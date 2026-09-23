@@ -1,0 +1,42 @@
+{
+  "name": "bb-plugin-kubernetes-provider",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Run each bb thread in its own Kubernetes pod in the server's namespace",
+  "engines": {
+    "bb": ">=0.43"
+  },
+  "bb": {
+    "name": "Kubernetes machines",
+    "description": "Run each bb thread in its own disposable pod in the server's namespace",
+    "branding": {
+      "icon": "Server"
+    },
+    "server": "./server.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "^0.4.101",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.0",
+    "better-sqlite3": "^12.11.1",
+    "cron-parser": "^5.10.1",
+    "hono": "^4.13.8",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.1"
+  },
+  "license": "MIT"
+}

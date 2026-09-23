@@ -1,0 +1,34 @@
+name: plugins
+on:
+  push:
+    paths:
+      - .github/workflows/plugins.yaml
+      - plugins/**
+  pull_request:
+    paths:
+      - .github/workflows/plugins.yaml
+      - plugins/**
+
+jobs:
+  quality_checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [kubernetes-provider, workstreams]
+    defaults:
+      run:
+        working-directory: plugins/${{ matrix.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+      - name: Install
+        run: npm install --include=dev --legacy-peer-deps --no-audit --no-fund
+      - name: Typecheck
+        run: npm run --if-present typecheck
+      - name: Test
+        run: npm test

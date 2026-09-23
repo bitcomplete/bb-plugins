@@ -3,6 +3,7 @@
   "schemaVersion": 1,
   "name": "bb-plugins",
   "plugins": [
-    { "name": "workstreams", "source": "./plugins/workstreams" }
+    { "name": "workstreams", "source": "./plugins/workstreams" },
+    { "name": "kubernetes-provider", "source": "./plugins/kubernetes-provider" }
   ]
 }
