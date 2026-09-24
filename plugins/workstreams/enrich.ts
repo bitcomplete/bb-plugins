@@ -25,6 +25,7 @@ import {
   type ClusterDecision,
   type Cohesion,
   type NamedGroup,
+  type SeedContext,
   type SeedItem,
 } from "./workstreams.js";
 
@@ -93,9 +94,9 @@ export type Candidate = { label: string; description: string; members: Cluster[]
  * cache key, not a display name: it only has to be stable and unique, so it is
  * derived from a member's own pull request title rather than invented.
  */
-export function candidatesFrom(clusters: Cluster[]): Candidate[] {
+export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): Candidate[] {
   const used = new Set<string>();
-  return seedGroups(clusters).map((members) => {
+  return seedGroups(clusters, context).map((members) => {
     const base = fallbackSummary(members[0] as Cluster);
     let label = base;
     for (let suffix = 2; used.has(label); suffix += 1) label = `${base} (${suffix})`;

@@ -174,7 +174,7 @@ state.
 | Mode | Keys set | What you get |
 | --- | --- | --- |
 | `basic` | neither | Clusters grouped by ticket (manual name, then Linear project, then the key). Summaries are the most recent PR title. |
-| `jev` | `typesafeApiKey` | Efforts, and the levels above them, with borrowed names. Jev selects each cluster's summary from its own PR titles and assigns each level's members to candidates that code seeded from independent signals (see [Grouping signals](#grouping-signals)). |
+| `jev` | `typesafeApiKey` | Efforts, and the levels above them, with borrowed names. Jev selects each cluster's summary from its own PR titles and assigns each level's members to candidates that code seeded from four signals (see [Grouping signals](#grouping-signals)). |
 | `jev+claude` | both | As `jev`, and Claude rewrites each group's name as a written category name and returns its cohesion verdict. That is Claude's only job here. |
 
 An Anthropic key on its own changes nothing: efforts only exist once Jev has
@@ -196,13 +196,13 @@ separately: `bb plugin logs workstreams`.
   ticket → effort name) and the Board's row actions, each of which runs only
   from the confirm button of its own dialog. See [Row actions](#row-actions).
 - **A manual name always wins.** `group` beats any model assignment.
-- **No single signal groups anything.** Seeding compares independent
+- **No single signal groups anything.** Seeding compares four independent
   signals: code areas (where in the repo a branch changes files), branch and PR
-  vocabulary, and Linear (a shared parent issue or project).
+  vocabulary, Linear (a shared parent issue or project), and a shared thread.
   Two clusters are seeded together only when at least two of them agree. The
   repo is not a signal: in a monorepo every pair shares it. See
   [Grouping signals](#grouping-signals).
-- **Linear informs a theme; it never decides one.** Linear is one of the seeding
+- **Linear informs a theme; it never decides one.** Linear is one of the four
   signals, so on its own it cannot merge anything. In naming, the project name
   is one candidate among the members' own phrases. With no Linear key the
   Linear code path is inert: no request is made and nothing Linear-shaped
@@ -385,6 +385,10 @@ the thresholds are exactly what they were before the hierarchy existed.
   of them counts nothing.
 - **Vocabulary.** Words from branch slugs and PR titles.
 - **Linear.** A shared parent issue, or (weaker) a shared project.
+- **Threads.** A thread strongly linked (started from the Board, running in the
+  checkout, or naming the ticket) to n clusters gives each pair 1/(n−1).
+  Path-only links never count, and a thread linking more than eight clusters
+  counts nothing.
 
 ## Linear details
 

@@ -1230,6 +1230,8 @@ export type SeedItem = {
   projects: ReadonlySet<string>;
   /** Linear parent issues the item's tickets sit under. */
   parents: ReadonlySet<string>;
+  /** Strong-linked thread id → its specificity weight; see `threadWeights`. */
+  threads: ReadonlyMap<string, number>;
 };
 
 /**
@@ -1270,8 +1272,15 @@ function areaAgreement(
   return total === 0 ? 0 : shared / total;
 }
 
-/** The three independent signals, each 0-1. Repo is deliberately not one; see `codeArea`. */
-export type Signals = { area: number; vocab: number; linear: number };
+/** Summed specificity of the threads both items are strongly linked to, capped at 1. */
+function threadAgreement(a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>): number {
+  let sum = 0;
+  for (const [thread, weight] of a) if (b.has(thread)) sum += weight;
+  return Math.min(1, sum);
+}
+
+/** The four independent signals, each 0-1. Repo is deliberately not one; see `codeArea`. */
+export type Signals = { area: number; vocab: number; linear: number; thread: number };
 
 export function signalsBetween(a: SeedItem, b: SeedItem, weights: ReadonlyMap<string, number>): Signals {
   return {
@@ -1279,6 +1288,7 @@ export function signalsBetween(a: SeedItem, b: SeedItem, weights: ReadonlyMap<st
     vocab: jaccard(a.vocab, b.vocab),
     // One source, one signal: a shared parent is the sharper half of it.
     linear: Math.max(jaccard(a.parents, b.parents), 0.7 * jaccard(a.projects, b.projects)),
+    thread: threadAgreement(a.threads, b.threads),
   };
 }
 
@@ -1286,14 +1296,14 @@ export function signalsBetween(a: SeedItem, b: SeedItem, weights: ReadonlyMap<st
 export const SIGNAL_FLOOR = 0.1;
 /** How many independent signals must agree before two items may merge. */
 export const SIGNALS_REQUIRED = 2;
-const SIMILARITY_WEIGHTS: Signals = { area: 0.6, vocab: 0.4, linear: 0.3 };
+const SIMILARITY_WEIGHTS: Signals = { area: 0.6, vocab: 0.4, linear: 0.3, thread: 0.4 };
 
 /**
  * The merge score, or 0 when fewer than two independent signals agree.
  *
  * The gate is the rule: NO single signal can merge two items on its own —
  * not Linear (which informs a theme and never decides one), not a shared
- * code area, not shared words. The weighted sum then
+ * thread, not a shared code area, not shared words. The weighted sum then
  * ranks the pairs that passed it against the merge threshold.
  */
 export function similarity(a: SeedItem, b: SeedItem, weights: ReadonlyMap<string, number> = areaWeights([a, b])): number {
@@ -1354,6 +1364,7 @@ export function seedItems(items: readonly SeedItem[]): string[][] {
       vocab: union(a.item.vocab, b.item.vocab),
       projects: union(a.item.projects, b.item.projects),
       parents: union(a.item.parents, b.item.parents),
+      threads: new Map([...a.item.threads, ...b.item.threads]),
     };
     groups.splice(best.right, 1);
   }
@@ -1363,37 +1374,45 @@ export function seedItems(items: readonly SeedItem[]): string[][] {
   return groups.map((group) => [...group.members].sort((a, b) => a.localeCompare(b)));
 }
 
+/** What seeding knows about each ticket beyond its own checkouts and its Linear detail. */
+export type SeedContext = {
+  /** Ticket → strong-linked thread id → specificity weight. */
+  threads?: ReadonlyMap<string, ReadonlyMap<string, number>>;
+};
+
 function present(value: string | null | undefined): Set<string> {
   return typeof value === "string" && value.trim() !== "" ? new Set([value.trim()]) : new Set<string>();
 }
 
 /** One cluster as a seed item. */
-export function clusterSeedItem(cluster: Cluster): SeedItem {
+export function clusterSeedItem(cluster: Cluster, context: SeedContext = {}): SeedItem {
   return {
     key: cluster.ticket,
     areas: areaProfile(cluster),
     vocab: clusterVocabulary(cluster),
     projects: present(cluster.linear?.project),
     parents: present(cluster.linear?.parentIdentifier ?? cluster.linear?.parentTitle),
+    threads: context.threads?.get(cluster.ticket) ?? new Map(),
   };
 }
 
 /** A group of clusters as ONE seed item, for the levels above an effort. */
-export function groupSeedItem(key: string, clusters: readonly Cluster[]): SeedItem {
-  const parts = clusters.map((cluster) => clusterSeedItem(cluster));
+export function groupSeedItem(key: string, clusters: readonly Cluster[], context: SeedContext = {}): SeedItem {
+  const parts = clusters.map((cluster) => clusterSeedItem(cluster, context));
   return {
     key,
     areas: parts.reduce<Map<string, number>>((sum, part) => sumCounts(sum, part.areas), new Map()),
     vocab: new Set(parts.flatMap((part) => [...part.vocab])),
     projects: new Set(parts.flatMap((part) => [...part.projects])),
     parents: new Set(parts.flatMap((part) => [...part.parents])),
+    threads: new Map(parts.flatMap((part) => [...part.threads])),
   };
 }
 
 /** The cluster level's seeding, expressed through the generic one. */
-export function seedGroups(clusters: Cluster[]): Cluster[][] {
+export function seedGroups(clusters: Cluster[], context: SeedContext = {}): Cluster[][] {
   const byKey = new Map(clusters.map((cluster) => [cluster.ticket, cluster]));
-  return seedItems(clusters.map((cluster) => clusterSeedItem(cluster))).map((keys) =>
+  return seedItems(clusters.map((cluster) => clusterSeedItem(cluster, context))).map((keys) =>
     keys.flatMap((key) => {
       const cluster = byKey.get(key);
       return cluster === undefined ? [] : [cluster];

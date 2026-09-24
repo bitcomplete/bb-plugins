@@ -1,7 +1,9 @@
 // The grouping signals: code areas (repo is deliberately NOT a signal), the
-// two-signal merge rule, and Linear in the semantic hash.
+// two-signal merge rule, thread co-occurrence, Linear as context, and the
+// stable candidate labels that keep a rename from forcing re-asks.
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
+import { THREAD_SPAN_MAX, threadWeights, type ThreadTier } from "./threads.js";
 import {
   AREA_COMMON_SHARE,
   MERGE_THRESHOLD,
@@ -65,7 +67,7 @@ function cluster(ticket: string, repo: string, changedPaths: string[], title = `
 }
 
 function item(key: string, overrides: Partial<SeedItem> = {}): SeedItem {
-  return { key, areas: new Map(), vocab: new Set(), projects: new Set(), parents: new Set(), ...overrides };
+  return { key, areas: new Map(), vocab: new Set(), projects: new Set(), parents: new Set(), threads: new Map(), ...overrides };
 }
 
 const linear = (overrides: Partial<ClusterLinear> = {}): ClusterLinear => ({
@@ -150,12 +152,18 @@ describe("the two-signal merge rule", () => {
       [item("a", { areas: area }), item("b", { areas: area })],
       [item("a", { vocab }), item("b", { vocab })],
       [item("a", { projects: new Set(["Print run"]), parents: new Set(["ABC-0"]) }), item("b", { projects: new Set(["Print run"]), parents: new Set(["ABC-0"]) })],
+      [item("a", { threads: new Map([["thr-1", 1]]) }), item("b", { threads: new Map([["thr-1", 1]]) })],
     ];
     for (const [a, b] of pairs) expect(similarity(a, b)).toBe(0);
   });
 
   it("merges when two independent signals agree", () => {
     expect(similarity(item("a", { areas: area, vocab }), item("b", { areas: area, vocab }))).toBeGreaterThan(MERGE_THRESHOLD);
+    const linearAndThread = similarity(
+      item("a", { parents: new Set(["ABC-0"]), threads: new Map([["thr-1", 1]]) }),
+      item("b", { parents: new Set(["ABC-0"]), threads: new Map([["thr-1", 1]]) }),
+    );
+    expect(linearAndThread).toBeGreaterThan(MERGE_THRESHOLD);
   });
 
   it("keeps a pair sharing ONLY a Linear project apart: Linear informs, it never decides", () => {
@@ -174,6 +182,48 @@ describe("the two-signal merge rule", () => {
     const a = { ...cluster("ABC-1", "quill", ["src/shelves/a.ts"], "Tune search ranking weights"), linear: linear({ parentIdentifier: "ABC-0" }) };
     const b = { ...cluster("ABC-2", "quill", ["src/shelves/b.ts"], "Refresh the seasonal reading list"), linear: linear({ parentIdentifier: "ABC-0" }) };
     expect(seedGroups([a, b])).toHaveLength(1);
+  });
+
+  it("uses a shared strong thread as one of the two signals", () => {
+    const a = cluster("ABC-1", "quill", ["src/shelves/a.ts"], "Tune search ranking weights");
+    const b = cluster("ABC-2", "quill", ["src/shelves/b.ts"], "Refresh the seasonal reading list");
+    expect(seedGroups([a, b])).toHaveLength(2);
+    const threads = new Map([["ABC-1", new Map([["thr-1", 1]])], ["ABC-2", new Map([["thr-1", 1]])]]);
+    expect(seedGroups([a, b], { threads })).toHaveLength(1);
+  });
+});
+
+describe("threadWeights", () => {
+  const links = (entries: [string, [string, ThreadTier][]][]) =>
+    new Map(entries.map(([thread, clusters]) => [thread, new Map(clusters)]));
+
+  it("gives each pair a thread strongly links 1/(n−1), so a focused thread counts more than a sprawling one", () => {
+    const weights = threadWeights(
+      links([
+        ["thr-pair", [["ABC-1", "started"], ["ABC-2", "environment"]]],
+        ["thr-four", [["ABC-1", "ticket"], ["ABC-3", "ticket"], ["ABC-4", "ticket"], ["ABC-5", "ticket"]]],
+      ]),
+    );
+    expect(weights.get("ABC-1")?.get("thr-pair")).toBe(1);
+    expect(weights.get("ABC-1")?.get("thr-four")).toBeCloseTo(1 / 3, 10);
+  });
+
+  it("ignores paths links, so a broad planning thread cannot glue the board together", () => {
+    const weights = threadWeights(links([["thr-plan", [["ABC-1", "paths"], ["ABC-2", "paths"], ["ABC-3", "ticket"]]]]));
+    expect(weights.size).toBe(0);
+  });
+
+  it("gives nothing for a thread linking one cluster, or more than the span cutoff", () => {
+    const wide = Array.from({ length: THREAD_SPAN_MAX + 1 }, (_, index): [string, ThreadTier] => [`ABC-${index}`, "ticket"]);
+    const atCap = wide.slice(0, THREAD_SPAN_MAX);
+    expect(threadWeights(links([["thr-solo", [["ABC-1", "started"]]], ["thr-wide", wide]])).size).toBe(0);
+    expect(threadWeights(links([["thr-cap", atCap]])).size).toBe(THREAD_SPAN_MAX);
+  });
+
+  it("is deterministic: the same links give the same weights whatever order they arrive in", () => {
+    const a = threadWeights(links([["t1", [["ABC-1", "ticket"], ["ABC-2", "ticket"]]], ["t2", [["ABC-2", "ticket"], ["ABC-3", "ticket"]]]]));
+    const b = threadWeights(links([["t2", [["ABC-3", "ticket"], ["ABC-2", "ticket"]]], ["t1", [["ABC-2", "ticket"], ["ABC-1", "ticket"]]]]));
+    for (const key of ["ABC-1", "ABC-2", "ABC-3"]) expect([...(a.get(key) ?? [])].sort()).toEqual([...(b.get(key) ?? [])].sort());
   });
 });
 

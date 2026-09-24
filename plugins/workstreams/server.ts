@@ -49,6 +49,7 @@ import {
   type ClusterDecision,
   type ClusterLinear,
   type NamedGroup,
+  type SeedContext,
   type SeedItem,
   type SummarizedCluster,
   type SurfaceRule,
@@ -69,8 +70,11 @@ import {
 } from "./enrich.js";
 import {
   EVENT_READ,
+  STRONG_TIERS,
   THREAD_TIERS,
   linkThread,
+  strongLinkedClusters,
+  threadWeights,
   pathsFromEvents,
   refreshWorkedPaths,
   threadCoverage,
@@ -641,6 +645,8 @@ export default async function plugin(bb: BbPluginApi) {
       // A Linear outage keeps the previous cache and is logged once; it never fails a scan.
       await linear.sync(await linearKeys(), ticketsOf(compilePattern(ticketPattern), result.units), signal);
 
+      // The first scan after a load waits for the thread list: threads seed the grouping.
+      if (!threadsSynced) await syncThreads();
       try {
         warnings.push(...(await enrich(signal)));
       } catch (error) {
@@ -1027,31 +1033,39 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /**
+   * Thread id → cluster → strongest tier, over the clusters given. The started-
+   * here record is read at link time: the spawn RPC can record it after
+   * `thread.created` has already built this thread's facts.
+   */
+  function threadLinks(
+    clusters: readonly { ticket: string; units: readonly { path: string; branch: string | null; defaultBranch: string | null }[] }[],
+    pattern: RegExp,
+  ): Map<string, Map<string, ThreadTier>> {
+    const targets: LinkTarget[] = clusters.flatMap((cluster) =>
+      cluster.units.map((unit) => ({
+        cluster: cluster.ticket,
+        path: unit.path,
+        branch: unit.branch,
+        defaultBranch: unit.defaultBranch,
+      })),
+    );
+    const links = new Map<string, Map<string, ThreadTier>>();
+    for (const thread of threadFacts.values()) {
+      links.set(thread.id, linkThread({ ...thread, startedFor: startedFor.get(thread.id) ?? thread.startedFor }, targets, pattern));
+    }
+    return links;
+  }
+
   async function board(): Promise<Board> {
     const { groups, mode, surfaces, warnings } = await hierarchy();
     const { rules } = await surfaceRules();
     const pattern = compilePattern((await settings.get()).ticketPattern);
-    const targets: LinkTarget[] = groups.flatMap((group) =>
-      group.clusters.flatMap((cluster) =>
-        cluster.units.map((unit) => ({
-          cluster: cluster.ticket,
-          path: unit.path,
-          branch: unit.branch,
-          defaultBranch: unit.defaultBranch,
-        })),
-      ),
-    );
-    const links = new Map<string, Map<string, ThreadTier>>();
+    const links = threadLinks(groups.flatMap((group) => group.clusters), pattern);
     const threadsOf = new Map<string, z.infer<typeof threadLinkSchema>[]>();
-    for (const thread of threadFacts.values()) {
-      // Read the started-here record at link time: the spawn RPC can record it
-      // after `thread.created` has already built this thread's facts.
-      const linked = linkThread(
-        { ...thread, startedFor: startedFor.get(thread.id) ?? thread.startedFor },
-        targets,
-        pattern,
-      );
-      links.set(thread.id, linked);
+    for (const [threadId, linked] of links) {
+      const thread = threadFacts.get(threadId);
+      if (thread === undefined) continue;
       for (const [cluster, tier] of linked) {
         const bucket = threadsOf.get(cluster) ?? [];
         bucket.push({
@@ -1215,7 +1229,10 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  let threadsBusy = false;
+  /** The relist in flight, shared by every caller that asks for one meanwhile. */
+  let threadSync: Promise<void> | null = null;
+  /** True once a relist has succeeded: enrichment seeds from threads and must not run without them. */
+  let threadsSynced = false;
   let threadSignal: ReturnType<typeof setTimeout> | null = null;
 
   /** Tell the board, coalescing a burst of thread events into one refetch. */
@@ -1235,9 +1252,14 @@ export default async function plugin(bb: BbPluginApi) {
    * scan, never inside one: a slow thread read must not hold a board refresh,
    * and a failed one skips that thread only.
    */
-  async function syncThreads(): Promise<void> {
-    if (threadsBusy) return;
-    threadsBusy = true;
+  function syncThreads(): Promise<void> {
+    threadSync ??= relistThreads().finally(() => {
+      threadSync = null;
+    });
+    return threadSync;
+  }
+
+  async function relistThreads(): Promise<void> {
     try {
       const rows = await bb.sdk.threads.list({ limit: 500 });
       for (const row of rows) await readStartedFor(row);
@@ -1260,12 +1282,11 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `threads: ${rows.length} listed, ${refreshed.read} event logs read, ${refreshed.reused} unchanged, ${refreshed.failed} skipped`,
       );
+      threadsSynced = true;
       reconcileRuns(rows);
       announceThreads();
     } catch (error) {
       bb.log.warn(`thread sync failed: ${String(error).slice(0, 300)}`);
-    } finally {
-      threadsBusy = false;
     }
   }
 
@@ -1459,6 +1480,7 @@ export default async function plugin(bb: BbPluginApi) {
     groups: BoardGroup[],
     hashOf: (group: BoardGroup) => string,
     childrenOf: (group: BoardGroup) => BoardGroup[],
+    context: SeedContext,
   ): LevelEntry[] {
     return groups
       .filter((group) => group.key !== UNSORTED && !group.key.endsWith(`:${UNSORTED}`))
@@ -1475,7 +1497,7 @@ export default async function plugin(bb: BbPluginApi) {
               .join(", ")
               .slice(0, 300),
           },
-          item: groupSeedItem(hash, clusters),
+          item: groupSeedItem(hash, clusters, context),
           repos: [...new Set(clusters.flatMap((cluster) => cluster.units.map((unit) => unit.repo ?? unit.dirName)))],
           clusters,
           group,
@@ -1601,7 +1623,7 @@ export default async function plugin(bb: BbPluginApi) {
    * `await`s below at ANY level, which is what makes an unchanged refresh free.
    */
   async function enrich(signal: AbortSignal): Promise<string[]> {
-    const { typesafeApiKey, anthropicApiKey, assignmentConfidenceThreshold } =
+    const { typesafeApiKey, anthropicApiKey, assignmentConfidenceThreshold, ticketPattern } =
       await settings.get();
     const mode = modeOf(typesafeApiKey, anthropicApiKey);
     if (mode === "basic" || typeof typesafeApiKey !== "string") {
@@ -1609,9 +1631,19 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info("enrich (basic): 0 model calls, 0 in / 0 out");
       return [];
     }
+    // Threads are a seeding signal. Seeding without them after a reload, then
+    // with them a scan later, would flip candidates and pay twice for nothing.
+    if (!threadsSynced) {
+      bb.log.info("enrich skipped: the thread list has not been read yet; grouping kept as is");
+      return [];
+    }
 
     const { clusters, linearProjects, rules } = await readPlacement();
-    const candidates = candidatesFrom(clusters);
+    const pattern = compilePattern(ticketPattern);
+    const links = threadLinks(clusters, pattern);
+    const context: SeedContext = { threads: threadWeights(links) };
+    bb.log.info(`threads: ${strongLinkedClusters(links)} of ${clusters.length} clusters have a strong thread link`);
+    const candidates = candidatesFrom(clusters, context);
     const labels = new Set(candidates.map((candidate) => candidate.label));
     const pending = clusters.filter((cluster) => {
       const decision = readDecision(clusterInputHash(cluster));
@@ -1675,7 +1707,7 @@ export default async function plugin(bb: BbPluginApi) {
     const efforts = effortsOf(placement.labelled, true, rules);
     const program = await deriveLevel({
       level: "program",
-      members: levelMembers(efforts, effortHash, () => []),
+      members: levelMembers(efforts, effortHash, () => [], context),
       summaryOf: (group) => group.name,
       jev,
       naming,
@@ -1697,6 +1729,7 @@ export default async function plugin(bb: BbPluginApi) {
           programGroups,
           (group) => memberHash("program", childrenOf(group).map(effortHash)),
           childrenOf,
+          context,
         ),
         summaryOf: (group) => group.name,
         jev,

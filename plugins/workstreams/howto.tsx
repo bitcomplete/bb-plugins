@@ -102,8 +102,8 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
       <Section title="How grouping works">
         <p>
           Checkouts cluster by ticket, clusters roll up into efforts, and efforts into programs. Code seeds the
-          groups from independent signals: the code areas a branch changes, shared words, and Linear parents and
-          projects. Two clusters are only seeded together when at least two signals
+          groups from four signals: the code areas a branch changes, shared words, Linear parents and projects, and
+          threads you worked on several tickets in. Two clusters are only seeded together when at least two signals
           agree, so no one signal, Linear included, decides a group. The repo is not a signal. Jev assigns each
           cluster with a confidence score, and a low score lands in Unsorted. Claude only names groups and flags ones
           that look mixed. Counts and rollups are computed locally.

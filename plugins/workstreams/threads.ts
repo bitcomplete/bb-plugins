@@ -278,3 +278,44 @@ export function threadCoverage(
   }
   return { threads: threadCount, linked, byTier, clustersWithThread: clusters.size };
 }
+
+// ---- threads as a grouping signal -------------------------------------------
+
+/** The tiers that say a thread WORKED on a cluster. `paths` only says it passed through. */
+export const STRONG_TIERS: ReadonlySet<ThreadTier> = new Set(["started", "environment", "ticket"]);
+/** A thread strongly linking more clusters than this is a planning thread: it says nothing about any pair. */
+export const THREAD_SPAN_MAX = 8;
+
+/**
+ * Cluster → thread → specificity weight, for seeding. A thread strongly linking
+ * n clusters gives each pair among them 1/(n−1): two tickets worked on in one
+ * focused thread belong together in the user's head, while a thread that
+ * touched eight tickets is weak evidence about any two of them. `paths` links
+ * never count — one broad planning thread would glue the whole board together —
+ * and a thread linking one cluster, or more than THREAD_SPAN_MAX, gives nothing.
+ */
+export function threadWeights(
+  links: ReadonlyMap<string, ReadonlyMap<string, ThreadTier>>,
+): Map<string, Map<string, number>> {
+  const out = new Map<string, Map<string, number>>();
+  for (const [thread, perCluster] of links) {
+    const strong = [...perCluster].filter(([, tier]) => STRONG_TIERS.has(tier)).map(([cluster]) => cluster);
+    if (strong.length < 2 || strong.length > THREAD_SPAN_MAX) continue;
+    const weight = 1 / (strong.length - 1);
+    for (const cluster of strong) {
+      const bucket = out.get(cluster) ?? new Map<string, number>();
+      bucket.set(thread, weight);
+      out.set(cluster, bucket);
+    }
+  }
+  return out;
+}
+
+/** How many clusters have at least one strong thread link: reported, so the signal's reach is visible. */
+export function strongLinkedClusters(links: ReadonlyMap<string, ReadonlyMap<string, ThreadTier>>): number {
+  const clusters = new Set<string>();
+  for (const perCluster of links.values()) {
+    for (const [cluster, tier] of perCluster) if (STRONG_TIERS.has(tier)) clusters.add(cluster);
+  }
+  return clusters.size;
+}
