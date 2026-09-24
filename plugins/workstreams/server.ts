@@ -44,7 +44,6 @@ import {
   memberHash,
   namingCandidates,
   parseSurfaceRules,
-  parseTicket,
   placeClusters,
   type BoardGroup,
   type Cluster,
@@ -103,6 +102,7 @@ import { parseLinearKeys, projectNameOf } from "./linear.js";
 import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearagent.js";
 import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
+import { TICKET_SOURCES, linkbacksDue, ticketFinder, type LinkbackCheck, type TicketFacts } from "./tickets.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
 const SCAN_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -120,6 +120,7 @@ const stalenessSchema = z.enum(STALENESS);
 const riskSchema = z.enum(RISKS);
 const unitSchema = rawUnitSchema.extend({
   ticket: z.string().nullable(),
+  ticketSource: z.enum(TICKET_SOURCES).nullable(),
   lifecycle: lifecycleSchema,
   stack: z
     .object({
@@ -510,6 +511,10 @@ export default async function plugin(bb: BbPluginApi) {
     LINEAR_DETAIL_MIGRATION,
     // Per cluster key: the semantic hash last seen, and the label-vanished damper's streak. See asks.ts.
     `CREATE TABLE IF NOT EXISTS cluster_asks (ticket TEXT PRIMARY KEY, hash TEXT NOT NULL, streak INTEGER NOT NULL, pinned INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+    // Per PR URL: the ticket its Linear linkback comment names (null: none), and
+    // when it was read. `final` marks a PR that was merged or closed when read:
+    // never read again. Comment text is never stored.
+    `CREATE TABLE IF NOT EXISTS pr_linkbacks (url TEXT PRIMARY KEY, ticket TEXT, checked_at INTEGER NOT NULL, final INTEGER NOT NULL)`,
   ]);
   const runs = createRunStore(db);
 
@@ -666,8 +671,17 @@ export default async function plugin(bb: BbPluginApi) {
       recordTransitions(result.units);
       warnings.push(...result.warnings);
 
+      // Tickets are resolved BEFORE Linear is synced, so a ticket found in a PR
+      // title, description or linkback gets its detail in this same scan and the
+      // regroup it causes is paid for once. Team keys are kept only from a
+      // discovery every key answered: a flaky lookup must not flip tickets.
+      const pattern = compilePattern(ticketPattern);
+      const keys = await linearKeys();
+      const teams = await linear.teams(keys, signal);
+      if (teams.complete) await bb.storage.kv.set("linearTeams", teams.keys);
+      await readLinkbackComments(pattern, result.units, hostId, signal);
       // A Linear outage keeps the previous cache and is logged once; it never fails a scan.
-      await linear.sync(await linearKeys(), ticketsOf(compilePattern(ticketPattern), result.units), signal);
+      await linear.sync(keys, ticketsOf(await findTickets(pattern, result.units), result.units), signal);
 
       // The first scan after a load waits for the thread list: threads seed the grouping.
       if (!threadsSynced) await syncThreads();
@@ -715,15 +729,61 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  function ticketsOf(pattern: RegExp, units: RawUnit[]): string[] {
-    return [
-      ...new Set(
-        units.flatMap((unit) => {
-          const ticket = parseTicket(pattern, unit.branch, unit.dirName);
-          return ticket === null ? [] : [ticket];
-        }),
-      ),
-    ];
+  /** Linear team keys from the last complete discovery; see `readLinkbackComments` and `ticketFinder`. */
+  async function knownTeams(): Promise<string[]> {
+    return (await bb.storage.kv.get<string[]>("linearTeams")) ?? [];
+  }
+
+  function readLinkbacks(): Map<string, string> {
+    const rows = db.prepare(`SELECT url, ticket FROM pr_linkbacks WHERE ticket IS NOT NULL`).all() as { url: string; ticket: string }[];
+    return new Map(rows.map((row) => [row.url, row.ticket]));
+  }
+
+  /** The ticket finder for this board: every source, with the prose allowlist built over all of it. */
+  async function findTickets(pattern: RegExp, units: readonly TicketFacts[]) {
+    return ticketFinder(pattern, units, { teams: await knownTeams(), linkbacks: readLinkbacks() });
+  }
+
+  function ticketsOf(find: (unit: TicketFacts) => { ticket: string } | null, units: readonly TicketFacts[]): string[] {
+    return [...new Set(units.flatMap((unit) => { const ticket = find(unit)?.ticket; return ticket === undefined ? [] : [ticket]; }))];
+  }
+
+  /**
+   * Read the Linear linkback comment of each PR that no cheaper source (branch,
+   * title, description) gave a ticket. Cached per PR URL: an open PR is re-read
+   * every few hours, a finished one once. Never fails a scan.
+   */
+  async function readLinkbackComments(pattern: RegExp, units: RawUnit[], hostId: string, signal: AbortSignal): Promise<void> {
+    const find = await findTickets(pattern, units);
+    const stateOf = new Map<string, string>();
+    for (const unit of units) {
+      if (unit.pr === null || unit.pr.url === "") continue;
+      const source = find(unit)?.source;
+      if (source === undefined || source === "directory") stateOf.set(unit.pr.url, unit.pr.state);
+    }
+    const rows = db.prepare(`SELECT url, checked_at, final FROM pr_linkbacks`).all() as { url: string; checked_at: number; final: number }[];
+    const checked = new Map<string, LinkbackCheck>(rows.map((row) => [row.url, { checkedAt: row.checked_at, final: row.final !== 0 }]));
+    const due = linkbacksDue([...stateOf.keys()].map((url) => ({ url })), checked, Date.now()).slice(0, 100);
+    if (due.length === 0) return;
+    try {
+      const result = await host.call("linkbacks", { prUrls: due }, { hostId, signal, timeoutMs: SCAN_TIMEOUT_MS });
+      const upsert = db.prepare(
+        `INSERT INTO pr_linkbacks (url, ticket, checked_at, final) VALUES (?, ?, ?, ?)
+         ON CONFLICT(url) DO UPDATE SET ticket = excluded.ticket, checked_at = excluded.checked_at, final = excluded.final`,
+      );
+      const now = Date.now();
+      db.transaction(() => {
+        for (const entry of result.found) {
+          const state = stateOf.get(entry.prUrl);
+          upsert.run(entry.prUrl, entry.ticket, now, state === "MERGED" || state === "CLOSED" ? 1 : 0);
+        }
+      })();
+      for (const warning of result.warnings) bb.log.warn(`linkback: ${warning}`);
+      bb.log.info(`linkback: read ${result.found.length} of ${due.length} PR(s), ${result.found.filter((entry) => entry.ticket !== null).length} linked`);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      bb.log.warn(`linkback: comment read failed: ${String(error).slice(0, 200)}`);
+    }
   }
 
   // ---- decisions: the only model-derived state, and its cache -----------
@@ -896,10 +956,14 @@ export default async function plugin(bb: BbPluginApi) {
     const warnings = new Set<string>();
     const { rules, warning } = await surfaceRules();
     if (warning !== null) warnings.add(warning);
-    const tickets = ticketsOf(pattern, units);
+    const teams = await knownTeams();
+    const linkbacks = readLinkbacks();
+    const tickets = ticketsOf(ticketFinder(pattern, units, { teams, linkbacks }), units);
     const linearProjects = cachedProjects(tickets);
     const workstreams = buildBoard(units, {
       pattern,
+      teams,
+      linkbacks,
       overrides,
       linearProjects,
       linear: clusterLinearOf(tickets),
@@ -1462,7 +1526,8 @@ export default async function plugin(bb: BbPluginApi) {
   /** Tickets on the board that no key covers and that have no Linear detail yet. */
   async function fallbackTickets(): Promise<string[]> {
     const pattern = compilePattern((await settings.get()).ticketPattern);
-    const unowned = await linear.unowned(await linearKeys(), ticketsOf(pattern, readUnits()), disposal.signal);
+    const units = readUnits();
+    const unowned = await linear.unowned(await linearKeys(), ticketsOf(await findTickets(pattern, units), units), disposal.signal);
     const known = linear.read(unowned);
     return unowned.filter((ticket) => !known.has(ticket)).sort((a, b) => a.localeCompare(b));
   }
@@ -1915,8 +1980,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function scannedUnit(path: string): Promise<{ raw: RawUnit; ticket: string } | undefined> {
     const pattern = compilePattern((await settings.get()).ticketPattern);
-    const raw = readUnits().find((unit) => unit.path === path);
-    return raw === undefined ? undefined : { raw, ticket: parseTicket(pattern, raw.branch, raw.dirName) ?? raw.dirName };
+    const units = readUnits();
+    const raw = units.find((unit) => unit.path === path);
+    return raw === undefined ? undefined : { raw, ticket: (await findTickets(pattern, units))(raw)?.ticket ?? raw.dirName };
   }
 
   /** The row's open PR and the host to act from, or the reason there is none. */
@@ -1994,11 +2060,12 @@ export default async function plugin(bb: BbPluginApi) {
     thread_start: async ({ path, prompt }) => {
       // The unit and its cluster come from the last scan, never from the client.
       const pattern = compilePattern((await settings.get()).ticketPattern);
-      const raw = readUnits().find((unit) => unit.path === path);
+      const units = readUnits();
+      const raw = units.find((unit) => unit.path === path);
       const unit =
         raw === undefined
           ? undefined
-          : { path: raw.path, ticket: parseTicket(pattern, raw.branch, raw.dirName) ?? raw.dirName };
+          : { path: raw.path, ticket: (await findTickets(pattern, units))(raw)?.ticket ?? raw.dirName };
       const result = await startThread(
         {
           projects: { list: () => bb.sdk.projects.list() },

@@ -75,6 +75,15 @@ export const prSchema = z
       .array(z.object({ login: z.string().max(140), state: z.string().max(40) }).strict())
       .max(50)
       .default([]),
+    /**
+     * Ticket IDs the PR description states, extracted on the host from its
+     * first 8 KB. The description itself is client content and is never kept,
+     * sent or logged. Absent on a unit cached before the field existed.
+     */
+    ticketRefs: z
+      .object({ urls: z.array(z.string().max(40)).max(10), mentions: z.array(z.string().max(40)).max(10) })
+      .strict()
+      .optional(),
   })
   .strict();
 export type Pr = z.infer<typeof prSchema>;
@@ -225,6 +234,20 @@ export const hostContract = defineRpcContract({
       .object({
         units: z.array(rawUnitSchema).max(20),
         warnings: z.array(z.string().max(500)).max(50),
+      })
+      .strict(),
+  },
+  /**
+   * Read the Linear linkback comment on each named PR, for PRs no cheaper
+   * source found a ticket for. Only the ticket ID comes back, never comment
+   * text. A PR whose read failed is left out, so it is tried again later.
+   */
+  linkbacks: {
+    input: z.object({ prUrls: z.array(z.string().max(500)).max(100) }).strict(),
+    output: z
+      .object({
+        found: z.array(z.object({ prUrl: z.string().max(500), ticket: z.string().max(40).nullable() }).strict()).max(100),
+        warnings: z.array(z.string().max(500)).max(10),
       })
       .strict(),
   },

@@ -10,6 +10,7 @@ import { hostContract, type GroupNaming, type RawUnit } from "./contract.js";
 import {
   checkConclusions,
   parseAheadBehind,
+  parseLinkback,
   parsePrList,
   repoFromRemote,
 } from "./gh.js";
@@ -122,7 +123,7 @@ function defaultBranchResolver(signal: AbortSignal) {
 }
 
 const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,reviewRequests";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,reviewRequests,body";
 
 /** A release tag: many teams deploy production from a version tag and nothing else. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;
@@ -558,6 +559,24 @@ export default experimental_defineHostEntry({
         case "nudge":
           return runNudge(gh, target, request.reviewers, request.comment);
       }
+    },
+    linkbacks: async ({ prUrls }, context) => {
+      const gh = ghRunner(context.signal);
+      const warnings: string[] = [];
+      const read = await mapBounded(prUrls, async (prUrl) => {
+        const target = prTarget(prUrl);
+        if (target === null) return null;
+        // Comments are read only here, one PR at a time, and only for PRs the
+        // cheaper sources left ticketless. Only the ticket ID leaves this function.
+        const result = await gh(["pr", "view", String(target.number), "--repo", target.slug, "--json", "comments"]);
+        const ticket = result.ok ? parseLinkback(result.stdout) : undefined;
+        if (ticket === undefined) {
+          if (warnings.length < 10) warnings.push(`${target.slug}#${target.number}: could not read PR comments${result.ok ? "" : ` (${result.error.slice(0, 200)})`}`);
+          return null;
+        }
+        return { prUrl, ticket };
+      });
+      return { found: read.filter((entry) => entry !== null), warnings };
     },
     nameGroups: async ({ apiKey, level, groups }, context) =>
       nameGroups(apiKey, level, groups, context.signal),

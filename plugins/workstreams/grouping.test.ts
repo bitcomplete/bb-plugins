@@ -68,7 +68,7 @@ function cluster(ticket: string, repo: string, changedPaths: string[], title = `
     staleness: "fresh",
     surfaces: [],
     risk: "none",
-    units: [{ ...raw, ticket, lifecycle: unitLifecycle(raw), stack: null, staleness: "fresh", surfaces: [], risk: "none" }],
+    units: [{ ...raw, ticket, ticketSource: "branch", lifecycle: unitLifecycle(raw), stack: null, staleness: "fresh", surfaces: [], risk: "none" }],
   };
 }
 
@@ -329,7 +329,7 @@ describe("ticketless checkouts, keyed on their pull request", () => {
   /** A checkout with no ticket: its cluster is keyed by directory, as buildBoard keys it. */
   function ticketless(dirName: string, state: "OPEN" | "MERGED" | "CLOSED" | null, paths = ["src/shelves/a.ts"]): Cluster {
     const base = cluster(dirName, "quill", paths, `Bump the ${dirName} shelf index`);
-    const unit = { ...base.units[0]!, ticket: null, branch: `chore/${dirName}`, pr: state === null ? null : { ...pr(`Bump the ${dirName} shelf index`), state } };
+    const unit = { ...base.units[0]!, ticket: null, ticketSource: null, branch: `chore/${dirName}`, pr: state === null ? null : { ...pr(`Bump the ${dirName} shelf index`), state } };
     const lifecycle = unitLifecycle(unit);
     return { ...base, lifecycle, units: [{ ...unit, lifecycle }] };
   }

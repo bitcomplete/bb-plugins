@@ -4,6 +4,7 @@
 // pass typed values inward.
 import { MERGE_STATE_STATUSES, type MergeStateStatus, type Pr } from "./contract.js";
 import { parseReviewRequests } from "./ghactions.js";
+import { linkbackTicketOf, ticketRefsOf } from "./tickets.js";
 
 const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
 
@@ -143,6 +144,20 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)
         : null,
+    // The description is reduced to the ticket IDs it states, here, and dropped.
+    ticketRefs: ticketRefsOf(view.body),
   };
   return { pr, mergeCommit: mergeCommitOf(view.mergeCommit) };
+}
+
+/** `gh pr view --json comments`: the ticket its Linear linkback comment names, or null. Undefined when unparseable. */
+export function parseLinkback(raw: string): string | null | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
+  return linkbackTicketOf((parsed as { comments?: unknown }).comments);
 }

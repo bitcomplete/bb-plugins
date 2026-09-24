@@ -23,6 +23,7 @@ function cluster(
     shipped: null,
     changedPaths: [],
     ticket,
+    ticketSource: "branch" as const,
     lifecycle: options.lifecycle ?? "in-progress",
     stack: null,
     staleness: "fresh" as const,

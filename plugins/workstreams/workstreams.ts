@@ -1,6 +1,7 @@
 // Pure board logic: no I/O, no SDK. Everything here is unit-tested in
 // workstreams.test.ts, because these rules are the whole point of the plugin.
 import type { MergeStateStatus, RawUnit } from "./contract.js";
+import { ticketFinder, type TicketSource } from "./tickets.js";
 
 /**
  * The lifecycle taxonomy, written in PRECEDENCE order: when several states
@@ -106,6 +107,8 @@ export type StackInfo = {
 
 export type Unit = RawUnit & {
   ticket: string | null;
+  /** Where the ticket was found, so a wrong match is debuggable; null with no ticket. */
+  ticketSource: TicketSource | null;
   lifecycle: Lifecycle;
   /** Null when the checkout is not part of a stack of more than one PR. */
   stack: StackInfo | null;
@@ -145,22 +148,15 @@ export const UNSORTED = "Unsorted";
 /**
  * Find the ticket key on the branch name, falling back to the directory name.
  * Branch wins because a checkout is often reused under a stale directory name.
+ * A board resolves tickets with `ticketFinder`, which also reads the PR; this
+ * is its branch-and-directory subset.
  */
 export function parseTicket(
   pattern: RegExp,
   branch: string | null,
   dirName: string,
 ): string | null {
-  for (const candidate of [branch, dirName]) {
-    if (candidate === null) continue;
-    const match = new RegExp(pattern.source, pattern.flags.replace("g", "")).exec(
-      candidate,
-    );
-    if (match !== null && match[1] !== undefined && match[2] !== undefined) {
-      return `${match[1].toUpperCase()}-${match[2]}`;
-    }
-  }
-  return null;
+  return ticketFinder(pattern, [])({ branch, dirName, pr: null })?.ticket ?? null;
 }
 
 
@@ -627,6 +623,10 @@ export function buildBoard(
     /** Injected so staleness is a pure function and its boundaries testable. */
     now?: number;
     surfaceRules?: readonly SurfaceRule[];
+    /** Linear team keys: prefixes a ticket written in prose may use. See `ticketFinder`. */
+    teams?: readonly string[];
+    /** PR URL → the ticket its Linear linkback comment names. */
+    linkbacks?: ReadonlyMap<string, string>;
   },
 ): Workstream[] {
   const now = options.now ?? Date.now();
@@ -635,12 +635,15 @@ export function buildBoard(
   const workstreamOf = new Map<string, string>();
   const all: Unit[] = [];
 
+  const findTicket = ticketFinder(options.pattern, rawUnits, { teams: options.teams, linkbacks: options.linkbacks });
   for (const raw of rawUnits) {
-    const ticket = parseTicket(options.pattern, raw.branch, raw.dirName);
+    const found = findTicket(raw);
+    const ticket = found?.ticket ?? null;
     const surfaces = classifySurfaces(raw.changedPaths, rules);
     const unit: Unit = {
       ...raw,
       ticket,
+      ticketSource: found?.source ?? null,
       lifecycle: unitLifecycle(raw),
       stack: null,
       staleness: stalenessOf(raw.lastCommitAt, now),

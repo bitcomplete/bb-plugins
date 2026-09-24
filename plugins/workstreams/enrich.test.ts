@@ -72,6 +72,7 @@ function cluster(ticket: string, units: RawUnit[]): Cluster {
     units: units.map((raw) => ({
       ...raw,
       ticket,
+      ticketSource: "branch" as const,
       lifecycle: unitLifecycle(raw),
       stack: null,
       staleness: "fresh" as const,
