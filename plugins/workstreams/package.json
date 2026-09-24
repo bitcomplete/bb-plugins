@@ -57,6 +57,7 @@
     "vitest": "^3.2.7"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "bb plugin build"
   },
