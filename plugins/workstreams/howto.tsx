@@ -8,6 +8,7 @@ import type { Board, BoardMode } from "./server";
 import { INBOX_SECTION_LABEL, relativeTime } from "./workstreams";
 import { TIER_WORDS } from "./threadmenu";
 import { THREAD_TIERS } from "./threads";
+import { runLabel } from "./runs";
 
 /** The fixed tab's stable reference: the owning nav panel, and this tab. */
 export const HOW_TAB = { panelId: "board", id: "how" } as const;
@@ -163,6 +164,23 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
                 ],
               ]}
             />
+            <p className="pt-1 text-foreground">Recent runs</p>
+            {board.runs.length === 0 ? (
+              <p>No row actions in the last day.</p>
+            ) : (
+              <ul className="space-y-0.5">
+                {board.runs.slice(0, 10).map((run) => (
+                  <li key={run.id} className="flex min-w-0 gap-2">
+                    <span className="w-24 shrink-0 truncate text-foreground" title={run.path}>
+                      {run.path.split("/").filter(Boolean).pop() ?? run.path}
+                    </span>
+                    <span className="min-w-0 truncate" title={runLabel(run, now)}>
+                      {runLabel(run, now)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
             {board.warnings.length === 0 ? null : (
               <ul className="list-disc space-y-1 pl-4 pt-1">
                 {board.warnings.map((warning) => (

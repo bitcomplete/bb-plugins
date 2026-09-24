@@ -473,36 +473,59 @@ async function nameGroups(
   }
 }
 
+/** Inspect checkouts with one gh auth probe and shared per-repo resolvers. */
+async function inspectAll(
+  paths: string[],
+  early: string[],
+  signal: AbortSignal,
+): Promise<{ units: RawUnit[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const warn = (message: string) => {
+    if (warnings.length < MAX_WARNINGS) warnings.push(message.slice(0, 500));
+  };
+  for (const message of early) warn(message);
+
+  // One auth probe per scan: an expired token would otherwise produce one
+  // identical warning per checkout.
+  const auth = await run("gh", ["auth", "status"], ".", GH_TIMEOUT_MS, signal);
+  const ghUsable = auth.ok;
+  if (!ghUsable) {
+    warn(
+      "gh is not authenticated; run `gh auth refresh -h github.com`. Showing local git state only.",
+    );
+  }
+
+  const defaultBranchOf = defaultBranchResolver(signal);
+  const shippedOf = shippedResolver(warn, signal);
+  const units = await mapBounded(paths, async (path) => {
+    try {
+      return await inspect(path, ghUsable, defaultBranchOf, shippedOf, warn, signal);
+    } catch (error) {
+      // One bad checkout must never fail the whole scan.
+      warn(`${path}: ${String(error).slice(0, 200)}`);
+      return null;
+    }
+  });
+
+  return {
+    units: units.filter((unit): unit is RawUnit => unit !== null).slice(0, 2_000),
+    warnings,
+  };
+}
+
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
     scan: async ({ roots }, context) => {
-      const { signal } = context;
-      const warnings: string[] = [];
-      const warn = (message: string) => {
-        if (warnings.length < MAX_WARNINGS) warnings.push(message.slice(0, 500));
-      };
-
-      // One auth probe per scan: an expired token would otherwise produce one
-      // identical warning per checkout.
-      const auth = await run("gh", ["auth", "status"], ".", GH_TIMEOUT_MS, signal);
-      const ghUsable = auth.ok;
-      if (!ghUsable) {
-        warn(
-          "gh is not authenticated; run `gh auth refresh -h github.com`. Showing local git state only.",
-        );
-      }
-
-      const defaultBranchOf = defaultBranchResolver(signal);
-      const shippedOf = shippedResolver(warn, signal);
       const candidates = new Set<string>();
+      const early: string[] = [];
       for (const root of roots) {
         if (await isUnit(root)) candidates.add(root);
         let children: string[];
         try {
           children = await readdir(root);
         } catch (error) {
-          warn(`${root}: unreadable (${String(error).slice(0, 120)})`);
+          early.push(`${root}: unreadable (${String(error).slice(0, 120)})`);
           continue;
         }
         for (const child of children) {
@@ -510,21 +533,12 @@ export default experimental_defineHostEntry({
           if (await isUnit(path)) candidates.add(path);
         }
       }
-
-      const units = await mapBounded([...candidates], async (path) => {
-        try {
-          return await inspect(path, ghUsable, defaultBranchOf, shippedOf, warn, signal);
-        } catch (error) {
-          // One bad checkout must never fail the whole scan.
-          warn(`${path}: ${String(error).slice(0, 200)}`);
-          return null;
-        }
-      });
-
-      return {
-        units: units.filter((unit): unit is RawUnit => unit !== null).slice(0, 2_000),
-        warnings,
-      };
+      return inspectAll([...candidates], early, context.signal);
+    },
+    inspectPaths: async ({ paths }, context) => {
+      const units: string[] = [];
+      for (const path of paths) if (await isUnit(path)) units.push(path);
+      return inspectAll(units, [], context.signal);
     },
     prLive: async ({ prUrl }, context) => {
       const target = prTarget(prUrl);

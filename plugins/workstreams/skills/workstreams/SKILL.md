@@ -309,6 +309,37 @@ pick any mode and thread, and edits the prompt, before anything runs.
 - **Continue** and **Subthread** only accept a thread linked to that row. New
   and sub threads run in the checkout and carry this plugin's thread metadata
   `{ ticket }`, which links them to the cluster as `started`.
+- Every agent prompt ends by asking for a final line starting `Result:` in
+  under 12 words. That line is how the Board reports the outcome.
+
+### Run tracking
+
+Every agent and direct action is recorded as a run (the `action_runs` table,
+the newest 200 and at most 30 days). `list --json` includes `runs`: open runs
+and the last day's, newest first. Nothing polls:
+
+- An agent run's status follows its thread's BB events. `thread.active` →
+  running, `interaction.pending` → needs you, `thread.idle` → done,
+  `thread.failed` → failed, and archive or delete → failed. BB has no
+  interaction-answered event, so a waiting run re-reads that thread's pending
+  interactions when its event sequence advances. The post-scan thread relist
+  catches up any event missed during a reload.
+- A **continue** run shares its thread with earlier work. It ignores that
+  thread's events until the turn it queued starts.
+- On finish, the outcome is the last `Result:` line of the final assistant
+  message (capped at 120 characters), read by code, never a model. With no such
+  line, the row says "Done: see thread".
+- Direct actions record their outcome once: succeeded with a short reason
+  ("Merged", "Branch updated", "Re-requested 2 reviewers and commented"), or
+  failed with the refusal.
+- A finished agent run, or a direct action that succeeded, rescans only that
+  checkout (`inspectPaths` on the host), batched over 3 seconds, so the row
+  moves sections on its own.
+
+The Board shows the row's latest run beside its verb (running, needs you, or
+finished in the last 24 hours), and an **Agents** line at the top while
+anything is running, waiting on you, or finished in the last 4 hours. BB's
+sidebar shows a count beside Workstreams: needs-you first, else running.
 
 ## Views
 

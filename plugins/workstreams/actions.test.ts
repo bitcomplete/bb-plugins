@@ -3,6 +3,7 @@
 // folio, margin, colophon and spine; tickets ABC-/OPS-/WEB-/SHOP-; PRs 42–99.
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_ACTIONS,
   actionPrompt,
   mergeVerdict,
   nudgeComment,
@@ -14,6 +15,7 @@ import {
   type ThreadCandidate,
   type ThreadCapabilities,
 } from "./actions.js";
+import { RESULT_INSTRUCTION } from "./runs.js";
 import { inboxSection, inboxVerb, type InboxUnitFacts } from "./workstreams.js";
 import type { MergeStateStatus } from "./contract.js";
 
@@ -163,23 +165,29 @@ describe("actionPrompt", () => {
     expect(text).toMatch(/^Changes were requested on folio #47 \(Show gift card balance\), branch dev\/abc-101, checkout \/p\/folio-abc-101\. /u);
     expect(text).toContain("Resolve only the threads the pushed code demonstrably addresses.");
     expect(text).toContain("Do not re-request review unless");
-    expect(text).toMatch(/Report back with a summary per thread\.$/u);
+    expect(text).toContain("Report back with a summary per thread.");
   });
 
   it("opens the address-comments prompt with the approval, and ends by forbidding the merge", () => {
     const text = actionPrompt("address-comments", FACTS);
     expect(text.startsWith("folio #47 (Show gift card balance) is approved but has open review comments")).toBe(true);
-    expect(text.endsWith("Do not merge. Report back whether the PR is ready to merge.")).toBe(true);
+    expect(text).toContain("Do not merge. Report back whether the PR is ready to merge.");
   });
 
   it("asks the conflict prompt for an exact --force-with-lease, in the right checkout", () => {
     expect(actionPrompt("resolve-conflicts", FACTS)).toBe(
-      "folio #47 (Show gift card balance) has merge conflicts with its base. In checkout /p/folio-abc-101 on branch dev/abc-101, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it.",
+      "folio #47 (Show gift card balance) has merge conflicts with its base. In checkout /p/folio-abc-101 on branch dev/abc-101, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it. End your final message with a line starting 'Result:' that says what happened in under 12 words.",
     );
   });
 
   it("reuses the existing Fix prompt for CI", () => {
     expect(actionPrompt("investigate-ci", FACTS)).toMatch(/^CI is failing on folio #47/u);
+  });
+
+  it("ends every template with the Result line the Board reads the outcome from, so no action reports back blind", () => {
+    for (const action of AGENT_ACTIONS) {
+      expect(actionPrompt(action, FACTS).endsWith(` ${RESULT_INSTRUCTION}`)).toBe(true);
+    }
   });
 
   it("leaves no placeholder behind in any template", () => {

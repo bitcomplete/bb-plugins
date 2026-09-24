@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { UrlLink, experimental_useSidebarThreads, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
-import type { Board, Prefs, WireGroup, rpcContract } from "./server";
+import type { Board, Prefs, WireGroup, WireRun, rpcContract } from "./server";
 import {
   INBOX_COLLAPSED,
   INBOX_SECTIONS,
@@ -44,6 +44,7 @@ import { toast } from "sonner";
 import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
+import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 
 type Cluster = WireGroup["clusters"][number];
 type Unit = Cluster["units"][number];
@@ -61,6 +62,8 @@ export type Row = {
   title: string;
   /** What the row's `a` key and action button do; null when there is nothing to do. */
   action: PrimaryAction | null;
+  /** The row's latest agent or direct run, while it is still worth reporting. */
+  run: WireRun | null;
 };
 
 /** Every checkout on the board, as rows, grouped and ordered by section. */
@@ -83,6 +86,7 @@ export function inboxRows(board: Board, now: number): Map<InboxSection, Row[]> {
           verb,
           action: primaryAction(unit, section, verb),
           age: stateAge(unit),
+          run: rowRun(board.runs, unit.path, now),
           repo: unit.repo ?? unit.dirName,
           title: unit.pr === null ? (unit.branch ?? unit.dirName) : displayTitle(unit.pr.title),
         });
@@ -182,8 +186,38 @@ export function InboxBoard({
   );
   const openThread = useCallback((id: string) => navigate.toThread(id), [navigate]);
 
+  const runColumn = useMemo(() => [...all.values()].some((rows) => rows.some((row) => row.run !== null)), [all]);
+
   const [starting, setStarting] = useState<Row | null>(null);
   const [request, setRequest] = useState<ActionRequest | null>(null);
+
+  /** Select a row anywhere on the Board: open its section and clear the search first. */
+  const reveal = useCallback(
+    (target: Row) => {
+      setOpen((current) => ({ ...current, [target.section]: true }));
+      setQuery("");
+      setSelectedKey(target.key);
+      onFocusTicket(target.cluster.ticket);
+      requestAnimationFrame(() => document.getElementById(`inbox-${target.key}`)?.scrollIntoView({ block: "nearest" }));
+    },
+    [onFocusTicket],
+  );
+
+  // The Agents strip counts each row's own run, so every count has rows to jump to.
+  const rowRuns = useMemo(() => [...all.values()].flat().filter((row) => row.run !== null), [all]);
+  const strip = useMemo(() => stripCounts(rowRuns.map((row) => row.run!), now), [rowRuns, now]);
+  const jumpIndex = useRef<{ kind: StripKind; index: number } | null>(null);
+  /** Each click on a strip part selects the next row in that state. */
+  const jumpTo = useCallback(
+    (kind: StripKind) => {
+      const matches = rowRuns.filter((row) => STRIP_MATCH[kind](row.run!.status));
+      if (matches.length === 0) return;
+      const index = jumpIndex.current?.kind === kind ? (jumpIndex.current.index + 1) % matches.length : 0;
+      jumpIndex.current = { kind, index };
+      reveal(matches[index]!);
+    },
+    [reveal, rowRuns],
+  );
 
   /**
    * The row's primary action. Direct and agent actions only ever OPEN their
@@ -202,14 +236,10 @@ export function InboxBoard({
           toast.error(`#${action.behind} is not on the board`, { description: "It may live in a checkout outside the scan roots." });
           return;
         }
-        setOpen((current) => ({ ...current, [target.section]: true }));
-        setQuery("");
-        setSelectedKey(target.key);
-        onFocusTicket(target.cluster.ticket);
-        requestAnimationFrame(() => document.getElementById(`inbox-${target.key}`)?.scrollIntoView({ block: "nearest" }));
+        reveal(target);
       }
     },
-    [all, onFocusTicket],
+    [all, reveal],
   );
 
   /**
@@ -316,6 +346,7 @@ export function InboxBoard({
         shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0)}
         total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0)}
       />
+      <AgentsStrip counts={strip} onJump={jumpTo} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pb-10">
           {INBOX_SECTIONS.map((section) => {
@@ -348,6 +379,7 @@ export function InboxBoard({
                           key={row.key}
                           row={row}
                           now={now}
+                          runColumn={runColumn}
                           selected={row.key === selected?.key}
                           threads={threadsOf(row)}
                           onSelect={() => select(row)}
@@ -448,9 +480,74 @@ function RowAction({ label, icon, onClick }: { label: string; icon: string; onCl
   );
 }
 
+/** A run's chip reads its status at a glance; only needs-you borrows the Fix rose. */
+const RUN_TONE: Record<RunStatus, string> = {
+  running: "bg-sky-500/10 text-sky-800 dark:text-sky-300",
+  "needs-you": CHIP.fix,
+  done: "bg-emerald-500/10 text-emerald-800 dark:text-emerald-300",
+  succeeded: "bg-emerald-500/10 text-emerald-800 dark:text-emerald-300",
+  failed: "bg-foreground/[0.05] text-rose-700 dark:text-rose-300",
+};
+
+/** A clock for one chip, so "· 4m" and "2m ago" stay true while the Board is open. */
+function useTick(ms: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), ms);
+    return () => window.clearInterval(timer);
+  }, [ms]);
+  return now;
+}
+
+/**
+ * The row's latest run, beside its verb. An agent run opens its thread; a
+ * direct run has none, so it only explains itself in the tooltip.
+ */
+function RunChip({ run, onOpenThread }: { run: WireRun; onOpenThread: (id: string) => void }) {
+  const now = useTick(30_000);
+  const label = runLabel(run, now);
+  const detail = runDetail(run, (at) => new Date(at).toLocaleString());
+  const threadId = run.threadId;
+  const className = cn(
+    "flex min-w-0 max-w-full items-center gap-1.5 rounded px-1.5 py-0.5 text-[11px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring",
+    RUN_TONE[run.status],
+  );
+  const body = (
+    <>
+      {run.status === "running" ? (
+        // Opacity only, and still under reduced motion.
+        <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current motion-safe:animate-pulse" />
+      ) : null}
+      <span className="truncate">{label}</span>
+    </>
+  );
+  return (
+    <Tip label={threadId === null ? detail : `${detail}\nClick to open the thread`}>
+      {threadId === null ? (
+        <span tabIndex={0} aria-label={`${label}. ${detail}`} className={className}>
+          {body}
+        </span>
+      ) : (
+        <button
+          type="button"
+          aria-label={`${label}. Open the thread`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenThread(threadId);
+          }}
+          className={cn(className, "hover:brightness-95")}
+        >
+          {body}
+        </button>
+      )}
+    </Tip>
+  );
+}
+
 function InboxRow({
   row,
   now,
+  runColumn,
   selected,
   threads,
   onSelect,
@@ -462,6 +559,8 @@ function InboxRow({
 }: {
   row: Row;
   now: number;
+  /** Some row on the Board has a run: every row keeps the column, so the columns stay aligned. */
+  runColumn: boolean;
   selected: boolean;
   threads: readonly ThreadLink[];
   onSelect: () => void;
@@ -492,6 +591,11 @@ function InboxRow({
           </span>
         )}
       </span>
+      {runColumn ? (
+        <span className="flex w-[13rem] shrink-0 items-center">
+          {row.run === null ? null : <RunChip run={row.run} onOpenThread={onOpenThread} />}
+        </span>
+      ) : null}
       <span
         className={cn(
           "w-[6.5rem] shrink-0 truncate text-right font-mono text-[10.5px] tabular-nums",
@@ -556,6 +660,57 @@ function InboxRow({
       </span>
       <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />
     </li>
+  );
+}
+
+// ---- the Agents strip ----------------------------------------------------------
+
+type StripKind = "running" | "needs-you" | "done" | "failed";
+
+const STRIP_MATCH: Record<StripKind, (status: RunStatus) => boolean> = {
+  running: (status) => status === "running",
+  "needs-you": (status) => status === "needs-you",
+  done: (status) => status === "done" || status === "succeeded",
+  failed: (status) => status === "failed",
+};
+
+/**
+ * One quiet line, only while agents are working, waiting on you, or finished
+ * in the last few hours. Each part jumps to the next row in that state.
+ */
+function AgentsStrip({ counts, onJump }: { counts: StripCounts; onJump: (kind: StripKind) => void }) {
+  if (!counts.show) return null;
+  const parts = (
+    [
+      ["running", counts.running, `${counts.running} running`],
+      ["needs-you", counts.needsYou, `${counts.needsYou} needs you`],
+      ["done", counts.doneToday, `${counts.doneToday} done today`],
+      ["failed", counts.failedToday, `${counts.failedToday} failed today`],
+    ] as const
+  ).filter(([, count]) => count > 0);
+  if (parts.length === 0) return null;
+  return (
+    <div className="shrink-0 border-b border-border/60">
+      <div role="status" aria-label="Agents" className="mx-auto flex w-full max-w-6xl items-center gap-1 px-4 py-1.5 text-[11.5px] text-muted-foreground">
+        <span className="pr-1 font-medium text-foreground/80">Agents</span>
+        {parts.map(([kind, , label], index) => (
+          <span key={kind} className="flex items-center gap-1">
+            {index === 0 ? null : <span aria-hidden>·</span>}
+            <button
+              type="button"
+              onClick={() => onJump(kind)}
+              aria-label={`${label}: go to the next one`}
+              className={cn(
+                "rounded px-1 outline-none hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+                kind === "needs-you" && "font-medium text-rose-700 dark:text-rose-300",
+              )}
+            >
+              {label}
+            </button>
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 

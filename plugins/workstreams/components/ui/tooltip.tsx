@@ -22,7 +22,7 @@ export function Tip({
             side={side}
             sideOffset={6}
             collisionPadding={8}
-            className="z-[60] max-w-64 rounded-md bg-foreground px-2 py-1 text-[11px] leading-snug text-background shadow-sm"
+            className="z-[60] max-w-64 whitespace-pre-line rounded-md bg-foreground px-2 py-1 text-[11px] leading-snug text-background shadow-sm"
           >
             {label}
           </TooltipPrimitive.Content>

@@ -200,6 +200,19 @@ export const hostContract = defineRpcContract({
       .strict(),
   },
   /**
+   * Re-inspect named checkouts only: a finished row action rescans the row it
+   * touched, not every root. A path that is no longer a checkout is left out.
+   */
+  inspectPaths: {
+    input: z.object({ paths: z.array(z.string().max(1_000)).max(20) }).strict(),
+    output: z
+      .object({
+        units: z.array(rawUnitSchema).max(20),
+        warnings: z.array(z.string().max(500)).max(50),
+      })
+      .strict(),
+  },
+  /**
    * Rename efforts with Claude. It lives on the host because the host artifact
    * bundles its pure-JS dependencies, and `@anthropic-ai/sdk` is one.
    */

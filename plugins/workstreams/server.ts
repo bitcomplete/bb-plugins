@@ -79,12 +79,15 @@ import {
   startedForOf,
 } from "./threads.js";
 import { startThread } from "./spawn.js";
-import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type MergeMethod } from "./actions.js";
+import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type DirectAction, type MergeMethod } from "./actions.js";
 import { planAgent, runAgent, type AgentSdk } from "./agent.js";
-import { executeMerge } from "./direct.js";
+import { executeMerge, type WriteResult } from "./direct.js";
 import { prTarget } from "./ghactions.js";
 import { trackTransitions, toLifecycle, unitLifecycle, type Transition } from "./workstreams.js";
 import { TypeSafeClient, choice, score } from "@typesafe-ai/sdk";
+import { RUNS_MIGRATION, createRunStore } from "./runstore.js";
+import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } from "./runs.js";
+import { createRescanQueue } from "./rescan.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
 const LINEAR_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -92,6 +95,10 @@ const LINEAR_BATCH = 25;
 const SCAN_TIMEOUT_MS = 10 * 60 * 1_000;
 const NAMING_TIMEOUT_MS = 5 * 60 * 1_000;
 const BOARD_CHANGED = "board-changed";
+/** Several runs finishing together share one targeted rescan. */
+const RESCAN_DELAY_MS = 3_000;
+/** More paths than this in one batch: rescan everything instead. */
+const TARGETED_MAX = 8;
 
 const lifecycleSchema = z.enum(LIFECYCLES);
 const stalenessSchema = z.enum(STALENESS);
@@ -161,6 +168,23 @@ const groupSchema = z.object({
   surfaces: z.array(z.string()),
   risk: riskSchema,
 });
+/** One agent or direct row action, and how it went. See runs.ts. */
+const runSchema = z.object({
+  id: z.number(),
+  kind: z.enum(["agent", "direct"]),
+  action: z.string(),
+  path: z.string(),
+  ticket: z.string().nullable(),
+  prUrl: z.string().nullable(),
+  prNumber: z.number().nullable(),
+  threadId: z.string().nullable(),
+  mode: z.enum(["continue", "subthread", "new"]).nullable(),
+  startedAt: z.number(),
+  status: z.enum(RUN_STATUSES),
+  finishedAt: z.number().nullable(),
+  result: z.string().nullable(),
+  error: z.string().nullable(),
+});
 /** Which model keys are in play. Reported so the board never lies about it. */
 const modeSchema = z.enum(["basic", "jev", "jev+claude"]);
 /** The last enrichment's model use, so model cost is visible on the board. */
@@ -201,6 +225,8 @@ const boardSchema = z.object({
   }),
   /** For the How-this-works panel: how often the board refreshes, and what the last enrichment cost. */
   health: z.object({ refreshMinutes: z.number(), enrichment: enrichmentSchema.nullable() }),
+  /** Open runs and the last day's, newest first: what the rows, the Agents strip and How this works report. */
+  runs: z.array(runSchema),
 });
 
 /** What the lens control remembers across a reload. */
@@ -282,6 +308,7 @@ export const rpcContract = defineRpcContract({
     input: z
       .object({
         path: z.string().max(1_000),
+        action: z.enum(AGENT_ACTIONS),
         mode: threadModeSchema,
         threadId: z.string().max(200).nullable(),
         prompt: z.string().max(8_000),
@@ -292,6 +319,8 @@ export const rpcContract = defineRpcContract({
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
   },
+  /** Open runs only: the sidebar badge's cheap read. */
+  runs_open: { input: z.null(), output: z.array(runSchema) },
   board_refresh: {
     input: z.null(),
     output: z.object({ started: z.boolean() }),
@@ -315,6 +344,7 @@ export type Board = z.infer<typeof boardSchema>;
 export type BoardMode = z.infer<typeof modeSchema>;
 export type Prefs = z.infer<typeof prefsSchema>;
 export type WireGroup = z.infer<typeof groupSchema>;
+export type WireRun = z.infer<typeof runSchema>;
 
 function mergeMethodOf(value: string): MergeMethod {
   return (MERGE_METHODS as readonly string[]).includes(value) ? (value as MergeMethod) : "squash";
@@ -431,7 +461,10 @@ export default async function plugin(bb: BbPluginApi) {
     // null until a change is observed: the first scan cannot know how long a
     // PR had already been red. See `trackTransitions`.
     `CREATE TABLE IF NOT EXISTS unit_transitions (path TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, entered_at INTEGER)`,
+    // One row per agent or direct row action; bounded, pruned on write. See runstore.ts.
+    RUNS_MIGRATION,
   ]);
+  const runs = createRunStore(db);
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
 
@@ -1092,6 +1125,7 @@ export default async function plugin(bb: BbPluginApi) {
         refreshMinutes: (await settings.get()).refreshMinutes,
         enrichment: enrichmentSchema.nullable().catch(null).parse((await bb.storage.kv.get<unknown>("lastEnrichment")) ?? null),
       },
+      runs: runs.recent(Date.now() - ROW_RUN_MS),
     };
   }
 
@@ -1246,6 +1280,7 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `threads: ${rows.length} listed, ${refreshed.read} event logs read, ${refreshed.reused} unchanged, ${refreshed.failed} skipped`,
       );
+      reconcileRuns(rows);
       announceThreads();
     } catch (error) {
       bb.log.warn(`thread sync failed: ${String(error).slice(0, 300)}`);
@@ -1298,23 +1333,125 @@ export default async function plugin(bb: BbPluginApi) {
     onThreadChanged(thread, false).catch(onThreadError);
   });
   bb.events.on("thread.active", ({ thread }) => {
+    signalRuns(thread.id, { kind: "active" });
     onThreadChanged(thread, false).catch(onThreadError);
   });
-  bb.events.on("thread.idle", ({ thread }) => {
+  bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
+    signalRuns(thread.id, { kind: "idle", text: lastAssistantText });
     onThreadChanged(thread, true).catch(onThreadError);
   });
-  bb.events.on("thread.failed", ({ thread }) => {
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    signalRuns(thread.id, { kind: "failed", text: null, error });
     onThreadChanged(thread, true).catch(onThreadError);
   });
   bb.events.on("thread.unarchived", ({ thread }) => {
     onThreadChanged(thread, true).catch(onThreadError);
   });
   bb.events.on("thread.archived", ({ thread }) => {
+    signalRuns(thread.id, { kind: "gone", reason: "Thread archived" });
     if (threadFacts.delete(thread.id)) announceThreads();
   });
   bb.events.on("thread.deleted", ({ thread }) => {
+    signalRuns(thread.id, { kind: "gone", reason: "Thread deleted" });
     if (threadFacts.delete(thread.id)) announceThreads();
   });
+  // A pending interaction IS an event: the agent is waiting on the user.
+  bb.events.on("interaction.pending", ({ thread }) => {
+    signalRuns(thread.id, { kind: "pending" });
+  });
+  // There is no "interaction answered" event, and the event DTO carries no
+  // pending flag. The thread's event sequence does advance when the user
+  // answers, so a waiting run re-reads that one thread's interactions then.
+  // Core coalesces this to at most once a second per thread; no polling.
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    if (thread.status !== "active" || !runs.openIn(thread.id).some((run) => run.status === "needs-you")) return;
+    bb.sdk.threads.interactions.list({ threadId: thread.id }).then(
+      (pending) => {
+        if (pending.length === 0) signalRuns(thread.id, { kind: "settled" });
+      },
+      (error: unknown) => bb.log.warn(`thread ${thread.id}: interaction read failed: ${String(error).slice(0, 200)}`),
+    );
+  });
+
+  // ---- run tracking: status from thread events, never a polling loop -------
+
+  let targeting = false;
+
+  /** Re-inspect just these checkouts and replace their rows; the rest of the board is untouched. */
+  async function rescanPaths(paths: string[]): Promise<boolean> {
+    if (scanning || targeting) return false;
+    if (paths.length > TARGETED_MAX) {
+      await scan();
+      return true;
+    }
+    const hostId = (await bb.sdk.system.config()).primaryHostId;
+    if (hostId === null) return true;
+    targeting = true;
+    try {
+      const result = await host.call("inspectPaths", { paths }, { hostId, timeoutMs: SCAN_TIMEOUT_MS });
+      const insert = db.prepare(`INSERT OR REPLACE INTO units (path, unit) VALUES (?, ?)`);
+      const remove = db.prepare(`DELETE FROM units WHERE path = ?`);
+      db.transaction(() => {
+        // A path the host no longer sees as a checkout leaves the board, as a full scan would drop it.
+        for (const path of paths) remove.run(path);
+        for (const unit of result.units) insert.run(unit.path, JSON.stringify(unit));
+      })();
+      recordTransitions(readUnits());
+      for (const warning of result.warnings) bb.log.warn(`rescan: ${warning}`);
+      bb.log.info(`rescanned ${paths.length} checkout(s) after row actions finished`);
+    } catch (error) {
+      bb.log.warn(`targeted rescan failed: ${String(error).slice(0, 300)}`);
+    } finally {
+      targeting = false;
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+    }
+    return true;
+  }
+
+  const rescans = createRescanQueue({
+    delayMs: RESCAN_DELAY_MS,
+    rescan: rescanPaths,
+    onError: (error) => bb.log.warn(`rescan queue: ${String(error).slice(0, 300)}`),
+  });
+  bb.onDispose(() => rescans.dispose());
+
+  /** Runs changed: open views refetch, and a finished run rescans the row it touched. */
+  function runsChanged(changed: readonly Run[]): void {
+    if (changed.length === 0) return;
+    for (const run of changed) {
+      const finished = run.kind === "agent" ? run.status === "done" || run.status === "failed" : run.status === "succeeded";
+      if (finished) rescans.add(run.path);
+      bb.log.info(`run ${run.id} (${run.action}) ${run.status}${run.result === null ? "" : `: ${run.result}`}`);
+    }
+    announceThreads();
+  }
+
+  /** Feed one thread signal to the runs in that thread. Cheap when there are none. */
+  function signalRuns(threadId: string, signal: ThreadSignal): void {
+    if (runs.openIn(threadId).length === 0) return;
+    runs
+      .signal(threadId, signal, async () => (await bb.sdk.threads.output({ threadId })).output)
+      .then(runsChanged, (error: unknown) => bb.log.warn(`run update failed: ${String(error).slice(0, 300)}`));
+  }
+
+  /**
+   * After each thread relist: catch up runs whose events were missed (a plugin
+   * reload mid-run). A finish is only trusted for runs over two minutes old, so
+   * a thread listed just before its first turn is not read as done.
+   */
+  function reconcileRuns(rows: readonly { id: string; status: string; hasPendingInteraction: boolean }[]): void {
+    const open = new Set(runs.openThreadIds());
+    const settledBefore = Date.now() - 2 * 60_000;
+    for (const row of rows) {
+      if (!open.has(row.id)) continue;
+      if (row.hasPendingInteraction) signalRuns(row.id, { kind: "pending" });
+      else if (row.status === "active") signalRuns(row.id, { kind: "settled" });
+      else if (runs.openIn(row.id).every((run) => run.startedAt < settledBefore)) {
+        if (row.status === "idle") signalRuns(row.id, { kind: "idle", text: null });
+        else if (row.status === "error") signalRuns(row.id, { kind: "failed", text: null, error: null });
+      }
+    }
+  }
 
   // ---- enrichment: the only place model calls happen --------------------
 
@@ -1660,15 +1797,36 @@ export default async function plugin(bb: BbPluginApi) {
     },
   };
 
-  /** After a write that moves the row, rescan so the Board shows where it went. */
-  function rescanAfter(result: { ok: boolean }, what: string): void {
-    if (!result.ok) return;
-    bb.log.info(`row action: ${what}`);
-    void scan();
+  /** Where a run points: the row's ticket and PR from the last scan. */
+  async function runTarget(path: string) {
+    const found = await scannedUnit(path);
+    const pr = found?.raw.pr ?? null;
+    return { path, ticket: found?.ticket ?? null, prUrl: pr?.url ?? null, prNumber: pr?.number ?? null };
+  }
+
+  /**
+   * Run a direct action and record its outcome. A success rescans the row (see
+   * `runsChanged`), so the Board shows where it went.
+   */
+  async function directRun(path: string, action: DirectAction, act: () => Promise<WriteResult>): Promise<WriteResult> {
+    const startedAt = Date.now();
+    const record = async (outcome: WriteResult) =>
+      runsChanged([runs.recordDirect({ ...(await runTarget(path)), action, startedAt, ...directOutcome(action, outcome) })]);
+    let result: WriteResult;
+    try {
+      result = await act();
+    } catch (error) {
+      await record({ ok: false, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+    await record(result);
+    return result;
   }
 
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    // Nothing starts after the end of time, so this is exactly the open runs.
+    runs_open: () => runs.recent(Number.MAX_SAFE_INTEGER),
     prefs_get: () => readPrefs(),
     prefs_set: async (next) => {
       await bb.storage.kv.set("prefs", next);
@@ -1713,49 +1871,57 @@ export default async function plugin(bb: BbPluginApi) {
         deleteBranch: shouldDeleteBranch(deleteBranchOnMerge, read.live.stackedAbove),
       };
     },
-    action_merge: async ({ path, sha, acknowledgeUnresolved }) => {
-      const target = await actionable(path);
-      if (!target.ok) return target;
-      const { mergeMethod, deleteBranchOnMerge } = await settings.get();
-      const result = await executeMerge(
-        { live: liveOf(target.hostId), write: writeOf(target.hostId) },
-        { prUrl: target.prUrl, sha, acknowledgeUnresolved, method: mergeMethodOf(mergeMethod), deleteBranchSetting: deleteBranchOnMerge },
-      );
-      rescanAfter(result, `merged ${target.prUrl}`);
-      return result;
-    },
-    action_update_branch: async ({ path }) => {
-      const target = await actionable(path);
-      if (!target.ok) return target;
-      const result = await writeOf(target.hostId)({ kind: "update-branch", prUrl: target.prUrl });
-      rescanAfter(result, `updated the branch of ${target.prUrl}`);
-      return result;
-    },
-    action_nudge: async ({ path, rerequest, comment }) => {
-      const target = await actionable(path);
-      if (!target.ok) return target;
-      const reviewers = rerequest ? (target.raw.pr?.reviewRequests ?? []) : [];
-      if (rerequest && reviewers.length === 0) return { ok: false as const, error: "No reviewers are pending on this PR to re-request." };
-      const result = await writeOf(target.hostId)({ kind: "nudge", prUrl: target.prUrl, reviewers, comment });
-      if (result.ok) bb.log.info(`row action: nudged ${target.prUrl}`);
-      return result;
-    },
+    action_merge: ({ path, sha, acknowledgeUnresolved }) =>
+      directRun(path, "merge", async () => {
+        const target = await actionable(path);
+        if (!target.ok) return target;
+        const { mergeMethod, deleteBranchOnMerge } = await settings.get();
+        return executeMerge(
+          { live: liveOf(target.hostId), write: writeOf(target.hostId) },
+          { prUrl: target.prUrl, sha, acknowledgeUnresolved, method: mergeMethodOf(mergeMethod), deleteBranchSetting: deleteBranchOnMerge },
+        );
+      }),
+    action_update_branch: ({ path }) =>
+      directRun(path, "update-branch", async () => {
+        const target = await actionable(path);
+        if (!target.ok) return target;
+        return writeOf(target.hostId)({ kind: "update-branch", prUrl: target.prUrl });
+      }),
+    action_nudge: ({ path, rerequest, comment }) =>
+      directRun(path, "nudge", async () => {
+        const target = await actionable(path);
+        if (!target.ok) return target;
+        const reviewers = rerequest ? (target.raw.pr?.reviewRequests ?? []) : [];
+        if (rerequest && reviewers.length === 0) return { ok: false as const, error: "No reviewers are pending on this PR to re-request." };
+        return writeOf(target.hostId)({ kind: "nudge", prUrl: target.prUrl, reviewers, comment });
+      }),
     agent_plan: async ({ path, action }) => {
       if ((await scannedUnit(path)) === undefined) {
         return { ok: false as const, error: "That checkout is not on the board any more. Rescan and try again." };
       }
       return { ok: true as const, ...(await planAgent(agentSdk, action, await linkedThreads(path))) };
     },
-    agent_run: async ({ path, mode, threadId, prompt }) => {
+    agent_run: async ({ path, action, mode, threadId, prompt }) => {
       const found = await scannedUnit(path);
       const linked = (await linkedThreads(path)).map((thread) => thread.id);
-      const result = await runAgent(agentSdk, {
-        unit: found === undefined ? undefined : { path: found.raw.path, ticket: found.ticket },
-        mode,
-        threadId,
-        prompt,
-        linked,
-      });
+      // Recorded before launch: a continue run's turn can start before send()
+      // returns, and its first event must find the run. Dropped if nothing ran.
+      const runId = runs.begin({ ...(await runTarget(path)), action, mode, threadId: mode === "continue" ? threadId : null });
+      let result: Awaited<ReturnType<typeof runAgent>>;
+      try {
+        result = await runAgent(agentSdk, {
+          unit: found === undefined ? undefined : { path: found.raw.path, ticket: found.ticket },
+          mode,
+          threadId,
+          prompt,
+          linked,
+        });
+      } catch (error) {
+        runs.discard(runId);
+        throw error;
+      }
+      if (!result.ok) runs.discard(runId);
+      else runs.attach(runId, result.threadId);
       if (result.ok) {
         // A new or sub thread is linked at once through the metadata it was seeded with.
         if (mode !== "continue") startedFor.set(result.threadId, result.ticket);

@@ -5,6 +5,7 @@
 import type { MergeStateStatus } from "./contract.js";
 import { threadPrompt, waitingBehind, type InboxSection, type InboxUnitFacts, type PromptFacts } from "./workstreams.js";
 import type { ThreadTier } from "./threads.js";
+import { RESULT_INSTRUCTION } from "./runs.js";
 
 /** Actions that need judgement, so they go to an agent thread. */
 export const AGENT_ACTIONS = ["investigate-ci", "resolve-conflicts", "address-review", "address-comments"] as const;
@@ -178,8 +179,16 @@ const REVIEW_STEPS =
   "Resolve only the threads the pushed code demonstrably addresses. " +
   "Do not re-request review unless your change is materially riskier than what was reviewed.";
 
-/** The editable prompt an agent action starts from. Every field is substituted. */
+/**
+ * The editable prompt an agent action starts from. Every field is substituted,
+ * and every template ends by asking for a Result line, which is how the Board
+ * reports the outcome without a model call (see `extractResult`).
+ */
 export function actionPrompt(action: AgentAction, facts: PromptFacts): string {
+  return `${actionBody(action, facts)} ${RESULT_INSTRUCTION}`;
+}
+
+function actionBody(action: AgentAction, facts: PromptFacts): string {
   const { pr, branch } = where(facts);
   switch (action) {
     case "investigate-ci":

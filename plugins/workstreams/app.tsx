@@ -15,7 +15,8 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { Board, Prefs, WireGroup, rpcContract } from "./server";
+import type { Board, Prefs, WireGroup, WireRun, rpcContract } from "./server";
+import { badgeValue } from "./runs";
 import { groupChildren, relativeTime, type Lens, type Lifecycle } from "./workstreams";
 import { HOW_TAB, HowThisWorks } from "./howto";
 import { EASE_CSS } from "./layout";
@@ -452,6 +453,39 @@ function HowThisWorksTab() {
   );
 }
 
+/**
+ * The count beside "Workstreams" in BB's sidebar: agents waiting on you first
+ * (rose), else agents running. Nothing at zero. Refetches on the same signal
+ * the Board does, so it never polls.
+ */
+function RunsBadge() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [open, setOpen] = useState<WireRun[]>([]);
+  const refetch = useCallback(() => {
+    rpc.call("runs_open").then(setOpen, () => {});
+  }, [rpc]);
+  useEffect(refetch, [refetch]);
+  useRealtime("board-changed", refetch);
+  const badge = badgeValue(open);
+  if (badge === null) return null;
+  const label = badge.needsYou
+    ? `${badge.count} ${badge.count === 1 ? "agent needs" : "agents need"} you`
+    : `${badge.count} ${badge.count === 1 ? "agent" : "agents"} running`;
+  return (
+    <span
+      role="status"
+      aria-label={label}
+      title={label}
+      className={cn(
+        "rounded-full px-1.5 font-mono text-[10.5px] leading-4 tabular-nums",
+        badge.needsYou ? "bg-rose-500/15 text-rose-700 dark:text-rose-300" : "bg-foreground/[0.07] text-muted-foreground",
+      )}
+    >
+      {badge.count}
+    </span>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "board",
@@ -460,5 +494,6 @@ export default definePluginApp((app) => {
     path: "board",
     component: WorkstreamsPage,
     fixedTabs: [{ ...HOW_TAB, title: "How this works", icon: "Info", component: HowThisWorksTab, layout: "padded" }],
+    experimental_sidebarAccessory: RunsBadge,
   });
 });

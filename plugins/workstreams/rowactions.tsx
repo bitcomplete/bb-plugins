@@ -527,6 +527,7 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
     try {
       const result = await rpc.call("agent_run", {
         path: request.row.unit.path,
+        action: request.action,
         mode,
         threadId: mode === "new" ? null : threadId,
         prompt,
