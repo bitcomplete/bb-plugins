@@ -61,6 +61,14 @@ via agent** action starts a BB thread only when you confirm it.
   merge, branch update, and reviewer nudge actions ask for confirmation. CI,
   conflict, and review work starts a dedicated agent thread after you review
   its prompt.
+- **Dispatch:** Choose one effort in the Board, use **Shadow preview** to see
+  the next eligible PR repair, then explicitly enable **Auto**. Auto starts one
+  agent at a time for failing CI, merge conflicts, or review feedback. The
+  agent works locally and is instructed to ask before pushing or replying on
+  GitHub. Workstreams checks the PR again before it calls a transition
+  verified. An unresolved gate pauses further dispatch until a fresh scan
+  confirms it cleared. **Off** stops new dispatches; it does not cancel an
+  agent already running. Auto never merges or deploys.
 - **How this works:** Open the ⓘ panel for state definitions, shortcuts, scan
   health, and warnings.
 
@@ -71,6 +79,9 @@ manual effort name; `bb workstreams ungroup <TICKET>` removes it.
 The internal `shipped` state means a merged commit appears in a local release
 tag. It does not establish that the change reached production. When a repository
 has no usable release tags, merged work remains `merged` and the board warns.
+Dispatch currently starts from existing PRs with a scanned checkout. It does
+not create PRs from issues or checkouts, request review, or merge; those steps
+remain Board actions. Its workflow ends when GitHub reports the PR merged.
 
 ## Develop
 

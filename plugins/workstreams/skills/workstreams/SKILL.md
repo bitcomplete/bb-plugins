@@ -363,6 +363,28 @@ or finished in the last 24 hours), and an **Agents** line at the top while
 anything is running, waiting on you, or finished in the last 4 hours. BB's
 sidebar shows a count beside Workstreams: needs-you first, else running.
 
+### Automatic dispatch pilot
+
+The Board can focus one effort for automatic PR repair. **Off** is the default.
+**Shadow preview** shows the next candidate without starting a thread. **Auto**
+starts at most one repair thread at a time for failing CI, merge conflicts, or
+review feedback in that effort. It skips dirty or unverified checkouts, stacked
+PRs blocked below, duplicate checkouts for a PR, and items with active work.
+The agent uses the BB project's default harness and is instructed to repair
+locally, test, and ask before a push or GitHub reply. The dispatcher itself
+does not write to GitHub, merge, or deploy.
+
+Each launch has a durable attempt record. Before launch, Workstreams inspects
+the PR again. After the agent finishes, a fresh scan must confirm that the
+specific gate cleared before the attempt reads **Verified**. An agent's
+`Result:` line alone is not proof. If the gate remains or inspection fails,
+the attempt reads **Needs you** and blocks further automatic launches until
+a later fresh scan confirms progress. **Off** stops future launches but does
+not cancel an already running thread. Workstreams never retries an unchanged
+attempt automatically. GitHub reporting the PR merged is the workflow's end;
+issue intake, PR creation, review requests, and merging remain manual Board
+steps in this pilot.
+
 ## Views
 
 The panel opens on the last view you used in this browser, or the **Map** on

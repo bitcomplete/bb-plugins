@@ -107,6 +107,7 @@ import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearage
 import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 import { TICKET_SOURCES, linkbacksDue, ticketFinder, type LinkbackCheck, type TicketFacts } from "./tickets.js";
+import { DISPATCH_MIGRATIONS, createDispatchStore, selectCandidate, gateStillOpen, type DispatchState } from "./dispatch.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
 const SCAN_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -251,6 +252,14 @@ const boardSchema = z.object({
   health: z.object({ refreshMinutes: z.number(), enrichment: enrichmentSchema.nullable() }),
   /** Open runs and the last day's, newest first: what the rows, the Agents strip and How this works report. */
   runs: z.array(runSchema),
+  dispatch: z.object({
+    mode: z.enum(["off", "shadow", "auto"]),
+    effortKey: z.string().nullable(),
+    candidate: z.object({ path: z.string(), prUrl: z.string(), action: z.enum(AGENT_ACTIONS), reason: z.string() }).nullable(),
+    attempts: z.array(z.object({ id: z.number(), path: z.string(), prUrl: z.string(), action: z.string(),
+      status: z.enum(["launching", "running", "verifying", "verified", "needs-you", "failed"]),
+      detail: z.string(), threadId: z.string().nullable(), startedAt: z.number() })),
+  }),
 });
 
 /** What the lens control remembers across a reload. */
@@ -275,6 +284,10 @@ const threadModeSchema = z.enum(["continue", "subthread", "new"]);
 
 export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
+  dispatch_set: {
+    input: z.object({ mode: z.enum(["off", "shadow", "auto"]), effortKey: z.string().nullable() }).strict(),
+    output: boardSchema.shape.dispatch,
+  },
   /** Read-only: re-read the PR live for the merge dialog. */
   action_merge_preview: {
     input: pathInput,
@@ -526,8 +539,11 @@ export default async function plugin(bb: BbPluginApi) {
     // when it was read. `final` marks a PR that was merged or closed when read:
     // never read again. Comment text is never stored.
     `CREATE TABLE IF NOT EXISTS pr_linkbacks (url TEXT PRIMARY KEY, ticket TEXT, checked_at INTEGER NOT NULL, final INTEGER NOT NULL)`,
+    ...DISPATCH_MIGRATIONS,
   ]);
   const runs = createRunStore(db);
+  const dispatch = createDispatchStore(db);
+  dispatch.closeStranded();
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
 
@@ -712,10 +728,12 @@ export default async function plugin(bb: BbPluginApi) {
 
       await bb.storage.kv.set("lastScanAt", new Date().toISOString());
       await bb.storage.kv.set("warnings", warnings.slice(0, 50));
+      recoverDispatch();
       bb.log.info(`scanned ${result.units.length} units across ${roots.length} roots`);
       // After the scan, never inside it: a slow thread log must not hold the
       // board, and a failed one must not fail the scan.
       void syncThreads();
+      queueMicrotask(() => void dispatchOne());
       return true;
     } catch (error) {
       // A reload killing the scan is a cancellation: no error, no warning.
@@ -1227,6 +1245,11 @@ export default async function plugin(bb: BbPluginApi) {
         ),
       })),
     }));
+    const dispatchPolicy = dispatch.policy();
+    const dispatchAttempts = dispatch.attempts();
+    const dispatchPaused = dispatchAttempts.some((attempt) =>
+      attempt.status === "launching" || attempt.status === "running" || attempt.status === "verifying" || attempt.status === "needs-you");
+    const dispatchChoice = dispatchPaused ? null : selectCandidate(wired, dispatchPolicy.effort_key, dispatchAttempts, runs.recent(Number.MAX_SAFE_INTEGER));
     return {
       groups: wired,
       depth: hierarchyDepth(groups),
@@ -1245,6 +1268,12 @@ export default async function plugin(bb: BbPluginApi) {
         enrichment: enrichmentSchema.nullable().catch(null).parse((await bb.storage.kv.get<unknown>("lastEnrichment")) ?? null),
       },
       runs: runs.recent(Date.now() - ROW_RUN_MS),
+      dispatch: {
+        mode: dispatchPolicy.mode,
+        effortKey: dispatchPolicy.effort_key,
+        candidate: dispatchPolicy.mode === "off" ? null : dispatchChoice?.candidate ?? null,
+        attempts: dispatchAttempts.slice(0, 50).map(({ fingerprint: _fingerprint, ...attempt }) => attempt),
+      },
     };
   }
 
@@ -1522,11 +1551,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function rescanPaths(paths: string[]): Promise<boolean> {
     if (scanning || targeting) return false;
     if (paths.length > TARGETED_MAX) {
-      await scan();
-      return true;
+      return scan();
     }
     const hostId = (await bb.sdk.system.config()).primaryHostId;
-    if (hostId === null) return true;
+    if (hostId === null) return false;
     targeting = true;
     try {
       const result = await host.call("inspectPaths", { paths }, { hostId, timeoutMs: SCAN_TIMEOUT_MS });
@@ -1540,13 +1568,14 @@ export default async function plugin(bb: BbPluginApi) {
       recordTransitions(readUnits());
       for (const warning of result.warnings) bb.log.warn(`rescan: ${warning}`);
       bb.log.info(`rescanned ${paths.length} checkout(s) after row actions finished`);
+      return true;
     } catch (error) {
       bb.log.warn(`targeted rescan failed: ${String(error).slice(0, 300)}`);
+      return false;
     } finally {
       targeting = false;
       bb.realtime.publish(BOARD_CHANGED, { scanning });
     }
-    return true;
   }
 
   const rescans = createRescanQueue({
@@ -1565,6 +1594,14 @@ export default async function plugin(bb: BbPluginApi) {
         // Not a row: nothing to rescan. Its answer is read and stored instead.
         if (run.status === "done") void settleLinearFetch(run);
         else if (run.status === "failed") void forgetLinearFetch(run.id);
+      } else if (run.threadId !== null && dispatch.byThread(run.threadId) !== undefined) {
+        const attempt = dispatch.byThread(run.threadId)!;
+        if (run.status === "done") {
+          dispatch.update(attempt.id, "verifying", "Checking the PR with a fresh scan");
+          void verifyDispatch(attempt.id, attempt.path, attempt.prUrl, attempt.action);
+        } else if (run.status === "failed") dispatch.update(attempt.id, "failed", run.error ?? "Agent thread failed");
+        else if (run.status === "needs-you") dispatch.update(attempt.id, "needs-you", "Agent needs your decision");
+        else if (run.status === "running" && attempt.status === "needs-you") dispatch.update(attempt.id, "running", "Agent resumed");
       } else if (finished) rescans.add(run.path);
       bb.log.info(`run ${run.id} (${run.action}) ${run.status}${run.result === null ? "" : `: ${run.result}`}`);
     }
@@ -2077,6 +2114,146 @@ export default async function plugin(bb: BbPluginApi) {
     },
   };
 
+  function recoverDispatch(): void {
+    const units = readUnits();
+    for (const attempt of dispatch.attempts()) {
+      if (attempt.status !== "needs-you") continue;
+      if (attempt.threadId !== null && runs.openIn(attempt.threadId).length > 0) continue;
+      const unit = units.find((entry) => entry.path === attempt.path && entry.pr?.url === attempt.prUrl);
+      if (unit?.observed?.status === true && unit.observed.pr === true && unit.pr !== null) {
+        if (unit.pr.state === "MERGED") dispatch.update(attempt.id, "verified", "Fresh scan confirms GitHub reports this PR merged");
+        else if (unit.pr.state === "OPEN" && !gateStillOpen(unit.pr, attempt.action)) {
+          dispatch.update(attempt.id, "verified", "Fresh scan confirms the PR gate cleared");
+        }
+      }
+    }
+  }
+
+  const verificationTimers = new Set<ReturnType<typeof setTimeout>>();
+  bb.onDispose(() => {
+    for (const timer of verificationTimers) clearTimeout(timer);
+    verificationTimers.clear();
+  });
+  function retryVerification(id: number, path: string, prUrl: string, action: string, retries: number): void {
+    if (disposal.signal.aborted || dispatch.status(id) !== "verifying") return;
+    if (retries >= 10) {
+      dispatch.finishVerification(id, "needs-you", "Fresh PR inspection stayed busy; refresh the board and inspect this attempt");
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+      return;
+    }
+    const timer = setTimeout(() => {
+      verificationTimers.delete(timer);
+      void verifyDispatch(id, path, prUrl, action, retries + 1);
+    }, RESCAN_DELAY_MS);
+    verificationTimers.add(timer);
+  }
+  async function verifyDispatch(id: number, path: string, prUrl: string, action: string, retries = 0): Promise<void> {
+    if (disposal.signal.aborted || dispatch.status(id) !== "verifying") return;
+    if (scanning || targeting) {
+      retryVerification(id, path, prUrl, action, retries);
+      return;
+    }
+    const scanned = await rescanPaths([path]);
+    if (disposal.signal.aborted || dispatch.status(id) !== "verifying") return;
+    if (!scanned && (scanning || targeting)) {
+      retryVerification(id, path, prUrl, action, retries);
+      return;
+    }
+    const unit = scanned ? readUnits().find((entry) => entry.path === path && entry.pr?.url === prUrl) : undefined;
+    if (unit === undefined || unit.observed?.status !== true || unit.observed?.pr !== true || unit.pr === null) {
+      dispatch.finishVerification(id, "needs-you", "Fresh PR inspection failed; check the agent thread and refresh the board");
+    } else if (unit.pr.state === "MERGED") {
+      dispatch.finishVerification(id, "verified", "Fresh scan confirms GitHub reports this PR merged");
+    } else if (unit.pr.state !== "OPEN") {
+      dispatch.finishVerification(id, "needs-you", "GitHub reports this PR closed without a merge");
+    } else if (gateStillOpen(unit.pr, action)) {
+      dispatch.finishVerification(id, "needs-you", "The PR gate remains after a fresh scan; inspect the agent's local proposal");
+    } else {
+      dispatch.finishVerification(id, "verified", "Fresh scan confirms the PR gate cleared");
+    }
+    bb.realtime.publish(BOARD_CHANGED, { scanning });
+    void dispatchOne();
+  }
+
+  /** One durable reservation per launch; the prompt confines autonomous work to local repairs. */
+  let dispatching = false;
+  async function dispatchOne(preflightPass = 0): Promise<void> {
+    if (dispatching || disposal.signal.aborted || scanning || targeting || dispatch.policy().mode !== "auto") return;
+    dispatching = true;
+    try {
+      const current = await board();
+      const choice = selectCandidate(current.groups, current.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER));
+      if (choice === null) return;
+      // The board may have been built from an old scan. Inspect this checkout before committing to a launch.
+      if (!(await rescanPaths([choice.candidate.path]))) return;
+      if (dispatch.policy().mode !== "auto" || disposal.signal.aborted) return;
+      const fresh = await board();
+      const checked = selectCandidate(fresh.groups, fresh.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER));
+      if (checked === null) return;
+      if (checked.candidate.path !== choice.candidate.path || checked.candidate.prUrl !== choice.candidate.prUrl ||
+        checked.candidate.action !== choice.candidate.action) {
+        if (preflightPass === 0) queueMicrotask(() => void dispatchOne(1));
+        return;
+      }
+      const id = dispatch.reserve(checked);
+      if (id === null) return;
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+      const { candidate } = checked;
+      const found = await scannedUnit(candidate.path);
+      if (found === undefined || found.raw.pr?.url !== candidate.prUrl) {
+        dispatch.update(id, "needs-you", "Checkout or PR changed before launch; refresh the board");
+        return;
+      }
+      const linked = await linkedThreads(candidate.path);
+      const plan = await planAgent(agentSdk, candidate.action, linked);
+      if (dispatch.policy().mode !== "auto" || disposal.signal.aborted) {
+        dispatch.update(id, "needs-you", "Automatic dispatch was switched off before launch");
+        return;
+      }
+      if (plan.candidates.some((thread) => thread.running) ||
+        runs.recent(Number.MAX_SAFE_INTEGER).some((run) =>
+          (run.path === candidate.path || run.prUrl === candidate.prUrl) && (run.status === "running" || run.status === "needs-you"))) {
+        dispatch.update(id, "needs-you", "A linked thread or row action became active before launch");
+        return;
+      }
+      const recommendation = plan.recommendation;
+      const mode = recommendation.mode === "subthread" ? "subthread" : "new";
+      const prompt = `Work on ${candidate.prUrl} in checkout ${candidate.path}. ${candidate.reason}. Inspect the relevant failure or review feedback, make a focused local repair, and run relevant tests. Do not push, reply to GitHub, update the branch remotely, merge, or deploy. Before any remote write, pause for the user's approval; if an approval interaction is unavailable, stop with a local proposal and report what remains. Do not claim the PR gate cleared until a fresh remote scan confirms it.`;
+      const runId = runs.begin({ ...(await runTarget(candidate.path)), action: candidate.action, mode, threadId: null });
+      if (dispatch.policy().mode !== "auto" || disposal.signal.aborted) {
+        runs.discard(runId);
+        dispatch.update(id, "needs-you", "Automatic dispatch was switched off before launch");
+        return;
+      }
+      let result: Awaited<ReturnType<typeof runAgent>>;
+      try {
+        result = await runAgent(agentSdk, {
+          unit: { path: found.raw.path, ticket: found.ticket }, mode, threadId: recommendation.threadId,
+          prompt, linked: linked.map((thread) => thread.id),
+        });
+      } catch (error) {
+        runs.discard(runId);
+        throw error;
+      }
+      if (!result.ok) {
+        runs.discard(runId);
+        dispatch.update(id, "failed", result.error);
+      } else {
+        runs.attach(runId, result.threadId);
+        dispatch.update(id, "running", "Agent is inspecting and repairing locally", result.threadId);
+        startedFor.set(result.threadId, result.ticket);
+        announceThreads();
+      }
+    } catch (error) {
+      const launching = dispatch.attempts().find((attempt) => attempt.status === "launching");
+      if (launching !== undefined) dispatch.update(launching.id, "failed", `Launch failed: ${String(error).slice(0, 300)}`);
+      bb.log.warn(`dispatch launch failed: ${String(error).slice(0, 300)}`);
+    } finally {
+      dispatching = false;
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+    }
+  }
+
   /** Where a run points: the row's ticket and PR from the last scan. */
   async function runTarget(path: string) {
     const found = await scannedUnit(path);
@@ -2105,6 +2282,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    dispatch_set: async ({ mode, effortKey }): Promise<DispatchState> => {
+      const current = await board();
+      if (mode === "auto" && effortKey === null) throw new Error("Choose an effort before enabling automatic dispatch.");
+      if (effortKey !== null && !current.groups.some((group) => group.key === effortKey && !current.groups.some((child) => child.parentKey === group.key))) {
+        throw new Error("That effort is no longer on the board. Refresh and choose an effort.");
+      }
+      dispatch.setPolicy(mode, effortKey);
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+      if (mode === "auto") queueMicrotask(() => void dispatchOne());
+      return (await board()).dispatch;
+    },
     // Nothing starts after the end of time, so this is exactly the open runs.
     runs_open: () => runs.recent(Number.MAX_SAFE_INTEGER),
     prefs_get: () => readPrefs(),
@@ -2193,7 +2381,13 @@ export default async function plugin(bb: BbPluginApi) {
         return { ok: false as const, error: "Continue in an existing thread cannot track this action reliably. Choose a subthread or new thread." };
       }
       const found = await scannedUnit(path);
+      if (dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
+        return { ok: false as const, error: "Automatic dispatch is working on this PR or waiting for a decision." };
+      }
       const linked = (await linkedThreads(path)).map((thread) => thread.id);
+      if (dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
+        return { ok: false as const, error: "Automatic dispatch is working on this PR or waiting for a decision." };
+      }
       // Recorded before launch; bound to the dedicated thread when spawn returns.
       const runId = runs.begin({ ...(await runTarget(path)), action, mode, threadId: null });
       let result: Awaited<ReturnType<typeof runAgent>>;
