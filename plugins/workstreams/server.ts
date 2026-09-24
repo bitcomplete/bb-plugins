@@ -1537,6 +1537,7 @@ export default async function plugin(bb: BbPluginApi) {
     const candidates = seedAssignables(
       members.map((entry) => ({
         key: entry.member.hash,
+        id: entry.group.key,
         name: entry.member.name,
         item: entry.item,
         description: entry.member.description,

@@ -338,6 +338,12 @@ export async function assignToCandidates(
 export type LevelMember = {
   /** The member hash this level's assignment and name cache under. */
   key: string;
+  /**
+   * The member's STABLE identity (its group key), which candidate labels are
+   * built from. Never its display name: a rename one level down must not make
+   * a label vanish one level up and force every member under it to be re-asked.
+   */
+  id: string;
   /** Display name, which is also what the model is shown. */
   name: string;
   item: SeedItem;
@@ -347,8 +353,9 @@ export type LevelMember = {
 /**
  * Deterministic candidate groups for the level ABOVE these members, using the
  * same agglomerative seeding the cluster level uses. The label is a cache key
- * rather than a display name: it only has to be stable and unique, so it is
- * taken from a member's own name rather than invented.
+ * rather than a display name: it only has to be stable and unique, so it is the
+ * smallest stable id among the candidate's members — unique because candidate
+ * groups are disjoint, and unchanged by any rename.
  */
 export function seedAssignables(
   members: readonly LevelMember[],
@@ -356,15 +363,15 @@ export function seedAssignables(
   const byKey = new Map(members.map((member) => [member.item.key, member]));
   const used = new Set<string>();
   return seedItems(members.map((member) => member.item)).map((keys) => {
-    const named = keys.flatMap((key) => {
+    const found = keys.flatMap((key) => {
       const member = byKey.get(key);
-      return member === undefined ? [] : [member.name];
+      return member === undefined ? [] : [member];
     });
-    const base = named[0] ?? keys[0] ?? "Group";
+    const base = found.map((member) => member.id).sort((a, b) => a.localeCompare(b))[0] ?? keys[0] ?? "Group";
     let label = base;
     for (let suffix = 2; used.has(label); suffix += 1) label = `${base} (${suffix})`;
     used.add(label);
-    return { label, members: named };
+    return { label, members: found.map((member) => member.name) };
   });
 }
 

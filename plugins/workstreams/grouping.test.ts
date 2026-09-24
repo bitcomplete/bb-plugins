@@ -3,6 +3,7 @@
 // stable candidate labels that keep a rename from forcing re-asks.
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
+import { seedAssignables } from "./enrich.js";
 import { THREAD_SPAN_MAX, threadWeights, type ThreadTier } from "./threads.js";
 import {
   AREA_COMMON_SHARE,
@@ -224,6 +225,26 @@ describe("threadWeights", () => {
     const a = threadWeights(links([["t1", [["ABC-1", "ticket"], ["ABC-2", "ticket"]]], ["t2", [["ABC-2", "ticket"], ["ABC-3", "ticket"]]]]));
     const b = threadWeights(links([["t2", [["ABC-3", "ticket"], ["ABC-2", "ticket"]]], ["t1", [["ABC-2", "ticket"], ["ABC-1", "ticket"]]]]));
     for (const key of ["ABC-1", "ABC-2", "ABC-3"]) expect([...(a.get(key) ?? [])].sort()).toEqual([...(b.get(key) ?? [])].sort());
+  });
+});
+
+describe("stable candidate labels one level up", () => {
+  it("keeps every candidate label when an effort is renamed, so no cached program assignment vanishes and nothing is re-asked", () => {
+    const members = (names: string[]) =>
+      ["effort-a", "effort-b", "effort-c"].map((id, index) => ({
+        key: `hash-${id}`,
+        id,
+        name: names[index]!,
+        description: "",
+        item: item(`hash-${id}`, { areas: new Map([["quill:shelves", 1]]), vocab: new Set(["shelves"]) }),
+      }));
+    const before = seedAssignables(members(["Shelf sorting", "Shelf search", "Shelf export"]));
+    const after = seedAssignables(members(["Reading list tidy-up", "Shelf search", "Shelf export"]));
+    const cached = new Map(before.flatMap((candidate) => candidate.members.map((name) => [name, candidate.label])));
+    const labels = new Set(after.map((candidate) => candidate.label));
+    const reAsked = [...cached.values()].filter((label) => !labels.has(label));
+    expect(reAsked).toEqual([]);
+    expect(after.map((candidate) => candidate.label)).toEqual(before.map((candidate) => candidate.label));
   });
 });
 
