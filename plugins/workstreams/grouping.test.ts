@@ -3,6 +3,7 @@
 // stable candidate labels that keep a rename from forcing re-asks.
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
+import { planClusterAsks } from "./asks.js";
 import { candidatesFrom, clusterContext, decideWithJev, nameGroups, namingContext, seedAssignables, type JevClient, type NamingClient } from "./enrich.js";
 import { THREAD_SPAN_MAX, threadWeights, type ThreadTier } from "./threads.js";
 import {
@@ -12,7 +13,9 @@ import {
   areaWeights,
   clusterInputHash,
   codeArea,
+  groupingRole,
   mostUrgent,
+  placeClusters,
   seedGroups,
   signalsBetween,
   similarity,
@@ -319,5 +322,65 @@ describe("with no Linear detail, nothing changes", () => {
     const [without, withLinear] = states as { clusters: Record<string, unknown>[] }[];
     expect(Object.keys(without!.clusters[0]!)).toEqual(["ticket", "repos", "prTitles"]);
     expect(withLinear!.clusters[0]!.linear).toEqual({ title: "Shelf sorting", project: null, parent: null });
+  });
+});
+
+describe("ticketless checkouts, keyed on their pull request", () => {
+  /** A checkout with no ticket: its cluster is keyed by directory, as buildBoard keys it. */
+  function ticketless(dirName: string, state: "OPEN" | "MERGED" | "CLOSED" | null, paths = ["src/shelves/a.ts"]): Cluster {
+    const base = cluster(dirName, "quill", paths, `Bump the ${dirName} shelf index`);
+    const unit = { ...base.units[0]!, ticket: null, branch: `chore/${dirName}`, pr: state === null ? null : { ...pr(`Bump the ${dirName} shelf index`), state } };
+    const lifecycle = unitLifecycle(unit);
+    return { ...base, lifecycle, units: [{ ...unit, lifecycle }] };
+  }
+  const open = ticketless("quill-fix", "OPEN");
+  const merged = ticketless("quill-bump", "MERGED");
+  const closed = ticketless("quill-try", "CLOSED");
+  const clone = ticketless("quill", null);
+
+  it("groups a ticketed cluster or an OPEN ticketless PR, sets aside a finished one, and leaves a bare clone out", () => {
+    expect(groupingRole(cluster("ABC-1", "quill", []))).toBe("grouped");
+    expect(groupingRole(open)).toBe("grouped");
+    expect(groupingRole(merged)).toBe("finished");
+    expect(groupingRole(closed)).toBe("finished");
+    expect(groupingRole(clone)).toBe("clone");
+  });
+
+  it("seeds candidates from grouped work only, so no slot is held by something that can never be placed in it", () => {
+    const members = candidatesFrom([cluster("ABC-1", "quill", ["src/shelves/b.ts"]), open, merged, closed, clone]).flatMap((c) => c.members.map((m) => m.ticket));
+    expect(members.sort()).toEqual(["ABC-1", "quill-fix"]);
+  });
+
+  it("never plans an ask for a finished PR or a bare clone, and an open PR that merges leaves the asked set without a re-ask", () => {
+    const plan = planClusterAsks({
+      clusters: [open, merged, clone].map((c) => ({ key: c.ticket, hash: clusterInputHash(c), decision: undefined, grouped: groupingRole(c) === "grouped" })),
+      labels: new Set(),
+      memory: new Map(),
+    });
+    expect(plan.ask.map((ask) => ask.key)).toEqual(["quill-fix"]);
+    // The same checkout, a scan later, with its PR merged: same key, same hash, nothing asked.
+    const after = ticketless("quill-fix", "MERGED");
+    expect(clusterInputHash(after)).toBe(clusterInputHash(open));
+    const next = planClusterAsks({
+      clusters: [{ key: after.ticket, hash: clusterInputHash(after), decision: undefined, grouped: groupingRole(after) === "grouped" }],
+      labels: new Set(),
+      memory: plan.next,
+    });
+    expect(next.ask).toEqual([]);
+  });
+
+  it("places an open ticketless PR like any grouped cluster, and keeps finished PRs and clones in Unsorted whatever was cached", () => {
+    const placed = placeClusters({
+      workstreams: [{ name: "Unsorted", clusters: [open, merged, clone] }],
+      decisionFor: () => ({ summary: null, assignment: { label: "Shelf index", fit: 0.9 } }),
+      overrides: {},
+      threshold: 0.6,
+      grouped: true,
+    });
+    expect(Object.fromEntries(placed.map((entry) => [entry.cluster.ticket, entry.label]))).toEqual({
+      "quill-fix": "Shelf index",
+      "quill-bump": "Unsorted",
+      quill: "Unsorted",
+    });
   });
 });

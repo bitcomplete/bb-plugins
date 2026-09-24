@@ -1717,6 +1717,25 @@ export function hierarchyDepth(groups: readonly { level: GroupLevel }[]): number
 }
 
 /**
+ * Whether a cluster takes part in grouping, keyed on its pull request rather
+ * than its ticket:
+ * - `grouped`: a ticket, or no ticket but an OPEN pull request (a quick fix, a
+ *   dependency bump). Seeded, asked about and placed like any other work.
+ * - `finished`: no ticket and a merged or closed pull request. Real work, so
+ *   it stays visible, but finished: no model is ever asked about it.
+ * - `clone`: no ticket and no pull request, a checkout of some default branch.
+ *   Not work; it stays in Unsorted.
+ */
+export type GroupingRole = "grouped" | "finished" | "clone";
+
+export function groupingRole(cluster: Pick<Cluster, "units">): GroupingRole {
+  if (cluster.units.some((unit) => unit.ticket !== null)) return "grouped";
+  const prs = cluster.units.flatMap((unit) => (unit.pr === null ? [] : [unit.pr]));
+  if (prs.length === 0) return "clone";
+  return prs.some((pr) => pr.state !== "MERGED" && pr.state !== "CLOSED") ? "grouped" : "finished";
+}
+
+/**
  * Place every cluster on the board: its summary, and the effort it belongs to.
  * Pure, so the three modes — no keys, Jev, Jev plus Claude — are the same code
  * path with different inputs rather than three branches that can drift apart.
@@ -1731,18 +1750,18 @@ export function placeClusters(options: {
 }): { label: string; cluster: SummarizedCluster; fit: number }[] {
   const placed: { label: string; cluster: SummarizedCluster; fit: number }[] = [];
   for (const workstream of options.workstreams) {
-    // A checkout with no recognizable ticket has nothing to be grouped with,
-    // so it stays in Unsorted rather than being offered to a model.
-    const ticketless = workstream.name === UNSORTED;
     for (const cluster of workstream.clusters) {
+      // A bare clone or a finished ticketless PR was never offered to a model,
+      // so any decision cached for it from before is ignored, not trusted.
+      const outside = groupingRole(cluster) !== "grouped";
       const decision = options.decisionFor(cluster);
       placed.push({
         label: effortLabel({
           ticket: cluster.ticket,
           override: options.overrides[cluster.ticket],
-          assignment: ticketless ? null : (decision?.assignment ?? null),
+          assignment: outside ? null : (decision?.assignment ?? null),
           threshold: options.threshold,
-          grouped: options.grouped && !ticketless,
+          grouped: options.grouped && !outside,
           fallbackName: workstream.name,
         }),
         cluster: { ...cluster, summary: decision?.summary ?? fallbackSummary(cluster) },

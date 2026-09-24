@@ -37,12 +37,20 @@ export type AskPlan = {
  * content is unchanged.
  */
 export function planClusterAsks(input: {
-  clusters: readonly { key: string; hash: string; baseHash?: string; decision: ClusterDecision | undefined }[];
+  clusters: readonly {
+    key: string;
+    hash: string;
+    baseHash?: string;
+    decision: ClusterDecision | undefined;
+    /** False for a bare clone or a finished ticketless PR: never asked, and its memory is left as it was. */
+    grouped?: boolean;
+  }[];
   labels: ReadonlySet<string>;
   memory: ReadonlyMap<string, AskMemory>;
 }): AskPlan {
   const plan: AskPlan = { ask: [], next: new Map(), pinned: [], linearArrivals: 0 };
   for (const cluster of input.clusters) {
+    if (cluster.grouped === false) continue;
     const prev = input.memory.get(cluster.key);
     const same = prev !== undefined && prev.hash === cluster.hash;
     const { decision } = cluster;

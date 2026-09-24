@@ -15,6 +15,7 @@ import {
   clusterInputHash,
   memberHash,
   fallbackSummary,
+  groupingRole,
   normalizeSummary,
   seedGroups,
   seedItems,
@@ -96,7 +97,10 @@ export type Candidate = { label: string; description: string; members: Cluster[]
  */
 export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): Candidate[] {
   const used = new Set<string>();
-  return seedGroups(clusters, context).map((members) => {
+  // Only what can be placed in an effort seeds one: a bare clone or a finished
+  // ticketless PR would hold a candidate slot nothing could ever be placed in.
+  const grouped = clusters.filter((cluster) => groupingRole(cluster) === "grouped");
+  return seedGroups(grouped, context).map((members) => {
     const base = fallbackSummary(members[0] as Cluster);
     let label = base;
     for (let suffix = 2; used.has(label); suffix += 1) label = `${base} (${suffix})`;
