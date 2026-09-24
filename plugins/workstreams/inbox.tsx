@@ -698,44 +698,30 @@ function InboxRow({
         selected ? "bg-foreground/[0.07] ring-1 ring-inset ring-ring/60" : "hover:bg-foreground/[0.035]",
       )}
     >
-      <span className="flex w-[6.5rem] shrink-0 items-center">
+      <span className="order-1 flex w-[6.5rem] shrink-0 items-center">
         {row.verb === null && !showSection ? null : (
           <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
         )}
       </span>
-      {row.run === null ? (
-        <Tip label={ageTip}>
-          <span
-            className={cn(
-              "w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
-              row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
-            )}
-          >
-            {age}
-          </span>
+      <span className={cn("order-2 flex min-w-0 shrink items-center gap-1.5", compact ? "flex-1" : "w-fit max-w-[11.5rem]")}>
+        <Tip label={row.repo}>
+          <span className="min-w-0 max-w-[8rem] truncate font-semibold text-foreground">{row.repo}</span>
         </Tip>
-      ) : (
-        <span className={cn("flex min-w-0 shrink-0 items-center", compact ? "max-w-[5.5rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
-          <RunChip run={row.run} ageTip={ageTip} onOpenThread={onOpenThread} />
-        </span>
-      )}
-      <Tip label={row.repo}>
-        <span className={cn("truncate font-medium text-foreground", compact ? "min-w-0 flex-1" : "w-32 shrink-0")}>{row.repo}</span>
-      </Tip>
-      {unit.pr === null ? (
-        <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground/70" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : "No pull request found"}>{unit.observed?.pr === false ? "PR ?" : "—"}</span>
-      ) : (
-        <UrlLink
-          href={unit.pr.url}
-          onClick={(event) => event.stopPropagation()}
-          className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-        >
-          #{unit.pr.number}
-        </UrlLink>
-      )}
-      <span className={cn("flex min-w-0 items-center gap-2", compact ? "basis-full flex-wrap gap-y-0.5" : "flex-[3]")}>
+        {unit.pr === null ? (
+          <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : "No pull request found"}>{unit.observed?.pr === false ? "PR ?" : "—"}</span>
+        ) : (
+          <UrlLink
+            href={unit.pr.url}
+            onClick={(event) => event.stopPropagation()}
+            className="shrink-0 font-mono text-[11.5px] font-medium text-foreground underline-offset-2 hover:underline"
+          >
+            #{unit.pr.number}
+          </UrlLink>
+        )}
+      </span>
+      <span className={cn("flex min-w-0 items-center gap-2", compact ? "order-4 basis-full flex-wrap gap-y-0.5" : "order-3 flex-[3]")}>
         <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
-          <span className={cn("min-w-0 truncate text-foreground", compact ? "basis-full" : "flex-1")}>{row.title}</span>
+          <span className={cn("min-w-0 truncate text-foreground/80", compact ? "basis-full" : "flex-1")}>{row.title}</span>
         </Tip>
         {resolvedThreads > 0 ? (
           <Tip label={approvedAfterReview
@@ -747,20 +733,37 @@ function InboxRow({
           </Tip>
         ) : null}
       </span>
-      {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
+      {row.run === null ? (
+        <Tip label={ageTip}>
+          <span
+            className={cn(
+              "order-4 w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
+              compact ? "order-3" : null,
+              row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
+            )}
+          >
+            {age}
+          </span>
+        </Tip>
+      ) : (
+        <span className={cn("order-4 flex min-w-0 shrink-0 items-center", compact ? "order-3 max-w-[5.5rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
+          <RunChip run={row.run} ageTip={ageTip} onOpenThread={onOpenThread} />
+        </span>
+      )}
+      {unit.observed?.status === false ? <span className="order-5 shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
       {row.cluster.linear?.url == null ? null : (
         <UrlLink
           href={row.cluster.linear.url}
           onClick={(event) => event.stopPropagation()}
-          className="shrink-0 text-[10.5px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+          className="order-5 shrink-0 text-[10.5px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
         >
           Linear
         </UrlLink>
       )}
-      {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
+      {reviewerColumn ? <span className="order-5"><ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /></span> : null}
       {showSection ? null : (
         <Tip label={row.effort}>
-          <span className={cn("min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80", compact ? "block" : "hidden lg:block")}>
+          <span className={cn("order-5 min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80", compact ? "block" : "hidden lg:block")}>
             {row.effort}
           </span>
         </Tip>
@@ -770,7 +773,7 @@ function InboxRow({
           <span
             tabIndex={0}
             aria-label={`High risk: touches ${risk.join(" and ")}`}
-            className="shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-rose-300"
+            className="order-5 shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-rose-300"
           >
             {risk.join(" · ")}
           </span>
@@ -778,7 +781,7 @@ function InboxRow({
       )}
       <span
         className={cn(
-          "flex shrink-0 items-center",
+          "order-5 flex shrink-0 items-center",
           selected || compact ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
         )}
       >
@@ -789,7 +792,7 @@ function InboxRow({
           onNewThread={onStart}
         />
       </span>
-      <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />
+      <span className="order-5"><ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} /></span>
     </li>
   );
 }

@@ -1300,19 +1300,21 @@ const UnitList = memo(function UnitList({
                   PAINT[unit.lifecycle].dot,
                 )}
               />
-              <span className="w-[5.5rem] shrink-0 truncate font-medium text-foreground">
-                {unit.repo ?? unit.dirName}
+              <span className="flex shrink-0 items-center gap-1">
+                <span className="w-[5.5rem] shrink-0 truncate font-semibold text-foreground">
+                  {unit.repo ?? unit.dirName}
+                </span>
+                {unit.pr === null ? (
+                  <span className="shrink-0 font-mono text-[10.5px] font-medium text-muted-foreground" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : undefined}>{unit.observed?.pr === false ? "PR ?" : "no PR"}</span>
+                ) : (
+                  <UrlLink
+                    href={unit.pr.url}
+                    className="shrink-0 font-mono text-[11px] font-semibold text-foreground underline-offset-2 hover:underline"
+                  >
+                    #{unit.pr.number}
+                  </UrlLink>
+                )}
               </span>
-              {unit.pr === null ? (
-                <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : undefined}>{unit.observed?.pr === false ? "PR ?" : "no PR"}</span>
-              ) : (
-                <UrlLink
-                  href={unit.pr.url}
-                  className="shrink-0 font-mono text-[10.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                >
-                  #{unit.pr.number}
-                </UrlLink>
-              )}
               <span className="min-w-0 flex-1 truncate text-muted-foreground" title={title}>
                 {title}
               </span>
