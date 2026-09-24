@@ -43,7 +43,7 @@ describe("renderPvcManifest", () => {
   const pvc = renderPvcManifest({
     name: "acme-app",
     key: "launch_1",
-    namespace: "bb-dylan-production",
+    namespace: "example-production",
     settings: { volumeSize: "20Gi", storageClass: "local-path" },
     now: Date.UTC(2026, 8, 18),
   });
@@ -67,7 +67,7 @@ describe("renderPodManifest", () => {
   const manifest = renderPodManifest({
     name: "acme-app",
     key: "launch_1",
-    namespace: "bb-dylan-production",
+    namespace: "example-production",
     image: "registry.example/agent:1",
     resourceClass: { cpu: "2", memory: "4Gi", limits: { memory: "8Gi" } },
     settings: baseSettings,
@@ -147,23 +147,23 @@ describe("renderPodManifest", () => {
     const placed = renderPodManifest({
       name: "acme-app",
       key: "launch_1",
-      namespace: "bb-dylan-production",
+      namespace: "example-production",
       image: "registry.example/agent:1",
       resourceClass: { cpu: "2", memory: "4Gi" },
       tailnet: null,
       settings: {
         ...baseSettings,
-        nodeSelector: { role: "github-runner" },
+        nodeSelector: { role: "agents" },
         tolerations: [
-          { key: "github-runner", operator: "Equal", value: "true", effect: "NoSchedule" },
+          { key: "agents", operator: "Equal", value: "true", effect: "NoSchedule" },
         ],
       },
       now: 0,
     });
     const spec = placed.spec as Record<string, any>;
-    expect(spec.nodeSelector).toEqual({ role: "github-runner" });
+    expect(spec.nodeSelector).toEqual({ role: "agents" });
     expect(spec.tolerations).toEqual([
-      { key: "github-runner", operator: "Equal", value: "true", effect: "NoSchedule" },
+      { key: "agents", operator: "Equal", value: "true", effect: "NoSchedule" },
     ]);
   });
 });
@@ -172,7 +172,7 @@ describe("renderPodManifest with a tailnet identity", () => {
   const manifest = renderPodManifest({
     name: "acme-app",
     key: "launch_1",
-    namespace: "bb-dylan-production",
+    namespace: "example-production",
     image: "registry.example/agent:1",
     resourceClass: { cpu: "2", memory: "4Gi" },
     settings: { worktreePath: "/workspace", nodeSelector: {}, tolerations: [] },

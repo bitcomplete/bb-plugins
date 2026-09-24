@@ -89,16 +89,16 @@ dashes as underscores); a machine created with the `image` input set to
 
 ### Placing machine pods on a node class
 
-Suppose the cluster's large nodes carry the label `role=github-runner` and
-the taint `github-runner=true:NoSchedule`. To steer machine pods there, set
+Suppose the nodes reserved for agents carry the label `role=agents` and
+the taint `agents=true:NoSchedule`. To steer machine pods there, set
 both placement settings:
 
 ```json
-{"role":"github-runner"}
+{"role":"agents"}
 ```
 
 ```json
-[{"key":"github-runner","operator":"Equal","value":"true","effect":"NoSchedule"}]
+[{"key":"agents","operator":"Equal","value":"true","effect":"NoSchedule"}]
 ```
 
 Both are validated as JSON on save and again when the plugin resolves its
@@ -189,6 +189,3 @@ directory, or from the published repo:
 ```sh
 bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin kubernetes-provider
 ```
-
-For an example of baking it into a server image and deploying it, see
-[bitcomplete/bb-dylan](https://github.com/bitcomplete/bb-dylan).

@@ -4,7 +4,7 @@ import { createTailnetMinter, readTailnetCredentials } from "./tailnet.js";
 const credentials = {
   clientId: "cid",
   clientSecret: "csecret",
-  tagPrefix: "bb-dylan",
+  tagPrefix: "example",
 };
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -20,7 +20,7 @@ describe("readTailnetCredentials", () => {
       readTailnetCredentials({
         TS_OAUTH_CLIENT_ID: "cid",
         TS_OAUTH_CLIENT_SECRET: "csecret",
-        TS_TAG_PREFIX: "bb-dylan",
+        TS_TAG_PREFIX: "example",
       }),
     ).toEqual(credentials);
   });
@@ -36,7 +36,7 @@ describe("readTailnetCredentials", () => {
       readTailnetCredentials({
         TS_OAUTH_CLIENT_ID: "  ",
         TS_OAUTH_CLIENT_SECRET: "csecret",
-        TS_TAG_PREFIX: "bb-dylan",
+        TS_TAG_PREFIX: "example",
       }),
     ).toBeNull();
   });
@@ -47,7 +47,7 @@ describe("tagFor", () => {
   // Role in each namespace that admitted the machine.
   it("is the install prefix and the machine name", () => {
     const minter = createTailnetMinter(credentials, vi.fn());
-    expect(minter.tagFor("acme")).toBe("tag:bb-dylan-acme");
+    expect(minter.tagFor("acme")).toBe("tag:example-acme");
   });
 });
 
@@ -72,7 +72,7 @@ describe("mintAuthKey", () => {
       reusable: false,
       ephemeral: true,
       preauthorized: true,
-      tags: ["tag:bb-dylan-acme"],
+      tags: ["tag:example-acme"],
     });
   });
 
@@ -88,7 +88,7 @@ describe("mintAuthKey", () => {
     await minter.mintAuthKey("other", new AbortController().signal);
 
     expect(JSON.parse(fetchImpl.mock.calls[1][1].body).capabilities.devices.create.tags).toEqual([
-      "tag:bb-dylan-other",
+      "tag:example-other",
     ]);
   });
 
@@ -102,7 +102,7 @@ describe("mintAuthKey", () => {
     const minter = createTailnetMinter(credentials, fetchImpl as unknown as typeof fetch);
 
     await expect(minter.mintAuthKey("acme", new AbortController().signal)).rejects.toThrow(
-      /tag:bb-dylan-acme.*403/su,
+      /tag:example-acme.*403/su,
     );
   });
 

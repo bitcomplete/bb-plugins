@@ -65,15 +65,15 @@ describe("resolveSettings", () => {
   it("parses node placement settings", () => {
     const resolved = resolveSettings({
       ...defaults,
-      nodeSelector: '{"role":"github-runner"}',
+      nodeSelector: '{"role":"agents"}',
       tolerations:
-        '[{"key":"github-runner","operator":"Equal","value":"true","effect":"NoSchedule"}]',
+        '[{"key":"agents","operator":"Equal","value":"true","effect":"NoSchedule"}]',
     });
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
-    expect(resolved.settings.nodeSelector).toEqual({ role: "github-runner" });
+    expect(resolved.settings.nodeSelector).toEqual({ role: "agents" });
     expect(resolved.settings.tolerations).toEqual([
-      { key: "github-runner", operator: "Equal", value: "true", effect: "NoSchedule" },
+      { key: "agents", operator: "Equal", value: "true", effect: "NoSchedule" },
     ]);
   });
 
@@ -118,21 +118,21 @@ describe("placement env fallbacks", () => {
   it("uses the env values while the settings are at their empty defaults", () => {
     withEnv(
       {
-        BB_K8S_NODE_SELECTOR: '{"role":"github-runner"}',
-        BB_K8S_TOLERATIONS: '[{"key":"github-runner","operator":"Equal","value":"true","effect":"NoSchedule"}]',
+        BB_K8S_NODE_SELECTOR: '{"role":"agents"}',
+        BB_K8S_TOLERATIONS: '[{"key":"agents","operator":"Equal","value":"true","effect":"NoSchedule"}]',
       },
       () => {
         const resolved = resolveSettings(base);
         expect(resolved.ok).toBe(true);
         if (!resolved.ok) return;
-        expect(resolved.settings.nodeSelector).toEqual({ role: "github-runner" });
+        expect(resolved.settings.nodeSelector).toEqual({ role: "agents" });
         expect(resolved.settings.tolerations).toHaveLength(1);
       },
     );
   });
 
   it("lets a configured setting win over the env", () => {
-    withEnv({ BB_K8S_NODE_SELECTOR: '{"role":"github-runner"}', BB_K8S_TOLERATIONS: "[]" }, () => {
+    withEnv({ BB_K8S_NODE_SELECTOR: '{"role":"agents"}', BB_K8S_TOLERATIONS: "[]" }, () => {
       const resolved = resolveSettings({ ...base, nodeSelector: '{"zone":"ytz-a"}' });
       expect(resolved.ok).toBe(true);
       if (!resolved.ok) return;

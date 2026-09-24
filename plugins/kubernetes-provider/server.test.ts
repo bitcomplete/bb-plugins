@@ -35,7 +35,7 @@ function fakeClient() {
   const pvcs = new Map<string, PvcSummary>();
   const executor = { exec: vi.fn(async () => ({ exitCode: 0 })) };
   const client: KubeClient = {
-    namespace: "bb-dylan-production",
+    namespace: "example-production",
     createPod: vi.fn(async (manifest: any) => {
       const pod = fakePod(manifest.metadata.name, { labels: manifest.metadata.labels });
       pods.set(pod.name, pod);
@@ -120,7 +120,7 @@ const createArgs = (name: string, key = `launch_${name}`, extra: Record<string, 
 const resourceFor = (name: string, key = `launch_${name}`) => ({
   name,
   key,
-  namespace: "bb-dylan-production",
+  namespace: "example-production",
   podName: `bb-${name}`,
   pvcName: `bb-${name}-data`,
 });
@@ -471,7 +471,7 @@ describe("kubernetes machine provider", () => {
 
 describe("tailnet identity", () => {
   const minter = (mint: () => Promise<string>): TailnetMinter => ({
-    tagFor: (name) => `tag:bb-dylan-${name}`,
+    tagFor: (name) => `tag:example-${name}`,
     mintAuthKey: mint,
   });
 
@@ -491,7 +491,7 @@ describe("tailnet identity", () => {
   // machine, so it must not fail the creation.
   it("creates a working machine when the tag does not exist yet", async () => {
     const mint = vi.fn(async () => {
-      throw new Error("Tailscale refused an auth key for tag:bb-dylan-acme-app: 403");
+      throw new Error("Tailscale refused an auth key for tag:example-acme-app: 403");
     });
     const { machine, client, bootstrap } = await loadPlugin({ tailnet: minter(mint) });
     const result = await machine.create({

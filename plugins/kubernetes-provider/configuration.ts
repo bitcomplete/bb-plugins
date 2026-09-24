@@ -117,7 +117,7 @@ export const SETTING_DESCRIPTORS = {
     type: "string",
     label: "Node selector",
     description:
-      'JSON object of node label → value that machine pods must match, e.g. {"role":"github-runner"}. Empty object places pods anywhere.',
+      'JSON object of node label → value that machine pods must match, e.g. {"role":"agents"}. Empty object places pods anywhere.',
     experimental_multiline: true,
     experimental_schema: z
       .string()
@@ -138,7 +138,7 @@ export const SETTING_DESCRIPTORS = {
     type: "string",
     label: "Tolerations",
     description:
-      'JSON array of Kubernetes tolerations, e.g. [{"key":"github-runner","operator":"Equal","value":"true","effect":"NoSchedule"}].',
+      'JSON array of Kubernetes tolerations, e.g. [{"key":"agents","operator":"Equal","value":"true","effect":"NoSchedule"}].',
     experimental_multiline: true,
     experimental_schema: z
       .string()

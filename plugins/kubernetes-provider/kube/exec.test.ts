@@ -3,7 +3,7 @@ import { execUrl, exitCodeFromStatus } from "./exec.js";
 
 const credentials = {
   apiUrl: "https://kubernetes.default.svc",
-  namespace: "bb-dylan-production",
+  namespace: "example-production",
   token: "t",
   ca: "",
 };
@@ -12,7 +12,7 @@ describe("execUrl", () => {
   it("targets the agent container with one command param per argv entry", () => {
     const url = new URL(execUrl(credentials, "bb-thr-1", "agent", ["sh", "-c", "echo hi"], true));
     expect(url.protocol).toBe("wss:");
-    expect(url.pathname).toBe("/api/v1/namespaces/bb-dylan-production/pods/bb-thr-1/exec");
+    expect(url.pathname).toBe("/api/v1/namespaces/example-production/pods/bb-thr-1/exec");
     expect(url.searchParams.getAll("command")).toEqual(["sh", "-c", "echo hi"]);
     expect(url.searchParams.get("container")).toBe("agent");
     expect(url.searchParams.get("stdin")).toBe("true");
