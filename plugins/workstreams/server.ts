@@ -36,6 +36,7 @@ import {
   clusterVocabulary,
   effortMemberHash,
   fallbackSummary,
+  hashString,
   groupChildren,
   groupSeedItem,
   hierarchyDepth,
@@ -96,6 +97,7 @@ import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } 
 import { createRescanQueue } from "./rescan.js";
 import { scanFailure } from "./scancancel.js";
 import { parseLinearKeys, projectNameOf } from "./linear.js";
+import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
@@ -486,6 +488,8 @@ export default async function plugin(bb: BbPluginApi) {
     // Full Linear detail per ticket, from a key or the agent fallback. Supersedes
     // linear_tickets (left in place: migrations are append-only).
     LINEAR_DETAIL_MIGRATION,
+    // Per cluster key: the semantic hash last seen, and the label-vanished damper's streak. See asks.ts.
+    `CREATE TABLE IF NOT EXISTS cluster_asks (ticket TEXT PRIMARY KEY, hash TEXT NOT NULL, streak INTEGER NOT NULL, pinned INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
   ]);
   const runs = createRunStore(db);
 
@@ -1515,6 +1519,25 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
+   * Log a group whose member set changed under an existing label: keys and
+   * member-hash prefixes only, never a title (logs may be shared). The label is
+   * itself a title, so it is logged as its hash.
+   */
+  async function logRenames(level: GroupLevel, hashes: ReadonlyMap<string, string>, renamed: ReadonlySet<string>): Promise<void> {
+    const memo = (await bb.storage.kv.get<Record<string, Record<string, string>>>("memberHashes")) ?? {};
+    const seen = { ...(memo[level] ?? {}) };
+    for (const [label, hash] of hashes) {
+      const labelKey = hashString(label);
+      if (renamed.has(hash)) {
+        const before = seen[labelKey];
+        bb.log.info(`${level} renamed: label ${labelKey} members ${before === undefined ? "none" : before.slice(0, 8)} -> ${hash.slice(0, 8)}`);
+      }
+      seen[labelKey] = hash;
+    }
+    await bb.storage.kv.set("memberHashes", { ...memo, [level]: seen });
+  }
+
+  /**
    * Derive ONE level above the groups given, with the same machinery every
    * other level uses: deterministic seeding, a Jev choice scored against the
    * confidence threshold, and Claude naming only the groups whose member set
@@ -1544,14 +1567,14 @@ export default async function plugin(bb: BbPluginApi) {
       })),
     );
     const labels = new Set(candidates.map((candidate) => candidate.label));
-    const pending = members
-      .filter((entry) => {
-        const cached = readGroupAssignment(level, entry.member.hash);
-        // A cached assignment survives only while the label it chose still
-        // exists; otherwise the member has nowhere to go and must be re-asked.
-        return cached === undefined || !labels.has(cached.label);
-      })
-      .map((entry) => entry.member);
+    const pending = members.filter((entry) => {
+      const cached = readGroupAssignment(level, entry.member.hash);
+      // A cached assignment survives only while the label it chose still
+      // exists; otherwise the member has nowhere to go and must be re-asked.
+      const reason = cached === undefined ? "new" : labels.has(cached.label) ? null : "label-vanished";
+      if (reason !== null) bb.log.info(`jev ${level} re-ask ${entry.member.hash.slice(0, 8)}: ${reason}`);
+      return reason !== null;
+    }).map((entry) => entry.member);
 
     const assigned = await assignToCandidates({
       pending,
@@ -1604,6 +1627,7 @@ export default async function plugin(bb: BbPluginApi) {
       naming: options.naming,
     });
     writeGroupNames(level, named.names);
+    await logRenames(level, new Map([...grouped.keys()].map((label) => [label, hashOf(label)])), new Set(named.names.keys()));
     warnings.push(...named.warnings);
     addUsage(usage, named.usage);
     bb.log.info(
@@ -1616,6 +1640,27 @@ export default async function plugin(bb: BbPluginApi) {
     total.calls += part.calls;
     total.inputTokens += part.inputTokens;
     total.outputTokens += part.outputTokens;
+  }
+
+  function readAskMemory(): Map<string, AskMemory> {
+    const rows = db.prepare(`SELECT ticket, hash, streak, pinned FROM cluster_asks`).all() as {
+      ticket: string;
+      hash: string;
+      streak: number;
+      pinned: number;
+    }[];
+    return new Map(rows.map((row) => [row.ticket, { hash: row.hash, streak: row.streak, pinned: row.pinned !== 0 }]));
+  }
+
+  function writeAskMemory(next: ReadonlyMap<string, AskMemory>): void {
+    const upsert = db.prepare(
+      `INSERT INTO cluster_asks (ticket, hash, streak, pinned, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(ticket) DO UPDATE SET hash = excluded.hash, streak = excluded.streak, pinned = excluded.pinned, updated_at = excluded.updated_at`,
+    );
+    const now = Date.now();
+    db.transaction(() => {
+      for (const [ticket, memory] of next) upsert.run(ticket, memory.hash, memory.streak, memory.pinned ? 1 : 0, now);
+    })();
   }
 
   /**
@@ -1645,20 +1690,31 @@ export default async function plugin(bb: BbPluginApi) {
     const context: SeedContext = { threads: threadWeights(links) };
     bb.log.info(`threads: ${strongLinkedClusters(links)} of ${clusters.length} clusters have a strong thread link`);
     const candidates = candidatesFrom(clusters, context);
-    const labels = new Set(candidates.map((candidate) => candidate.label));
-    const pending = clusters.filter((cluster) => {
-      const decision = readDecision(clusterInputHash(cluster));
-      if (decision === undefined) return true;
-      // A cached assignment survives only while the label it chose still
-      // exists; otherwise the cluster has nowhere to go and must be re-asked.
-      return decision.assignment === null || !labels.has(decision.assignment.label);
+    const plan = planClusterAsks({
+      clusters: clusters.map((cluster) => ({
+        key: cluster.ticket,
+        hash: clusterInputHash(cluster),
+        baseHash: cluster.linear === undefined || cluster.linear === null ? undefined : clusterInputHash({ ...cluster, linear: undefined }),
+        decision: readDecision(clusterInputHash(cluster)),
+      })),
+      labels: new Set(candidates.map((candidate) => candidate.label)),
+      memory: readAskMemory(),
     });
+    for (const ask of plan.ask) bb.log.info(`jev cluster re-ask ${ask.key} (${ask.hash}): ${ask.reason}`);
+    for (const key of plan.pinned) {
+      bb.log.info(`jev cluster ${key}: pinned to its last assignment after ${PIN_AFTER} label-vanished re-asks; re-asked again only when its content changes`);
+    }
+    if (plan.linearArrivals > 0) bb.log.info(`regrouping with Linear detail: ${plan.linearArrivals} clusters`);
+    const asked = new Set(plan.ask.map((ask) => ask.key));
+    const pending = clusters.filter((cluster) => asked.has(cluster.ticket));
 
     const warnings: string[] = [];
     const usage: ModelUsage = { ...ZERO_USAGE };
     const jev = jevClient(typesafeApiKey, signal);
     const cluster = await decideWithJev({ pending, candidates, jev });
     writeDecisions(cluster.decisions);
+    // Remembered only once the answers are stored: a failed call must be re-asked, not counted as asked.
+    writeAskMemory(plan.next);
     warnings.push(...cluster.warnings);
     addUsage(usage, cluster.usage);
     bb.log.info(
@@ -1697,6 +1753,11 @@ export default async function plugin(bb: BbPluginApi) {
         naming,
       });
       writeGroupNames("effort", named.names);
+      await logRenames(
+        "effort",
+        new Map([...grouped].map(([label, members]) => [label, effortMemberHash(members)])),
+        new Set(named.names.keys()),
+      );
       warnings.push(...named.warnings);
       addUsage(usage, named.usage);
       bb.log.info(

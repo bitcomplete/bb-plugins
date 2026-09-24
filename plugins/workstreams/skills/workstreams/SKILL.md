@@ -399,4 +399,5 @@ prefix no key owns gets no detail; that is not an error. Failures are logged
 once and keep the previous cache. Keys stay on the server and are never logged.
 
 The first scan after Linear detail arrives regroups the clusters it changed,
-which costs a one-time burst of model calls. Later scans return to zero calls.
+which costs a one-time burst of model calls, logged as `regrouping with Linear
+detail: N clusters`. Later scans return to zero calls.
