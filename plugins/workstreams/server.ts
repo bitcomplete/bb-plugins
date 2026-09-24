@@ -46,6 +46,7 @@ import {
   type BoardGroup,
   type Cluster,
   type ClusterDecision,
+  type ClusterLinear,
   type NamedGroup,
   type SeedItem,
   type SummarizedCluster,
@@ -89,10 +90,10 @@ import { RUNS_MIGRATION, createRunStore } from "./runstore.js";
 import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } from "./runs.js";
 import { createRescanQueue } from "./rescan.js";
 import { scanFailure } from "./scancancel.js";
+import { parseLinearKeys, projectNameOf } from "./linear.js";
+import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
-const LINEAR_TTL_MS = 24 * 60 * 60 * 1_000;
-const LINEAR_BATCH = 25;
 const SCAN_TIMEOUT_MS = 10 * 60 * 1_000;
 const NAMING_TIMEOUT_MS = 5 * 60 * 1_000;
 /** How long a dead host worker waits for the dispose that says a reload killed it. */
@@ -146,6 +147,10 @@ const clusterSchema = z.object({
   /** The cluster's ONE home on the Risk face; see `dominantSurface`. */
   dominant: z.object({ surface: z.string().nullable(), risk: riskSchema }),
   threads: z.array(threadLinkSchema),
+  /** What Linear says about the ticket, for the row's hover. Null when nothing is known. */
+  linear: z
+    .object({ title: z.string().nullable(), state: z.string().nullable(), project: z.string().nullable(), url: z.string().nullable() })
+    .nullable(),
 });
 /**
  * The hierarchy goes over the wire FLAT, with a parent key. A recursive schema
@@ -379,11 +384,18 @@ export default async function plugin(bb: BbPluginApi) {
         "Regular expression with two capture groups (prefix, number), matched against the branch name first and then the directory name. The match is uppercased to form the cluster key.",
       default: DEFAULT_TICKET_PATTERN,
     },
+    linearApiKeys: {
+      type: "string",
+      label: "Linear API keys",
+      description:
+        "Optional. One or more Linear personal API keys, separated by commas or spaces (one per workspace). Each ticket is looked up with the key whose workspace owns its team prefix; a prefix no key owns gets no Linear detail. Ticket titles, parents and projects then inform grouping and naming, never decide them. Keys stay on the server and are never logged.",
+      secret: true,
+    },
     linearApiKey: {
       type: "string",
-      label: "Linear API key",
+      label: "Linear API key (single, older setting)",
       description:
-        "Optional. When set, each ticket resolves to its Linear project name, which seeds the workstream name.",
+        "Optional. Still read, and merged with Linear API keys above, so a key entered here keeps working. Prefer the list above for new keys.",
       secret: true,
     },
     refreshMinutes: {
@@ -466,6 +478,9 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE TABLE IF NOT EXISTS unit_transitions (path TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, entered_at INTEGER)`,
     // One row per agent or direct row action; bounded, pruned on write. See runstore.ts.
     RUNS_MIGRATION,
+    // Full Linear detail per ticket, from a key or the agent fallback. Supersedes
+    // linear_tickets (left in place: migrations are append-only).
+    LINEAR_DETAIL_MIGRATION,
   ]);
   const runs = createRunStore(db);
 
@@ -518,86 +533,41 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- Linear enrichment ----------------------------------------------
 
-  function cachedProjects(tickets: string[]): Record<string, string | null> {
-    if (tickets.length === 0) return {};
-    const placeholders = tickets.map(() => "?").join(",");
-    const rows = db
-      .prepare(
-        `SELECT ticket, project FROM linear_tickets WHERE ticket IN (${placeholders})`,
-      )
-      .all(...tickets) as { ticket: string; project: string | null }[];
-    return Object.fromEntries(rows.map((row) => [row.ticket, row.project]));
+  const linear = createLinearSync({
+    db,
+    fetch: (url, init) => fetch(url, init),
+    log: bb.log,
+  });
+  settings.onChange((next, prev) => {
+    if (next.linearApiKeys !== prev.linearApiKeys || next.linearApiKey !== prev.linearApiKey) linear.invalidate();
+  });
+
+  async function linearKeys(): Promise<string[]> {
+    const { linearApiKeys, linearApiKey } = await settings.get();
+    return parseLinearKeys(linearApiKeys, linearApiKey);
   }
 
-  function staleTickets(tickets: string[]): string[] {
-    const cutoff = Date.now() - LINEAR_TTL_MS;
-    const fresh = new Set(
-      (
-        db
-          .prepare(`SELECT ticket FROM linear_tickets WHERE fetched_at >= ?`)
-          .all(cutoff) as { ticket: string }[]
-      ).map((row) => row.ticket),
-    );
-    return tickets.filter((ticket) => !fresh.has(ticket));
-  }
-
-  const linearIssueSchema = z
-    .object({
-      project: z.object({ name: z.string() }).nullable().optional(),
-      parent: z.object({ title: z.string() }).nullable().optional(),
-    })
-    .nullable();
-
-  /** Resolve tickets to Linear project names. Never throws; reports instead. */
-  async function fetchLinearProjects(
-    apiKey: string,
-    tickets: string[],
-    signal: AbortSignal,
-  ): Promise<string | null> {
-    const upsert = db.prepare(
-      `INSERT INTO linear_tickets (ticket, project, fetched_at) VALUES (?, ?, ?)
-       ON CONFLICT(ticket) DO UPDATE SET project = excluded.project, fetched_at = excluded.fetched_at`,
-    );
-    for (let index = 0; index < tickets.length; index += LINEAR_BATCH) {
-      const batch = tickets.slice(index, index + LINEAR_BATCH);
-      const query = `query {${batch
-        .map(
-          (ticket, slot) =>
-            ` t${slot}: issue(id: ${JSON.stringify(ticket)}) { project { name } parent { title } }`,
-        )
-        .join("")} }`;
-      let payload: unknown;
-      try {
-        const response = await fetch("https://api.linear.app/graphql", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: apiKey,
-          },
-          body: JSON.stringify({ query }),
-          signal,
-        });
-        if (!response.ok) return `Linear returned HTTP ${response.status}.`;
-        payload = await response.json();
-      } catch (error) {
-        return `Linear lookup failed: ${String(error).slice(0, 200)}`;
-      }
-      const data =
-        payload !== null && typeof payload === "object"
-          ? (payload as { data?: Record<string, unknown> }).data
-          : undefined;
-      if (data === undefined) return "Linear returned no data.";
-      const now = Date.now();
-      db.transaction(() => {
-        batch.forEach((ticket, slot) => {
-          const issue = linearIssueSchema.safeParse(data[`t${slot}`]);
-          const value = issue.success && issue.data !== null ? issue.data : null;
-          const name = value?.project?.name ?? value?.parent?.title ?? null;
-          upsert.run(ticket, name, now);
-        });
-      })();
+  /** Ticket → what the board shows and seeds from. Empty when nothing is cached. */
+  function clusterLinearOf(tickets: string[]): Record<string, ClusterLinear> {
+    const out: Record<string, ClusterLinear> = {};
+    for (const [ticket, detail] of linear.read(tickets)) {
+      out[ticket] = {
+        title: detail.title,
+        state: detail.state?.name ?? null,
+        project: detail.project?.name ?? null,
+        parentIdentifier: detail.parent?.identifier ?? null,
+        parentTitle: detail.parent?.title ?? null,
+        url: detail.url,
+      };
     }
-    return null;
+    return out;
+  }
+
+  /** The v1 name source: project, else parent title. See `workstreamName`. */
+  function cachedProjects(tickets: string[]): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (const [ticket, detail] of linear.read(tickets)) out[ticket] = projectNameOf(detail);
+    return out;
   }
 
   // ---- scanning --------------------------------------------------------
@@ -644,7 +614,7 @@ export default async function plugin(bb: BbPluginApi) {
     const signal = caller === undefined ? disposal.signal : AbortSignal.any([caller, disposal.signal]);
     bb.realtime.publish(BOARD_CHANGED, { scanning: true });
     try {
-      const { scanRoots, linearApiKey, ticketPattern } = await settings.get();
+      const { scanRoots, ticketPattern } = await settings.get();
       const { roots, warnings } = await resolveRoots(scanRoots);
       if (roots.length === 0) {
         await bb.storage.kv.set("warnings", warnings);
@@ -667,19 +637,8 @@ export default async function plugin(bb: BbPluginApi) {
       recordTransitions(result.units);
       warnings.push(...result.warnings);
 
-      if (typeof linearApiKey === "string" && linearApiKey !== "") {
-        const tickets = ticketsOf(compilePattern(ticketPattern), result.units);
-        const stale = staleTickets(tickets);
-        if (stale.length > 0) {
-          const failure = await fetchLinearProjects(
-            linearApiKey,
-            stale,
-            signal,
-          );
-          // A Linear outage keeps the previous cache; it never fails a scan.
-          if (failure !== null) warnings.push(failure);
-        }
-      }
+      // A Linear outage keeps the previous cache and is logged once; it never fails a scan.
+      await linear.sync(await linearKeys(), ticketsOf(compilePattern(ticketPattern), result.units), signal);
 
       try {
         warnings.push(...(await enrich(signal)));
@@ -906,11 +865,13 @@ export default async function plugin(bb: BbPluginApi) {
     const warnings = new Set<string>();
     const { rules, warning } = await surfaceRules();
     if (warning !== null) warnings.add(warning);
-    const linearProjects = cachedProjects(ticketsOf(pattern, units));
+    const tickets = ticketsOf(pattern, units);
+    const linearProjects = cachedProjects(tickets);
     const workstreams = buildBoard(units, {
       pattern,
       overrides,
       linearProjects,
+      linear: clusterLinearOf(tickets),
       onWarning: (message) => warnings.add(message),
       surfaceRules: rules,
     });
@@ -1116,6 +1077,10 @@ export default async function plugin(bb: BbPluginApi) {
           cluster.units.flatMap((unit) => unit.changedPaths),
           rules,
         ),
+        linear:
+          cluster.linear === undefined || cluster.linear === null
+            ? null
+            : { title: cluster.linear.title, state: cluster.linear.state, project: cluster.linear.project, url: cluster.linear.url },
         // Strongest link first, then by id: a stable order, never a status one.
         threads: (threadsOf.get(cluster.ticket) ?? []).sort(
           (a, b) => tierRank(a.tier) - tierRank(b.tier) || a.id.localeCompare(b.id),

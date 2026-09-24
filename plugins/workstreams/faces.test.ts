@@ -34,6 +34,7 @@ function cluster(
     ticket,
     lifecycle: options.lifecycle ?? "in-progress",
     summary: `${ticket} summary`,
+    linear: null,
     units: Array.from({ length: options.units ?? 1 }, (_, i) => ({ ...unit, path: `${unit.path}/${i}` })),
     staleness: "fresh",
     surfaces: dominant.surface === null ? [] : [dominant.surface],

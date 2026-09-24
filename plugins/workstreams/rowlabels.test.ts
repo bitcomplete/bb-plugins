@@ -73,4 +73,13 @@ describe("titleHint", () => {
   it("falls back to the row's title for a branch with no PR", () => {
     expect(titleHint({ title: "dev/web-7", repo: "quill", pr: null, branch: "dev/web-7" })).toBe("dev/web-7\nquill · dev/web-7");
   });
+
+  it("adds the Linear title, state and project as one line when known, and nothing when not", () => {
+    const base = { title: "Show gift card balance", repo: "folio", pr: { number: 42, title: "Show gift card balance" }, branch: null };
+    expect(titleHint({ ...base, linear: { title: "Gift cards in the cart", state: "In Progress", project: "Print run" } })).toBe(
+      "Show gift card balance\nfolio #42\nLinear: Gift cards in the cart · In Progress · Print run",
+    );
+    expect(titleHint({ ...base, linear: null })).toBe(titleHint(base));
+    expect(titleHint({ ...base, linear: { title: null, state: null, project: null } })).toBe(titleHint(base));
+  });
 });

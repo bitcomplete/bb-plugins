@@ -114,8 +114,23 @@ export type Unit = RawUnit & {
   surfaces: string[];
   risk: Risk;
 };
+/**
+ * What Linear says about a cluster's ticket, when a key or the agent fallback
+ * found it. Context and a seeding signal; never the decider.
+ */
+export type ClusterLinear = {
+  title: string | null;
+  state: string | null;
+  project: string | null;
+  parentIdentifier: string | null;
+  parentTitle: string | null;
+  url: string | null;
+};
+
 export type Cluster = {
   ticket: string;
+  /** Absent or null when no Linear detail is known: the board then behaves exactly as without Linear. */
+  linear?: ClusterLinear | null;
   lifecycle: Lifecycle;
   units: Unit[];
   staleness: Staleness;
@@ -605,6 +620,8 @@ export function buildBoard(
     pattern: RegExp;
     overrides: Record<string, string>;
     linearProjects: Record<string, string | null>;
+    /** Ticket → Linear detail. Optional: absent means no Linear, exactly as before. */
+    linear?: Record<string, ClusterLinear>;
     /** Receives the one failure stack linking can hit: a cycle of PR bases. */
     onWarning?: (message: string) => void;
     /** Injected so staleness is a pure function and its boundaries testable. */
@@ -641,8 +658,10 @@ export function buildBoard(
     workstreamOf.set(key, name);
     const existing = clusters.get(key);
     if (existing === undefined) {
+      const linear = ticket === null ? undefined : options.linear?.[ticket];
       clusters.set(key, {
         ticket: ticket ?? raw.dirName,
+        ...(linear === undefined ? {} : { linear }),
         lifecycle: unit.lifecycle,
         units: [unit],
         staleness: unit.staleness,
@@ -916,9 +935,15 @@ export function clusterInputHash(cluster: Cluster): string {
   const branches = [
     ...new Set(cluster.units.flatMap((unit) => (unit.branch === null ? [] : [unit.branch]))),
   ].sort();
-  return hashString(
-    JSON.stringify([cluster.ticket, repos, titles, branches]),
-  );
+  // Linear's stable words join the hash only when known, so a board with no
+  // Linear detail hashes bit-for-bit as before. Its STATE never does: a ticket
+  // moving to Done is not a change in what the work is about.
+  const linear = cluster.linear;
+  const payload =
+    linear === undefined || linear === null
+      ? [cluster.ticket, repos, titles, branches]
+      : [cluster.ticket, repos, titles, branches, [linear.title, linear.project, linear.parentIdentifier ?? linear.parentTitle]];
+  return hashString(JSON.stringify(payload));
 }
 
 /**

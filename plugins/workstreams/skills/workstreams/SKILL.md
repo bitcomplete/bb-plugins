@@ -207,8 +207,8 @@ separately: `bb plugin logs workstreams`.
   force-fitted into a confident-looking effort. Checkouts with no recognizable
   ticket also land there, one cluster each, and are never sent to a model.
 - **Model calls are cached by semantic input.** Each cluster is hashed over its
-  ticket, repos, PR titles, and branch slugs — not lifecycles, counts, or
-  timestamps. A rescan where nothing changed semantically makes zero model
+  ticket, repos, PR titles, and branch slugs, plus its Linear title, project and
+  parent when known — not lifecycles, Linear state, counts, or timestamps. A rescan where nothing changed semantically makes zero model
   calls. Effort names are keyed by member set, so an effort that neither gained
   nor lost a cluster is never renamed. Call counts and token usage are logged at
   info level: `bb plugin logs workstreams`.
@@ -229,7 +229,8 @@ Configure with `bb plugin config workstreams set <key> <value>`:
 | --- | --- |
 | `scanRoots` | Newline-separated absolute paths; empty falls back to every BB project's path. |
 | `ticketPattern` | Two capture groups; default `([A-Za-z]{2,5})-(\d{1,6})`. |
-| `linearApiKey` | Secret, optional. Seeds the `basic` mode grouping name. |
+| `linearApiKeys` | Secret, optional. One or more Linear personal API keys separated by commas or spaces, one per workspace. Each ticket is routed to the key whose workspace owns its team prefix. |
+| `linearApiKey` | Secret, optional, older single-key setting. Still read and merged with `linearApiKeys`. |
 | `refreshMinutes` | 1–240, default 10. |
 | `typesafeApiKey` | Secret, optional. Turns on efforts and selected summaries. |
 | `anthropicApiKey` | Secret, optional. Turns on written group names and cohesion verdicts. |
@@ -368,3 +369,14 @@ by tier, warnings in full, and the last enrichment's model calls and tokens.
 Zoom bands span depth ranges and adapt to the depth the board actually
 collapsed to, so every band boundary reveals something. On a two-level board
 the thresholds are exactly what they were before the hierarchy existed.
+
+## Linear details
+
+Ticket detail (title, state, project, parent, labels, url) is fetched with the
+key whose workspace owns the ticket's prefix, batched, and cached for 12 hours.
+Workspaces and their team keys are re-read daily and after a settings change. A
+prefix no key owns gets no detail; that is not an error. Failures are logged
+once and keep the previous cache. Keys stay on the server and are never logged.
+
+The first scan after Linear detail arrives regroups the clusters it changed,
+which costs a one-time burst of model calls. Later scans return to zero calls.

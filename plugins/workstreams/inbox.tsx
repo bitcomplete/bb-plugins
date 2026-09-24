@@ -685,9 +685,18 @@ function InboxRow({
           #{unit.pr.number}
         </UrlLink>
       )}
-      <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch })}>
+      <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
         <span className="min-w-0 flex-[3] truncate text-foreground">{row.title}</span>
       </Tip>
+      {row.cluster.linear?.url == null ? null : (
+        <UrlLink
+          href={row.cluster.linear.url}
+          onClick={(event) => event.stopPropagation()}
+          className="shrink-0 text-[10.5px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+        >
+          Linear
+        </UrlLink>
+      )}
       {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} /> : null}
       <Tip label={row.effort}>
         <span className="hidden min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80 lg:block">

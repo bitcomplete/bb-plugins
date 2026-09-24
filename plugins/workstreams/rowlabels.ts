@@ -51,8 +51,14 @@ export function titleHint(row: {
   repo: string;
   pr: { number: number; title: string } | null;
   branch: string | null;
+  /** The ticket's Linear detail, when known: one more line, never a replacement. */
+  linear?: { title: string | null; state: string | null; project: string | null } | null;
 }): string {
   const heading = row.pr === null || row.pr.title.trim() === "" ? row.title : row.pr.title;
   const where = row.pr === null ? row.repo : `${row.repo} #${row.pr.number}`;
-  return row.branch === null ? `${heading}\n${where}` : `${heading}\n${where} · ${row.branch}`;
+  const base = row.branch === null ? `${heading}\n${where}` : `${heading}\n${where} · ${row.branch}`;
+  const linear = row.linear;
+  if (linear === undefined || linear === null) return base;
+  const parts = [linear.title, linear.state, linear.project].filter((part): part is string => part !== null && part.trim() !== "");
+  return parts.length === 0 ? base : `${base}\nLinear: ${parts.join(" · ")}`;
 }
