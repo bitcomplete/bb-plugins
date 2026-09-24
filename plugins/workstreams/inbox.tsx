@@ -132,14 +132,16 @@ export function InboxBoard({
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
-  const [compact, setCompact] = useState(false);
+  const [boardWidth, setBoardWidth] = useState(0);
   useEffect(() => {
     const node = boardRef.current;
     if (node === null) return;
-    const observer = new ResizeObserver(([entry]) => setCompact((entry?.contentRect.width ?? node.clientWidth) < 920));
+    const observer = new ResizeObserver(([entry]) => setBoardWidth(entry?.contentRect.width ?? node.clientWidth));
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
+  const compact = boardWidth < 1060;
+  const tight = boardWidth < 420;
   const [groupBy, setGroupBy] = useState<InboxGrouping>("action");
   const [actionOpen, setActionOpen] = useState<Record<InboxSection, boolean>>(() =>
     Object.fromEntries(INBOX_SECTIONS.map((section) => [section, !INBOX_COLLAPSED[section]])) as Record<
@@ -425,6 +427,7 @@ export function InboxBoard({
                           now={now}
                           reviewerColumn={reviewerColumn}
                           compact={compact}
+                          tight={tight}
                           selected={row.key === selected?.key}
                           threads={threadsOf(row)}
                           onSelect={() => select(row)}
@@ -593,6 +596,13 @@ const RUN_TONE: Record<RunStatus, string> = {
   succeeded: "bg-emerald-500/10 text-emerald-800 dark:text-emerald-300",
   failed: "bg-foreground/[0.05] text-rose-700 dark:text-rose-300",
 };
+const RUN_SHORT_LABEL: Record<RunStatus, string> = {
+  running: "Running",
+  "needs-you": "Needs you",
+  done: "Done",
+  succeeded: "Done",
+  failed: "Failed",
+};
 
 /** A clock for one chip, so "· 4m" and "2m ago" stay true while the Board is open. */
 function useTick(ms: number): number {
@@ -608,11 +618,12 @@ function useTick(ms: number): number {
  * The row's latest run, beside its verb. An agent run opens its thread; a
  * direct run has none, so it only explains itself in the tooltip.
  */
-function RunChip({ run, ageTip, onOpenThread }: { run: WireRun; ageTip: string; onOpenThread: (id: string) => void }) {
+function RunChip({ run, ageTip, compact, onOpenThread }: { run: WireRun; ageTip: string; compact: boolean; onOpenThread: (id: string) => void }) {
   const now = useTick(30_000);
   const label = runLabel(run, now);
+  const visibleLabel = compact ? RUN_SHORT_LABEL[run.status] : label;
   // The run takes the age cell's place, so the age moves into this hover.
-  const detail = `${runDetail(run, (at) => new Date(at).toLocaleString())}\n${ageTip}`;
+  const detail = `${label}\n${runDetail(run, (at) => new Date(at).toLocaleString())}\n${ageTip}`;
   const threadId = run.threadId;
   const className = cn(
     "flex min-w-0 max-w-full items-center gap-1.5 rounded px-1.5 py-0.5 text-[11px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -624,19 +635,19 @@ function RunChip({ run, ageTip, onOpenThread }: { run: WireRun; ageTip: string; 
         // Opacity only, and still under reduced motion.
         <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-current motion-safe:animate-pulse" />
       ) : null}
-      <span className="truncate">{label}</span>
+      <span className="truncate">{visibleLabel}</span>
     </>
   );
   return (
     <Tip label={threadId === null ? detail : `${detail}\nClick to open the thread`}>
       {threadId === null ? (
-        <span tabIndex={0} aria-label={`${label}. ${detail}`} className={className}>
+        <span tabIndex={0} aria-label={detail} className={className}>
           {body}
         </span>
       ) : (
         <button
           type="button"
-          aria-label={`${label}. Open the thread`}
+          aria-label={`${detail}. Open the thread`}
           onClick={(event) => {
             event.stopPropagation();
             onOpenThread(threadId);
@@ -656,6 +667,7 @@ function InboxRow({
   now,
   reviewerColumn,
   compact,
+  tight,
   selected,
   threads,
   onSelect,
@@ -671,6 +683,7 @@ function InboxRow({
   /** Some row on the Board has reviewers: every row keeps the column, so the columns stay aligned. */
   reviewerColumn: boolean;
   compact: boolean;
+  tight: boolean;
   selected: boolean;
   threads: readonly ThreadLink[];
   onSelect: () => void;
@@ -694,105 +707,110 @@ function InboxRow({
       onClick={onSelect}
       className={cn(
         "group flex min-w-0 cursor-default items-center rounded-md px-2 text-[12.5px]",
-        compact ? "min-h-16 flex-wrap gap-x-2 gap-y-1 py-2" : "h-9 gap-3",
+        compact ? "min-h-14 flex-wrap gap-y-1 py-2" : "h-9 gap-3",
         selected ? "bg-foreground/[0.07] ring-1 ring-inset ring-ring/60" : "hover:bg-foreground/[0.035]",
       )}
     >
-      <span className="order-1 flex w-[6.5rem] shrink-0 items-center">
+      <span className={cn("flex min-w-0 items-center gap-2", compact ? "w-full" : "flex-1", tight && "flex-wrap gap-y-0.5")}>
         {row.verb === null && !showSection ? null : (
-          <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
+          <span className={cn("flex shrink-0 items-center", !compact && "w-[6.5rem]")}>
+            <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
+          </span>
         )}
-      </span>
-      <span className={cn("order-2 flex min-w-0 shrink items-center gap-1.5", compact ? "flex-1" : "w-fit max-w-[11.5rem]")}>
-        <Tip label={row.repo}>
-          <span className="min-w-0 max-w-[8rem] truncate font-semibold text-foreground">{row.repo}</span>
-        </Tip>
-        {unit.pr === null ? (
-          <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : "No pull request found"}>{unit.observed?.pr === false ? "PR ?" : "—"}</span>
-        ) : (
-          <UrlLink
-            href={unit.pr.url}
-            onClick={(event) => event.stopPropagation()}
-            className="shrink-0 font-mono text-[11.5px] font-medium text-foreground underline-offset-2 hover:underline"
-          >
-            #{unit.pr.number}
-          </UrlLink>
-        )}
-      </span>
-      <span className={cn("flex min-w-0 items-center gap-2", compact ? "order-4 basis-full flex-wrap gap-y-0.5" : "order-3 flex-[3]")}>
-        <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
-          <span className={cn("min-w-0 truncate text-foreground/80", compact ? "basis-full" : "flex-1")}>{row.title}</span>
-        </Tip>
-        {resolvedThreads > 0 ? (
-          <Tip label={approvedAfterReview
-            ? `${resolvedThreads === 1 ? "The review thread is" : `All ${resolvedThreads} review threads are`} resolved; GitHub still marks this PR approved.`
-            : `${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved.`}>
-            <span tabIndex={0} className="shrink-0 rounded text-[10px] text-muted-foreground/80 outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              {resolvedThreads} {resolvedThreads === 1 ? "thread" : "threads"} resolved
-            </span>
+        <span className={cn("flex min-w-0 shrink-0 items-center gap-1.5", compact ? "max-w-[11rem]" : "max-w-[11.5rem]")}>
+          <Tip label={row.repo}>
+            <span className="min-w-0 max-w-[8rem] truncate font-semibold text-foreground">{row.repo}</span>
           </Tip>
-        ) : null}
+          {unit.pr === null ? (
+            <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : "No pull request found"}>{unit.observed?.pr === false ? "PR ?" : "—"}</span>
+          ) : (
+            <UrlLink
+              href={unit.pr.url}
+              onClick={(event) => event.stopPropagation()}
+              className="shrink-0 font-mono text-[11.5px] font-medium text-foreground underline-offset-2 hover:underline"
+            >
+              #{unit.pr.number}
+            </UrlLink>
+          )}
+        </span>
+        <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
+          <span className={cn("min-w-0 truncate text-foreground/80", tight ? "w-full flex-none" : "flex-1")}>{row.title}</span>
+        </Tip>
       </span>
-      {row.run === null ? (
-        <Tip label={ageTip}>
+      <span className={cn("flex min-w-0 items-center gap-y-1", compact ? "w-full flex-wrap gap-x-2" : "shrink-0 gap-x-3")}>
+        <span className={cn("flex max-w-full shrink-0 flex-wrap items-center gap-y-1", compact ? "gap-x-2" : "gap-x-3")}>
+          {row.run === null ? (
+            <Tip label={ageTip}>
+              <span
+                className={cn(
+                  "w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
+                  row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
+                )}
+              >
+                {age}
+              </span>
+            </Tip>
+          ) : (
+            <span className={cn("flex min-w-0 shrink-0 items-center", compact ? "max-w-[8rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
+              <RunChip run={row.run} ageTip={ageTip} compact={compact} onOpenThread={onOpenThread} />
+            </span>
+          )}
+          {resolvedThreads > 0 ? (
+            <Tip label={approvedAfterReview
+              ? `${resolvedThreads === 1 ? "The review thread is" : `All ${resolvedThreads} review threads are`} resolved; GitHub still marks this PR approved.`
+              : `${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved.`}>
+              <span tabIndex={0} className="shrink-0 rounded text-[10px] text-muted-foreground/80 outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                {resolvedThreads} {compact ? "resolved" : `${resolvedThreads === 1 ? "thread" : "threads"} resolved`}
+              </span>
+            </Tip>
+          ) : null}
+          {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
+          {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
+          {risk.length === 0 ? null : (
+            <Tip label="High risk: touches a surface that is hard to undo">
+              <span
+                tabIndex={0}
+                aria-label={`High risk: touches ${risk.join(" and ")}`}
+                className="shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-rose-300"
+              >
+                {risk.join(" · ")}
+              </span>
+            </Tip>
+          )}
+        </span>
+        <span className={cn("flex max-w-full shrink-0 items-center", compact ? "gap-2" : "gap-3")}>
+          {showSection ? null : (
+            <Tip label={row.effort}>
+              <span className={cn("min-w-0 truncate text-[11.5px] text-muted-foreground/80", compact ? "block max-w-24" : "hidden max-w-32 lg:block")}>
+                {row.effort}
+              </span>
+            </Tip>
+          )}
+          {row.cluster.linear?.url == null ? null : (
+            <UrlLink
+              href={row.cluster.linear.url}
+              onClick={(event) => event.stopPropagation()}
+              className="shrink-0 text-[10.5px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+            >
+              Linear
+            </UrlLink>
+          )}
           <span
             className={cn(
-              "order-4 w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
-              compact ? "order-3" : null,
-              row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
+              "flex shrink-0 items-center",
+              selected || compact ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
             )}
           >
-            {age}
+            <RowActionMenu
+              hasThreads={threads.length > 0}
+              onGoToThread={() => threads[0] !== undefined && onOpenThread(threads[0].id)}
+              onOpenCheckout={onOpenCheckout}
+              onNewThread={onStart}
+            />
           </span>
-        </Tip>
-      ) : (
-        <span className={cn("order-4 flex min-w-0 shrink-0 items-center", compact ? "order-3 max-w-[5.5rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
-          <RunChip run={row.run} ageTip={ageTip} onOpenThread={onOpenThread} />
+          <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />
         </span>
-      )}
-      {unit.observed?.status === false ? <span className="order-5 shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
-      {row.cluster.linear?.url == null ? null : (
-        <UrlLink
-          href={row.cluster.linear.url}
-          onClick={(event) => event.stopPropagation()}
-          className="order-5 shrink-0 text-[10.5px] text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
-        >
-          Linear
-        </UrlLink>
-      )}
-      {reviewerColumn ? <span className="order-5"><ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /></span> : null}
-      {showSection ? null : (
-        <Tip label={row.effort}>
-          <span className={cn("order-5 min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80", compact ? "block" : "hidden lg:block")}>
-            {row.effort}
-          </span>
-        </Tip>
-      )}
-      {risk.length === 0 ? null : (
-        <Tip label="High risk: touches a surface that is hard to undo">
-          <span
-            tabIndex={0}
-            aria-label={`High risk: touches ${risk.join(" and ")}`}
-            className="order-5 shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-rose-300"
-          >
-            {risk.join(" · ")}
-          </span>
-        </Tip>
-      )}
-      <span
-        className={cn(
-          "order-5 flex shrink-0 items-center",
-          selected || compact ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
-        )}
-      >
-        <RowActionMenu
-          hasThreads={threads.length > 0}
-          onGoToThread={() => threads[0] !== undefined && onOpenThread(threads[0].id)}
-          onOpenCheckout={onOpenCheckout}
-          onNewThread={onStart}
-        />
       </span>
-      <span className="order-5"><ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} /></span>
     </li>
   );
 }
