@@ -9,6 +9,7 @@ import { INBOX_SECTION_LABEL, relativeTime } from "./workstreams";
 import { TIER_WORDS } from "./threadmenu";
 import { THREAD_TIERS } from "./threads";
 import { runLabel } from "./runs";
+import { LinearFetchAction } from "./linearfetch";
 
 /** The fixed tab's stable reference: the owning nav panel, and this tab. */
 export const HOW_TAB = { panelId: "board", id: "how" } as const;
@@ -193,6 +194,15 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
             )}
           </>
         )}
+      </Section>
+
+      <Section title="Linear details">
+        <p>
+          Add one or more Linear API keys in settings and each ticket is looked up with the key whose workspace owns
+          its team prefix. For tickets no key covers, an agent in the project that holds your checkouts can look them
+          up with that project's own Linear tools. It runs only when you ask.
+        </p>
+        <LinearFetchAction />
       </Section>
 
       <Section title="Settings">

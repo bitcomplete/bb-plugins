@@ -399,6 +399,12 @@ Workspaces and their team keys are re-read daily and after a settings change. A
 prefix no key owns gets no detail; that is not an error. Failures are logged
 once and keep the previous cache. Keys stay on the server and are never logged.
 
+For tickets no key covers, **How this works → Fetch Linear details via agent**
+asks, after a confirm dialog, ONE new thread in the BB project that holds the
+checkouts to look the tickets up with that project's own Linear tools. The
+answer's last `json` block is validated and cached; anything else records the
+run as failed. It never runs on a schedule.
+
 The first scan after Linear detail arrives regroups the clusters it changed,
 which costs a one-time burst of model calls, logged as `regrouping with Linear
 detail: N clusters`. Later scans return to zero calls.

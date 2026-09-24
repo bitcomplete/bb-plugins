@@ -151,3 +151,14 @@ describe("stranded continue runs", () => {
     expect(store.closeStranded("thr-colophon-6")).toEqual([]);
   });
 });
+
+describe("settling a run from its answer", () => {
+  it("turns a cleanly finished run into a failure with a short reason when its answer was unusable", () => {
+    const { store } = setup();
+    const id = store.begin({ path: "/p", ticket: null, prUrl: null, prNumber: null, action: "linear-fetch", mode: "new", threadId: null });
+    const failed = store.settle(id, false, "No json block in the final message.");
+    expect(failed).toEqual(expect.objectContaining({ id, status: "failed", error: "No json block in the final message.", result: null }));
+    expect(failed?.finishedAt).not.toBeNull();
+    expect(store.settle(id, true, "Stored 2 of 3 tickets")).toEqual(expect.objectContaining({ status: "done", result: "Stored 2 of 3 tickets", error: null }));
+  });
+});

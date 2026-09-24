@@ -99,6 +99,7 @@ import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } 
 import { createRescanQueue } from "./rescan.js";
 import { scanFailure } from "./scancancel.js";
 import { parseLinearKeys, projectNameOf } from "./linear.js";
+import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearagent.js";
 import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 
@@ -333,6 +334,22 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.discriminatedUnion("ok", [
       z.object({ ok: z.literal(true), threadId: z.string(), ticket: z.string() }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Read-only: how many tickets the manual Linear fallback would ask an agent about. */
+  linear_fetch_plan: {
+    input: z.null(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), tickets: z.number(), capped: z.number(), running: z.boolean(), keys: z.number() }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Start the ONE fallback thread. Manual only; never scheduled. */
+  linear_fetch_run: {
+    input: z.null(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), threadId: z.string(), asked: z.number() }),
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
   },
@@ -1427,10 +1444,59 @@ export default async function plugin(bb: BbPluginApi) {
     if (changed.length === 0) return;
     for (const run of changed) {
       const finished = run.kind === "agent" ? run.status === "done" || run.status === "failed" : run.status === "succeeded";
-      if (finished) rescans.add(run.path);
+      if (run.action === LINEAR_FETCH) {
+        // Not a row: nothing to rescan. Its answer is read and stored instead.
+        if (run.status === "done") void settleLinearFetch(run);
+        else if (run.status === "failed") void forgetLinearFetch(run.id);
+      } else if (finished) rescans.add(run.path);
       bb.log.info(`run ${run.id} (${run.action}) ${run.status}${run.result === null ? "" : `: ${run.result}`}`);
     }
     announceThreads();
+  }
+
+  // ---- the manual Linear fallback: one agent thread, its answer parsed by code ----
+
+  const LINEAR_FETCH = "linear-fetch";
+
+  /** Tickets on the board that no key covers and that have no Linear detail yet. */
+  async function fallbackTickets(): Promise<string[]> {
+    const pattern = compilePattern((await settings.get()).ticketPattern);
+    const unowned = await linear.unowned(await linearKeys(), ticketsOf(pattern, readUnits()), disposal.signal);
+    const known = linear.read(unowned);
+    return unowned.filter((ticket) => !known.has(ticket)).sort((a, b) => a.localeCompare(b));
+  }
+
+  async function pendingFetches(): Promise<Record<string, string[]>> {
+    return (await bb.storage.kv.get<Record<string, string[]>>("linearFetches")) ?? {};
+  }
+
+  async function forgetLinearFetch(runId: number): Promise<string[] | undefined> {
+    const pending = await pendingFetches();
+    const asked = pending[String(runId)];
+    if (asked === undefined) return undefined;
+    delete pending[String(runId)];
+    await bb.storage.kv.set("linearFetches", pending);
+    return asked;
+  }
+
+  /** Read the finished thread's last json block, store what validates, and record the outcome. */
+  async function settleLinearFetch(run: Run): Promise<void> {
+    try {
+      const asked = await forgetLinearFetch(run.id);
+      if (asked === undefined || run.threadId === null) return;
+      const text = (await bb.sdk.threads.output({ threadId: run.threadId })).output;
+      const parsed = parseAgentAnswer(text, asked);
+      if (parsed.ok) linear.store(parsed.details.map((detail) => ({ ticket: detail.identifier, detail })), "agent");
+      const settled = runs.settle(
+        run.id,
+        parsed.ok,
+        parsed.ok ? `Stored Linear detail for ${parsed.details.length} of ${asked.length} tickets` : parsed.reason,
+      );
+      bb.log.info(`linear fetch run ${run.id}: ${parsed.ok ? `stored ${parsed.details.length} of ${asked.length}` : "failed"}`);
+      if (settled !== null) announceThreads();
+    } catch (error) {
+      bb.log.warn(`linear fetch run ${run.id}: settling failed: ${String(error).slice(0, 200)}`);
+    }
   }
 
   /** Feed one thread signal to the runs in that thread. Cheap when there are none. */
@@ -2020,6 +2086,42 @@ export default async function plugin(bb: BbPluginApi) {
         announceThreads();
       }
       return result;
+    },
+    linear_fetch_plan: async () => {
+      const tickets = await fallbackTickets();
+      const running = runs.recent(Number.MAX_SAFE_INTEGER).some((run) => run.action === LINEAR_FETCH);
+      return { ok: true as const, tickets: tickets.length, capped: Math.min(tickets.length, AGENT_FETCH_MAX), running, keys: (await linearKeys()).length };
+    },
+    linear_fetch_run: async () => {
+      if (runs.recent(Number.MAX_SAFE_INTEGER).some((run) => run.action === LINEAR_FETCH)) {
+        return { ok: false as const, error: "A Linear fetch is already running." };
+      }
+      const { roots } = await resolveRoots((await settings.get()).scanRoots);
+      const tickets = await fallbackTickets();
+      const runId = runs.begin({ path: roots[0] ?? "", ticket: null, prUrl: null, prNumber: null, action: LINEAR_FETCH, mode: "new", threadId: null });
+      let result: Awaited<ReturnType<typeof startLinearFetch>>;
+      try {
+        result = await startLinearFetch(
+          {
+            projects: { list: () => bb.sdk.projects.list() },
+            threads: { spawn: (args) => bb.sdk.threads.spawn(args) },
+          },
+          roots,
+          tickets,
+        );
+      } catch (error) {
+        runs.discard(runId);
+        throw error;
+      }
+      if (!result.ok) {
+        runs.discard(runId);
+        return result;
+      }
+      runs.attach(runId, result.threadId);
+      await bb.storage.kv.set("linearFetches", { ...(await pendingFetches()), [String(runId)]: result.asked });
+      bb.log.info(`linear fetch run ${runId}: thread ${result.threadId}, ${result.asked.length} tickets`);
+      announceThreads();
+      return { ok: true as const, threadId: result.threadId, asked: result.asked.length };
     },
     board_refresh: () => {
       // scan() flips `scanning` synchronously, so read it before calling.

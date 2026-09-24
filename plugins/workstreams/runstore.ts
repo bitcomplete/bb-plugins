@@ -170,6 +170,24 @@ export function createRunStore(db: RunDb, now: () => number = Date.now) {
       });
       return get(id)!;
     },
+    /**
+     * Overwrite a finished agent run's outcome with what code found in its
+     * answer: a run whose thread ended cleanly can still have produced nothing
+     * usable, and that is a failure with a reason, not "done".
+     */
+    settle(id: number, ok: boolean, text: string): Run | null {
+      db.prepare(`UPDATE action_runs SET status = ?, result = ?, error = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(
+        ok ? "done" : "failed",
+        ok ? clip(text) : null,
+        ok ? null : clip(text),
+        now(),
+        id,
+      );
+      const run = get(id);
+      if (run === null) return null;
+      const { armed: _armed, ...rest } = run;
+      return rest;
+    },
     /** Open runs in this thread, oldest first. */
     openIn,
     /** Every open agent run's thread, for the post-scan reconcile. */

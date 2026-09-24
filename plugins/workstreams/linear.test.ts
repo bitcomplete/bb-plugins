@@ -10,6 +10,7 @@ import {
   routeTeams,
   ticketPrefix,
 } from "./linear.js";
+import { AGENT_FETCH_MAX, agentFetchPrompt, parseAgentAnswer, startLinearFetch } from "./linearagent.js";
 
 describe("parseLinearKeys", () => {
   it("splits on commas and any whitespace, because a secret setting cannot be multi-line", () => {
@@ -112,5 +113,108 @@ describe("the batched detail query", () => {
     const base = parseDetails(["ABC-1"], { data: { t0: { identifier: "ABC-1", parent: { identifier: "ABC-0", title: "Gift cards" } } } })?.get("ABC-1");
     expect(projectNameOf(base)).toBe("Gift cards");
     expect(projectNameOf(null)).toBeNull();
+  });
+});
+
+describe("the agent fallback", () => {
+  it("asks for exactly one json block of the fields the cache keeps, and says what to do without Linear tools", () => {
+    const prompt = agentFetchPrompt(["SHOP-12", "SHOP-13"]);
+    expect(prompt).toContain("SHOP-12, SHOP-13");
+    expect(prompt).toContain("exactly one fenced ```json block");
+    for (const field of ["identifier", "title", "state", "project", "parentIdentifier", "parentTitle", "url"]) expect(prompt).toContain(field);
+    expect(prompt).toContain("empty array");
+    expect(prompt).toContain("Do not change anything in Linear");
+  });
+
+  it("parses a valid answer into agent-sourced detail", () => {
+    const text = 'Found both.\n```json\n[{"identifier":"SHOP-12","title":"Spine labels","state":"Todo","project":"Print run","parentIdentifier":"SHOP-10","parentTitle":"Bindery","url":"https://linear.app/inkwell/issue/SHOP-12"}]\n```';
+    const parsed = parseAgentAnswer(text, ["SHOP-12"]);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.details).toEqual([
+      expect.objectContaining({
+        identifier: "SHOP-12",
+        title: "Spine labels",
+        project: { id: null, name: "Print run" },
+        parent: { identifier: "SHOP-10", title: "Bindery" },
+        source: "agent",
+      }),
+    ]);
+  });
+
+  it("takes the LAST json block, because earlier ones are the agent working it out", () => {
+    const text = '```json\n[{"identifier":"SHOP-12","title":"draft"}]\n```\nOn reflection:\n```json\n[{"identifier":"SHOP-12","title":"Spine labels"}]\n```';
+    const parsed = parseAgentAnswer(text, ["SHOP-12"]);
+    expect(parsed.ok && parsed.details[0]?.title).toBe("Spine labels");
+  });
+
+  it("accepts an empty array as a real answer: the session had no Linear tools", () => {
+    expect(parseAgentAnswer("No Linear tools here.\n```json\n[]\n```", ["SHOP-12"])).toEqual({ ok: true, details: [] });
+  });
+
+  it("fails with a short reason on invalid output, so nothing half-parsed is stored", () => {
+    expect(parseAgentAnswer("no block at all", ["SHOP-12"])).toEqual({ ok: false, reason: "No json block in the final message." });
+    expect(parseAgentAnswer("```json\n{not json\n```", ["SHOP-12"]).ok).toBe(false);
+    expect(parseAgentAnswer('```json\n{"identifier":"SHOP-12"}\n```', ["SHOP-12"]).ok).toBe(false);
+    expect(parseAgentAnswer(null, ["SHOP-12"]).ok).toBe(false);
+  });
+
+  it("stores only tickets it was asked about, so an agent cannot add rows to the cache", () => {
+    const parsed = parseAgentAnswer('```json\n[{"identifier":"SHOP-12"},{"identifier":"ABC-999"}]\n```', ["SHOP-12"]);
+    expect(parsed.ok && parsed.details.map((detail) => detail.identifier)).toEqual(["SHOP-12"]);
+  });
+
+  it("caps a run at a bounded number of tickets", () => {
+    expect(AGENT_FETCH_MAX).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("starting the agent fallback", () => {
+  function fakeSdk(projects: { id: string; sources: { hostId: string; path: string }[] }[]) {
+    const spawned: unknown[] = [];
+    return {
+      spawned,
+      sdk: {
+        projects: { list: async () => projects },
+        threads: {
+          spawn: async (args: unknown) => {
+            spawned.push(args);
+            return { id: "thr-fetch-1" };
+          },
+        },
+      },
+    };
+  }
+
+  it("spawns ONE thread in the deepest project containing the scan root, so that project's Linear identity answers", async () => {
+    const { sdk, spawned } = fakeSdk([
+      { id: "prj-home", sources: [{ hostId: "host-a", path: "/Users/inkwell" }] },
+      { id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/Users/inkwell/checkouts" }] },
+    ]);
+    const result = await startLinearFetch(sdk, ["/Users/inkwell/checkouts"], ["SHOP-12", "SHOP-13"]);
+    expect(result).toEqual({ ok: true, threadId: "thr-fetch-1", root: "/Users/inkwell/checkouts", asked: ["SHOP-12", "SHOP-13"] });
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual(
+      expect.objectContaining({
+        projectId: "prj-inkwell",
+        environment: { type: "host", hostId: "host-a", workspace: { type: "unmanaged", path: "/Users/inkwell/checkouts" } },
+        prompt: agentFetchPrompt(["SHOP-12", "SHOP-13"]),
+      }),
+    );
+  });
+
+  it("spawns nothing when there is nothing to ask, or no project holds the checkouts", async () => {
+    const empty = fakeSdk([{ id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/Users/inkwell/checkouts" }] }]);
+    expect((await startLinearFetch(empty.sdk, ["/Users/inkwell/checkouts"], [])).ok).toBe(false);
+    const orphan = fakeSdk([{ id: "prj-other", sources: [{ hostId: "host-a", path: "/elsewhere" }] }]);
+    expect((await startLinearFetch(orphan.sdk, ["/Users/inkwell/checkouts"], ["SHOP-12"])).ok).toBe(false);
+    expect([...empty.spawned, ...orphan.spawned]).toEqual([]);
+  });
+
+  it("caps the tickets one run asks about", async () => {
+    const { sdk } = fakeSdk([{ id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/c" }] }]);
+    const many = Array.from({ length: AGENT_FETCH_MAX + 10 }, (_, index) => `SHOP-${index + 1}`);
+    const result = await startLinearFetch(sdk, ["/c"], many);
+    expect(result.ok && result.asked).toHaveLength(AGENT_FETCH_MAX);
   });
 });

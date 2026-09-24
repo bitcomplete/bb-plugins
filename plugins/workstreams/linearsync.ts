@@ -174,6 +174,11 @@ export function createLinearSync(deps: LinearSyncDeps) {
       return { fetched, unowned };
     },
 
+    /** Tickets no key covers, using the last discovery (running one if there is none yet). */
+    async unowned(keys: readonly string[], tickets: readonly string[], signal: AbortSignal): Promise<string[]> {
+      if (keys.length === 0) return [...tickets];
+      return planFetch(tickets, routeTeams(await workspaces(keys, signal)).owner).unowned;
+    },
   };
 }
 

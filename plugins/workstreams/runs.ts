@@ -190,6 +190,7 @@ const AGENT_DOING: Record<string, string> = {
   "investigate-ci": "investigating CI",
   "address-review": "addressing review",
   "address-comments": "addressing comments",
+  "linear-fetch": "fetching Linear details",
 };
 
 /** The run a row reports: its latest, while open or finished within a day. */
