@@ -65,6 +65,16 @@ export const prSchema = z
      * so a unit cached before the field existed still parses.
      */
     reviewRequests: z.array(z.string().max(140)).max(20).default([]),
+    /**
+     * Each reviewer's latest review, with who left it, from the same
+     * `latestReviews` field `latestReviewStates` reads. The Board row shows
+     * one mark per reviewer. Defaulted so a unit cached before the field
+     * existed still parses.
+     */
+    latestReviews: z
+      .array(z.object({ login: z.string().max(140), state: z.string().max(40) }).strict())
+      .max(50)
+      .default([]),
   })
   .strict();
 export type Pr = z.infer<typeof prSchema>;

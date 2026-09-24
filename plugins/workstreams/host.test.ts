@@ -2,7 +2,7 @@
 // rule in workstreams.ts. Nothing here needs a network, a token, or git: what
 // is checked is how a payload is read, not how it was fetched.
 import { describe, expect, it } from "vitest";
-import { latestReviewStates, mergeCommitOf, parseMergeStateStatus, parsePrList } from "./gh.js";
+import { latestReviewStates, latestReviewers, mergeCommitOf, parseMergeStateStatus, parsePrList } from "./gh.js";
 
 describe("latestReviewStates", () => {
   it("uppercases each reviewer's most recent state, because `approved-with-comments` turns on a COMMENTED review the aggregate decision hides", () => {
@@ -15,6 +15,25 @@ describe("latestReviewStates", () => {
     expect(latestReviewStates(undefined)).toEqual([]);
     expect(latestReviewStates("nonsense")).toEqual([]);
     expect(latestReviewStates([null, {}, { state: "" }])).toEqual([]);
+  });
+});
+
+describe("latestReviewers", () => {
+  it("keeps who left each latest review, bots included, because the Board row marks every reviewer and a bot's review counts like a person's", () => {
+    expect(
+      latestReviewers([
+        { author: { login: "reader-ada" }, state: "approved" },
+        { author: { login: "inkbot" }, state: "COMMENTED" },
+      ]),
+    ).toEqual([
+      { login: "reader-ada", state: "APPROVED" },
+      { login: "inkbot", state: "COMMENTED" },
+    ]);
+  });
+
+  it("drops an entry with no author or state rather than inventing a reviewer", () => {
+    expect(latestReviewers(undefined)).toEqual([]);
+    expect(latestReviewers([null, { state: "APPROVED" }, { author: { login: "reader-lin" } }, { author: null, state: "APPROVED" }])).toEqual([]);
   });
 });
 
@@ -40,7 +59,10 @@ describe("parsePrList", () => {
         isDraft: false,
         reviewDecision: "approved",
         statusCheckRollup: [{ conclusion: "success" }],
-        latestReviews: [{ state: "APPROVED" }, { state: "COMMENTED" }],
+        latestReviews: [
+          { author: { login: "reader-ada" }, state: "APPROVED" },
+          { author: { login: "reader-lin" }, state: "COMMENTED" },
+        ],
         url: "https://github.com/inkwell/folio/pull/42",
         title: "ABC-101: Show gift card balance",
         mergeable: "mergeable",
@@ -53,6 +75,13 @@ describe("parsePrList", () => {
 
   it("carries the review states through, because that field is the whole reason the gh call changed", () => {
     expect(parsePrList(row())?.pr.latestReviewStates).toEqual(["APPROVED", "COMMENTED"]);
+  });
+
+  it("carries the reviewers from the same latestReviews field, because the row's reviewer marks must cost no extra gh call", () => {
+    expect(parsePrList(row())?.pr.latestReviews).toEqual([
+      { login: "reader-ada", state: "APPROVED" },
+      { login: "reader-lin", state: "COMMENTED" },
+    ]);
   });
 
   it("returns the merge commit beside the PR rather than on it, because it is an input to a local git check and not a fact the board renders", () => {

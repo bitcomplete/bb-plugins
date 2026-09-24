@@ -240,8 +240,9 @@ Configure with `bb plugin config workstreams set <key> <value>`:
 
 ## Row actions
 
-Each Board row offers the action its verb calls for, on its action button, in
-its `⋯` menu, and on the `a` key. Every row also offers **Go to thread** (`t`)
+Each Board row offers the action its verb calls for: the row's verb chip is
+its button, and the `a` key runs it. Rows with nothing to do show the verb as
+plain text. The `⋯` menu offers **Go to thread** (`t`), **Open checkout** (`o`)
 and **Start a new thread** (`n`). Opening a dialog never writes; the write runs
 only from the dialog's confirm button.
 
@@ -336,8 +337,8 @@ and the last day's, newest first. Nothing polls:
   checkout (`inspectPaths` on the host), batched over 3 seconds, so the row
   moves sections on its own.
 
-The Board shows the row's latest run beside its verb (running, needs you, or
-finished in the last 24 hours), and an **Agents** line at the top while
+The Board shows the row's latest run in place of its age (running, needs you,
+or finished in the last 24 hours), and an **Agents** line at the top while
 anything is running, waiting on you, or finished in the last 4 hours. BB's
 sidebar shows a count beside Workstreams: needs-you first, else running.
 

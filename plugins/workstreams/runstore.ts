@@ -2,7 +2,7 @@
 // action, a bounded history, and the status each thread signal moves it to.
 // Written against the slice of SQLite server.ts already uses, so the tests run
 // the real SQL on an in-memory database.
-import { applySignal, clip, type Run, type RunMode, type RunStatus, type ThreadSignal } from "./runs.js";
+import { applySignal, clip, isStranded, type Run, type RunMode, type RunStatus, type ThreadSignal } from "./runs.js";
 
 /** Append-only: server.ts adds this to its migration list. */
 export const RUNS_MIGRATION = `CREATE TABLE IF NOT EXISTS action_runs (
@@ -200,6 +200,23 @@ export function createRunStore(db: RunDb, now: () => number = Date.now) {
         db.prepare(
           `UPDATE action_runs SET status = ?, armed = ?, finished_at = ?, result = ?, error = ? WHERE id = ? AND status IN ('running', 'needs-you')`,
         ).run(patch.status, patch.armed ? 1 : 0, patch.finishedAt, patch.result, patch.error, run.id);
+        const next = get(run.id);
+        if (next !== null) changed.push(next);
+      }
+      return changed;
+    },
+    /**
+     * Close this idle thread's stranded continue runs (see `isStranded`) as
+     * done, with no result. Returns the runs that changed.
+     */
+    closeStranded(threadId: string): Run[] {
+      const at = now();
+      const changed: Run[] = [];
+      for (const run of openIn(threadId)) {
+        if (!isStranded(run, true, at)) continue;
+        db.prepare(
+          `UPDATE action_runs SET status = 'done', finished_at = ?, result = NULL, error = NULL WHERE id = ? AND status IN ('running', 'needs-you')`,
+        ).run(at, run.id);
         const next = get(run.id);
         if (next !== null) changed.push(next);
       }

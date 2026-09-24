@@ -14,7 +14,6 @@ import {
   nudgeComment,
   type AgentAction,
   type DirectAction,
-  type PrimaryAction,
   type ThreadMode,
 } from "./actions";
 import { compactAge } from "./workstreams";
@@ -38,24 +37,21 @@ export type ActionRequest =
   | { kind: "direct"; action: DirectAction; row: Row }
   | { kind: "agent"; action: AgentAction; row: Row };
 
-const PRIMARY_ICON: Record<PrimaryAction["kind"], string> = { agent: "Bot", direct: "GitMerge", jump: "ArrowDown" };
-
 /**
- * The row's primary action as a small labelled button, and a menu with the
- * rest. Shown on hover or selection like the other row controls, and every
- * item is a real button, so Tab reaches it and Enter or Space runs it.
+ * The row's secondary actions behind one "More actions" button. The primary
+ * action is the row's verb chip, so it is not repeated here. Shown on hover or
+ * selection like the other row controls, and every item is a real button, so
+ * Tab reaches it and Enter or Space runs it.
  */
 export function RowActionMenu({
-  primary,
   hasThreads,
-  onPrimary,
   onGoToThread,
+  onOpenCheckout,
   onNewThread,
 }: {
-  primary: PrimaryAction | null;
   hasThreads: boolean;
-  onPrimary: () => void;
   onGoToThread: () => void;
+  onOpenCheckout: () => void;
   onNewThread: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -85,22 +81,6 @@ export function RowActionMenu({
   );
   return (
     <span ref={rootRef} className="relative flex items-center gap-0.5" onKeyDown={(event) => event.key === "Escape" && setOpen(false)}>
-      {primary === null ? null : (
-        <Tip label={`${primary.label} (a)`}>
-          <button
-            type="button"
-            aria-label={`${primary.label} (a)`}
-            onClick={(event) => {
-              event.stopPropagation();
-              onPrimary();
-            }}
-            className="flex h-6 items-center gap-1 rounded px-1.5 text-[11px] font-medium text-foreground/85 outline-none hover:bg-foreground/[0.08] focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Icon name={PRIMARY_ICON[primary.kind]} className="size-3.5" />
-            {primary.label}
-          </button>
-        </Tip>
-      )}
       <Tip label="More actions">
         <button
           type="button"
@@ -121,8 +101,8 @@ export function RowActionMenu({
           role="menu"
           className="absolute right-0 top-7 z-30 flex w-56 flex-col rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
         >
-          {primary === null ? null : item(primary.label, "a", onPrimary)}
           {hasThreads ? item("Go to thread", "t", onGoToThread) : null}
+          {item("Open checkout", "o", onOpenCheckout)}
           {item("Start a new thread", "n", onNewThread)}
         </span>
       ) : null}

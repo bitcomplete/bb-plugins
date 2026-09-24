@@ -70,6 +70,27 @@ export function latestReviewStates(reviews: unknown): string[] {
     .slice(0, 50);
 }
 
+/**
+ * Who left each latest review, and its state, from the same `latestReviews`
+ * payload. Bots are kept: they review like people. Display only, never passed
+ * to gh, so a login is bounded rather than validated.
+ */
+export function latestReviewers(reviews: unknown): { login: string; state: string }[] {
+  if (!Array.isArray(reviews)) return [];
+  return reviews
+    .flatMap((entry) => {
+      if (entry === null || typeof entry !== "object") return [];
+      const record = entry as Record<string, unknown>;
+      const author = record.author;
+      const login =
+        author !== null && typeof author === "object" ? (author as Record<string, unknown>).login : undefined;
+      const state = record.state;
+      if (typeof login !== "string" || login === "" || typeof state !== "string" || state === "") return [];
+      return [{ login: login.slice(0, 140), state: state.toUpperCase().slice(0, 40) }];
+    })
+    .slice(0, 50);
+}
+
 /** `gh pr list --json mergeCommit` gives `{ oid }`, or null before a merge. */
 export function mergeCommitOf(value: unknown): string | null {
   if (value === null || typeof value !== "object") return null;
@@ -117,6 +138,7 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
         : null,
     latestReviewStates: latestReviewStates(view.latestReviews),
     reviewRequests: parseReviewRequests(view.reviewRequests),
+    latestReviews: latestReviewers(view.latestReviews),
     mergedAt:
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)

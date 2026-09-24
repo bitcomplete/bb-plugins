@@ -88,12 +88,15 @@ import { TypeSafeClient, choice, score } from "@typesafe-ai/sdk";
 import { RUNS_MIGRATION, createRunStore } from "./runstore.js";
 import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } from "./runs.js";
 import { createRescanQueue } from "./rescan.js";
+import { scanFailure } from "./scancancel.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
 const LINEAR_TTL_MS = 24 * 60 * 60 * 1_000;
 const LINEAR_BATCH = 25;
 const SCAN_TIMEOUT_MS = 10 * 60 * 1_000;
 const NAMING_TIMEOUT_MS = 5 * 60 * 1_000;
+/** How long a dead host worker waits for the dispose that says a reload killed it. */
+const RELOAD_GRACE_MS = 5_000;
 const BOARD_CHANGED = "board-changed";
 /** Several runs finishing together share one targeted rescan. */
 const RESCAN_DELAY_MS = 3_000;
@@ -600,6 +603,9 @@ export default async function plugin(bb: BbPluginApi) {
   // ---- scanning --------------------------------------------------------
 
   let scanning = false;
+  /** Aborts every in-flight scan when a reload disposes the plugin. */
+  const disposal = new AbortController();
+  bb.onDispose(() => disposal.abort());
 
   async function resolveRoots(configured: string): Promise<{
     roots: string[];
@@ -632,9 +638,10 @@ export default async function plugin(bb: BbPluginApi) {
     return { roots: roots.slice(0, 50), warnings };
   }
 
-  async function scan(signal?: AbortSignal): Promise<boolean> {
+  async function scan(caller?: AbortSignal): Promise<boolean> {
     if (scanning) return false;
     scanning = true;
+    const signal = caller === undefined ? disposal.signal : AbortSignal.any([caller, disposal.signal]);
     bb.realtime.publish(BOARD_CHANGED, { scanning: true });
     try {
       const { scanRoots, linearApiKey, ticketPattern } = await settings.get();
@@ -667,7 +674,7 @@ export default async function plugin(bb: BbPluginApi) {
           const failure = await fetchLinearProjects(
             linearApiKey,
             stale,
-            signal ?? new AbortController().signal,
+            signal,
           );
           // A Linear outage keeps the previous cache; it never fails a scan.
           if (failure !== null) warnings.push(failure);
@@ -675,8 +682,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       try {
-        warnings.push(...(await enrich(signal ?? new AbortController().signal)));
+        warnings.push(...(await enrich(signal)));
       } catch (error) {
+        // A reload is not a grouping failure: let the outer catch log it as cancelled.
+        if (disposal.signal.aborted) throw error;
         // Grouping is an enhancement over a board that already works. Losing it
         // must never lose the scan that produced the board.
         warnings.push(`Effort grouping failed: ${String(error).slice(0, 200)}`);
@@ -691,6 +700,11 @@ export default async function plugin(bb: BbPluginApi) {
       void syncThreads();
       return true;
     } catch (error) {
+      // A reload killing the scan is a cancellation: no error, no warning.
+      if ((await scanFailure(error, disposal.signal, RELOAD_GRACE_MS)) === "cancelled") {
+        bb.log.info("scan cancelled by reload");
+        return false;
+      }
       await bb.storage.kv.set("warnings", [
         `Scan failed: ${String(error).slice(0, 400)}`,
       ]);
@@ -1446,11 +1460,22 @@ export default async function plugin(bb: BbPluginApi) {
       if (!open.has(row.id)) continue;
       if (row.hasPendingInteraction) signalRuns(row.id, { kind: "pending" });
       else if (row.status === "active") signalRuns(row.id, { kind: "settled" });
-      else if (runs.openIn(row.id).every((run) => run.startedAt < settledBefore)) {
-        if (row.status === "idle") signalRuns(row.id, { kind: "idle", text: null });
-        else if (row.status === "error") signalRuns(row.id, { kind: "failed", text: null, error: null });
+      else {
+        if (row.status === "idle") closeStranded(row.id);
+        if (runs.openIn(row.id).every((run) => run.startedAt < settledBefore)) {
+          if (row.status === "idle") signalRuns(row.id, { kind: "idle", text: null });
+          else if (row.status === "error") signalRuns(row.id, { kind: "failed", text: null, error: null });
+        }
       }
     }
+  }
+
+  /** A continue run whose own turn was missed in a reload never arms: close it after 6h on an idle thread. */
+  function closeStranded(threadId: string): void {
+    const closed = runs.closeStranded(threadId);
+    if (closed.length === 0) return;
+    bb.log.info(`closed ${closed.length} stranded continue run(s) in thread ${threadId}`);
+    runsChanged(closed);
   }
 
   // ---- enrichment: the only place model calls happen --------------------

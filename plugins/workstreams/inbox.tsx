@@ -14,7 +14,6 @@ import {
   INBOX_SECTION_LABEL,
   ESCALATING,
   STALENESS,
-  ageLabel,
   byInboxOrder,
   displayTitle,
   groupChildren,
@@ -45,6 +44,8 @@ import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
+import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
+import { ageHint, primaryHint, shortAge, shortVerb, titleHint } from "./rowlabels";
 
 type Cluster = WireGroup["clusters"][number];
 type Unit = Cluster["units"][number];
@@ -186,7 +187,10 @@ export function InboxBoard({
   );
   const openThread = useCallback((id: string) => navigate.toThread(id), [navigate]);
 
-  const runColumn = useMemo(() => [...all.values()].some((rows) => rows.some((row) => row.run !== null)), [all]);
+  const reviewerColumn = useMemo(
+    () => [...all.values()].some((rows) => rows.some((row) => reviewersOf(row.unit.pr).length > 0)),
+    [all],
+  );
 
   const [starting, setStarting] = useState<Row | null>(null);
   const [request, setRequest] = useState<ActionRequest | null>(null);
@@ -379,7 +383,7 @@ export function InboxBoard({
                           key={row.key}
                           row={row}
                           now={now}
-                          runColumn={runColumn}
+                          reviewerColumn={reviewerColumn}
                           selected={row.key === selected?.key}
                           threads={threadsOf(row)}
                           onSelect={() => select(row)}
@@ -462,20 +466,80 @@ function ThreadMark({
   );
 }
 
-function RowAction({ label, icon, onClick }: { label: string; icon: string; onClick: () => void }) {
+/**
+ * The row's verb. When the row has a primary action the chip IS its button
+ * (the same thing `a` runs); otherwise it is plain text, so a filled chip
+ * always means "click to act". The hover spells out the full verb.
+ */
+function VerbChip({
+  verb,
+  section,
+  action,
+  onPrimary,
+}: {
+  verb: string;
+  section: InboxSection;
+  action: PrimaryAction | null;
+  onPrimary: () => void;
+}) {
+  const label = shortVerb(verb);
+  if (action === null) {
+    return (
+      <Tip label={verb}>
+        <span className="truncate px-1.5 text-[11px] text-muted-foreground">{label}</span>
+      </Tip>
+    );
+  }
+  const hint = primaryHint(verb, action);
   return (
-    <Tip label={label}>
+    <Tip label={hint}>
       <button
         type="button"
-        aria-label={label}
+        aria-label={hint}
         onClick={(event) => {
           event.stopPropagation();
-          onClick();
+          onPrimary();
         }}
-        className="flex size-6 items-center justify-center rounded text-muted-foreground outline-none hover:bg-foreground/[0.08] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        className={cn(
+          "max-w-full cursor-pointer truncate rounded px-1.5 py-0.5 text-[11px] font-medium outline-none ring-1 ring-inset ring-foreground/15 hover:ring-foreground/35 hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
+          CHIP[section],
+        )}
       >
-        <Icon name={icon} className="size-3.5" />
+        {label}
       </button>
+    </Tip>
+  );
+}
+
+const REVIEWER_TONE: Record<ReviewerState, string> = {
+  approved: "text-emerald-700 dark:text-emerald-300",
+  changes: "text-rose-700 dark:text-rose-300",
+  commented: "text-muted-foreground",
+  pending: "text-muted-foreground",
+};
+
+/** Up to three reviewer marks and a "+N"; the hover lists every reviewer and where they stand. */
+function ReviewerMarks({ reviewers }: { reviewers: readonly Reviewer[] }) {
+  if (reviewers.length === 0) return <span className="w-[7rem] shrink-0" aria-hidden />;
+  const { shown, more } = visibleReviewers(reviewers);
+  const label = reviewersLabel(reviewers);
+  return (
+    <Tip label={label}>
+      <span
+        tabIndex={0}
+        aria-label={`Reviewers: ${label.replace(/\n/gu, "; ")}`}
+        className="flex w-[7rem] shrink-0 items-center gap-1.5 overflow-hidden rounded font-mono text-[10.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {shown.map((reviewer) => (
+          <span key={reviewer.login} className="flex shrink-0 items-center gap-0.5">
+            <span aria-hidden className={cn("text-[11px]", REVIEWER_TONE[reviewer.state])}>
+              {REVIEWER_MARK[reviewer.state]}
+            </span>
+            <span className="text-foreground/75">{reviewerInitials(reviewer.login)}</span>
+          </span>
+        ))}
+        {more > 0 ? <span className="shrink-0 text-muted-foreground">+{more}</span> : null}
+      </span>
     </Tip>
   );
 }
@@ -503,10 +567,11 @@ function useTick(ms: number): number {
  * The row's latest run, beside its verb. An agent run opens its thread; a
  * direct run has none, so it only explains itself in the tooltip.
  */
-function RunChip({ run, onOpenThread }: { run: WireRun; onOpenThread: (id: string) => void }) {
+function RunChip({ run, ageTip, onOpenThread }: { run: WireRun; ageTip: string; onOpenThread: (id: string) => void }) {
   const now = useTick(30_000);
   const label = runLabel(run, now);
-  const detail = runDetail(run, (at) => new Date(at).toLocaleString());
+  // The run takes the age cell's place, so the age moves into this hover.
+  const detail = `${runDetail(run, (at) => new Date(at).toLocaleString())}\n${ageTip}`;
   const threadId = run.threadId;
   const className = cn(
     "flex min-w-0 max-w-full items-center gap-1.5 rounded px-1.5 py-0.5 text-[11px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring",
@@ -547,7 +612,7 @@ function RunChip({ run, onOpenThread }: { run: WireRun; onOpenThread: (id: strin
 function InboxRow({
   row,
   now,
-  runColumn,
+  reviewerColumn,
   selected,
   threads,
   onSelect,
@@ -559,8 +624,8 @@ function InboxRow({
 }: {
   row: Row;
   now: number;
-  /** Some row on the Board has a run: every row keeps the column, so the columns stay aligned. */
-  runColumn: boolean;
+  /** Some row on the Board has reviewers: every row keeps the column, so the columns stay aligned. */
+  reviewerColumn: boolean;
   selected: boolean;
   threads: readonly ThreadLink[];
   onSelect: () => void;
@@ -572,7 +637,8 @@ function InboxRow({
 }) {
   const { unit } = row;
   const risk = unit.surfaces.filter((surface) => ESCALATING.includes(surface));
-  const age = ageLabel(row.age, now);
+  const age = shortAge(row.age, now);
+  const ageTip = ageHint(row.age, row.verb, now);
   return (
     <li
       id={`inbox-${row.key}`}
@@ -584,34 +650,30 @@ function InboxRow({
         selected ? "bg-foreground/[0.07] ring-1 ring-inset ring-ring/60" : "hover:bg-foreground/[0.035]",
       )}
     >
-      <span className="flex w-[10.5rem] shrink-0 items-center">
+      <span className="flex w-[6.5rem] shrink-0 items-center">
         {row.verb === null ? null : (
-          <span className={cn("truncate rounded px-1.5 py-0.5 text-[11px] font-medium", CHIP[row.section])}>
-            {row.verb}
+          <VerbChip verb={row.verb} section={row.section} action={row.action} onPrimary={onPrimary} />
+        )}
+      </span>
+      {row.run === null ? (
+        <Tip label={ageTip}>
+          <span
+            className={cn(
+              "w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
+              row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
+            )}
+          >
+            {age}
           </span>
-        )}
-      </span>
-      {runColumn ? (
-        <span className="flex w-[13rem] shrink-0 items-center">
-          {row.run === null ? null : <RunChip run={row.run} onOpenThread={onOpenThread} />}
+        </Tip>
+      ) : (
+        <span className="flex min-w-[2.5rem] max-w-[13rem] shrink-0 items-center">
+          <RunChip run={row.run} ageTip={ageTip} onOpenThread={onOpenThread} />
         </span>
-      ) : null}
-      <span
-        className={cn(
-          "w-[6.5rem] shrink-0 truncate text-right font-mono text-[10.5px] tabular-nums",
-          row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
-        )}
-        title={
-          row.age.basis === "state"
-            ? "Time in this state"
-            : "No state change seen yet, so this is the time since the last commit"
-        }
-      >
-        {age}
-      </span>
-      <span className="w-32 shrink-0 truncate font-medium text-foreground" title={row.repo}>
-        {row.repo}
-      </span>
+      )}
+      <Tip label={row.repo}>
+        <span className="w-32 shrink-0 truncate font-medium text-foreground">{row.repo}</span>
+      </Tip>
       {unit.pr === null ? (
         <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground/70">—</span>
       ) : (
@@ -623,15 +685,15 @@ function InboxRow({
           #{unit.pr.number}
         </UrlLink>
       )}
-      <span className="min-w-0 flex-[3] truncate text-foreground" title={row.title}>
-        {row.title}
-      </span>
-      <span
-        className="hidden min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80 lg:block"
-        title={row.effort}
-      >
-        {row.effort}
-      </span>
+      <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch })}>
+        <span className="min-w-0 flex-[3] truncate text-foreground">{row.title}</span>
+      </Tip>
+      {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} /> : null}
+      <Tip label={row.effort}>
+        <span className="hidden min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80 lg:block">
+          {row.effort}
+        </span>
+      </Tip>
       {risk.length === 0 ? null : (
         <Tip label="High risk: touches a surface that is hard to undo">
           <span
@@ -645,16 +707,14 @@ function InboxRow({
       )}
       <span
         className={cn(
-          "flex shrink-0 items-center gap-0.5",
+          "flex shrink-0 items-center",
           selected ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
         )}
       >
-        <RowAction label="Open checkout (o)" icon="FolderOpen" onClick={onOpenCheckout} />
         <RowActionMenu
-          primary={row.action}
           hasThreads={threads.length > 0}
-          onPrimary={onPrimary}
           onGoToThread={() => threads[0] !== undefined && onOpenThread(threads[0].id)}
+          onOpenCheckout={onOpenCheckout}
           onNewThread={onStart}
         />
       </span>

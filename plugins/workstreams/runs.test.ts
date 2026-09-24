@@ -4,11 +4,13 @@ import { describe, expect, it } from "vitest";
 import {
   RESULT_MAX,
   ROW_RUN_MS,
+  STRANDED_MS,
   STRIP_RECENT_MS,
   applySignal,
   badgeValue,
   directOutcome,
   extractResult,
+  isStranded,
   rowRun,
   runDetail,
   runLabel,
@@ -236,5 +238,27 @@ describe("badgeValue", () => {
   it("falls back to the running count, and shows nothing at zero", () => {
     expect(badgeValue([run(), run({ status: "done" })])).toEqual({ count: 1, needsYou: false });
     expect(badgeValue([run({ status: "done" }), run({ status: "succeeded" })])).toBeNull();
+  });
+});
+
+describe("isStranded", () => {
+  const NOW = Date.UTC(2030, 0, 10, 12);
+  const stranded = { mode: "continue" as const, armed: false, status: "running" as const, startedAt: NOW - STRANDED_MS - 1 };
+
+  it("closes only an unarmed continue run, still open, on an idle thread, past 6h", () => {
+    expect(isStranded(stranded, true, NOW)).toBe(true);
+  });
+
+  it("keeps each of the other cases open, because each still has a signal that can finish it", () => {
+    expect(isStranded({ ...stranded, startedAt: NOW - STRANDED_MS + 60_000 }, true, NOW)).toBe(false);
+    expect(isStranded(stranded, false, NOW)).toBe(false);
+    expect(isStranded({ ...stranded, armed: true }, true, NOW)).toBe(false);
+    expect(isStranded({ ...stranded, mode: "new" }, true, NOW)).toBe(false);
+    expect(isStranded({ ...stranded, status: "done" }, true, NOW)).toBe(false);
+  });
+
+  it("labels a closed stranded run 'Done: see thread', because no result is known", () => {
+    const closed: Run = { ...run({ status: "done", result: null, mode: "continue" }) };
+    expect(runLabel(closed, NOW)).toBe("Done: see thread");
   });
 });

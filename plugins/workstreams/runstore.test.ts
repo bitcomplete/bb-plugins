@@ -117,3 +117,37 @@ describe("pruning", () => {
     expect(store.recent(0).some((run) => run.id === open)).toBe(true);
   });
 });
+
+describe("stranded continue runs", () => {
+  const HOUR = 3_600_000;
+
+  it("closes an unarmed continue run on an idle thread after 6h as done with no result, because its outcome is unknown and must not be invented", async () => {
+    const { store, tick } = setup();
+    const id = store.begin({ ...TARGET, action: "address-comments", mode: "continue", threadId: "thr-spine-4" });
+    tick(6 * HOUR + 1_000);
+    const [closed] = store.closeStranded("thr-spine-4");
+    expect(closed).toMatchObject({ id, status: "done", result: null, error: null });
+    // Closed runs never move again, even on a later turn in the same thread.
+    expect(await store.signal("thr-spine-4", { kind: "idle", text: "Result: something else" }, async () => null)).toEqual([]);
+  });
+
+  it("leaves a run under 6h open, because its own turn may still arrive", () => {
+    const { store, tick } = setup();
+    store.begin({ ...TARGET, action: "address-comments", mode: "continue", threadId: "thr-spine-4" });
+    tick(5 * HOUR);
+    expect(store.closeStranded("thr-spine-4")).toEqual([]);
+    expect(store.recent(0)[0]?.status).toBe("running");
+  });
+
+  it("leaves an armed run and a new-thread run alone, because their turns were seen and the normal signals finish them", async () => {
+    const { store, tick } = setup();
+    store.begin({ ...TARGET, action: "address-review", mode: "continue", threadId: "thr-colophon-5" });
+    tick(1_000);
+    await store.signal("thr-colophon-5", { kind: "active" }, async () => null);
+    const fresh = store.begin({ ...TARGET, action: "investigate-ci", mode: "new", threadId: null });
+    store.attach(fresh, "thr-colophon-6");
+    tick(7 * HOUR);
+    expect(store.closeStranded("thr-colophon-5")).toEqual([]);
+    expect(store.closeStranded("thr-colophon-6")).toEqual([]);
+  });
+});

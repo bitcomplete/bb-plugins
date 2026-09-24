@@ -135,6 +135,24 @@ export function applySignal(run: TrackedRun, signal: ThreadSignal, at: number): 
   }
 }
 
+/** How long an unarmed continue run may wait on an idle thread before it is closed. */
+export const STRANDED_MS = 6 * 60 * 60 * 1_000;
+
+/**
+ * A `continue` run whose own turn was never seen (its `thread.active` fired
+ * during a reload) would otherwise stay "running" forever. Once its thread is
+ * idle and the run is over six hours old, it is closed as done with no result:
+ * the turn may well have finished, but what it did is not known, so the row
+ * says "Done: see thread" rather than inventing an outcome.
+ */
+export function isStranded(
+  run: Pick<Run, "mode" | "status" | "startedAt"> & { armed: boolean },
+  threadIdle: boolean,
+  now: number,
+): boolean {
+  return run.mode === "continue" && !run.armed && isOpen(run.status) && threadIdle && now - run.startedAt > STRANDED_MS;
+}
+
 // ---- direct actions ----------------------------------------------------------
 
 /** What a direct run's row says once it succeeded, before "2m ago". */
