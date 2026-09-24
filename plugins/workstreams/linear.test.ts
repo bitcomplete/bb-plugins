@@ -109,6 +109,26 @@ describe("the batched detail query", () => {
     expect(parseDetails(["ABC-1"], { errors: [] })).toBeNull();
   });
 
+  it("does not treat missing, invalid, or errored aliases as nonexistent issues", () => {
+    const partial = parseDetails(["ABC-1", "ABC-2", "ABC-3", "ABC-4"], {
+      data: {
+        t0: { identifier: "ABC-1", title: "Valid" },
+        t1: null,
+        t2: { identifier: "OTHER-3", title: "Wrong issue" },
+      },
+      errors: [{ message: "Temporary resolver failure", path: ["t1"] }],
+    });
+    expect([...partial!]).toEqual([["ABC-1", expect.objectContaining({ title: "Valid" })]]);
+    expect(parseDetails(["ABC-1"], {
+      data: { t0: { identifier: "ABC-1", title: "Partial" } },
+      errors: [{ message: "Project failed", path: ["t0", "project"] }],
+    })?.size).toBe(0);
+    expect(parseWorkspace(0, {
+      data: { viewer: { organization: { name: "Example", urlKey: "example" } }, teams: { nodes: [] } },
+      errors: [{ message: "Partial discovery" }],
+    })).toBeNull();
+  });
+
   it("names a ticket by its project, else its parent's title, exactly as the old single-key path did", () => {
     const base = parseDetails(["ABC-1"], { data: { t0: { identifier: "ABC-1", parent: { identifier: "ABC-0", title: "Gift cards" } } } })?.get("ABC-1");
     expect(projectNameOf(base)).toBe("Gift cards");

@@ -21,7 +21,7 @@ export const MODE_TEXT: Record<BoardMode, { label: string; detail: string }> = {
   },
   jev: {
     label: "Jev",
-    detail: "Jev picks summaries from your PR titles and assigns clusters to efforts. Add an Anthropic key and Claude also names the groups.",
+    detail: "Jev picks summaries from your PR titles and assigns clusters to efforts. Add an Anthropic key and Claude Sonnet 5 also names the groups.",
   },
   "jev+claude": {
     label: "Jev + Claude",
@@ -68,6 +68,7 @@ const STATES: [string, string][] = [
   ["Waiting · In review", "Nobody has decided yet. Nudge reviewers is one click away."],
   ["Waiting · Behind #N", "Stacked on an unmerged PR, which has to merge first."],
   ["Waiting · Blocked by branch rules", "Branch protection is unsatisfied; clicking merge would not help."],
+  ["Waiting · Status unavailable", "A local status check or GitHub PR lookup failed. Rescan to verify this checkout; no PR action is offered."],
 ];
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -102,20 +103,15 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
     <div className="text-[12px]">
       <Section title="How grouping works">
         <p>
-          Checkouts cluster by ticket, clusters roll up into efforts, and efforts into programs. Code seeds the
-          groups from four signals: the code areas a branch changes, shared words, Linear parents and projects, and
-          threads you worked on several tickets in. Two clusters are only seeded together when at least two signals
-          agree, with one exception: clusters that share a Linear parent or project are seeded together when any
-          other signal is present, however weak, so for linked tickets Linear effectively decides. The repo is not
-          a signal. Jev assigns each cluster with a confidence score, and a low score lands in Unsorted. Claude only
-          names groups and flags ones that look mixed. Counts and rollups are computed locally.
+          Checkouts with the same ticket form a cluster. Related clusters can form efforts, programs, and domains;
+          levels that add no useful grouping collapse. Code seeds groups from changed code areas, shared words,
+          Linear parents or projects, and linked threads. Two signals must agree, except that a Linear link needs
+          only one other signal. Sharing a repository alone does not group tickets.
         </p>
         <p>
-          A ticket that nothing else was found to belong with is a one-off. One-offs are filed by team, in a
-          container per ticket prefix such as &ldquo;ABC &middot; 14 one-offs&rdquo;. That is a filing rule, not a
-          claim that they are related: no model groups or names a container. Merged or closed pull requests with no
-          ticket are filed the same way under No ticket; checkouts with no ticket and no pull request stay in
-          Unsorted.
+          Jev assigns groups with a confidence score; low scores land in Unsorted. Claude names groups and flags
+          mixed ones. Code computes counts and rollups. Tickets with no related cluster go into team containers
+          such as &ldquo;ABC &middot; 14 one-offs&rdquo;. Containers do not imply that their tickets are related.
         </p>
         {mode === null ? null : (
           <p>
@@ -126,9 +122,11 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
 
       <Section title="What the states mean">
         <p>
-          The Board sorts every checkout into {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
-          {INBOX_SECTION_LABEL.merge} and {INBOX_SECTION_LABEL.waiting}, oldest in state first, then folds in-flight,
-          shipped and parked work away.
+          Group by Action (the default) or Effort. Both keep urgent work first within each group and offer the same
+          row actions. Action groups include {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
+          {INBOX_SECTION_LABEL.merge} and {INBOX_SECTION_LABEL.waiting}; in-flight, recently merged, and parked work
+          starts folded. The internal &ldquo;shipped&rdquo; state means a merge commit appears in a local release tag;
+          it does not verify a production deployment.
         </p>
         <Pairs rows={STATES} />
       </Section>
@@ -211,6 +209,19 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
           up with that project's own Linear tools. It runs only when you ask.
         </p>
         <LinearFetchAction />
+      </Section>
+
+      <Section title="Data and services">
+        <p>
+          Board facts and caches stay in BB&apos;s local plugin storage. Workstreams uses your authenticated gh to
+          read GitHub pull requests and run actions you confirm. A configured Linear key sends ticket identifiers
+          to Linear and retrieves issue details.
+        </p>
+        <p>
+          With model keys, Jev receives ticket keys, repository names, PR titles, and available Linear context to
+          select summaries and groups. Anthropic receives group members, summaries, repository names, and available
+          Linear or linked-thread context to name groups. Unchanged semantic inputs reuse cached decisions.
+        </p>
       </Section>
 
       <Section title="Settings">

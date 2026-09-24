@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   DAY_MS,
   INBOX_COLLAPSED,
+  INBOX_SECTION_LABEL,
   INBOX_SECTIONS,
   LIFECYCLES,
   RECENTLY_SHIPPED_DAYS,
@@ -22,6 +23,7 @@ import {
   type Transition,
 } from "./workstreams.js";
 import type { MergeStateStatus } from "./contract.js";
+import { primaryAction } from "./actions.js";
 
 const NOW = Date.parse("2030-01-10T12:00:00Z");
 
@@ -44,6 +46,7 @@ describe("inboxSection", () => {
     ["approved-with-comments", "respond", "approval hides comments the author still has to read"],
     ["awaiting-merge", "merge", "one button stands between it and done"],
     ["awaiting-review", "waiting", "someone else holds it"],
+    ["unverified", "waiting", "scan failure needs a visible rescan cue"],
     ["active", "in-flight", "it is being edited, not waiting on anyone"],
     ["in-progress", "in-flight", "commits or a draft, still the author's own"],
     ["up-next", "parked", "a branch with nothing on it is not work yet"],
@@ -80,8 +83,20 @@ describe("inboxSection", () => {
     expect(inboxSection(facts({ ticket: null, pr: null, lifecycle: "active" }), NOW)).toBe("parked");
   });
 
+  it("keeps a ticketless unverified checkout in expanded Waiting with no actionable primary verb", () => {
+    const unit = facts({ ticket: null, pr: null, lifecycle: "unverified", observed: { status: false, pr: false } });
+    expect(inboxSection(unit, NOW)).toBe("waiting");
+    expect(inboxVerb(unit, "waiting")).toBe("Status unavailable");
+    expect(primaryAction(unit, "waiting", "Status unavailable")).toBeNull();
+    expect(INBOX_COLLAPSED.waiting).toBe(false);
+  });
+
   it("keeps a ticketless branch that HAS a pull request in its real section, because a PR is work whatever its branch name", () => {
     expect(inboxSection(facts({ ticket: null, lifecycle: "blocked" }), NOW)).toBe("fix");
+  });
+
+  it("labels recent merges by their shared fact, including merges with no release tag", () => {
+    expect(INBOX_SECTION_LABEL.shipped).toBe("Recently merged");
   });
 
   it("collapses exactly the three context sections by default", () => {
@@ -158,7 +173,7 @@ describe("DIRTY (merge conflicts) in the inbox precedence", () => {
   });
 });
 
-describe("the recently-shipped window", () => {
+describe("the recently merged window", () => {
   const mergedAgo = (ms: number) => facts({ lifecycle: "merged", pr: { mergedAt: new Date(NOW - ms).toISOString() } });
 
   it("includes work merged exactly seven days ago, inclusive", () => {
@@ -172,7 +187,7 @@ describe("the recently-shipped window", () => {
   it("applies the same window to shipped", () => {
     const shipped = facts({ lifecycle: "shipped", pr: { mergedAt: new Date(NOW - DAY_MS).toISOString() } });
     expect(inboxSection(shipped, NOW)).toBe("shipped");
-    expect(inboxVerb(shipped, "shipped")).toBe("Shipped");
+    expect(inboxVerb(shipped, "shipped")).toBe("Release tagged");
   });
 
   it("parks merged work with no or unreadable merge time rather than inventing recency", () => {
@@ -261,7 +276,7 @@ describe("stateAge and its label", () => {
     expect(age).toEqual({ since: NOW - 2 * DAY_MS, basis: "state" });
   });
 
-  it("does not use the merge time for shipped, because shipping happened later than the merge", () => {
+  it("does not use the merge time for the release-tag state, because tag inclusion happened later than the merge", () => {
     const age = stateAge({ ...base, lifecycle: "shipped", pr: { mergedAt: new Date(NOW - 2 * DAY_MS).toISOString() } });
     expect(age.basis).toBe("last-commit");
   });

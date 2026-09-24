@@ -109,13 +109,13 @@ describe("unitLifecycle", () => {
     expect(unitLifecycle(unit({ pr: pr({ state: "CLOSED" }) }))).toBe("closed");
   });
 
-  it("calls a merged PR whose merge commit reached a release tag shipped, because merged and deployed are different facts and only one of them is done", () => {
+  it("uses the internal shipped state when a merge commit is in a local release tag", () => {
     expect(unitLifecycle(unit({ shipped: true, pr: pr({ state: "MERGED" }) }))).toBe(
       "shipped",
     );
   });
 
-  it("degrades to merged when tag containment could not be answered, because an unknown must never be allowed to invent a production deploy", () => {
+  it("degrades to merged when tag containment could not be answered, because an unknown cannot establish release tag ancestry", () => {
     expect(unitLifecycle(unit({ shipped: null, pr: pr({ state: "MERGED" }) }))).toBe(
       "merged",
     );
@@ -247,6 +247,13 @@ describe("unitLifecycle", () => {
   it("treats a missing upstream as up-next rather than guessing, because ahead is unknowable without one", () => {
     expect(unitLifecycle(unit({ pr: null, ahead: null, behind: null }))).toBe("up-next");
   });
+
+  it("keeps observed local activity but never calls an unobserved clean tree with an unobserved PR up-next", () => {
+    expect(unitLifecycle(unit({ observed: { status: false, pr: false }, dirty: false, ahead: 0 }))).toBe("unverified");
+    expect(unitLifecycle(unit({ observed: { status: true, pr: false }, dirty: true, ahead: 0 }))).toBe("active");
+    expect(unitLifecycle(unit({ observed: { status: false, pr: false }, dirty: false, ahead: 2 }))).toBe("in-progress");
+    expect(unitLifecycle(unit({ observed: { status: false, pr: true }, dirty: false, ahead: 0 }))).toBe("unverified");
+  });
 });
 
 describe("lifecycle groups", () => {
@@ -299,11 +306,11 @@ describe("mostUrgent", () => {
     );
   });
 
-  it("ranks any live state above shipped, so a partly shipped cluster still shows its remaining work", () => {
+  it("ranks any live state above the release-tag state, so a partly merged cluster still shows its remaining work", () => {
     expect(mostUrgent(["shipped", "shipped", "up-next"])).toBe("up-next");
   });
 
-  it("ranks shipped above merged above closed, so landed work does not read as abandoned and deployed work does not read as merely merged", () => {
+  it("ranks shipped above merged above closed, so tagged work remains distinct from other merged work", () => {
     expect(mostUrgent(["merged", "shipped"])).toBe("shipped");
     expect(mostUrgent(["closed", "merged"])).toBe("merged");
   });

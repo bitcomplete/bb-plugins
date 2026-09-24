@@ -459,12 +459,8 @@ export async function nameGroups(
       },
     });
   }
-  // A label the call omitted entirely was still paid for. Record it, so the
-  // next scan does not pay for it again on the chance of a different answer.
-  for (const group of stale) {
-    const hash = hashes.get(group.label);
-    if (hash !== undefined && !names.has(hash)) names.set(hash, { name: "", cohesion: null });
-  }
+  // An omitted label may be a failed or incomplete batch. Let the next scan
+  // retry it rather than caching the absence as a successful answer.
   return {
     names,
     warnings: result.warnings,

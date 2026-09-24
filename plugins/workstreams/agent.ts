@@ -23,18 +23,13 @@ export type AgentSdk = SpawnSdk & {
       canSpawnChild: boolean;
     }>;
     context?(args: { threadId: string }): Promise<{ usage: { usedTokens: number; modelContextWindow: number } | null }>;
-    send?(args: {
-      threadId: string;
-      mode: "queue-if-active";
-      input: { type: "text"; text: string; mentions: never[] }[];
-    }): Promise<unknown>;
   };
 };
 
-/** What the SDK in hand can do, read from it rather than assumed. */
+/** Board action capabilities; shared-thread sends cannot be tracked by turn. */
 export function capabilitiesOf(sdk: AgentSdk): ThreadCapabilities {
   return {
-    send: typeof sdk.threads.send === "function",
+    send: false,
     // `parentThreadId` is part of the spawn request in every SDK this plugin supports (>= 0.4.104).
     subthread: true,
     contextUsage: typeof sdk.threads.context === "function",
@@ -94,9 +89,8 @@ export async function planAgent(
 }
 
 /**
- * Run the agent action where the user chose. `continue` and `subthread` only
- * accept a thread linked to this row: the client picks among the threads the
- * server offered, never an arbitrary id.
+ * Run the agent action where the user chose. A subthread only accepts a
+ * parent linked to this row; the client cannot supply an arbitrary thread id.
  */
 export async function runAgent(
   sdk: AgentSdk,
@@ -109,17 +103,12 @@ export async function runAgent(
   },
 ): Promise<StartResult> {
   const { unit, mode, threadId, prompt, linked } = request;
+  if (mode === "continue") {
+    return { ok: false, error: "Continue in an existing thread cannot track this action reliably. Choose a subthread or new thread." };
+  }
   if (mode === "new") return startThread(sdk, unit, prompt);
   if (threadId === null || !linked.includes(threadId)) {
     return { ok: false, error: "That thread is not linked to this row any more. Reopen the dialog." };
   }
-  if (mode === "subthread") return startThread(sdk, unit, prompt, threadId);
-  if (unit === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
-  const text = prompt.trim();
-  if (text === "") return { ok: false, error: "The prompt is empty." };
-  if (sdk.threads.send === undefined) return { ok: false, error: "This BB version cannot message an existing thread." };
-  // Queue behind a running turn rather than steering it: the user chose to
-  // continue here, not to interrupt what the thread is doing.
-  await sdk.threads.send({ threadId, mode: "queue-if-active", input: [{ type: "text", text, mentions: [] }] });
-  return { ok: true, threadId, ticket: unit.ticket };
+  return startThread(sdk, unit, prompt, threadId);
 }

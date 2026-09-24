@@ -11,9 +11,8 @@ import { ticketFinder, type TicketSource } from "./tickets.js";
  * hierarchy. The Board's inbox is the one list that sorts by next action (see
  * `inboxSection`), and it uses its own section order, not this one.
  *
- * `closed` is the eleventh state and the only one the user did not name: it is
- * abandoned work, kept so a closed PR still renders under Done, and excluded
- * from the attention rail by `ACTIONABLE` rather than by being dropped.
+ * `closed` preserves abandoned work so a closed PR still renders under Done.
+ * It is excluded from the attention rail by `ACTIONABLE`.
  */
 export const LIFECYCLES = [
   "blocked",
@@ -21,6 +20,7 @@ export const LIFECYCLES = [
   "approved-with-comments",
   "awaiting-merge",
   "awaiting-review",
+  "unverified",
   "active",
   "in-progress",
   "up-next",
@@ -42,6 +42,7 @@ export const LIFECYCLE_GROUPS = {
     "approved-with-comments",
     "awaiting-merge",
     "awaiting-review",
+    "unverified",
   ],
   done: ["shipped", "merged", "closed"],
 } as const satisfies Record<string, readonly Lifecycle[]>;
@@ -287,20 +288,21 @@ function checksGreen(conclusions: readonly string[]): boolean {
 export function unitLifecycle(unit: RawUnit): Lifecycle {
   const { pr } = unit;
   if (pr === null) {
-    // No PR at all: the three ACTIVE states are the whole vocabulary here.
-    if (unit.dirty) return "active";
-    return (unit.ahead ?? 0) > 0 ? "in-progress" : "up-next";
+    // A missing PR is only confirmed when the GitHub lookup succeeded.
+    if (unit.observed?.status !== false && unit.dirty) return "active";
+    if ((unit.ahead ?? 0) > 0) return "in-progress";
+    return unit.observed?.status === false || unit.observed?.pr === false ? "unverified" : "up-next";
   }
   if (pr.state === "MERGED") {
-    // `shipped` is a local-tag fact the host resolved. Unknown (null) means the
-    // check could not run, and an unknown must never invent a deploy.
+    // `shipped` means the merge commit is in a local release tag. Unknown
+    // (null) means the ancestry check could not run.
     return unit.shipped === true ? "shipped" : "merged";
   }
   if (pr.state === "CLOSED") return "closed";
   // A draft is still open, so the WAITING rules below would otherwise claim it.
   // Red checks on a draft are expected rather than actionable, so a draft stays
   // in the ACTIVE group and never competes with a genuinely blocked PR.
-  if (pr.isDraft) return unit.dirty ? "active" : "in-progress";
+  if (pr.isDraft) return unit.observed?.status !== false && unit.dirty ? "active" : "in-progress";
   if (pr.checkConclusions.some((value) => FAILING_CHECKS.has(value))) return "blocked";
   // Changes requested is NOT blocked: the reviewer already acted and the ball
   // is with the author. Merging the two would hide the one state the user can
@@ -367,7 +369,7 @@ export const RISKS = ["none", "low", "medium", "high"] as const;
 export type Risk = (typeof RISKS)[number];
 
 /**
- * The shipped table. Exposed as ONE multiline setting because "risk" is
+ * The default surface rule table. Exposed as ONE multiline setting because "risk" is
  * org-specific: the lines here (GraphQL schema, generated
  * types, terraform) are exactly what another org would want to replace.
  */
@@ -781,7 +783,7 @@ export type BoardGroup = {
   /** Populated only at the effort level; the two levels above hold groups. */
   clusters: SummarizedCluster[];
   repoCount: number;
-  /** Units that merged or shipped, out of every unit below this group. */
+  /** Merged units, including those in a release tag, out of every unit below this group. */
   merged: number;
   total: number;
   staleness: Staleness;
@@ -1042,15 +1044,16 @@ export const ACTIONABLE: readonly Lifecycle[] = [
 
 /**
  * Stuck: work that is expected to move and has not been touched in a month.
- * Every Waiting state counts, and so do the two Active states that mean
+ * Every work-related Waiting state counts, and so do the two Active states that mean
  * somebody is on it. `up-next` does not — a parked checkout is not expected to
- * move — and nothing Done can be stuck. `awaiting-review` and dead is the
+ * move. `unverified` describes scan health, not stalled work. Nothing Done can
+ * be stuck. `awaiting-review` and dead is the
  * single most useful pairing the two dimensions produce.
  */
 export function isStuck(cluster: { lifecycle: Lifecycle; staleness: Staleness }): boolean {
   if (cluster.staleness !== "cold" && cluster.staleness !== "dead") return false;
   return (
-    lifecycleGroup(cluster.lifecycle) === "waiting" ||
+    (cluster.lifecycle !== "unverified" && lifecycleGroup(cluster.lifecycle) === "waiting") ||
     cluster.lifecycle === "active" ||
     cluster.lifecycle === "in-progress"
   );
@@ -1111,7 +1114,7 @@ function blockedReason(unit: Unit): string {
 export function rollupSentence(clusters: Cluster[]): string {
   const units = clusters.flatMap((cluster) => cluster.units);
   if (units.length === 0) return "No checkouts.";
-  // `shipped` is merged work that also reached production, so it counts as
+  // `shipped` is merged work included in a local release tag, so it counts as
   // merged here: the sentence is about how much of the effort has landed.
   const merged = countOf(units, "merged") + countOf(units, "shipped");
   const head = `${merged} of ${units.length} merged`;
@@ -1957,7 +1960,7 @@ export const INBOX_SECTION_LABEL: Record<InboxSection, string> = {
   merge: "Merge",
   waiting: "Waiting",
   "in-flight": "In flight",
-  shipped: "Recently shipped",
+  shipped: "Recently merged",
   parked: "Parked",
 };
 
@@ -1972,7 +1975,7 @@ export const INBOX_COLLAPSED: Record<InboxSection, boolean> = {
   parked: true,
 };
 
-/** How long merged work stays under Recently shipped, in whole days, inclusive. */
+/** How long merged work stays under Recently merged, in whole days, inclusive. */
 export const RECENTLY_SHIPPED_DAYS = 7;
 
 /** The facts section assignment reads. A wire unit and a board unit both fit. */
@@ -1981,14 +1984,15 @@ export type InboxUnitFacts = {
   lifecycle: Lifecycle;
   stack: { blockedBelow: number | null } | null;
   pr: { mergedAt?: string | null; mergeStateStatus?: MergeStateStatus } | null;
+  observed?: RawUnit["observed"];
 };
 
 /**
  * A ticketless checkout with no pull request: a clone of some repo's default
  * branch. It is not work, so it is parked and hidden unless asked for.
  */
-export function isTicketlessClone(unit: Pick<InboxUnitFacts, "ticket" | "pr">): boolean {
-  return unit.ticket === null && unit.pr === null;
+export function isTicketlessClone(unit: Pick<InboxUnitFacts, "ticket" | "pr" | "observed">): boolean {
+  return unit.ticket === null && unit.pr === null && unit.observed?.pr !== false && unit.observed?.status !== false;
 }
 
 /**
@@ -2082,6 +2086,7 @@ export function inboxSection(unit: InboxUnitFacts, now: number): InboxSection {
     case "awaiting-merge":
       return mergeReadiness(unit.pr?.mergeStateStatus).section;
     case "awaiting-review":
+    case "unverified":
       return "waiting";
     case "active":
     case "in-progress":
@@ -2100,9 +2105,10 @@ const VERB: Partial<Record<Lifecycle, string>> = {
   "awaiting-followup": "Changes requested",
   "approved-with-comments": "Approved, comments open",
   "awaiting-review": "In review",
+  unverified: "Status unavailable",
   active: "Editing",
   "in-progress": "In progress",
-  shipped: "Shipped",
+  shipped: "Release tagged",
   merged: "Merged",
 };
 

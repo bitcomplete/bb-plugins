@@ -11,10 +11,12 @@ import {
   checkConclusions,
   parseAheadBehind,
   parseLinkback,
+  parseLiveReviewRequests,
   parsePrList,
   repoFromRemote,
 } from "./gh.js";
 import { prTarget, readLiveMerge, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
+import { namingResponse, type NamedGroupRow } from "./naming.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
@@ -125,22 +127,18 @@ function defaultBranchResolver(signal: AbortSignal) {
 const PR_FIELDS =
   "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,reviewRequests,body";
 
-/** A release tag: many teams deploy production from a version tag and nothing else. */
+/** Version-shaped local tags used as a release marker. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;
 
 /** Cap the file list per checkout. The RPC result is limited to 8 MiB. */
 const MAX_CHANGED_PATHS = 500;
 
 /**
- * Whether a merged commit reached production, from LOCAL TAGS ONLY.
+ * Whether a merged commit is an ancestor of the latest local version tag.
  *
- * Repos that tag their releases already carry them, so this costs one cheap
- * ancestry check per merged checkout and one tag listing per repo — against a
- * GitHub deployments API call per unit, which is a network round trip for a
- * fact already on disk. Missing tags, an unfetched merge commit or any git
- * failure all resolve to `null`, which `unitLifecycle` reads as "merged", never
- * as "shipped": a scan must never block on this, and an unknown must never
- * invent a deploy.
+ * This uses one tag listing per repo and one ancestry check per merged
+ * checkout. It does not establish whether a deployment reached production.
+ * Missing tags or an unfetched merge commit resolve to `null`.
  */
 function shippedResolver(warn: (message: string) => void, signal: AbortSignal) {
   const latestTag = new Map<string, Promise<string | null>>();
@@ -167,7 +165,7 @@ function shippedResolver(warn: (message: string) => void, signal: AbortSignal) {
     if (tag === null) {
       if (!warned.has(key)) {
         warned.add(key);
-        warn(`${key}: no release tags found; merged work cannot be reported as shipped.`);
+        warn(`${key}: no release tags found; merged work cannot be marked release tagged.`);
       }
       return null;
     }
@@ -179,7 +177,7 @@ function shippedResolver(warn: (message: string) => void, signal: AbortSignal) {
       signal,
     );
     // Exit 1 is the real answer "not an ancestor"; anything else is a failure
-    // we cannot tell apart from it here, so both read as not-shipped rather
+    // we cannot tell apart from it here, so both read as not release-tagged rather
     // than as unknown. An unknown would be indistinguishable on the board.
     return contained.ok;
   };
@@ -235,6 +233,7 @@ async function inspect(
     repo: remote === null ? null : repoFromRemote(remote),
     branch: branch === null || branch === "" ? null : branch,
     dirty: status !== null && status !== "",
+    observed: { status: status !== null, pr: false },
     ahead: counts?.ahead ?? null,
     behind: counts?.behind ?? null,
     lastCommitAt: lastCommitAt === null || lastCommitAt === "" ? null : lastCommitAt,
@@ -243,6 +242,7 @@ async function inspect(
     shipped: null,
     changedPaths: [],
   };
+  if (status === null) warn(`${dirName}: git status failed; working-tree state is unknown.`);
   if (!ghUsable || unit.branch === null) return unit;
   unit.defaultBranch = await defaultBranchOf(unit.repo, path);
   // The default branch is memoized per repo for stack detection already, so
@@ -261,8 +261,22 @@ async function inspect(
     warn(`${dirName}: gh pr list failed: ${listed.error}`);
     return unit;
   }
+  let rows: unknown;
+  try { rows = JSON.parse(listed.stdout); } catch { /* malformed gh output */ }
+  if (!Array.isArray(rows)) {
+    warn(`${dirName}: gh pr list returned unreadable data.`);
+    return unit;
+  }
+  if (rows.length === 0) {
+    unit.observed = { status: status !== null, pr: true };
+    return unit;
+  }
   const parsed = parsePrList(listed.stdout);
-  if (parsed === null) return unit;
+  if (parsed === null) {
+    warn(`${dirName}: gh pr list returned an unreadable pull request.`);
+    return unit;
+  }
+  unit.observed = { status: status !== null, pr: true };
   unit.pr = parsed.pr;
   if (parsed.pr.state === "MERGED") {
     unit.shipped = await shippedOf(unit.repo, path, parsed.mergeCommit);
@@ -304,7 +318,7 @@ async function mapBounded<In, Out>(
 // out loud rather than silently repairing it, because a fluent name over a bad
 // grouping is harder to catch than an awkward one.
 
-const NAMING_MODEL = "claude-opus-5";
+const NAMING_MODEL = "claude-sonnet-5";
 const NAMING_MAX_TOKENS = 16_000;
 
 type Level = "domain" | "program" | "effort";
@@ -363,42 +377,6 @@ const NAMING_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-export type NamedGroupRow = {
-  label: string;
-  name: string;
-  cohesion: "cohesive" | "mixed";
-  reason: string | null;
-};
-
-export function parseNames(text: string): NamedGroupRow[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return [];
-  }
-  if (parsed === null || typeof parsed !== "object") return [];
-  const groups = (parsed as { groups?: unknown }).groups;
-  if (!Array.isArray(groups)) return [];
-  return groups.flatMap((entry) => {
-    if (entry === null || typeof entry !== "object") return [];
-    const record = entry as Record<string, unknown>;
-    if (typeof record.label !== "string" || typeof record.name !== "string") return [];
-    return [
-      {
-        label: record.label,
-        name: record.name,
-        // Anything but an explicit "mixed" is treated as cohesive: a marker
-        // that fires on a parse slip would train the reader to ignore it.
-        cohesion: record.cohesion === "mixed" ? ("mixed" as const) : ("cohesive" as const),
-        reason: typeof record.reason === "string" && record.reason.trim() !== ""
-          ? record.reason.trim().slice(0, 300)
-          : null,
-      },
-    ];
-  });
-}
-
 type NamingResult = {
   names: NamedGroupRow[];
   warnings: string[];
@@ -450,11 +428,7 @@ async function nameGroups(
       .flatMap((block) => (block.type === "text" ? [block.text] : []))
       .join("");
     return {
-      names: parseNames(text),
-      warnings:
-        response.stop_reason === "refusal"
-          ? [`Claude declined to name ${level}s; they keep their selected names.`]
-          : [],
+      ...namingResponse(level, response.stop_reason, text, groups.map((group) => group.label)),
       calls: 1,
       inputTokens: response.usage.input_tokens,
       outputTokens: response.usage.output_tokens,
@@ -476,7 +450,7 @@ async function nameGroups(
 }
 
 /** Inspect checkouts with one gh auth probe and shared per-repo resolvers. */
-async function inspectAll(
+export async function inspectAll(
   paths: string[],
   early: string[],
   signal: AbortSignal,
@@ -541,6 +515,16 @@ export default experimental_defineHostEntry({
       const units: string[] = [];
       for (const path of paths) if (await isUnit(path)) units.push(path);
       return inspectAll(units, [], context.signal);
+    },
+    prReviewers: async ({ prUrl }, context) => {
+      const target = prTarget(prUrl);
+      if (target === null) return { ok: false as const, error: "That is not a pull request URL." };
+      const result = await ghRunner(context.signal)(["pr", "view", String(target.number), "--repo", target.slug, "--json", "state,reviewRequests"]);
+      if (!result.ok) return { ok: false as const, error: `Could not read current reviewers: ${result.error}` };
+      const live = parseLiveReviewRequests(result.stdout);
+      if (live === null) return { ok: false as const, error: "GitHub did not return the PR's current reviewers." };
+      if (live.state !== "OPEN") return { ok: false as const, error: "This pull request is no longer open. Rescan and try again." };
+      return { ok: true as const, reviewers: live.reviewers };
     },
     prLive: async ({ prUrl }, context) => {
       const target = prTarget(prUrl);

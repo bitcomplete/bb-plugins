@@ -49,7 +49,7 @@ export const prSchema = z
     latestReviewStates: z.array(z.string().max(40)).max(50),
     /**
      * When the PR merged, from the same `gh pr list` call. It dates the Board's
-     * Recently shipped section. Defaulted so a unit cached before the field
+     * Recently merged section. Defaulted so a unit cached before the field
      * existed still parses rather than vanishing until the next scan.
      */
     mergedAt: z.string().max(40).nullable().default(null),
@@ -96,6 +96,8 @@ export const rawUnitSchema = z
     repo: z.string().max(200).nullable(),
     branch: z.string().max(300).nullable(),
     dirty: z.boolean(),
+    /** Explicit scan observations. Missing on older persisted rows, which the server treats as unknown. */
+    observed: z.object({ status: z.boolean(), pr: z.boolean() }).strict().optional(),
     ahead: z.number().int().nullable(),
     behind: z.number().int().nullable(),
     lastCommitAt: z.string().max(40).nullable(),
@@ -105,7 +107,7 @@ export const rawUnitSchema = z
     /**
      * True when the merge commit is contained in a release tag, false when it
      * is not, and null when the question could not be answered — no tags, no
-     * merge commit, or a git failure. Null must never be read as shipped.
+     * merge commit, or a git failure. Null must never be read as release tagged.
      */
     shipped: z.boolean().nullable(),
     /**
@@ -205,6 +207,14 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
 export type PrWrite = z.infer<typeof prWriteSchema>;
 
 export const hostContract = defineRpcContract({
+  /** Recheck the PR and its pending reviewers immediately before a nudge. */
+  prReviewers: {
+    input: z.object({ prUrl: z.string().max(500) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), reviewers: z.array(z.string().max(140)).max(20) }).strict(),
+      z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
+    ]),
+  },
   /** Read-only: the facts the merge dialog shows, fetched live. */
   prLive: {
     input: z.object({ prUrl: z.string().max(500) }).strict(),

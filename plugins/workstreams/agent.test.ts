@@ -47,12 +47,12 @@ function fakeSdk(threads: Record<string, Row>, options: { send?: boolean; contex
 const UNIT = { path: "/p/folio-abc-101", ticket: "ABC-101" };
 
 describe("planAgent", () => {
-  it("reads each linked thread live and recommends continuing in the idle author thread", async () => {
+  it("reads each linked thread live and recommends a dedicated subthread of the idle author thread", async () => {
     const { sdk } = fakeSdk({ thr_a: { status: "idle", updatedAt: 5, used: 0.3 } });
     const plan = await planAgent(sdk, "address-review", [{ id: "thr_a", title: "stale title", tier: "started" }]);
-    expect(plan.capabilities).toEqual({ send: true, subthread: true, contextUsage: true });
+    expect(plan.capabilities).toEqual({ send: false, subthread: true, contextUsage: true });
     expect(plan.candidates[0]).toMatchObject({ id: "thr_a", title: "Folio work thr_a", running: false, contextUsed: 0.3 });
-    expect(plan.recommendation).toMatchObject({ mode: "continue", threadId: "thr_a" });
+    expect(plan.recommendation).toMatchObject({ mode: "subthread", threadId: "thr_a" });
   });
 
   it("uses live context usage to prefer a subthread over a nearly full author thread", async () => {
@@ -82,10 +82,10 @@ describe("planAgent", () => {
 describe("runAgent", () => {
   const base = { unit: UNIT, prompt: "Address the review on folio #47.", linked: ["thr_a"] };
 
-  it("continues by queueing a message into the chosen thread, never steering it", async () => {
+  it("refuses continue before sending a message or spawning a thread", async () => {
     const { sdk, sent, spawned } = fakeSdk({});
-    expect(await runAgent(sdk, { ...base, mode: "continue", threadId: "thr_a" })).toEqual({ ok: true, threadId: "thr_a", ticket: "ABC-101" });
-    expect(sent).toEqual([{ threadId: "thr_a", mode: "queue-if-active", input: [{ type: "text", text: base.prompt, mentions: [] }] }]);
+    expect(await runAgent(sdk, { ...base, mode: "continue", threadId: "thr_a" })).toMatchObject({ ok: false });
+    expect(sent).toEqual([]);
     expect(spawned).toEqual([]);
   });
 

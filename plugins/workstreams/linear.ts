@@ -57,6 +57,7 @@ const workspaceSchema = z.object({
 
 /** A workspace-discovery response, or null when it is not one. */
 export function parseWorkspace(keyIndex: number, payload: unknown): LinearWorkspace | null {
+  if (hasGraphqlErrors(payload)) return null;
   const parsed = workspaceSchema.safeParse(payload);
   if (!parsed.success) return null;
   const { organization } = parsed.data.data.viewer;
@@ -149,22 +150,35 @@ const issueSchema = z.object({
 });
 
 /**
- * Read one batch's response. Every ticket in the batch gets an entry: its
- * detail, or null when Linear had no such issue (or returned something
- * unreadable) — a null is cached too, so a missing ticket is not re-asked about
- * on every scan. Returns null when the payload carries no data at all.
+ * Read one batch's response. An explicit null means Linear has no such issue
+ * only when the response has no GraphQL errors. Missing or unreadable aliases
+ * are left out so a partial response cannot poison the cache.
  */
 export function parseDetails(batch: readonly string[], payload: unknown): Map<string, LinearDetail | null> | null {
   const data =
     payload !== null && typeof payload === "object" ? (payload as { data?: unknown }).data : undefined;
   if (data === null || typeof data !== "object") return null;
+  const errors = graphqlErrors(payload);
+  const failedAliases = new Set<string>();
+  let unscopedError = false;
+  for (const error of errors) {
+    const path = error !== null && typeof error === "object" ? (error as { path?: unknown }).path : undefined;
+    const alias = Array.isArray(path) ? path[0] : undefined;
+    if (typeof alias === "string" && /^t\d+$/u.test(alias)) failedAliases.add(alias);
+    else unscopedError = true;
+  }
   const out = new Map<string, LinearDetail | null>();
   batch.forEach((ticket, slot) => {
-    const issue = issueSchema.safeParse((data as Record<string, unknown>)[`t${slot}`]);
-    if (!issue.success) {
-      out.set(ticket, null);
+    const alias = `t${slot}`;
+    if (unscopedError || failedAliases.has(alias)) return;
+    if (!Object.hasOwn(data, alias)) return;
+    const raw = (data as Record<string, unknown>)[alias];
+    if (raw === null) {
+      if (errors.length === 0) out.set(ticket, null);
       return;
     }
+    const issue = issueSchema.safeParse(raw);
+    if (!issue.success || issue.data.identifier.toUpperCase() !== ticket.toUpperCase()) return;
     const value = issue.data;
     out.set(ticket, {
       identifier: value.identifier,
@@ -183,6 +197,16 @@ export function parseDetails(batch: readonly string[], payload: unknown): Map<st
     });
   });
   return out;
+}
+
+function hasGraphqlErrors(payload: unknown): boolean {
+  return graphqlErrors(payload).length > 0;
+}
+
+function graphqlErrors(payload: unknown): unknown[] {
+  if (payload === null || typeof payload !== "object") return [];
+  const errors = (payload as { errors?: unknown }).errors;
+  return Array.isArray(errors) ? errors : [];
 }
 
 /** The name `basic` mode and the Linear seed term have always used: the project, else the parent's title. */

@@ -332,7 +332,7 @@ describe("nameEfforts", () => {
     expect(again.usage.calls).toBe(0);
   });
 
-  it("records a label the call omitted entirely, because it was paid for even though nothing came back for it", async () => {
+  it("retries a label the call omitted, because an incomplete response is not a successful answer", async () => {
     const { client } = stubNaming([]);
     const result = await nameEfforts({
       efforts,
@@ -340,7 +340,8 @@ describe("nameEfforts", () => {
       summaryOf,
       naming: client,
     });
-    expect([...result.names.values()]).toEqual([{ name: "", cohesion: null }]);
+    expect(result.names.size).toBe(0);
+    expect(result.usage.calls).toBe(1);
   });
 
   it("strips a trailing period and an accidental ticket prefix from a written name, because effort names are labels and not sentences", async () => {

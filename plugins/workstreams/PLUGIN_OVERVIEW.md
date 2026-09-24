@@ -1,30 +1,36 @@
-See the work you have in flight, grouped by the ticket it belongs to rather
-than by the repository it happens to live in.
+See work across repositories by ticket and by the action it needs next.
 
-## What you get
+## Explore and act
 
-- A **Workstreams** page in the left sidebar: a board of workstreams,
-  each holding the ticket clusters under it, each cluster holding one card per
-  checkout.
-- A colored status chip per cluster — blocked, ready, in review, drafting,
-  local, merged, or closed — rolled up from its most urgent checkout.
-- A `bb workstreams` command that reads the same board from a terminal and
-  names a cluster's workstream.
+- **Map:** Explore ticket clusters within named efforts, programs, and domains.
+  Levels collapse when they add no useful grouping. Switch between theme and
+  risk, filter by status or code surface, and open linked agent threads.
+- **Board:** Group checkouts by Action or Effort while keeping urgent work first
+  within each group. Find CI fixes, review responses, merges, and reviewer
+  nudges. Confirm direct GitHub actions, or review a prompt before an agent
+  starts work in a dedicated thread.
+- **CLI:** Run `bb workstreams list [--json]` to read the board, `bb workstreams
+  refresh` to rescan, and `bb workstreams group <TICKET> <name>` to set an effort
+  name.
 
-## How it works
+Workstreams scans your configured git checkout directories. It finds ticket
+keys in branches, pull requests, Linear linkback comments, and directory names,
+then joins checkouts for the same ticket. An authenticated `gh` supplies pull
+request state; without it, the board reports a warning, shows observed local
+git activity, and marks unverified checkouts. The board uses local release tags
+to identify merged commits in a release; that does not prove a production
+deployment.
 
-The plugin scans every git checkout under its configured scan roots, reads each
-one's branch, upstream position, and pull request state, and clusters them by
-the ticket key in the branch name. One ticket often spans several
-repositories; that cluster is the thing nothing else in the toolchain shows.
+## Optional services
 
-Everything stays on your machine. Pull request state comes from your own
-authenticated `gh`; without it the board falls back to local git state. An
-optional Linear API key resolves each ticket to its project name so workstreams
-name themselves.
+You can use the board without model keys. A Linear key adds ticket details and
+team names. A TypeSafe key lets Jev select ticket summaries and assign related
+tickets to groups. With Jev enabled, an Anthropic key lets Claude Sonnet 5 name
+those groups and flag mixed ones. Anthropic does not change group membership.
 
-## For agents
-
-The bundled skill tells an agent to read the board with
-`bb workstreams list [--json]`, rescan with `bb workstreams refresh`, and name a
-cluster's workstream with `bb workstreams group <TICKET> <name>`.
+Board facts and caches live in BB's local plugin storage. Workstreams uses your
+authenticated `gh` for GitHub reads and confirmed actions. When configured, it
+sends ticket identifiers to Linear; Jev receives ticket, repository, pull
+request title, and available Linear context; Anthropic receives group members,
+summaries, repository names, and available Linear or linked-thread context for
+naming. Unchanged semantic inputs reuse cached model decisions.

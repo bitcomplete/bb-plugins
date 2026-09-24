@@ -2,7 +2,45 @@
 // rule in workstreams.ts. Nothing here needs a network, a token, or git: what
 // is checked is how a payload is read, not how it was fetched.
 import { describe, expect, it } from "vitest";
-import { latestReviewStates, latestReviewers, mergeCommitOf, parseMergeStateStatus, parsePrList } from "./gh.js";
+import { latestReviewStates, latestReviewers, mergeCommitOf, parseLiveReviewRequests, parseMergeStateStatus, parsePrList } from "./gh.js";
+import { namingResponse, parseNames } from "./naming.js";
+
+describe("Claude naming response", () => {
+  const labels = ["checkout", "accounts"];
+  const complete = JSON.stringify({ groups: [
+    { label: "checkout", name: "Gift cards in checkout", cohesion: "cohesive", reason: null },
+    { label: "accounts", name: "Reader account updates", cohesion: "mixed", reason: "The login change is unrelated" },
+  ] });
+
+  it("accepts a complete structured batch with a verdict for every requested label", () => {
+    expect(namingResponse("effort", "end_turn", complete, labels)).toEqual({
+      names: [
+        { label: "checkout", name: "Gift cards in checkout", cohesion: "cohesive", reason: null },
+        { label: "accounts", name: "Reader account updates", cohesion: "mixed", reason: "The login change is unrelated" },
+      ],
+      warnings: [],
+    });
+  });
+
+  it("rejects invalid cohesion instead of silently calling the group cohesive", () => {
+    const invalid = complete.replace('"cohesion":"cohesive"', '"cohesion":"uncertain"');
+    expect(parseNames(invalid, labels)).toBeNull();
+  });
+
+  it("rejects a missing label so it can be retried on the next scan", () => {
+    const incomplete = JSON.stringify({ groups: [JSON.parse(complete).groups[0]] });
+    expect(parseNames(incomplete, labels)).toBeNull();
+    expect(namingResponse("effort", "end_turn", incomplete, labels).names).toEqual([]);
+  });
+
+  it("does not accept a refusal or token-limited response even if its JSON looks complete", () => {
+    for (const stopReason of ["refusal", "max_tokens"]) {
+      const result = namingResponse("effort", stopReason, complete, labels);
+      expect(result.names).toEqual([]);
+      expect(result.warnings).toHaveLength(1);
+    }
+  });
+});
 
 describe("latestReviewStates", () => {
   it("uppercases each reviewer's most recent state, because `approved-with-comments` turns on a COMMENTED review the aggregate decision hides", () => {
@@ -34,6 +72,17 @@ describe("latestReviewers", () => {
   it("drops an entry with no author or state rather than inventing a reviewer", () => {
     expect(latestReviewers(undefined)).toEqual([]);
     expect(latestReviewers([null, { state: "APPROVED" }, { author: { login: "reader-lin" } }, { author: null, state: "APPROVED" }])).toEqual([]);
+  });
+});
+
+describe("parseLiveReviewRequests", () => {
+  it("requires a readable state and reviewer list so a nudge cannot use stale scan data", () => {
+    expect(parseLiveReviewRequests(JSON.stringify({ state: "open", reviewRequests: [
+      { login: "ada-inkwell" },
+      { __typename: "Team", slug: "reviewers", organization: { login: "inkwell" } },
+    ] }))).toEqual({ state: "OPEN", reviewers: ["ada-inkwell", "inkwell/reviewers"] });
+    expect(parseLiveReviewRequests("not json")).toBeNull();
+    expect(parseLiveReviewRequests(JSON.stringify({ state: "open" }))).toBeNull();
   });
 });
 

@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Workstreams",
-    "description": "A board that clusters git checkouts by Linear ticket across repositories, with confirm-first row actions.",
+    "description": "Map and action board for git checkouts grouped by ticket across repositories.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

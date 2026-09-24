@@ -96,18 +96,32 @@ export function linkThread(
     }
   };
   const clusters = new Set(targets.map((target) => target.cluster));
+  // A branch name is only evidence when it identifies one cluster on this
+  // board. Different repositories often reuse names such as feature/auth.
+  const branchClusters = new Map<string, Set<string>>();
+  for (const target of targets) {
+    if (target.branch === null || target.branch === target.defaultBranch || SHARED_BRANCHES.has(target.branch)) continue;
+    const owners = branchClusters.get(target.branch) ?? new Set<string>();
+    owners.add(target.cluster);
+    branchClusters.set(target.branch, owners);
+  }
+  const knownEnvironmentPath = typeof thread.environmentPath === "string" && targets.some(
+    (target) => thread.environmentPath?.replace(/\/+$/u, "") === target.path.replace(/\/+$/u, ""),
+  );
 
   if (thread.startedFor !== null && clusters.has(thread.startedFor)) offer(thread.startedFor, "started");
 
   for (const target of targets) {
     const samePath =
-      thread.environmentPath !== null && thread.environmentPath.replace(/\/+$/u, "") === target.path.replace(/\/+$/u, "");
+      typeof thread.environmentPath === "string" && thread.environmentPath.replace(/\/+$/u, "") === target.path.replace(/\/+$/u, "");
     const sameBranch =
       thread.environmentBranchName !== null &&
       target.branch !== null &&
       thread.environmentBranchName === target.branch &&
       target.branch !== target.defaultBranch &&
-      !SHARED_BRANCHES.has(target.branch);
+      !SHARED_BRANCHES.has(target.branch) &&
+      branchClusters.get(target.branch)?.size === 1 &&
+      (!knownEnvironmentPath || samePath);
     if (samePath || sameBranch) offer(target.cluster, "environment");
   }
 

@@ -161,3 +161,17 @@ export function parseLinkback(raw: string): string | null | undefined {
   if (parsed === null || typeof parsed !== "object") return undefined;
   return linkbackTicketOf((parsed as { comments?: unknown }).comments);
 }
+
+/** Current PR state and pending reviewers from a live `gh pr view`. */
+export function parseLiveReviewRequests(raw: string): { state: string; reviewers: string[] } | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const view = value as Record<string, unknown>;
+  if (typeof view.state !== "string" || !Array.isArray(view.reviewRequests)) return null;
+  return { state: view.state.toUpperCase(), reviewers: parseReviewRequests(view.reviewRequests) };
+}

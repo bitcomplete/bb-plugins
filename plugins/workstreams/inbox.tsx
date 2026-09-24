@@ -1,4 +1,4 @@
-// The Board: an inbox of checkouts, sectioned by the next action each needs.
+// The Board: an inbox of checkouts grouped by next action or effort.
 //
 // One row per checkout, because every action is per pull request. Unlike the
 // Map, position here DOES follow status: this is a list you work through, and
@@ -46,6 +46,7 @@ import { ThreadMenu } from "./threadmenu";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
 import { ageHint, primaryHint, shortAge, shortVerb, titleHint } from "./rowlabels";
+import { groupInboxRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
 
 type Cluster = WireGroup["clusters"][number];
 type Unit = Cluster["units"][number];
@@ -55,6 +56,7 @@ export type Row = {
   key: string;
   unit: Unit;
   cluster: Cluster;
+  effortKey: string;
   effort: string;
   section: InboxSection;
   verb: string | null;
@@ -82,6 +84,7 @@ export function inboxRows(board: Board, now: number): Map<InboxSection, Row[]> {
           key: unit.path,
           unit,
           cluster,
+          effortKey: group.key,
           effort: group.name,
           section,
           verb,
@@ -128,12 +131,23 @@ export function InboxBoard({
   const all = useMemo(() => inboxRows(board, now), [board, now]);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement | null>(null);
-  const [open, setOpen] = useState<Record<InboxSection, boolean>>(() =>
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const [compact, setCompact] = useState(false);
+  useEffect(() => {
+    const node = boardRef.current;
+    if (node === null) return;
+    const observer = new ResizeObserver(([entry]) => setCompact((entry?.contentRect.width ?? node.clientWidth) < 920));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  const [groupBy, setGroupBy] = useState<InboxGrouping>("action");
+  const [actionOpen, setActionOpen] = useState<Record<InboxSection, boolean>>(() =>
     Object.fromEntries(INBOX_SECTIONS.map((section) => [section, !INBOX_COLLAPSED[section]])) as Record<
       InboxSection,
       boolean
     >,
   );
+  const [effortOpen, setEffortOpen] = useState<Record<string, boolean>>({});
 
   // Search and the Filter popover narrow rows; they never reorder them.
   const sections = useMemo(() => {
@@ -147,12 +161,22 @@ export function InboxBoard({
       );
     return new Map([...all].map(([section, rows]) => [section, rows.filter(keep)]));
   }, [all, prefs, query]);
+  const groups = useMemo(() => groupInboxRows(sections, groupBy), [sections, groupBy]);
+  const isOpen = useCallback(
+    (group: RowGroup) => group.section === null ? effortOpen[group.key] !== false : actionOpen[group.section],
+    [actionOpen, effortOpen],
+  );
+  const toggleGroup = useCallback((group: RowGroup) => {
+    const section = group.section;
+    if (section === null) {
+      setEffortOpen((current) => ({ ...current, [group.key]: current[group.key] === false }));
+    } else {
+      setActionOpen((current) => ({ ...current, [section]: !current[section] }));
+    }
+  }, []);
 
   // j/k walk the rows the reader can see, top to bottom.
-  const visible = useMemo(
-    () => INBOX_SECTIONS.flatMap((section) => (open[section] ? (sections.get(section) ?? []) : [])),
-    [open, sections],
-  );
+  const visible = useMemo(() => visibleInboxRows(groups, isOpen), [groups, isOpen]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selected = visible.find((row) => row.key === selectedKey) ?? null;
 
@@ -161,9 +185,13 @@ export function InboxBoard({
   useEffect(() => {
     if (arrived.current) return;
     arrived.current = true;
-    const row = focusTicket === null ? undefined : visible.find((entry) => entry.cluster.ticket === focusTicket);
-    if (row !== undefined) setSelectedKey(row.key);
-  }, [focusTicket, visible]);
+    const row = focusTicket === null ? undefined : [...all.values()].flat().find((entry) => entry.cluster.ticket === focusTicket);
+    if (row !== undefined) {
+      setSelectedKey(row.key);
+      setActionOpen((current) => ({ ...current, [row.section]: true }));
+      setEffortOpen((current) => ({ ...current, [row.effortKey]: true }));
+    }
+  }, [all, focusTicket]);
 
   const select = useCallback(
     (row: Row | null) => {
@@ -195,16 +223,22 @@ export function InboxBoard({
   const [starting, setStarting] = useState<Row | null>(null);
   const [request, setRequest] = useState<ActionRequest | null>(null);
 
-  /** Select a row anywhere on the Board: open its section and clear the search first. */
+  /** Select a row anywhere on the Board, even when filters or a group hide it. */
   const reveal = useCallback(
     (target: Row) => {
-      setOpen((current) => ({ ...current, [target.section]: true }));
+      setActionOpen((current) => ({ ...current, [target.section]: true }));
+      setEffortOpen((current) => ({ ...current, [target.effortKey]: true }));
       setQuery("");
+      const patch: Partial<Prefs> = {};
+      if (!prefs.showClones && isTicketlessClone(target.unit)) patch.showClones = true;
+      if (prefs.staleness.length > 0 && !prefs.staleness.includes(target.unit.staleness)) patch.staleness = [];
+      if (prefs.surfaces.length > 0 && !prefs.surfaces.some((surface) => target.unit.surfaces.includes(surface))) patch.surfaces = [];
+      if (Object.keys(patch).length > 0) onPrefs(patch);
       setSelectedKey(target.key);
       onFocusTicket(target.cluster.ticket);
       requestAnimationFrame(() => document.getElementById(`inbox-${target.key}`)?.scrollIntoView({ block: "nearest" }));
     },
-    [onFocusTicket],
+    [onFocusTicket, onPrefs, prefs],
   );
 
   // The Agents strip counts each row's own run, so every count has rows to jump to.
@@ -339,11 +373,13 @@ export function InboxBoard({
 
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col">
+    <div ref={boardRef} className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <InboxHeader
         searchRef={searchRef}
         query={query}
         onQuery={setQuery}
+        groupBy={groupBy}
+        onGroupBy={setGroupBy}
         prefs={prefs}
         onPrefs={onPrefs}
         surfaces={board.surfaces}
@@ -353,37 +389,42 @@ export function InboxBoard({
       <AgentsStrip counts={strip} onJump={jumpTo} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pb-10">
-          {INBOX_SECTIONS.map((section) => {
-            const rows = sections.get(section) ?? [];
-            const expanded = open[section];
+          {groups.length === 0 ? (
+            <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching checkouts.</p>
+          ) : null}
+          {groups.map((group) => {
+            const rows = group.rows;
+            const expanded = isOpen(group);
             return (
-              <section key={section} aria-label={INBOX_SECTION_LABEL[section]} className="pt-5">
+              <section key={group.key} aria-label={group.label} className="pt-5">
                 <button
                   type="button"
                   aria-expanded={expanded}
-                  onClick={() => setOpen((current) => ({ ...current, [section]: !current[section] }))}
+                  onClick={() => toggleGroup(group)}
                   className="flex w-full items-center gap-2 rounded-sm px-2 pb-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   <Icon
                     name="ChevronRight"
                     className={cn("size-3.5 text-muted-foreground transition-transform duration-150", expanded && "rotate-90")}
                   />
-                  <h2 className="text-[13px] font-semibold tracking-tight text-foreground">
-                    {INBOX_SECTION_LABEL[section]}
+                  <h2 className="min-w-0 truncate text-[13px] font-semibold tracking-tight text-foreground">
+                    {group.label}
                   </h2>
                   <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
                 </button>
                 {expanded ? (
                   rows.length === 0 ? (
-                    <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{EMPTY[section]}</p>
+                    <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
                   ) : (
-                    <ul role="listbox" aria-label={INBOX_SECTION_LABEL[section]} className="flex flex-col">
+                    <ul role="listbox" aria-label={group.label} className="flex flex-col">
                       {rows.map((row) => (
                         <InboxRow
                           key={row.key}
                           row={row}
+                          showSection={groupBy === "effort"}
                           now={now}
                           reviewerColumn={reviewerColumn}
+                          compact={compact}
                           selected={row.key === selected?.key}
                           threads={threadsOf(row)}
                           onSelect={() => select(row)}
@@ -519,8 +560,8 @@ const REVIEWER_TONE: Record<ReviewerState, string> = {
 };
 
 /** Up to three reviewer marks and a "+N"; the hover lists every reviewer and where they stand. */
-function ReviewerMarks({ reviewers }: { reviewers: readonly Reviewer[] }) {
-  if (reviewers.length === 0) return <span className="w-[7rem] shrink-0" aria-hidden />;
+function ReviewerMarks({ reviewers, compact }: { reviewers: readonly Reviewer[]; compact: boolean }) {
+  if (reviewers.length === 0) return compact ? null : <span className="w-[7rem] shrink-0" aria-hidden />;
   const { shown, more } = visibleReviewers(reviewers);
   const label = reviewersLabel(reviewers);
   return (
@@ -528,7 +569,7 @@ function ReviewerMarks({ reviewers }: { reviewers: readonly Reviewer[] }) {
       <span
         tabIndex={0}
         aria-label={`Reviewers: ${label.replace(/\n/gu, "; ")}`}
-        className="flex w-[7rem] shrink-0 items-center gap-1.5 overflow-hidden rounded font-mono text-[10.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className={cn("flex shrink-0 items-center gap-1.5 overflow-hidden rounded font-mono text-[10.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring", compact ? "max-w-[7rem]" : "w-[7rem]")}
       >
         {shown.map((reviewer) => (
           <span key={reviewer.login} className="flex shrink-0 items-center gap-0.5">
@@ -611,8 +652,10 @@ function RunChip({ run, ageTip, onOpenThread }: { run: WireRun; ageTip: string; 
 
 function InboxRow({
   row,
+  showSection,
   now,
   reviewerColumn,
+  compact,
   selected,
   threads,
   onSelect,
@@ -623,9 +666,11 @@ function InboxRow({
   onShowOnMap,
 }: {
   row: Row;
+  showSection: boolean;
   now: number;
   /** Some row on the Board has reviewers: every row keeps the column, so the columns stay aligned. */
   reviewerColumn: boolean;
+  compact: boolean;
   selected: boolean;
   threads: readonly ThreadLink[];
   onSelect: () => void;
@@ -646,13 +691,14 @@ function InboxRow({
       aria-selected={selected}
       onClick={onSelect}
       className={cn(
-        "group flex h-9 min-w-0 cursor-default items-center gap-3 rounded-md px-2 text-[12.5px]",
+        "group flex min-w-0 cursor-default items-center rounded-md px-2 text-[12.5px]",
+        compact ? "min-h-16 flex-wrap gap-x-2 gap-y-1 py-2" : "h-9 gap-3",
         selected ? "bg-foreground/[0.07] ring-1 ring-inset ring-ring/60" : "hover:bg-foreground/[0.035]",
       )}
     >
       <span className="flex w-[6.5rem] shrink-0 items-center">
-        {row.verb === null ? null : (
-          <VerbChip verb={row.verb} section={row.section} action={row.action} onPrimary={onPrimary} />
+        {row.verb === null && !showSection ? null : (
+          <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
         )}
       </span>
       {row.run === null ? (
@@ -667,15 +713,15 @@ function InboxRow({
           </span>
         </Tip>
       ) : (
-        <span className="flex min-w-[2.5rem] max-w-[13rem] shrink-0 items-center">
+        <span className={cn("flex min-w-0 shrink-0 items-center", compact ? "max-w-[5.5rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
           <RunChip run={row.run} ageTip={ageTip} onOpenThread={onOpenThread} />
         </span>
       )}
       <Tip label={row.repo}>
-        <span className="w-32 shrink-0 truncate font-medium text-foreground">{row.repo}</span>
+        <span className={cn("truncate font-medium text-foreground", compact ? "min-w-0 flex-1" : "w-32 shrink-0")}>{row.repo}</span>
       </Tip>
       {unit.pr === null ? (
-        <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground/70">—</span>
+        <span className="w-10 shrink-0 font-mono text-[11px] text-muted-foreground/70" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : "No pull request found"}>{unit.observed?.pr === false ? "PR ?" : "—"}</span>
       ) : (
         <UrlLink
           href={unit.pr.url}
@@ -686,8 +732,9 @@ function InboxRow({
         </UrlLink>
       )}
       <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
-        <span className="min-w-0 flex-[3] truncate text-foreground">{row.title}</span>
+        <span className={cn("min-w-0 truncate text-foreground", compact ? "basis-full" : "flex-[3]")}>{row.title}</span>
       </Tip>
+      {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
       {row.cluster.linear?.url == null ? null : (
         <UrlLink
           href={row.cluster.linear.url}
@@ -697,12 +744,14 @@ function InboxRow({
           Linear
         </UrlLink>
       )}
-      {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} /> : null}
-      <Tip label={row.effort}>
-        <span className="hidden min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80 lg:block">
-          {row.effort}
-        </span>
-      </Tip>
+      {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
+      {showSection ? null : (
+        <Tip label={row.effort}>
+          <span className={cn("min-w-0 max-w-52 flex-1 truncate text-[11.5px] text-muted-foreground/80", compact ? "block" : "hidden lg:block")}>
+            {row.effort}
+          </span>
+        </Tip>
+      )}
       {risk.length === 0 ? null : (
         <Tip label="High risk: touches a surface that is hard to undo">
           <span
@@ -717,7 +766,7 @@ function InboxRow({
       <span
         className={cn(
           "flex shrink-0 items-center",
-          selected ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+          selected || compact ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
         )}
       >
         <RowActionMenu
@@ -817,6 +866,8 @@ function InboxHeader({
   searchRef,
   query,
   onQuery,
+  groupBy,
+  onGroupBy,
   prefs,
   onPrefs,
   surfaces,
@@ -826,6 +877,8 @@ function InboxHeader({
   searchRef: React.RefObject<HTMLInputElement | null>;
   query: string;
   onQuery: (next: string) => void;
+  groupBy: InboxGrouping;
+  onGroupBy: (next: InboxGrouping) => void;
   prefs: Prefs;
   onPrefs: (patch: Partial<Prefs>) => void;
   surfaces: readonly string[];
@@ -846,8 +899,8 @@ function InboxHeader({
 
   return (
     <div className="shrink-0 border-b border-border/60">
-      <div className="mx-auto flex w-full max-w-6xl items-center gap-2 px-4 py-2">
-        <label className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 focus-within:ring-2 focus-within:ring-ring">
+      <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-2 px-4 py-2">
+        <label className="flex h-8 min-w-40 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 focus-within:ring-2 focus-within:ring-ring">
           <Icon name="Search" className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             ref={searchRef}
@@ -869,6 +922,18 @@ function InboxHeader({
         <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
           {shown === total ? `${total} rows` : `${shown} of ${total}`}
         </span>
+        <label className="flex h-8 shrink-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
+          Group by
+          <select
+            value={groupBy}
+            onChange={(event) => onGroupBy(event.target.value as InboxGrouping)}
+            aria-label="Group rows by"
+            className="h-8 rounded-md border border-border bg-background px-1.5 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <option value="action">Action</option>
+            <option value="effort">Effort</option>
+          </select>
+        </label>
         <div ref={rootRef} className="relative shrink-0">
           <Tip label="Filter rows by last commit, surface or clones">
             <button

@@ -80,7 +80,9 @@ export function createLinearSync(deps: LinearSyncDeps) {
     }
     const { duplicates } = routeTeams(found);
     for (const team of duplicates) once(`Linear team ${team} is visible to more than one key; using the first key that sees it.`);
-    discovered = { at: now(), keyCount: keys.length, workspaces: found };
+    // A failed key may own any otherwise unclaimed prefix. Retry discovery on
+    // the next scan rather than keeping a partial ownership map for a day.
+    discovered = found.length === keys.length ? { at: now(), keyCount: keys.length, workspaces: found } : null;
     deps.log.info(`linear: ${found.length} of ${keys.length} key(s) resolved to a workspace, ${found.reduce((sum, one) => sum + one.teams.length, 0)} team(s)`);
     return found;
   }
@@ -156,7 +158,9 @@ export function createLinearSync(deps: LinearSyncDeps) {
      */
     async sync(keys: readonly string[], tickets: readonly string[], signal: AbortSignal): Promise<{ fetched: number; unowned: string[] }> {
       if (keys.length === 0) return { fetched: 0, unowned: [...tickets] };
-      const { owner } = routeTeams(await workspaces(keys, signal));
+      const found = await workspaces(keys, signal);
+      const complete = found.length === keys.length;
+      const { owner } = routeTeams(found);
       const { byKey, unowned } = planFetch(tickets, owner);
       const rows = readRows(tickets);
       const cutoff = now() - LINEAR_DETAIL_TTL_MS;
@@ -177,8 +181,12 @@ export function createLinearSync(deps: LinearSyncDeps) {
               once(`Linear key #${index + 1}: an issue lookup returned no data; keeping the cached detail.`);
               break;
             }
-            store(batch.map((ticket) => ({ ticket, detail: details.get(ticket) ?? null })), "key");
-            fetched += batch.length;
+            const entries = [...details].map(([ticket, detail]) => ({ ticket, detail }));
+            if (entries.length < batch.length) {
+              once(`Linear key #${index + 1}: an issue lookup returned partial data; missing tickets will be retried.`);
+            }
+            if (entries.length > 0) store(entries, "key");
+            fetched += entries.length;
           } catch (error) {
             if (signal.aborted) throw error;
             once(`Linear key #${index + 1}: issue lookup failed (${errorText(error)}); keeping the cached detail.`);
@@ -187,13 +195,14 @@ export function createLinearSync(deps: LinearSyncDeps) {
         }
       }
       if (fetched > 0) deps.log.info(`linear: fetched ${fetched} ticket(s)`);
-      return { fetched, unowned };
+      return { fetched, unowned: complete ? unowned : [] };
     },
 
     /** Tickets no key covers, using the last discovery (running one if there is none yet). */
     async unowned(keys: readonly string[], tickets: readonly string[], signal: AbortSignal): Promise<string[]> {
       if (keys.length === 0) return [...tickets];
-      return planFetch(tickets, routeTeams(await workspaces(keys, signal)).owner).unowned;
+      const found = await workspaces(keys, signal);
+      return found.length === keys.length ? planFetch(tickets, routeTeams(found).owner).unowned : [];
     },
   };
 }

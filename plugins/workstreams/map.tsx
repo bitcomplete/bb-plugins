@@ -120,6 +120,7 @@ const PAINT: Record<Lifecycle, Paint> = {
   "awaiting-review": { ring: "text-indigo-400", fill: null, dot: "bg-indigo-400" },
   active: { ring: "text-blue-500", fill: "bg-blue-500/30", dot: "bg-blue-500" },
   "in-progress": { ring: "text-blue-400", fill: "bg-blue-400/20", dot: "bg-blue-400" },
+  unverified: { ring: "text-amber-400", fill: "bg-amber-400/15", dot: "bg-amber-400" },
   "up-next": { ring: "text-sky-300", fill: "bg-sky-300/20", dot: "bg-sky-300" },
   shipped: { ring: "text-foreground/25", fill: "bg-foreground/[0.07]", dot: "bg-foreground/30" },
   merged: { ring: "text-foreground/20", fill: "bg-foreground/[0.05]", dot: "bg-foreground/25" },
@@ -154,6 +155,36 @@ function lifecycleOf(datum: MapDatum): Lifecycle {
 
 function isUnsorted(group: Group): boolean {
   return group.key === UNSORTED || group.key.endsWith(`:${UNSORTED}`);
+}
+
+const TICKET_SOURCE_LABEL: Record<NonNullable<Unit["ticketSource"]>, string> = {
+  branch: "branch",
+  linkback: "Linear linkback",
+  title: "PR title",
+  "description-url": "Linear URL in PR description",
+  "description-mention": "ticket mention in PR description",
+  directory: "checkout directory",
+};
+
+function ticketSources(units: readonly Unit[]): string | null {
+  const sources = [...new Set(units.flatMap((unit) => unit.ticketSource === null ? [] : [unit.ticketSource]))];
+  return sources.length === 0 ? null : sources.map((source) => TICKET_SOURCE_LABEL[source]).join(" · ");
+}
+
+function emptyMapMessage(board: Board | null, hasUnsorted: boolean, showUnsorted: boolean): string {
+  if (board === null) return "Loading the map…";
+  if (board.scanning) return "Scanning your checkouts…";
+  if (board.lastScanAt === null) {
+    return board.warnings.length > 0
+      ? "No scan has finished. Check the scan notices above, resolve them, then select Rescan."
+      : "No scan yet. Open a BB project with checkouts or set scan roots in Plugins → Workstreams, then select Rescan.";
+  }
+  if (hasUnsorted && !showUnsorted) {
+    return "No ticketed checkouts to map. Open More map options to show Unsorted, or add a ticket ID to a branch or PR and select Rescan.";
+  }
+  return board.warnings.length > 0
+    ? "No checkouts found. Check the scan notices above, then select Rescan."
+    : "No checkouts found in the scanned locations. Open a BB project with checkouts or set scan roots in Plugins → Workstreams, then select Rescan.";
 }
 
 // ---- type ------------------------------------------------------------------
@@ -522,6 +553,11 @@ const EMPTY_SCENE: Scene = { layout: null, keys: [], codes: new Map(), captions:
  */
 const CHROME: Insets = { top: 32, right: 24, bottom: 58, left: 24 };
 
+/** The legend sits above the controls when both cannot fit side by side. */
+function chromeInsets(width: number): Insets {
+  return width < 400 ? { ...CHROME, bottom: 118 } : width < 760 ? { ...CHROME, bottom: 92 } : CHROME;
+}
+
 /**
  * The glance test at fit-all: every top-level circle should be nameable. One
  * too small to hold its name gets a caption outside its rim, on whichever
@@ -583,7 +619,7 @@ function placeCaptions(
     ];
   });
   const mounted = circles.filter((circle) => decisions.has(circle.key));
-  const bounds = { left: 4, top: 4, right: size.width - 4, bottom: size.height - CHROME.bottom + 12 };
+  const bounds = { left: 4, top: 4, right: size.width - 4, bottom: size.height - chromeInsets(size.width).bottom + 12 };
   const metrics = { height: CAPTION.line, gap: CAPTION.gap, clearance: 2, pad: 3 };
   const placed = placeCaptionBoxes(
     [...requests, ...hot],
@@ -1243,6 +1279,7 @@ const UnitList = memo(function UnitList({
               key={unit.path}
               className={cn("relative flex items-center gap-2 pl-5 text-[11.5px]", LEGIBLE)}
               style={{ height: UNIT_ROW }}
+              title={unit.ticketSource === null ? undefined : `Ticket found in ${TICKET_SOURCE_LABEL[unit.ticketSource]}`}
             >
               {linkUp || linkDown ? (
                 <span
@@ -1266,7 +1303,7 @@ const UnitList = memo(function UnitList({
                 {unit.repo ?? unit.dirName}
               </span>
               {unit.pr === null ? (
-                <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">no PR</span>
+                <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground" title={unit.observed?.pr === false ? "GitHub status unavailable; rescan to check for a pull request" : undefined}>{unit.observed?.pr === false ? "PR ?" : "no PR"}</span>
               ) : (
                 <UrlLink
                   href={unit.pr.url}
@@ -1892,6 +1929,7 @@ export function MapView({
   const tipRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<View>({ scale: 1, x: 0, y: 0 });
   const sizeRef = useRef({ width: 0, height: 0 });
+  const [compactHud, setCompactHud] = useState(false);
   const frameRef = useRef<number | null>(null);
   const flightRef = useRef<Flight | null>(null);
   const flightFrameRef = useRef<number | null>(null);
@@ -1932,7 +1970,7 @@ export function MapView({
 
   // Fit the drawn mass, not the circle around it, into what the chrome leaves.
   const fitAllView = useCallback(
-    () => fitBox(massBox(layout.roots), sizeRef.current, CHROME),
+    () => fitBox(massBox(layout.roots), sizeRef.current, chromeInsets(sizeRef.current.width)),
     [layout],
   );
 
@@ -2266,7 +2304,7 @@ export function MapView({
       const vTo =
         target !== undefined && focus !== null
           ? fitView(target, size, 0.9)
-          : fitBox(massBox(toLayout.roots), size, CHROME);
+          : fitBox(massBox(toLayout.roots), size, chromeInsets(size.width));
       if (focus === null) {
         focusRef.current = null;
         onSelect(null);
@@ -2359,23 +2397,42 @@ export function MapView({
     return () => window.removeEventListener("keydown", onKey);
   }, [face, turnTo]);
 
-  // Track the viewport; fit the first time both it and the layout are known.
+  // Track the viewport. Preserve a reader's zoom, but keep a fitted view fitted
+  // when a BB sidebar or help panel changes the available width.
   useLayoutEffect(() => {
     const node = viewportRef.current;
     if (node === null) return;
     const observer = new ResizeObserver(() => {
       const rect = node.getBoundingClientRect();
+      const previous = sizeRef.current;
+      if (rect.width === previous.width && rect.height === previous.height) return;
+      const priorFit = previous.width > 0 ? fitBox(massBox(layout.roots), previous, chromeInsets(previous.width)) : null;
+      const focus = focusRef.current === null ? undefined : layout.index.get(focusRef.current);
+      const priorFocus = focus === undefined || previous.width === 0 ? null : fitView(focus, previous, 0.9);
+      const near = (target: View | null) => target !== null &&
+        Math.abs(viewRef.current.scale / target.scale - 1) < 0.01 &&
+        Math.abs(viewRef.current.x - target.x) < 2 &&
+        Math.abs(viewRef.current.y - target.y) < 2;
       sizeRef.current = { width: rect.width, height: rect.height };
+      setCompactHud(rect.width < 760);
       if (!fittedRef.current && rect.width > 0 && layout.world.r > 0) {
         fittedRef.current = true;
         settleView();
+      } else if (near(priorFocus) && focus !== undefined) {
+        flyTo(fitView(focus, sizeRef.current, 0.9), true);
+      } else if (near(priorFit)) {
+        settleView();
       } else {
-        commit(viewRef.current);
+        commit({
+          ...viewRef.current,
+          x: viewRef.current.x + (rect.width - previous.width) / 2,
+          y: viewRef.current.y + (rect.height - previous.height) / 2,
+        });
       }
     });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [commit, layout, settleView]);
+  }, [commit, flyTo, layout, settleView]);
 
   // A rescan or the Unsorted toggle can change the world under a valid view.
   useEffect(() => {
@@ -2662,6 +2719,9 @@ export function MapView({
   const hoverCircle = hover === null ? undefined : layout.index.get(hover);
   const hoverFacts = hover === null ? undefined : facts.get(hover);
   const hoverCode = hover === null ? undefined : scene.codes.get(hover);
+  const hoverTicketSources = hoverCircle?.data.kind === "cluster"
+    ? ticketSources(hoverCircle.data.cluster.units)
+    : null;
 
   return (
     <div className="relative flex min-h-0 flex-1">
@@ -2776,7 +2836,7 @@ export function MapView({
           className="pointer-events-none absolute left-0 top-0 max-w-72 rounded-lg border border-border bg-popover px-2.5 py-1.5 text-popover-foreground shadow-sm"
           style={{
             opacity:
-              door === null && hoverCircle !== undefined && hoverFacts !== undefined && hoverCode?.[0] !== "f" ? 1 : 0,
+              door === null && hoverCircle !== undefined && hoverFacts !== undefined && (hoverCode?.[0] !== "f" || hoverTicketSources !== null) ? 1 : 0,
             transition: `opacity ${hoverCircle === undefined ? 80 : 160}ms ${EASE_CSS}`,
           }}
         >
@@ -2796,6 +2856,11 @@ export function MapView({
                   ? `${hoverFacts.hotCount === 0 ? "Nothing needs you" : `${hoverFacts.hotCount} ${hoverFacts.hotCount === 1 ? "needs" : "need"} you`} · ${hoverCircle.data.group.total} checkouts`
                   : `${TONE[hoverFacts.lifecycle].label} · ${hoverCircle.data.cluster.units.length} ${hoverCircle.data.cluster.units.length === 1 ? "checkout" : "checkouts"}${hoverFacts.stuck ? "" : ` · last commit ${STALE_WORDS[hoverFacts.staleness]}`}`}
               </p>
+              {hoverTicketSources === null ? null : (
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Ticket found in {hoverTicketSources}
+                </p>
+              )}
               {hoverFacts.stuck ? (
                 <p className="mt-1 flex items-center gap-1.5 text-[11px] font-medium text-foreground">
                   <StuckGlyph />
@@ -2819,17 +2884,16 @@ export function MapView({
 
         {layout.roots.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center p-6">
-            <Notice>
-              {shownBoard === null ? "Loading the map…" : "Nothing to map yet. Rescan once your checkouts are in view."}
-            </Notice>
+            <Notice>{emptyMapMessage(shownBoard, unsorted !== null, showUnsorted)}</Notice>
           </div>
         ) : null}
       </div>
 
-      {/* The chrome sits in the corners a circle never reaches at fit-all. */}
+      {/* The legend moves above the controls when the plugin panel narrows. */}
+      <div className={cn("pointer-events-none absolute inset-x-3 bottom-3 flex", compactHud ? "flex-col-reverse items-start gap-2" : "items-end justify-between gap-3")}>
       <div
         data-hud
-        className="absolute bottom-3 left-3 flex items-center gap-0.5 rounded-full border border-border/70 bg-background/90 p-0.5 shadow-sm"
+        className="pointer-events-auto flex max-w-full flex-wrap items-center gap-0.5 rounded-full border border-border/70 bg-background/90 p-0.5 shadow-sm"
       >
         <Tip label="Fit everything (Esc)">
           <button
@@ -2857,8 +2921,9 @@ export function MapView({
           }}
         />
       </div>
-      <div data-hud className="absolute bottom-4 right-4">
+      <div data-hud className="pointer-events-auto">
         <Legend />
+      </div>
       </div>
     </div>
   );

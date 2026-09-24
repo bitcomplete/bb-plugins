@@ -26,6 +26,7 @@ import { Icon } from "@/components/ui/icon";
 import { Tip } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
+import { readLastView, storeLastView, viewFromSubPath, type ViewId } from "./view-preference";
 
 export type Group = WireGroup;
 export type Cluster = Group["clusters"][number];
@@ -40,8 +41,9 @@ export const TONE: Record<Lifecycle, { dot: string; label: string }> = {
   "awaiting-review": { dot: "bg-amber-500", label: "Awaiting review" },
   active: { dot: "bg-sky-400", label: "Being edited" },
   "in-progress": { dot: "bg-sky-600", label: "In progress" },
+  unverified: { dot: "bg-amber-400", label: "Status unverified" },
   "up-next": { dot: "bg-muted-foreground/50", label: "Up next" },
-  shipped: { dot: "bg-teal-500", label: "Shipped" },
+  shipped: { dot: "bg-teal-500", label: "Release tagged" },
   merged: { dot: "bg-violet-500", label: "Merged" },
   closed: { dot: "bg-muted-foreground/40", label: "Closed" },
 };
@@ -164,8 +166,8 @@ function groupWarnings(warnings: readonly string[]): string[] {
   if (untagged.length === 0) return rest;
   const summary =
     untagged.length === 1
-      ? `${NO_RELEASE_TAGS.exec(untagged[0]!)?.[1] ?? "One repo"} has no release tags — merged work there shows as merged, not shipped.`
-      : `${untagged.length} repos have no release tags — merged work there shows as merged, not shipped.`;
+      ? `${NO_RELEASE_TAGS.exec(untagged[0]!)?.[1] ?? "One repo"} has no release tags — merged work there stays labeled Merged.`
+      : `${untagged.length} repos have no release tags — merged work there stays labeled Merged.`;
   return [...rest, summary];
 }
 
@@ -221,17 +223,13 @@ function Warnings({ warnings }: { warnings: string[] }) {
 // ---------------------------------------------------------------------------
 
 /**
- * The Map is the landing view: the point of the board is the picture, and the
- * dense list is the secondary read. Both stay deep-linkable — `board` is a real
- * sub-path rather than a toggle — so panel history keeps walking with browser
- * back and forward.
+ * Both views have explicit paths so panel history keeps walking with browser
+ * back and forward. The panel root redirects to the last view opened here.
  */
 const VIEWS = [
-  { id: "", title: "Map", icon: "GridView" },
+  { id: "map", title: "Map", icon: "GridView" },
   { id: "board", title: "Board", icon: "Columns2" },
 ] as const;
-
-type ViewId = (typeof VIEWS)[number]["id"];
 
 /** Typing in a field is never a view switch. */
 function isEditable(target: EventTarget | null): boolean {
@@ -285,7 +283,15 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   const { rpc, board, error, refetch } = useBoard();
   const { prefs, update } = usePrefs();
   const navigate = useBbNavigate();
-  const view: ViewId = subPath.split("/")[0] === "board" ? "board" : "";
+  const explicitView = viewFromSubPath(subPath);
+  const view = explicitView ?? readLastView();
+  useEffect(() => {
+    if (explicitView === null) {
+      navigate.toPluginPanel("board", { subPath: view, replace: true });
+    } else {
+      storeLastView(explicitView);
+    }
+  }, [explicitView, navigate, view]);
   const now = useNow(30_000);
   const panel = experimental_useAppPanel();
   const openHow = useCallback(() => {
@@ -316,7 +322,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
       if (event.metaKey || event.ctrlKey || event.altKey || isEditable(event.target)) return;
       event.preventDefault();
       if (event.key === "?") openHow();
-      else navigate.toPluginPanel("board", { subPath: view === "board" ? "" : "board" });
+      else navigate.toPluginPanel("board", { subPath: view === "board" ? "map" : "board" });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -335,7 +341,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
           onPrefs={update}
           focusTicket={focusTicket}
           onFocusTicket={setFocusTicket}
-          onShowOnMap={() => navigate.toPluginPanel("board", { subPath: "" })}
+          onShowOnMap={() => navigate.toPluginPanel("board", { subPath: "map" })}
         />
       )
     ) : (

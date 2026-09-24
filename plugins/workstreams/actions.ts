@@ -76,13 +76,10 @@ export type ThreadCandidate = {
   canSpawnChild: boolean;
 };
 
-/** Which thread APIs the installed SDK exposes. */
+/** Which thread APIs are safe for tracked Board actions. */
 export type ThreadCapabilities = { send: boolean; subthread: boolean; contextUsage: boolean };
 
 export type Recommendation = { mode: ThreadMode; threadId: string | null; reason: string };
-
-/** Above this share of its context window, a thread gets a subthread instead of another turn. */
-export const CONTEXT_LIMIT = 0.7;
 
 const STRONG = new Set<ThreadTier>(["started", "environment"]);
 const TIER_ORDER: readonly ThreadTier[] = ["started", "environment", "ticket", "paths"];
@@ -118,10 +115,10 @@ function subthreadOr(parent: ThreadCandidate, caps: ThreadCapabilities, reason: 
  * as a subthread: they do not need the author's reasoning, a subthread leaves
  * the parent's context untouched, and the parent hears when it finishes.
  *
- * Review replies want the thread that WROTE the PR (a strong link), because it
- * knows why the code looks the way it does. Idle → continue in it; running, or
- * its context nearly full → a subthread of it. Weak links (a title or a path
- * mention) often point at large unrelated threads, so they get a new thread.
+ * Review replies use a subthread of the thread that wrote the PR (a strong
+ * link). Each Board action needs its own thread so lifecycle events and final
+ * answers belong to exactly one run. Weak links (a title or a path mention)
+ * often point at large unrelated threads, so they get a new thread.
  */
 export function recommendThread(
   action: AgentAction,
@@ -144,23 +141,8 @@ export function recommendThread(
           reason: "New thread: the linked threads only mention this work, and may be large or unrelated.",
         };
   }
-  const idle = strong.find((thread) => !thread.running);
-  if (idle === undefined) {
-    const parent = strong[0]!;
-    return subthreadOr(parent, caps, `Subthread of ${quoted(parent.title)}: it wrote this PR and is running, so its work is not interrupted.`);
-  }
-  const used = caps.contextUsage ? idle.contextUsed : null;
-  if (used !== null && used > CONTEXT_LIMIT) {
-    return subthreadOr(
-      idle,
-      caps,
-      `Subthread of ${quoted(idle.title)}: it wrote this PR, but ${Math.round(used * 100)}% of its context is used.`,
-    );
-  }
-  if (!caps.send) {
-    return subthreadOr(idle, caps, `Subthread of ${quoted(idle.title)}: this BB version cannot message an existing thread.`);
-  }
-  return { mode: "continue", threadId: idle.id, reason: `Continue in ${quoted(idle.title)}: it wrote this PR and is idle.` };
+  const parent = strong.find((thread) => thread.canSpawnChild) ?? strong[0]!;
+  return subthreadOr(parent, caps, `Subthread of ${quoted(parent.title)}: it wrote this PR; this action gets its own tracked thread.`);
 }
 
 // ---- prompts ----------------------------------------------------------------

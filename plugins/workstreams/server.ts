@@ -48,6 +48,7 @@ import {
   namingCandidates,
   parseSurfaceRules,
   placeClusters,
+  relativeTime,
   type BoardGroup,
   type Cluster,
   type ClusterDecision,
@@ -326,7 +327,7 @@ export const rpcContract = defineRpcContract({
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
   },
-  /** Run an agent action: continue in, branch from, or start a thread. */
+  /** Run an agent action in its own subthread or new thread. */
   agent_run: {
     input: z
       .object({
@@ -536,7 +537,7 @@ export default async function plugin(bb: BbPluginApi) {
     const rows = db.prepare(`SELECT unit FROM units`).all() as { unit: string }[];
     return rows.flatMap((row) => {
       const parsed = rawUnitSchema.safeParse(JSON.parse(row.unit));
-      return parsed.success ? [parsed.data] : [];
+      return parsed.success ? [{ ...parsed.data, observed: parsed.data.observed ?? { status: false, pr: false } }] : [];
     });
   }
 
@@ -1385,7 +1386,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function relistThreads(): Promise<void> {
     try {
-      const rows = await bb.sdk.threads.list({ limit: 500 });
+      const pageSize = 500;
+      const maxPages = 21; // Twenty full pages, plus one to confirm there are no more.
+      const rows = [] as Awaited<ReturnType<typeof bb.sdk.threads.list>>[number][];
+      const seen = new Set<string>();
+      for (let page = 0; page < maxPages; page++) {
+        const batch = await bb.sdk.threads.list({ limit: pageSize, offset: page * pageSize });
+        for (const row of batch) {
+          if (!seen.has(row.id)) {
+            rows.push(row);
+            seen.add(row.id);
+          }
+        }
+        if (page === maxPages - 1 && batch.length > 0) throw new Error(`Thread list exceeds ${pageSize * (maxPages - 1)} threads.`);
+        if (batch.length < pageSize) break;
+        if (rows.length < (page + 1) * pageSize) throw new Error("Thread list pagination repeated a page.");
+      }
       for (const row of rows) await readStartedFor(row);
       const refreshed = await refreshWorkedPaths({
         threads: rows,
@@ -2028,7 +2044,7 @@ export default async function plugin(bb: BbPluginApi) {
     const found = await scannedUnit(path);
     if (found === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
     const { raw } = found;
-    if (raw.pr === null || raw.pr.state !== "OPEN") return { ok: false, error: "This row has no open pull request." };
+    if (raw.pr === null || raw.pr.state !== "OPEN") return { ok: false, error: raw.observed?.pr === false ? "Pull request status is unavailable. Rescan before acting." : "This row has no open pull request." };
     if (prTarget(raw.pr.url) === null) return { ok: false, error: "The pull request URL from the last scan is not one gh can act on." };
     const hostId = (await bb.sdk.system.config()).primaryHostId;
     if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh from." };
@@ -2037,6 +2053,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   const liveOf = (hostId: string) => (prUrl: string) =>
     host.call("prLive", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+  const reviewersOf = (hostId: string) => (prUrl: string) =>
+    host.call("prReviewers", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
   const writeOf = (hostId: string) => (request: Parameters<typeof host.call<"prWrite">>[1]) =>
     host.call("prWrite", request, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
 
@@ -2056,7 +2074,6 @@ export default async function plugin(bb: BbPluginApi) {
       spawn: (args) => bb.sdk.threads.spawn(args),
       get: (args) => bb.sdk.threads.get(args),
       context: (args) => bb.sdk.threads.context(args),
-      send: (args) => bb.sdk.threads.send(args),
     },
   };
 
@@ -2155,7 +2172,13 @@ export default async function plugin(bb: BbPluginApi) {
       directRun(path, "nudge", async () => {
         const target = await actionable(path);
         if (!target.ok) return target;
-        const reviewers = rerequest ? (target.raw.pr?.reviewRequests ?? []) : [];
+        const live = await reviewersOf(target.hostId)(target.prUrl);
+        if (!live.ok) return live;
+        const scanned = target.raw.pr?.reviewRequests ?? [];
+        if (rerequest && [...live.reviewers].sort().join("\n") !== [...scanned].sort().join("\n")) {
+          return { ok: false as const, error: "Pending reviewers changed since the last scan. Rescan and confirm again." };
+        }
+        const reviewers = rerequest ? live.reviewers : [];
         if (rerequest && reviewers.length === 0) return { ok: false as const, error: "No reviewers are pending on this PR to re-request." };
         return writeOf(target.hostId)({ kind: "nudge", prUrl: target.prUrl, reviewers, comment });
       }),
@@ -2166,11 +2189,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const, ...(await planAgent(agentSdk, action, await linkedThreads(path))) };
     },
     agent_run: async ({ path, action, mode, threadId, prompt }) => {
+      if (mode === "continue") {
+        return { ok: false as const, error: "Continue in an existing thread cannot track this action reliably. Choose a subthread or new thread." };
+      }
       const found = await scannedUnit(path);
       const linked = (await linkedThreads(path)).map((thread) => thread.id);
-      // Recorded before launch: a continue run's turn can start before send()
-      // returns, and its first event must find the run. Dropped if nothing ran.
-      const runId = runs.begin({ ...(await runTarget(path)), action, mode, threadId: mode === "continue" ? threadId : null });
+      // Recorded before launch; bound to the dedicated thread when spawn returns.
+      const runId = runs.begin({ ...(await runTarget(path)), action, mode, threadId: null });
       let result: Awaited<ReturnType<typeof runAgent>>;
       try {
         result = await runAgent(agentSdk, {
@@ -2188,7 +2213,7 @@ export default async function plugin(bb: BbPluginApi) {
       else runs.attach(runId, result.threadId);
       if (result.ok) {
         // A new or sub thread is linked at once through the metadata it was seeded with.
-        if (mode !== "continue") startedFor.set(result.threadId, result.ticket);
+        startedFor.set(result.threadId, result.ticket);
         bb.log.info(`agent action (${mode}) in thread ${result.threadId} for ${result.ticket}`);
         announceThreads();
       }
@@ -2242,13 +2267,33 @@ export default async function plugin(bb: BbPluginApi) {
   // ---- CLI -------------------------------------------------------------
 
   function summarize(current: Board): string {
-    if (current.groups.length === 0) return "No clusters. Run `bb workstreams refresh`.";
     const byParent = groupChildren(current.groups);
     const coverage = current.threadCoverage;
+    const failed = current.warnings.some((warning) =>
+      warning.startsWith("Scan failed:") ||
+      warning.startsWith("No scan roots configured") ||
+      warning.startsWith("No primary BB host"),
+    );
+    const now = Date.now();
+    const scanAt = current.lastScanAt;
+    const age = scanAt === null ? null : now - Date.parse(scanAt);
+    const stale = age !== null && Number.isFinite(age) && age > current.health.refreshMinutes * 60_000;
+    const scan = scanAt === null
+      ? failed ? "scan: no successful scan (latest attempt failed)" : "scan: never scanned"
+      : `scan: ${scanAt} (${relativeTime(scanAt, now)})${stale ? "; stale" : ""}${failed ? "; latest attempt failed" : ""}`;
     const lines = [
+      `${scan}${current.scanning ? "; scanning now" : ""}`,
       `mode: ${current.mode}  levels: ${current.depth}`,
       `threads: ${coverage.linked} of ${coverage.threads} linked (environment ${coverage.byTier.environment}, ticket ${coverage.byTier.ticket}, paths ${coverage.byTier.paths}); ${coverage.clustersWithThread} clusters have a thread`,
     ];
+    if (current.warnings.length > 0) {
+      lines.push(`warnings: ${current.warnings.length}${current.warnings.length > 3 ? " (showing 3)" : ""}`);
+      for (const warning of current.warnings.slice(0, 3)) lines.push(`  - ${warning.replace(/\s+/gu, " ").trim().slice(0, 200)}`);
+    }
+    if (current.groups.length === 0) {
+      lines.push(scanAt === null ? "No clusters yet. Run `bb workstreams refresh`." : "No checkouts found in the scanned roots.");
+      return lines.join("\n");
+    }
 
     const render = (group: WireGroup, indent: string): void => {
       const flag =
@@ -2260,10 +2305,14 @@ export default async function plugin(bb: BbPluginApi) {
         `${indent}  ${group.rollup}`,
       );
       for (const cluster of group.clusters) {
+        const unknown = [
+          cluster.units.some((unit) => unit.observed?.status === false) ? "git status unavailable" : null,
+          cluster.units.some((unit) => unit.observed?.pr === false) ? "GitHub status unavailable" : null,
+        ].filter((part): part is string => part !== null);
         lines.push(
           `${indent}  ${cluster.ticket}  ${cluster.lifecycle}  ${cluster.summary}${
             cluster.surfaces.length === 0 ? "" : `  [${cluster.surfaces.join(" ")}]`
-          }${cluster.threads.length === 0 ? "" : `  threads:${cluster.threads.length}`}`,
+          }${cluster.threads.length === 0 ? "" : `  threads:${cluster.threads.length}`}${unknown.length === 0 ? "" : `  [${unknown.join("; ")}]`}`,
         );
       }
       for (const child of byParent.get(group.key) ?? []) render(child, `${indent}  `);

@@ -83,10 +83,10 @@ function thread(overrides: Partial<ThreadCandidate> = {}): ThreadCandidate {
 
 describe("recommendThread for review replies", () => {
   for (const action of ["address-review", "address-comments"] as AgentAction[]) {
-    it(`${action}: continues in the idle thread that wrote the PR, because it knows why the code looks the way it does`, () => {
+    it(`${action}: gives the idle author thread a dedicated subthread for reliable run tracking`, () => {
       const result = recommendThread(action, [thread({ tier: "environment" })], ALL);
-      expect(result).toMatchObject({ mode: "continue", threadId: "thr_a" });
-      expect(result.reason).toBe("Continue in 'Gift card balance on folio': it wrote this PR and is idle.");
+      expect(result).toMatchObject({ mode: "subthread", threadId: "thr_a" });
+      expect(result.reason).toBe("Subthread of 'Gift card balance on folio': it wrote this PR; this action gets its own tracked thread.");
     });
 
     it(`${action}: spawns a subthread of a running author thread, so its work is not interrupted`, () => {
@@ -100,23 +100,22 @@ describe("recommendThread for review replies", () => {
     });
   }
 
-  it("prefers an idle author thread over a running one", () => {
+  it("prefers the strongest and most recent author thread as parent", () => {
     const threads = [thread({ id: "thr_run", running: true, updatedAt: 9_000 }), thread({ id: "thr_idle", tier: "environment" })];
-    expect(recommendThread("address-review", threads, ALL)).toMatchObject({ mode: "continue", threadId: "thr_idle" });
+    expect(recommendThread("address-review", threads, ALL)).toMatchObject({ mode: "subthread", threadId: "thr_run" });
   });
 
-  it("spawns a subthread instead of continuing when the author thread's context is over 70% used, and says so", () => {
+  it("uses a dedicated subthread regardless of author context use", () => {
     const result = recommendThread("address-review", [thread({ contextUsed: 0.82 })], ALL);
     expect(result).toMatchObject({ mode: "subthread", threadId: "thr_a" });
-    expect(result.reason).toContain("82% of its context is used");
-    expect(recommendThread("address-review", [thread({ contextUsed: 0.7 })], ALL).mode).toBe("continue");
+    expect(recommendThread("address-review", [thread({ contextUsed: 0.7 })], ALL).mode).toBe("subthread");
   });
 
-  it("ignores context usage when the SDK does not report it", () => {
-    expect(recommendThread("address-review", [thread({ contextUsed: 0.95 })], { ...ALL, contextUsage: false }).mode).toBe("continue");
+  it("can use a subthread when the SDK does not report context use", () => {
+    expect(recommendThread("address-review", [thread({ contextUsed: 0.95 })], { ...ALL, contextUsage: false }).mode).toBe("subthread");
   });
 
-  it("degrades: no send → subthread; no subthreads → new; BB refusing a child → new", () => {
+  it("degrades: no subthreads or BB refusing a child → new", () => {
     expect(recommendThread("address-review", [thread()], { ...ALL, send: false }).mode).toBe("subthread");
     expect(recommendThread("address-review", [thread()], { send: false, subthread: false, contextUsage: true }).mode).toBe("new");
     expect(recommendThread("address-review", [thread({ running: true })], { ...ALL, subthread: false }).mode).toBe("new");

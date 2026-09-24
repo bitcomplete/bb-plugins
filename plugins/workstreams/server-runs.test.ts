@@ -146,26 +146,18 @@ describe("agent runs through the server", () => {
     expect(harness.sdk.callsTo("threads.output")).toEqual([[{ threadId: "thr-quill-new" }]]);
   });
 
-  it("in continue mode, ignores the thread's earlier turn and catches a turn that starts before send() returns", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  it("refuses continue before launching or recording an untrackable shared-thread action", async () => {
     const linked = {
       ...thread("thr-quill-author", "idle"),
       environmentPath: PATH,
       environmentBranchName: "dev/abc-101-gift-card-balance",
       hasPendingInteraction: false,
     };
-    const { harness, open, settle } = await load({ threads: [linked] });
-    harness.sdk.stub("threads.send", async () => {
-      // BB can start the queued turn before the send call resolves.
-      await harness.emitThreadEvent("thread.active", { thread: thread("thr-quill-author") });
-      return {};
-    });
-    await harness.callRpc("agent_run", { path: PATH, action: "address-comments", mode: "continue", threadId: "thr-quill-author", prompt: "Reply." });
-    await settle();
-    expect(await open()).toEqual([expect.objectContaining({ status: "running", threadId: "thr-quill-author", mode: "continue" })]);
-    await harness.emitThreadEvent("thread.idle", { thread: thread("thr-quill-author", "idle"), lastAssistantText: "Result: Replied on 2 threads" });
-    await settle();
+    const { harness, open } = await load({ threads: [linked] });
+    expect(await harness.callRpc("agent_run", { path: PATH, action: "address-comments", mode: "continue", threadId: "thr-quill-author", prompt: "Reply." })).toMatchObject({ ok: false });
     expect(await open()).toEqual([]);
+    expect(harness.sdk.callsTo("threads.send")).toEqual([]);
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([]);
   });
 });
 

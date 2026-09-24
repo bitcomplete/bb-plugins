@@ -66,7 +66,7 @@ need the details; use the plain form when you need the shape.
 ## Lifecycles
 
 Each unit gets one lifecycle, and a cluster takes its most urgent member's. The
-eleven states fall into three groups, and **those groups are the lenses**.
+twelve states fall into three groups, and **those groups are the lenses**.
 
 | Group | Lifecycle | Meaning |
 | --- | --- | --- |
@@ -75,12 +75,18 @@ eleven states fall into three groups, and **those groups are the lenses**.
 | Waiting | `approved-with-comments` | APPROVED, but a reviewer is still sitting at COMMENTED |
 | Waiting | `awaiting-merge` | APPROVED, checks green, nothing outstanding |
 | Waiting | `awaiting-review` | Open PR with no review decision yet |
+| Waiting | `unverified` | Local or GitHub status could not be checked; rescan to verify it |
 | Active | `active` | Working tree is dirty — edits are open right now |
 | Active | `in-progress` | Commits ahead of upstream, or a draft PR, tree clean |
-| Active | `up-next` | Branch exists, nothing ahead, no PR |
-| Done | `shipped` | Merged, and the merge commit is contained in a release tag |
+| Active | `up-next` | Branch exists, nothing ahead, and no PR was found |
+| Done | `shipped` | Merged, and the merge commit is contained in a local release tag; this does not verify deployment |
 | Done | `merged` | Merged, not yet in a release tag |
 | Done | `closed` | Closed without merging |
+
+New unit JSON records whether git status and the GitHub PR lookup completed.
+Older persisted units have no observation flags and appear as `unverified`
+until the next successful scan. Failed checks remain visible as unavailable;
+they do not prove that a tree is clean or a pull request is absent.
 
 Precedence runs top to bottom in that table. Two distinctions matter most:
 
@@ -93,9 +99,9 @@ Precedence runs top to bottom in that table. Two distinctions matter most:
 
 `shipped` is derived from **local git tags only**: the merge commit is tested
 for containment in the newest release tag with `git merge-base --is-ancestor`.
-No GitHub deployments API call is made. If a repo has no release tags or the
-check fails, the unit degrades to `merged` and the board warns once per repo —
-an unknown never invents a production deploy.
+No GitHub deployments API call is made, so this state does not establish a
+production deployment. If a repo has no release tags or the check fails, the
+unit remains `merged` and the board warns once per repo.
 
 ## Staleness
 
@@ -227,8 +233,9 @@ separately: `bb plugin logs workstreams`.
   nor lost a cluster is never renamed. Call counts and token usage are logged at
   info level: `bb plugin logs workstreams`.
 - **Pull request state needs an authenticated `gh`.** When `gh auth status`
-  fails, the board reports one warning and falls back to local git state: every
-  unit reads as `drafting` or `local`, and no stacks are detected. Fix it with
+  fails, the board reports one warning and falls back to local git state: observed
+  edits remain `active` and ahead commits remain `in-progress`; other units show
+  `unverified` until a GitHub check succeeds. No stacks are detected. Fix it with
   `gh auth refresh -h github.com`. Changed paths and therefore surfaces also go
   missing, because the default branch they are diffed against comes from `gh`.
 - **Scans are cached.** `list` reads the last scan; run `refresh` first when
@@ -242,12 +249,12 @@ Configure with `bb plugin config workstreams set <key> <value>`:
 | Key | Notes |
 | --- | --- |
 | `scanRoots` | Newline-separated absolute paths; empty falls back to every BB project's path. |
-| `ticketPattern` | Two capture groups; default `([A-Za-z]{2,5})-(\d{1,6})`. |
+| `ticketPattern` | Two capture groups (prefix and number); default `([A-Za-z]{2,5})-(\d{1,6})`. Used to find tickets in branches, pull request titles, and checkout directory names. |
 | `linearApiKeys` | Secret, optional. One or more Linear personal API keys separated by commas or spaces, one per workspace. Each ticket is routed to the key whose workspace owns its team prefix. |
 | `linearApiKey` | Secret, optional, older single-key setting. Still read and merged with `linearApiKeys`. |
 | `refreshMinutes` | 1–240, default 10. |
 | `typesafeApiKey` | Secret, optional. Turns on efforts and selected summaries. |
-| `anthropicApiKey` | Secret, optional. Turns on written group names and cohesion verdicts. |
+| `anthropicApiKey` | Secret, optional. With Jev enabled, Claude Sonnet 5 writes group names and cohesion verdicts; it does not assign members. |
 | `surfaceRules` | Multiline. `name: glob, glob, …` per line. A table that fails to parse falls back to the default. |
 | `assignmentConfidenceThreshold` | 0–1, default 0.6. Applies at every grouping level. |
 | `mergeMethod` | `squash` (default), `merge` or `rebase`: how the Board's Merge action merges. |
@@ -299,32 +306,31 @@ branch. A successful merge triggers a rescan.
 checkout is not touched. A rescan follows.
 
 **Nudge reviewers.** Two independent choices: re-request review from the
-reviewers GitHub still lists as pending (`reviewRequests`, read by the scan's
-existing `gh pr list` call), and post an editable comment prefilled as
+reviewers GitHub still lists as pending (rechecked live before the write),
+and post an editable comment prefilled as
 `PTAL - @reviewer: repo #PR (title) has been waiting 3d.` With no pending
 reviewers, only the comment is offered, and the dialog says so.
 
 ### Agent actions (a BB thread does the work)
 
-The dialog reads the row's linked threads live (status and context-window use)
-and preselects where the work runs, with its reason in one line. The user can
-pick any mode and thread, and edits the prompt, before anything runs.
+The dialog reads the row's linked threads live and recommends where to start a
+dedicated thread, with its reason in one line. You can choose a linked parent
+for a subthread or start a new thread, and edit the prompt before anything runs.
 
 - **Investigate CI and Resolve conflicts** are repairs: a **subthread** of the
   most relevant linked thread of any tier (strongest tier, then most recently
   updated, then id), which leaves the parent's context untouched and tells the
   parent when it finishes. A **new** thread only when nothing is linked.
-- **Address review and Address comments** want the thread that wrote the PR (a
-  `started` or `environment` link). Idle → **continue** in it (the message is
-  queued, never steered into a running turn). Running, or more than 70% of its
-  context used → a **subthread** of it. Only weak links (`ticket`, `paths`) or
-  none → a **new** thread, because weak links often point at large, unrelated
-  threads.
+- **Address review and Address comments** prefer a **subthread** of the thread
+  that wrote the PR (a `started` or `environment` link). Only weak links
+  (`ticket`, `paths`) or none → a **new** thread, because weak links often point
+  at large, unrelated threads.
 - If BB will not add a child to a thread, the recommendation falls back to a
   new thread and says why.
-- **Continue** and **Subthread** only accept a thread linked to that row. New
-  and sub threads run in the checkout and carry this plugin's thread metadata
-  `{ ticket }`, which links them to the cluster as `started`.
+- **Subthread** only accepts a parent linked to that row. New and subthreads
+  run in the checkout and carry this plugin's thread metadata `{ ticket }`,
+  which links them to the cluster as `started`. Continue is unavailable because
+  BB's thread events cannot reliably identify which queued turn finished.
 - Every agent prompt ends by asking for a final line starting `Result:` in
   under 12 words. That line is how the Board reports the outcome.
 
@@ -340,8 +346,8 @@ and the last day's, newest first. Nothing polls:
   interaction-answered event, so a waiting run re-reads that thread's pending
   interactions when its event sequence advances. The post-scan thread relist
   catches up any event missed during a reload.
-- A **continue** run shares its thread with earlier work. It ignores that
-  thread's events until the turn it queued starts.
+- Older runs that shared a thread close without claiming a `Result:` line from
+  an unrelated turn.
 - On finish, the outcome is the last `Result:` line of the final assistant
   message (capped at 120 characters), read by code, never a model. With no such
   line, the row says "Done: see thread".
@@ -359,16 +365,19 @@ sidebar shows a count beside Workstreams: needs-you first, else running.
 
 ## Views
 
-The plugin panel opens on the **Map** — the semantic-zoom canvas — with the
-**Board** as the secondary tab. Both are deep-linkable (`board` is a real
-sub-path) and both read the same single fetch, so they can never disagree.
+The panel opens on the last view you used in this browser, or the **Map** on
+your first visit. Both the Map and **Board** have deep links and read the same
+board data.
 
-The Board is an inbox with one row per checkout, grouped by the next action:
-**Fix** (`blocked`), **Respond** (`awaiting-followup`,
+The Board is an inbox with one row per checkout. **Group by: Action** is the
+default; **Group by: Effort** collects each effort's rows without changing their
+priority or available actions. Efforts with the most urgent work come first,
+and each effort's rows follow action priority, then age within a state. Action
+groups are **Fix** (`blocked`), **Respond** (`awaiting-followup`,
 `approved-with-comments`), **Merge** (`awaiting-merge` not blocked by a stack),
 **Waiting** (`awaiting-review`, and any live row stacked on an unmerged PR,
-shown as "Behind #NN"), then, collapsed, **In flight**, **Recently shipped**
-(merged in the last 7 days, from `gh`'s `mergedAt`) and **Parked**. Within a
+shown as "Behind #NN"), then, collapsed, **In flight**, a section for work
+merged in the last 7 days (from `gh`'s `mergedAt`), and **Parked**. Within a
 section the row that has been in its state longest comes first. The age is
 measured from the scan that saw the checkout enter its state. Until one has,
 the row shows its last-commit age and labels it "last commit". Keys: `j`/`k`,

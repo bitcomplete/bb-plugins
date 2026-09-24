@@ -199,15 +199,29 @@ export function createRunStore(db: RunDb, now: () => number = Date.now) {
       ).map((row) => row.thread_id);
     },
     /**
-     * Apply one thread signal to every open run in that thread. `readText` is
-     * called at most once, only when a run finishes and the signal carried no text.
+     * Apply one thread signal to its run. A shared thread cannot identify which
+     * action produced a turn. Finish ambiguous legacy runs without attributing
+     * the event's answer to either one.
      * Returns the runs that changed.
      */
     async signal(threadId: string, signal: ThreadSignal, readText: () => Promise<string | null>): Promise<Run[]> {
       const at = now();
       const changed: Run[] = [];
+      const open = openIn(threadId);
+      const ambiguous = open.length > 1 || open.some((run) => run.mode === "continue");
+      if (ambiguous && (signal.kind === "idle" || signal.kind === "failed")) {
+        for (const run of open) {
+          db.prepare(
+            `UPDATE action_runs SET status = 'done', finished_at = ?, result = NULL, error = NULL WHERE id = ? AND status IN ('running', 'needs-you')`,
+          ).run(at, run.id);
+          const next = get(run.id);
+          if (next !== null) changed.push(next);
+        }
+        return changed;
+      }
+      if (ambiguous && signal.kind !== "gone") return [];
       let text: string | null | undefined;
-      for (const run of openIn(threadId)) {
+      for (const run of open) {
         let effective = signal;
         if ((signal.kind === "idle" || signal.kind === "failed") && signal.text === null && run.armed && at >= run.startedAt) {
           if (text === undefined) text = await readText().catch(() => null);

@@ -1,146 +1,90 @@
-# bb-plugin-workstreams
+# Workstreams
 
-A BB board that groups your git checkouts by the ticket they belong
-to, three levels deep: workstream → ticket cluster → unit (one checkout).
+Workstreams connects git checkouts that belong to the same ticket, even across
+repositories. Its Map groups tickets into efforts, programs, and domains when
+the evidence supports those levels. Its Board groups checkouts by next action
+or effort.
 
-- `host.ts` — the per-machine scanner: walks each scan root, reads every
-  checkout's branch, upstream position, and pull request state with `git` and
-  `gh`, and answers one `scan` host RPC.
-- `contract.ts` — the schemas both sides share.
-- `workstreams.ts` — the pure grouping rules: ticket parsing, unit lifecycle,
-  cluster rollup, workstream naming. Unit-tested in `workstreams.test.ts`.
-- `server.ts` — settings, the SQLite scan and Linear caches, the background
-  refresh service, the `board_get` / `board_refresh` RPC, and the
-  `bb workstreams` CLI.
-- `app.tsx` — the **Workstreams** page in the left sidebar
-  (`app.slots.navPanel`).
-- `skills/workstreams/SKILL.md` — what agents read to use the CLI.
-- `PLUGIN_OVERVIEW.md` — the store listing text.
+## Get started
 
-Try it: install the plugin, set `scanRoots` to the directory holding your
-checkouts, then open **Workstreams** in the sidebar or run
-`bb workstreams list`.
+From this directory:
 
-## UI components
-
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
-
-```
-npx shadcn add @bb/select @bb/table
-```
-
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Every shimmed package is declared in `devDependencies` at the
-host's version so those imports typecheck; keep them there (never in
-`dependencies`, which would bundle a second copy), and `bb plugin types`
-repins them alongside the SDK. Ship `dist/` (npm tarball or committed for
-git installs) so people installing your plugin never need npm.
-
-## Manifest
-
-`package.json` is the plugin manifest. Notable fields:
-
-- `bb.server` — backend entry (required).
-- `bb.app` — frontend entry. Delete it, `app.tsx`, `components/`,
-  `hooks/`, and `lib/` for a headless plugin.
-- `bb.skills` — skill roots; omitted here, so BB reads `skills/`. Each
-  directory with a `SKILL.md` is one skill, named after the directory.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — the lowest plugin SDK you need (scaffold:
-  `>=0.4.104`). BB reads this as a floor, not a ceiling: a later
-  SDK in the same major still loads your plugin.
-- `dependencies` — every package your source imports that BB does not provide.
-  `bb plugin build` inlines them into `dist/`, and git installs resolve this
-  list alone, so a build-required package here rather than in
-  `devDependencies` is what keeps your plugin installable. `devDependencies`
-  is for types and tooling only (BB shims React, the portal primitives, and
-  `@get-bb/plugin-sdk` at runtime — never bundle them).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` and `app.js` / `app.css` /
-`app.meta.json`. Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
-
-## Store listing
-
-Two texts describe the plugin in the store. `bb.description` in package.json
-is the one-sentence hook on every browse card and the lead paragraph on the
-detail page; keep it under about 140 characters. `PLUGIN_OVERVIEW.md` is the
-same claim at length, shown in an Overview section under that paragraph.
-Rewrite the scaffold's copy for your plugin, and update it whenever
-`bb.description` changes, so the two never disagree.
-
-The submission to the public BB Community marketplace requires the file. Keep
-it under 4000 characters (aim for 700 to 1800) and use headings, paragraphs,
-emphasis, code, blockquotes, lists, thematic breaks, and absolute https links
-only — raw HTML, images, tables, footnotes, and task lists are rejected. Do
-not open with a `#` title or repeat `bb.description` verbatim; the page
-shows both directly above.
-
-## Install
-
-From this directory (`bb plugin new` already ran the install; a fresh clone
-needs it):
-
-```
+```sh
 npm install
 bb plugin install .
-```
-
-After editing sources, reload:
-
-```
-bb plugin reload workstreams
-```
-
-Or let `bb plugin dev` rebuild and reload on every save.
-
-## Configure
-
-```
 bb plugin config workstreams
-bb plugin config workstreams set showDone false
-bb plugin reload workstreams
 ```
 
-## Types & API reference
+Set `scanRoots` to the directories that hold your checkouts. If you leave it
+empty, Workstreams scans the paths of your BB projects. Open **Workstreams** in
+the sidebar, or run `bb workstreams refresh` followed by `bb workstreams list`.
 
-The plugin API ships as the npm package `@get-bb/plugin-sdk`, pinned to an
-exact version in `devDependencies` (`0.4.104` — the SDK of the BB
-that scaffolded this plugin). After `npm install`, the full surface is on disk
-at:
+An authenticated `gh` supplies pull request state and enables Board actions.
+Without it, the board shows observed local git activity, marks other checkouts
+as unverified, and shows a warning. Workstreams looks
+for ticket keys in branch names, Linear linkback comments, pull request titles
+and descriptions, and checkout directory names, in that order. A ticket's
+checkouts form one cluster. Related clusters can form an effort; levels that do
+not add information collapse.
 
+## Choose enrichment
+
+The board works without model keys. Optional keys add detail:
+
+| Setting | What it adds |
+| --- | --- |
+| `linearApiKeys` | Ticket titles, state, project, parent, and team names from each matching Linear workspace. The older `linearApiKey` setting still works. |
+| `typesafeApiKey` | Jev selects ticket summaries and assigns related tickets to efforts and higher groups. |
+| `anthropicApiKey` | With Jev enabled, Claude Sonnet 5 names groups and flags groups whose members look unrelated. It does not change membership. |
+
+Set these under **Plugins → Workstreams** or with `bb plugin config workstreams
+set <key> <value>`. Keys are optional. An Anthropic key alone does not enable
+grouping.
+
+The scanner stores board facts and caches in BB's local plugin storage. It uses
+`git` locally and your authenticated `gh` to read GitHub pull requests and
+perform Board actions that you confirm. A Linear key sends ticket identifiers
+to Linear and retrieves issue details. With model keys, Jev receives ticket
+keys, repository names, pull request titles, and available Linear context to
+select summaries and groups. Anthropic receives the member keys, summaries,
+repository names, candidate phrases, and available Linear or thread-title
+context needed to name a group. Model calls happen when semantic inputs change;
+an unchanged rescan reuses cached decisions. The optional **Fetch Linear details
+via agent** action starts a BB thread only when you confirm it.
+
+## Use the board
+
+- **Map:** Explore the grouping hierarchy. Switch between theme and risk faces,
+  filter by status and code surface, and open a linked agent thread.
+- **Board:** Group rows by Action (the default) or Effort. Both views keep
+  urgent work first within each group and offer the same row actions. Direct
+  merge, branch update, and reviewer nudge actions ask for confirmation. CI,
+  conflict, and review work starts a dedicated agent thread after you review
+  its prompt.
+- **How this works:** Open the ⓘ panel for state definitions, shortcuts, scan
+  health, and warnings.
+
+`bb workstreams list [--json]` reads the last scan. Run `bb workstreams refresh`
+when freshness matters. `bb workstreams group <TICKET> <effort name>` sets a
+manual effort name; `bb workstreams ungroup <TICKET>` removes it.
+
+The internal `shipped` state means a merged commit appears in a local release
+tag. It does not establish that the change reached production. When a repository
+has no usable release tags, merged work remains `merged` and the board warns.
+
+## Develop
+
+The scanner and Anthropic naming call live in `host.ts`. `server.ts` handles
+settings, local storage, refresh, enrichment, actions, and the CLI. The grouping
+and lifecycle rules live in `workstreams.ts`; `app.tsx` mounts the Map and Board.
+`contract.ts` defines the host RPC schema, and `skills/workstreams/SKILL.md`
+documents the CLI for agents.
+
+```sh
+npm test
+npm run typecheck
+npm run build
 ```
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk.d.ts      # backend
-node_modules/@get-bb/plugin-sdk/bundled-types/bb-plugin-sdk-app.d.ts  # frontend
-```
 
-Your editor and `tsc` resolve `@get-bb/plugin-sdk` there through ordinary node
-resolution — no path mapping. These are readable declarations: open them for an
-exact signature.
-
-The SDK surface grows with every BB release, so the pin has to track the BB you
-actually run:
-
-```
-bb plugin types          # sync this plugin's SDK surface to the running BB
-bb plugin types --check  # CI: fail when it does not match
-```
-
-Ask BB to write plugins for you: the `bb-plugin-authoring` skill documents
-the whole surface with examples.
-
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+After editing the plugin, run `bb plugin reload workstreams`. The build creates
+the distributable files in `dist/` for git or npm installs.

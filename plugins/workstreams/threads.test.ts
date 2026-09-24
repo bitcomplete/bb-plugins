@@ -52,6 +52,25 @@ describe("linkThread tiers", () => {
     expect(links(thread({ environmentBranchName: "main" }))).toEqual({});
   });
 
+  it("does not link a branch reused by different clusters, because the thread's repository is unknown", () => {
+    const targets: LinkTarget[] = [
+      { cluster: "ABC-101", path: "/p/service-a", branch: "feature/auth", defaultBranch: "main" },
+      { cluster: "OPS-2222", path: "/p/service-b", branch: "feature/auth", defaultBranch: "main" },
+    ];
+    expect(Object.fromEntries(linkThread(thread({ environmentBranchName: "feature/auth" }), targets, PATTERN))).toEqual({});
+    expect(Object.fromEntries(linkThread(thread({ environmentPath: "/p/service-a", environmentBranchName: "feature/auth" }), targets, PATTERN)))
+      .toEqual({ "ABC-101": "environment" });
+  });
+
+  it("uses a known checkout path to constrain branch matching to that checkout", () => {
+    const targets: LinkTarget[] = [
+      { cluster: "ABC-101", path: "/p/service-a", branch: "feature/a", defaultBranch: "main" },
+      { cluster: "OPS-2222", path: "/p/service-b", branch: "feature/b", defaultBranch: "main" },
+    ];
+    expect(Object.fromEntries(linkThread(thread({ environmentPath: "/p/service-a", environmentBranchName: "feature/b" }), targets, PATTERN)))
+      .toEqual({ "ABC-101": "environment" });
+  });
+
   it("tier 2: links a ticket named in the title or the first-prompt fallback, uppercased", () => {
     expect(links(thread({ title: "Tidy abc-101 author bios" }))).toEqual({ "ABC-101": "ticket" });
     expect(links(thread({ titleFallback: "look at OPS-2222 please" }))).toEqual({ "OPS-2222": "ticket" });

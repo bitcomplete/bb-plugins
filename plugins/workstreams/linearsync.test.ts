@@ -10,7 +10,7 @@ const KEY_B = "lin_api_inkwellfakekeyB";
 
 type Call = { key: string; query: string };
 
-function setup(options: { teams?: Record<string, string[]>; fail?: boolean } = {}) {
+function setup(options: { teams?: Record<string, string[]>; fail?: boolean; failWorkspaceKey?: string; detailResponse?: (query: string) => unknown } = {}) {
   const db = new Database(":memory:");
   db.exec(LINEAR_DETAIL_MIGRATION);
   let clock = 1_000_000;
@@ -27,6 +27,7 @@ function setup(options: { teams?: Record<string, string[]>; fail?: boolean } = {
       calls.push({ key, query });
       if (options.fail) throw new Error(`connect ECONNREFUSED (auth ${key})`);
       if (query.includes("viewer")) {
+        if (options.failWorkspaceKey === key) throw new Error("workspace unavailable");
         return {
           ok: true,
           status: 200,
@@ -39,7 +40,7 @@ function setup(options: { teams?: Record<string, string[]>; fail?: boolean } = {
       for (const match of query.matchAll(/(t\d+): issue\(id: "([^"]+)"\)/gu)) {
         data[match[1]!] = { identifier: match[2], title: `Title of ${match[2]}`, project: { id: "p", name: "Print run" } };
       }
-      return { ok: true, status: 200, json: async () => ({ data }) };
+      return { ok: true, status: 200, json: async () => options.detailResponse?.(query) ?? { data } };
     },
   });
   return { db, sync, calls, logs, tick: (ms: number) => (clock += ms) };
@@ -130,5 +131,28 @@ describe("Linear sync", () => {
     await sync.sync([KEY_A], ["ABC-1"], signal);
     expect(issueCalls(calls)).toHaveLength(1);
     expect(sync.read(["ABC-1"]).get("ABC-1")?.title).toBe("Title of ABC-1");
+  });
+
+  it("retries a missing alias after a partial GraphQL response instead of caching it as no issue", async () => {
+    let attempt = 0;
+    const { sync, calls, db, logs } = setup({ detailResponse: () => {
+      attempt += 1;
+      return attempt === 1
+        ? { data: { t0: { identifier: "ABC-1", title: "Available" }, t1: null }, errors: [{ message: "Resolver failed", path: ["t1"] }] }
+        : { data: { t0: { identifier: "ABC-2", title: "Recovered" } } };
+    } });
+    expect(await sync.sync([KEY_A], ["ABC-1", "ABC-2"], signal)).toMatchObject({ fetched: 1 });
+    expect(db.prepare("SELECT ticket FROM linear_detail ORDER BY ticket").all()).toEqual([{ ticket: "ABC-1" }]);
+    expect(await sync.sync([KEY_A], ["ABC-1", "ABC-2"], signal)).toMatchObject({ fetched: 1 });
+    expect(sync.read(["ABC-2"]).get("ABC-2")?.title).toBe("Recovered");
+    expect(issueCalls(calls)).toHaveLength(2);
+    expect(logs.some((line) => line.includes("partial data"))).toBe(true);
+  });
+
+  it("does not offer unknown ownership to the agent when a workspace lookup fails", async () => {
+    const { sync, calls } = setup({ teams: { [KEY_A]: ["ABC"], [KEY_B]: ["OPS"] }, failWorkspaceKey: KEY_B });
+    expect(await sync.sync([KEY_A, KEY_B], ["ABC-1", "OPS-2"], signal)).toEqual({ fetched: 1, unowned: [] });
+    expect(await sync.unowned([KEY_A, KEY_B], ["ABC-1", "OPS-2"], signal)).toEqual([]);
+    expect(calls.filter((call) => call.key === KEY_B && call.query.includes("viewer")).length).toBeGreaterThan(1);
   });
 });

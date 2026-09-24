@@ -494,7 +494,7 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
   const chosen = candidates.find((thread) => thread.id === threadId) ?? null;
   const allowed: Record<ThreadMode, boolean> = {
     new: true,
-    continue: plan !== null && plan.capabilities.send && candidates.length > 0,
+    continue: false,
     subthread: plan !== null && plan.capabilities.subthread && candidates.some((thread) => thread.canSpawnChild),
   };
   const ready =
@@ -537,7 +537,7 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
           <>
             <p className="rounded-md bg-foreground/[0.04] px-3 py-2 text-[12.5px]">{plan.recommendation.reason}</p>
             <div role="radiogroup" aria-label="Where to run" className="flex flex-wrap gap-1.5">
-              {(["continue", "subthread", "new"] as ThreadMode[]).map((option) => (
+              {(["subthread", "new"] as ThreadMode[]).map((option) => (
                 <button
                   key={option}
                   type="button"
@@ -591,7 +591,7 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
             Cancel
           </Button>
           <Button onClick={() => void run()} disabled={!ready || busy}>
-            {busy ? "Starting…" : mode === "continue" ? "Send to thread" : mode === "subthread" ? "Start subthread" : "Start thread"}
+            {busy ? "Starting…" : mode === "subthread" ? "Start subthread" : "Start thread"}
             <kbd className="ml-1 font-mono text-[10px] opacity-70">⌘↵</kbd>
           </Button>
         </DialogFooter>
