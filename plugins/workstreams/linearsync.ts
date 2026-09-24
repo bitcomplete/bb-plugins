@@ -122,10 +122,16 @@ export function createLinearSync(deps: LinearSyncDeps) {
      * Every team key the keys can see, and whether EVERY key answered. The
      * caller keeps a partial answer out of anything that decides tickets.
      */
-    async teams(keys: readonly string[], signal: AbortSignal): Promise<{ keys: string[]; complete: boolean }> {
-      if (keys.length === 0) return { keys: [], complete: true };
+    async teams(keys: readonly string[], signal: AbortSignal): Promise<{ keys: string[]; names: Record<string, string>; complete: boolean }> {
+      if (keys.length === 0) return { keys: [], names: {}, complete: true };
       const found = await workspaces(keys, signal);
-      return { keys: [...routeTeams(found).owner.keys()].sort(), complete: found.length === keys.length };
+      const { owner } = routeTeams(found);
+      const names: Record<string, string> = {};
+      for (const [team, index] of owner) {
+        const name = found.find((workspace) => workspace.keyIndex === index)?.teamNames?.[team];
+        if (name !== undefined) names[team] = name;
+      }
+      return { keys: [...owner.keys()].sort(), names, complete: found.length === keys.length };
     },
 
     /** Forget the discovered workspaces: the keys changed. */

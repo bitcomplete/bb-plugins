@@ -65,7 +65,7 @@ describe("team routing", () => {
     const workspace = parseWorkspace(3, {
       data: { viewer: { organization: { name: "Inkwell", urlKey: "inkwell" } }, teams: { nodes: [{ key: "abc" }, { key: "OPS" }] } },
     });
-    expect(workspace).toEqual({ keyIndex: 3, name: "Inkwell", urlKey: "inkwell", teams: ["ABC", "OPS"] });
+    expect(workspace).toEqual({ keyIndex: 3, name: "Inkwell", urlKey: "inkwell", teams: ["ABC", "OPS"], teamNames: {} });
     expect(parseWorkspace(0, { errors: [{ message: "Authentication required" }] })).toBeNull();
   });
 });

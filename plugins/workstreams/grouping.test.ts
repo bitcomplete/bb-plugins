@@ -369,7 +369,7 @@ describe("ticketless checkouts, keyed on their pull request", () => {
     expect(next.ask).toEqual([]);
   });
 
-  it("places an open ticketless PR like any grouped cluster, and keeps finished PRs and clones in Unsorted whatever was cached", () => {
+  it("places an open ticketless PR like any grouped cluster, files finished PRs under No ticket and keeps clones in Unsorted, whatever was cached", () => {
     const placed = placeClusters({
       workstreams: [{ name: "Unsorted", clusters: [open, merged, clone] }],
       decisionFor: () => ({ summary: null, assignment: { label: "Shelf index", fit: 0.9 } }),
@@ -379,7 +379,7 @@ describe("ticketless checkouts, keyed on their pull request", () => {
     });
     expect(Object.fromEntries(placed.map((entry) => [entry.cluster.ticket, entry.label]))).toEqual({
       "quill-fix": "Shelf index",
-      "quill-bump": "Unsorted",
+      "quill-bump": "No ticket",
       quill: "Unsorted",
     });
   });

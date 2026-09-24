@@ -212,8 +212,14 @@ separately: `bb plugin logs workstreams`.
   reaches a hash, a Jev question or a naming call.
 - **Low confidence goes to Unsorted.** A cluster whose effort fit scores below
   `assignmentConfidenceThreshold` lands in `Unsorted` rather than being
-  force-fitted into a confident-looking effort. Checkouts with no recognizable
-  ticket also land there, one cluster each, and are never sent to a model.
+  force-fitted into a confident-looking effort. A checkout with no recognizable
+  ticket and no pull request also lands there and is never sent to a model. With
+  no ticket but an open pull request it is grouped like any ticket; with a merged
+  or closed one it is filed under No ticket, never sent to a model.
+- **One-offs are filed by team, not grouped.** An effort holding a single
+  cluster rolls into a container per ticket prefix, named from the `teamNames`
+  setting, else the Linear team name, else the prefix ("ABC · 14 one-offs").
+  Containers are built by code alone: no model assigns, names or judges them.
 - **Model calls are cached by semantic input.** Each cluster is hashed over its
   ticket, repos, PR titles, and branch slugs, plus its Linear title, project and
   parent when known — not lifecycles, Linear state, counts, or timestamps. A rescan where nothing changed semantically makes zero model

@@ -29,6 +29,9 @@ import {
   STALENESS,
   UNSORTED,
   buildBoard,
+  outsideGrouping,
+  parseTeamNames,
+  rollOneOffs,
   buildEfforts,
   buildHierarchy,
   clusterInputHash,
@@ -468,6 +471,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Delete the head branch after the Board merges a pull request. Always skipped when another open pull request is based on that branch.",
       default: true,
     },
+    teamNames: {
+      type: "string",
+      label: "Team names",
+      description:
+        "Optional. Names for the containers one-off tickets are filed into, by ticket prefix: `ABC=Storefront, OPS=Operations`. Without one, the Linear team name is used when a Linear key can see the team, and otherwise the prefix itself.",
+      default: "",
+    },
     assignmentConfidenceThreshold: {
       type: "number",
       label: "Effort assignment confidence",
@@ -678,7 +688,10 @@ export default async function plugin(bb: BbPluginApi) {
       const pattern = compilePattern(ticketPattern);
       const keys = await linearKeys();
       const teams = await linear.teams(keys, signal);
-      if (teams.complete) await bb.storage.kv.set("linearTeams", teams.keys);
+      if (teams.complete) {
+        await bb.storage.kv.set("linearTeams", teams.keys);
+        await bb.storage.kv.set("linearTeamNames", teams.names);
+      }
       await readLinkbackComments(pattern, result.units, hostId, signal);
       // A Linear outage keeps the previous cache and is logged once; it never fails a scan.
       await linear.sync(keys, ticketsOf(await findTickets(pattern, result.units), result.units), signal);
@@ -947,8 +960,10 @@ export default async function plugin(bb: BbPluginApi) {
     mode: BoardMode;
     rules: SurfaceRule[];
     warnings: string[];
+    /** What `rollOneOffs` needs: overrides, and team names from the setting and from Linear. */
+    roll: Parameters<typeof rollOneOffs>[1];
   }> {
-    const { ticketPattern, typesafeApiKey, anthropicApiKey, assignmentConfidenceThreshold } =
+    const { ticketPattern, typesafeApiKey, anthropicApiKey, assignmentConfidenceThreshold, teamNames: teamNamesText } =
       await settings.get();
     const units = readUnits();
     const pattern = compilePattern(ticketPattern);
@@ -972,6 +987,10 @@ export default async function plugin(bb: BbPluginApi) {
     });
     const mode = modeOf(typesafeApiKey, anthropicApiKey);
     const grouped = mode !== "basic";
+    const teamNames = parseTeamNames(teamNamesText);
+    if (teamNames.malformed > 0) {
+      warnings.add(`Team names: ignored ${teamNames.malformed} entr${teamNames.malformed === 1 ? "y" : "ies"} that are not PREFIX=Name.`);
+    }
 
     const labelled = placeClusters({
       workstreams,
@@ -987,7 +1006,22 @@ export default async function plugin(bb: BbPluginApi) {
       mode,
       rules,
       warnings: [...warnings],
+      roll: {
+        overrides,
+        teamNames: teamNames.names,
+        linearTeamNames: (await bb.storage.kv.get<Record<string, string>>("linearTeamNames")) ?? {},
+        surfaceRules: rules,
+      },
     };
+  }
+
+  /** The effort level with one-offs rolled into containers; with no model grouping, nothing rolls. */
+  function boardEfforts(
+    placement: Pick<Awaited<ReturnType<typeof readPlacement>>, "labelled" | "rules" | "roll">,
+    grouped: boolean,
+  ): { efforts: BoardGroup[]; containers: BoardGroup[] } {
+    const efforts = effortsOf(placement.labelled, grouped, placement.rules);
+    return grouped ? rollOneOffs(efforts, placement.roll) : { efforts, containers: [] };
   }
 
   /** The effort level, named from whatever the cache already holds. */
@@ -1028,8 +1062,8 @@ export default async function plugin(bb: BbPluginApi) {
     const membersOf = new Map<string, string[]>();
     let seen = 0;
     for (const child of children) {
-      if (child.key === UNSORTED || child.key.endsWith(`:${UNSORTED}`)) {
-        labelOf[child.key] = UNSORTED;
+      if (outsideGrouping(child.key)) {
+        labelOf[child.key] = child.key === UNSORTED || child.key.endsWith(`:${UNSORTED}`) ? UNSORTED : child.key;
         continue;
       }
       const assignment = readGroupAssignment(level, child.hash);
@@ -1067,9 +1101,10 @@ export default async function plugin(bb: BbPluginApi) {
     warnings: string[];
   }> {
     const { assignmentConfidenceThreshold } = await settings.get();
-    const { labelled, mode, rules, warnings } = await readPlacement();
+    const placement = await readPlacement();
+    const { mode, rules, warnings } = placement;
     const grouped = mode !== "basic";
-    const efforts = effortsOf(labelled, grouped, rules);
+    const { efforts, containers } = boardEfforts(placement, grouped);
 
     const programs = grouped
       ? parentLevel(
@@ -1111,6 +1146,7 @@ export default async function plugin(bb: BbPluginApi) {
       domainNames: domains?.names,
       grouped,
       surfaceRules: rules,
+      containers,
     });
 
     return {
@@ -1621,7 +1657,7 @@ export default async function plugin(bb: BbPluginApi) {
     context: SeedContext,
   ): LevelEntry[] {
     return groups
-      .filter((group) => group.key !== UNSORTED && !group.key.endsWith(`:${UNSORTED}`))
+      .filter((group) => !outsideGrouping(group.key))
       .map((group) => {
         const clusters = clustersUnder(group, childrenOf);
         const hash = hashOf(group);
@@ -1821,7 +1857,7 @@ export default async function plugin(bb: BbPluginApi) {
       return [];
     }
 
-    const { clusters, linearProjects, rules } = await readPlacement();
+    const { clusters, linearProjects } = await readPlacement();
     const pattern = compilePattern(ticketPattern);
     const links = threadLinks(clusters, pattern);
     const context: SeedContext = { threads: threadWeights(links) };
@@ -1886,10 +1922,13 @@ export default async function plugin(bb: BbPluginApi) {
     const summaries = new Map(
       placement.labelled.map((entry) => [entry.cluster.ticket, entry.cluster.summary]),
     );
+    // One-offs are filed into containers by code: never named, never assigned a program.
+    const rolled = boardEfforts(placement, true);
+    const inContainer = new Set(rolled.containers.flatMap((group) => group.clusters.map((cluster) => cluster.ticket)));
     if (naming !== null) {
       const grouped = new Map<string, Cluster[]>();
       for (const entry of placement.labelled) {
-        if (entry.label === UNSORTED) continue;
+        if (outsideGrouping(entry.label) || inContainer.has(entry.cluster.ticket)) continue;
         if (entry.fit < assignmentConfidenceThreshold) continue;
         const bucket = grouped.get(entry.label);
         if (bucket === undefined) grouped.set(entry.label, [entry.cluster]);
@@ -1917,10 +1956,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     // ---- program level, then domain level ----
-    const efforts = effortsOf(placement.labelled, true, rules);
     const program = await deriveLevel({
       level: "program",
-      members: levelMembers(efforts, effortHash, () => [], context),
+      members: levelMembers(rolled.efforts, effortHash, () => [], context),
       summaryOf: (group) => group.name,
       contextOf,
       jev,

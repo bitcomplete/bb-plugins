@@ -107,9 +107,15 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
           threads you worked on several tickets in. Two clusters are only seeded together when at least two signals
           agree, with one exception: clusters that share a Linear parent or project are seeded together when any
           other signal is present, however weak, so for linked tickets Linear effectively decides. The repo is not
-          a signal. Jev assigns each
-          cluster with a confidence score, and a low score lands in Unsorted. Claude only names groups and flags ones
-          that look mixed. Counts and rollups are computed locally.
+          a signal. Jev assigns each cluster with a confidence score, and a low score lands in Unsorted. Claude only
+          names groups and flags ones that look mixed. Counts and rollups are computed locally.
+        </p>
+        <p>
+          A ticket that nothing else was found to belong with is a one-off. One-offs are filed by team, in a
+          container per ticket prefix such as &ldquo;ABC &middot; 14 one-offs&rdquo;. That is a filing rule, not a
+          claim that they are related: no model groups or names a container. Merged or closed pull requests with no
+          ticket are filed the same way under No ticket; checkouts with no ticket and no pull request stay in
+          Unsorted.
         </p>
         {mode === null ? null : (
           <p>

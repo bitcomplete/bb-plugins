@@ -1563,7 +1563,135 @@ export function byGroupOrder(a: BoardGroup, b: BoardGroup): number {
   const unsortedA = a.key === UNSORTED || a.key.endsWith(`:${UNSORTED}`);
   const unsortedB = b.key === UNSORTED || b.key.endsWith(`:${UNSORTED}`);
   if (unsortedA !== unsortedB) return unsortedA ? 1 : -1;
+  // Containers of one-offs are a filing convenience, not groups: after the real ones.
+  if (isContainer(a) !== isContainer(b)) return isContainer(a) ? 1 : -1;
   return a.name.localeCompare(b.name) || a.key.localeCompare(b.key);
+}
+
+// ---- one-off containers ---------------------------------------------------
+//
+// An effort holding exactly one cluster is a one-off: nothing else on the
+// board was found to belong with it. One-offs are filed into a container per
+// ticket prefix (a team, usually) so they do not each take a slot at the top
+// of the board. A container is a filing rule, not a claim that its members are
+// related: it is built by code alone, with no model call, no name from Claude
+// and no cohesion verdict, and it is never offered for program assignment.
+
+/** The effort label finished ticketless PRs are placed under, and the container they and ticketless one-offs share. */
+export const NO_TICKET = "No ticket";
+/** Key prefix of a one-off container. It sits at the program level and holds clusters directly. */
+export const CONTAINER_KEY = "team:";
+
+export function isContainer(group: Pick<BoardGroup, "key">): boolean {
+  return group.key.startsWith(CONTAINER_KEY);
+}
+
+/** A group no model is asked about: Unsorted, the No ticket effort, or a container. */
+export function outsideGrouping(key: string): boolean {
+  return key === UNSORTED || key.endsWith(`:${UNSORTED}`) || key === NO_TICKET || key.startsWith(CONTAINER_KEY);
+}
+
+/**
+ * The user's `teamNames` setting, "ABC=Storefront, OPS=Operations". Parsed
+ * defensively: an entry that is not KEY=Name is skipped and counted, so the
+ * caller can warn once.
+ */
+export function parseTeamNames(text: unknown): { names: Record<string, string>; malformed: number } {
+  const names: Record<string, string> = {};
+  let malformed = 0;
+  if (typeof text !== "string") return { names, malformed };
+  for (const entry of text.split(/[,\n]/u)) {
+    if (entry.trim() === "") continue;
+    const match = /^\s*([A-Za-z][A-Za-z0-9]{0,9})\s*=\s*(\S.{0,59}?)\s*$/u.exec(entry);
+    if (match === null || match[1] === undefined || match[2] === undefined) {
+      malformed += 1;
+      continue;
+    }
+    names[match[1].toUpperCase()] = match[2];
+  }
+  return { names, malformed };
+}
+
+/** The container a one-off cluster is filed under: its ticket prefix, or No ticket. */
+export function containerPrefix(cluster: Cluster): string {
+  const ticket = cluster.units.find((unit) => unit.ticket !== null)?.ticket;
+  if (ticket === undefined || ticket === null) return NO_TICKET;
+  const dash = ticket.lastIndexOf("-");
+  return dash === -1 ? ticket : ticket.slice(0, dash);
+}
+
+/** "Storefront (ABC) · 14 one-offs", "ABC · 14 one-offs" or "No ticket · 3". */
+export function containerName(prefix: string, count: number, teamName: string | undefined): string {
+  if (prefix === NO_TICKET) return `${NO_TICKET} · ${count}`;
+  return `${teamName === undefined ? prefix : `${teamName} (${prefix})`} · ${count} one-offs`;
+}
+
+/**
+ * Split the effort level into the efforts that stay and the containers the
+ * one-offs roll into. The No ticket effort (finished ticketless PRs) always
+ * rolls into the No ticket container. An effort a user named by override is
+ * the user's decision and stays. A container that would hold one cluster is
+ * not made: that cluster keeps its own effort.
+ */
+export function rollOneOffs(
+  efforts: readonly BoardGroup[],
+  options: {
+    overrides: Record<string, string>;
+    /** The user's `teamNames` setting, parsed. Wins over Linear. */
+    teamNames: Record<string, string>;
+    /** Linear team key → name, from key discovery. */
+    linearTeamNames: Record<string, string>;
+    surfaceRules?: readonly SurfaceRule[];
+  },
+): { efforts: BoardGroup[]; containers: BoardGroup[] } {
+  const rules = options.surfaceRules ?? parseSurfaceRules(DEFAULT_SURFACE_RULES).rules;
+  const kept: BoardGroup[] = [];
+  const buckets = new Map<string, BoardGroup[]>();
+  for (const effort of efforts) {
+    const only = effort.clusters.length === 1 ? effort.clusters[0] : undefined;
+    const overridden = only !== undefined && (options.overrides[only.ticket] ?? "").trim() !== "";
+    const prefix =
+      effort.key === NO_TICKET
+        ? NO_TICKET
+        : only === undefined || overridden || outsideGrouping(effort.key)
+          ? null
+          : containerPrefix(only);
+    if (prefix === null) {
+      kept.push(effort);
+      continue;
+    }
+    const bucket = buckets.get(prefix);
+    if (bucket === undefined) buckets.set(prefix, [effort]);
+    else bucket.push(effort);
+  }
+
+  const containers: BoardGroup[] = [];
+  for (const [prefix, members] of buckets) {
+    const clusters = members.flatMap((effort) => effort.clusters).sort((a, b) => a.ticket.localeCompare(b.ticket));
+    if (clusters.length < 2) {
+      kept.push(...members);
+      continue;
+    }
+    const units = clusters.flatMap((cluster) => cluster.units);
+    const surfaces = unionSurfaces(clusters.map((cluster) => cluster.surfaces), rules);
+    containers.push({
+      level: "program",
+      key: `${CONTAINER_KEY}${prefix}`,
+      parentKey: null,
+      name: containerName(prefix, clusters.length, options.teamNames[prefix] ?? options.linearTeamNames[prefix]),
+      rollup: rollupSentence(clusters),
+      lifecycle: mostUrgent(clusters.map((cluster) => cluster.lifecycle)),
+      cohesion: null,
+      clusters,
+      repoCount: new Set(units.map(repoOf)).size,
+      merged: countOf(units, "merged") + countOf(units, "shipped"),
+      total: units.length,
+      staleness: freshest(clusters.map((cluster) => cluster.staleness)),
+      surfaces,
+      risk: riskOf(surfaces),
+    });
+  }
+  return { efforts: kept.sort(byGroupOrder), containers: containers.sort(byGroupOrder) };
 }
 
 // ---- the levels above an effort -------------------------------------------
@@ -1703,13 +1831,21 @@ export function buildHierarchy(options: {
   domainNames?: Record<string, NamedGroup>;
   grouped?: boolean;
   surfaceRules?: readonly SurfaceRule[];
+  /** One-off containers: program-level groups holding clusters directly. See `rollOneOffs`. */
+  containers?: BoardGroup[];
 }): BoardGroup[] {
   const grouped = options.grouped ?? true;
   const rules = options.surfaceRules ?? parseSurfaceRules(DEFAULT_SURFACE_RULES).rules;
   let level: Node[] = options.efforts.map((group) => ({ group, children: [] }));
+  const containers: Node[] = (options.containers ?? []).map((group) => ({ group, children: [] }));
 
-  if (options.programOf !== undefined) {
-    level = rollUp(level, "program", options.programOf, options.programNames ?? {}, grouped, rules);
+  if (options.programOf === undefined) {
+    level = [...level, ...containers];
+  } else {
+    // Containers join at the program level, never assigned into it; a domain
+    // label they were never given leaves each in a one-child domain, which the
+    // collapse pass then removes.
+    level = [...rollUp(level, "program", options.programOf, options.programNames ?? {}, grouped, rules), ...containers];
     if (options.domainOf !== undefined) {
       level = rollUp(level, "domain", options.domainOf, options.domainNames ?? {}, grouped, rules);
     }
@@ -1782,7 +1918,8 @@ export function placeClusters(options: {
           assignment: outside ? null : (decision?.assignment ?? null),
           threshold: options.threshold,
           grouped: options.grouped && !outside,
-          fallbackName: workstream.name,
+          // Finished ticketless PRs are real work: filed under No ticket, not hidden in Unsorted.
+          fallbackName: options.grouped && groupingRole(cluster) === "finished" ? NO_TICKET : workstream.name,
         }),
         cluster: { ...cluster, summary: decision?.summary ?? fallbackSummary(cluster) },
         fit: decision?.assignment?.fit ?? 0,

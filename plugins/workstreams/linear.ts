@@ -37,14 +37,21 @@ export function ticketPrefix(ticket: string): string {
 }
 
 /** One key's workspace, as discovered. `keyIndex` stands in for the key everywhere. */
-export type LinearWorkspace = { keyIndex: number; name: string; urlKey: string; teams: string[] };
+export type LinearWorkspace = {
+  keyIndex: number;
+  name: string;
+  urlKey: string;
+  teams: string[];
+  /** Team key → the team's display name, where Linear gave one. */
+  teamNames?: Record<string, string>;
+};
 
-export const WORKSPACE_QUERY = "query { viewer { organization { name urlKey } } teams(first: 250) { nodes { key } } }";
+export const WORKSPACE_QUERY = "query { viewer { organization { name urlKey } } teams(first: 250) { nodes { key name } } }";
 
 const workspaceSchema = z.object({
   data: z.object({
     viewer: z.object({ organization: z.object({ name: z.string(), urlKey: z.string() }) }),
-    teams: z.object({ nodes: z.array(z.object({ key: z.string() })) }),
+    teams: z.object({ nodes: z.array(z.object({ key: z.string(), name: z.string().nullish() })) }),
   }),
 });
 
@@ -58,6 +65,9 @@ export function parseWorkspace(keyIndex: number, payload: unknown): LinearWorksp
     name: organization.name,
     urlKey: organization.urlKey,
     teams: [...new Set(parsed.data.data.teams.nodes.map((team) => team.key.toUpperCase()))],
+    teamNames: Object.fromEntries(
+      parsed.data.data.teams.nodes.flatMap((team) => (typeof team.name === "string" && team.name.trim() !== "" ? [[team.key.toUpperCase(), team.name.trim().slice(0, 60)]] : [])),
+    ),
   };
 }
 
