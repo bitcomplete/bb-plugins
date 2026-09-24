@@ -2,7 +2,7 @@
 // rule in workstreams.ts. Nothing here needs a network, a token, or git: what
 // is checked is how a payload is read, not how it was fetched.
 import { describe, expect, it } from "vitest";
-import { latestReviewStates, mergeCommitOf, parsePrList } from "./gh.js";
+import { latestReviewStates, mergeCommitOf, parseMergeStateStatus, parsePrList } from "./gh.js";
 
 describe("latestReviewStates", () => {
   it("uppercases each reviewer's most recent state, because `approved-with-comments` turns on a COMMENTED review the aggregate decision hides", () => {
@@ -65,8 +65,44 @@ describe("parsePrList", () => {
     expect(parsePrList("[]")).toBeNull();
   });
 
+  it("carries the merge time, because Recently shipped is dated by it and costs no extra gh call", () => {
+    expect(parsePrList(row({ state: "MERGED", mergedAt: "2030-01-09T10:00:00Z" }))?.pr.mergedAt).toBe("2030-01-09T10:00:00Z");
+  });
+
+  it("reads a missing or unreadable merge time as null rather than inventing one", () => {
+    expect(parsePrList(row())?.pr.mergedAt).toBeNull();
+    expect(parsePrList(row({ mergedAt: "yesterday-ish" }))?.pr.mergedAt).toBeNull();
+  });
+
   it("reads unparseable output as no pull request rather than throwing", () => {
     expect(parsePrList("not json")).toBeNull();
     expect(parsePrList('{"not":"an array"}')).toBeNull();
+  });
+
+  it("carries mergeStateStatus through, because it is the authoritative can-this-merge-now signal the inbox now reads", () => {
+    expect(parsePrList(row({ mergeStateStatus: "dirty" }))?.pr.mergeStateStatus).toBe("DIRTY");
+    expect(parsePrList(row({ mergeStateStatus: "behind" }))?.pr.mergeStateStatus).toBe("BEHIND");
+  });
+});
+
+describe("parseMergeStateStatus", () => {
+  it("uppercases each of GitHub's known merge state statuses", () => {
+    for (const [raw, expected] of [
+      ["clean", "CLEAN"],
+      ["Behind", "BEHIND"],
+      ["DIRTY", "DIRTY"],
+      ["blocked", "BLOCKED"],
+      ["unstable", "UNSTABLE"],
+      ["has_hooks", "HAS_HOOKS"],
+    ] as const) {
+      expect(parseMergeStateStatus(raw)).toBe(expected);
+    }
+  });
+
+  it("reads a missing or unrecognized value as UNKNOWN, so a unit cached before this field existed still loads and a new GitHub value is never misread as ready", () => {
+    expect(parseMergeStateStatus(undefined)).toBe("UNKNOWN");
+    expect(parseMergeStateStatus(null)).toBe("UNKNOWN");
+    expect(parseMergeStateStatus(42)).toBe("UNKNOWN");
+    expect(parseMergeStateStatus("some_future_value")).toBe("UNKNOWN");
   });
 });

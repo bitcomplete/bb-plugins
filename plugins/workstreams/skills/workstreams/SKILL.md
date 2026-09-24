@@ -32,16 +32,18 @@ Every level carries words, not just counts:
 - **Program**: a 2–6 word name for the domain several efforts share.
 - **Domain**: a 1–4 word name for the area of the product several programs sit in.
 
-## Position is theme; status is a lens
+## On the Map, position is theme; status is a lens
 
-Ordering and layout come from the grouping hierarchy and stable weights alone.
-**Nothing on the board is ever positioned by lifecycle.** Status drives colour,
-badges, dimming, filtering and the attention rail, and nothing else. The one
-deliberate exception is the attention rail itself, which is explicitly a status
-view and is ordered by urgency.
+The Map's layout comes from the grouping hierarchy and stable weights alone.
+**No circle or group is ever positioned by lifecycle**: a picture you navigate
+by memory must not reshuffle when a PR turns red. Status drives colour, halos
+and dimming there, and nothing else.
 
-The lens control filters and dims **in place**: switching lenses never moves a
-card or a region. Its three status lenses are exactly the three lifecycle
+The Board is the deliberate opposite: an inbox you work through, so it IS
+ordered by status (see Views).
+
+The Map's lens control filters and dims **in place**: switching lenses never
+moves a circle or a region. Its three status lenses are exactly the three lifecycle
 groups below, and it composes with independent staleness and surface filters —
 "Needs you ∩ cold or dead" is simply both selected at once. The selection is
 persisted in plugin kv and survives a reload.
@@ -189,10 +191,14 @@ separately: `bb plugin logs workstreams`.
 - **Code owns every number.** Counts, sorting, rollup sentences, lifecycle
   derivation, stack order, and the confidence cut are all deterministic. Models
   only select, assign, and name. The board and `list` can never disagree.
-- **Read-only, except for grouping.** The plugin never runs a git mutation,
-  never touches a pull request, and never opens a thread. `group` and `ungroup`
-  write one key-value map of ticket → effort name; that is the only write
-  surface.
+- **Read-only toward git and GitHub.** The plugin never runs a git mutation
+  and never touches a pull request. It writes in two places: `group` and
+  `ungroup` write one key-value map of ticket → effort name, and the Board's
+  **Start a thread** action spawns a BB thread — only after the user confirms
+  an editable prompt. That thread runs in the checkout itself, uses the
+  project's default provider and model, and carries this plugin's thread
+  metadata `{ ticket }`, which links it to its cluster as `started` (the
+  strongest thread tier, above `environment`, `ticket` and `paths`).
 - **A manual name always wins.** `group` beats any model assignment.
 - **Linear informs a theme; it never decides one.** A shared Linear project is
   a weighted similarity term alongside shared repos and shared vocabulary, and
@@ -237,8 +243,20 @@ Configure with `bb plugin config workstreams set <key> <value>`:
 ## Views
 
 The plugin panel opens on the **Map** — the semantic-zoom canvas — with the
-dense **Board** as the secondary tab. Both are deep-linkable (`board` is a real
+**Board** as the secondary tab. Both are deep-linkable (`board` is a real
 sub-path) and both read the same single fetch, so they can never disagree.
+
+The Board is an inbox with one row per checkout, grouped by the next action:
+**Fix** (`blocked`), **Respond** (`awaiting-followup`,
+`approved-with-comments`), **Merge** (`awaiting-merge` not blocked by a stack),
+**Waiting** (`awaiting-review`, and any live row stacked on an unmerged PR,
+shown as "Behind #NN"), then, collapsed, **In flight**, **Recently shipped**
+(merged in the last 7 days, from `gh`'s `mergedAt`) and **Parked**. Within a
+section the row that has been in its state longest comes first. The age is
+measured from the scan that saw the checkout enter its state. Until one has,
+the row shows its last-commit age and labels it "last commit". Keys: `j`/`k`,
+`Enter` (PR), `t` (newest thread), `m` (Map), `o` (open the checkout), `n`
+(start a thread), `/` (search), `?` (all keys).
 
 Zoom bands span depth ranges and adapt to the depth the board actually
 collapsed to, so every band boundary reveals something. On a two-level board

@@ -2,7 +2,21 @@
 // without loading the host runtime. They are the boundary between an external
 // tool's JSON and every rule in workstreams.ts: parse defensively here, and
 // pass typed values inward.
-import type { Pr } from "./contract.js";
+import { MERGE_STATE_STATUSES, type MergeStateStatus, type Pr } from "./contract.js";
+
+const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
+
+/**
+ * GitHub's authoritative "can this merge right now" signal, from
+ * `gh pr list --json mergeStateStatus`. Anything missing or unrecognized
+ * becomes UNKNOWN, so a value GitHub adds later — or a unit cached before
+ * this field existed — never gets misread as ready to merge.
+ */
+export function parseMergeStateStatus(value: unknown): MergeStateStatus {
+  if (typeof value !== "string") return "UNKNOWN";
+  const upper = value.toUpperCase();
+  return KNOWN_MERGE_STATE_STATUSES.has(upper) ? (upper as MergeStateStatus) : "UNKNOWN";
+}
 
 /** Basename of an origin URL, minus `.git`. Handles scp-style git@ remotes. */
 export function repoFromRemote(remoteUrl: string): string | null {
@@ -91,6 +105,7 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
     title: typeof view.title === "string" ? view.title.slice(0, 300) : "",
     mergeable:
       typeof view.mergeable === "string" ? view.mergeable.toUpperCase() : null,
+    mergeStateStatus: parseMergeStateStatus(view.mergeStateStatus),
     baseRefName:
       typeof view.baseRefName === "string" && view.baseRefName !== ""
         ? view.baseRefName.slice(0, 300)
@@ -100,6 +115,10 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
         ? view.headRefName.slice(0, 300)
         : null,
     latestReviewStates: latestReviewStates(view.latestReviews),
+    mergedAt:
+      typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
+        ? view.mergedAt.slice(0, 40)
+        : null,
   };
   return { pr, mergeCommit: mergeCommitOf(view.mergeCommit) };
 }

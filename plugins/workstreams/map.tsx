@@ -18,9 +18,9 @@ import {
   type MapDatum,
 } from "./faces";
 import {
-  // "Needs you" is an encoding here, not a lens. app.tsx has its own local
-  // ACTIONABLE for the Board's attention rail, which also lists `active`, so
-  // the map's set gets a name that cannot be mistaken for that one.
+  // "Needs you" is an encoding here, not a lens, so the map's set gets a name
+  // that cannot be mistaken for the Board's sections, which are a different
+  // cut of the same lifecycles (see `inboxSection`).
   ACTIONABLE as HALO_STATES,
   DAY_MS,
   LENSES,
@@ -1173,7 +1173,7 @@ function Caption({ circle, caption }: { circle: MapCircle; caption: ShownCaption
  * repo, lifecycle, PR link and its cleaned title, with each stack drawn as a
  * chain in merge order. Selectable text; links work; clicks here never fly.
  */
-const TIER_LABEL = { environment: "runs here", ticket: "names it", paths: "worked here" } as const;
+const TIER_LABEL = { started: "started here", environment: "runs here", ticket: "names it", paths: "worked here" } as const;
 
 const UnitList = memo(function UnitList({
   circle,

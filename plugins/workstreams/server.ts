@@ -74,7 +74,10 @@ import {
   type ThreadFacts,
   type ThreadTier,
   type WorkedPaths,
+  startedForOf,
 } from "./threads.js";
+import { startThread } from "./spawn.js";
+import { trackTransitions, toLifecycle, unitLifecycle, type Transition } from "./workstreams.js";
 import { TypeSafeClient, choice, score } from "@typesafe-ai/sdk";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
@@ -101,6 +104,12 @@ const unitSchema = rawUnitSchema.extend({
   staleness: stalenessSchema,
   surfaces: z.array(z.string()),
   risk: riskSchema,
+  /**
+   * When a scan SAW this checkout enter its current lifecycle, or null when it
+   * has been there since before tracking began. Never a proxy: the Board falls
+   * back to the last commit itself, and labels it as such.
+   */
+  enteredAt: z.string().nullable(),
 });
 /** A BB thread linked to a cluster, and the rule that linked it. Read-only. */
 const threadLinkSchema = z.object({
@@ -155,6 +164,11 @@ const boardSchema = z.object({
   /** Every surface the current rule table can produce, for the filter control. */
   surfaces: z.array(z.string()),
   mode: modeSchema,
+  /**
+   * The machine every checkout was scanned on. The Board needs it to name a
+   * checkout as a host file target when opening it.
+   */
+  hostId: z.string().nullable(),
   lastScanAt: z.string().nullable(),
   scanning: z.boolean(),
   warnings: z.array(z.string()),
@@ -162,7 +176,12 @@ const boardSchema = z.object({
   threadCoverage: z.object({
     threads: z.number(),
     linked: z.number(),
-    byTier: z.object({ environment: z.number(), ticket: z.number(), paths: z.number() }),
+    byTier: z.object({
+      started: z.number(),
+      environment: z.number(),
+      ticket: z.number(),
+      paths: z.number(),
+    }),
     clustersWithThread: z.number(),
   }),
 });
@@ -176,6 +195,8 @@ const prefsSchema = z.object({
   colorBy: z.enum(["status", "surface"]),
   /** Which face of the Map is up. A default, so prefs saved before faces still parse. */
   face: z.enum(["theme", "risk"]).default("theme"),
+  /** The Board's filter: list ticketless default-branch clones under Parked. */
+  showClones: z.boolean().default(false),
 });
 
 export const rpcContract = defineRpcContract({
@@ -186,6 +207,17 @@ export const rpcContract = defineRpcContract({
   },
   prefs_get: { input: z.null(), output: prefsSchema },
   prefs_set: { input: prefsSchema, output: prefsSchema },
+  /**
+   * Start a BB thread in one checkout. The client names the path; the unit and
+   * its cluster are looked up from the server's own last scan.
+   */
+  thread_start: {
+    input: z.object({ path: z.string().max(1_000), prompt: z.string().max(8_000) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), threadId: z.string(), ticket: z.string() }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
 });
 
 export type Board = z.infer<typeof boardSchema>;
@@ -199,6 +231,7 @@ const DEFAULT_PREFS: Prefs = {
   surfaces: [],
   colorBy: "status",
   face: "theme",
+  showClones: false,
 };
 
 export default async function plugin(bb: BbPluginApi) {
@@ -285,6 +318,10 @@ export default async function plugin(bb: BbPluginApi) {
     // The absolute paths a thread's recent events worked in, keyed on the
     // thread's `updatedAt` at read time: an unchanged thread is never re-read.
     `CREATE TABLE IF NOT EXISTS thread_paths (thread_id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, paths TEXT NOT NULL)`,
+    // When each checkout was SEEN to enter its current lifecycle. entered_at is
+    // null until a change is observed: the first scan cannot know how long a
+    // PR had already been red. See `trackTransitions`.
+    `CREATE TABLE IF NOT EXISTS unit_transitions (path TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, entered_at INTEGER)`,
   ]);
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -304,6 +341,29 @@ export default async function plugin(bb: BbPluginApi) {
     db.transaction(() => {
       db.prepare(`DELETE FROM units`).run();
       for (const unit of units) insert.run(unit.path, JSON.stringify(unit));
+    })();
+  }
+
+  function readTransitions(): Map<string, Transition> {
+    const rows = db
+      .prepare(`SELECT path, lifecycle, entered_at FROM unit_transitions`)
+      .all() as { path: string; lifecycle: string; entered_at: number | null }[];
+    return new Map(
+      rows.map((row) => [row.path, { lifecycle: toLifecycle(row.lifecycle), enteredAt: row.entered_at }]),
+    );
+  }
+
+  /** Advance the transition table by one scan's worth of units. */
+  function recordTransitions(units: RawUnit[]): void {
+    const next = trackTransitions(
+      readTransitions(),
+      units.map((unit) => ({ path: unit.path, lifecycle: unitLifecycle(unit) })),
+      Date.now(),
+    );
+    const insert = db.prepare(`INSERT INTO unit_transitions (path, lifecycle, entered_at) VALUES (?, ?, ?)`);
+    db.transaction(() => {
+      db.prepare(`DELETE FROM unit_transitions`).run();
+      for (const [path, value] of next) insert.run(path, value.lifecycle, value.enteredAt);
     })();
   }
 
@@ -455,6 +515,7 @@ export default async function plugin(bb: BbPluginApi) {
         { hostId, signal, timeoutMs: SCAN_TIMEOUT_MS },
       );
       writeUnits(result.units);
+      recordTransitions(result.units);
       warnings.push(...result.warnings);
 
       if (typeof linearApiKey === "string" && linearApiKey !== "") {
@@ -865,7 +926,13 @@ export default async function plugin(bb: BbPluginApi) {
     const links = new Map<string, Map<string, ThreadTier>>();
     const threadsOf = new Map<string, z.infer<typeof threadLinkSchema>[]>();
     for (const thread of threadFacts.values()) {
-      const linked = linkThread(thread, targets, pattern);
+      // Read the started-here record at link time: the spawn RPC can record it
+      // after `thread.created` has already built this thread's facts.
+      const linked = linkThread(
+        { ...thread, startedFor: startedFor.get(thread.id) ?? thread.startedFor },
+        targets,
+        pattern,
+      );
       links.set(thread.id, linked);
       for (const [cluster, tier] of linked) {
         const bucket = threadsOf.get(cluster) ?? [];
@@ -879,10 +946,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     const tierRank = (tier: ThreadTier) => THREAD_TIERS.indexOf(tier);
+    const transitions = readTransitions();
+    const enteredAt = (path: string) => {
+      const at = transitions.get(path)?.enteredAt ?? null;
+      return at === null ? null : new Date(at).toISOString();
+    };
     const wired = groups.map((group) => ({
       ...group,
       clusters: group.clusters.map((cluster) => ({
         ...cluster,
+        units: cluster.units.map((unit) => ({ ...unit, enteredAt: enteredAt(unit.path) })),
         dominant: dominantSurface(
           cluster.units.flatMap((unit) => unit.changedPaths),
           rules,
@@ -898,6 +971,7 @@ export default async function plugin(bb: BbPluginApi) {
       depth: hierarchyDepth(groups),
       surfaces,
       mode,
+      hostId: (await bb.sdk.system.config()).primaryHostId,
       lastScanAt: (await bb.storage.kv.get<string>("lastScanAt")) ?? null,
       scanning,
       warnings: [
@@ -992,7 +1066,26 @@ export default async function plugin(bb: BbPluginApi) {
       environmentPath: environment.path,
       updatedAt: row.updatedAt,
       workedPaths: worked?.paths ?? [],
+      startedFor: startedFor.get(row.id) ?? null,
     };
+  }
+
+  /**
+   * Threads this plugin started, and the cluster each was started for, read
+   * from this plugin's own thread metadata. Only threads attributed to this
+   * plugin are ever read, so a relist costs one metadata read per thread the
+   * Board started, not one per thread in BB.
+   */
+  const startedFor = new Map<string, string>();
+
+  async function readStartedFor(row: { id: string; originPluginId: string | null }): Promise<void> {
+    if (row.originPluginId !== bb.pluginId || startedFor.has(row.id)) return;
+    try {
+      const ticket = startedForOf(await bb.sdk.threads.getPluginMetadata({ threadId: row.id }));
+      if (ticket !== null) startedFor.set(row.id, ticket);
+    } catch (error) {
+      bb.log.warn(`thread ${row.id}: metadata read failed: ${String(error).slice(0, 200)}`);
+    }
   }
 
   let threadsBusy = false;
@@ -1020,6 +1113,7 @@ export default async function plugin(bb: BbPluginApi) {
     threadsBusy = true;
     try {
       const rows = await bb.sdk.threads.list({ limit: 500 });
+      for (const row of rows) await readStartedFor(row);
       const refreshed = await refreshWorkedPaths({
         threads: rows,
         cached: cachedPaths,
@@ -1052,7 +1146,9 @@ export default async function plugin(bb: BbPluginApi) {
    * its event log only when it has just finished a turn, which is when it can
    * have worked somewhere new.
    */
-  async function onThreadChanged(row: ThreadRow & { environmentId: string | null }, reread: boolean): Promise<void> {
+  async function onThreadChanged(
+    row: ThreadRow & { environmentId: string | null; originPluginId: string | null },
+    reread: boolean): Promise<void> {
     if (row.visibility !== "visible" || row.archivedAt !== null || row.deletedAt !== null) {
       if (threadFacts.delete(row.id)) announceThreads();
       return;
@@ -1068,6 +1164,7 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`thread ${row.id}: environment lookup failed: ${String(error).slice(0, 200)}`);
       }
     }
+    await readStartedFor(row);
     let worked = cachedPaths(row.id);
     if (reread) {
       const refreshed = await refreshWorkedPaths({
@@ -1403,6 +1500,30 @@ export default async function plugin(bb: BbPluginApi) {
     prefs_set: async (next) => {
       await bb.storage.kv.set("prefs", next);
       return next;
+    },
+    thread_start: async ({ path, prompt }) => {
+      // The unit and its cluster come from the last scan, never from the client.
+      const pattern = compilePattern((await settings.get()).ticketPattern);
+      const raw = readUnits().find((unit) => unit.path === path);
+      const unit =
+        raw === undefined
+          ? undefined
+          : { path: raw.path, ticket: parseTicket(pattern, raw.branch, raw.dirName) ?? raw.dirName };
+      const result = await startThread(
+        {
+          projects: { list: () => bb.sdk.projects.list() },
+          threads: { spawn: (args) => bb.sdk.threads.spawn(args) },
+        },
+        unit,
+        prompt,
+      );
+      if (result.ok) {
+        // Linked at once, not on the next relist: the metadata is the record.
+        startedFor.set(result.threadId, result.ticket);
+        bb.log.info(`started thread ${result.threadId} for ${result.ticket}`);
+        announceThreads();
+      }
+      return result;
     },
     board_refresh: () => {
       // scan() flips `scanning` synchronously, so read it before calling.

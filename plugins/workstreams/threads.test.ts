@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EVENT_READ,
+  startedForOf,
   linkThread,
   pathsFromEvents,
   refreshWorkedPaths,
@@ -31,6 +32,7 @@ function thread(overrides: Partial<ThreadFacts> = {}): ThreadFacts {
     environmentPath: "/p",
     updatedAt: 1,
     workedPaths: [],
+    startedFor: null,
     ...overrides,
   };
 }
@@ -88,6 +90,38 @@ describe("linkThread tiers", () => {
 
   it("finds every ticket in a title once, in order", () => {
     expect(ticketsIn("abc-101 and OPS-2222, then ABC-101 again", PATTERN)).toEqual(["ABC-101", "OPS-2222"]);
+  });
+});
+
+describe("the started-here tier", () => {
+  it("links a thread started from the Board for a cluster as `started`, beating the environment, ticket and path tiers that also reach it", () => {
+    const facts = thread({
+      startedFor: "ABC-101",
+      environmentPath: "/p/folio-abc-101",
+      environmentBranchName: "dev/abc-101-gift-cards",
+      title: "ABC-101 follow-up",
+      workedPaths: ["/p/margin-abc-101/src/app.tsx"],
+    });
+    expect(links(facts)).toEqual({ "ABC-101": "started" });
+  });
+
+  it("links on the metadata alone, so a new thread shows on the board before it has run anything", () => {
+    expect(links(thread({ startedFor: "OPS-2222" }))).toEqual({ "OPS-2222": "started" });
+  });
+
+  it("ignores metadata naming a cluster that is not on the board, rather than linking it to nothing", () => {
+    expect(links(thread({ startedFor: "WEB-77" }))).toEqual({});
+  });
+
+  it("keeps the inferred tiers for OTHER clusters the same thread reaches", () => {
+    expect(links(thread({ startedFor: "ABC-101", title: "OPS-2222 too" }))).toEqual({ "ABC-101": "started", "OPS-2222": "ticket" });
+  });
+
+  it("reads only a well-formed ticket out of the metadata, because any client can write that namespace", () => {
+    expect(startedForOf({ ticket: "ABC-101" })).toBe("ABC-101");
+    for (const bad of [null, "ABC-101", [], {}, { ticket: 7 }, { ticket: "  " }, { ticket: "x".repeat(301) }]) {
+      expect(startedForOf(bad)).toBeNull();
+    }
   });
 });
 
@@ -197,7 +231,7 @@ describe("threadCoverage", () => {
     expect(coverage).toEqual({
       threads: 4,
       linked: 2,
-      byTier: { environment: 1, ticket: 1, paths: 0 },
+      byTier: { started: 0, environment: 1, ticket: 1, paths: 0 },
       clustersWithThread: 2,
     });
   });

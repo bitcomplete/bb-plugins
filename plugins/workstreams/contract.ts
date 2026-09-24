@@ -4,6 +4,28 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
+/**
+ * GitHub's authoritative "can this merge right now" signal
+ * (`mergeStateStatus` from `gh pr list`), as opposed to `mergeable`, which
+ * only says whether the diff applies and is fetched but unused. CLEAN,
+ * HAS_HOOKS and UNSTABLE all mean nothing blocks the merge button; BEHIND
+ * means the branch needs updating; BLOCKED means branch protection is
+ * unsatisfied; DIRTY means there is a conflict; UNKNOWN covers a value
+ * GitHub has not reported yet, one it added later, or a unit scanned before
+ * this field existed.
+ */
+export const MERGE_STATE_STATUSES = [
+  "CLEAN",
+  "BEHIND",
+  "DIRTY",
+  "BLOCKED",
+  "UNSTABLE",
+  "HAS_HOOKS",
+  "UNKNOWN",
+] as const;
+export const mergeStateStatusSchema = z.enum(MERGE_STATE_STATUSES);
+export type MergeStateStatus = z.infer<typeof mergeStateStatusSchema>;
+
 /** The pull request facts the lifecycle rules in workstreams.ts consume. */
 export const prSchema = z
   .object({
@@ -25,6 +47,18 @@ export const prSchema = z
      * that was already being made rather than from a second round trip per PR.
      */
     latestReviewStates: z.array(z.string().max(40)).max(50),
+    /**
+     * When the PR merged, from the same `gh pr list` call. It dates the Board's
+     * Recently shipped section. Defaulted so a unit cached before the field
+     * existed still parses rather than vanishing until the next scan.
+     */
+    mergedAt: z.string().max(40).nullable().default(null),
+    /**
+     * The merge-conflict / branch-currency signal. Defaulted to UNKNOWN so a
+     * unit cached before this field existed loads instead of failing to
+     * parse — and UNKNOWN is never read as ready to merge.
+     */
+    mergeStateStatus: mergeStateStatusSchema.default("UNKNOWN"),
   })
   .strict();
 export type Pr = z.infer<typeof prSchema>;

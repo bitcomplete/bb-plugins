@@ -2,8 +2,12 @@
 // caller injects. Every link is DETERMINISTIC and says which rule made it, so a
 // wrong link can be traced to the rule that produced it.
 //
-// Three tiers, strongest first. A thread may link to several clusters, and to
+// Four tiers, strongest first. A thread may link to several clusters, and to
 // each one through its strongest tier only.
+//   0. started     — the thread was started from the Board for this cluster:
+//      the plugin seeded its own thread metadata with the cluster's ticket at
+//      spawn time. The one link that is a record rather than an inference, so
+//      it beats every inferred tier below.
 //   1. environment — the thread runs in the checkout itself: its environment
 //      path IS a unit's path, or its environment branch IS a unit's branch.
 //   2. ticket      — the thread's title names the ticket.
@@ -12,7 +16,7 @@
 // No fuzzy matching and no model: a link nobody can explain is worse than a
 // missing one, because the reader stops trusting every mark on the map.
 
-export const THREAD_TIERS = ["environment", "ticket", "paths"] as const;
+export const THREAD_TIERS = ["started", "environment", "ticket", "paths"] as const;
 export type ThreadTier = (typeof THREAD_TIERS)[number];
 
 const TIER_RANK = new Map<ThreadTier, number>(THREAD_TIERS.map((tier, index) => [tier, index]));
@@ -27,7 +31,20 @@ export type ThreadFacts = {
   environmentPath: string | null;
   updatedAt: number;
   workedPaths: readonly string[];
+  /** The cluster this plugin's own metadata says the thread was started for. */
+  startedFor: string | null;
 };
+
+/**
+ * Read the cluster out of this plugin's thread metadata namespace. Any client,
+ * or the thread's own agent, can write that namespace, so the value is
+ * validated here and only ever used to draw a link — never to grant anything.
+ */
+export function startedForOf(metadata: unknown): string | null {
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const ticket = (metadata as Record<string, unknown>).ticket;
+  return typeof ticket === "string" && ticket.trim() !== "" && ticket.length <= 300 ? ticket : null;
+}
 
 /** One checkout a thread can land in, and the cluster it belongs to. */
 export type LinkTarget = {
@@ -79,6 +96,8 @@ export function linkThread(
     }
   };
   const clusters = new Set(targets.map((target) => target.cluster));
+
+  if (thread.startedFor !== null && clusters.has(thread.startedFor)) offer(thread.startedFor, "started");
 
   for (const target of targets) {
     const samePath =
@@ -244,7 +263,7 @@ export function threadCoverage(
   threadCount: number,
   links: ReadonlyMap<string, ReadonlyMap<string, ThreadTier>>,
 ): ThreadCoverage {
-  const byTier: Record<ThreadTier, number> = { environment: 0, ticket: 0, paths: 0 };
+  const byTier: Record<ThreadTier, number> = { started: 0, environment: 0, ticket: 0, paths: 0 };
   const clusters = new Set<string>();
   let linked = 0;
   for (const perCluster of links.values()) {

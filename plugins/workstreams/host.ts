@@ -96,7 +96,7 @@ function defaultBranchResolver(signal: AbortSignal) {
 }
 
 const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,baseRefName,headRefName,mergeCommit";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt";
 
 /** A release tag: many teams deploy production from a version tag and nothing else. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;

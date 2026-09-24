@@ -28,6 +28,7 @@ function cluster(
     staleness: "fresh" as const,
     surfaces: [],
     risk: "none" as const,
+    enteredAt: null,
   };
   return {
     ticket,

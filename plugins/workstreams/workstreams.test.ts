@@ -68,6 +68,8 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     baseRefName: "main",
     headRefName: "dev/abc-101-show-gift-card-balance",
     latestReviewStates: [],
+    mergedAt: null,
+    mergeStateStatus: "CLEAN",
     ...overrides,
   };
 }

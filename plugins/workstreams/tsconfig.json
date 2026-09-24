@@ -28,6 +28,8 @@
     "workstreams.ts",
     "enrich.ts",
     "threads.ts",
+    "spawn.ts",
+    "inbox.tsx",
     "faces.ts",
     "app.tsx",
     "*.test.ts",
