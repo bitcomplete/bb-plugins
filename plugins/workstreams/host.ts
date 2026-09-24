@@ -15,7 +15,7 @@ import {
   parsePrList,
   repoFromRemote,
 } from "./gh.js";
-import { prTarget, readLiveMerge, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
+import { prTarget, readLiveMerge, readReviewThreads, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
 import { namingResponse, type NamedGroupRow } from "./naming.js";
 
 const GIT_TIMEOUT_MS = 10_000;
@@ -215,6 +215,7 @@ async function inspect(
     path: string,
     mergeCommit: string | null,
   ) => Promise<boolean | null>,
+  reviewThreadsOf: (url: string) => Promise<Awaited<ReturnType<typeof readReviewThreads>>>,
   warn: (message: string) => void,
   signal: AbortSignal,
 ): Promise<RawUnit> {
@@ -278,6 +279,12 @@ async function inspect(
   }
   unit.observed = { status: status !== null, pr: true };
   unit.pr = parsed.pr;
+  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft && parsed.pr.reviewDecision === "APPROVED" &&
+      !parsed.pr.latestReviewStates.includes("COMMENTED")) {
+    const threads = await reviewThreadsOf(parsed.pr.url);
+    if (!threads.ok) warn(`${dirName}: cannot check PR review threads: ${threads.error}`);
+    else unit.pr.unresolvedReviewThreads = threads.count;
+  }
   if (parsed.pr.state === "MERGED") {
     unit.shipped = await shippedOf(unit.repo, path, parsed.mergeCommit);
   }
@@ -473,9 +480,20 @@ export async function inspectAll(
 
   const defaultBranchOf = defaultBranchResolver(signal);
   const shippedOf = shippedResolver(warn, signal);
+  const threadReads = new Map<string, Promise<Awaited<ReturnType<typeof readReviewThreads>>>>();
+  const reviewThreadsOf = (url: string): Promise<Awaited<ReturnType<typeof readReviewThreads>>> => {
+    const cached = threadReads.get(url);
+    if (cached !== undefined) return cached;
+    const target = prTarget(url);
+    const pending = target === null
+      ? Promise.resolve({ ok: false as const, error: "invalid PR URL" })
+      : readReviewThreads(ghRunner(signal), target);
+    threadReads.set(url, pending);
+    return pending;
+  };
   const units = await mapBounded(paths, async (path) => {
     try {
-      return await inspect(path, ghUsable, defaultBranchOf, shippedOf, warn, signal);
+      return await inspect(path, ghUsable, defaultBranchOf, shippedOf, reviewThreadsOf, warn, signal);
     } catch (error) {
       // One bad checkout must never fail the whole scan.
       warn(`${path}: ${String(error).slice(0, 200)}`);

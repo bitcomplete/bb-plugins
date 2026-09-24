@@ -30,6 +30,7 @@ const unit: RawUnit = {
     latestReviewStates: [],
     reviewRequests: ["inkwell/reviewers"],
     latestReviews: [],
+    unresolvedReviewThreads: null,
     mergedAt: null,
   },
   shipped: null,

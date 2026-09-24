@@ -70,6 +70,7 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     mergeStateStatus: "CLEAN",
     reviewRequests: [],
     latestReviews: [],
+    unresolvedReviewThreads: 0,
     ...overrides,
   };
 }
@@ -165,6 +166,11 @@ describe("unitLifecycle", () => {
         }),
       ),
     ).toBe("approved-with-comments");
+  });
+
+  it("keeps an approved, green PR out of Merge while its review thread remains unresolved, even though the latest review is APPROVED", () => {
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["APPROVED"], unresolvedReviewThreads: 1 }) }))).toBe("approved-with-comments");
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["APPROVED"], unresolvedReviewThreads: null }) }))).toBe("unverified");
   });
 
   it("calls an approved PR with green checks and no open comments awaiting-merge, because it is waiting on nothing but a button", () => {

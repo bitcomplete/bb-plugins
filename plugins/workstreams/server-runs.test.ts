@@ -37,6 +37,7 @@ function unit(mergeStateStatus: "DIRTY" | "CLEAN"): RawUnit {
       mergeStateStatus,
       reviewRequests: ["inkwell/reviewers"],
       latestReviews: [],
+      unresolvedReviewThreads: 0,
     },
     shipped: null,
     changedPaths: ["src/balance.ts"],

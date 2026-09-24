@@ -44,6 +44,7 @@ function pr(title: string): Pr {
     mergeStateStatus: "CLEAN",
     reviewRequests: [],
     latestReviews: [],
+    unresolvedReviewThreads: 0,
   };
 }
 

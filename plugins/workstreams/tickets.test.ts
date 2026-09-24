@@ -93,7 +93,7 @@ describe("precedence when sources disagree", () => {
       path, dirName: path.slice(1), repo: "inkwell/quill", branch, dirty: false, ahead: 0, behind: 0, lastCommitAt: null,
       defaultBranch: "main", shipped: null, changedPaths: [],
       pr: { number: 7, state: "OPEN", isDraft: false, reviewDecision: null, checkConclusions: [], url: `${URL}${path}`, title, mergeable: null,
-        baseRefName: "main", headRefName: branch, latestReviewStates: [], mergedAt: null, mergeStateStatus: "UNKNOWN", reviewRequests: [], latestReviews: [] },
+        baseRefName: "main", headRefName: branch, latestReviewStates: [], mergedAt: null, mergeStateStatus: "UNKNOWN", reviewRequests: [], latestReviews: [], unresolvedReviewThreads: null },
     });
     const board = buildBoard([raw("/a", "ops-42-wrap", "Wrap gift cards"), raw("/b", "fix/wrap-copy", "OPS-42: Fix the wrap copy")], {
       pattern: PATTERN, overrides: {}, linearProjects: {},

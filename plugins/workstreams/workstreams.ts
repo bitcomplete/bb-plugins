@@ -309,8 +309,8 @@ export function unitLifecycle(unit: RawUnit): Lifecycle {
   // clear on their own.
   if (pr.reviewDecision === "CHANGES_REQUESTED") return "awaiting-followup";
   if (pr.reviewDecision === "APPROVED") {
-    if (pr.latestReviewStates.includes("COMMENTED")) return "approved-with-comments";
-    if (checksGreen(pr.checkConclusions)) return "awaiting-merge";
+    if (pr.latestReviewStates.includes("COMMENTED") || (pr.unresolvedReviewThreads ?? 0) > 0) return "approved-with-comments";
+    if (checksGreen(pr.checkConclusions)) return pr.unresolvedReviewThreads === 0 ? "awaiting-merge" : "unverified";
   }
   return "awaiting-review";
 }
@@ -2022,6 +2022,7 @@ const OPEN_PR_LIFECYCLES = new Set<Lifecycle>([
   "approved-with-comments",
   "awaiting-merge",
   "awaiting-review",
+  "unverified",
 ]);
 
 /**
@@ -2123,6 +2124,7 @@ export function inboxVerb(unit: InboxUnitFacts, section: InboxSection): string |
   const behind = waitingBehind(unit);
   if (behind !== null) return `Behind #${behind}`;
   if (hasUnresolvedConflict(unit)) return "Resolve conflicts";
+  if (unit.lifecycle === "unverified" && unit.pr !== null) return "Review status unavailable";
   if (unit.lifecycle === "awaiting-merge") return mergeReadiness(unit.pr?.mergeStateStatus).verb;
   return VERB[unit.lifecycle] ?? null;
 }

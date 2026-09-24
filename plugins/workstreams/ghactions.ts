@@ -117,6 +117,25 @@ function json(run: Run): unknown {
 
 export type LiveRead = { ok: true; live: LiveMergeFacts } | { ok: false; error: string };
 
+/** Read only the first page: a positive count is enough to block merge; an empty
+ * page with more pages is unknown, never clear. */
+export async function readReviewThreads(run: GhRunner, target: PrTarget): Promise<{ ok: true; count: number; hasNextPage: boolean } | { ok: false; error: string }> {
+  const result = await run(threadsArgv(target));
+  if (!result.ok) return { ok: false, error: result.error };
+  const body = json(result) as { errors?: unknown; data?: { repository?: { pullRequest?: { reviewThreads?: unknown } } } } | undefined;
+  if (body === undefined || body.errors !== undefined) return { ok: false, error: "GitHub did not return complete review thread data." };
+  const threads = body.data?.repository?.pullRequest?.reviewThreads as { pageInfo?: { hasNextPage?: unknown }; nodes?: unknown } | undefined;
+  if (!Array.isArray(threads?.nodes) || typeof threads.pageInfo?.hasNextPage !== "boolean" ||
+      !threads.nodes.every((node) => node !== null && typeof node === "object" && typeof node.isResolved === "boolean")) {
+    return { ok: false, error: "GitHub did not return the PR's review threads." };
+  }
+  const count = threads.nodes.filter((node) => node.isResolved === false).length;
+  if (count === 0 && threads.pageInfo.hasNextPage) {
+    return { ok: false, error: "More review thread pages remain unread." };
+  }
+  return { ok: true, count, hasNextPage: threads.pageInfo.hasNextPage };
+}
+
 /**
  * Re-read, live, everything the merge dialog shows: the PR's own state, any
  * open PR stacked on its head branch, and how many review threads are still
@@ -130,16 +149,11 @@ export async function readLiveMerge(run: GhRunner, target: PrTarget): Promise<Li
   const head = typeof view.headRefName === "string" && !view.headRefName.startsWith("-") ? view.headRefName : null;
   const [stacked, threads] = await Promise.all([
     head === null ? Promise.resolve<Run>({ ok: true, stdout: "[]" }) : run(stackedArgv(target, head)),
-    run(threadsArgv(target)),
+    readReviewThreads(run, target),
   ]);
   if (!stacked.ok) return { ok: false, error: `Could not check for stacked PRs: ${stacked.error}` };
   if (!threads.ok) return { ok: false, error: `Could not count unresolved review threads: ${threads.error}` };
   const above = json(stacked);
-  const reviewThreads = (json(threads) as { data?: { repository?: { pullRequest?: { reviewThreads?: unknown } } } } | undefined)
-    ?.data?.repository?.pullRequest?.reviewThreads as { pageInfo?: { hasNextPage?: unknown }; nodes?: unknown } | undefined;
-  if (reviewThreads === undefined || !Array.isArray(reviewThreads.nodes)) {
-    return { ok: false, error: "GitHub did not return the PR's review threads." };
-  }
   return {
     ok: true,
     live: {
@@ -151,8 +165,8 @@ export async function readLiveMerge(run: GhRunner, target: PrTarget): Promise<Li
       stackedAbove: Array.isArray(above)
         ? above.flatMap((entry) => (typeof entry?.number === "number" ? [entry.number as number] : [])).slice(0, 50)
         : [],
-      unresolvedThreads: reviewThreads.nodes.filter((node) => (node as { isResolved?: unknown } | null)?.isResolved === false).length,
-      unresolvedAtLeast: reviewThreads.pageInfo?.hasNextPage === true,
+      unresolvedThreads: threads.count,
+      unresolvedAtLeast: threads.hasNextPage,
     },
   };
 }

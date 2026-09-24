@@ -140,6 +140,7 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
     latestReviewStates: latestReviewStates(view.latestReviews),
     reviewRequests: parseReviewRequests(view.reviewRequests),
     latestReviews: latestReviewers(view.latestReviews),
+    unresolvedReviewThreads: null,
     mergedAt:
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)

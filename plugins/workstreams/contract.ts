@@ -75,6 +75,8 @@ export const prSchema = z
       .array(z.object({ login: z.string().max(140), state: z.string().max(40) }).strict())
       .max(50)
       .default([]),
+    /** Null until review threads are checked; zero means no unresolved threads. */
+    unresolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
     /**
      * Ticket IDs the PR description states, extracted on the host from its
      * first 8 KB. The description itself is client content and is never kept,

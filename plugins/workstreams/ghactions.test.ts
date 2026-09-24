@@ -7,6 +7,7 @@ import {
   parseReviewRequests,
   prTarget,
   readLiveMerge,
+  readReviewThreads,
   rerequestArgv,
   runMerge,
   runNudge,
@@ -139,6 +140,21 @@ describe("readLiveMerge", () => {
   it("fails loudly rather than reporting zero when the thread count cannot be read", async () => {
     const { run } = fakeGh((args) => (args[0] === "api" ? { ok: false, error: "HTTP 502" } : answers([], [])(args)));
     expect(await readLiveMerge(run, TARGET)).toEqual({ ok: false, error: "Could not count unresolved review threads: HTTP 502" });
+  });
+});
+
+describe("readReviewThreads", () => {
+  it("refuses an empty first page when later review thread pages are unread, so neither the Board nor merge dialog claims the PR is clear", async () => {
+    const paginated = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true }, nodes: [{ isResolved: true }] } } } } }) }));
+    expect((await readReviewThreads(paginated.run, TARGET)).ok).toBe(false);
+    expect((await readLiveMerge(paginated.run, TARGET)).ok).toBe(false);
+  });
+
+  it("does not turn partial GraphQL data or unreadable nodes into a clear review state", async () => {
+    const partial = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ errors: [{ message: "partial" }], data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } }) }));
+    expect((await readReviewThreads(partial.run, TARGET)).ok).toBe(false);
+    const malformed = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [{}] } } } } }) }));
+    expect((await readReviewThreads(malformed.run, TARGET)).ok).toBe(false);
   });
 });
 
