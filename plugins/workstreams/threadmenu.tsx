@@ -7,6 +7,7 @@ import type { CSSProperties, ReactNode } from "react";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
 import { CLOSED, HOVER_CLOSE_MS, menuEntries, menuReducer, nextIndex, threadDotLabel, type MenuEvent } from "./menustate";
 import type { ThreadTier } from "./threads";
+import { usePortalScopeProps } from "./lib/portal-scope";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
 
 export type MenuThread = { id: string; title: string; active: boolean; tier: ThreadTier };
@@ -102,6 +103,7 @@ export function ThreadMenu({
       </PopoverPrimitive.Anchor>
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content
+          {...usePortalScopeProps()}
           side="bottom"
           align="end"
           sideOffset={4}
