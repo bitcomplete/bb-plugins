@@ -416,7 +416,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Linear API keys",
       description:
-        "Optional. One or more Linear personal API keys, separated by commas or spaces (one per workspace). Each ticket is looked up with the key whose workspace owns its team prefix; a prefix no key owns gets no Linear detail. Ticket titles, parents and projects then inform grouping and naming, never decide them. Keys stay on the server and are never logged.",
+        "Optional. One or more Linear personal API keys, separated by commas or spaces (one per workspace). Each ticket is looked up with the key whose workspace owns its team prefix; a prefix no key owns gets no Linear detail. Ticket titles, parents and projects then inform grouping and naming; a shared parent or project merges tickets that share any other signal. Keys stay on the server and are never logged.",
       secret: true,
     },
     linearApiKey: {

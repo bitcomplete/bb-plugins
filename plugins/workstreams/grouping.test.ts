@@ -172,7 +172,7 @@ describe("the two-signal merge rule", () => {
     expect(linearAndThread).toBeGreaterThan(MERGE_THRESHOLD);
   });
 
-  it("keeps a pair sharing ONLY a Linear project apart: Linear informs, it never decides", () => {
+  it("keeps a pair sharing ONLY a Linear project apart: with no second signal at all, Linear merges nothing", () => {
     const a = { ...cluster("ABC-1", "quill", ["src/shelves/a.ts"], "Tune search ranking weights"), linear: linear({ project: "Print run" }) };
     const b = { ...cluster("ABC-9", "folio", ["src/spine/b.ts"], "Refresh the seasonal reading list"), linear: linear({ project: "Print run" }) };
     expect(seedGroups([a, b])).toHaveLength(2);
@@ -382,5 +382,41 @@ describe("ticketless checkouts, keyed on their pull request", () => {
       "quill-bump": "Unsorted",
       quill: "Unsorted",
     });
+  });
+});
+
+describe("a shared Linear parent or project merges with any second signal", () => {
+  // One shared word out of twelve: nonzero, but far below the signal floor.
+  const weakVocab = (own: string) => new Set(["shelves", ...Array.from({ length: 11 }, (_, i) => `${own}${i}`)]);
+  // One small shared area beside two large private ones.
+  const weakArea = (own: string) => new Map([["quill:shelves", 1], [`quill:${own}`, 20]]);
+
+  it("merges a parent share whose only other agreement is weak vocabulary", () => {
+    const a = item("a", { parents: new Set(["ABC-0"]), vocab: weakVocab("a") });
+    const b = item("b", { parents: new Set(["ABC-0"]), vocab: weakVocab("b") });
+    expect(signalsBetween(a, b, areaWeights([a, b])).vocab).toBeLessThan(0.1);
+    expect(similarity(a, b)).toBeGreaterThan(MERGE_THRESHOLD);
+  });
+
+  it("merges a project share whose only other agreement is a weak code area", () => {
+    const a = item("a", { projects: new Set(["Print run"]), areas: weakArea("a") });
+    const b = item("b", { projects: new Set(["Print run"]), areas: weakArea("b") });
+    const weights = areaWeights([a, b]);
+    expect(signalsBetween(a, b, weights).area).toBeGreaterThan(0);
+    expect(signalsBetween(a, b, weights).area).toBeLessThan(0.1);
+    expect(similarity(a, b, weights)).toBeGreaterThan(MERGE_THRESHOLD);
+  });
+
+  it("does NOT merge a Linear share when every other signal is zero", () => {
+    const a = item("a", { parents: new Set(["ABC-0"]), projects: new Set(["Print run"]), vocab: new Set(["shelves"]) });
+    const b = item("b", { parents: new Set(["ABC-0"]), projects: new Set(["Print run"]), vocab: new Set(["spine"]) });
+    expect(similarity(a, b)).toBe(0);
+  });
+
+  it("leaves pairs with no Linear share on the two-signal rule and the threshold", () => {
+    expect(similarity(item("a", { vocab: weakVocab("a") }), item("b", { vocab: weakVocab("b") }))).toBe(0);
+    const a = item("a", { parents: new Set(["ABC-0"]), vocab: weakVocab("a") });
+    const b = item("b", { parents: new Set(["ABC-5"]), vocab: weakVocab("b") });
+    expect(similarity(a, b)).toBe(0);
   });
 });

@@ -199,11 +199,13 @@ separately: `bb plugin logs workstreams`.
 - **No single signal groups anything.** Seeding compares four independent
   signals: code areas (where in the repo a branch changes files), branch and PR
   vocabulary, Linear (a shared parent issue or project), and a shared thread.
-  Two clusters are seeded together only when at least two of them agree. The
-  repo is not a signal: in a monorepo every pair shares it. See
+  Two clusters are seeded together only when at least two of them agree, except
+  that a shared Linear parent or project merges a pair when any other signal is
+  nonzero. The repo is not a signal: in a monorepo every pair shares it. See
   [Grouping signals](#grouping-signals).
-- **Linear informs a theme; it never decides one.** Linear is one of the four
-  signals, so on its own it cannot merge anything. In naming, the project name
+- **Linear decides linked groups, and only those.** On its own Linear merges
+  nothing, but a shared parent or project merges a pair that shares any other
+  signal at all, so in practice Linear decides where tickets are linked. In naming, the project name
   is one candidate among the members' own phrases, and ticket titles, parents
   and projects are passed as context, never as the name. With no Linear key the
   Linear code path is inert: no request is made and nothing Linear-shaped
