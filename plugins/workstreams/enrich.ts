@@ -19,7 +19,7 @@ import {
   seedGroups,
   seedItems,
   namingCandidates as namingCandidatesFor,
-  summaryCandidates,
+  summaryChoices,
   wordCount,
   type Cluster,
   type ClusterDecision,
@@ -113,10 +113,15 @@ export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): 
 }
 
 function clusterState(cluster: Cluster) {
+  const linear = cluster.linear;
   return {
     ticket: cluster.ticket,
     repos: [...new Set(cluster.units.map((unit) => unit.repo ?? unit.dirName))],
     prTitles: cluster.units.flatMap((unit) => (unit.pr === null ? [] : [unit.pr.title])),
+    // Only when known, so a board with no Linear sends exactly what it always did.
+    ...(linear === undefined || linear === null
+      ? {}
+      : { linear: { title: linear.title, project: linear.project, parent: linear.parentTitle ?? linear.parentIdentifier } }),
   };
 }
 
@@ -164,7 +169,7 @@ export async function decideWithJev(request: JevRequest): Promise<JevOutcome> {
     const questions: Record<string, JevQuestion> = {};
     const slots = batch.map((cluster, index) => {
       const key = `c${index}`;
-      const titles = summaryCandidates(cluster);
+      const titles = summaryChoices(cluster);
       // With one candidate there is nothing to choose; code already has the
       // answer, so asking would be spending a model call on a known result.
       if (titles.length > 1) {
@@ -387,6 +392,8 @@ export type GroupNameRequest = {
   cached: (memberHash: string) => NamedGroup | undefined;
   /** Phrases the name may be drawn from, Linear projects among them. */
   candidatesFor: (label: string) => string[];
+  /** Context for the name, never a name: Linear titles, parents, projects, thread titles. */
+  contextFor?: (label: string) => string[];
   naming: NamingClient;
 };
 
@@ -415,10 +422,13 @@ export async function nameGroups(
     const hash = request.hashOf(label);
     hashes.set(label, hash);
     if (request.cached(hash) !== undefined) continue;
+    const context = request.contextFor?.(label) ?? [];
     stale.push({
       label,
       members: members.slice(0, 30),
       candidates: request.candidatesFor(label),
+      // Omitted when empty, so a board with no Linear and no threads sends what it always did.
+      ...(context.length === 0 ? {} : { context }),
     });
   }
 
@@ -468,6 +478,8 @@ export type EffortNameRequest = {
   cachedName: (memberHash: string) => NamedGroup | undefined;
   summaryOf: (cluster: Cluster) => string;
   linearProjectOf?: (cluster: Cluster) => string | null;
+  /** Per-cluster naming context; see `GroupNameRequest.contextFor`. */
+  contextOf?: (cluster: Cluster) => string[];
   naming: NamingClient;
 };
 
@@ -497,6 +509,39 @@ export async function nameEfforts(
         clusters.map((cluster) => request.linearProjectOf?.(cluster) ?? null),
       );
     },
+    contextFor: (label) => namingContext((clustersOf.get(label) ?? []).flatMap((cluster) => request.contextOf?.(cluster) ?? [])),
     naming: request.naming,
   });
+}
+
+
+/** The most context lines one group's naming call carries. */
+export const CONTEXT_LINES = 20;
+
+/** Unique, trimmed, bounded naming context lines. */
+export function namingContext(lines: readonly string[]): string[] {
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const text = line.replace(/\s+/gu, " ").trim().slice(0, 300);
+    if (text !== "") seen.add(text);
+  }
+  return [...seen].slice(0, CONTEXT_LINES);
+}
+
+/**
+ * One cluster's naming context: its Linear ticket title, parent and project,
+ * and the titles of the threads strongly linked to it. Labelled, so the model
+ * reads each as what it is rather than as a candidate name.
+ */
+export function clusterContext(cluster: Cluster, threadTitles: readonly string[] = []): string[] {
+  const linear = cluster.linear;
+  const lines: string[] = [];
+  if (linear !== undefined && linear !== null) {
+    if (linear.title !== null) lines.push(`Linear ${cluster.ticket}: ${linear.title}`);
+    const parent = linear.parentTitle ?? linear.parentIdentifier;
+    if (parent !== null) lines.push(`Linear parent: ${parent}`);
+    if (linear.project !== null) lines.push(`Linear project: ${linear.project}`);
+  }
+  for (const title of threadTitles) lines.push(`Thread: ${title}`);
+  return lines;
 }

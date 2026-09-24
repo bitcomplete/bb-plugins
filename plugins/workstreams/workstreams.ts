@@ -901,6 +901,19 @@ export function summaryCandidates(cluster: Cluster): string[] {
 }
 
 /**
+ * What Jev chooses a cluster's summary from: its PR titles, plus its Linear
+ * ticket's title when one is known — one more candidate, never the default.
+ * With no Linear detail this is exactly `summaryCandidates`.
+ */
+export function summaryChoices(cluster: Cluster): string[] {
+  const titles = summaryCandidates(cluster);
+  const raw = cluster.linear?.title;
+  const linear = typeof raw === "string" ? normalizeSummary(raw) : null;
+  if (linear === null || titles.includes(linear)) return titles;
+  return [...titles.slice(0, 7), isSummaryLength(linear) ? linear : truncateSummary(linear)];
+}
+
+/**
  * Summary with no model in the loop: the most recent PR title, prefix stripped.
  * This is what the board shows before — or instead of — any model call, so it
  * has to be genuinely useful rather than a placeholder.

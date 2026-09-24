@@ -204,9 +204,10 @@ separately: `bb plugin logs workstreams`.
   [Grouping signals](#grouping-signals).
 - **Linear informs a theme; it never decides one.** Linear is one of the four
   signals, so on its own it cannot merge anything. In naming, the project name
-  is one candidate among the members' own phrases. With no Linear key the
+  is one candidate among the members' own phrases, and ticket titles, parents
+  and projects are passed as context, never as the name. With no Linear key the
   Linear code path is inert: no request is made and nothing Linear-shaped
-  reaches a hash.
+  reaches a hash, a Jev question or a naming call.
 - **Low confidence goes to Unsorted.** A cluster whose effort fit scores below
   `assignmentConfidenceThreshold` lands in `Unsorted` rather than being
   force-fitted into a confident-looking effort. Checkouts with no recognizable

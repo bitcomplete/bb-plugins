@@ -331,6 +331,7 @@ function namingSystem(level: Level): string {
     "- Name the shared subject at one level above the members, not one member's title.",
     '- Concrete. "Faster search for long-tail titles", never "Platform work" or "Various improvements".',
     "- You may be given candidate phrases. Treat each as one option among the members' own words, never as the answer.",
+    "- You may be given context lines: Linear ticket titles, parent issues and projects, and titles of the threads the work happened in. Use them to understand what the members are about; never copy one as the name.",
     "Also judge each grouping:",
     '- "cohesive" when the members plausibly belong together.',
     '- "mixed" when they do not, with one short line naming which members look unrelated.',

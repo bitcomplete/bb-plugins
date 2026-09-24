@@ -3,7 +3,7 @@
 // stable candidate labels that keep a rename from forcing re-asks.
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
-import { seedAssignables } from "./enrich.js";
+import { candidatesFrom, clusterContext, decideWithJev, nameGroups, namingContext, seedAssignables, type JevClient, type NamingClient } from "./enrich.js";
 import { THREAD_SPAN_MAX, threadWeights, type ThreadTier } from "./threads.js";
 import {
   AREA_COMMON_SHARE,
@@ -16,6 +16,8 @@ import {
   seedGroups,
   signalsBetween,
   similarity,
+  summaryCandidates,
+  summaryChoices,
   unitLifecycle,
   type Cluster,
   type ClusterLinear,
@@ -248,7 +250,14 @@ describe("stable candidate labels one level up", () => {
   });
 });
 
-describe("Linear in the semantic hash", () => {
+describe("Linear as context", () => {
+  it("adds the Linear title to the summary choices, and changes nothing without Linear", () => {
+    const plain = cluster("ABC-1", "quill", [], "Show gift card balance in the cart");
+    expect(summaryChoices(plain)).toEqual(summaryCandidates(plain));
+    const withLinear = { ...plain, linear: linear({ title: "Gift card balances on the cart page" }) };
+    expect(summaryChoices(withLinear)).toEqual(["Show gift card balance in the cart", "Gift card balances on the cart page"]);
+  });
+
   it("hashes a cluster with no Linear detail exactly as before, and a state change never re-asks", () => {
     const plain = cluster("ABC-1", "quill", []);
     expect(clusterInputHash({ ...plain, linear: null })).toBe(clusterInputHash(plain));
@@ -256,5 +265,59 @@ describe("Linear in the semantic hash", () => {
     const done = { ...plain, linear: linear({ title: "Gift cards", state: "Done" }) };
     expect(clusterInputHash(todo)).not.toBe(clusterInputHash(plain));
     expect(clusterInputHash(todo)).toBe(clusterInputHash(done));
+  });
+
+  it("labels each context line by what it is, and bounds and dedupes the set", () => {
+    const one = { ...cluster("ABC-1", "quill", []), linear: linear({ title: "Gift cards", parentTitle: "Checkout", project: "Print run" }) };
+    expect(clusterContext(one, ["Tidy the cart"])).toEqual([
+      "Linear ABC-1: Gift cards",
+      "Linear parent: Checkout",
+      "Linear project: Print run",
+      "Thread: Tidy the cart",
+    ]);
+    expect(namingContext(["a", " a ", "", ...Array.from({ length: 40 }, (_, index) => `line ${index}`)])).toHaveLength(20);
+  });
+
+  it("sends naming context only when there is some, keeps the Linear project one candidate among several, and never names from context", async () => {
+    const sent: unknown[] = [];
+    const naming: NamingClient = {
+      async name(_level, groups) {
+        sent.push(...groups);
+        return { names: groups.map((group) => ({ label: group.label, name: "Gift card balances in checkout", cohesion: "cohesive" as const, reason: null })), warnings: [], calls: 1, inputTokens: 1, outputTokens: 1 };
+      },
+    };
+    const members = [{ ticket: "ABC-1", summary: "Show gift card balance", repos: ["quill"] }];
+    await nameGroups({
+      level: "effort",
+      groups: new Map([["with", members], ["without", members]]),
+      hashOf: (label) => label,
+      cached: () => undefined,
+      candidatesFor: () => ["Print run", "Show gift card balance"],
+      contextFor: (label) => (label === "with" ? ["Linear project: Print run"] : []),
+      naming,
+    });
+    expect(sent).toEqual([
+      expect.objectContaining({ label: "with", context: ["Linear project: Print run"], candidates: ["Print run", "Show gift card balance"] }),
+      expect.not.objectContaining({ context: expect.anything() }),
+    ]);
+  });
+});
+
+describe("with no Linear detail, nothing changes", () => {
+  it("sends Jev exactly the cluster state it always did, and the Linear title only when one is known", async () => {
+    const states: unknown[] = [];
+    const jev: JevClient = {
+      async ask(state) {
+        states.push(state);
+        return { answers: {}, usage: { input_tokens: 0, output_tokens: 0 } };
+      },
+    };
+    const plain = cluster("ABC-1", "quill", ["src/shelves/a.ts"]);
+    const other = cluster("ABC-2", "quill", ["src/spine/b.ts"]);
+    await decideWithJev({ pending: [plain], candidates: candidatesFrom([plain, other]), jev });
+    await decideWithJev({ pending: [{ ...plain, linear: linear({ title: "Shelf sorting" }) }], candidates: candidatesFrom([plain, other]), jev });
+    const [without, withLinear] = states as { clusters: Record<string, unknown>[] }[];
+    expect(Object.keys(without!.clusters[0]!)).toEqual(["ticket", "repos", "prTitles"]);
+    expect(withLinear!.clusters[0]!.linear).toEqual({ title: "Shelf sorting", project: null, parent: null });
   });
 });

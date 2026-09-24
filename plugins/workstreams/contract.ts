@@ -131,6 +131,12 @@ export const groupNamingSchema = z
      * candidate, never an automatic winner.
      */
     candidates: z.array(z.string().max(300)).max(12),
+    /**
+     * Context, never a name: members' Linear ticket titles, parents and
+     * projects, and the titles of their strongly linked threads. Absent when
+     * none is known.
+     */
+    context: z.array(z.string().max(300)).max(20).optional(),
   })
   .strict();
 export type GroupNaming = z.infer<typeof groupNamingSchema>;

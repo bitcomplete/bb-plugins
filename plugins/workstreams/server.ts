@@ -59,9 +59,11 @@ import {
   ZERO_USAGE,
   assignToCandidates,
   candidatesFrom,
+  clusterContext,
   decideWithJev,
   nameEfforts,
   nameGroups,
+  namingContext,
   seedAssignables,
   type Assignable,
   type JevAnswer,
@@ -1547,6 +1549,7 @@ export default async function plugin(bb: BbPluginApi) {
     level: Exclude<GroupLevel, "effort">;
     members: LevelEntry[];
     summaryOf: (group: BoardGroup) => string;
+    contextOf: (cluster: Cluster) => string[];
     jev: JevClient;
     naming: NamingClient | null;
     threshold: number;
@@ -1624,6 +1627,8 @@ export default async function plugin(bb: BbPluginApi) {
           entries.flatMap((entry) => [...entry.item.projects]),
         );
       },
+      contextFor: (label) =>
+        namingContext((grouped.get(label) ?? []).flatMap((entry) => entry.clusters.flatMap(options.contextOf))),
       naming: options.naming,
     });
     writeGroupNames(level, named.names);
@@ -1689,6 +1694,18 @@ export default async function plugin(bb: BbPluginApi) {
     const links = threadLinks(clusters, pattern);
     const context: SeedContext = { threads: threadWeights(links) };
     bb.log.info(`threads: ${strongLinkedClusters(links)} of ${clusters.length} clusters have a strong thread link`);
+    const threadTitles = new Map<string, string[]>();
+    for (const [threadId, perCluster] of links) {
+      const thread = threadFacts.get(threadId);
+      const title = thread?.title ?? thread?.titleFallback ?? null;
+      if (title === null) continue;
+      for (const [cluster, tier] of perCluster) {
+        if (!STRONG_TIERS.has(tier)) continue;
+        threadTitles.set(cluster, [...(threadTitles.get(cluster) ?? []), title]);
+      }
+    }
+    const contextOf = (cluster: Cluster) => clusterContext(cluster, (threadTitles.get(cluster.ticket) ?? []).slice(0, 3));
+
     const candidates = candidatesFrom(clusters, context);
     const plan = planClusterAsks({
       clusters: clusters.map((cluster) => ({
@@ -1750,6 +1767,7 @@ export default async function plugin(bb: BbPluginApi) {
         cachedName: (hash) => readGroupName("effort", hash),
         summaryOf: (value) => summaries.get(value.ticket) ?? fallbackSummary(value),
         linearProjectOf: (value) => linearProjects[value.ticket] ?? null,
+        contextOf,
         naming,
       });
       writeGroupNames("effort", named.names);
@@ -1771,6 +1789,7 @@ export default async function plugin(bb: BbPluginApi) {
       level: "program",
       members: levelMembers(efforts, effortHash, () => [], context),
       summaryOf: (group) => group.name,
+      contextOf,
       jev,
       naming,
       threshold: assignmentConfidenceThreshold,
@@ -1794,6 +1813,7 @@ export default async function plugin(bb: BbPluginApi) {
           context,
         ),
         summaryOf: (group) => group.name,
+        contextOf,
         jev,
         naming,
         threshold: assignmentConfidenceThreshold,
