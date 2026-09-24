@@ -37,6 +37,7 @@ import {
   effortMemberHash,
   fallbackSummary,
   groupChildren,
+  groupSeedItem,
   hierarchyDepth,
   memberHash,
   namingCandidates,
@@ -1445,23 +1446,25 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- enrichment: the only place model calls happen --------------------
 
+  type LevelEntry = {
+    member: Assignable & { hash: string };
+    item: SeedItem;
+    repos: string[];
+    clusters: SummarizedCluster[];
+    group: BoardGroup;
+  };
+
   /** A level's members, shaped for seeding, assignment and naming. */
   function levelMembers(
     groups: BoardGroup[],
     hashOf: (group: BoardGroup) => string,
     childrenOf: (group: BoardGroup) => BoardGroup[],
-    linearProjects: Record<string, string | null>,
-  ): { member: Assignable & { hash: string }; item: SeedItem; group: BoardGroup }[] {
+  ): LevelEntry[] {
     return groups
       .filter((group) => group.key !== UNSORTED && !group.key.endsWith(`:${UNSORTED}`))
       .map((group) => {
         const clusters = clustersUnder(group, childrenOf);
         const hash = hashOf(group);
-        const projects = new Set<string>();
-        for (const cluster of clusters) {
-          const project = linearProjects[cluster.ticket];
-          if (typeof project === "string" && project.trim() !== "") projects.add(project.trim());
-        }
         return {
           member: {
             key: hash,
@@ -1472,14 +1475,9 @@ export default async function plugin(bb: BbPluginApi) {
               .join(", ")
               .slice(0, 300),
           },
-          item: {
-            key: hash,
-            repos: new Set(
-              clusters.flatMap((cluster) => cluster.units.map((unit) => unit.repo ?? unit.dirName)),
-            ),
-            vocab: new Set(clusters.flatMap((cluster) => [...clusterVocabulary(cluster)])),
-            projects,
-          },
+          item: groupSeedItem(hash, clusters),
+          repos: [...new Set(clusters.flatMap((cluster) => cluster.units.map((unit) => unit.repo ?? unit.dirName)))],
+          clusters,
           group,
         };
       });
@@ -1502,8 +1500,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function deriveLevel(options: {
     level: Exclude<GroupLevel, "effort">;
-    members: { member: Assignable & { hash: string }; item: SeedItem; group: BoardGroup }[];
-    linearProjects: Record<string, string | null>;
+    members: LevelEntry[];
     summaryOf: (group: BoardGroup) => string;
     jev: JevClient;
     naming: NamingClient | null;
@@ -1541,9 +1538,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     writeGroupAssignments(level, assigned.assignments);
     warnings.push(...assigned.warnings);
-    usage.calls += assigned.usage.calls;
-    usage.inputTokens += assigned.usage.inputTokens;
-    usage.outputTokens += assigned.usage.outputTokens;
+    addUsage(usage, assigned.usage);
     bb.log.info(
       `jev ${level}: ${assigned.usage.calls} calls for ${pending.length} of ${members.length} members, ${assigned.usage.inputTokens} in / ${assigned.usage.outputTokens} out`,
     );
@@ -1560,6 +1555,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (bucket === undefined) grouped.set(cached.label, [entry]);
       else bucket.push(entry);
     }
+    const hashOf = (label: string) => memberHash(level, (grouped.get(label) ?? []).map((entry) => entry.member.hash));
 
     const named = await nameGroups({
       level,
@@ -1569,12 +1565,11 @@ export default async function plugin(bb: BbPluginApi) {
           entries.map((entry) => ({
             ticket: entry.group.key,
             summary: options.summaryOf(entry.group),
-            repos: [...entry.item.repos].slice(0, 50),
+            repos: entry.repos.slice(0, 50),
           })),
         ]),
       ),
-      hashOf: (label) =>
-        memberHash(level, (grouped.get(label) ?? []).map((entry) => entry.member.hash)),
+      hashOf,
       cached: (hash) => readGroupName(level, hash),
       candidatesFor: (label) => {
         const entries = grouped.get(label) ?? [];
@@ -1587,13 +1582,17 @@ export default async function plugin(bb: BbPluginApi) {
     });
     writeGroupNames(level, named.names);
     warnings.push(...named.warnings);
-    usage.calls += named.usage.calls;
-    usage.inputTokens += named.usage.inputTokens;
-    usage.outputTokens += named.usage.outputTokens;
+    addUsage(usage, named.usage);
     bb.log.info(
       `claude ${level}: ${named.usage.calls} calls for ${named.names.size} renamed, ${named.usage.inputTokens} in / ${named.usage.outputTokens} out`,
     );
     return { warnings, usage };
+  }
+
+  function addUsage(total: ModelUsage, part: ModelUsage): void {
+    total.calls += part.calls;
+    total.inputTokens += part.inputTokens;
+    total.outputTokens += part.outputTokens;
   }
 
   /**
@@ -1612,7 +1611,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const { clusters, linearProjects, rules } = await readPlacement();
-    const candidates = candidatesFrom(clusters, linearProjects);
+    const candidates = candidatesFrom(clusters);
     const labels = new Set(candidates.map((candidate) => candidate.label));
     const pending = clusters.filter((cluster) => {
       const decision = readDecision(clusterInputHash(cluster));
@@ -1628,9 +1627,7 @@ export default async function plugin(bb: BbPluginApi) {
     const cluster = await decideWithJev({ pending, candidates, jev });
     writeDecisions(cluster.decisions);
     warnings.push(...cluster.warnings);
-    usage.calls += cluster.usage.calls;
-    usage.inputTokens += cluster.usage.inputTokens;
-    usage.outputTokens += cluster.usage.outputTokens;
+    addUsage(usage, cluster.usage);
     bb.log.info(
       `jev cluster: ${cluster.usage.calls} calls for ${pending.length} of ${clusters.length} clusters, ${cluster.usage.inputTokens} in / ${cluster.usage.outputTokens} out`,
     );
@@ -1668,9 +1665,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
       writeGroupNames("effort", named.names);
       warnings.push(...named.warnings);
-      usage.calls += named.usage.calls;
-      usage.inputTokens += named.usage.inputTokens;
-      usage.outputTokens += named.usage.outputTokens;
+      addUsage(usage, named.usage);
       bb.log.info(
         `claude effort: ${named.usage.calls} calls for ${named.names.size} renamed, ${named.usage.inputTokens} in / ${named.usage.outputTokens} out`,
       );
@@ -1678,20 +1673,16 @@ export default async function plugin(bb: BbPluginApi) {
 
     // ---- program level, then domain level ----
     const efforts = effortsOf(placement.labelled, true, rules);
-    const effortMembers = levelMembers(efforts, effortHash, () => [], linearProjects);
     const program = await deriveLevel({
       level: "program",
-      members: effortMembers,
-      linearProjects,
+      members: levelMembers(efforts, effortHash, () => []),
       summaryOf: (group) => group.name,
       jev,
       naming,
       threshold: assignmentConfidenceThreshold,
     });
     warnings.push(...program.warnings);
-    usage.calls += program.usage.calls;
-    usage.inputTokens += program.usage.inputTokens;
-    usage.outputTokens += program.usage.outputTokens;
+    addUsage(usage, program.usage);
 
     // Programs are read back from the hierarchy the assignments just produced,
     // so the domain level sees exactly what the board will render.
@@ -1700,25 +1691,20 @@ export default async function plugin(bb: BbPluginApi) {
     const childrenOf = (group: BoardGroup) => byParent.get(group.key) ?? [];
     const programGroups = built.groups.filter((group) => group.level === "program");
     if (programGroups.length > 0) {
-      const programMembers = levelMembers(
-        programGroups,
-        (group) => memberHash("program", childrenOf(group).map(effortHash)),
-        childrenOf,
-        linearProjects,
-      );
       const domain = await deriveLevel({
         level: "domain",
-        members: programMembers,
-        linearProjects,
+        members: levelMembers(
+          programGroups,
+          (group) => memberHash("program", childrenOf(group).map(effortHash)),
+          childrenOf,
+        ),
         summaryOf: (group) => group.name,
         jev,
         naming,
         threshold: assignmentConfidenceThreshold,
       });
       warnings.push(...domain.warnings);
-      usage.calls += domain.usage.calls;
-      usage.inputTokens += domain.usage.inputTokens;
-      usage.outputTokens += domain.usage.outputTokens;
+      addUsage(usage, domain.usage);
     }
 
     bb.log.info(

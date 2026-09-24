@@ -1157,11 +1157,59 @@ export function clusterVocabulary(cluster: Cluster): Set<string> {
   return words;
 }
 
-function clusterRepos(cluster: Cluster): Set<string> {
-  return new Set(cluster.units.map(repoOf));
+// ---- code areas: where in the code a cluster works --------------------------
+
+/** Directory names that hold code rather than name what it is about. */
+const CONTAINER_SEGMENTS = new Set([
+  "src", "lib", "app", "apps", "packages", "services", "internal", "pkg", "cmd",
+  "test", "tests", "__tests__", "spec", "e2e",
+]);
+/** Build output and generated code: what changed there says nothing about the work. */
+const GENERATED_SEGMENTS = new Set(["dist", "generated", "__generated__", "node_modules", "vendor"]);
+const LOCKFILE = /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|go\.sum|Gemfile\.lock|poetry\.lock|uv\.lock|composer\.lock|Podfile\.lock|[^/]+\.lock)$/u;
+const GENERATED_FILE = /\.(?:generated|gen|pb|min)\.[a-z]+$|_pb2\.py$|\.snap$/u;
+/** Meaningful directory segments kept per area. */
+const AREA_DEPTH = 2;
+
+/**
+ * The code area one changed path belongs to, or null when the path says nothing
+ * about the work (a lockfile, generated output).
+ *
+ * Why areas and not repos: a repo is an artificial grouping input. In a
+ * monorepo EVERY pair of clusters shares the repo, so repo overlap would agree
+ * for every pair and quietly defeat the two-signal rule; in a polyrepo two
+ * unrelated chores in one repo would look like one body of work. Where the code
+ * lives inside the repo stays meaningful in both: container segments (src,
+ * packages, apps, …) are stripped and the next two named directories are kept,
+ * so `packages/reader-web/src/shelves/Form.tsx` is `reader-web/shelves`.
+ *
+ * The repo is prefixed as a DISAMBIGUATOR, never a signal: identical areas in
+ * two repos stay distinct, and in a monorepo the prefix is the same for every
+ * cluster, so it can neither create nor block agreement — two clusters in one
+ * repo but different areas share nothing.
+ */
+export function codeArea(repo: string, path: string): string | null {
+  const clean = path.replace(/^\.?\/+/u, "");
+  if (LOCKFILE.test(clean) || GENERATED_FILE.test(clean)) return null;
+  const directories = clean.split("/").slice(0, -1);
+  if (directories.some((segment) => GENERATED_SEGMENTS.has(segment))) return null;
+  const named = directories.filter((segment) => !CONTAINER_SEGMENTS.has(segment)).slice(0, AREA_DEPTH);
+  return `${repo}:${named.length === 0 ? "." : named.join("/")}`;
 }
 
-function jaccard(a: Set<string>, b: Set<string>): number {
+/** Changed files per code area across a cluster's checkouts. Empty when nothing changed. */
+export function areaProfile(cluster: Cluster): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const unit of cluster.units) {
+    for (const path of unit.changedPaths) {
+      const area = codeArea(repoOf(unit), path);
+      if (area !== null) counts.set(area, (counts.get(area) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let shared = 0;
   for (const value of a) if (b.has(value)) shared += 1;
@@ -1175,46 +1223,98 @@ function jaccard(a: Set<string>, b: Set<string>): number {
  */
 export type SeedItem = {
   key: string;
-  repos: Set<string>;
-  vocab: Set<string>;
-  /** Linear project names the item touches. A signal, never the decider. */
-  projects: Set<string>;
+  /** Changed files per code area; see `codeArea`. */
+  areas: ReadonlyMap<string, number>;
+  vocab: ReadonlySet<string>;
+  /** Linear project names the item touches. */
+  projects: ReadonlySet<string>;
+  /** Linear parent issues the item's tickets sit under. */
+  parents: ReadonlySet<string>;
 };
 
 /**
- * Repos weigh more than words, and a shared Linear project is a nudge on top of
- * both.
- *
- * The normalization is the load-bearing part. Dividing by the weights that
- * actually had data means that with no Linear key configured the score is
- * bit-for-bit what it was before this term existed, and that with Linear data
- * present a perfect project match ALONE scores 0.3/1.3 = 0.23 — below the merge
- * threshold. Linear can therefore only ever amplify agreement that repos or
- * vocabulary already found; it can never originate a grouping of its own. That
- * is the difference between informing a theme and deciding one.
+ * How much each code area says, over the items being seeded: an area few items
+ * touch is specific evidence, one many touch (shared utils, config) is not, and
+ * one touched by more than a quarter of them — never fewer than two — says
+ * nothing at all.
  */
-const SIMILARITY_WEIGHTS = { repos: 0.6, vocab: 0.4, projects: 0.3 } as const;
+export const AREA_COMMON_SHARE = 0.25;
 
-export function similarity(a: SeedItem, b: SeedItem): number {
-  const base =
-    SIMILARITY_WEIGHTS.repos * jaccard(a.repos, b.repos) +
-    SIMILARITY_WEIGHTS.vocab * jaccard(a.vocab, b.vocab);
-  const weighProjects = a.projects.size > 0 && b.projects.size > 0;
-  if (!weighProjects) return base;
-  // The cap is what makes Linear a signal rather than a decider: the project
-  // term can at most DOUBLE the agreement repos and vocabulary already found,
-  // and doubling nothing is still nothing. Without it, a perfect project match
-  // plus a spurious one-word vocabulary overlap clears the merge threshold on
-  // its own, which is exactly the grouping Linear is not allowed to make.
-  const projects = Math.min(
-    SIMILARITY_WEIGHTS.projects * jaccard(a.projects, b.projects),
-    base,
-  );
-  return (base + projects) / (1 + SIMILARITY_WEIGHTS.projects);
+export function areaWeights(items: readonly Pick<SeedItem, "areas">[]): Map<string, number> {
+  const touched = new Map<string, number>();
+  for (const item of items) for (const area of item.areas.keys()) touched.set(area, (touched.get(area) ?? 0) + 1);
+  const cutoff = Math.max(2, AREA_COMMON_SHARE * items.length);
+  const weights = new Map<string, number>();
+  for (const [area, count] of touched) {
+    weights.set(area, count > cutoff ? 0 : Math.log(1 + items.length / count));
+  }
+  return weights;
+}
+
+/** Weighted Jaccard over areas: file counts dampened by log, scaled by how specific each area is. */
+function areaAgreement(
+  a: ReadonlyMap<string, number>,
+  b: ReadonlyMap<string, number>,
+  weights: ReadonlyMap<string, number>,
+): number {
+  let shared = 0;
+  let total = 0;
+  for (const area of new Set([...a.keys(), ...b.keys()])) {
+    const weight = weights.get(area) ?? 0;
+    if (weight === 0) continue;
+    const left = Math.log1p(a.get(area) ?? 0);
+    const right = Math.log1p(b.get(area) ?? 0);
+    shared += weight * Math.min(left, right);
+    total += weight * Math.max(left, right);
+  }
+  return total === 0 ? 0 : shared / total;
+}
+
+/** The three independent signals, each 0-1. Repo is deliberately not one; see `codeArea`. */
+export type Signals = { area: number; vocab: number; linear: number };
+
+export function signalsBetween(a: SeedItem, b: SeedItem, weights: ReadonlyMap<string, number>): Signals {
+  return {
+    area: areaAgreement(a.areas, b.areas, weights),
+    vocab: jaccard(a.vocab, b.vocab),
+    // One source, one signal: a shared parent is the sharper half of it.
+    linear: Math.max(jaccard(a.parents, b.parents), 0.7 * jaccard(a.projects, b.projects)),
+  };
+}
+
+/** A signal below this is noise, not agreement. */
+export const SIGNAL_FLOOR = 0.1;
+/** How many independent signals must agree before two items may merge. */
+export const SIGNALS_REQUIRED = 2;
+const SIMILARITY_WEIGHTS: Signals = { area: 0.6, vocab: 0.4, linear: 0.3 };
+
+/**
+ * The merge score, or 0 when fewer than two independent signals agree.
+ *
+ * The gate is the rule: NO single signal can merge two items on its own —
+ * not Linear (which informs a theme and never decides one), not a shared
+ * code area, not shared words. The weighted sum then
+ * ranks the pairs that passed it against the merge threshold.
+ */
+export function similarity(a: SeedItem, b: SeedItem, weights: ReadonlyMap<string, number> = areaWeights([a, b])): number {
+  const signals = signalsBetween(a, b, weights);
+  const agreeing = (Object.keys(signals) as (keyof Signals)[]).filter((name) => signals[name] >= SIGNAL_FLOOR).length;
+  if (agreeing < SIGNALS_REQUIRED) return 0;
+  return (Object.keys(signals) as (keyof Signals)[]).reduce((sum, name) => sum + SIMILARITY_WEIGHTS[name] * signals[name], 0);
 }
 
 export const MERGE_THRESHOLD = 0.25;
 const MAX_GROUP = 8;
+
+function union<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): Set<T> {
+  return new Set([...a, ...b]);
+}
+
+function sumCounts(a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>): Map<string, number> {
+  const out = new Map(a);
+  for (const [key, value] of b) out.set(key, (out.get(key) ?? 0) + value);
+  return out;
+}
 
 /**
  * Agglomerative seeding: merge the most similar pair of groups until nothing is
@@ -1226,12 +1326,10 @@ const MAX_GROUP = 8;
  * Returns groups of KEYS, sorted, so the same function serves every level.
  */
 export function seedItems(items: readonly SeedItem[]): string[][] {
-  const groups = items.map((item) => ({
-    members: [item.key],
-    repos: new Set(item.repos),
-    vocab: new Set(item.vocab),
-    projects: new Set(item.projects),
-  }));
+  // Specificity is judged once, over the items as given: merging must not make
+  // an area look rarer than it is.
+  const weights = areaWeights(items);
+  const groups = items.map((item) => ({ members: [item.key], item: { ...item } }));
 
   for (;;) {
     let best = { score: MERGE_THRESHOLD, left: -1, right: -1 };
@@ -1241,7 +1339,7 @@ export function seedItems(items: readonly SeedItem[]): string[][] {
         const b = groups[right];
         if (a === undefined || b === undefined) continue;
         if (a.members.length + b.members.length > MAX_GROUP) continue;
-        const score = similarity({ key: "", ...a }, { key: "", ...b });
+        const score = similarity(a.item, b.item, weights);
         if (score > best.score) best = { score, left, right };
       }
     }
@@ -1250,9 +1348,13 @@ export function seedItems(items: readonly SeedItem[]): string[][] {
     const b = groups[best.right];
     if (a === undefined || b === undefined) break;
     a.members.push(...b.members);
-    a.repos = new Set([...a.repos, ...b.repos]);
-    a.vocab = new Set([...a.vocab, ...b.vocab]);
-    a.projects = new Set([...a.projects, ...b.projects]);
+    a.item = {
+      key: a.item.key,
+      areas: sumCounts(a.item.areas, b.item.areas),
+      vocab: union(a.item.vocab, b.item.vocab),
+      projects: union(a.item.projects, b.item.projects),
+      parents: union(a.item.parents, b.item.parents),
+    };
     groups.splice(best.right, 1);
   }
 
@@ -1261,25 +1363,37 @@ export function seedItems(items: readonly SeedItem[]): string[][] {
   return groups.map((group) => [...group.members].sort((a, b) => a.localeCompare(b)));
 }
 
+function present(value: string | null | undefined): Set<string> {
+  return typeof value === "string" && value.trim() !== "" ? new Set([value.trim()]) : new Set<string>();
+}
+
+/** One cluster as a seed item. */
+export function clusterSeedItem(cluster: Cluster): SeedItem {
+  return {
+    key: cluster.ticket,
+    areas: areaProfile(cluster),
+    vocab: clusterVocabulary(cluster),
+    projects: present(cluster.linear?.project),
+    parents: present(cluster.linear?.parentIdentifier ?? cluster.linear?.parentTitle),
+  };
+}
+
+/** A group of clusters as ONE seed item, for the levels above an effort. */
+export function groupSeedItem(key: string, clusters: readonly Cluster[]): SeedItem {
+  const parts = clusters.map((cluster) => clusterSeedItem(cluster));
+  return {
+    key,
+    areas: parts.reduce<Map<string, number>>((sum, part) => sumCounts(sum, part.areas), new Map()),
+    vocab: new Set(parts.flatMap((part) => [...part.vocab])),
+    projects: new Set(parts.flatMap((part) => [...part.projects])),
+    parents: new Set(parts.flatMap((part) => [...part.parents])),
+  };
+}
+
 /** The cluster level's seeding, expressed through the generic one. */
-export function seedGroups(
-  clusters: Cluster[],
-  linearProjects: Record<string, string | null> = {},
-): Cluster[][] {
+export function seedGroups(clusters: Cluster[]): Cluster[][] {
   const byKey = new Map(clusters.map((cluster) => [cluster.ticket, cluster]));
-  const items = clusters.map((cluster) => {
-    const project = linearProjects[cluster.ticket];
-    return {
-      key: cluster.ticket,
-      repos: clusterRepos(cluster),
-      vocab: clusterVocabulary(cluster),
-      projects:
-        typeof project === "string" && project.trim() !== ""
-          ? new Set([project.trim()])
-          : new Set<string>(),
-    };
-  });
-  return seedItems(items).map((keys) =>
+  return seedItems(clusters.map((cluster) => clusterSeedItem(cluster))).map((keys) =>
     keys.flatMap((key) => {
       const cluster = byKey.get(key);
       return cluster === undefined ? [] : [cluster];

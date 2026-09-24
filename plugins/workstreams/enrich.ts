@@ -93,12 +93,9 @@ export type Candidate = { label: string; description: string; members: Cluster[]
  * cache key, not a display name: it only has to be stable and unique, so it is
  * derived from a member's own pull request title rather than invented.
  */
-export function candidatesFrom(
-  clusters: Cluster[],
-  linearProjects: Record<string, string | null> = {},
-): Candidate[] {
+export function candidatesFrom(clusters: Cluster[]): Candidate[] {
   const used = new Set<string>();
-  return seedGroups(clusters, linearProjects).map((members) => {
+  return seedGroups(clusters).map((members) => {
     const base = fallbackSummary(members[0] as Cluster);
     let label = base;
     for (let suffix = 2; used.has(label); suffix += 1) label = `${base} (${suffix})`;
@@ -495,4 +492,3 @@ export async function nameEfforts(
     naming: request.naming,
   });
 }
-

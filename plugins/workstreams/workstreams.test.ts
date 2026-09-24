@@ -7,7 +7,6 @@ import {
   ESCALATING,
   LENSES,
   LIFECYCLES,
-  MERGE_THRESHOLD,
   STALENESS_DAYS,
   UNSORTED,
   buildBoard,
@@ -24,7 +23,6 @@ import {
   namingCandidates,
   parseSurfaceRules,
   riskOf,
-  similarity,
   stalenessOf,
   toLifecycle,
   type BoardGroup,
@@ -714,7 +712,7 @@ describe("rollupSentence", () => {
 });
 
 describe("seedGroups", () => {
-  it("groups tickets that share repos and vocabulary, because those are the candidates worth asking a model about", () => {
+  it("groups tickets that share a code area and vocabulary, because two agreeing signals are the candidates worth asking a model about", () => {
     const groups = seedGroups([
       cluster("ABC-101", [
         unit({
@@ -722,6 +720,7 @@ describe("seedGroups", () => {
           repo: "quill",
           branch: "dev/abc-101-gift-card-balance",
           pr: pr({ title: "Show gift card balance in the cart" }),
+          changedPaths: ["src/giftcards/Balance.tsx"],
         }),
       ]),
       cluster("ABC-102", [
@@ -730,6 +729,7 @@ describe("seedGroups", () => {
           repo: "quill",
           branch: "dev/abc-102-gift-card-balance-log",
           pr: pr({ title: "Log slow search queries" }),
+          changedPaths: ["src/giftcards/log.ts"],
         }),
       ]),
       cluster("OPS-1111", [
@@ -1303,40 +1303,10 @@ describe("the Linear signal", () => {
     ];
   }
 
-  it("cannot on its own merge two clusters whose repos and vocabulary disagree, because Linear informs a theme and does not decide one", () => {
-    const clusters = twoUnrelated();
-    const grouped = seedGroups(clusters, {
-      "ABC-1": "Inkwell backlog",
-      "ABC-9": "Inkwell backlog",
-    });
+  it("cannot on its own merge two clusters whose code areas and vocabulary disagree, because Linear informs a theme and does not decide one", () => {
+    const linear = { title: null, state: null, project: "Inkwell backlog", parentIdentifier: "ABC-0", parentTitle: null, url: null };
+    const grouped = seedGroups(twoUnrelated().map((one) => ({ ...one, linear })));
     expect(grouped).toHaveLength(2);
-  });
-
-  it("scores a perfect project match alone below the merge threshold, which is the arithmetic that makes the rule above true rather than a coincidence of this fixture", () => {
-    const alone = similarity(
-      { key: "a", repos: new Set(["x"]), vocab: new Set(["one"]), projects: new Set(["P"]) },
-      { key: "b", repos: new Set(["y"]), vocab: new Set(["two"]), projects: new Set(["P"]) },
-    );
-    expect(alone).toBeLessThan(MERGE_THRESHOLD);
-  });
-
-  it("still amplifies agreement the other terms already found, because a nudge that never changes anything is not a signal", () => {
-    const a = { key: "a", repos: new Set(["folio"]), vocab: new Set(["wishlist"]) };
-    const without = similarity(
-      { ...a, projects: new Set<string>() },
-      { key: "b", repos: new Set(["folio"]), vocab: new Set(["billing"]), projects: new Set<string>() },
-    );
-    const with_ = similarity(
-      { ...a, projects: new Set(["Wishlists"]) },
-      { key: "b", repos: new Set(["folio"]), vocab: new Set(["billing"]), projects: new Set(["Wishlists"]) },
-    );
-    expect(with_).toBeGreaterThan(without);
-  });
-
-  it("scores exactly as it did before the term existed when no project is known, so a board with no Linear key behaves precisely as today", () => {
-    const a = { key: "a", repos: new Set(["folio"]), vocab: new Set(["wishlist", "giftcard"]), projects: new Set<string>() };
-    const b = { key: "b", repos: new Set(["folio"]), vocab: new Set(["wishlist"]), projects: new Set<string>() };
-    expect(similarity(a, b)).toBeCloseTo(0.6 * 1 + 0.4 * 0.5, 10);
   });
 
   it("offers a Linear project as ONE naming candidate among the members' own words rather than installing it as the answer", () => {

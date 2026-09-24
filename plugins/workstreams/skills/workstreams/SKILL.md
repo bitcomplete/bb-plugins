@@ -174,7 +174,7 @@ state.
 | Mode | Keys set | What you get |
 | --- | --- | --- |
 | `basic` | neither | Clusters grouped by ticket (manual name, then Linear project, then the key). Summaries are the most recent PR title. |
-| `jev` | `typesafeApiKey` | Efforts, and the levels above them, with borrowed names. Jev selects each cluster's summary from its own PR titles and assigns each level's members to candidates that code seeded from shared repos, branch vocabulary and Linear projects. |
+| `jev` | `typesafeApiKey` | Efforts, and the levels above them, with borrowed names. Jev selects each cluster's summary from its own PR titles and assigns each level's members to candidates that code seeded from independent signals (see [Grouping signals](#grouping-signals)). |
 | `jev+claude` | both | As `jev`, and Claude rewrites each group's name as a written category name and returns its cohesion verdict. That is Claude's only job here. |
 
 An Anthropic key on its own changes nothing: efforts only exist once Jev has
@@ -196,12 +196,17 @@ separately: `bb plugin logs workstreams`.
   ticket → effort name) and the Board's row actions, each of which runs only
   from the confirm button of its own dialog. See [Row actions](#row-actions).
 - **A manual name always wins.** `group` beats any model assignment.
-- **Linear informs a theme; it never decides one.** A shared Linear project is
-  a weighted similarity term alongside shared repos and shared vocabulary, and
-  its contribution is capped at the agreement those two already found — it can
-  at most double a real signal, and doubling nothing is nothing. In naming, the
-  project name is one candidate among the members' own phrases. With no Linear
-  key configured, behaviour is exactly as it was before the term existed.
+- **No single signal groups anything.** Seeding compares independent
+  signals: code areas (where in the repo a branch changes files), branch and PR
+  vocabulary, and Linear (a shared parent issue or project).
+  Two clusters are seeded together only when at least two of them agree. The
+  repo is not a signal: in a monorepo every pair shares it. See
+  [Grouping signals](#grouping-signals).
+- **Linear informs a theme; it never decides one.** Linear is one of the seeding
+  signals, so on its own it cannot merge anything. In naming, the project name
+  is one candidate among the members' own phrases. With no Linear key the
+  Linear code path is inert: no request is made and nothing Linear-shaped
+  reaches a hash.
 - **Low confidence goes to Unsorted.** A cluster whose effort fit scores below
   `assignmentConfidenceThreshold` lands in `Unsorted` rather than being
   force-fitted into a confident-looking effort. Checkouts with no recognizable
@@ -369,6 +374,17 @@ by tier, warnings in full, and the last enrichment's model calls and tokens.
 Zoom bands span depth ranges and adapt to the depth the board actually
 collapsed to, so every band boundary reveals something. On a two-level board
 the thresholds are exactly what they were before the hierarchy existed.
+
+## Grouping signals
+
+- **Code area.** Each changed path maps to an area: container directories
+  (`src`, `packages`, `apps`, `services`, …) are stripped and the next two named
+  directories kept, so `packages/reader-web/src/shelves/Form.tsx` is
+  `reader-web/shelves`. Lockfiles and generated output are ignored. An area
+  touched by many clusters counts less, and one touched by more than a quarter
+  of them counts nothing.
+- **Vocabulary.** Words from branch slugs and PR titles.
+- **Linear.** A shared parent issue, or (weaker) a shared project.
 
 ## Linear details
 
