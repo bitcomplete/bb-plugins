@@ -3,7 +3,7 @@ than by the repository it happens to live in.
 
 ## What you get
 
-- A **Workstreams** page in the left sidebar: a read-only board of workstreams,
+- A **Workstreams** page in the left sidebar: a board of workstreams,
   each holding the ticket clusters under it, each cluster holding one card per
   checkout.
 - A colored status chip per cluster — blocked, ready, in review, drafting,

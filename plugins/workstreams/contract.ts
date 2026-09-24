@@ -59,6 +59,12 @@ export const prSchema = z
      * parse — and UNKNOWN is never read as ready to merge.
      */
     mergeStateStatus: mergeStateStatusSchema.default("UNKNOWN"),
+    /**
+     * Reviewers (logins, or org/team slugs) whose review is still requested,
+     * from the same `gh pr list` call. The nudge dialog lists them. Defaulted
+     * so a unit cached before the field existed still parses.
+     */
+    reviewRequests: z.array(z.string().max(140)).max(20).default([]),
   })
   .strict();
 export type Pr = z.infer<typeof prSchema>;
@@ -127,7 +133,63 @@ export type GroupLevel = z.infer<typeof groupLevelSchema>;
 /** Claude's coarse verdict on a grouping it was asked to name. */
 export const cohesionSchema = z.enum(["cohesive", "mixed"]);
 
+const writeResultSchema = z.discriminatedUnion("ok", [
+  z.object({ ok: z.literal(true), detail: z.string().max(500) }).strict(),
+  z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
+]);
+
+/** What the merge dialog re-reads live. Mirrors `LiveMergeFacts` in actions.ts. */
+export const liveMergeSchema = z
+  .object({
+    state: z.string().max(40),
+    isDraft: z.boolean(),
+    reviewDecision: z.string().max(40).nullable(),
+    mergeStateStatus: mergeStateStatusSchema,
+    headRefOid: z.string().max(64).nullable(),
+    stackedAbove: z.array(z.number().int()).max(50),
+    unresolvedThreads: z.number().int(),
+    unresolvedAtLeast: z.boolean(),
+  })
+  .strict();
+
+/**
+ * A direct GitHub write. The PR is named by its URL from the server's own
+ * scan; the host re-derives owner, repo and number from it and builds every
+ * command as an argv array.
+ */
+export const prWriteSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("merge"),
+      prUrl: z.string().max(500),
+      method: z.enum(["squash", "merge", "rebase"]),
+      sha: z.string().regex(/^[0-9a-f]{40}$/u),
+      deleteBranch: z.boolean(),
+    })
+    .strict(),
+  z.object({ kind: z.literal("update-branch"), prUrl: z.string().max(500) }).strict(),
+  z
+    .object({
+      kind: z.literal("nudge"),
+      prUrl: z.string().max(500),
+      reviewers: z.array(z.string().max(140)).max(20),
+      comment: z.string().max(4_000).nullable(),
+    })
+    .strict(),
+]);
+export type PrWrite = z.infer<typeof prWriteSchema>;
+
 export const hostContract = defineRpcContract({
+  /** Read-only: the facts the merge dialog shows, fetched live. */
+  prLive: {
+    input: z.object({ prUrl: z.string().max(500) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), live: liveMergeSchema }).strict(),
+      z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
+    ]),
+  },
+  /** The only GitHub writes. Each runs only after the user confirmed its dialog. */
+  prWrite: { input: prWriteSchema, output: writeResultSchema },
   scan: {
     input: z.object({ roots: z.array(z.string().max(1_000)).max(50) }).strict(),
     output: z

@@ -10,17 +10,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
   definePluginApp,
+  experimental_useAppPanel,
   useBbNavigate,
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { Board, BoardMode, Prefs, WireGroup, rpcContract } from "./server";
-import { groupChildren, type Lens, type Lifecycle } from "./workstreams";
+import type { Board, Prefs, WireGroup, rpcContract } from "./server";
+import { groupChildren, relativeTime, type Lens, type Lifecycle } from "./workstreams";
+import { HOW_TAB, HowThisWorks } from "./howto";
 import { EASE_CSS } from "./layout";
 import { MapView } from "./map";
 import { InboxBoard } from "./inbox";
 import { Icon } from "@/components/ui/icon";
-import { cn } from "@/lib/utils";
+import { Tip } from "@/components/ui/tooltip";
+import { toast } from "sonner";
+import { POINTER_CURSORS, cn } from "@/lib/utils";
 
 export type Group = WireGroup;
 export type Cluster = Group["clusters"][number];
@@ -46,24 +50,6 @@ export const LENS_LABEL: Record<Lens, string> = {
   active: "Active",
   waiting: "Waiting",
   done: "Done",
-};
-
-const MODE_LABEL: Record<BoardMode, { label: string; detail: string }> = {
-  basic: {
-    label: "Ticket grouping",
-    detail:
-      "Clusters are grouped by ticket. Summaries are the most recent pull request title. Every count and rollup is computed locally.",
-  },
-  jev: {
-    label: "Jev grouping",
-    detail:
-      "Jev picks each cluster's summary from its own pull request titles and groups clusters into efforts. Every word shown is one you wrote.",
-  },
-  "jev+claude": {
-    label: "Jev + Claude",
-    detail:
-      "Jev groups clusters and picks their summaries; Claude writes the effort names. Counts and rollups are computed locally.",
-  },
 };
 
 function useBoard() {
@@ -201,16 +187,18 @@ function Warnings({ warnings }: { warnings: string[] }) {
   if (lines.length === 0) return null;
   return (
     <div ref={rootRef} className="relative shrink-0">
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-label={`${lines.length} ${lines.length === 1 ? "notice" : "notices"} from the last scan`}
-        onClick={() => setOpen((current) => !current)}
-        className="flex h-7 items-center gap-1 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
-      >
-        <Icon name="AlertTriangle" className="size-3.5" />
-        {lines.length}
-      </button>
+      <Tip label={`Show ${lines.length} ${lines.length === 1 ? "notice" : "notices"} from the last scan`}>
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label={`Show ${lines.length} ${lines.length === 1 ? "notice" : "notices"} from the last scan`}
+          onClick={() => setOpen((current) => !current)}
+          className="flex h-7 items-center gap-1 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
+        >
+          <Icon name="AlertTriangle" className="size-3.5" />
+          {lines.length}
+        </button>
+      </Tip>
       {open ? (
         <div
           role="status"
@@ -297,7 +285,13 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   const { prefs, update } = usePrefs();
   const navigate = useBbNavigate();
   const view: ViewId = subPath.split("/")[0] === "board" ? "board" : "";
-  const mode = board === null ? null : MODE_LABEL[board.mode];
+  const now = useNow(30_000);
+  const panel = experimental_useAppPanel();
+  const openHow = useCallback(() => {
+    if (!panel.openFixedTab({ surface: { kind: "current" }, tab: HOW_TAB })) {
+      toast.error("Could not open How this works", { description: "Open BB's right panel and choose its How this works tab." });
+    }
+  }, [panel]);
   // The one selection both views share: a cluster focused on the Map is the
   // row the Board opens on, and the circle the Map flies back to.
   const [focusTicket, setFocusTicket] = useState<string | null>(null);
@@ -314,16 +308,18 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
 
   // `V` toggles the views from anywhere on the page. The Map's own keys are
   // + − 0 Esc Backspace and the arrows, and Tab stays focus navigation.
+  // `?` opens How this works from either view.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "v" && event.key !== "V") return;
+      if (event.key !== "v" && event.key !== "V" && event.key !== "?") return;
       if (event.metaKey || event.ctrlKey || event.altKey || isEditable(event.target)) return;
       event.preventDefault();
-      navigate.toPluginPanel("board", { subPath: view === "board" ? "" : "board" });
+      if (event.key === "?") openHow();
+      else navigate.toPluginPanel("board", { subPath: view === "board" ? "" : "board" });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [navigate, view]);
+  }, [navigate, openHow, view]);
 
   const render = (id: ViewId) =>
     id === "board" ? (
@@ -352,7 +348,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
     );
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col">
+    <div className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
       <header className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60 px-3">
         {/* Two views of one fetch, one keystroke apart. Quiet on purpose: the
             map is the surface, and this is only the way to the other view. */}
@@ -376,36 +372,44 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
             </button>
           ))}
         </div>
-        <p className="truncate text-[11px] text-muted-foreground">
-          {board === null
-            ? "Loading…"
-            : board.lastScanAt === null
-              ? "Never scanned"
-              : `Scanned ${new Date(board.lastScanAt).toLocaleString()}`}
-          {/* Factual, not a scold: every mode is a usable board. */}
-          {mode === null ? null : (
-            <span className="cursor-help" title={mode.detail}>
-              {" "}
-              · {mode.label}
-            </span>
-          )}
-        </p>
+        {board === null ? (
+          <p className="truncate text-[11px] text-muted-foreground">Loading…</p>
+        ) : (
+          <Tip label={board.lastScanAt === null ? "No scan has finished yet" : `Last scan: ${new Date(board.lastScanAt).toLocaleString()}`}>
+            <p tabIndex={0} className="truncate text-[11px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              {board.lastScanAt === null ? "Never scanned" : `scanned ${relativeTime(board.lastScanAt, now)}`}
+            </p>
+          </Tip>
+        )}
         <span className="flex-1" />
+        <Tip label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}>
+          <button
+            type="button"
+            disabled={board?.scanning === true}
+            aria-label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}
+            onClick={() => {
+              rpc.call("board_refresh").then(refetch, refetch);
+            }}
+            className="flex h-7 items-center gap-1.5 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-60"
+          >
+            <Icon
+              name={board?.scanning === true ? "Loading" : "ArrowReloadHorizontal"}
+              className={cn("size-3.5", board?.scanning === true && "animate-spin")}
+            />
+            {board?.scanning === true ? "Scanning…" : "Rescan"}
+          </button>
+        </Tip>
         {board === null ? null : <Warnings warnings={board.warnings} />}
-        <button
-          type="button"
-          disabled={board?.scanning === true}
-          onClick={() => {
-            rpc.call("board_refresh").then(refetch, refetch);
-          }}
-          className="flex h-7 items-center gap-1.5 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-60"
-        >
-          <Icon
-            name={board?.scanning === true ? "Loading" : "ArrowReloadHorizontal"}
-            className={cn("size-3.5", board?.scanning === true && "animate-spin")}
-          />
-          {board?.scanning === true ? "Scanning…" : "Rescan"}
-        </button>
+        <Tip label="How this works (?)">
+          <button
+            type="button"
+            aria-label="How this works (?)"
+            onClick={openHow}
+            className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <Icon name="Info" className="size-4" />
+          </button>
+        </Tip>
       </header>
 
       {error === null ? null : (
@@ -427,6 +431,27 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   );
 }
 
+/** A clock that ticks every `ms`, for relative times that must not go stale on screen. */
+function useNow(ms: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), ms);
+    return () => window.clearInterval(timer);
+  }, [ms]);
+  return now;
+}
+
+/** The How this works fixed tab: its own board read, so it stays current while open. */
+function HowThisWorksTab() {
+  const { board } = useBoard();
+  const now = useNow(30_000);
+  return (
+    <div className={POINTER_CURSORS}>
+      <HowThisWorks board={board} now={now} />
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "board",
@@ -434,5 +459,6 @@ export default definePluginApp((app) => {
     icon: "Columns2",
     path: "board",
     component: WorkstreamsPage,
+    fixedTabs: [{ ...HOW_TAB, title: "How this works", icon: "Info", component: HowThisWorksTab, layout: "padded" }],
   });
 });

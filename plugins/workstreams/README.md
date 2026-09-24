@@ -1,6 +1,6 @@
 # bb-plugin-workstreams
 
-A read-only BB board that groups your git checkouts by the ticket they belong
+A BB board that groups your git checkouts by the ticket they belong
 to, three levels deep: workstream → ticket cluster → unit (one checkout).
 
 - `host.ts` — the per-machine scanner: walks each scan root, reads every

@@ -3,6 +3,7 @@
 // tool's JSON and every rule in workstreams.ts: parse defensively here, and
 // pass typed values inward.
 import { MERGE_STATE_STATUSES, type MergeStateStatus, type Pr } from "./contract.js";
+import { parseReviewRequests } from "./ghactions.js";
 
 const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
 
@@ -115,6 +116,7 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
         ? view.headRefName.slice(0, 300)
         : null,
     latestReviewStates: latestReviewStates(view.latestReviews),
+    reviewRequests: parseReviewRequests(view.reviewRequests),
     mergedAt:
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)

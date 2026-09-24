@@ -1855,6 +1855,18 @@ export function ageLabel(age: StateAge, now: number): string {
   return age.basis === "state" ? text : `last commit ${text}`;
 }
 
+/**
+ * "scanned 3m ago" for the header: under a minute is "just now", then the
+ * same whole units as `compactAge`. An unreadable time says so rather than
+ * inventing one; a time in the future (clock skew) reads as just now.
+ */
+export function relativeTime(iso: string | null, now: number): string {
+  if (iso === null) return "never";
+  const at = Date.parse(iso);
+  if (Number.isNaN(at)) return "unknown";
+  return now - at < 60_000 ? "just now" : `${compactAge(at, now)} ago`;
+}
+
 // ---- rows and ordering -----------------------------------------------------
 
 /** What ordering and search read about a row. */

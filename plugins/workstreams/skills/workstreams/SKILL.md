@@ -191,14 +191,10 @@ separately: `bb plugin logs workstreams`.
 - **Code owns every number.** Counts, sorting, rollup sentences, lifecycle
   derivation, stack order, and the confidence cut are all deterministic. Models
   only select, assign, and name. The board and `list` can never disagree.
-- **Read-only toward git and GitHub.** The plugin never runs a git mutation
-  and never touches a pull request. It writes in two places: `group` and
-  `ungroup` write one key-value map of ticket → effort name, and the Board's
-  **Start a thread** action spawns a BB thread — only after the user confirms
-  an editable prompt. That thread runs in the checkout itself, uses the
-  project's default provider and model, and carries this plugin's thread
-  metadata `{ ticket }`, which links it to its cluster as `started` (the
-  strongest thread tier, above `environment`, `ticket` and `paths`).
+- **Every write asks first.** Scans never run a git mutation or touch a pull
+  request. The only writes are `group` / `ungroup` (one key-value map of
+  ticket → effort name) and the Board's row actions, each of which runs only
+  from the confirm button of its own dialog. See [Row actions](#row-actions).
 - **A manual name always wins.** `group` beats any model assignment.
 - **Linear informs a theme; it never decides one.** A shared Linear project is
   a weighted similarity term alongside shared repos and shared vocabulary, and
@@ -239,6 +235,80 @@ Configure with `bb plugin config workstreams set <key> <value>`:
 | `anthropicApiKey` | Secret, optional. Turns on written group names and cohesion verdicts. |
 | `surfaceRules` | Multiline. `name: glob, glob, …` per line. A table that fails to parse falls back to the default. |
 | `assignmentConfidenceThreshold` | 0–1, default 0.6. Applies at every grouping level. |
+| `mergeMethod` | `squash` (default), `merge` or `rebase`: how the Board's Merge action merges. |
+| `deleteBranchOnMerge` | Default `true`. Always skipped when another open PR is based on the branch. |
+
+## Row actions
+
+Each Board row offers the action its verb calls for, on its action button, in
+its `⋯` menu, and on the `a` key. Every row also offers **Go to thread** (`t`)
+and **Start a new thread** (`n`). Opening a dialog never writes; the write runs
+only from the dialog's confirm button.
+
+| Row | Action | Kind |
+| --- | --- | --- |
+| Fix · CI failing | Investigate CI | Agent |
+| Fix · Resolve conflicts | Resolve conflicts | Agent |
+| Respond · Changes requested | Address review and reply | Agent |
+| Respond · Approved, comments open | Address comments and reply (never merges) | Agent |
+| Merge · Ready to merge | Merge | Direct |
+| Merge · Update branch | Update branch | Direct |
+| Waiting · In review | Nudge reviewers | Direct |
+| Waiting · Behind #NN | Jump to the blocking row | Navigation |
+
+### Direct actions (the host runs `gh`; no agent)
+
+Safeguards common to all three:
+
+- Every command is an argv array passed to `execFile`, never a shell string,
+  and names the repo with `--repo`, so `gh` never touches the local checkout.
+- The client sends only the row's checkout path. The server resolves the
+  repo, PR number and pending reviewers from its own last scan.
+- Comment bodies reach `gh` on stdin (`--body-file -`), never as a flag value.
+  Reviewer logins are validated before they become `--add-reviewer` values.
+
+**Merge.** Opening the dialog re-reads the PR live: state, draft, review
+decision, `mergeStateStatus`, head commit, any open PR based on its head
+branch, and the count of unresolved review threads. The dialog refuses, with
+the reason, unless the PR is open, not a draft, `APPROVED`, and `CLEAN`,
+`HAS_HOOKS` or `UNSTABLE` (`UNSTABLE` shows a warning). Unresolved review
+threads need an explicit **Merge anyway** tick. The server re-reads and
+re-checks all of this again before it writes, then runs
+`gh pr merge <n> --<mergeMethod> --match-head-commit <sha shown>`, so GitHub
+refuses if anything was pushed after the dialog opened. `--delete-branch` is
+added only when `deleteBranchOnMerge` is on and no open PR is stacked on the
+branch. A successful merge triggers a rescan.
+
+**Update branch.** `gh pr update-branch <n>` after a confirm; the local
+checkout is not touched. A rescan follows.
+
+**Nudge reviewers.** Two independent choices: re-request review from the
+reviewers GitHub still lists as pending (`reviewRequests`, read by the scan's
+existing `gh pr list` call), and post an editable comment prefilled as
+`PTAL - @reviewer: repo #PR (title) has been waiting 3d.` With no pending
+reviewers, only the comment is offered, and the dialog says so.
+
+### Agent actions (a BB thread does the work)
+
+The dialog reads the row's linked threads live (status and context-window use)
+and preselects where the work runs, with its reason in one line. The user can
+pick any mode and thread, and edits the prompt, before anything runs.
+
+- **Investigate CI and Resolve conflicts** are repairs: a **subthread** of the
+  most relevant linked thread of any tier (strongest tier, then most recently
+  updated, then id), which leaves the parent's context untouched and tells the
+  parent when it finishes. A **new** thread only when nothing is linked.
+- **Address review and Address comments** want the thread that wrote the PR (a
+  `started` or `environment` link). Idle → **continue** in it (the message is
+  queued, never steered into a running turn). Running, or more than 70% of its
+  context used → a **subthread** of it. Only weak links (`ticket`, `paths`) or
+  none → a **new** thread, because weak links often point at large, unrelated
+  threads.
+- If BB will not add a child to a thread, the recommendation falls back to a
+  new thread and says why.
+- **Continue** and **Subthread** only accept a thread linked to that row. New
+  and sub threads run in the checkout and carry this plugin's thread metadata
+  `{ ticket }`, which links them to the cluster as `started`.
 
 ## Views
 
@@ -255,8 +325,13 @@ shown as "Behind #NN"), then, collapsed, **In flight**, **Recently shipped**
 section the row that has been in its state longest comes first. The age is
 measured from the scan that saw the checkout enter its state. Until one has,
 the row shows its last-commit age and labels it "last commit". Keys: `j`/`k`,
-`Enter` (PR), `t` (newest thread), `m` (Map), `o` (open the checkout), `n`
-(start a thread), `/` (search), `?` (all keys).
+`Enter` (PR), `a` (the row's action, which asks first), `t` (newest thread),
+`m` (Map), `o` (open the checkout), `n` (start a thread), `/` (search).
+
+The header's ⓘ, or `?` in either view, opens **How this works** in BB's right
+panel. It explains grouping, the states, both views' keys and the Map's marks,
+and it shows health: the last scan, the refresh interval, thread-link coverage
+by tier, warnings in full, and the last enrichment's model calls and tokens.
 
 Zoom bands span depth ranges and adapt to the depth the board actually
 collapsed to, so every band boundary reveals something. On a two-level board

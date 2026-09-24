@@ -72,6 +72,8 @@ import {
 import { Icon } from "@/components/ui/icon";
 import { usePointerCoarse } from "@/components/ui/hooks/use-pointer-coarse";
 import { cn } from "@/lib/utils";
+import { ThreadMenu } from "./threadmenu";
+import { Tip } from "@/components/ui/tooltip";
 import {
   LENS_LABEL,
   Notice,
@@ -290,8 +292,6 @@ type Facts = {
 const CAPTION = { size: 11, weight: 500, line: 14, gap: 3, chars: 26 } as const;
 /** Linked threads listed at a fly-in destination before "+N more". */
 const THREAD_LIST_MAX = 4;
-/** Linked threads a thread mark's popover lists before "+N more". */
-const DOOR_LIST_MAX = 5;
 /** The rose count a group's rim pill carries: its dot, gap and digits. */
 function heatWidth(count: number): number {
   return count === 0 ? 0 : 6 + 4 + String(count).length * 7 + 6;
@@ -739,9 +739,13 @@ const DOOR_PX = { fine: 24, coarse: 40 } as const;
 type Door = {
   /** Hit target in screen pixels. */
   hit: number;
-  label: string;
-  onOpen: () => void;
-  /** Hover or focus: show the thread popover, or hide it. */
+  /** Most recent first. */
+  threads: readonly ThreadLink[];
+  ticket: string;
+  onOpenThread: (id: string) => void;
+  /** "+N more": fly into the leaf, whose own list names them all. */
+  onMore: () => void;
+  /** Hover or focus: the leaf `T` opens the newest thread of. */
   onShow: (shown: boolean) => void;
 };
 
@@ -781,24 +785,28 @@ function ThreadMark({ r, active, door }: { r: number; active: boolean; door?: Do
     );
   }
   return (
-    <button
-      type="button"
-      data-thread-mark
-      aria-label={door.label}
-      className="absolute left-0 top-0 flex origin-top-left cursor-pointer items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    <ThreadMenu
+      threads={door.threads}
+      onOpenThread={door.onOpenThread}
+      onMore={door.onMore}
+      onHoverChange={door.onShow}
+      data={{ "data-thread-mark": "" }}
+      heading={
+        <>
+          {door.threads.length === 1 ? "1 thread" : `${door.threads.length} threads`}
+          <span className="ml-1.5 font-mono font-medium">{door.ticket}</span>
+        </>
+      }
+      footer={
+        <>
+          <kbd className="font-mono">T</kbd> opens the newest
+        </>
+      }
+      className="absolute left-0 top-0 flex origin-top-left items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
       style={{ transform: rimMark(r, 1, -1), width: door.hit, height: door.hit }}
-      onClick={(event) => {
-        // The circle's own click is a fly-to; this one is not.
-        event.stopPropagation();
-        door.onOpen();
-      }}
-      onPointerEnter={() => door.onShow(true)}
-      onPointerLeave={() => door.onShow(false)}
-      onFocus={() => door.onShow(true)}
-      onBlur={() => door.onShow(false)}
     >
       {dot}
-    </button>
+    </ThreadMenu>
   );
 }
 
@@ -810,8 +818,12 @@ function ThreadMark({ r, active, door }: { r: number; active: boolean; door?: Do
  */
 function StuckMark({ r }: { r: number }) {
   return (
-    <span aria-hidden className="pointer-events-none absolute left-0 top-0 flex origin-top-left" style={{ transform: rimMark(r, -1, 1) }}>
-      <StuckGlyph />
+    <span className="pointer-events-none absolute left-0 top-0 flex origin-top-left" style={{ transform: rimMark(r, -1, 1) }}>
+      <Tip label="Stuck: expected to move, untouched for a month or more">
+        <span role="img" aria-label="Stuck: expected to move, untouched for a month or more" className="pointer-events-auto flex">
+          <StuckGlyph />
+        </span>
+      </Tip>
     </span>
   );
 }
@@ -861,6 +873,8 @@ const CircleView = memo(function CircleView({
   doorPx,
   onDoor,
   onDoorShown,
+  onOpenThread,
+  byRecency,
 }: {
   circle: MapCircle;
   facts: Facts;
@@ -870,6 +884,8 @@ const CircleView = memo(function CircleView({
   doorPx: number;
   onDoor: (key: string) => void;
   onDoorShown: (key: string, shown: boolean) => void;
+  onOpenThread: (id: string) => void;
+  byRecency: (threads: readonly ThreadLink[]) => ThreadLink[];
 }) {
   const leaf = circle.data.kind === "cluster";
   const size = circle.r * 2;
@@ -933,11 +949,10 @@ const CircleView = memo(function CircleView({
           active={threads.some((thread) => thread.active)}
           door={{
             hit: doorPx,
-            label:
-              threads.length === 1
-                ? `Open thread: ${threads[0]!.title}`
-                : `${threads.length} threads work here. Fly in to list them`,
-            onOpen: () => onDoor(circle.key),
+            threads: byRecency(threads),
+            ticket: circle.data.kind === "cluster" ? circle.data.cluster.ticket : "",
+            onOpenThread,
+            onMore: () => onDoor(circle.key),
             onShow: (shown) => onDoorShown(circle.key, shown),
           }}
         />
@@ -1419,15 +1434,17 @@ function Overflow({
   }, [open]);
   return (
     <div ref={rootRef} className="relative">
-      <button
-        type="button"
-        aria-label="More map options"
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-        className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
-      >
-        <Icon name="MoreHorizontal" className="size-4" />
-      </button>
+      <Tip label="More map options">
+        <button
+          type="button"
+          aria-label="More map options"
+          aria-expanded={open}
+          onClick={() => setOpen((current) => !current)}
+          className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
+        >
+          <Icon name="MoreHorizontal" className="size-4" />
+        </button>
+      </Tip>
       {open ? (
         <div
           role="menu"
@@ -1478,12 +1495,8 @@ function Swatch({ ring, fill, px = 1.25 }: { ring: string; fill?: string; px?: n
   );
 }
 
-function Legend({ face }: { face: Face }) {
+function Legend() {
   const item = "flex items-center gap-1.5";
-  const [hovered, setHovered] = useState(false);
-  const [focused, setFocused] = useState(false);
-  const open = hovered || focused;
-  const buttonRef = useRef<HTMLButtonElement | null>(null);
   return (
     <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
       <span className={item}>
@@ -1507,76 +1520,6 @@ function Legend({ face }: { face: Face }) {
         </span>
         Needs you
       </span>
-      <div
-        className="relative"
-        onPointerEnter={() => setHovered(true)}
-        onPointerLeave={() => setHovered(false)}
-      >
-        <button
-          ref={buttonRef}
-          type="button"
-          aria-label="More of the key"
-          aria-expanded={open}
-          aria-controls="ws-legend-more"
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") buttonRef.current?.blur();
-          }}
-          className={cn(
-            "flex size-5 items-center justify-center rounded-full border font-mono text-[10.5px] font-medium outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring",
-            open ? "border-foreground/40 text-foreground" : "border-border text-muted-foreground",
-          )}
-        >
-          ?
-        </button>
-        <div
-          id="ws-legend-more"
-          role="group"
-          aria-label="Map marks"
-          hidden={!open}
-          className="absolute bottom-full right-0 mb-2 w-64 rounded-xl border border-border bg-popover p-2.5 text-popover-foreground shadow-md"
-        >
-          <ul className="flex flex-col gap-2 text-[11.5px]">
-            <li className="flex items-start gap-2">
-              <span className="mt-px flex size-4 shrink-0 items-center justify-center">
-                <StuckGlyph />
-              </span>
-              <span>
-                <span className="font-medium">Stuck</span>
-                <span className="block text-[11px] text-muted-foreground">
-                  In progress or waiting, with no commits in a month or more.
-                </span>
-              </span>
-            </li>
-            {face === "theme" ? (
-              <li className="flex items-start gap-2">
-                <span className="mt-px flex size-4 shrink-0 items-center justify-center">
-                  <span className="size-2.5 rounded-full border border-dashed border-foreground/60" />
-                </span>
-                <span>
-                  <span className="font-medium">Mixed grouping</span>
-                  <span className="block text-[11px] text-muted-foreground">
-                    Claude thought what is inside looked unrelated.
-                  </span>
-                </span>
-              </li>
-            ) : null}
-            <li className="flex items-start gap-2">
-              <span className="mt-px flex size-4 shrink-0 items-center justify-center">
-                <span className="size-[7px] rounded-full bg-foreground/60" />
-              </span>
-              <span>
-                <span className="font-medium">Agent thread</span>
-                <span className="block text-[11px] text-muted-foreground">
-                  A BB thread works here; it pulses while running. Click it to open the thread, or press{" "}
-                  <kbd className="font-mono">T</kbd> on a focused cluster.
-                </span>
-              </span>
-            </li>
-          </ul>
-        </div>
-      </div>
     </div>
   );
 }
@@ -1586,21 +1529,22 @@ function FaceToggle({ face, onTurn }: { face: Face; onTurn: (face: Face) => void
   return (
     <div role="group" aria-label="Map face" className="flex items-center">
       {FACES.map((entry) => (
-        <button
-          key={entry}
-          type="button"
-          aria-pressed={face === entry}
-          title={`${FACE_LABEL[entry]} face ([ and ] turn the map)`}
-          onClick={() => onTurn(entry)}
-          className={cn(
-            "rounded-full px-2.5 py-1 text-[11.5px] transition-colors duration-150",
-            face === entry
-              ? "bg-foreground/[0.08] font-medium text-foreground"
-              : "text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {FACE_LABEL[entry]}
-        </button>
+        <Tip key={entry} label={`Show the ${FACE_LABEL[entry]} face ([ and ] turn the map)`}>
+          <button
+            type="button"
+            aria-pressed={face === entry}
+            aria-label={`Show the ${FACE_LABEL[entry]} face ([ and ] turn the map)`}
+            onClick={() => onTurn(entry)}
+            className={cn(
+              "rounded-full px-2.5 py-1 text-[11.5px] transition-colors duration-150",
+              face === entry
+                ? "bg-foreground/[0.08] font-medium text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {FACE_LABEL[entry]}
+          </button>
+        </Tip>
       ))}
     </div>
   );
@@ -1935,7 +1879,6 @@ export function MapView({
   const [door, setDoor] = useState<string | null>(null);
   const doorRef = useRef<string | null>(null);
   doorRef.current = door;
-  const doorTipRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const planeRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -2046,16 +1989,6 @@ export function MapView({
 
   const placeTip = useCallback(() => {
     const view = viewRef.current;
-    // The thread popover hangs off the mark's rim point, kept on screen.
-    const doorTip = doorTipRef.current;
-    const doorCircle = doorRef.current === null ? undefined : layout.index.get(doorRef.current);
-    if (doorTip !== null && doorCircle !== undefined) {
-      const x = view.x + (doorCircle.x + doorCircle.r * Math.SQRT1_2) * view.scale;
-      const y = view.y + (doorCircle.y - doorCircle.r * Math.SQRT1_2) * view.scale;
-      const left = clamp(x + 12, 8, sizeRef.current.width - doorTip.offsetWidth - 8);
-      const top = Math.max(y - 12 - doorTip.offsetHeight, 8);
-      doorTip.style.transform = `translate(${left}px, ${top}px)`;
-    }
     const tip = tipRef.current;
     const key = hoverRef.current;
     if (tip === null) return;
@@ -2721,25 +2654,11 @@ export function MapView({
     [layout, scene, turning],
   );
   const mountedSet = useMemo(() => new Set(scene.keys), [scene]);
-  /**
-   * The thread mark's click: one thread opens directly; several fly to the
-   * leaf, whose own list already names them all.
-   */
-  const onDoor = useCallback(
-    (key: string) => {
-      const circle = layout.index.get(key);
-      if (circle?.data.kind !== "cluster") return;
-      const threads = circle.data.cluster.threads;
-      if (threads.length === 1) openThread(threads[0]!.id);
-      else if (threads.length > 1) flyToKey(key);
-    },
-    [flyToKey, layout, openThread],
-  );
+  /** The thread menu's "+N more": fly to the leaf, whose own list names them all. */
+  const onDoor = useCallback((key: string) => flyToKey(key), [flyToKey]);
   const onDoorShown = useCallback((key: string, shown: boolean) => {
     setDoor((current) => (shown ? key : current === key ? null : current));
   }, []);
-  const doorCircle = door === null ? undefined : layout.index.get(door);
-  const doorThreads = doorCircle?.data.kind === "cluster" ? byRecency(doorCircle.data.cluster.threads) : [];
   const hoverCircle = hover === null ? undefined : layout.index.get(hover);
   const hoverFacts = hover === null ? undefined : facts.get(hover);
   const hoverCode = hover === null ? undefined : scene.codes.get(hover);
@@ -2811,6 +2730,8 @@ export function MapView({
               doorPx={doorPx}
               onDoor={onDoor}
               onDoorShown={onDoorShown}
+              onOpenThread={openThread}
+              byRecency={byRecency}
             />
           ))}
           {turning === null ? <EdgeLayer edges={edges} layerRef={edgeRef} /> : null}
@@ -2896,44 +2817,6 @@ export function MapView({
           )}
         </div>
 
-        {/* The thread mark's popover: which threads, whether each is running,
-            and why it was linked. Informational; the mark itself is the door. */}
-        {doorCircle === undefined || doorThreads.length === 0 ? null : (
-          <div
-            ref={doorTipRef}
-            aria-hidden
-            className="pointer-events-none absolute left-0 top-0 w-72 rounded-lg border border-border bg-popover px-2.5 py-2 text-popover-foreground shadow-sm"
-          >
-            <p className="mb-1 text-[11px] font-semibold text-muted-foreground">
-              {doorThreads.length === 1 ? "1 thread" : `${doorThreads.length} threads`}
-              {doorCircle.data.kind === "cluster" ? (
-                <span className="ml-1.5 font-mono font-medium">{doorCircle.data.cluster.ticket}</span>
-              ) : null}
-            </p>
-            <ul className="flex flex-col gap-1">
-              {doorThreads.slice(0, DOOR_LIST_MAX).map((thread) => (
-                <li key={thread.id} className="flex min-w-0 items-center gap-2 text-[11.5px]">
-                  <span
-                    aria-hidden
-                    className={cn("size-[7px] shrink-0 rounded-full", thread.active ? "bg-foreground" : "bg-foreground/40")}
-                  />
-                  <span className="min-w-0 flex-1 truncate">{thread.title}</span>
-                  <span className="shrink-0 text-[10.5px] text-muted-foreground">
-                    {thread.active ? "running" : "idle"} · {TIER_LABEL[thread.tier]}
-                  </span>
-                </li>
-              ))}
-              {doorThreads.length > DOOR_LIST_MAX ? (
-                <li className="pl-[15px] text-[11px] text-muted-foreground">+{doorThreads.length - DOOR_LIST_MAX} more</li>
-              ) : null}
-            </ul>
-            <p className="mt-1.5 border-t border-border/70 pt-1.5 text-[11px] text-muted-foreground">
-              {doorThreads.length === 1 ? "Click to open it" : "Click to fly in and see them all"} ·{" "}
-              <kbd className="font-mono">T</kbd> opens the newest
-            </p>
-          </div>
-        )}
-
         {layout.roots.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center p-6">
             <Notice>
@@ -2948,15 +2831,16 @@ export function MapView({
         data-hud
         className="absolute bottom-3 left-3 flex items-center gap-0.5 rounded-full border border-border/70 bg-background/90 p-0.5 shadow-sm"
       >
-        <button
-          type="button"
-          aria-label="Fit everything (Esc)"
-          title="Fit everything (Esc)"
-          onClick={() => fitAll()}
-          className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
-        >
-          <Icon name="Target" className="size-4" />
-        </button>
+        <Tip label="Fit everything (Esc)">
+          <button
+            type="button"
+            aria-label="Fit everything (Esc)"
+            onClick={() => fitAll()}
+            className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <Icon name="Target" className="size-4" />
+          </button>
+        </Tip>
         <span aria-hidden className="mx-0.5 h-4 w-px bg-border" />
         <FaceToggle face={face} onTurn={turnTo} />
         <span aria-hidden className="mx-0.5 h-4 w-px bg-border" />
@@ -2974,7 +2858,7 @@ export function MapView({
         />
       </div>
       <div data-hud className="absolute bottom-4 right-4">
-        <Legend face={face} />
+        <Legend />
       </div>
     </div>
   );

@@ -12,6 +12,7 @@ import {
   inboxSection,
   inboxVerb,
   matchesInboxQuery,
+  relativeTime,
   stateAge,
   threadPrompt,
   trackTransitions,
@@ -350,5 +351,27 @@ describe("threadPrompt", () => {
     expect(threadPrompt("waiting", { ...facts, prNumber: null, title: null, branch: null })).toBe(
       "Pick up folio (no pull request), no branch checked out, checkout /p/folio-abc-101.",
     );
+  });
+});
+
+describe("relativeTime", () => {
+  const at = (ms: number) => new Date(NOW - ms).toISOString();
+  it("reads under a minute, and a future time from clock skew, as just now", () => {
+    expect(relativeTime(at(0), NOW)).toBe("just now");
+    expect(relativeTime(at(59_999), NOW)).toBe("just now");
+    expect(relativeTime(at(-5_000), NOW)).toBe("just now");
+  });
+
+  it("switches units at the minute, hour and day boundaries", () => {
+    expect(relativeTime(at(60_000), NOW)).toBe("1m ago");
+    expect(relativeTime(at(59 * 60_000), NOW)).toBe("59m ago");
+    expect(relativeTime(at(60 * 60_000), NOW)).toBe("1h ago");
+    expect(relativeTime(at(DAY_MS - 1), NOW)).toBe("23h ago");
+    expect(relativeTime(at(DAY_MS), NOW)).toBe("1d ago");
+  });
+
+  it("says never or unknown rather than inventing a time", () => {
+    expect(relativeTime(null, NOW)).toBe("never");
+    expect(relativeTime("yesterday-ish", NOW)).toBe("unknown");
   });
 });

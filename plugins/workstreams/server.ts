@@ -1,9 +1,10 @@
 // bb-plugin-workstreams — backend entry.
 //
-// Read-only board over the git checkouts under one or more scan roots. The
+// A board over the git checkouts under one or more scan roots. The
 // host entry (host.ts) does the per-machine scanning; this module owns
 // settings, caching, Linear enrichment, grouping, the RPC the board reads,
-// and the one write surface in v1: `bb workstreams group`.
+// and its write surfaces: `bb workstreams group` and the Board's confirm-first
+// row actions (see actions.ts).
 import {
   PluginCliError,
   cliCommand,
@@ -14,6 +15,7 @@ import {
 import { z } from "zod";
 import {
   hostContract,
+  liveMergeSchema,
   rawUnitSchema,
   type GroupLevel,
   type GroupNaming,
@@ -77,6 +79,10 @@ import {
   startedForOf,
 } from "./threads.js";
 import { startThread } from "./spawn.js";
+import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type MergeMethod } from "./actions.js";
+import { planAgent, runAgent, type AgentSdk } from "./agent.js";
+import { executeMerge } from "./direct.js";
+import { prTarget } from "./ghactions.js";
 import { trackTransitions, toLifecycle, unitLifecycle, type Transition } from "./workstreams.js";
 import { TypeSafeClient, choice, score } from "@typesafe-ai/sdk";
 
@@ -157,6 +163,15 @@ const groupSchema = z.object({
 });
 /** Which model keys are in play. Reported so the board never lies about it. */
 const modeSchema = z.enum(["basic", "jev", "jev+claude"]);
+/** The last enrichment's model use, so model cost is visible on the board. */
+const enrichmentSchema = z.object({
+  mode: modeSchema,
+  calls: z.number(),
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  at: z.string(),
+});
+
 const boardSchema = z.object({
   groups: z.array(groupSchema),
   /** How many grouping levels survived the collapse: 1, 2 or 3. */
@@ -184,6 +199,8 @@ const boardSchema = z.object({
     }),
     clustersWithThread: z.number(),
   }),
+  /** For the How-this-works panel: how often the board refreshes, and what the last enrichment cost. */
+  health: z.object({ refreshMinutes: z.number(), enrichment: enrichmentSchema.nullable() }),
 });
 
 /** What the lens control remembers across a reload. */
@@ -199,8 +216,82 @@ const prefsSchema = z.object({
   showClones: z.boolean().default(false),
 });
 
+const pathInput = z.object({ path: z.string().max(1_000) }).strict();
+const writeResult = z.discriminatedUnion("ok", [
+  z.object({ ok: z.literal(true), detail: z.string() }),
+  z.object({ ok: z.literal(false), error: z.string() }),
+]);
+const threadModeSchema = z.enum(["continue", "subthread", "new"]);
+
 export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
+  /** Read-only: re-read the PR live for the merge dialog. */
+  action_merge_preview: {
+    input: pathInput,
+    output: z.discriminatedUnion("ok", [
+      z.object({
+        ok: z.literal(true),
+        live: liveMergeSchema,
+        refusals: z.array(z.string()),
+        warnings: z.array(z.string()),
+        method: z.enum(MERGE_METHODS),
+        deleteBranch: z.boolean(),
+      }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Merge, pinned to the head sha the dialog showed. Re-checked server-side first. */
+  action_merge: {
+    input: z
+      .object({ path: z.string().max(1_000), sha: z.string().regex(/^[0-9a-f]{40}$/u), acknowledgeUnresolved: z.boolean() })
+      .strict(),
+    output: writeResult,
+  },
+  action_update_branch: { input: pathInput, output: writeResult },
+  /** Re-request the scan's pending reviewers and/or post a comment (sent to gh on stdin). */
+  action_nudge: {
+    input: z
+      .object({ path: z.string().max(1_000), rerequest: z.boolean(), comment: z.string().max(4_000).nullable() })
+      .strict(),
+    output: writeResult,
+  },
+  /** Read-only: the row's linked threads, live, and where the agent action should run. */
+  agent_plan: {
+    input: z.object({ path: z.string().max(1_000), action: z.enum(AGENT_ACTIONS) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({
+        ok: z.literal(true),
+        candidates: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            tier: z.enum(THREAD_TIERS),
+            running: z.boolean(),
+            contextUsed: z.number().nullable(),
+            canSpawnChild: z.boolean(),
+          }),
+        ),
+        recommendation: z.object({ mode: threadModeSchema, threadId: z.string().nullable(), reason: z.string() }),
+        capabilities: z.object({ send: z.boolean(), subthread: z.boolean(), contextUsage: z.boolean() }),
+      }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Run an agent action: continue in, branch from, or start a thread. */
+  agent_run: {
+    input: z
+      .object({
+        path: z.string().max(1_000),
+        mode: threadModeSchema,
+        threadId: z.string().max(200).nullable(),
+        prompt: z.string().max(8_000),
+      })
+      .strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), threadId: z.string(), ticket: z.string() }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
   board_refresh: {
     input: z.null(),
     output: z.object({ started: z.boolean() }),
@@ -224,6 +315,10 @@ export type Board = z.infer<typeof boardSchema>;
 export type BoardMode = z.infer<typeof modeSchema>;
 export type Prefs = z.infer<typeof prefsSchema>;
 export type WireGroup = z.infer<typeof groupSchema>;
+
+function mergeMethodOf(value: string): MergeMethod {
+  return (MERGE_METHODS as readonly string[]).includes(value) ? (value as MergeMethod) : "squash";
+}
 
 const DEFAULT_PREFS: Prefs = {
   lens: "all",
@@ -285,6 +380,20 @@ export default async function plugin(bb: BbPluginApi) {
         "One line per surface: `name: glob, glob, ...`, matched against the paths a branch changes. Risk is derived from the surfaces present (auth, payments and migrations are high; docs and tests are low). A table that cannot be parsed is ignored in favour of the default, with a warning on the board.",
       experimental_multiline: true,
       default: DEFAULT_SURFACE_RULES,
+    },
+    mergeMethod: {
+      type: "select",
+      label: "Merge method",
+      description: "How the Board's Merge action merges a pull request.",
+      options: [...MERGE_METHODS],
+      default: "squash",
+    },
+    deleteBranchOnMerge: {
+      type: "boolean",
+      label: "Delete branch on merge",
+      description:
+        "Delete the head branch after the Board merges a pull request. Always skipped when another open pull request is based on that branch.",
+      default: true,
     },
     assignmentConfidenceThreshold: {
       type: "number",
@@ -979,10 +1088,14 @@ export default async function plugin(bb: BbPluginApi) {
         ...warnings,
       ].slice(0, 50),
       threadCoverage: threadCoverage(threadFacts.size, links),
+      health: {
+        refreshMinutes: (await settings.get()).refreshMinutes,
+        enrichment: enrichmentSchema.nullable().catch(null).parse((await bb.storage.kv.get<unknown>("lastEnrichment")) ?? null),
+      },
     };
   }
 
-  // ---- BB threads: read, link, open. Never written to. -------------------
+  // ---- BB threads: read, link, open. Only row actions write to them. -----
 
   /** Every visible, unarchived thread, with the paths its recent events worked in. */
   let threadFacts = new Map<string, ThreadFacts>();
@@ -1484,6 +1597,8 @@ export default async function plugin(bb: BbPluginApi) {
     bb.log.info(
       `enrich (${mode}): ${usage.calls} model calls, ${usage.inputTokens} in / ${usage.outputTokens} out`,
     );
+    const record: z.infer<typeof enrichmentSchema> = { mode, ...usage, at: new Date().toISOString() };
+    await bb.storage.kv.set("lastEnrichment", record);
     return warnings;
   }
 
@@ -1492,6 +1607,64 @@ export default async function plugin(bb: BbPluginApi) {
     // a lens name from an older build must not break the board.
     const parsed = prefsSchema.safeParse(await bb.storage.kv.get<unknown>("prefs"));
     return parsed.success ? parsed.data : DEFAULT_PREFS;
+  }
+
+  // ---- row actions ----------------------------------------------------
+  //
+  // The client names a row by its checkout path and nothing else. The repo,
+  // PR and reviewers come from the server's own last scan; the thread a
+  // continue or subthread targets must be one this row is linked to.
+
+  const HOST_ACTION_TIMEOUT_MS = 90_000;
+
+  async function scannedUnit(path: string): Promise<{ raw: RawUnit; ticket: string } | undefined> {
+    const pattern = compilePattern((await settings.get()).ticketPattern);
+    const raw = readUnits().find((unit) => unit.path === path);
+    return raw === undefined ? undefined : { raw, ticket: parseTicket(pattern, raw.branch, raw.dirName) ?? raw.dirName };
+  }
+
+  /** The row's open PR and the host to act from, or the reason there is none. */
+  async function actionable(path: string): Promise<{ ok: true; raw: RawUnit; prUrl: string; hostId: string } | { ok: false; error: string }> {
+    const found = await scannedUnit(path);
+    if (found === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
+    const { raw } = found;
+    if (raw.pr === null || raw.pr.state !== "OPEN") return { ok: false, error: "This row has no open pull request." };
+    if (prTarget(raw.pr.url) === null) return { ok: false, error: "The pull request URL from the last scan is not one gh can act on." };
+    const hostId = (await bb.sdk.system.config()).primaryHostId;
+    if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh from." };
+    return { ok: true, raw, prUrl: raw.pr.url, hostId };
+  }
+
+  const liveOf = (hostId: string) => (prUrl: string) =>
+    host.call("prLive", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+  const writeOf = (hostId: string) => (request: Parameters<typeof host.call<"prWrite">>[1]) =>
+    host.call("prWrite", request, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+
+  /** The threads the Board links to this row's cluster, strongest first. */
+  async function linkedThreads(path: string): Promise<{ id: string; title: string; tier: ThreadTier }[]> {
+    for (const group of (await board()).groups) {
+      for (const cluster of group.clusters) {
+        if (cluster.units.some((unit) => unit.path === path)) return cluster.threads;
+      }
+    }
+    return [];
+  }
+
+  const agentSdk: AgentSdk = {
+    projects: { list: () => bb.sdk.projects.list() },
+    threads: {
+      spawn: (args) => bb.sdk.threads.spawn(args),
+      get: (args) => bb.sdk.threads.get(args),
+      context: (args) => bb.sdk.threads.context(args),
+      send: (args) => bb.sdk.threads.send(args),
+    },
+  };
+
+  /** After a write that moves the row, rescan so the Board shows where it went. */
+  function rescanAfter(result: { ok: boolean }, what: string): void {
+    if (!result.ok) return;
+    bb.log.info(`row action: ${what}`);
+    void scan();
   }
 
   bb.rpc.register(rpcContract, {
@@ -1521,6 +1694,72 @@ export default async function plugin(bb: BbPluginApi) {
         // Linked at once, not on the next relist: the metadata is the record.
         startedFor.set(result.threadId, result.ticket);
         bb.log.info(`started thread ${result.threadId} for ${result.ticket}`);
+        announceThreads();
+      }
+      return result;
+    },
+    action_merge_preview: async ({ path }) => {
+      const target = await actionable(path);
+      if (!target.ok) return target;
+      const read = await liveOf(target.hostId)(target.prUrl);
+      if (!read.ok) return read;
+      const { mergeMethod, deleteBranchOnMerge } = await settings.get();
+      const verdict = mergeVerdict(read.live);
+      return {
+        ok: true as const,
+        live: read.live,
+        ...verdict,
+        method: mergeMethodOf(mergeMethod),
+        deleteBranch: shouldDeleteBranch(deleteBranchOnMerge, read.live.stackedAbove),
+      };
+    },
+    action_merge: async ({ path, sha, acknowledgeUnresolved }) => {
+      const target = await actionable(path);
+      if (!target.ok) return target;
+      const { mergeMethod, deleteBranchOnMerge } = await settings.get();
+      const result = await executeMerge(
+        { live: liveOf(target.hostId), write: writeOf(target.hostId) },
+        { prUrl: target.prUrl, sha, acknowledgeUnresolved, method: mergeMethodOf(mergeMethod), deleteBranchSetting: deleteBranchOnMerge },
+      );
+      rescanAfter(result, `merged ${target.prUrl}`);
+      return result;
+    },
+    action_update_branch: async ({ path }) => {
+      const target = await actionable(path);
+      if (!target.ok) return target;
+      const result = await writeOf(target.hostId)({ kind: "update-branch", prUrl: target.prUrl });
+      rescanAfter(result, `updated the branch of ${target.prUrl}`);
+      return result;
+    },
+    action_nudge: async ({ path, rerequest, comment }) => {
+      const target = await actionable(path);
+      if (!target.ok) return target;
+      const reviewers = rerequest ? (target.raw.pr?.reviewRequests ?? []) : [];
+      if (rerequest && reviewers.length === 0) return { ok: false as const, error: "No reviewers are pending on this PR to re-request." };
+      const result = await writeOf(target.hostId)({ kind: "nudge", prUrl: target.prUrl, reviewers, comment });
+      if (result.ok) bb.log.info(`row action: nudged ${target.prUrl}`);
+      return result;
+    },
+    agent_plan: async ({ path, action }) => {
+      if ((await scannedUnit(path)) === undefined) {
+        return { ok: false as const, error: "That checkout is not on the board any more. Rescan and try again." };
+      }
+      return { ok: true as const, ...(await planAgent(agentSdk, action, await linkedThreads(path))) };
+    },
+    agent_run: async ({ path, mode, threadId, prompt }) => {
+      const found = await scannedUnit(path);
+      const linked = (await linkedThreads(path)).map((thread) => thread.id);
+      const result = await runAgent(agentSdk, {
+        unit: found === undefined ? undefined : { path: found.raw.path, ticket: found.ticket },
+        mode,
+        threadId,
+        prompt,
+        linked,
+      });
+      if (result.ok) {
+        // A new or sub thread is linked at once through the metadata it was seeded with.
+        if (mode !== "continue") startedFor.set(result.threadId, result.ticket);
+        bb.log.info(`agent action (${mode}) in thread ${result.threadId} for ${result.ticket}`);
         announceThreads();
       }
       return result;

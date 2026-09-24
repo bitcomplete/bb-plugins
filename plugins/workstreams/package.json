@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Workstreams",
-    "description": "A read-only board that clusters git checkouts by Linear ticket across repositories.",
+    "description": "A board that clusters git checkouts by Linear ticket across repositories, with confirm-first row actions.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

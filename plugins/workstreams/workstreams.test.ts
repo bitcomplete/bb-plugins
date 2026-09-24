@@ -70,6 +70,7 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     latestReviewStates: [],
     mergedAt: null,
     mergeStateStatus: "CLEAN",
+    reviewRequests: [],
     ...overrides,
   };
 }

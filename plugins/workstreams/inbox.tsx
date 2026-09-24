@@ -38,8 +38,12 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
-import { cn } from "@/lib/utils";
+import { Tip } from "@/components/ui/tooltip";
+import { POINTER_CURSORS, cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { primaryAction, type PrimaryAction } from "./actions";
+import { ActionDialogs, RowActionMenu, type ActionRequest } from "./rowactions";
+import { ThreadMenu } from "./threadmenu";
 
 type Cluster = WireGroup["clusters"][number];
 type Unit = Cluster["units"][number];
@@ -55,6 +59,8 @@ export type Row = {
   age: StateAge;
   repo: string;
   title: string;
+  /** What the row's `a` key and action button do; null when there is nothing to do. */
+  action: PrimaryAction | null;
 };
 
 /** Every checkout on the board, as rows, grouped and ordered by section. */
@@ -67,13 +73,15 @@ export function inboxRows(board: Board, now: number): Map<InboxSection, Row[]> {
     for (const cluster of group.clusters) {
       for (const unit of cluster.units) {
         const section = inboxSection(unit, now);
+        const verb = inboxVerb(unit, section);
         rows.push({
           key: unit.path,
           unit,
           cluster,
           effort: group.name,
           section,
-          verb: inboxVerb(unit, section),
+          verb,
+          action: primaryAction(unit, section, verb),
           age: stateAge(unit),
           repo: unit.repo ?? unit.dirName,
           title: unit.pr === null ? (unit.branch ?? unit.dirName) : displayTitle(unit.pr.title),
@@ -115,7 +123,6 @@ export function InboxBoard({
   const all = useMemo(() => inboxRows(board, now), [board, now]);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement | null>(null);
-  const [help, setHelp] = useState(false);
   const [open, setOpen] = useState<Record<InboxSection, boolean>>(() =>
     Object.fromEntries(INBOX_SECTIONS.map((section) => [section, !INBOX_COLLAPSED[section]])) as Record<
       InboxSection,
@@ -176,6 +183,34 @@ export function InboxBoard({
   const openThread = useCallback((id: string) => navigate.toThread(id), [navigate]);
 
   const [starting, setStarting] = useState<Row | null>(null);
+  const [request, setRequest] = useState<ActionRequest | null>(null);
+
+  /**
+   * The row's primary action. Direct and agent actions only ever OPEN their
+   * dialog; the write happens on the dialog's own confirm button. A jump
+   * selects the PR this row is stacked behind, opening its section if folded.
+   */
+  const runPrimary = useCallback(
+    (row: Row) => {
+      const action = row.action;
+      if (action === null) return;
+      if (action.kind === "agent") setRequest({ kind: "agent", action: action.action, row });
+      else if (action.kind === "direct") setRequest({ kind: "direct", action: action.action, row });
+      else {
+        const target = [...all.values()].flat().find((entry) => entry.repo === row.repo && entry.unit.pr?.number === action.behind);
+        if (target === undefined) {
+          toast.error(`#${action.behind} is not on the board`, { description: "It may live in a checkout outside the scan roots." });
+          return;
+        }
+        setOpen((current) => ({ ...current, [target.section]: true }));
+        setQuery("");
+        setSelectedKey(target.key);
+        onFocusTicket(target.cluster.ticket);
+        requestAnimationFrame(() => document.getElementById(`inbox-${target.key}`)?.scrollIntoView({ block: "nearest" }));
+      }
+    },
+    [all, onFocusTicket],
+  );
 
   /**
    * Open the checkout. The SDK has no frontend call that opens a BB terminal
@@ -202,7 +237,7 @@ export function InboxBoard({
 
   const onKey = useCallback(
     (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || starting !== null) return;
+      if (event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
@@ -246,15 +281,14 @@ export function InboxBoard({
         case "n":
           act(setStarting);
           break;
+        case "a":
+          act(runPrimary);
+          break;
         case "/":
           searchRef.current?.focus();
           break;
-        case "?":
-          setHelp((current) => !current);
-          break;
         case "Escape":
-          if (help) setHelp(false);
-          else if (query !== "") setQuery("");
+          if (query !== "") setQuery("");
           else select(null);
           break;
         default:
@@ -262,7 +296,7 @@ export function InboxBoard({
       }
       event.preventDefault();
     },
-    [help, navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, select, selected, starting, threadsOf, visible],
+    [navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, request, runPrimary, select, selected, starting, threadsOf, visible],
   );
   useEffect(() => {
     window.addEventListener("keydown", onKey);
@@ -281,7 +315,6 @@ export function InboxBoard({
         surfaces={board.surfaces}
         shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0)}
         total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0)}
-        onHelp={() => setHelp((current) => !current)}
       />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pb-10">
@@ -321,6 +354,11 @@ export function InboxBoard({
                           onOpenThread={openThread}
                           onOpenCheckout={() => openCheckout(row)}
                           onStart={() => setStarting(row)}
+                          onPrimary={() => runPrimary(row)}
+                          onShowOnMap={() => {
+                            onFocusTicket(row.cluster.ticket);
+                            onShowOnMap();
+                          }}
                         />
                       ))}
                     </ul>
@@ -331,48 +369,8 @@ export function InboxBoard({
           })}
         </div>
       </div>
-      {help ? <KeyList onClose={() => setHelp(false)} /> : null}
       <StartThreadDialog row={starting} onClose={() => setStarting(null)} />
-    </div>
-  );
-}
-
-const KEYS: [string, string][] = [
-  ["j / k", "Next / previous row"],
-  ["Enter", "Open the pull request"],
-  ["t", "Open the most recent thread"],
-  ["m", "Show it on the Map"],
-  ["o", "Open the checkout"],
-  ["n", "Start a thread (asks first)"],
-  ["/", "Search"],
-  ["Esc", "Clear search, then selection"],
-  ["v", "Switch to the Map"],
-  ["?", "Show or hide these keys"],
-];
-
-function KeyList({ onClose }: { onClose: () => void }) {
-  return (
-    <div
-      role="dialog"
-      aria-label="Keyboard shortcuts"
-      className="absolute right-4 top-12 z-30 w-72 rounded-xl border border-border bg-popover p-3 text-popover-foreground shadow-md"
-    >
-      <div className="mb-2 flex items-center justify-between">
-        <p className="text-[12px] font-semibold">Keys</p>
-        <button type="button" aria-label="Close" onClick={onClose} className="text-muted-foreground hover:text-foreground">
-          <Icon name="X" className="size-3.5" />
-        </button>
-      </div>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
-        {KEYS.map(([key, what]) => (
-          <div key={key} className="contents">
-            <dt>
-              <kbd className="rounded border border-border px-1 font-mono text-[11px]">{key}</kbd>
-            </dt>
-            <dd className="text-muted-foreground">{what}</dd>
-          </div>
-        ))}
-      </dl>
+      <ActionDialogs request={request} now={now} onClose={() => setRequest(null)} />
     </div>
   );
 }
@@ -403,81 +401,50 @@ const CHIP: Record<InboxSection, string> = {
 
 type ThreadLink = Cluster["threads"][number];
 
-const TIER_WORDS: Record<ThreadLink["tier"], string> = {
-  started: "started here",
-  environment: "runs here",
-  ticket: "names it",
-  paths: "worked here",
-};
-
 /**
  * The thread mark, as on the Map: a dot that is solid while a thread runs.
- * Hover or focus lists the threads; a click opens the most recent one.
+ * Hover or click opens the shared thread menu; each entry opens its thread.
  */
-function ThreadMark({ threads, onOpen }: { threads: readonly ThreadLink[]; onOpen: (id: string) => void }) {
-  const [shown, setShown] = useState(false);
+function ThreadMark({
+  threads,
+  onOpen,
+  onMore,
+}: {
+  threads: readonly ThreadLink[];
+  onOpen: (id: string) => void;
+  onMore: () => void;
+}) {
   if (threads.length === 0) return <span className="w-4 shrink-0" aria-hidden />;
   const running = threads.some((thread) => thread.active);
   return (
     <span className="relative flex w-4 shrink-0 justify-center">
-      <button
-        type="button"
-        aria-label={`${threads.length} BB ${threads.length === 1 ? "thread" : "threads"}; open the most recent`}
-        onClick={(event) => {
-          event.stopPropagation();
-          onOpen(threads[0]!.id);
-        }}
-        onPointerEnter={() => setShown(true)}
-        onPointerLeave={() => setShown(false)}
-        onFocus={() => setShown(true)}
-        onBlur={() => setShown(false)}
+      <ThreadMenu
+        threads={threads}
+        onOpenThread={onOpen}
+        onMore={onMore}
         className="flex size-5 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <span
-          aria-hidden
-          className={cn("size-[7px] rounded-full", running ? "bg-foreground" : "bg-foreground/45")}
-        />
-      </button>
-      {shown ? (
-        <span
-          role="tooltip"
-          className="absolute right-0 top-6 z-20 w-72 rounded-lg border border-border bg-popover px-2.5 py-2 text-left text-popover-foreground shadow-sm"
-        >
-          {threads.slice(0, 5).map((thread) => (
-            <span key={thread.id} className="flex min-w-0 items-center gap-2 py-0.5 text-[11.5px]">
-              <span
-                aria-hidden
-                className={cn("size-[7px] shrink-0 rounded-full", thread.active ? "bg-foreground" : "bg-foreground/40")}
-              />
-              <span className="min-w-0 flex-1 truncate">{thread.title}</span>
-              <span className="shrink-0 text-[10.5px] text-muted-foreground">
-                {thread.active ? "running" : "idle"} · {TIER_WORDS[thread.tier]}
-              </span>
-            </span>
-          ))}
-          {threads.length > 5 ? (
-            <span className="block pl-[15px] text-[11px] text-muted-foreground">+{threads.length - 5} more</span>
-          ) : null}
-        </span>
-      ) : null}
+        <span aria-hidden className={cn("size-[7px] rounded-full", running ? "bg-foreground" : "bg-foreground/45")} />
+      </ThreadMenu>
     </span>
   );
 }
 
 function RowAction({ label, icon, onClick }: { label: string; icon: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={(event) => {
-        event.stopPropagation();
-        onClick();
-      }}
-      className="flex size-6 items-center justify-center rounded text-muted-foreground outline-none hover:bg-foreground/[0.08] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <Icon name={icon} className="size-3.5" />
-    </button>
+    <Tip label={label}>
+      <button
+        type="button"
+        aria-label={label}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClick();
+        }}
+        className="flex size-6 items-center justify-center rounded text-muted-foreground outline-none hover:bg-foreground/[0.08] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Icon name={icon} className="size-3.5" />
+      </button>
+    </Tip>
   );
 }
 
@@ -490,6 +457,8 @@ function InboxRow({
   onOpenThread,
   onOpenCheckout,
   onStart,
+  onPrimary,
+  onShowOnMap,
 }: {
   row: Row;
   now: number;
@@ -499,6 +468,8 @@ function InboxRow({
   onOpenThread: (id: string) => void;
   onOpenCheckout: () => void;
   onStart: () => void;
+  onPrimary: () => void;
+  onShowOnMap: () => void;
 }) {
   const { unit } = row;
   const risk = unit.surfaces.filter((surface) => ESCALATING.includes(surface));
@@ -558,9 +529,15 @@ function InboxRow({
         {row.effort}
       </span>
       {risk.length === 0 ? null : (
-        <span className="shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 dark:text-rose-300" title="High risk: touches an irreversible surface">
-          {risk.join(" · ")}
-        </span>
+        <Tip label="High risk: touches a surface that is hard to undo">
+          <span
+            tabIndex={0}
+            aria-label={`High risk: touches ${risk.join(" and ")}`}
+            className="shrink-0 rounded border border-rose-500/40 px-1 text-[10.5px] text-rose-700 outline-none focus-visible:ring-2 focus-visible:ring-ring dark:text-rose-300"
+          >
+            {risk.join(" · ")}
+          </span>
+        </Tip>
       )}
       <span
         className={cn(
@@ -569,9 +546,15 @@ function InboxRow({
         )}
       >
         <RowAction label="Open checkout (o)" icon="FolderOpen" onClick={onOpenCheckout} />
-        <RowAction label="Start a thread (n)" icon="MessageSquarePlus" onClick={onStart} />
+        <RowActionMenu
+          primary={row.action}
+          hasThreads={threads.length > 0}
+          onPrimary={onPrimary}
+          onGoToThread={() => threads[0] !== undefined && onOpenThread(threads[0].id)}
+          onNewThread={onStart}
+        />
       </span>
-      <ThreadMark threads={threads} onOpen={onOpenThread} />
+      <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />
     </li>
   );
 }
@@ -615,7 +598,6 @@ function InboxHeader({
   surfaces,
   shown,
   total,
-  onHelp,
 }: {
   searchRef: React.RefObject<HTMLInputElement | null>;
   query: string;
@@ -625,7 +607,6 @@ function InboxHeader({
   surfaces: readonly string[];
   shown: number;
   total: number;
-  onHelp: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -665,18 +646,21 @@ function InboxHeader({
           {shown === total ? `${total} rows` : `${shown} of ${total}`}
         </span>
         <div ref={rootRef} className="relative shrink-0">
-          <button
-            type="button"
-            aria-expanded={open}
-            onClick={() => setOpen((current) => !current)}
-            className={cn(
-              "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[12px] hover:bg-foreground/[0.06]",
-              active > 0 ? "text-foreground" : "text-muted-foreground",
-            )}
-          >
-            <Icon name="FilterHorizontal" className="size-3.5" />
-            Filter{active > 0 ? ` · ${active}` : ""}
-          </button>
+          <Tip label="Filter rows by last commit, surface or clones">
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-label={`Filter rows by last commit, surface or clones${active > 0 ? ` (${active} on)` : ""}`}
+              onClick={() => setOpen((current) => !current)}
+              className={cn(
+                "flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[12px] hover:bg-foreground/[0.06]",
+                active > 0 ? "text-foreground" : "text-muted-foreground",
+              )}
+            >
+              <Icon name="FilterHorizontal" className="size-3.5" />
+              Filter{active > 0 ? ` · ${active}` : ""}
+            </button>
+          </Tip>
           {open ? (
             <div
               role="menu"
@@ -716,15 +700,6 @@ function InboxHeader({
             </div>
           ) : null}
         </div>
-        <button
-          type="button"
-          aria-label="Keyboard shortcuts (?)"
-          title="Keyboard shortcuts (?)"
-          onClick={onHelp}
-          className="flex size-8 shrink-0 items-center justify-center rounded-md font-mono text-[12px] text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground"
-        >
-          ?
-        </button>
       </div>
     </div>
   );
@@ -780,7 +755,7 @@ function StartThreadDialog({ row, onClose }: { row: Row | null; onClose: () => v
 
   return (
     <Dialog open={row !== null} onOpenChange={(next) => (next ? null : onClose())}>
-      <DialogContent className="max-w-xl">
+      <DialogContent className={cn("max-w-xl", POINTER_CURSORS)}>
         <DialogHeader>
           <DialogTitle>Start a thread</DialogTitle>
           <DialogDescription>

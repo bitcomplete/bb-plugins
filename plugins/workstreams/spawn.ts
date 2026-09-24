@@ -18,6 +18,8 @@ export type SpawnSdk = {
       };
       prompt: string;
       pluginMetadata: { ticket: string };
+      /** Set for a subthread: BB files it under this parent and tells the parent when it finishes. */
+      parentThreadId?: string;
     }): Promise<{ id: string }>;
   };
 };
@@ -59,6 +61,7 @@ export async function startThread(
   sdk: SpawnSdk,
   unit: { path: string; ticket: string } | undefined,
   prompt: string,
+  parentThreadId?: string,
 ): Promise<StartResult> {
   if (unit === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
   const text = prompt.trim();
@@ -75,6 +78,7 @@ export async function startThread(
     environment: { type: "host", hostId: project.hostId, workspace: { type: "unmanaged", path: unit.path } },
     prompt: text,
     pluginMetadata: { ticket: unit.ticket },
+    ...(parentThreadId === undefined ? {} : { parentThreadId }),
   });
   return { ok: true, threadId: thread.id, ticket: unit.ticket };
 }

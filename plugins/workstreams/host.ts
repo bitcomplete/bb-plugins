@@ -2,6 +2,7 @@
 // node:fs are available here and only here.
 import { execFile } from "node:child_process";
 import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
@@ -12,9 +13,11 @@ import {
   parsePrList,
   repoFromRemote,
 } from "./gh.js";
+import { prTarget, readLiveMerge, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
+const GH_WRITE_TIMEOUT_MS = 60_000;
 const CONCURRENCY = 8;
 const MAX_WARNINGS = 50;
 
@@ -42,6 +45,29 @@ function run(
       },
     );
   });
+}
+
+/**
+ * `gh` with an optional stdin, for the Board's direct actions. Arguments are an
+ * array handed straight to execFile: no shell ever parses them.
+ */
+function ghRunner(signal: AbortSignal): GhRunner {
+  return (args, stdin) =>
+    new Promise((resolve) => {
+      const child = execFile(
+        "gh",
+        [...args],
+        { cwd: homedir(), timeout: GH_WRITE_TIMEOUT_MS, signal, maxBuffer: 4 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            resolve({ ok: false, error: (stderr || error.message).replace(/\s+/gu, " ").trim().slice(0, 600) });
+            return;
+          }
+          resolve({ ok: true, stdout: stdout.toString() });
+        },
+      );
+      child.stdin?.end(stdin ?? "");
+    });
 }
 
 async function git(
@@ -96,7 +122,7 @@ function defaultBranchResolver(signal: AbortSignal) {
 }
 
 const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,reviewRequests";
 
 /** A release tag: many teams deploy production from a version tag and nothing else. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;
@@ -499,6 +525,24 @@ export default experimental_defineHostEntry({
         units: units.filter((unit): unit is RawUnit => unit !== null).slice(0, 2_000),
         warnings,
       };
+    },
+    prLive: async ({ prUrl }, context) => {
+      const target = prTarget(prUrl);
+      if (target === null) return { ok: false as const, error: "That is not a pull request URL." };
+      return readLiveMerge(ghRunner(context.signal), target);
+    },
+    prWrite: async (request, context) => {
+      const target = prTarget(request.prUrl);
+      if (target === null) return { ok: false as const, error: "That is not a pull request URL." };
+      const gh = ghRunner(context.signal);
+      switch (request.kind) {
+        case "merge":
+          return runMerge(gh, target, request.method, request.sha, request.deleteBranch);
+        case "update-branch":
+          return runUpdateBranch(gh, target);
+        case "nudge":
+          return runNudge(gh, target, request.reviewers, request.comment);
+      }
     },
     nameGroups: async ({ apiKey, level, groups }, context) =>
       nameGroups(apiKey, level, groups, context.signal),
