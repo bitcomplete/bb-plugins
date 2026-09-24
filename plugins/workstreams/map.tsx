@@ -58,6 +58,7 @@ import {
   settle as settleShown,
   smoothstep,
   stackEdges,
+  turnView,
   turnTilt,
   zoomAt,
   type Box,
@@ -1975,21 +1976,23 @@ export function MapView({
   );
 
   /** The zoom range: out to half of fit-all, in until the smallest leaf is roomy. */
-  const bounds = useCallback(() => {
+  const bounds = useCallback((forLayout = layout) => {
     const size = sizeRef.current;
-    if (layout.world.r === 0 || size.width === 0) return { min: 0.05, max: 40 };
-    const fit = fitAllView().scale;
-    const smallest = Math.min(...circles.map((circle) => circle.r));
+    if (forLayout.world.r === 0 || size.width === 0) return { min: 0.05, max: 40 };
+    const fit = forLayout === layout
+      ? fitAllView().scale
+      : fitBox(massBox(forLayout.roots), size, chromeInsets(size.width)).scale;
+    const smallest = Math.min(...(forLayout === layout ? circles : flatten(forLayout)).map((circle) => circle.r));
     return { min: fit * 0.5, max: Math.max(fit * 2, fitView({ x: 0, y: 0, r: smallest }, size).scale * 1.6) };
   }, [layout, circles, fitAllView]);
 
   /** The world may drift off-centre, never off-screen: getting lost is the failure. */
   const clampView = useCallback(
-    (next: View): View => {
+    (next: View, forLayout = layout): View => {
       const size = sizeRef.current;
-      const { min, max } = bounds();
+      const { min, max } = bounds(forLayout);
       const scale = clamp(next.scale, min, max);
-      const r = layout.world.r * scale;
+      const r = forLayout.world.r * scale;
       const margin = Math.min(96, r);
       return {
         scale,
@@ -2301,10 +2304,18 @@ export function MapView({
       const focused = focusRef.current;
       const target = focused === null ? undefined : toLayout.index.get(focused);
       const focus = target?.data.kind === "cluster" ? target.key : null;
-      const vTo =
-        target !== undefined && focus !== null
-          ? fitView(target, size, 0.9)
-          : fitBox(massBox(toLayout.roots), size, chromeInsets(size.width));
+      const source = focus === null || focused === null ? undefined : layout.index.get(focused);
+      const fromBox = massBox(layout.roots);
+      const toBox = massBox(toLayout.roots);
+      const fromFit = source === undefined ? fitAllView() : fitView(source, size, 0.9);
+      const toFit = target !== undefined && focus !== null
+        ? fitView(target, size, 0.9)
+        : fitBox(toBox, size, chromeInsets(size.width));
+      const fromAnchor = source ?? { x: (fromBox.left + fromBox.right) / 2, y: (fromBox.top + fromBox.bottom) / 2 };
+      const toAnchor = target !== undefined && focus !== null
+        ? target
+        : { x: (toBox.left + toBox.right) / 2, y: (toBox.top + toBox.bottom) / 2 };
+      const vTo = clampView(turnView(viewRef.current, fromFit, toFit, fromAnchor, toAnchor, bounds(toLayout)), toLayout);
       if (focus === null) {
         focusRef.current = null;
         onSelect(null);
@@ -2321,7 +2332,7 @@ export function MapView({
       setHover(null);
       setTurning(turn);
     },
-    [cancelFlight, face, layout, layouts, onPrefs, onSelect],
+    [bounds, cancelFlight, clampView, face, fitAllView, layout, layouts, onPrefs, onSelect],
   );
 
   // The turn's frames: transform and opacity only, on nodes mounted once at

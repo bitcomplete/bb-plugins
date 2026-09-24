@@ -616,6 +616,23 @@ export function zoomAt(view: View, at: Point, factor: number, bounds: ScaleBound
   };
 }
 
+/** Carry a reader's zoom and anchor position between two fitted map layouts. */
+export function turnView(
+  current: View,
+  fromFit: View,
+  toFit: View,
+  fromAnchor: Point,
+  toAnchor: Point,
+  bounds: ScaleBounds,
+): View {
+  const scale = Math.min(Math.max(current.scale * toFit.scale / fromFit.scale, bounds.min), bounds.max);
+  return {
+    scale,
+    x: current.x + fromAnchor.x * current.scale - toAnchor.x * scale,
+    y: current.y + fromAnchor.y * current.scale - toAnchor.y * scale,
+  };
+}
+
 /**
  * The view two fingers are asking for, relative to where the gesture started.
  * The distance ratio sets the scale and the midpoint's travel the translation;

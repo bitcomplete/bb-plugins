@@ -35,6 +35,7 @@ import {
   rimProgress,
   settle,
   stackEdges,
+  turnView,
   turnTilt,
   zoomAt,
   type Box,
@@ -616,6 +617,33 @@ describe("captions", () => {
 });
 
 describe("turning", () => {
+  it("keeps wheel or pinch zoom and pan relative to a focused cluster when changing faces", () => {
+    const size = { width: 800, height: 600 };
+    const from = { x: 40, y: 10, r: 10 };
+    const to = { x: -60, y: 90, r: 20 };
+    const fromFit = fitView(from, size);
+    const toFit = fitView(to, size);
+    const current = zoomAt(fromFit, { x: 470, y: 260 }, 1.7, { min: 0.1, max: 100 });
+    const turned = turnView(current, fromFit, toFit, from, to, { min: 0.1, max: 100 });
+    expect(turned.scale / toFit.scale).toBeCloseTo(1.7, 9);
+    expect(turned.x + to.x * turned.scale).toBeCloseTo(current.x + from.x * current.scale, 9);
+    expect(turned.y + to.y * turned.scale).toBeCloseTo(current.y + from.y * current.scale, 9);
+  });
+
+  it("carries manual overview zoom across differently sized faces and leaves a fitted overview fitted", () => {
+    const fromFit = { scale: 0.9, x: 400, y: 300 };
+    const toFit = { scale: 0.65, x: 387, y: 306.5 };
+    const from = { x: 0, y: 0 };
+    const to = { x: 20, y: -10 };
+    const bounds = { min: 0.2, max: 5 };
+    expect(turnView(fromFit, fromFit, toFit, from, to, bounds)).toEqual(toFit);
+    const current = zoomAt(fromFit, { x: 300, y: 350 }, 2, bounds);
+    const turned = turnView(current, fromFit, toFit, from, to, bounds);
+    expect(turned.scale / toFit.scale).toBeCloseTo(2, 9);
+    expect(turned.x + to.x * turned.scale).toBeCloseTo(current.x + from.x * current.scale, 9);
+    expect(turned.y + to.y * turned.scale).toBeCloseTo(current.y + from.y * current.scale, 9);
+  });
+
   it("interpolates every circle present on both faces, keyed by id, and leaves one-face containers out", () => {
     const from = new Map([
       ["cluster:ABC-101", { x: 0, y: 0, r: 10 }],
