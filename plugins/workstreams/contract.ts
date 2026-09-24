@@ -41,11 +41,7 @@ export const prSchema = z
     /** The branch this PR merges into. Another PR's head means it is stacked. */
     baseRefName: z.string().max(300).nullable(),
     headRefName: z.string().max(300).nullable(),
-    /**
-     * The state of each reviewer's LATEST review, uppercased. The one extra
-     * field `approved-with-comments` needs, taken from the `gh pr list` call
-     * that was already being made rather than from a second round trip per PR.
-     */
+    /** Each reviewer's latest review, uppercased, from the existing PR list call. */
     latestReviewStates: z.array(z.string().max(40)).max(50),
     /**
      * When the PR merged, from the same `gh pr list` call. It dates the Board's
@@ -77,6 +73,8 @@ export const prSchema = z
       .default([]),
     /** Null until review threads are checked; zero means no unresolved threads. */
     unresolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
+    /** Complete-page count of resolved review threads; null when unread or incomplete. */
+    resolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
     /**
      * Ticket IDs the PR description states, extracted on the host from its
      * first 8 KB. The description itself is client content and is never kept,

@@ -144,6 +144,13 @@ describe("readLiveMerge", () => {
 });
 
 describe("readReviewThreads", () => {
+  it("counts resolved history only for a complete page, separately from open threads", async () => {
+    const resolved = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: Array.from({ length: 8 }, () => ({ isResolved: true })) } } } } }) }));
+    expect(await readReviewThreads(resolved.run, TARGET)).toEqual({ ok: true, count: 0, resolvedCount: 8, hasNextPage: false });
+    const incomplete = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true }, nodes: [{ isResolved: true }, { isResolved: false }] } } } } }) }));
+    expect(await readReviewThreads(incomplete.run, TARGET)).toEqual({ ok: true, count: 1, resolvedCount: null, hasNextPage: true });
+  });
+
   it("refuses an empty first page when later review thread pages are unread, so neither the Board nor merge dialog claims the PR is clear", async () => {
     const paginated = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true }, nodes: [{ isResolved: true }] } } } } }) }));
     expect((await readReviewThreads(paginated.run, TARGET)).ok).toBe(false);

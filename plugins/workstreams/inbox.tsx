@@ -684,6 +684,8 @@ function InboxRow({
   const risk = unit.surfaces.filter((surface) => ESCALATING.includes(surface));
   const age = shortAge(row.age, now);
   const ageTip = ageHint(row.age, row.verb, now);
+  const resolvedThreads = unit.pr?.resolvedReviewThreads ?? 0;
+  const approvedAfterReview = unit.pr?.reviewDecision === "APPROVED" && unit.pr.unresolvedReviewThreads === 0;
   return (
     <li
       id={`inbox-${row.key}`}
@@ -731,9 +733,20 @@ function InboxRow({
           #{unit.pr.number}
         </UrlLink>
       )}
-      <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
-        <span className={cn("min-w-0 truncate text-foreground", compact ? "basis-full" : "flex-[3]")}>{row.title}</span>
-      </Tip>
+      <span className={cn("flex min-w-0 items-center gap-2", compact ? "basis-full flex-wrap gap-y-0.5" : "flex-[3]")}>
+        <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
+          <span className={cn("min-w-0 truncate text-foreground", compact ? "basis-full" : "flex-1")}>{row.title}</span>
+        </Tip>
+        {resolvedThreads > 0 ? (
+          <Tip label={approvedAfterReview
+            ? `${resolvedThreads === 1 ? "The review thread is" : `All ${resolvedThreads} review threads are`} resolved; GitHub still marks this PR approved.`
+            : `${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved.`}>
+            <span tabIndex={0} className="shrink-0 rounded text-[10px] text-muted-foreground/80 outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              {resolvedThreads} {resolvedThreads === 1 ? "thread" : "threads"} resolved
+            </span>
+          </Tip>
+        ) : null}
+      </span>
       {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
       {row.cluster.linear?.url == null ? null : (
         <UrlLink

@@ -22,7 +22,7 @@ function clusterOf(ticket: string | null, key: string, state: "OPEN" | "MERGED" 
     lastCommitAt: null, defaultBranch: "main", shipped: null, changedPaths: [],
     pr: { number: 1, state, isDraft: false, reviewDecision: null, checkConclusions: [], url: `https://github.com/inkwell/quill/pull/${key}`,
       title: `Work on ${key}`, mergeable: null, baseRefName: "main", headRefName: `dev/${key}`, latestReviewStates: [], mergedAt: null,
-      mergeStateStatus: "UNKNOWN", reviewRequests: [], latestReviews: [], unresolvedReviewThreads: null },
+      mergeStateStatus: "UNKNOWN", reviewRequests: [], latestReviews: [], unresolvedReviewThreads: null, resolvedReviewThreads: null },
   };
   const lifecycle = unitLifecycle(raw);
   return {

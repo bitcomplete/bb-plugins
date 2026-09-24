@@ -279,11 +279,13 @@ async function inspect(
   }
   unit.observed = { status: status !== null, pr: true };
   unit.pr = parsed.pr;
-  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft && parsed.pr.reviewDecision === "APPROVED" &&
-      !parsed.pr.latestReviewStates.includes("COMMENTED")) {
+  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft && parsed.pr.reviewDecision === "APPROVED") {
     const threads = await reviewThreadsOf(parsed.pr.url);
     if (!threads.ok) warn(`${dirName}: cannot check PR review threads: ${threads.error}`);
-    else unit.pr.unresolvedReviewThreads = threads.count;
+    else {
+      unit.pr.unresolvedReviewThreads = threads.count;
+      unit.pr.resolvedReviewThreads = threads.resolvedCount;
+    }
   }
   if (parsed.pr.state === "MERGED") {
     unit.shipped = await shippedOf(unit.repo, path, parsed.mergeCommit);

@@ -54,12 +54,7 @@ export function checkConclusions(rollup: unknown): string[] {
     .slice(0, 100);
 }
 
-/**
- * The state of each reviewer's most recent review. This is what separates
- * `approved-with-comments` from `awaiting-merge`: a PR whose overall decision
- * is APPROVED but which still carries a reviewer sitting at COMMENTED has
- * something outstanding that the aggregate `reviewDecision` hides.
- */
+/** Each reviewer's latest review state, for the Board's reviewer marks. */
 export function latestReviewStates(reviews: unknown): string[] {
   if (!Array.isArray(reviews)) return [];
   return reviews
@@ -141,6 +136,7 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
     reviewRequests: parseReviewRequests(view.reviewRequests),
     latestReviews: latestReviewers(view.latestReviews),
     unresolvedReviewThreads: null,
+    resolvedReviewThreads: null,
     mergedAt:
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)

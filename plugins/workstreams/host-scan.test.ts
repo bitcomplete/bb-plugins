@@ -15,9 +15,13 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-async function commands(options: { statusFails?: boolean; dirty?: boolean; authFails?: boolean; prFails?: boolean; prMalformed?: boolean; approvedPr?: boolean; threadsFail?: boolean; threadsMore?: boolean; threadsOpen?: boolean }) {
+async function commands(options: { statusFails?: boolean; dirty?: boolean; authFails?: boolean; prFails?: boolean; prMalformed?: boolean; approvedPr?: boolean; threadsFail?: boolean; threadsMore?: boolean; threadsOpen?: boolean; threadsResolved?: number }) {
   const directory = await mkdtemp(join(tmpdir(), "workstreams-scan-"));
   directories.push(directory);
+  const threadNodes = [
+    ...Array.from({ length: options.threadsResolved ?? 1 }, () => ({ isResolved: true })),
+    ...(options.threadsOpen ? [{ isResolved: false }] : []),
+  ];
   await writeFile(join(directory, "git"), `#!/bin/sh
 case "$1" in
   remote) echo https://github.com/example/widget.git ;;
@@ -33,8 +37,8 @@ esac
   await writeFile(join(directory, "gh"), `#!/bin/sh
 if [ "$1" = auth ]; then ${options.authFails ? "exit 1" : "exit 0"}; fi
 if [ "$1" = repo ]; then echo main; exit 0; fi
-if [ "$1" = pr ]; then ${options.prFails ? "exit 1" : options.prMalformed ? "echo malformed; exit 0" : options.approvedPr ? `echo '[{"number":42,"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[{"conclusion":"SUCCESS"}],"url":"https://github.com/example/widget/pull/42","title":"ABC-123: Widget fix","latestReviews":[{"author":{"login":"reviewer"},"state":"APPROVED"}],"mergeStateStatus":"CLEAN"}]'; exit 0` : "echo '[]'; exit 0"}; fi
-if [ "$1" = api ]; then echo checked >> '${directory}/gh-api-calls'; ${options.threadsFail ? "exit 1" : `echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":${options.threadsMore === true}},"nodes":[{"isResolved":${options.threadsOpen !== true}}]}}}}}'; exit 0`}; fi
+if [ "$1" = pr ]; then ${options.prFails ? "exit 1" : options.prMalformed ? "echo malformed; exit 0" : options.approvedPr ? `echo '[{"number":42,"state":"OPEN","isDraft":false,"reviewDecision":"APPROVED","statusCheckRollup":[{"conclusion":"SUCCESS"}],"url":"https://github.com/example/widget/pull/42","title":"ABC-123: Widget fix","latestReviews":[{"author":{"login":"reviewer"},"state":"APPROVED"},{"author":{"login":"bot"},"state":"COMMENTED"}],"mergeStateStatus":"CLEAN"}]'; exit 0` : "echo '[]'; exit 0"}; fi
+if [ "$1" = api ]; then echo checked >> '${directory}/gh-api-calls'; ${options.threadsFail ? "exit 1" : `echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":${options.threadsMore === true}},"nodes":${JSON.stringify(threadNodes)}}}}}}'; exit 0`}; fi
 exit 1
 `, { mode: 0o755 });
   process.env.PATH = `${directory}${delimiter}${originalPath ?? ""}`;
@@ -74,7 +78,20 @@ describe("host scan uncertainty", () => {
     const path = await commands({ approvedPr: true, threadsOpen: true });
     const { units } = await inspectAll([path], [], new AbortController().signal);
     expect(units[0]?.pr?.unresolvedReviewThreads).toBe(1);
+    expect(units[0]?.pr?.resolvedReviewThreads).toBe(1);
     expect(unitLifecycle(units[0]!)).toBe("approved-with-comments");
+  });
+
+  it("keeps approval and offers Merge after all eight commented review threads are resolved", async () => {
+    const path = await commands({ approvedPr: true, threadsResolved: 8 });
+    const { units } = await inspectAll([path], [], new AbortController().signal);
+    expect(units[0]?.pr).toMatchObject({
+      reviewDecision: "APPROVED",
+      latestReviewStates: ["APPROVED", "COMMENTED"],
+      unresolvedReviewThreads: 0,
+      resolvedReviewThreads: 8,
+    });
+    expect(unitLifecycle(units[0]!)).toBe("awaiting-merge");
   });
 
   it("checks each PR once when multiple checkouts point at it", async () => {
@@ -92,6 +109,7 @@ describe("host scan uncertainty", () => {
       const path = await commands({ approvedPr: true, ...options });
       const { units, warnings } = await inspectAll([path], [], new AbortController().signal);
       expect(units[0]?.pr?.unresolvedReviewThreads).toBeNull();
+      expect(units[0]?.pr?.resolvedReviewThreads).toBeNull();
       expect(unitLifecycle(units[0]!)).toBe("unverified");
       expect(warnings.some((warning) => warning.includes("review thread"))).toBe(true);
     }

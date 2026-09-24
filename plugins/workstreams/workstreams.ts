@@ -309,8 +309,9 @@ export function unitLifecycle(unit: RawUnit): Lifecycle {
   // clear on their own.
   if (pr.reviewDecision === "CHANGES_REQUESTED") return "awaiting-followup";
   if (pr.reviewDecision === "APPROVED") {
-    if (pr.latestReviewStates.includes("COMMENTED") || (pr.unresolvedReviewThreads ?? 0) > 0) return "approved-with-comments";
-    if (checksGreen(pr.checkConclusions)) return pr.unresolvedReviewThreads === 0 ? "awaiting-merge" : "unverified";
+    if (pr.unresolvedReviewThreads === null) return "unverified";
+    if (pr.unresolvedReviewThreads > 0) return "approved-with-comments";
+    if (checksGreen(pr.checkConclusions)) return "awaiting-merge";
   }
   return "awaiting-review";
 }

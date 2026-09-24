@@ -2,6 +2,7 @@
 // rule in workstreams.ts. Nothing here needs a network, a token, or git: what
 // is checked is how a payload is read, not how it was fetched.
 import { describe, expect, it } from "vitest";
+import { prSchema } from "./contract.js";
 import { latestReviewStates, latestReviewers, mergeCommitOf, parseLiveReviewRequests, parseMergeStateStatus, parsePrList } from "./gh.js";
 import { namingResponse, parseNames } from "./naming.js";
 
@@ -43,7 +44,7 @@ describe("Claude naming response", () => {
 });
 
 describe("latestReviewStates", () => {
-  it("uppercases each reviewer's most recent state, because `approved-with-comments` turns on a COMMENTED review the aggregate decision hides", () => {
+  it("uppercases each reviewer's most recent state for the Board's reviewer marks", () => {
     expect(
       latestReviewStates([{ state: "approved" }, { state: "COMMENTED" }]),
     ).toEqual(["APPROVED", "COMMENTED"]);
@@ -122,8 +123,16 @@ describe("parsePrList", () => {
       },
     ]);
 
-  it("carries the review states through, because that field is the whole reason the gh call changed", () => {
+  it("carries review states through for the Board's reviewer marks", () => {
     expect(parsePrList(row())?.pr.latestReviewStates).toEqual(["APPROVED", "COMMENTED"]);
+  });
+
+  it("starts review-thread counts unknown and loads older cached PRs without resolved history", () => {
+    const parsed = parsePrList(row())!.pr;
+    expect(parsed.unresolvedReviewThreads).toBeNull();
+    expect(parsed.resolvedReviewThreads).toBeNull();
+    const { resolvedReviewThreads: _oldCount, ...older } = parsed;
+    expect(prSchema.parse(older).resolvedReviewThreads).toBeNull();
   });
 
   it("carries the reviewers from the same latestReviews field, because the row's reviewer marks must cost no extra gh call", () => {

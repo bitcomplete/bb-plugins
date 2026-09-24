@@ -71,6 +71,7 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     reviewRequests: [],
     latestReviews: [],
     unresolvedReviewThreads: 0,
+    resolvedReviewThreads: 0,
     ...overrides,
   };
 }
@@ -154,7 +155,7 @@ describe("unitLifecycle", () => {
     ).toBe("blocked");
   });
 
-  it("calls an approved PR carrying an unresolved COMMENTED review approved-with-comments, because the aggregate decision says APPROVED while something is still outstanding", () => {
+  it("keeps an approved PR with a historical COMMENTED review ready to merge after all threads resolve", () => {
     expect(
       unitLifecycle(
         unit({
@@ -162,15 +163,17 @@ describe("unitLifecycle", () => {
             reviewDecision: "APPROVED",
             checkConclusions: ["SUCCESS"],
             latestReviewStates: ["APPROVED", "COMMENTED"],
+            unresolvedReviewThreads: 0,
+            resolvedReviewThreads: 8,
           }),
         }),
       ),
-    ).toBe("approved-with-comments");
+    ).toBe("awaiting-merge");
   });
 
-  it("keeps an approved, green PR out of Merge while its review thread remains unresolved, even though the latest review is APPROVED", () => {
-    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["APPROVED"], unresolvedReviewThreads: 1 }) }))).toBe("approved-with-comments");
-    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["APPROVED"], unresolvedReviewThreads: null }) }))).toBe("unverified");
+  it("keeps an approved, green PR out of Merge while a thread is unresolved or its resolution is unknown", () => {
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["COMMENTED", "APPROVED"], unresolvedReviewThreads: 1 }) }))).toBe("approved-with-comments");
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["COMMENTED", "APPROVED"], unresolvedReviewThreads: null }) }))).toBe("unverified");
   });
 
   it("calls an approved PR with green checks and no open comments awaiting-merge, because it is waiting on nothing but a button", () => {

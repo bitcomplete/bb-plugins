@@ -72,7 +72,7 @@ twelve states fall into three groups, and **those groups are the lenses**.
 | --- | --- | --- |
 | Waiting | `blocked` | A check is FAILURE or ERROR |
 | Waiting | `awaiting-followup` | CHANGES_REQUESTED — the reviewer acted, the ball is with you |
-| Waiting | `approved-with-comments` | APPROVED, but a reviewer is still sitting at COMMENTED |
+| Waiting | `approved-with-comments` | APPROVED, with unresolved review threads |
 | Waiting | `awaiting-merge` | APPROVED, checks green, nothing outstanding |
 | Waiting | `awaiting-review` | Open PR with no review decision yet |
 | Waiting | `unverified` | Local or GitHub status could not be checked; rescan to verify it |
@@ -383,6 +383,9 @@ measured from the scan that saw the checkout enter its state. Until one has,
 the row shows its last-commit age and labels it "last commit". Keys: `j`/`k`,
 `Enter` (PR), `a` (the row's action, which asks first), `t` (newest thread),
 `m` (Map), `o` (open the checkout), `n` (start a thread), `/` (search).
+The Board shows a resolved-thread count beside a PR title when GitHub has
+confirmed review threads were resolved; reviewer marks still show the latest
+review states, including approval.
 
 The header's ⓘ, or `?` in either view, opens **How this works** in BB's right
 panel. It explains grouping, the states, both views' keys and the Map's marks,

@@ -38,6 +38,7 @@ function unit(mergeStateStatus: "DIRTY" | "CLEAN"): RawUnit {
       reviewRequests: ["inkwell/reviewers"],
       latestReviews: [],
       unresolvedReviewThreads: 0,
+      resolvedReviewThreads: 0,
     },
     shipped: null,
     changedPaths: ["src/balance.ts"],

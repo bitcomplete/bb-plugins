@@ -45,6 +45,7 @@ function pr(title: string): Pr {
     reviewRequests: [],
     latestReviews: [],
     unresolvedReviewThreads: 0,
+    resolvedReviewThreads: 0,
   };
 }
 

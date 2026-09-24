@@ -59,10 +59,10 @@ const STATES: [string, string][] = [
   ["Fix · CI failing", "A check failed. Investigate CI hands it to an agent."],
   ["Fix · Resolve conflicts", "GitHub reports a merge conflict with the base."],
   ["Respond · Changes requested", "A reviewer asked for changes; the ball is with you."],
-  ["Respond · Approved, comments open", "Approved, but a reviewer's latest review still has comments."],
+  ["Respond · Approved, comments open", "Approved, with unresolved review threads on GitHub."],
   [
     "Merge · Ready to merge",
-    "Approved; every check finished and green; GitHub mergeStateStatus CLEAN (or HAS_HOOKS, or UNSTABLE for non-required checks); not stacked behind an unmerged PR.",
+    "Approved; no unresolved review threads; every check finished and green; GitHub mergeStateStatus CLEAN (or HAS_HOOKS, or UNSTABLE for non-required checks); not stacked behind an unmerged PR.",
   ],
   ["Merge · Update branch", "Ready except the branch is behind its base."],
   ["Waiting · In review", "Nobody has decided yet. Nudge reviewers is one click away."],

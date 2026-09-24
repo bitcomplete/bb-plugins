@@ -119,7 +119,7 @@ export type LiveRead = { ok: true; live: LiveMergeFacts } | { ok: false; error: 
 
 /** Read only the first page: a positive count is enough to block merge; an empty
  * page with more pages is unknown, never clear. */
-export async function readReviewThreads(run: GhRunner, target: PrTarget): Promise<{ ok: true; count: number; hasNextPage: boolean } | { ok: false; error: string }> {
+export async function readReviewThreads(run: GhRunner, target: PrTarget): Promise<{ ok: true; count: number; resolvedCount: number | null; hasNextPage: boolean } | { ok: false; error: string }> {
   const result = await run(threadsArgv(target));
   if (!result.ok) return { ok: false, error: result.error };
   const body = json(result) as { errors?: unknown; data?: { repository?: { pullRequest?: { reviewThreads?: unknown } } } } | undefined;
@@ -133,7 +133,12 @@ export async function readReviewThreads(run: GhRunner, target: PrTarget): Promis
   if (count === 0 && threads.pageInfo.hasNextPage) {
     return { ok: false, error: "More review thread pages remain unread." };
   }
-  return { ok: true, count, hasNextPage: threads.pageInfo.hasNextPage };
+  return {
+    ok: true,
+    count,
+    resolvedCount: threads.pageInfo.hasNextPage ? null : threads.nodes.length - count,
+    hasNextPage: threads.pageInfo.hasNextPage,
+  };
 }
 
 /**

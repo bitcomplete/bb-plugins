@@ -59,6 +59,7 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     reviewRequests: [],
     latestReviews: [],
     unresolvedReviewThreads: 0,
+    resolvedReviewThreads: 0,
     ...overrides,
   };
 }
