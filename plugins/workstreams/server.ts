@@ -23,6 +23,11 @@ import {
   type RawUnit,
   type Pr,
 } from "./contract.js";
+import { createEffortStore, EFFORT_MIGRATIONS, establishedEffortSchema, normalizeMembers, type EffortMembers } from "./effort-store.js";
+import { createCoordinatorService, coordinateInputSchema, coordinateResultSchema, effortPlanSchema, type EffortPlan } from "./effort-coordinator.js";
+import { planGroupingRepair, reviewGroupingRepair, repairRequestEstimate } from "./grouping-repair.js";
+import { effortParent, activeCheckoutThread } from "./effort-routing.js";
+import { inventoryEffort } from "./effort-membership.js";
 import { createInventoryStore, EMPTY_INVENTORY, INVENTORY_MIGRATIONS } from "./inventory-store.js";
 import type { InventoryResult } from "./inventory.js";
 import {
@@ -66,6 +71,7 @@ import {
 import {
   ZERO_USAGE,
   assignToCandidates,
+  migrateCandidateDecisions,
   candidatesFrom,
   clusterContext,
   decideWithJev,
@@ -94,6 +100,8 @@ import {
   type ThreadTier,
   type WorkedPaths,
   startedForOf,
+  ticketsIn,
+  withinPath,
 } from "./threads.js";
 import { startThread } from "./spawn.js";
 import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type DirectAction, type MergeMethod } from "./actions.js";
@@ -229,6 +237,7 @@ const enrichmentSchema = z.object({
 });
 
 const boardSchema = z.object({
+  efforts: z.array(establishedEffortSchema).default([]),
   prInventory: inventoryBoardSchema.default(EMPTY_INVENTORY),
   groups: z.array(groupSchema),
   /** How many grouping levels survived the collapse: 1, 2 or 3. */
@@ -295,6 +304,8 @@ const threadModeSchema = z.enum(["continue", "subthread", "new"]);
 
 export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
+  effort_plan: { input: z.object({ groupKey: z.string().min(1).max(500) }).strict(), output: effortPlanSchema },
+  effort_coordinate: { input: coordinateInputSchema, output: coordinateResultSchema },
   inventory_refresh: { input: z.null(), output: z.object({ started: z.boolean() }) },
   dispatch_set: {
     input: z.object({ mode: z.enum(["off", "shadow", "auto"]), effortKey: z.string().nullable() }).strict(),
@@ -566,10 +577,14 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE TABLE IF NOT EXISTS pr_linkbacks (url TEXT PRIMARY KEY, ticket TEXT, checked_at INTEGER NOT NULL, final INTEGER NOT NULL)`,
     ...DISPATCH_MIGRATIONS,
     ...INVENTORY_MIGRATIONS,
+    ...EFFORT_MIGRATIONS,
+    `CREATE TABLE IF NOT EXISTS grouping_repairs (ticket TEXT PRIMARY KEY, label TEXT NOT NULL, hash TEXT NOT NULL, evidence TEXT NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS grouping_legacy_labels (hash TEXT PRIMARY KEY, label TEXT NOT NULL)`,
   ]);
   const runs = createRunStore(db);
   const dispatch = createDispatchStore(db);
   const inventory = createInventoryStore(db);
+  const effortStore = createEffortStore(db);
   dispatch.closeStranded();
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -1117,12 +1132,25 @@ export default async function plugin(bb: BbPluginApi) {
       warnings.add(`Team names: ignored ${teamNames.malformed} entr${teamNames.malformed === 1 ? "y" : "ies"} that are not PREFIX=Name.`);
     }
 
-    const labelled = placeClusters({
+    const inferred = placeClusters({
       workstreams,
       decisionFor: (cluster) => readDecision(clusterInputHash(cluster)),
       overrides,
       threshold: assignmentConfidenceThreshold,
       grouped,
+    });
+    const labelled = inferred.map((entry) => {
+      const explicit = effortStore.owner("ticket", entry.cluster.ticket) ?? entry.cluster.units.flatMap((unit) => {
+        const owner = unit.pr ? effortStore.owner("prUrl", unit.pr.url) : null;
+        return owner ? [owner] : [];
+      })[0];
+      if (!explicit) {
+        const repair = db.prepare(`SELECT label, hash FROM grouping_repairs WHERE ticket = ?`).get(entry.cluster.ticket) as { label: string; hash: string } | undefined;
+        return repair?.hash === clusterInputHash(entry.cluster) && overrides[entry.cluster.ticket] === undefined
+          ? { ...entry, label: repair.label, fit: 1 } : entry;
+      }
+      overrides[entry.cluster.ticket] = explicit.key;
+      return { ...entry, label: explicit.key, fit: 1 };
     });
     return {
       labelled,
@@ -1166,7 +1194,16 @@ export default async function plugin(bb: BbPluginApi) {
       const named = readGroupName("effort", effortMemberHash(clusters));
       if (named !== undefined) names[label] = named;
     }
-    return buildEfforts(labelled, names, grouped, rules);
+    for (const effort of effortStore.list()) names[effort.key] = { name: effort.name, cohesion: null };
+    const built = buildEfforts(labelled, names, grouped, rules).map((group) => {
+      const established = effortStore.get(group.key);
+      return established ? { ...group, name: established.name } : group;
+    });
+    for (const effort of effortStore.list()) if (!built.some((group) => group.key === effort.key)) built.push({
+      key: effort.key, level: "effort", parentKey: null, name: effort.name, rollup: effort.goal, lifecycle: "merged",
+      cohesion: null, clusters: [], repoCount: 0, merged: 0, total: 0, staleness: "fresh", surfaces: [], risk: "none",
+    });
+    return built;
   }
 
   /**
@@ -1356,7 +1393,17 @@ export default async function plugin(bb: BbPluginApi) {
     const dispatchPaused = dispatchAttempts.some((attempt) =>
       attempt.status === "launching" || attempt.status === "running" || attempt.status === "verifying" || attempt.status === "needs-you");
     const dispatchChoice = dispatchPaused ? null : selectCandidate(wired, dispatchPolicy.effort_key, dispatchAttempts, runs.recent(Number.MAX_SAFE_INTEGER));
+    const established = await Promise.all(effortStore.list().map(async (effort) => {
+      if (!effort.coordinatorThreadId) return effort;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: effort.coordinatorThreadId });
+        const state = thread.archivedAt === null && thread.deletedAt === null ? "ready" : "unavailable";
+        return state === effort.coordinatorState ? effort : effortStore.save({ ...effort, coordinatorState: state });
+      } catch { return { ...effort, coordinatorState: "unavailable" as const }; }
+    }));
+    const storedInventory = inventory.read();
     return {
+      efforts: established,
       groups: wired,
       depth: hierarchyDepth(groups),
       surfaces,
@@ -1364,7 +1411,9 @@ export default async function plugin(bb: BbPluginApi) {
       hostId: (await bb.sdk.system.config()).primaryHostId,
       lastScanAt: (await bb.storage.kv.get<string>("lastScanAt")) ?? null,
       scanning,
-      prInventory: { ...inventory.read(), refreshing: inventoryRefreshing || inventoryTargeting },
+      prInventory: { ...storedInventory, entries: storedInventory.entries.map((entry) => ({ ...entry,
+        ...(inventoryEffort(entry.pr, wired, established, pattern) ?? {}),
+      })), refreshing: inventoryRefreshing || inventoryTargeting },
       warnings: [
         ...((await bb.storage.kv.get<string[]>("warnings")) ?? []),
         ...warnings,
@@ -2078,15 +2127,36 @@ export default async function plugin(bb: BbPluginApi) {
     const contextOf = (cluster: Cluster) => clusterContext(cluster, (threadTitles.get(cluster.ticket) ?? []).slice(0, 3));
 
     const candidates = candidatesFrom(clusters, context);
+    writeDecisions(migrateCandidateDecisions(candidates, new Map(clusters.flatMap((cluster) => {
+      const hash = clusterInputHash(cluster), decision = readDecision(hash);
+      return decision ? [[hash, decision] as const] : [];
+    }))));
+    if (!(await bb.storage.kv.get<boolean>("stableCandidateMigration"))) {
+      const labels = new Set(candidates.map((candidate) => candidate.label));
+      let preserved = 0;
+      for (const item of clusters) {
+        const hash = clusterInputHash(item), decision = readDecision(hash);
+        if (decision?.assignment && !labels.has(decision.assignment.label)) {
+          db.prepare(`INSERT OR REPLACE INTO grouping_legacy_labels (hash, label) VALUES (?, ?)`).run(hash, decision.assignment.label);
+          preserved++;
+        }
+      }
+      await bb.storage.kv.set("stableCandidateMigration", true);
+      bb.log.info(`stable candidate migration: preserved ${preserved} unmatched legacy assignments for bounded membership review`);
+    }
+    const preservedLabels = new Set((db.prepare(`SELECT hash, label FROM grouping_legacy_labels`).all() as { hash: string; label: string }[])
+      .filter((row) => clusters.some((item) => clusterInputHash(item) === row.hash)).map((row) => row.label));
     const plan = planClusterAsks({
       clusters: clusters.map((cluster) => ({
         key: cluster.ticket,
         hash: clusterInputHash(cluster),
         baseHash: cluster.linear === undefined || cluster.linear === null ? undefined : clusterInputHash({ ...cluster, linear: undefined }),
         decision: readDecision(clusterInputHash(cluster)),
-        grouped: groupingRole(cluster) === "grouped",
+        grouped: groupingRole(cluster) === "grouped" && effortStore.owner("ticket", cluster.ticket) === null &&
+          !cluster.units.some((unit) => unit.pr && effortStore.owner("prUrl", unit.pr.url)) &&
+          (db.prepare(`SELECT hash FROM grouping_repairs WHERE ticket = ?`).get(cluster.ticket) as { hash: string } | undefined)?.hash !== clusterInputHash(cluster),
       })),
-      labels: new Set(candidates.map((candidate) => candidate.label)),
+      labels: new Set([...candidates.map((candidate) => candidate.label), ...preservedLabels]),
       memory: readAskMemory(),
     });
     for (const ask of plan.ask) bb.log.info(`jev cluster re-ask ${ask.key} (${ask.hash}): ${ask.reason}`);
@@ -2100,6 +2170,7 @@ export default async function plugin(bb: BbPluginApi) {
     const warnings: string[] = [];
     const usage: ModelUsage = { ...ZERO_USAGE };
     const jev = jevClient(typesafeApiKey, signal);
+    bb.log.info(`grouping normal asks planned: ${pending.length} clusters; preserved legacy groups remain eligible for bounded repair`);
     const cluster = await decideWithJev({ pending, candidates, jev });
     writeDecisions(cluster.decisions);
     // Remembered only once the answers are stored: a failed call must be re-asked, not counted as asked.
@@ -2109,6 +2180,39 @@ export default async function plugin(bb: BbPluginApi) {
     bb.log.info(
       `jev cluster: ${cluster.usage.calls} calls for ${pending.length} of ${clusters.length} clusters, ${cluster.usage.inputTokens} in / ${cluster.usage.outputTokens} out`,
     );
+
+    // Membership review is separate from naming. Its evidence cache survives
+    // repartitioning; an unchanged scan never pays to repeat the judgment.
+    const repairPlacement = await readPlacement();
+    const repairEfforts = effortsOf(repairPlacement.labelled, true, repairPlacement.rules);
+    const manual = await readOverrides();
+    const reviewed = new Map((db.prepare(`SELECT ticket, evidence FROM grouping_repairs`).all() as { ticket: string; evidence: string }[]).map((row) => [row.ticket, row.evidence]));
+    const repairPlan = planGroupingRepair({
+      groups: repairEfforts.flatMap((group) => {
+        const locked = effortStore.get(group.key) !== null || group.clusters.some((member) => manual[member.ticket] !== undefined);
+        return outsideGrouping(group.key) ? group.clusters.map((member) => ({ id: member.ticket, members: [member], mixed: false, locked }))
+          : [{ id: group.key, members: group.clusters, mixed: group.cohesion?.verdict === "mixed", locked }];
+      }), context, reviewed,
+      pathThreads: [...links].map(([id, entries]) => ({ id, title: threadFacts.get(id)?.title ?? threadFacts.get(id)?.titleFallback ?? "",
+        clusters: [...entries].some(([, tier]) => tier === "paths") ? [...entries.keys()] : [] })),
+    });
+    const estimate = repairRequestEstimate(repairPlan.jobs);
+    bb.log.info(`grouping repair: ${JSON.stringify(estimate)}`);
+    const repaired = await reviewGroupingRepair({ jobs: repairPlan.jobs, jev });
+    warnings.push(...repairPlan.warnings, ...repaired.warnings);
+    addUsage(usage, repaired.usage);
+    const clusterByTicket = new Map(clusters.map((item) => [item.ticket, item]));
+    const currentManual = await readOverrides();
+    db.transaction(() => {
+      for (const partition of repaired.partitions) for (const members of partition.members) {
+        const label = `repair:${hashString([...members].sort().join("\n"))}`;
+        for (const ticket of members) {
+          const member = clusterByTicket.get(ticket);
+          if (!member || effortStore.owner("ticket", ticket) || member.units.some((unit) => unit.pr && effortStore.owner("prUrl", unit.pr.url)) || currentManual[ticket] !== undefined) continue;
+          db.prepare(`INSERT OR REPLACE INTO grouping_repairs (ticket, label, hash, evidence) VALUES (?, ?, ?, ?)`).run(ticket, label, clusterInputHash(member), partition.evidence[ticket]);
+        }
+      }
+    })();
 
     const hostId =
       mode === "jev+claude" ? (await bb.sdk.system.config()).primaryHostId : null;
@@ -2131,7 +2235,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (naming !== null) {
       const grouped = new Map<string, Cluster[]>();
       for (const entry of placement.labelled) {
-        if (outsideGrouping(entry.label) || inContainer.has(entry.cluster.ticket)) continue;
+        if (outsideGrouping(entry.label) || inContainer.has(entry.cluster.ticket) || effortStore.get(entry.label)) continue;
         if (entry.fit < assignmentConfidenceThreshold) continue;
         const bucket = grouped.get(entry.label);
         if (bucket === undefined) grouped.set(entry.label, [entry.cluster]);
@@ -2286,16 +2390,109 @@ export default async function plugin(bb: BbPluginApi) {
   async function linkedThreads(path: string): Promise<{ id: string; title: string; tier: ThreadTier }[]> {
     for (const group of (await board()).groups) {
       for (const cluster of group.clusters) {
-        if (cluster.units.some((unit) => unit.path === path)) return cluster.threads;
+        if (cluster.units.some((unit) => unit.path === path)) {
+          const unit = cluster.units.find((unit) => unit.path === path)!;
+          const effort = (unit.pr ? effortStore.owner("prUrl", unit.pr.url) : null) ?? effortStore.owner("ticket", cluster.ticket);
+          const parent = effort && unit.pr ? await effortParent(effortStore, effort, unit.pr.url, (id) => bb.sdk.threads.get({ threadId: id })) : null;
+          return parent && !cluster.threads.some((thread) => thread.id === parent.thread.id)
+            ? [{ id: parent.thread.id, title: parent.thread.title ?? effort!.name, tier: "started" as const }, ...cluster.threads]
+            : cluster.threads;
+        }
       }
     }
     return [];
   }
 
+  async function effortPlan(groupKey: string): Promise<EffortPlan> {
+    const current = await board();
+    const established = effortStore.source(groupKey);
+    const group = current.groups.find((entry) => entry.key === groupKey);
+    if (!group && !established) return { ok: false, error: "That group is no longer on the board. Refresh and choose its current effort." };
+    if (!established && (group!.level !== "effort" || outsideGrouping(group!.key))) return { ok: false, error: "Choose an outcome-based effort rather than a catch-all container." };
+    const keys = new Set([groupKey]);
+    for (let pass = 0; pass < 3; pass++) for (const entry of current.groups) if (entry.parentKey && keys.has(entry.parentKey)) keys.add(entry.key);
+    const clusters = current.groups.filter((entry) => keys.has(entry.key)).flatMap((entry) => entry.clusters);
+    const members: EffortMembers = established?.members ?? normalizeMembers({
+      tickets: clusters.map((cluster) => cluster.ticket),
+      prUrls: [...clusters.flatMap((cluster) => cluster.units.flatMap((unit) => unit.pr ? [unit.pr.url] : [])),
+        ...current.prInventory.entries.filter((entry) => entry.effortKey && keys.has(entry.effortKey)).map((entry) => entry.pr.url)],
+    });
+    if (members.tickets.length === 0 && members.prUrls.length === 0) return { ok: false, error: "This group has no tracked work to coordinate." };
+    const allProjects = await bb.sdk.projects.list();
+    const paths = clusters.flatMap((cluster) => cluster.units.map((unit) => unit.path));
+    const projects = allProjects.filter((project) => project.id === established?.projectId || project.sources.some((source) => paths.some((path) => withinPath(path, source.path))))
+      .map((project) => ({ id: project.id, name: project.name }));
+    const choices = (await bb.sdk.threads.list({ archived: false, limit: 100 })).filter((thread) =>
+      thread.status === "idle" && thread.deletedAt === null && projects.some((project) => project.id === thread.projectId));
+    const eligible = (await Promise.all(choices.slice(0, 50).map(async (thread) => {
+      try { return await bb.sdk.threads.get({ threadId: thread.id }); } catch { return null; }
+    }))).filter((thread): thread is NonNullable<typeof thread> => thread !== null && thread.canSpawnChild);
+    let effort = established;
+    if (effort?.coordinatorThreadId) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: effort.coordinatorThreadId });
+        effort = effortStore.save({ ...effort, coordinatorState: thread.archivedAt === null && thread.deletedAt === null ? "ready" : "unavailable" });
+      } catch { effort = effortStore.save({ ...effort, coordinatorState: "unavailable" }); }
+    }
+    return { ok: true, name: effort?.name ?? group!.name, goal: effort?.goal ?? "", members, projects,
+      threads: eligible.map((thread) => ({ id: thread.id, title: thread.title ?? thread.titleFallback ?? thread.id, projectId: thread.projectId })), effort };
+  }
+
+  const coordinators = createCoordinatorService(effortStore, {
+    get: (threadId) => bb.sdk.threads.get({ threadId }),
+    rename: (threadId, title) => bb.sdk.threads.update({ threadId, title }),
+    associate: (threadId, effortId) => bb.sdk.threads.updatePluginMetadata({ threadId, set: { effortId, role: "coordinator" } }),
+    spawn: async (args) => {
+      const projects = await bb.sdk.projects.list();
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      const project = projects.find((entry) => entry.id === args.projectId);
+      const source = project?.sources.find((entry) => entry.hostId === hostId) ?? project?.sources[0];
+      if (!source) throw new Error("The selected project has no available source for a separate coordinator worktree.");
+      return bb.sdk.threads.spawn({ ...args, environment: { type: "provider", environmentProviderId: "git-worktree",
+        machine: { type: "existing", hostId: source.hostId }, inputs: { branch: { kind: "default" } } } });
+    },
+    recover: async (effortId, projectId) => {
+      const matches: string[] = [];
+      for (let offset = 0; offset < 2000; offset += 100) {
+        const rows = await bb.sdk.threads.list({ projectId, originPluginId: bb.pluginId, includeHidden: true, limit: 100, offset });
+        for (const thread of rows) {
+          const metadata = await bb.sdk.threads.getPluginMetadata({ threadId: thread.id });
+          if (metadata.effortId === effortId && metadata.role === "coordinator" && thread.archivedAt === null && thread.deletedAt === null) matches.push(thread.id);
+        }
+        if (rows.length < 100) break;
+      }
+      return matches;
+    },
+  });
+
+  const launchingCheckouts = new Set<string>();
   const agentSdk: AgentSdk = {
     projects: { list: () => bb.sdk.projects.list() },
     threads: {
-      spawn: (args) => bb.sdk.threads.spawn(args),
+      spawn: async (args) => {
+        const path = args.environment.workspace.path;
+        if (launchingCheckouts.has(path)) throw new Error("Another Workstreams action is launching in this checkout.");
+        launchingCheckouts.add(path);
+        try {
+          const active = await activeCheckoutThread(path, args.environment.hostId, (offset) => bb.sdk.threads.list({ archived: false, includeHidden: true, limit: 100, offset }));
+          if (active) throw new Error(`Thread ${active} is already working in this checkout. Wait for it or stop it before starting another writer.`);
+          const raw = readUnits().find((unit) => unit.path === path);
+          const effort = (raw?.pr ? effortStore.owner("prUrl", raw.pr.url) : null) ?? effortStore.owner("ticket", args.pluginMetadata.ticket);
+          const route = effort && raw?.pr ? await effortParent(effortStore, effort, raw.pr.url, (id) => bb.sdk.threads.get({ threadId: id })) : null;
+          let parentThreadId = args.parentThreadId ?? route?.thread.id;
+          if (parentThreadId) {
+            const parent = await bb.sdk.threads.get({ threadId: parentThreadId });
+            if (!parent.canSpawnChild || parent.archivedAt !== null || parent.deletedAt !== null) throw new Error("The selected parent can no longer own a child thread. Reopen the action preview.");
+          }
+          const role = route !== null && route.thread.id === parentThreadId ? route.role : "pr";
+          const metadata = effort && raw?.pr ? { ...args.pluginMetadata, effortId: effort.id, role, prUrl: raw.pr.url } : args.pluginMetadata;
+          const { parentThreadId: _previous, ...request } = args;
+          const prompt = effort ? `${request.prompt}\nEffort context (data): ${JSON.stringify({ name: effort.name, goal: effort.goal, coordinatorThreadId: effort.coordinatorThreadId })}. Keep this action scoped to the requested PR and report the outcome and remaining blockers.` : request.prompt;
+          const thread = await bb.sdk.threads.spawn({ ...request, prompt, ...(parentThreadId ? { parentThreadId } : {}), pluginMetadata: metadata });
+          if (effort && raw?.pr) effortStore.recordWorker(effort.id, thread.id, raw.pr.url, role);
+          return thread;
+        } finally { launchingCheckouts.delete(path); }
+      },
       get: (args) => bb.sdk.threads.get(args),
       context: (args) => bb.sdk.threads.context(args),
     },
@@ -2482,6 +2679,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    effort_plan: ({ groupKey }) => effortPlan(groupKey),
+    effort_coordinate: async (input) => {
+      const result = await coordinators.coordinate(input, await effortPlan(input.groupKey));
+      if (result.ok && dispatch.policy().effort_key === input.groupKey) dispatch.setPolicy(dispatch.policy().mode, result.effort.key);
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+      return result;
+    },
     inventory_refresh: () => {
       if (inventoryRefreshing || inventoryTargeting) return { started: false };
       void refreshInventory();
@@ -2611,7 +2815,14 @@ export default async function plugin(bb: BbPluginApi) {
       if ((await scannedUnit(path)) === undefined) {
         return { ok: false as const, error: "That checkout is not on the board any more. Rescan and try again." };
       }
-      return { ok: true as const, ...(await planAgent(agentSdk, action, await linkedThreads(path))) };
+      const plan = await planAgent(agentSdk, action, await linkedThreads(path));
+      const found = await scannedUnit(path);
+      const effort = (found?.raw.pr ? effortStore.owner("prUrl", found.raw.pr.url) : null) ?? (found ? effortStore.owner("ticket", found.ticket) : null);
+      const parent = effort && found?.raw.pr ? await effortParent(effortStore, effort, found.raw.pr.url, (id) => bb.sdk.threads.get({ threadId: id })) : null;
+      if (parent) plan.recommendation = { mode: "subthread", threadId: parent.thread.id, reason: parent.role === "followup"
+        ? `A bounded follow-up under this PR's worker will report its result there.`
+        : `A PR worker under ${effort!.name} will report its result to the effort coordinator.` };
+      return { ok: true as const, ...plan };
     },
     agent_run: async ({ path, action, mode, threadId, prompt }) => {
       if (mode === "continue") {
@@ -2638,7 +2849,7 @@ export default async function plugin(bb: BbPluginApi) {
         });
       } catch (error) {
         runs.discard(runId);
-        throw error;
+        return { ok: false as const, error: String(error).slice(0, 400) };
       }
       if (!result.ok) runs.discard(runId);
       else runs.attach(runId, result.threadId);

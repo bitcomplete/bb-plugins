@@ -13,10 +13,12 @@ import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 
-export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, checkoutFiltersActive = false }: {
+export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, embeddedEffortKey, checkoutFiltersActive = false }: {
   board: Board; locals: Row[]; now: number; width: number;
   /** Embed inventory-only PRs under Efforts without adding another set of controls. */
   unassignedQuery?: string;
+  /** When set, render only server-associated siblings under this effort heading. */
+  embeddedEffortKey?: string;
   checkoutFiltersActive?: boolean;
   onRequest: (request: ActionRequest) => void; onMessage: (row: Row) => void;
   onCheckout: (row: Row) => void; onStart: (row: Row) => void;
@@ -29,7 +31,7 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
   const [refreshPending, setRefreshPending] = useState(false);
   const rows = useMemo(() => prBacklog(inventory.entries, locals, now), [inventory.entries, locals, now]);
   const embedded = unassignedQuery !== undefined;
-  const shown = rows.filter((row) => (!embedded || row.local === null) && (embedded || !approvedOnly || row.pr.reviewDecision === "APPROVED") && backlogMatches(row, unassignedQuery ?? query));
+  const shown = rows.filter((row) => (!embedded || (row.local === null && row.effortKey === embeddedEffortKey)) && (embedded || !approvedOnly || row.pr.reviewDecision === "APPROVED") && backlogMatches(row, unassignedQuery ?? query));
   const approved = rows.filter((row) => row.pr.reviewDecision === "APPROVED").length;
   const ready = rows.filter((row) => row.group === "ready").length;
   const compact = width < 1060;
@@ -59,6 +61,7 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
       repo: row.repo, title: row.pr.title, age: rowAge(row.pr, null), unit: { pr: row.pr, prUrl: row.pr.url },
     } });
   };
+  if (embeddedEffortKey !== undefined && shown.length === 0) return null;
   if (embedded && shown.length === 0 && inventory.complete && inventory.warnings.length === 0 && !inventory.refreshing) return null;
   return (
     <>
@@ -80,26 +83,27 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
 
           {shown.length === 0 ? <p className="px-2 py-5 text-[12px] text-muted-foreground">{inventory.refreshing ? "Reading your open PRs from GitHub…" : rows.length === 0 ? "No open PRs found in this scope." : "No matching PRs."}</p> : null}
           </>}
-          {!inventory.complete || inventory.warnings.length > 0 ? (
+          {embeddedEffortKey === undefined && (!inventory.complete || inventory.warnings.length > 0) ? (
             <details className="mx-2 mt-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-[11.5px] text-muted-foreground">
               <summary className="cursor-pointer text-amber-700 dark:text-amber-300">{inventory.lastAttemptAt === null ? "Inventory has not been refreshed yet" : "Coverage is partial; some PRs may be missing or stale"}</summary>
               <ul className="mt-1 list-disc space-y-1 pl-4">{inventory.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
             </details>
           ) : null}
-          {embedded && inventory.refreshing && shown.length === 0 ? <p className="px-2 pt-3 text-[11.5px] text-muted-foreground">Reading PR backlog from GitHub…</p> : null}
+          {embedded && embeddedEffortKey === undefined && inventory.refreshing && shown.length === 0 ? <p className="px-2 pt-3 text-[11.5px] text-muted-foreground">Reading PR backlog from GitHub…</p> : null}
           {(embedded ? ["unassigned" as const] : BACKLOG_GROUPS).map((group) => {
             const items = group === "unassigned" ? shown : shown.filter((row) => row.group === group);
             if (items.length === 0) return null;
             const label = group === "unassigned" ? "No effort assigned" : BACKLOG_LABEL[group];
-            return <section key={group} aria-label={label} className="pt-5">
-              <h2 className="flex items-baseline gap-2 px-2 pb-1.5 text-[13px] font-semibold">{label}<span className="font-mono text-[11px] font-normal text-muted-foreground">{items.length}</span></h2>
-              {embedded ? <p className="px-2 pb-2 text-[11px] text-muted-foreground">Your open PRs without a scanned checkout. Merge, update, or nudge here; agent fixes need a checkout.{checkoutFiltersActive ? " Checkout date and surface filters do not apply to these PRs; search still does." : ""}</p> : null}
+            return <section key={group} aria-label={embeddedEffortKey === undefined ? label : "Related PRs without checkouts"} className={embeddedEffortKey === undefined ? "pt-5" : undefined}>
+              {embeddedEffortKey === undefined ? <h2 className="flex items-baseline gap-2 px-2 pb-1.5 text-[13px] font-semibold">{label}<span className="font-mono text-[11px] font-normal text-muted-foreground">{items.length}</span></h2> : null}
+              {embeddedEffortKey === undefined ? null : <p className="mx-2 mt-2 border-t border-border/40 pb-1 pt-2 text-[10.5px] text-muted-foreground">Related PRs without checkouts</p>}
+              {embedded && (embeddedEffortKey === undefined || checkoutFiltersActive) ? <p className="px-2 pb-2 text-[11px] text-muted-foreground">{embeddedEffortKey === undefined ? "Your open PRs without a scanned checkout. Merge, update, or nudge here; agent fixes need a checkout." : "Related PRs have no scanned checkout."}{checkoutFiltersActive ? " Checkout date and surface filters do not apply to these PRs; search still does." : ""}</p> : null}
               <ul>{items.map((row) => {
                 const age = rowAge(row.pr, null);
                 const threads = row.local === null ? [] : threadsOf(row.local);
                 const needsCheckout = row.action?.kind === "agent" && row.local === null;
                 const gate = row.stale ? row.verb : row.pr.reviewDecision === "APPROVED" && !shortVerb(row.verb).startsWith("Approved") ? `Approved · ${shortVerb(row.verb)}` : shortVerb(row.verb);
-                const detail = [row.pr.title, row.local === null ? "No scanned checkout. Agent fixes need a checkout." : `Effort: ${row.local.effort}`, row.parent === null ? null : `Waiting on ${row.parent.repo} #${row.parent.pr.number} (${row.parent.pr.title})`, row.pr.resolvedReviewThreads ? `${row.pr.resolvedReviewThreads} review threads resolved` : null].filter(Boolean).join("\n");
+                const detail = [row.pr.title, row.local === null ? `${row.effortName === undefined ? "" : `Effort: ${row.effortName}\n`}No scanned checkout. Agent fixes need a checkout.` : `Effort: ${row.local.effort}`, row.parent === null ? null : `Waiting on ${row.parent.repo} #${row.parent.pr.number} (${row.parent.pr.title})`, row.pr.resolvedReviewThreads ? `${row.pr.resolvedReviewThreads} review threads resolved` : null].filter(Boolean).join("\n");
                 return <li key={row.pr.url} data-pr-backlog-row id={`backlog-${row.pr.url}`} className={cn("grid min-w-0 items-center gap-x-3 gap-y-1 rounded-md border-b border-border/40 px-2 py-2 text-[12px] hover:bg-foreground/[0.035]", compact ? tight ? "grid-cols-[minmax(0,1fr)_3rem_6.5rem]" : "grid-cols-[minmax(9rem,1fr)_minmax(10rem,1fr)_3rem_6.5rem]" : "grid-cols-[11rem_minmax(0,1fr)_12rem_3rem_8rem_3rem]")}>
                   <UrlLink href={row.pr.url} title={detail} className="col-start-1 row-start-1 flex min-w-0 items-baseline gap-1.5 text-foreground underline-offset-2 hover:underline"><span className="truncate font-semibold">{row.repo.split("/").at(-1)}</span><span className="shrink-0 font-mono text-[11.5px]">#{row.pr.number}</span></UrlLink>
                   <Tip label={detail}><span tabIndex={0} className={cn("min-w-0 truncate text-foreground/80 outline-none focus-visible:ring-2 focus-visible:ring-ring", compact ? tight ? "col-span-2 col-start-1 row-start-2" : "col-span-3 col-start-1 row-start-2" : "col-start-2 row-start-1")}>{row.pr.title}</span></Tip>

@@ -1347,29 +1347,22 @@ const SIMILARITY_WEIGHTS: Signals = { area: 0.6, vocab: 0.4, linear: 0.3, thread
  * own. At least two must agree, and the weighted sum then ranks the pairs that
  * passed against the merge threshold.
  *
- * The exception is Linear. A pair that shares a Linear parent issue or project
+ * The exception is an explicit Linear parent. A pair that shares a parent issue
  * may merge when ANY other signal (code area, vocabulary, shared thread) is
- * nonzero, however weak, bypassing both the gate and the threshold. The user
- * chose this knowing that on real data "any other signal" is almost always
- * true, so for Linear-linked clusters Linear effectively decides the group.
- * It deliberately reverses the earlier "Linear informs, it never decides", for
- * the cross-repo groups that rule kept apart: Linear-sharing pairs in an
- * offline replay of live data scored 0.03-0.23 on vocabulary and never cleared
- * two signals. Linear with no other signal at all still merges nothing.
+ * nonzero, however weak, bypassing both the gate and the threshold. A parent
+ * can express one outcome implemented across repositories. A project is broader:
+ * it contributes affinity under the normal gate, without overriding the floor
+ * or threshold. This supersedes the previous project-or-parent exception.
  */
 export function similarity(a: SeedItem, b: SeedItem, weights: ReadonlyMap<string, number> = areaWeights([a, b])): number {
   const signals = signalsBetween(a, b, weights);
   const sum = (Object.keys(signals) as (keyof Signals)[]).reduce((total, name) => total + SIMILARITY_WEIGHTS[name] * signals[name], 0);
-  if (sharesLinear(a, b) && (signals.area > 0 || signals.vocab > 0 || signals.thread > 0)) {
+  if ([...a.parents].some((parent) => b.parents.has(parent)) && (signals.area > 0 || signals.vocab > 0 || signals.thread > 0)) {
     // Eligible at any score; still ranked by its sum against other pairs.
     return Math.max(sum, MERGE_THRESHOLD + 1e-9);
   }
   const agreeing = (Object.keys(signals) as (keyof Signals)[]).filter((name) => signals[name] >= SIGNAL_FLOOR).length;
   return agreeing < SIGNALS_REQUIRED ? 0 : sum;
-}
-
-function sharesLinear(a: SeedItem, b: SeedItem): boolean {
-  return [...a.parents].some((parent) => b.parents.has(parent)) || [...a.projects].some((project) => b.projects.has(project));
 }
 
 export const MERGE_THRESHOLD = 0.25;

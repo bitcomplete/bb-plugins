@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { prSchema, type Pr } from "./contract.js";
 import type { Row } from "./inbox.js";
-import { backlogMatches, prBacklog, type BacklogEntry } from "./pr-backlog.js";
+import { backlogMatches, includeRemoteEfforts, prBacklog, remoteAttentionRows, remotePrsByEffort, type BacklogEntry } from "./pr-backlog.js";
+import { workstreamAttention, hasBoardRows } from "./workstream-attention.js";
 import { prLifecycle, unitLifecycle } from "./workstreams.js";
 
 function pr(patch: Partial<Pr> = {}): Pr {
@@ -51,5 +52,35 @@ describe("authored PR backlog", () => {
     expect(prLifecycle(pr({ reviewDecision: "CHANGES_REQUESTED", reviewFollowupPosted: true }))).toBe("awaiting-rereview");
     expect(unitLifecycle({ pr: pr({ state: "MERGED" }), shipped: true } as Parameters<typeof unitLifecycle>[0])).toBe("shipped");
     expect(unitLifecycle({ pr: pr({ isDraft: true }), dirty: true } as Parameters<typeof unitLifecycle>[0])).toBe("active");
+  });
+});
+
+describe("inventory effort associations", () => {
+  it("uses server-confirmed effort membership without creating a checkout row", () => {
+    const rows = prBacklog([{ ...entry(), effortKey: "effort:stable", effortName: "Account experience" }, entry({ number: 2, url: "https://github.com/acme/app/pull/2", title: "Unrelated work" })], [], now);
+    const remote = remotePrsByEffort(rows, "account experience");
+    expect([...remote.keys()]).toEqual(["effort:stable"]);
+    expect(includeRemoteEfforts([], remote)).toEqual([{ key: "effort:stable", label: "Account experience", rows: [], section: null }]);
+    expect(rows.every((row) => row.local === null)).toBe(true);
+    expect(remotePrsByEffort(rows, "unrelated").size).toBe(0);
+  });
+
+  it("does not duplicate a matching checkout or an existing effort heading", () => {
+    const local = { key: "/real/app", effortKey: "effort:stable", effort: "Account experience", unit: { path: "/real/app", pr: pr(), stack: null } } as Row;
+    const entries = [{ ...entry(), effortKey: "effort:stable", effortName: "Account experience" }];
+    expect(remotePrsByEffort(prBacklog(entries, [local], now), "").size).toBe(0);
+    const remote = remotePrsByEffort(prBacklog(entries, [], now), "");
+    const heading = { key: "effort:stable", label: "Account experience", rows: [local], section: null };
+    expect(includeRemoteEfforts([heading], remote)).toEqual([heading]);
+  });
+
+  it("keeps remote work in effort ranking without inventing checkout staleness", () => {
+    const fresh = { ...entry(), effortKey: "effort:stable", effortName: "Account experience" };
+    const [attention] = workstreamAttention(remoteAttentionRows(prBacklog([fresh], [], now)));
+    expect(attention).toMatchObject({ key: "effort:stable", ready: 1, oldCommits: 0 });
+    expect(hasBoardRows(attention!)).toBe(true);
+    const [stale] = workstreamAttention(remoteAttentionRows(prBacklog([{ ...fresh, stale: true }], [], now)));
+    expect(stale).toMatchObject({ ready: 0, unknown: 1, oldCommits: 0 });
+    expect(workstreamAttention(remoteAttentionRows(prBacklog([entry()], [], now)))).toEqual([]);
   });
 });

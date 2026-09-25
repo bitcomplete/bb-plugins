@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
 import { planClusterAsks } from "./asks.js";
-import { candidatesFrom, clusterContext, decideWithJev, nameGroups, namingContext, seedAssignables, type JevClient, type NamingClient } from "./enrich.js";
+import { candidatesFrom, clusterContext, decideWithJev, migrateCandidateDecisions, nameGroups, namingContext, seedAssignables, type JevClient, type NamingClient } from "./enrich.js";
 import { THREAD_SPAN_MAX, threadWeights, type ThreadTier } from "./threads.js";
 import {
   AREA_COMMON_SHARE,
@@ -235,7 +235,25 @@ describe("threadWeights", () => {
   });
 });
 
-describe("stable candidate labels one level up", () => {
+describe("stable candidate labels", () => {
+  it("keeps identity when a member title changes, and distinguishes identical titles", () => {
+    const first = cluster("ABC-1", "quill", [], "Improve delivery reliability");
+    const second = cluster("ABC-2", "folio", [], "Improve delivery reliability");
+    const before = candidatesFrom([first, second]);
+    const after = candidatesFrom([{ ...first, units: first.units.map((unit) => ({ ...unit, pr: { ...unit.pr!, title: "Improve job retry reliability" } })) }, second]);
+    expect(before.map((candidate) => candidate.label)).toEqual(after.map((candidate) => candidate.label));
+    expect(new Set(before.map((candidate) => candidate.label)).size).toBe(2);
+  });
+
+  it("migrates only known legacy assignment labels without rerunning the model", () => {
+    const candidates = candidatesFrom([cluster("ABC-1", "quill", [], "Improve delivery reliability")]);
+    const cached = { summary: "An existing summary", assignment: { label: candidates[0]!.legacyLabel!, fit: 0.75 } };
+    const updates = migrateCandidateDecisions(candidates, new Map([["known", cached], ["unknown", { ...cached, assignment: { label: "Unrelated former effort", fit: 1 } }]]));
+    expect([...updates.keys()]).toEqual(["known"]);
+    expect(updates.get("known")).toEqual({ ...cached, assignment: { label: "seed:ABC-1", fit: 0.75 } });
+    expect(migrateCandidateDecisions(candidates, updates).size).toBe(0);
+  });
+
   it("keeps every candidate label when an effort is renamed, so no cached program assignment vanishes and nothing is re-asked", () => {
     const members = (names: string[]) =>
       ["effort-a", "effort-b", "effort-c"].map((id, index) => ({
@@ -387,7 +405,7 @@ describe("ticketless checkouts, keyed on their pull request", () => {
   });
 });
 
-describe("a shared Linear parent or project merges with any second signal", () => {
+describe("an explicit Linear parent differs from broad project affinity", () => {
   // One shared word out of twelve: nonzero, but far below the signal floor.
   const weakVocab = (own: string) => new Set(["shelves", ...Array.from({ length: 11 }, (_, i) => `${own}${i}`)]);
   // One small shared area beside two large private ones.
@@ -400,13 +418,13 @@ describe("a shared Linear parent or project merges with any second signal", () =
     expect(similarity(a, b)).toBeGreaterThan(MERGE_THRESHOLD);
   });
 
-  it("merges a project share whose only other agreement is a weak code area", () => {
+  it("keeps unrelated outcomes apart when a broad project and weak code area are their only connection", () => {
     const a = item("a", { projects: new Set(["Print run"]), areas: weakArea("a") });
     const b = item("b", { projects: new Set(["Print run"]), areas: weakArea("b") });
     const weights = areaWeights([a, b]);
     expect(signalsBetween(a, b, weights).area).toBeGreaterThan(0);
     expect(signalsBetween(a, b, weights).area).toBeLessThan(0.1);
-    expect(similarity(a, b, weights)).toBeGreaterThan(MERGE_THRESHOLD);
+    expect(similarity(a, b, weights)).toBe(0);
   });
 
   it("does NOT merge a Linear share when every other signal is zero", () => {

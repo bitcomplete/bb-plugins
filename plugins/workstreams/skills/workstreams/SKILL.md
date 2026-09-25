@@ -223,12 +223,13 @@ separately: `bb plugin logs workstreams`.
   signals: code areas (where in the repo a branch changes files), branch and PR
   vocabulary, Linear (a shared parent issue or project), and a shared thread.
   Two clusters are seeded together only when at least two of them agree, except
-  that a shared Linear parent or project merges a pair when any other signal is
-  nonzero. The repo is not a signal: in a monorepo every pair shares it. See
+  that a shared Linear parent issue can merge a pair when another signal is
+  nonzero. A broad shared project follows the normal evidence threshold. The repo is not a signal: in a monorepo every pair shares it. See
   [Grouping signals](#grouping-signals).
 - **Linear decides linked groups, and only those.** On its own Linear merges
-  nothing, but a shared parent or project merges a pair that shares any other
-  signal at all, so in practice Linear decides where tickets are linked. In naming, the project name
+  nothing. A shared parent issue has a narrow exception when another signal
+  supports the pair; shared project membership follows the normal evidence
+  threshold. In naming, the project name
   is one candidate among the members' own phrases, and ticket titles, parents
   and projects are passed as context, never as the name. With no Linear key the
   Linear code path is inert: no request is made and nothing Linear-shaped
@@ -428,7 +429,7 @@ that thread has newer activity.
 The panel opens on the last view you used in this browser, or the **Map** on
 your first visit. **Map** and **Board** have deep links and read the same board
 data. **Efforts** groups all tracked checkouts by effort; **PR backlog** groups
-your open PRs by next action. The effort chooser uses all scanned rows, even
+your open PRs by next action. The effort chooser counts scanned rows and associated inventory PRs, even
 when search or filters hide some.
 It counts a PR once by URL and ranks efforts by their first available move:
 ready to merge, update branch, fix, respond, waiting for review, then work in
@@ -450,10 +451,26 @@ confirmed review threads were resolved; reviewer marks still show the latest
 review states, including approval.
 
 The **PR backlog** lists your open PRs in organizations represented by scanned
-projects. Open PRs without a scanned checkout also appear under **No effort
-assigned** in Efforts. Approved records a review decision; Ready to merge also
+projects. A saved PR membership or unambiguous ticket match can place an open
+PR without a checkout under its effort. Other remote PRs appear under **No
+effort assigned** in Efforts. Approved records a review decision; Ready to merge also
 requires checks, threads, branch state, and stack dependencies to clear.
 Direct GitHub actions work on remote PRs; agent repairs need a scanned checkout.
+
+**🧭 Coordinate** previews an effort's linked tickets and PRs, editable name and
+goal, and the matching BB projects. Explicit confirmation creates a planning
+thread in a separate worktree using the selected project's default agent, or
+associates an eligible idle thread. An existing thread is renamed to **🧭 <effort name>**
+but keeps its parent; association does not start a turn. The saved
+effort ID preserves the chosen identity and membership across later grouping.
+The heading then opens the effort thread. Team containers and Unsorted do not
+offer this control.
+
+Manual repair planning prefers a previous idle PR worker as parent for a
+follow-up, then the effort coordinator. The dialog shows that recommendation
+before launch. Repairs keep the PR's real checkout; coordinator presence does
+not satisfy a merge gate or replace a PR's latest result. Archived or missing
+coordinators require an explicit eligible replacement or restoration.
 
 Archive an idle leaf thread from its thread menu. **Archived threads** shows
 archive history and lets you undo it. Threads with children must be archived
@@ -480,8 +497,14 @@ the thresholds are exactly what they were before the hierarchy existed.
 - **Linear.** A shared parent issue, or (weaker) a shared project.
 - **Threads.** A thread strongly linked (started from the Board, running in the
   checkout, or naming the ticket) to n clusters gives each pair 1/(n−1).
-  Path-only links never count, and a thread linking more than eight clusters
+  Path-only links do not seed groups directly, and a thread linking more than eight clusters
   counts nothing.
+
+A bounded Jev review can revisit uncertain singleton and mixed-group
+neighborhoods using evidence about a shared outcome. Path-only thread links
+participate only when the thread's title also matches the work. The review
+reuses cached decisions when the evidence is unchanged and leaves established
+effort membership fixed.
 
 ## Linear details
 

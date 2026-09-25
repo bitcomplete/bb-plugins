@@ -150,7 +150,7 @@ export const inventoryInspectionSchema = z.object({
 }).strict();
 export const inventoryBoardSchema = z.object({
   owners: z.array(z.string()),
-  entries: z.array(inventoryEntrySchema.extend({ stale: z.boolean() })),
+  entries: z.array(inventoryEntrySchema.extend({ stale: z.boolean(), effortKey: z.string().optional(), effortName: z.string().optional() })),
   complete: z.boolean(),
   lastSuccessAt: z.string().nullable(),
   lastAttemptAt: z.string().nullable(),

@@ -119,6 +119,18 @@ const typeface = cluster("OPS-1111", [
 ]);
 
 describe("decideWithJev", () => {
+  it("does not place work in the first effort when a multi-candidate answer omits or invents its choice", async () => {
+    for (const choice of [undefined, "not an offered effort"]) {
+      const { client } = stubJev((name) => {
+        if (name.endsWith("_fit")) return { type: "score", score: 4, confidence: 1 };
+        if (name.endsWith("_effort") && choice !== undefined) return { type: "choice", choice, confidence: 1 };
+        return undefined;
+      });
+      const result = await decideWithJev({ pending: [balance], candidates: candidatesFrom([balance, typeface]), jev: client });
+      expect(result.decisions.get(clusterInputHash(balance))?.assignment).toBeNull();
+    }
+  });
+
   it("asks nothing when nothing changed, because a rescan of an unchanged board must cost zero model calls", async () => {
     const { client, asks } = stubJev(() => undefined);
     const result = await decideWithJev({
@@ -171,7 +183,7 @@ describe("decideWithJev", () => {
 
   it("normalizes the rubric score into the 0-1 range the confidence threshold is expressed in, so the setting means what it says", async () => {
     const { client } = stubJev((name) => {
-      if (name.endsWith("_effort")) return { type: "choice", choice: "Show gift card balance in the cart", confidence: 0.9 };
+      if (name.endsWith("_effort")) return { type: "choice", choice: "seed:ABC-101", confidence: 0.9 };
       if (name.endsWith("_fit")) return { type: "score", score: 3, confidence: 0.8 };
       return undefined;
     });
@@ -186,7 +198,7 @@ describe("decideWithJev", () => {
 
   it("records a bottom-of-rubric score as a near-zero fit, so the threshold can route it to Unsorted rather than force-fitting it", async () => {
     const { client } = stubJev((name) => {
-      if (name.endsWith("_effort")) return { type: "choice", choice: "Show gift card balance in the cart", confidence: 0.3 };
+      if (name.endsWith("_effort")) return { type: "choice", choice: "seed:ABC-101", confidence: 0.3 };
       if (name.endsWith("_fit")) return { type: "score", score: 0, confidence: 0.9 };
       return undefined;
     });

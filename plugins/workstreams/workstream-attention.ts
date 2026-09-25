@@ -20,19 +20,24 @@ export type WorkstreamAttention = {
 };
 type CountKey = Exclude<keyof WorkstreamAttention, "key" | "name">;
 
+/** Attention needs PR facts, not a checkout path. */
+export type AttentionRow = Pick<Row, "effortKey" | "effort" | "section" | "verb"> & {
+  unit: Pick<Row["unit"], "ticket" | "pr" | "lifecycle"> & Partial<Pick<Row["unit"], "observed" | "staleness">>;
+};
+
 const PRIORITY: CountKey[] = [
   "ready", "update", "fix", "respond", "waitingRereview", "waitingReview", "inFlight", "waitingOther", "unknown", "parked", "merged", "inReleaseTag",
 ];
 
-/** Rank all scanned workstreams by the first available forward move, then name. */
-export function workstreamAttention(rows: readonly Row[]): WorkstreamAttention[] {
+/** Rank tracked workstreams by the first available forward move, then name. */
+export function workstreamAttention<T extends AttentionRow>(rows: readonly T[]): WorkstreamAttention[] {
   const byKey = new Map<string, WorkstreamAttention>();
   const seenPrs = new Set<string>();
   for (const row of rows) {
     if (isTicketlessClone(row.unit)) continue;
     const prUrl = row.unit.pr?.url;
     if (prUrl) {
-      const id = `${row.effortKey}\0${prUrl}`;
+      const id = `${row.effortKey}\0${prUrl.toLowerCase()}`;
       if (seenPrs.has(id)) continue;
       seenPrs.add(id);
     }
@@ -50,7 +55,7 @@ export function workstreamAttention(rows: readonly Row[]): WorkstreamAttention[]
     else if (row.section === "fix") item.fix++;
     else if (row.section === "respond") item.respond++;
     else if (row.section === "waiting" && row.unit.lifecycle === "awaiting-rereview") item.waitingRereview++;
-    else if (row.section === "waiting" && row.unit.lifecycle === "awaiting-review") item.waitingReview++;
+    else if (row.section === "waiting" && row.unit.lifecycle === "awaiting-review" && row.verb !== "Checks pending") item.waitingReview++;
     else if (row.unit.lifecycle === "unverified") item.unknown++;
     else if (row.section === "waiting") item.waitingOther++;
     else if (row.section === "in-flight") item.inFlight++;
@@ -82,7 +87,7 @@ export function attentionDetail(item: WorkstreamAttention): string {
   return parts.length === 0 ? "No checkouts in this workstream." : `${parts.join(" · ")}.`;
 }
 
-/** Completed-only workstreams have no Board v2 group to select or scroll to. */
+/** Completed-only workstreams have no current action to preview. */
 export function hasBoardRows(item: WorkstreamAttention): boolean {
   return PRIORITY.slice(0, PRIORITY.indexOf("merged")).some((key) => item[key] > 0);
 }

@@ -88,12 +88,12 @@ function normalizeFit(score: number): number {
 }
 
 /** Candidate efforts, keyed by a label stable across rescans. */
-export type Candidate = { label: string; description: string; members: Cluster[] };
+export type Candidate = { label: string; legacyLabel?: string; description: string; members: Cluster[] };
 
 /**
  * Turn the deterministic seed groups into labelled candidates. The label is a
  * cache key, not a display name: it only has to be stable and unique, so it is
- * derived from a member's own pull request title rather than invented.
+ * derived from a member's stable ticket key. Display words never identify it.
  */
 export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): Candidate[] {
   const used = new Set<string>();
@@ -102,11 +102,12 @@ export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): 
   const grouped = clusters.filter((cluster) => groupingRole(cluster) === "grouped");
   return seedGroups(grouped, context).map((members) => {
     const base = fallbackSummary(members[0] as Cluster);
-    let label = base;
-    for (let suffix = 2; used.has(label); suffix += 1) label = `${base} (${suffix})`;
-    used.add(label);
+    let legacyLabel = base;
+    for (let suffix = 2; used.has(legacyLabel); suffix += 1) legacyLabel = `${base} (${suffix})`;
+    used.add(legacyLabel);
     return {
-      label,
+      label: `seed:${encodeURIComponent((members[0] as Cluster).ticket)}`,
+      legacyLabel,
       description: members
         .map((cluster) => `${cluster.ticket}: ${fallbackSummary(cluster)}`)
         .join("; ")
@@ -114,6 +115,22 @@ export function candidatesFrom(clusters: Cluster[], context: SeedContext = {}): 
       members,
     };
   });
+}
+
+/** Rename legacy cache keys without paying to repeat an unchanged judgment. */
+export function migrateCandidateDecisions(
+  candidates: readonly Candidate[],
+  decisions: ReadonlyMap<string, ClusterDecision>,
+): Map<string, ClusterDecision> {
+  const aliases = new Map(candidates.flatMap((candidate) => candidate.legacyLabel === undefined ? [] : [[candidate.legacyLabel, candidate.label] as const]));
+  const current = new Set(candidates.map((candidate) => candidate.label));
+  const updates = new Map<string, ClusterDecision>();
+  for (const [hash, decision] of decisions) {
+    if (decision.assignment === null || current.has(decision.assignment.label)) continue;
+    const label = aliases.get(decision.assignment.label);
+    if (label !== undefined) updates.set(hash, { ...decision, assignment: { ...decision.assignment, label } });
+  }
+  return updates;
 }
 
 function clusterState(cluster: Cluster) {
@@ -231,7 +248,7 @@ export async function decideWithJev(request: JevRequest): Promise<JevOutcome> {
       const label =
         effort?.type === "choice" && effort.choice in labels
           ? effort.choice
-          : (request.candidates[0]?.label ?? null);
+          : (request.candidates.length === 1 ? request.candidates[0]?.label ?? null : null);
       const fit = answers[`${slot.key}_fit`];
       decisions.set(clusterInputHash(slot.cluster), {
         summary: picked ?? (slot.titles.length === 1 ? (slot.titles[0] ?? null) : null),

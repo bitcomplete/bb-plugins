@@ -46,7 +46,9 @@ The scanner stores board facts and caches in BB's local plugin storage. It uses
 perform Board actions that you confirm. A Linear key sends ticket identifiers
 to Linear and retrieves issue details. With model keys, Jev receives ticket
 keys, repository names, pull request titles, and available Linear context to
-select summaries and groups. Anthropic receives the member keys, summaries,
+select summaries and groups. Bounded Jev reviews can revisit uncertain
+singletons and mixed groups using shared outcome evidence; saved effort
+membership stays fixed. Anthropic receives the member keys, summaries,
 repository names, candidate phrases, and available Linear or thread-title
 context needed to name a group. Model calls happen when semantic inputs change;
 an unchanged rescan reuses cached decisions. The optional **Fetch Linear details
@@ -57,7 +59,9 @@ via agent** action starts a BB thread only when you confirm it.
 - **Map:** Explore the grouping hierarchy. Switch between theme and risk faces,
   filter by status and code surface, and open a linked agent thread.
 - **Board:** **Efforts** groups all tracked checkouts by effort. Open PRs
-  without a scanned checkout appear under **No effort assigned**. **PR backlog**
+  without a scanned checkout join an effort when a saved PR link or an
+  unambiguous ticket match connects them. Other PRs appear under **No effort
+  assigned**. **PR backlog**
   groups your open PRs by next action in organizations represented by scanned
   projects, including PRs without a checkout. Approved
   is a review decision; **Ready to merge** also requires clear checks, review
@@ -73,6 +77,16 @@ via agent** action starts a BB thread only when you confirm it.
   After the author pushes a newer head, resolves review threads, and posts a
   directed PTAL, the row reads **Awaiting re-review** while GitHub still reports
   changes requested. Workstreams does not send another PTAL or reviewer nudge.
+- **Effort threads:** Choose **🧭 Coordinate** on an effort to review its linked
+  tickets and PRs, set its name and goal, and choose a matching BB project.
+  Create a planning thread in a separate worktree with that project's default
+  agent, or link an eligible idle thread. New and explicitly linked coordinator
+  titles use **🧭**. Creating a coordinator establishes a stable effort identity
+  that later grouping passes preserve. **Effort thread** opens it from the
+  heading. New PR repairs can run beneath the coordinator; later repairs can
+  run beneath that PR's earlier worker. The action preview shows the parent.
+  Linking a coordinator does not move existing PR threads or replace PR result
+  cards. Generic team containers and Unsorted are not coordinator scopes.
 - **Automatic agent actions:** Choose an effort, then use **Off**,
   **Preview only**, or **Run automatically**. Preview only shows the next
   candidate on its pull request row without starting an agent. Run

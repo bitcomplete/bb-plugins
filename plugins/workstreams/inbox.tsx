@@ -22,6 +22,7 @@ import {
   inboxSection,
   inboxVerb,
   isTicketlessClone,
+  outsideGrouping,
   matchesInboxQuery,
   stateAge,
   threadPrompt,
@@ -46,7 +47,8 @@ import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
 import { PrBacklog } from "./pr-backlog-view";
-import { backlogMatches, prBacklog } from "./pr-backlog";
+import { EffortCoordinatorControl } from "./effort-coordinator-control";
+import { backlogMatches, includeRemoteEfforts, prBacklog, remoteAttentionRows, remotePrsByEffort } from "./pr-backlog";
 import { ArchivedThreadsButton } from "./archivedthreads";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
@@ -150,8 +152,8 @@ export function InboxBoard({
   const rpc = useRpc<typeof rpcContract>();
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
-  const unassignedPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
-  const allEfforts = useMemo(() => workstreamAttention([...all.values()].flat()), [all]);
+  const inventoryOnlyPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
+  const allEfforts = useMemo(() => workstreamAttention([...Array.from(all.values()).flat(), ...remoteAttentionRows(inventoryOnlyPrs)]), [all, inventoryOnlyPrs]);
   const efforts = useMemo(() => allEfforts.filter(hasBoardRows), [allEfforts]);
   const [dispatch, setDispatch] = useState(board.dispatch);
   const [dispatchBusy, setDispatchBusy] = useState(false);
@@ -171,6 +173,7 @@ export function InboxBoard({
   };
   const effortHeadings = useRef(new Map<string, HTMLElement>());
   const initialEffortScroll = useRef(false);
+  const coordinatedFocus = useRef<string | null>(null);
   const focusEffort = (effortKey: string | null) => {
     if (effortKey !== null) {
       setEffortOpen((current) => ({ ...current, [effortKey]: true }));
@@ -179,6 +182,7 @@ export function InboxBoard({
     void setDispatchMode(effortKey === null ? "off" : "shadow", effortKey);
   };
   const [query, setQuery] = useState("");
+  const remoteEffortPrs = useMemo(() => remotePrsByEffort(inventoryOnlyPrs, query), [inventoryOnlyPrs, query]);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const [boardWidth, setBoardWidth] = useState(0);
@@ -217,14 +221,18 @@ export function InboxBoard({
   const visibleEffortCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const row of [...sections.values()].flat()) counts.set(row.effortKey, (counts.get(row.effortKey) ?? 0) + 1);
+    for (const [key, rows] of remoteEffortPrs) counts.set(key, (counts.get(key) ?? 0) + rows.length);
     return counts;
-  }, [sections]);
+  }, [sections, remoteEffortPrs]);
   const completed = useMemo(() => partitionCompletedRows(sections), [sections]);
   const effortCompleted = useMemo(() => completedByEffort(completed), [completed]);
   const completionWithinEffort = dispatchControls && groupBy === "effort";
-  const groups = useMemo(() => groupInboxRows(dispatchControls && !completionWithinEffort ? completed.active : sections, groupBy)
-    .filter((group) => !dispatchControls || group.section !== "shipped")
-    .map((group) => completionWithinEffort ? { ...group, rows: group.rows.filter((row) => row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped") } : group), [completed, completionWithinEffort, dispatchControls, sections, groupBy]);
+  const groups = useMemo(() => {
+    const localGroups = groupInboxRows(dispatchControls && !completionWithinEffort ? completed.active : sections, groupBy)
+      .filter((group) => !dispatchControls || group.section !== "shipped")
+      .map((group) => completionWithinEffort ? { ...group, rows: group.rows.filter((row) => row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped") } : group);
+    return completionWithinEffort ? includeRemoteEfforts(localGroups, remoteEffortPrs) : localGroups;
+  }, [completed, completionWithinEffort, dispatchControls, sections, groupBy, remoteEffortPrs]);
   const [effortCompletedOpen, setEffortCompletedOpen] = useState<Record<string, { merged: boolean; inReleaseTag: boolean }>>({});
   const [completedOpen, setCompletedOpen] = useState({ merged: false, inReleaseTag: false });
   useEffect(() => {
@@ -235,8 +243,15 @@ export function InboxBoard({
       requestAnimationFrame(() => effortHeadings.current.get(dispatch.effortKey!)?.scrollIntoView({ block: "start" }));
     }
   }, [dispatchControls, dispatch.effortKey, groups]);
+  useEffect(() => {
+    const key = coordinatedFocus.current;
+    if (key !== null && groups.some((group) => group.key === key)) {
+      coordinatedFocus.current = null;
+      requestAnimationFrame(() => effortHeadings.current.get(key)?.scrollIntoView({ block: "start" }));
+    }
+  }, [groups]);
   const selectedEffortVisible = dispatch.effortKey === null || groups.some((group) => group.key === dispatch.effortKey);
-  const completedOnlySelected = allEfforts.some((effort) => effort.key === dispatch.effortKey && !hasBoardRows(effort));
+  const completedOnlySelected = allEfforts.some((effort) => effort.key === dispatch.effortKey && !hasBoardRows(effort)) && !inventoryOnlyPrs.some((row) => row.effortKey === dispatch.effortKey);
   const revealSelectedEffort = () => {
     setQuery("");
     const selectedRows = outcomeRows.get(dispatch.effortKey ?? "") ?? [];
@@ -548,14 +563,15 @@ export function InboxBoard({
         prefs={prefs}
         onPrefs={onPrefs}
         surfaces={board.surfaces}
-        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0) + (dispatchControls ? unassignedPrs.filter((row) => backlogMatches(row, query)).length : 0)}
-        total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0) + (dispatchControls ? unassignedPrs.length : 0)}
+        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0) + (dispatchControls ? inventoryOnlyPrs.filter((row) => backlogMatches(row, query)).length : 0)}
+        total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0) + (dispatchControls ? inventoryOnlyPrs.length : 0)}
         dispatch={dispatch}
         dispatchBusy={dispatchBusy}
         dispatchError={dispatchError}
         efforts={efforts}
         unavailableEffortName={allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? null}
         focusedVisibleCount={visibleEffortCounts.get(dispatch.effortKey ?? "") ?? 0}
+        focusedHasCheckout={[...all.values()].flat().some((row) => row.effortKey === dispatch.effortKey && row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped")}
         filtersActive={query !== "" || prefs.staleness.length > 0 || prefs.surfaces.length > 0 || prefs.showClones}
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
@@ -569,17 +585,20 @@ export function InboxBoard({
           {dispatchControls && !selectedEffortVisible ? (
             <div className="flex flex-wrap items-center gap-2 px-2 pt-4 text-[12px] text-muted-foreground">
               <span>{completedOnlySelected ? "The selected workstream has no current Board rows" : "The selected workstream is outside the current view"}{dispatch.mode === "auto" ? " · Running automatically" : dispatch.mode === "shadow" ? " · Preview only" : " · Off"}.</span>
-              {!completedOnlySelected && outcomeRows.has(dispatch.effortKey ?? "") ? (
+              {!completedOnlySelected && (outcomeRows.has(dispatch.effortKey ?? "") || inventoryOnlyPrs.some((row) => row.effortKey === dispatch.effortKey)) ? (
                 <button type="button" onClick={revealSelectedEffort} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Show workstream</button>
               ) : null}
               {dispatch.mode !== "off" ? <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button> : null}
             </div>
           ) : null}
-          {groups.length === 0 && (!dispatchControls || (completed.merged.length + completed.inReleaseTag.length === 0 && !unassignedPrs.some((row) => backlogMatches(row, query)))) ? (
+          {groups.length === 0 && (!dispatchControls || (completed.merged.length + completed.inReleaseTag.length === 0 && !inventoryOnlyPrs.some((row) => backlogMatches(row, query)))) ? (
             <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching work.</p>
           ) : null}
           {groups.map((group) => {
             const rows = group.rows;
+            const remoteCount = completionWithinEffort ? remoteEffortPrs.get(group.key)?.length ?? 0 : 0;
+            const established = board.efforts.find((effort) => effort.key === group.key) ?? null;
+            const canCoordinate = established !== null || (board.groups.some((entry) => entry.key === group.key && entry.level === "effort") && !outsideGrouping(group.key));
             const expanded = isOpen(group);
             const outcome = dispatchControls && group.section === null
               ? latestEffortOutcome(outcomeRows.get(group.key) ?? [], board.runs, dispatch.attempts)
@@ -603,8 +622,13 @@ export function InboxBoard({
                     <h2 className="min-w-0 truncate text-[13px] font-semibold tracking-tight text-foreground">
                       {group.label}
                     </h2>
-                    <span className="font-mono text-[11px] text-muted-foreground">{completionWithinEffort ? rows.length > 0 ? `${rows.length} active` : "Completed" : rows.length}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{completionWithinEffort ? rows.length + remoteCount > 0 ? `${rows.length + remoteCount} active` : "Completed" : rows.length}</span>
                   </button>
+                  {dispatchControls && group.section === null && canCoordinate ? <EffortCoordinatorControl groupKey={group.key} name={group.label} effort={established} board={board} onOpenThread={openThread} onCoordinated={(key) => {
+                    setEffortOpen((current) => ({ ...current, [key]: true }));
+                    setDispatch((current) => current.effortKey === group.key ? { ...current, effortKey: key } : current);
+                    coordinatedFocus.current = key;
+                  }} /> : null}
                   {dispatchControls && group.section === null ? (
                     <EffortOutcomeCard
                       outcome={outcome}
@@ -612,7 +636,7 @@ export function InboxBoard({
                       threadUpdatedAt={sidebarThreads.find((thread) => thread.id === outcome?.threadId)?.updatedAt ?? null}
                     />
                   ) : null}
-                  {dispatchControls && group.section === null && rows.length > 0 ? (
+                  {dispatchControls && group.section === null && rows.length + remoteCount > 0 ? (
                     <button
                       type="button"
                       disabled={dispatchBusy || dispatch.effortKey === group.key}
@@ -630,13 +654,14 @@ export function InboxBoard({
                 </div>
                 {expanded ? (
                   rows.length === 0 ? (
-                    completionWithinEffort && effortCompleted.has(group.key) ? null : <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
+                    completionWithinEffort && (effortCompleted.has(group.key) || remoteCount > 0) ? null : <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
                   ) : (
                     <ul role="listbox" aria-label={group.label} className="flex flex-col">
                       {rows.map((row) => renderRow(row, groupBy === "effort", group.key))}
                     </ul>
                   )
                 ) : null}
+                {expanded && remoteCount > 0 ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
                 {expanded && completionWithinEffort ? completionCards(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, group.key) : null}
               </section>
             );
@@ -1284,6 +1309,7 @@ function InboxHeader({
   efforts,
   unavailableEffortName,
   focusedVisibleCount,
+  focusedHasCheckout,
   filtersActive,
   onFocusEffort,
   onDispatchMode,
@@ -1307,6 +1333,7 @@ function InboxHeader({
   efforts: WorkstreamAttention[];
   unavailableEffortName: string | null;
   focusedVisibleCount: number;
+  focusedHasCheckout: boolean;
   filtersActive: boolean;
   onFocusEffort: (key: string | null) => void;
   onDispatchMode: (mode: Board["dispatch"]["mode"]) => void;
@@ -1494,7 +1521,7 @@ function InboxHeader({
             type="button"
             aria-pressed={dispatch.mode === "auto"}
             aria-label={focused ? `${dispatch.mode === "auto" ? "Running automatically" : "Run automatically"} for ${focused}` : "Run automatically"}
-            disabled={dispatchBusy || dispatch.mode !== "shadow" || dispatch.effortKey === null}
+            disabled={dispatchBusy || dispatch.mode !== "shadow" || dispatch.effortKey === null || !focusedHasCheckout}
             onClick={() => onDispatchMode("auto")}
             className={cn(
               "h-8 max-w-full truncate rounded-md border px-2.5 text-[11.5px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
@@ -1504,7 +1531,9 @@ function InboxHeader({
             {dispatch.mode === "auto" ? "Running automatically" : "Run automatically"}
           </button>
           <span className={cn("min-w-0 text-muted-foreground", compact && (tight ? "col-span-2" : "col-span-3"))}>
-            {dispatch.mode === "auto"
+            {dispatch.effortKey !== null && !focusedHasCheckout
+              ? "No active checkout is linked. PR actions are available below; automatic repairs need a checkout."
+              : dispatch.mode === "auto"
               ? "One agent at a time. Agents ask before pushing or replying. No automatic merges."
               : dispatch.mode === "shadow"
                 ? "Shows the next action without starting an agent."
@@ -1512,7 +1541,7 @@ function InboxHeader({
           </span>
           {focusedAttention !== undefined ? (
             <p className={cn("min-w-0 basis-full text-[11.5px] text-muted-foreground", compact && (tight ? "col-span-2" : "col-span-3"))} aria-live="polite">
-              <span className="font-medium text-foreground">{focusedAttention.name} · What moves next across all checkouts:</span>{" "}
+              <span className="font-medium text-foreground">{focusedAttention.name} · What moves next across this effort:</span>{" "}
               {attentionDetail(focusedAttention)}
               {filtersActive ? ` ${focusedVisibleCount} match the current view.` : null}
             </p>
