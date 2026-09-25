@@ -3,6 +3,7 @@
 // schemas below are the single definition of what a scan returns.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { advanceInspectionSchema, advanceWorkspaceInputSchema, advanceWorkspaceSchema } from "./advance-contract.js";
 
 /**
  * GitHub's authoritative "can this merge right now" signal
@@ -41,6 +42,8 @@ export const prSchema = z
     /** The branch this PR merges into. Another PR's head means it is stacked. */
     baseRefName: z.string().max(300).nullable(),
     headRefName: z.string().max(300).nullable(),
+    headRefOid: z.string().regex(/^[0-9a-f]{40}$/u).optional(),
+    baseRefOid: z.string().regex(/^[0-9a-f]{40}$/u).optional(),
     /** Each reviewer's latest review, uppercased, from the existing PR list call. */
     latestReviewStates: z.array(z.string().max(40)).max(50),
     /** GitHub's PR open time. Optional so older persisted scans still load. */
@@ -252,6 +255,11 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
 export type PrWrite = z.infer<typeof prWriteSchema>;
 
 export const hostContract = defineRpcContract({
+  advanceInspect: {
+    input: z.object({ prUrl: z.string().max(500) }).strict(),
+    output: advanceInspectionSchema,
+  },
+  advanceWorkspace: { input: advanceWorkspaceInputSchema, output: advanceWorkspaceSchema },
   authoredPrs: {
     input: z.object({ owners: z.array(z.string().max(39)).max(50) }).strict(),
     output: inventoryResultSchema,

@@ -122,6 +122,8 @@ import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearage
 import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 import { TICKET_SOURCES, linkbacksDue, ticketFinder, type LinkbackCheck, type TicketFacts } from "./tickets.js";
+import { ADVANCE_MIGRATIONS, createAdvanceService, advancePreviewSchema, advanceBatchSchema, type AdvanceFacts } from "./bulk-advance.js";
+import { projectForPath } from "./spawn.js";
 import { DISPATCH_MIGRATIONS, createDispatchStore, selectCandidate, gateStillOpen, type DispatchState } from "./dispatch.js";
 
 const DEFAULT_TICKET_PATTERN = "([A-Za-z]{2,5})-(\\d{1,6})";
@@ -308,6 +310,11 @@ export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
   effort_plan: { input: z.object({ groupKey: z.string().min(1).max(500) }).strict(), output: effortPlanSchema },
   effort_coordinate: { input: coordinateInputSchema, output: coordinateResultSchema },
+  advance_preview: { input: z.object({ prUrls: z.array(z.string().max(500)).min(1).max(100) }).strict(), output: advancePreviewSchema },
+  advance_start: { input: z.object({ token: z.string().uuid() }).strict(), output: advanceBatchSchema },
+  advance_get: { input: z.null(), output: z.array(advanceBatchSchema) },
+  advance_cancel: { input: z.object({ batchId: z.string().uuid() }).strict(), output: advanceBatchSchema },
+  advance_recheck: { input: z.object({ batchId: z.string().uuid() }).strict(), output: advanceBatchSchema },
   inventory_refresh: { input: z.null(), output: z.object({ started: z.boolean() }) },
   dispatch_set: {
     input: z.object({ mode: z.enum(["off", "shadow", "auto"]), effortKey: z.string().nullable() }).strict(),
@@ -583,6 +590,7 @@ export default async function plugin(bb: BbPluginApi) {
     ...EFFORT_MIGRATIONS,
     `CREATE TABLE IF NOT EXISTS grouping_repairs (ticket TEXT PRIMARY KEY, label TEXT NOT NULL, hash TEXT NOT NULL, evidence TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS grouping_legacy_labels (hash TEXT PRIMARY KEY, label TEXT NOT NULL)`,
+    ...ADVANCE_MIGRATIONS,
   ]);
   const runs = createRunStore(db);
   const dispatch = createDispatchStore(db);
@@ -701,6 +709,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (hostId === null) throw new Error("No primary BB host is available to read authored PRs.");
       const result = await host.call("authoredPrs", { owners }, { hostId, signal, timeoutMs: SCAN_TIMEOUT_MS });
       inventory.apply(result);
+      advance.invalidate(result.entries.map((entry) => entry.pr));
       return result.complete;
     } catch (error) {
       if (!signal.aborted) {
@@ -727,6 +736,7 @@ export default async function plugin(bb: BbPluginApi) {
       for (let offset = 0; offset < urls.length; offset += 100) {
         const result = await host.call("inspectPrs", { prUrls: urls.slice(offset, offset + 100) }, { hostId, signal: disposal.signal, timeoutMs: SCAN_TIMEOUT_MS });
         inventory.inspect(result);
+        advance.invalidate(result.entries.map((entry) => entry.pr));
         const fresh = new Map(result.entries.map((entry) => [entry.pr.url.toLowerCase(), entry.pr]));
         const closed = new Set(result.closed.map((url) => url.toLowerCase()));
         const insert = db.prepare(`INSERT OR REPLACE INTO units (path, unit) VALUES (?, ?)`);
@@ -819,6 +829,7 @@ export default async function plugin(bb: BbPluginApi) {
       writeUnits(result.units);
       recordTransitions(result.units);
       inventory.observe(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
+      advance.invalidate(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
       await refreshInventory(signal);
       warnings.push(...result.warnings);
 
@@ -1704,22 +1715,26 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     signalRuns(thread.id, { kind: "idle", text: lastAssistantText });
+    void advance.signal(thread.id, "idle", lastAssistantText).catch(onThreadError);
     onThreadChanged(thread, true).then(() => prFreshnessLinks.add(thread.id)).catch(onThreadError);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     signalRuns(thread.id, { kind: "failed", text: null, error });
+    void advance.signal(thread.id, "failed").catch(onThreadError);
     onThreadChanged(thread, true).catch(onThreadError);
   });
   bb.events.on("thread.unarchived", ({ thread }) => {
     onThreadChanged(thread, true).catch(onThreadError);
   });
   bb.events.on("thread.archived", ({ thread }) => {
+    void advance.signal(thread.id, "gone").catch(onThreadError);
     signalRuns(thread.id, { kind: "gone", reason: "Thread archived" });
     threadEnvironments.delete(thread.id);
     prFreshnessLinks.add("");
     if (threadFacts.delete(thread.id)) announceThreads();
   });
   bb.events.on("thread.deleted", ({ thread }) => {
+    void advance.signal(thread.id, "gone").catch(onThreadError);
     signalRuns(thread.id, { kind: "gone", reason: "Thread deleted" });
     threadEnvironments.delete(thread.id);
     prFreshnessLinks.add("");
@@ -1728,6 +1743,7 @@ export default async function plugin(bb: BbPluginApi) {
   // A pending interaction IS an event: the agent is waiting on the user.
   bb.events.on("interaction.pending", ({ thread }) => {
     signalRuns(thread.id, { kind: "pending" });
+    void advance.signal(thread.id, "pending").catch(onThreadError);
   });
   // There is no "interaction answered" event, and the event DTO carries no
   // pending flag. The thread's event sequence does advance when the user
@@ -1767,6 +1783,7 @@ export default async function plugin(bb: BbPluginApi) {
       })();
       recordTransitions(readUnits());
       inventory.observe(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
+      advance.invalidate(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
       prFreshnessLinks.add("");
       for (const warning of result.warnings) bb.log.warn(`rescan: ${warning}`);
       bb.log.info(`rescanned ${paths.length} checkout(s) after row actions finished`);
@@ -2468,6 +2485,109 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  const manualPrWrites = new Set<string>();
+  // SDK spawn/send can return before thread events reach the board cache.
+  const pendingPrThreads = new Map<string, { id: string; startedAt: number }>();
+  async function withPrWriter<T>(path: string, prUrl: string | undefined, action: () => Promise<T>): Promise<T | { ok: false; error: string }> {
+    const key = prUrl?.toLowerCase();
+    if (advance.reserved(key ?? "", path) || (key && manualPrWrites.has(key)) || launchingCheckouts.has(path)) return { ok: false, error: "A batch or another action owns this PR or checkout." };
+    if (key) manualPrWrites.add(key);
+    try {
+      const result = await action();
+      if (key && result !== null && typeof result === "object" && "threadId" in result && typeof result.threadId === "string") {
+        pendingPrThreads.set(key, { id: result.threadId, startedAt: Date.now() });
+      }
+      return result;
+    } finally { if (key) manualPrWrites.delete(key); }
+  }
+  async function advanceInspect(prUrl: string): Promise<AdvanceFacts> {
+    const units = readUnits();
+    const tracked = units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.pr ?? inventory.get(prUrl)?.pr;
+    if (!tracked) throw new Error("That PR is no longer tracked. Refresh the backlog.");
+    const target = prTarget(prUrl);
+    if (!target) throw new Error("Invalid tracked PR URL");
+    const hostId = (await bb.sdk.system.config()).primaryHostId;
+    if (!hostId) throw new Error("No primary host is available");
+    const projects = await bb.sdk.projects.list();
+    const candidates = units.filter((unit) => unit.githubRepo?.toLowerCase() === target.slug.toLowerCase())
+      .sort((a, b) => Number(b.pr?.url === prUrl) - Number(a.pr?.url === prUrl) || a.path.localeCompare(b.path));
+    const source = candidates.map((unit) => ({ unit, project: projectForPath(projects, unit.path) }))
+      .find((entry) => entry.project?.hostId === hostId);
+    const fallback: AdvanceFacts = { prUrl, repo: target.slug, number: tracked.number, title: tracked.title,
+      headOid: "", baseOid: "", baseRefName: tracked.baseRefName ?? "", headRefName: tracked.headRefName ?? "",
+      needsPreparation: false, eligible: false, detail: "GitHub inspection failed", workspace: source ? "create" : "unavailable",
+      projectId: source?.project?.projectId ?? null, hostId, sourcePath: source?.unit.path ?? null,
+      path: units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.path ?? null, readiness: "needs-attention", blockedBy: null };
+    try {
+      const result = await host.call("advanceInspect", { prUrl }, { hostId, timeoutMs: 60_000, signal: disposal.signal });
+      if (!result.ok) return { ...fallback, detail: result.error };
+      const facts = result.facts;
+      const eligible = facts.state === "OPEN" && facts.reviewDecision === "APPROVED" && !facts.isDraft && (!facts.needsPreparation || (!facts.isCrossRepository && !!source));
+      const detail = facts.isCrossRepository && facts.needsPreparation ? "Fork PRs need manual preparation in this version" : facts.state !== "OPEN" || facts.reviewDecision !== "APPROVED" || facts.isDraft ? "Select an open, approved, non-draft PR" : facts.needsPreparation && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail;
+      return { ...fallback, ...facts, eligible, detail, blockedBy: facts.basePrNumber === null ? null : `${target.slug}#${facts.basePrNumber}` };
+    } catch (error) { return { ...fallback, detail: `Inspection failed: ${String(error).slice(0, 300)}` }; }
+  }
+  const advance = createAdvanceService(db, {
+    inspect: advanceInspect,
+    workspace: async (facts, batchId, jobId) => {
+      if (!facts.sourcePath) throw new Error("No matching repository source is available");
+      const result = await host.call("advanceWorkspace", { sourcePath: facts.sourcePath, prUrl: facts.prUrl,
+        expectedHeadOid: facts.headOid, expectedBaseOid: facts.baseOid, batchId, jobId }, { hostId: facts.hostId, timeoutMs: SCAN_TIMEOUT_MS, signal: disposal.signal });
+      if (!result.ok) throw new Error(result.error);
+      return result;
+    },
+    busyNow: (prUrl, path) => manualPrWrites.has(prUrl.toLowerCase()) || pendingPrThreads.has(prUrl.toLowerCase()) || (path !== null && launchingCheckouts.has(path)) || dispatch.activeFor(path ?? "", prUrl) ||
+      runs.recent(Number.MAX_SAFE_INTEGER).some((run) => (run.prUrl === prUrl || (path !== null && run.path === path)) && ["running", "needs-you"].includes(run.status)),
+    busy: async (prUrl, path, ownThreadId) => {
+      const key = prUrl.toLowerCase();
+      const pending = pendingPrThreads.get(key);
+      if (pending && pending.id !== ownThreadId) {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: pending.id });
+          if ((thread.status !== "idle" && thread.status !== "error") || Date.now() - pending.startedAt < 120_000) return true;
+          pendingPrThreads.delete(key);
+        } catch { return true; }
+      }
+      if (manualPrWrites.has(prUrl.toLowerCase()) || (path !== null && launchingCheckouts.has(path)) || dispatch.activeFor(path ?? "", prUrl) ||
+        runs.recent(Number.MAX_SAFE_INTEGER).some((run) => (run.prUrl === prUrl || (path !== null && run.path === path)) && ["running", "needs-you"].includes(run.status))) return true;
+      if (path === null) return false;
+      const linked = await linkedThreads(path);
+      const live = await Promise.all(linked.filter((thread) => thread.id !== ownThreadId).map(async (thread) => {
+        try { const state = await bb.sdk.threads.get({ threadId: thread.id }); return state.status !== "idle" && state.status !== "error"; }
+        catch { return true; }
+      }));
+      return live.some(Boolean);
+    },
+    spawn: async (facts, workerPath, prompt, jobId) => {
+      if (!facts.projectId) throw new Error("No project is available for the repository worker");
+      const thread = await bb.sdk.threads.spawn({ projectId: facts.projectId, title: "Rebasing...", prompt,
+        environment: { type: "host", hostId: facts.hostId, workspace: { type: "unmanaged", path: workerPath } },
+        pluginMetadata: { advanceJobId: jobId, role: "rebase-worker" } });
+      return thread.id;
+    },
+    send: async (threadId, prompt) => { await bb.sdk.threads.send({ threadId, mode: "auto", input: [{ type: "text", text: prompt, mentions: [] }] }); },
+    thread: async (threadId) => {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return { ...thread, output: thread.status === "idle" ? (await bb.sdk.threads.output({ threadId })).output ?? "" : "" };
+    },
+    recover: async (jobId, projectId) => {
+      const matches: string[] = [];
+      for (let offset = 0; ; offset += 100) {
+        const rows = await bb.sdk.threads.list({ projectId, originPluginId: bb.pluginId, includeHidden: true, limit: 100, offset });
+        for (const thread of rows) {
+          const metadata = await bb.sdk.threads.getPluginMetadata({ threadId: thread.id });
+          if (metadata.advanceJobId === jobId) matches.push(thread.id);
+        }
+        if (rows.length < 100) return matches;
+      }
+    },
+    changed: () => { bb.realtime.publish(BOARD_CHANGED, { scanning }); },
+    verified: (url, path) => { scheduleInventoryUrls([url]); if (path) rescans.add(path); },
+  });
+  const advanceTimer = setInterval(() => { void advance.tick().catch(onThreadError); }, 30_000);
+  bb.onDispose(() => { clearInterval(advanceTimer); advance.dispose(); });
+  queueMicrotask(() => { void advance.tick(true).catch(onThreadError); });
+
   const launchingCheckouts = new Set<string>();
   const agentSdk: AgentSdk = {
     projects: { list: () => bb.sdk.projects.list() },
@@ -2582,6 +2702,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (preflightPass === 0) queueMicrotask(() => void dispatchOne(1));
         return;
       }
+      if (advance.reserved(checked.candidate.prUrl, checked.candidate.path)) return;
       const id = dispatch.reserve(checked);
       if (id === null) return;
       bb.realtime.publish(BOARD_CHANGED, { scanning });
@@ -2670,18 +2791,26 @@ export default async function plugin(bb: BbPluginApi) {
   async function directActionRun(input: DirectTarget, action: DirectAction, act: () => Promise<WriteResult>): Promise<WriteResult> {
     const unit = "path" in input ? readUnits().find((entry) => entry.path === input.path) :
       readUnits().find((entry) => entry.pr?.url.toLowerCase() === input.prUrl.toLowerCase());
+    const prUrl = "prUrl" in input ? input.prUrl : unit?.pr?.url;
+    if (prUrl && (advance.reserved(prUrl, unit?.path ?? null) || manualPrWrites.has(prUrl.toLowerCase()))) return { ok: false, error: "A batch or another action owns this PR." };
+    if (prUrl) manualPrWrites.add(prUrl.toLowerCase());
     try {
       // Remote-only actions report through their dialog and fresh PR state. Run
       // history remains checkout-based until it has a real nullable target type.
       return unit === undefined ? await act() : await directRun(unit.path, action, act);
     } finally {
-      const url = "prUrl" in input ? input.prUrl : unit?.pr?.url;
-      if (url !== undefined) scheduleInventoryUrls([url]);
+      if (prUrl) manualPrWrites.delete(prUrl.toLowerCase());
+      if (prUrl !== undefined) scheduleInventoryUrls([prUrl]);
     }
   }
 
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    advance_preview: ({ prUrls }) => advance.preview(prUrls),
+    advance_start: ({ token }) => advance.start(token),
+    advance_get: () => advance.list(),
+    advance_cancel: ({ batchId }) => advance.cancel(batchId),
+    advance_recheck: ({ batchId }) => advance.recheck(batchId),
     effort_plan: ({ groupKey }) => effortPlan(groupKey),
     effort_coordinate: async (input) => {
       const result = await coordinators.coordinate(input, await effortPlan(input.groupKey));
@@ -2712,7 +2841,7 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set("prefs", next);
       return next;
     },
-    thread_start: async ({ path, prompt }) => {
+    thread_start: async ({ path, prompt }) => withPrWriter(path, readUnits().find((unit) => unit.path === path)?.pr?.url, async () => {
       // The unit and its cluster come from the last scan, never from the client.
       const pattern = compilePattern((await settings.get()).ticketPattern);
       const units = readUnits();
@@ -2736,7 +2865,7 @@ export default async function plugin(bb: BbPluginApi) {
         announceThreads();
       }
       return result;
-    },
+    }),
     thread_archive: async ({ threadId }) => {
       const clusters = (await board()).groups.flatMap((group) => group.clusters);
       const cluster = clusters.find((item) => item.threads.some((thread) => thread.id === threadId));
@@ -2747,7 +2876,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     thread_restore: ({ threadId }) => restoreArchivedThread(bb.sdk.threads, archiveStore, threadId),
     thread_archived: async () => (await archiveStore.list()).sort((a, b) => b.archivedAt - a.archivedAt).slice(0, ARCHIVE_HISTORY_LIMIT),
-    thread_message: async ({ path, prUrl, threadId, message }) => {
+    thread_message: async ({ path, prUrl, threadId, message }) => withPrWriter(path, readUnits().find((unit) => unit.path === path)?.pr?.url, async () => {
       const found = await scannedUnit(path);
       if (found === undefined) return { ok: false as const, error: "That checkout is no longer on the board. Refresh and try again." };
       const pr = found.raw.pr;
@@ -2756,7 +2885,11 @@ export default async function plugin(bb: BbPluginApi) {
       return sendRowMessage(
         {
           get: ({ threadId: id }) => bb.sdk.threads.get({ threadId: id }),
-          send: (args) => bb.sdk.threads.send(args),
+          send: async (args) => {
+            const result = await bb.sdk.threads.send(args);
+            pendingPrThreads.set(prUrl.toLowerCase(), { id: args.threadId, startedAt: Date.now() });
+            return result;
+          },
         },
         {
           threadId,
@@ -2765,7 +2898,7 @@ export default async function plugin(bb: BbPluginApi) {
           pr: { repo: found.raw.repo ?? found.raw.dirName, number: pr.number, title: pr.title, url: pr.url, checkout: path },
         },
       );
-    },
+    }),
     action_merge_preview: async (input) => {
       const target = await actionable(input);
       if (!target.ok) return target;
@@ -2827,16 +2960,16 @@ export default async function plugin(bb: BbPluginApi) {
         : `A PR worker under ${effort!.name} will report its result to the effort coordinator.` };
       return { ok: true as const, ...plan };
     },
-    agent_run: async ({ path, action, mode, threadId, prompt }) => {
+    agent_run: async ({ path, action, mode, threadId, prompt }) => withPrWriter(path, readUnits().find((unit) => unit.path === path)?.pr?.url, async () => {
       if (mode === "continue") {
         return { ok: false as const, error: "Continue in an existing thread cannot track this action reliably. Choose a subthread or new thread." };
       }
       const found = await scannedUnit(path);
-      if (dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
+      if (advance.reserved(found?.raw.pr?.url ?? "", path) || dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
         return { ok: false as const, error: "Automatic dispatch is working on this PR or waiting for a decision." };
       }
       const linked = (await linkedThreads(path)).map((thread) => thread.id);
-      if (dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
+      if (advance.reserved(found?.raw.pr?.url ?? "", path) || dispatch.activeFor(path, found?.raw.pr?.url ?? null)) {
         return { ok: false as const, error: "Automatic dispatch is working on this PR or waiting for a decision." };
       }
       // Recorded before launch; bound to the dedicated thread when spawn returns.
@@ -2863,7 +2996,7 @@ export default async function plugin(bb: BbPluginApi) {
         announceThreads();
       }
       return result;
-    },
+    }),
     linear_fetch_plan: async () => {
       const tickets = await fallbackTickets();
       const running = runs.recent(Number.MAX_SAFE_INTEGER).some((run) => run.action === LINEAR_FETCH);

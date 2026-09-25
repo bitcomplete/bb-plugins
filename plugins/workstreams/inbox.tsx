@@ -47,6 +47,7 @@ import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
 import { PrBacklog } from "./pr-backlog-view";
+import { AdvanceProgress, useAdvanceBatches } from "./bulk-advance-view";
 import { matchesApprovedFilter } from "./approval-filter";
 import { EffortCoordinatorControl } from "./effort-coordinator-control";
 import { backlogMatches, includeRemoteEfforts, prBacklog, remoteAttentionRows, remotePrsByEffort } from "./pr-backlog";
@@ -151,6 +152,7 @@ export function InboxBoard({
   };
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
+  const advance = useAdvanceBatches();
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
   const inventoryOnlyPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
@@ -546,6 +548,7 @@ export function InboxBoard({
       {dispatchControls ? <div className="flex items-center gap-1 border-b border-border/60 px-4 py-1.5" role="group" aria-label="Board view">
         {(["efforts", "backlog"] as const).map((view) => <button key={view} type="button" aria-pressed={boardV2View === view} onClick={() => chooseView(view)} className={cn("rounded-md px-2.5 py-1 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", boardV2View === view ? "bg-foreground/[0.08] font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{view === "efforts" ? "Efforts" : "PR backlog"}</button>)}
       </div> : null}
+      <AdvanceProgress batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
       {backlogVisible && dispatch.mode === "auto" ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-4 py-2 text-[11.5px] text-muted-foreground">
         <span>Automatic agent runs · {allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? "selected effort"}</span>
         <button type="button" onClick={() => {
@@ -558,7 +561,7 @@ export function InboxBoard({
         <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button>
         {dispatchError === null ? null : <span role="alert" className="text-destructive">{dispatchError}</span>}
       </div> : null}
-      {backlogVisible ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
+      {backlogVisible ? <PrBacklog advanceJobs={advance.batches.flatMap((batch) => batch.jobs)} advanceActive={advance.active} onAdvanceStarted={advance.refresh} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
       <InboxHeader
         searchRef={searchRef}
         query={query}

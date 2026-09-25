@@ -75,12 +75,27 @@ via agent** action starts a BB thread only when you confirm it.
   dedicated agent thread. You can expand and edit its instructions.
   Agent repairs inspect the PR and base, address actionable feedback, test,
   commit and push code changes, reply on the PR, and recheck live merge gates.
-  A remote PR needs a scanned checkout for an agent repair; direct GitHub
+  A remote PR needs a scanned checkout for a single-PR agent repair; direct GitHub
   actions remain available without one. Merged and release-tagged work stays
   under its effort in collapsed sections.
   After the author pushes a newer head, resolves review threads, and posts a
   directed PTAL, the row reads **Awaiting re-review** while GitHub still reports
   changes requested. Workstreams does not send another PTAL or reviewer nudge.
+- **Bulk preparation:** In **PR backlog**, select approved PRs and choose
+  **Advance selected**. Review the exact selection, planned branch work, and
+  skips before starting. Each repository uses one **Rebasing...** thread, with
+  a separate turn and isolated worktree for each PR. Preparation integrates the
+  base, resolves conflicts, tests, pushes with an exact commit lease when
+  needed, and posts a summary after a pushed change. PRs that only need
+  verification run without an agent. The Board keeps per-PR results and checks
+  current approval, feedback, checks, and stack dependencies before reporting
+  **Ready to merge**. **Stop queued PRs** stops work that has not started;
+  active workers can finish. Comment fixes remain a separate action, and the
+  batch never merges PRs. Worktrees remain available for inspection. One batch
+  runs at a time, with up to two repository workers. If a parent update makes a
+  verification-only child need branch edits, preview that child again to
+  authorize the added work. Fork preparation and mixed BB project mappings
+  within one repository need separate handling; the batch reports these skips.
 - **Effort threads:** Choose **🧭 Coordinate** on an effort to review its linked
   tickets and PRs, set its name and goal, and choose a matching BB project.
   Create a planning thread in a separate worktree with that project's default

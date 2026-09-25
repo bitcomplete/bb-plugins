@@ -10,7 +10,7 @@ const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
 
 /** Shared by checkout scans and the authored PR inventory. */
 export const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,createdAt,reviewRequests,body";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,headRefOid,baseRefOid,mergeCommit,mergedAt,createdAt,reviewRequests,body";
 
 /**
  * GitHub's authoritative "can this merge right now" signal, from
@@ -162,6 +162,8 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
       typeof view.headRefName === "string" && view.headRefName !== ""
         ? view.headRefName.slice(0, 300)
         : null,
+    ...(typeof view.headRefOid === "string" && /^[0-9a-f]{40}$/u.test(view.headRefOid) ? { headRefOid: view.headRefOid } : {}),
+    ...(typeof view.baseRefOid === "string" && /^[0-9a-f]{40}$/u.test(view.baseRefOid) ? { baseRefOid: view.baseRefOid } : {}),
     latestReviewStates: latestReviewStates(view.latestReviews),
     reviewRequests: parseReviewRequests(view.reviewRequests),
     latestReviews: latestReviewers(view.latestReviews),

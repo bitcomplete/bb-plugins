@@ -21,6 +21,8 @@ import { prTarget, readLiveMerge, readReviewThreads, runMerge, runNudge, runUpda
 import { namingResponse, type NamedGroupRow } from "./naming.js";
 import { checkoutBranch } from "./rebase.js";
 import { readAuthoredPrs, readInventoryPrs } from "./inventory.js";
+import { readAdvancePr } from "./advance-host.js";
+import { prepareAdvanceWorkspace } from "./advance-workspace.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
@@ -550,6 +552,9 @@ export async function inspectAll(
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    advanceInspect: ({ prUrl }, context) => readAdvancePr(ghRunner(context.signal), prUrl),
+    advanceWorkspace: (input, context) => prepareAdvanceWorkspace(
+      (args, cwd) => run("git", args, cwd, GH_WRITE_TIMEOUT_MS, context.signal), ghRunner(context.signal), input),
     authoredPrs: ({ owners }, context) => readAuthoredPrs(ghRunner(context.signal), owners),
     inspectPrs: ({ prUrls }, context) => readInventoryPrs(ghRunner(context.signal), prUrls),
     checkoutState: async ({ path }, context) => {

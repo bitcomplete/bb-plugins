@@ -6,6 +6,21 @@ import { prSchema } from "./contract.js";
 import { latestReviewStates, latestReviewers, mergeCommitOf, parseLiveReviewRequests, parseMergeStateStatus, parsePrList } from "./gh.js";
 import { namingResponse, parseNames } from "./naming.js";
 
+describe("PR commit identity", () => {
+  it("retains exact head and base commits so a later scan can invalidate old readiness", () => {
+    const pr = parsePrList(JSON.stringify([{ number: 42, headRefOid: "a".repeat(40), baseRefOid: "b".repeat(40) }]))?.pr;
+    expect(pr).toMatchObject({ headRefOid: "a".repeat(40), baseRefOid: "b".repeat(40) });
+    expect(prSchema.safeParse(pr).success).toBe(true);
+  });
+
+  it("accepts older snapshots without inventing commit identities from malformed output", () => {
+    const pr = parsePrList(JSON.stringify([{ number: 42, headRefOid: "partial", baseRefOid: null }]))?.pr;
+    expect(pr?.headRefOid).toBeUndefined();
+    expect(pr?.baseRefOid).toBeUndefined();
+    expect(prSchema.safeParse(pr).success).toBe(true);
+  });
+});
+
 describe("Claude naming response", () => {
   const labels = ["checkout", "accounts"];
   const complete = JSON.stringify({ groups: [

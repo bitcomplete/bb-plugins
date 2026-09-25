@@ -68,7 +68,7 @@ export function stackedArgv(target: PrTarget, headRefName: string): string[] {
 
 /** Constant: the only variables are passed as typed -f/-F fields, never spliced in. */
 export const REVIEW_THREADS_QUERY =
-  "query($owner:String!,$name:String!,$number:Int!,$includeFollowup:Boolean!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} reviews(last:100){pageInfo{hasPreviousPage}nodes{id state body submittedAt author{login} commit{oid}}} reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved comments(first:1){nodes{pullRequestReview{id}}}}} comments(last:100) @include(if:$includeFollowup){pageInfo{hasPreviousPage}nodes{body createdAt author{login}}} commits(last:1) @include(if:$includeFollowup){nodes{commit{oid committedDate}}}}}}";
+  "query($owner:String!,$name:String!,$number:Int!,$includeFollowup:Boolean!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid author{login} reviews(last:100){pageInfo{hasPreviousPage}nodes{id state body submittedAt author{login} commit{oid}}} reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved comments(first:1){nodes{pullRequestReview{id}}}}} comments(last:100) @include(if:$includeFollowup){pageInfo{hasPreviousPage}nodes{body createdAt author{login}}} commits(last:1) @include(if:$includeFollowup){nodes{commit{oid committedDate}}}}}}";
 
 export function threadsArgv(target: PrTarget, includeFollowup = false): string[] {
   return [

@@ -455,7 +455,25 @@ projects. A saved PR membership or unambiguous ticket match can place an open
 PR without a checkout under its effort. Other remote PRs appear under **No
 effort assigned** in Efforts. Approved records a review decision; Ready to merge also
 requires checks, threads, branch state, and stack dependencies to clear.
-Direct GitHub actions work on remote PRs; agent repairs need a scanned checkout.
+Direct GitHub actions work on remote PRs; single-PR agent repairs need a scanned checkout.
+
+In **PR backlog**, select approved open PRs and choose **Advance selected** to
+preview a finite preparation batch. Confirmation authorizes the listed branch
+updates, conflict fixes, tests, pushes, and preparation summaries. Each repository
+uses one **Rebasing...** worker, with a separate turn and isolated worktree per PR;
+remote PRs can use a worktree from an exactly matched scanned repository.
+Verification-only jobs do not spawn an agent. Saved per-PR results appear in
+**Advance progress** across Board lenses. Readiness requires fresh approval,
+review feedback, checks, branch state, and stack dependencies on the checked head.
+**Recheck readiness** reads current facts; **Stop queued PRs** stops pending work
+while active workers can finish. Keep worktrees for inspection. Comment fixes
+remain a separate action; preparation never merges or deploys.
+One batch runs at a time, with up to two repository workers and 100 selected PRs.
+CI polling runs for up to 30 minutes after a job enters **Waiting for checks**;
+use **Recheck readiness** afterward. If a selected parent update makes a
+verification-only child need branch edits, preview the child again before
+authorizing those edits. Fork writes are skipped; PRs mapped to different BB
+projects in the same repository require separate batches.
 
 The shared **Approved** filter persists across Map, Efforts, PR backlog, and
 reloads, including approved PRs that still need fixes, checks, or branch work.

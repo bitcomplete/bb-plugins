@@ -1,0 +1,105 @@
+// Live preparation facts. Nothing in this reader writes to GitHub or a checkout.
+import { z } from "zod";
+import { approvalHasBody, parseMergeStateStatus } from "./gh.js";
+import { prTarget, readReviewThreads, type GhRunner, type Run } from "./ghactions.js";
+import type { AdvanceFacts, AdvanceInspection } from "./advance-contract.js";
+
+const branch = z.string().min(1).max(300).refine((value) => !value.startsWith("-"));
+const oid = z.string().regex(/^[0-9a-f]{40}$/u);
+const viewSchema = z.object({
+  url: z.string(), number: z.number().int().positive(), title: z.string(),
+  state: z.enum(["OPEN", "CLOSED", "MERGED"]), isDraft: z.boolean(), isCrossRepository: z.boolean(),
+  headRefName: branch, baseRefName: branch, headRefOid: oid, baseRefOid: oid,
+  reviewDecision: z.string().nullable(), mergeStateStatus: z.string(), mergeable: z.string(),
+  latestReviews: z.array(z.object({ state: z.string(), body: z.string().optional() }).passthrough()),
+  statusCheckRollup: z.array(z.unknown()),
+});
+const fields = Object.keys(viewSchema.shape).join(",");
+
+function decoded(result: Run): unknown {
+  if (!result.ok) return undefined;
+  try { return JSON.parse(result.stdout); } catch { return undefined; }
+}
+
+/** Empty conclusions on queued/running checks must never look like passing checks. */
+export function advanceChecks(rollup: readonly unknown[]): AdvanceFacts["checks"] {
+  let pending = false;
+  let unknown = false;
+  for (const item of rollup) {
+    if (item === null || typeof item !== "object") { unknown = true; continue; }
+    const check = item as Record<string, unknown>;
+    if (check.status !== undefined) {
+      if (["QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"].includes(String(check.status))) { pending = true; continue; }
+      if (check.status !== "COMPLETED") { unknown = true; continue; }
+      if (["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"].includes(String(check.conclusion))) return "failed";
+      if (!["SUCCESS", "NEUTRAL", "SKIPPED"].includes(String(check.conclusion))) unknown = true;
+    } else if (check.state === "PENDING" || check.state === "EXPECTED") pending = true;
+    else if (check.state === "ERROR" || check.state === "FAILURE") return "failed";
+    else if (check.state !== "SUCCESS") unknown = true;
+  }
+  return unknown ? "unknown" : pending ? "pending" : "passed";
+}
+
+export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<AdvanceInspection> {
+  const target = prTarget(prUrl);
+  if (target === null) return { ok: false, error: "That is not a pull request URL." };
+  const readView = () => run(["pr", "view", String(target.number), "--repo", target.slug, "--json", fields]);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const firstRun = await readView();
+    const first = viewSchema.safeParse(decoded(firstRun));
+    if (!first.success) return { ok: false, error: firstRun.ok ? "GitHub returned incomplete PR preparation facts." : `Could not read the PR: ${firstRun.error}`.slice(0, 800) };
+    if (first.data.number !== target.number || first.data.url.toLowerCase() !== prUrl.toLowerCase()) return { ok: false, error: "GitHub returned a different pull request." };
+    let reviewHead: string | undefined;
+    let reviewBase: string | undefined;
+    const capture: GhRunner = async (args, stdin) => {
+      const response = await run(args, stdin);
+      const body = decoded(response) as { data?: { repository?: { pullRequest?: { headRefOid?: string; baseRefOid?: string } } } } | undefined;
+      reviewHead = body?.data?.repository?.pullRequest?.headRefOid;
+      reviewBase = body?.data?.repository?.pullRequest?.baseRefOid;
+      return response;
+    };
+    const [threads, basesRun] = await Promise.all([
+      readReviewThreads(capture, target, true, true),
+      run(["pr", "list", "--repo", target.slug, "--head", first.data.baseRefName, "--state", "open", "--limit", "2", "--json", "number,headRefName"]),
+    ]);
+    if (!threads.ok) return { ok: false, error: `Could not verify review feedback: ${threads.error}`.slice(0, 800) };
+    const bases = z.array(z.object({ number: z.number().int().positive(), headRefName: z.string() })).safeParse(decoded(basesRun));
+    if (!bases.success || bases.data.some((base) => base.headRefName !== first.data.baseRefName)) return { ok: false, error: "Could not verify the PR's stack dependencies." };
+    if (bases.data.length > 1) return { ok: false, error: "Multiple open PRs match the base branch; its stack dependency is ambiguous." };
+    const final = viewSchema.safeParse(decoded(await readView()));
+    if (!final.success) return { ok: false, error: "Could not verify the final PR head and base commits." };
+    // Review/check snapshots must describe the same commits and review decision.
+    const identity = (view: z.infer<typeof viewSchema>) => JSON.stringify([view.url, view.headRefOid, view.baseRefOid, view.headRefName, view.baseRefName, view.state, view.isDraft, view.isCrossRepository, view.reviewDecision, view.latestReviews]);
+    if (identity(first.data) !== identity(final.data) || reviewHead !== final.data.headRefOid || reviewBase !== final.data.baseRefOid) continue;
+    const view = final.data;
+    const checks = advanceChecks(view.statusCheckRollup);
+    const approvalNotePending = approvalHasBody(view.latestReviews) && threads.approvalNoteFollowedUp !== true;
+    const mergeStateStatus = parseMergeStateStatus(view.mergeStateStatus);
+    const needsPreparation = mergeStateStatus === "BEHIND" || mergeStateStatus === "DIRTY" || view.mergeable === "CONFLICTING";
+    const basePrNumber = bases.data[0]?.number ?? null;
+    let readiness: AdvanceFacts["readiness"] = "needs-attention";
+    let detail: string;
+    if (view.state !== "OPEN") detail = "This PR is no longer open.";
+    else if (view.isDraft) detail = "This PR is still a draft.";
+    else if (needsPreparation) detail = mergeStateStatus === "DIRTY" || view.mergeable === "CONFLICTING" ? "Resolve conflicts, test, and push the prepared branch." : "Update the branch against its base, test, and push.";
+    else if (threads.count > 0) detail = `${threads.count}${threads.hasNextPage ? "+" : ""} unresolved review threads need attention.`;
+    else if (threads.hasNextPage) detail = "Review threads are incomplete; readiness needs another check.";
+    else if (threads.approvalNotesComplete !== true) detail = "Review history is incomplete; readiness needs another check.";
+    else if (approvalNotePending) detail = "An approving review includes a note without confirmed follow-up.";
+    else if (checks === "failed") detail = "One or more checks failed.";
+    else if (checks === "unknown") detail = "Check results are incomplete or unknown.";
+    else if (view.reviewDecision !== "APPROVED") { readiness = "waiting-review"; detail = view.reviewDecision === "CHANGES_REQUESTED" ? "Review still requests changes; wait for a new approval after follow-up." : "Waiting for approval on the current PR."; }
+    else if (basePrNumber !== null) detail = "The base branch belongs to another open PR; advance that dependency first.";
+    else if (checks === "pending") { readiness = "waiting-checks"; detail = "Waiting for checks on the current head commit."; }
+    else if (view.mergeable !== "MERGEABLE" || !["CLEAN", "HAS_HOOKS"].includes(mergeStateStatus)) detail = "GitHub has not confirmed that all merge requirements are satisfied.";
+    else { readiness = "ready"; detail = "Approved, review feedback clear, checks passed, and branch ready to merge."; }
+    return { ok: true, facts: {
+      prUrl: view.url, number: view.number, title: view.title.slice(0, 300), repo: target.slug,
+      headRefName: view.headRefName, baseRefName: view.baseRefName, headOid: view.headRefOid, baseOid: view.baseRefOid,
+      state: view.state, isDraft: view.isDraft, isCrossRepository: view.isCrossRepository,
+      reviewDecision: view.reviewDecision || null, mergeStateStatus, mergeable: view.mergeable,
+      needsPreparation, readiness, detail, unresolvedThreads: threads.count, checks, basePrNumber, approvalNotePending,
+    } };
+  }
+  return { ok: false, error: "The PR head, base, or reviews changed during verification. Refresh and try again." };
+}
