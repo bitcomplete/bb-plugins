@@ -14,6 +14,7 @@ import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { ArchivedThreadsDialog } from "./archivedthreads";
 import { toast } from "sonner";
+import { ThreadSplitButton } from "./thread-split-button";
 
 export type MenuThread = { id: string; title: string; active: boolean; tier: ThreadTier };
 
@@ -26,6 +27,7 @@ export const TIER_WORDS: Record<ThreadTier, string> = {
 
 export function ThreadMenu({
   threads,
+  showAll = false,
   onOpenThread,
   onMore,
   heading,
@@ -38,6 +40,7 @@ export function ThreadMenu({
 }: {
   /** Already in display order. */
   threads: readonly MenuThread[];
+  showAll?: boolean;
   onOpenThread: (id: string) => void;
   /** "+N more": fly to the cluster on the Map, where the full list is. */
   onMore: () => void;
@@ -74,7 +77,7 @@ export function ThreadMenu({
   }, [cancel, send]);
   useEffect(() => cancel, [cancel]);
 
-  const { shown, more } = menuEntries(threads);
+  const { shown, more } = menuEntries(threads, showAll ? threads.length : undefined);
   const label = threadDotLabel(threads.length);
   const entries = (): HTMLButtonElement[] =>
     listRef.current === null ? [] : Array.from(listRef.current.querySelectorAll<HTMLButtonElement>("[data-thread-entry]:not(:disabled)"));
@@ -151,7 +154,7 @@ export function ThreadMenu({
           onClick={(event) => event.stopPropagation()}
           onPointerDown={(event) => event.stopPropagation()}
           className={cn(
-            "z-50 w-72 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none",
+            "z-50 max-h-[60vh] w-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none",
             POINTER_CURSORS,
           )}
         >
@@ -189,6 +192,7 @@ export function ThreadMenu({
                     {thread.active ? "running" : "idle"} · {TIER_WORDS[thread.tier]}
                   </span>
                 </button>
+                <ThreadSplitButton threadId={thread.id} compact onOpened={() => send("dismiss")} />
                 <button
                   type="button" role="menuitem" data-thread-entry
                   disabled={thread.active || archiving !== null}

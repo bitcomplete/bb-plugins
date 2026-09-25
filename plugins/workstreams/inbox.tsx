@@ -48,6 +48,7 @@ import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest }
 import { ThreadMenu } from "./threadmenu";
 import { PrBacklog } from "./pr-backlog-view";
 import { AdvanceProgress, useAdvanceBatches } from "./bulk-advance-view";
+import { AdvanceRepairDialog } from "./advance-repair-dialog";
 import { matchesApprovedFilter } from "./approval-filter";
 import { EffortCoordinatorControl } from "./effort-coordinator-control";
 import { backlogMatches, includeRemoteEfforts, prBacklog, remoteAttentionRows, remotePrsByEffort } from "./pr-backlog";
@@ -153,6 +154,12 @@ export function InboxBoard({
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
   const advance = useAdvanceBatches();
+  const advanceJobs = useMemo(() => advance.batches.flatMap((batch) => batch.jobs), [advance.batches]);
+  const [repairTarget, setRepairTarget] = useState<{ batchId: string; jobId: string } | null>(null);
+  const repairJob = (jobId: string) => {
+    const batch = advance.batches.find((item) => item.jobs.some((job) => job.id === jobId));
+    if (batch) setRepairTarget({ batchId: batch.id, jobId });
+  };
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
   const inventoryOnlyPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
@@ -548,7 +555,8 @@ export function InboxBoard({
       {dispatchControls ? <div className="flex items-center gap-1 border-b border-border/60 px-4 py-1.5" role="group" aria-label="Board view">
         {(["efforts", "backlog"] as const).map((view) => <button key={view} type="button" aria-pressed={boardV2View === view} onClick={() => chooseView(view)} className={cn("rounded-md px-2.5 py-1 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", boardV2View === view ? "bg-foreground/[0.08] font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{view === "efforts" ? "Efforts" : "PR backlog"}</button>)}
       </div> : null}
-      <AdvanceProgress batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
+      <AdvanceRepairDialog target={repairTarget} onClose={() => setRepairTarget(null)} onStarted={advance.refresh} onOpenThread={openThread} />
+      <AdvanceProgress onRepair={(batchId, jobId) => setRepairTarget({ batchId, jobId })} batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
       {backlogVisible && dispatch.mode === "auto" ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-4 py-2 text-[11.5px] text-muted-foreground">
         <span>Automatic agent runs · {allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? "selected effort"}</span>
         <button type="button" onClick={() => {
@@ -561,7 +569,7 @@ export function InboxBoard({
         <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button>
         {dispatchError === null ? null : <span role="alert" className="text-destructive">{dispatchError}</span>}
       </div> : null}
-      {backlogVisible ? <PrBacklog advanceJobs={advance.batches.flatMap((batch) => batch.jobs)} advanceActive={advance.active} onAdvanceStarted={advance.refresh} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
+      {backlogVisible ? <PrBacklog advanceJobs={advanceJobs} onRepair={repairJob} advanceActive={advance.active} onAdvanceStarted={advance.refresh} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
       <InboxHeader
         searchRef={searchRef}
         query={query}
@@ -669,12 +677,12 @@ export function InboxBoard({
                     </ul>
                   )
                 ) : null}
-                {expanded && remoteCount > 0 ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+                {expanded && remoteCount > 0 ? <PrBacklog advanceJobs={advanceJobs} onRepair={repairJob} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
                 {expanded && completionWithinEffort ? completionCards(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, group.key) : null}
               </section>
             );
           })}
-          {dispatchControls ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+          {dispatchControls ? <PrBacklog advanceJobs={advanceJobs} onRepair={repairJob} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
           {dispatchControls && !completionWithinEffort ? completionCards(completed, null) : null}
         </div>
       </div>

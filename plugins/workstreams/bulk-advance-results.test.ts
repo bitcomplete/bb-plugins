@@ -13,9 +13,9 @@ describe("inline advance results", () => {
   it("does not claim readiness after a newer push or fall back to another old batch", () => {
     expect(advanceResultForPr([job(), job({ id: "old", checkedHeadOid: "c".repeat(40) })], { url: job().prUrl, headRefOid: "c".repeat(40) }, true)).toBeNull();
   });
-  it("does not show an old verification after the base branch moves", () => {
+  it("does not treat GitHub historical baseRefOid as the current base tip", () => {
     const verified = job({ checkedBaseOid: "d".repeat(40) });
-    expect(advanceResultForPr([verified], { url: verified.prUrl, headRefOid: verified.checkedHeadOid, baseRefOid: "e".repeat(40) }, true)).toBeNull();
+    expect(advanceResultForPr([verified], { url: verified.prUrl, headRefOid: verified.checkedHeadOid, baseRefOid: "e".repeat(40) }, true)).toBe(verified);
   });
   it("does not override the current row's blockers with an earlier ready verdict at the same commit", () => {
     const verified = job();
@@ -37,6 +37,7 @@ describe("inline advance results", () => {
 
 describe("advance work labels", () => {
   it("identifies active feedback work while preserving saved preparation labels", () => {
+    expect(advanceStatus({ status: "running", dedicated: true, needsFeedback: true })).toBe("Repairing PR");
     expect(advanceStatus({ status: "running", needsFeedback: true })).toBe("Addressing feedback");
     expect(advanceStatus({ status: "running" })).toBe("Preparing branch");
     expect(advanceStatus({ status: "needs-attention", needsFeedback: true })).toBe("Needs attention");

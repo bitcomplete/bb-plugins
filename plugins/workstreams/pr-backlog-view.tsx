@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { UrlLink, useRpc } from "@get-bb/plugin-sdk/app";
+import { UrlLink, experimental_useSidebarThreads, useRpc } from "@get-bb/plugin-sdk/app";
 import type { Board, rpcContract } from "./server";
 import type { Row } from "./inbox";
 import { BACKLOG_GROUPS, BACKLOG_LABEL, backlogMatches, prBacklog, type BacklogRow } from "./pr-backlog";
 import { RowActionMenu, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
+import { backlogThreads } from "./backlog-threads";
 import { ArchivedThreadsButton } from "./archivedthreads";
 import { ageHint, rowAge, shortAge, shortVerb } from "./rowlabels";
 import { relativeTime } from "./workstreams";
@@ -18,7 +19,7 @@ import { advanceStatus, advanceResultForPr } from "./bulk-advance-results";
 import { AdvancePreviewButton } from "./bulk-advance-view";
 import { ADVANCE_SELECTION_LIMIT, advancePrKey, eligibleAdvanceSelection, reconcileAdvanceSelection, selectVisibleApproved, type AdvanceSelection } from "./bulk-advance-selection";
 
-export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, embeddedEffortKey, checkoutFiltersActive = false, approvedOnly = false, onClearApproved, advanceActive = false, advanceJobs = [], onAdvanceStarted }: {
+export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, embeddedEffortKey, checkoutFiltersActive = false, approvedOnly = false, onClearApproved, advanceActive = false, advanceJobs = [], onAdvanceStarted, onRepair }: {
   board: Board; locals: Row[]; now: number; width: number;
   /** Embed inventory-only PRs under Efforts without adding another set of controls. */
   unassignedQuery?: string;
@@ -30,12 +31,14 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
   advanceActive?: boolean;
   advanceJobs?: AdvanceJob[];
   onAdvanceStarted?: () => void;
+  onRepair?: (jobId: string) => void;
   onRequest: (request: ActionRequest) => void; onMessage: (row: Row) => void;
   onCheckout: (row: Row) => void; onStart: (row: Row) => void;
   onOpenThread: (id: string) => void; threadsOf: (row: Row) => Row["cluster"]["threads"];
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const inventory = board.prInventory;
+  const liveThreads = experimental_useSidebarThreads().threads;
   const [query, setQuery] = useState("");
   const [refreshPending, setRefreshPending] = useState(false);
   const [selection, setSelection] = useState<AdvanceSelection>({ urls: [], removed: 0 });
@@ -127,14 +130,16 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
               {embeddedEffortKey === undefined ? null : <p className="mx-2 mt-2 border-t border-border/40 pb-1 pt-2 text-[10.5px] text-muted-foreground">Related PRs without checkouts</p>}
               {embedded && (embeddedEffortKey === undefined || checkoutFiltersActive) ? <p className="px-2 pb-2 text-[11px] text-muted-foreground">{embeddedEffortKey === undefined ? "Your open PRs without a scanned checkout. Merge, update, or nudge here; agent fixes need a checkout." : "Related PRs have no scanned checkout."}{checkoutFiltersActive ? " Checkout date and surface filters do not apply to these PRs; search still does." : ""}</p> : null}
               <ul>{items.map((row) => {
+                const latestJob = advanceJobs.find((job) => advancePrKey(job.prUrl) === advancePrKey(row.pr.url));
                 const advanceResult = advanceResultForPr(advanceJobs, row.pr, row.group === "ready");
+                const displayedJob = advanceResult ?? (latestJob?.status === "needs-attention" ? latestJob : null);
                 const age = rowAge(row.pr, null);
-                const threads = row.local === null ? [] : threadsOf(row.local);
+                const threads = backlogThreads(row.pr.url, row.local === null ? [] : threadsOf(row.local), board.runs, advanceJobs, liveThreads);
                 const needsCheckout = row.action?.kind === "agent" && row.local === null;
                 const canAdvance = needsCheckout && isApprovedOpenPr(row.pr) && row.action?.kind === "agent" && ["resolve-conflicts", "address-comments", "address-review", "review-approval-note"].includes(row.action.action);
                 const gate = row.stale ? row.verb : row.pr.reviewDecision === "APPROVED" && !shortVerb(row.verb).startsWith("Approved") ? `Approved · ${shortVerb(row.verb)}` : shortVerb(row.verb);
                 const detail = [row.pr.title, row.local === null ? `${row.effortName === undefined ? "" : `Effort: ${row.effortName}\n`}No scanned checkout. Advance can create an isolated checkout for approved feedback or branch work; other agent fixes need a checkout.` : `Effort: ${row.local.effort}`, row.parent === null ? null : `Waiting on ${row.parent.repo} #${row.parent.pr.number} (${row.parent.pr.title})`, row.pr.resolvedReviewThreads ? `${row.pr.resolvedReviewThreads} review threads resolved` : null].filter(Boolean).join("\n");
-                return <li key={row.pr.url} data-pr-backlog-row id={`backlog-${row.pr.url}`} className={cn("grid min-w-0 items-center gap-x-3 gap-y-1 rounded-md border-b border-border/40 px-2 py-2 text-[12px] hover:bg-foreground/[0.035]", compact ? tight ? "grid-cols-[minmax(0,1fr)_3rem_6.5rem]" : "grid-cols-[minmax(9rem,1fr)_minmax(10rem,1fr)_3rem_6.5rem]" : "grid-cols-[11rem_minmax(0,1fr)_12rem_3rem_8rem_3rem]")}>
+                return <li key={row.pr.url} data-pr-backlog-row id={`backlog-${row.pr.url}`} className={cn("grid min-w-0 items-center gap-x-3 gap-y-1 rounded-md border-b border-border/40 px-2 py-2 text-[12px] hover:bg-foreground/[0.035]", compact ? tight ? "grid-cols-[minmax(0,1fr)_3rem_6.5rem]" : "grid-cols-[minmax(9rem,1fr)_minmax(10rem,1fr)_3rem_6.5rem]" : "grid-cols-[11rem_minmax(0,1fr)_12rem_3rem_8rem_5.5rem]")}>
                   <span className="col-start-1 row-start-1 flex min-w-0 items-center gap-2">
                     {!embedded ? <input type="checkbox" aria-label={`Select ${row.repo} #${row.pr.number} (${row.pr.title}) for advance`} checked={selectedSet.has(advancePrKey(row.pr.url))} disabled={advanceActive || !isApprovedOpenPr(row.pr) || (!selectedSet.has(advancePrKey(row.pr.url)) && selected.length >= ADVANCE_SELECTION_LIMIT)} onChange={(event) => setSelectedUrls(event.target.checked ? [...selected, advancePrKey(row.pr.url)] : selected.filter((url) => url !== advancePrKey(row.pr.url)))} className="size-3.5 shrink-0 accent-current disabled:opacity-25" title={isApprovedOpenPr(row.pr) ? "Select to address feedback, prepare the branch, and verify readiness" : "Advance starts with approved, open PRs"} /> : null}
                     <UrlLink href={row.pr.url} title={detail} className="flex min-w-0 items-baseline gap-1.5 text-foreground underline-offset-2 hover:underline"><span className="truncate font-semibold">{row.repo.split("/").at(-1)}</span><span className="shrink-0 font-mono text-[11.5px]">#{row.pr.number}</span></UrlLink>
@@ -146,15 +151,13 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
                     {needsCheckout ? <Tip label={canAdvance ? "Select this PR in the backlog and use Advance selected to address feedback and prepare its branch in an isolated checkout." : "A scanned checkout is needed for this agent fix. Advance does not repair unrelated CI failures."}><span className="flex min-w-0 flex-col items-end text-[10px] text-muted-foreground"><span>{canAdvance ? embedded ? "Use PR backlog" : "Select to advance" : "Checkout needed"}</span><UrlLink href={row.pr.url} className="text-[11px] underline underline-offset-2">Open PR ↗</UrlLink></span></Tip> : row.action !== null ? <button type="button" onClick={() => act(row)} className="max-w-full truncate rounded border border-border px-2 py-1 text-[11px] outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">{row.action.label}</button> : null}
                   </span>
                   <span className={cn("flex items-center justify-end", compact ? tight ? "col-start-3 row-start-1" : "col-start-4 row-start-1" : "col-start-6 row-start-1")}>
-                    {row.local === null ? <Tip label={canAdvance ? "Advance can create an isolated checkout for this work" : needsCheckout ? "Checkout needed for this agent fix" : "No scanned checkout; GitHub actions remain available"}><span className="text-[10px] text-muted-foreground">GitHub</span></Tip> : <>
-                      {threads.length > 0 ? <ThreadMenu threads={threads} onOpenThread={onOpenThread} onMore={() => onOpenThread(threads[0]!.id)} className="flex size-6 items-center justify-center rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"><span className={cn("size-1.5 rounded-full", threads.some((thread) => thread.active) ? "bg-sky-400" : "bg-muted-foreground/50")} /></ThreadMenu> : null}
-                      <RowActionMenu hasThreads={threads.length > 0} hasOpenPr onGoToThread={() => threads[0] && onOpenThread(threads[0].id)} onMessageAgent={() => onMessage(row.local!)} onOpenCheckout={() => onCheckout(row.local!)} onNewThread={() => onStart(row.local!)} />
-                    </>}
+                    {threads.length > 0 ? <ThreadMenu showAll threads={threads} onOpenThread={onOpenThread} onMore={() => onOpenThread(threads[0]!.id)} className={cn("flex h-6 shrink-0 items-center rounded px-1 text-[10.5px] outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring", threads.some((thread) => thread.active) ? "text-sky-700 dark:text-sky-400" : "text-muted-foreground")}>Threads {threads.length}</ThreadMenu> : null}
+                    {row.local !== null ? <RowActionMenu hasThreads={threads.length > 0} hasOpenPr onGoToThread={() => threads[0] && onOpenThread(threads[0].id)} onMessageAgent={() => onMessage(row.local!)} onOpenCheckout={() => onCheckout(row.local!)} onNewThread={() => onStart(row.local!)} /> : threads.length === 0 ? <Tip label={canAdvance ? "Advance can create an isolated checkout for this work" : needsCheckout ? "Checkout needed for this agent fix" : "No scanned checkout; GitHub actions remain available"}><span className="text-[10px] text-muted-foreground">GitHub</span></Tip> : null}
                   </span>
-                  {advanceResult === null ? null : <div className="col-span-full flex min-w-0 items-center gap-2 text-[10.5px]" title={`${advanceResult.detail}${advanceResult.checkedHeadOid ? ` · Verified commit ${advanceResult.checkedHeadOid}` : ""} · ${new Date(advanceResult.updatedAt).toLocaleString()}`}>
-                    <span className={cn("shrink-0 font-medium", advanceResult.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : advanceResult.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>Advance · {advanceStatus(advanceResult)}</span>
-                    <span className="min-w-0 truncate text-muted-foreground">{advanceResult.detail}</span>
-                    {advanceResult.threadId ? <button type="button" onClick={() => onOpenThread(advanceResult.threadId!)} className="ml-auto shrink-0 rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Worker ↗</button> : null}
+                  {displayedJob === null ? null : <div className="col-span-full flex min-w-0 items-center gap-2 text-[10.5px]" title={`${displayedJob.detail}${displayedJob.checkedHeadOid ? ` · Verified commit ${displayedJob.checkedHeadOid}` : ""} · ${new Date(displayedJob.updatedAt).toLocaleString()}`}>
+                    <span className={cn("shrink-0 font-medium", displayedJob.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : displayedJob.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{advanceResult === null ? "Previous advance" : "Advance"} · {advanceStatus(displayedJob)}</span>
+                    <span className="min-w-0 truncate text-muted-foreground">{displayedJob.detail}</span>
+                    {displayedJob.status === "needs-attention" && onRepair ? <button type="button" onClick={() => onRepair(displayedJob.id)} className="ml-auto shrink-0 rounded border border-border px-2 py-0.5 text-foreground outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">Fix…</button> : null}
                   </div>}
                 </li>;
               })}</ul>

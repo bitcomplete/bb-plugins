@@ -12,15 +12,17 @@ const view = {
   latestReviews: [], statusCheckRollup: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
 };
 
-function fixture(options: { view?: Record<string, unknown>; review?: Record<string, unknown>; bases?: unknown; views?: Record<string, unknown>[] } = {}) {
+function fixture(options: { view?: Record<string, unknown>; review?: Record<string, unknown>; finalRefs?: Record<string, unknown>; bases?: unknown; views?: Record<string, unknown>[] } = {}) {
   let views = 0;
   const calls: string[][] = [];
   const run: GhRunner = async (args) => {
     calls.push([...args]);
     let value: unknown;
     if (args[0] === "api") value = { data: { repository: { pullRequest: {
-      headRefOid: head, baseRefOid: base, reviews: { pageInfo: { hasPreviousPage: false }, nodes: [] },
-      reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] }, ...options.review,
+      headRefOid: head, baseRefOid: base, baseRefName: "main", baseRef: { name: "main", target: { oid: base } },
+      reviews: { pageInfo: { hasPreviousPage: false }, nodes: [] },
+      reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+      ...(args.some((arg) => arg.includes("reviewThreads")) ? options.review : options.finalRefs),
     } } } };
     else if (args[1] === "list") value = options.bases ?? [];
     else { value = { ...view, ...options.view, ...options.views?.[views] }; views++; }
@@ -77,7 +79,7 @@ describe("bulk advance verification", () => {
   });
 
   it("fails boundedly if review facts describe an old head or base", async () => {
-    for (const review of [{ headRefOid: "c".repeat(40) }, { baseRefOid: "c".repeat(40) }]) {
+    for (const review of [{ headRefOid: "c".repeat(40) }, { baseRef: { name: "main", target: { oid: "c".repeat(40) } } }]) {
       const fake = fixture({ review });
       expect(await readAdvancePr(fake.run, url)).toMatchObject({ ok: false, error: expect.stringContaining("changed during verification") });
       expect(fake.calls.filter((args) => args[1] === "view")).toHaveLength(6);
@@ -89,8 +91,20 @@ describe("bulk advance verification", () => {
   });
 
   it("rejects partial API results and ambiguous base branches", async () => {
-    expect(await readAdvancePr(fixture({ view: { baseRefOid: undefined } }).run, url)).toMatchObject({ ok: false });
+    expect(await readAdvancePr(fixture({ finalRefs: { baseRef: null } }).run, url)).toMatchObject({ ok: false });
     expect(await readAdvancePr(fixture({ bases: [{ number: 40, headRefName: "main" }, { number: 41, headRefName: "main" }] }).run, url)).toMatchObject({ ok: false });
+  });
+
+  it("uses the current base ref when the PR's historical base snapshot is stale", async () => {
+    const stale = "c".repeat(40);
+    expect(await readAdvancePr(fixture({ view: { baseRefOid: stale }, review: { baseRefOid: stale } }).run, url))
+      .toMatchObject({ ok: true, facts: { baseOid: base, readiness: "ready" } });
+  });
+
+  it("refuses readiness when the actual base branch moves during verification", async () => {
+    const fake = fixture({ finalRefs: { baseRef: { name: "main", target: { oid: "c".repeat(40) } } } });
+    expect(await readAdvancePr(fake.run, url)).toMatchObject({ ok: false, error: expect.stringContaining("changed during verification") });
+    expect(fake.calls.filter((args) => args[1] === "view")).toHaveLength(6);
   });
 });
 

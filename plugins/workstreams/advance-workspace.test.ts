@@ -42,11 +42,11 @@ async function fixture() {
   const input = { sourcePath, prUrl: "https://github.com/example/widget/pull/42", expectedHeadOid: head, expectedBaseOid: base, batchId: "batch-1", jobId: "job-42" };
   const gh: GhRunner = async (args) => {
     const value = args[0] === "api" ? { data: { repository: { pullRequest: {
-      headRefOid: head, baseRefOid: base, reviews: { pageInfo: { hasPreviousPage: false }, nodes: [] },
+      headRefOid: head, baseRefOid: "c".repeat(40), baseRefName: "main", baseRef: { name: "main", target: { oid: base } }, reviews: { pageInfo: { hasPreviousPage: false }, nodes: [] },
       reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
     } } } } : args[1] === "list" ? [] : {
       url: input.prUrl, number: 42, title: "Fix account lookup", state: "OPEN", isDraft: false, isCrossRepository: false,
-      headRefName: "feature", baseRefName: "main", headRefOid: head, baseRefOid: base,
+      headRefName: "feature", baseRefName: "main", headRefOid: head, baseRefOid: "c".repeat(40),
       reviewDecision: "APPROVED", mergeStateStatus: "BEHIND", mergeable: "MERGEABLE", latestReviews: [], statusCheckRollup: [],
     };
     return { ok: true, stdout: JSON.stringify(value) };
@@ -55,7 +55,7 @@ async function fixture() {
 }
 
 describe("isolated advance workspaces", () => {
-  it("creates a detached checkout at the exact PR commit without changing author work, then reuses it", async () => {
+  it("creates the exact PR checkout using the live base tip despite a stale PR base snapshot, then reuses it", async () => {
     const f = await fixture();
     const first = await prepareAdvanceWorkspace(f.run, f.gh, f.input, f.root);
     expect(first).toMatchObject({ ok: true, created: true });

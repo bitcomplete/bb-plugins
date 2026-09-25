@@ -90,6 +90,14 @@ via agent** action starts a BB thread only when you confirm it.
   pushes with an exact commit lease when rewriting history, replies with
   evidence, and resolves only feedback verified as addressed. A pushed change
   receives a PR summary. PRs that only need verification run without an agent.
+  Use **Fix…** on a result that needs attention to review its failure and fresh
+  next steps, then choose a child of a linked thread or a new thread. An
+  eligible stopped worker can continue when its ownership is clear. Repairs
+  keep their own result history and do not extend the repository batch queue.
+  **Threads** on each backlog row includes related author and action threads,
+  including previous batch workers. These links remain when a readiness result
+  becomes stale. Open a thread normally or beside the Board when BB supports
+  split panes.
   The Board keeps per-PR results and checks current approval, feedback, checks,
   and stack dependencies before reporting **Ready to merge**. **Stop queued PRs**
   stops work that has not started; active workers can finish. The batch never

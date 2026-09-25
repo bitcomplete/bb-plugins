@@ -104,7 +104,7 @@ import {
   withinPath,
 } from "./threads.js";
 import { startThread } from "./spawn.js";
-import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type DirectAction, type MergeMethod } from "./actions.js";
+import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, recommendThread, type DirectAction, type MergeMethod, type ThreadCandidate } from "./actions.js";
 import { planAgent, runAgent, type AgentSdk } from "./agent.js";
 import { sendRowMessage } from "./threadmessage.js";
 import { archiveLinkedThread, restoreArchivedThread, archiveRecordSchema, ARCHIVE_HISTORY_LIMIT, type ArchiveStore } from "./threadarchive.js";
@@ -122,7 +122,7 @@ import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearage
 import { PIN_AFTER, planClusterAsks, type AskMemory } from "./asks.js";
 import { LINEAR_DETAIL_MIGRATION, createLinearSync } from "./linearsync.js";
 import { TICKET_SOURCES, linkbacksDue, ticketFinder, type LinkbackCheck, type TicketFacts } from "./tickets.js";
-import { ADVANCE_MIGRATIONS, createAdvanceService, advancePreviewSchema, advanceBatchSchema, type AdvanceFacts } from "./bulk-advance.js";
+import { ADVANCE_MIGRATIONS, createAdvanceService, advancePreviewSchema, advanceBatchSchema, advanceRepairPlanSchema, advanceRepairRunSchema, advanceRepairResultSchema, type AdvanceFacts, type AdvanceJob } from "./bulk-advance.js";
 import { projectForPath } from "./spawn.js";
 import { DISPATCH_MIGRATIONS, createDispatchStore, selectCandidate, gateStillOpen, type DispatchState } from "./dispatch.js";
 
@@ -315,6 +315,8 @@ export const rpcContract = defineRpcContract({
   advance_get: { input: z.null(), output: z.array(advanceBatchSchema) },
   advance_cancel: { input: z.object({ batchId: z.string().uuid() }).strict(), output: advanceBatchSchema },
   advance_recheck: { input: z.object({ batchId: z.string().uuid() }).strict(), output: advanceBatchSchema },
+  advance_repair_plan: { input: z.object({ batchId: z.string().uuid(), jobId: z.string().uuid() }).strict(), output: advanceRepairPlanSchema },
+  advance_repair_run: { input: advanceRepairRunSchema, output: advanceRepairResultSchema },
   inventory_refresh: { input: z.null(), output: z.object({ started: z.boolean() }) },
   dispatch_set: {
     input: z.object({ mode: z.enum(["off", "shadow", "auto"]), effortKey: z.string().nullable() }).strict(),
@@ -2500,7 +2502,7 @@ export default async function plugin(bb: BbPluginApi) {
       return result;
     } finally { if (key) manualPrWrites.delete(key); }
   }
-  async function advanceInspect(prUrl: string): Promise<AdvanceFacts> {
+  async function advanceInspect(prUrl: string, repair = false): Promise<AdvanceFacts> {
     const units = readUnits();
     const tracked = units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.pr ?? inventory.get(prUrl)?.pr;
     if (!tracked) throw new Error("That PR is no longer tracked. Refresh the backlog.");
@@ -2523,14 +2525,56 @@ export default async function plugin(bb: BbPluginApi) {
       if (!result.ok) return { ...fallback, detail: result.error };
       const facts = result.facts;
       const needsFeedback = facts.unresolvedThreads > 0 || facts.approvalNotePending;
-      const needsWriter = facts.needsPreparation || needsFeedback;
-      const eligible = facts.state === "OPEN" && facts.reviewDecision === "APPROVED" && !facts.isDraft && (!needsWriter || (!facts.isCrossRepository && !!source));
+      const needsWriter = repair || facts.needsPreparation || needsFeedback;
+      const eligible = facts.state === "OPEN" && (repair || facts.reviewDecision === "APPROVED") && !facts.isDraft && (!needsWriter || (!facts.isCrossRepository && !!source));
       const detail = facts.state !== "OPEN" || facts.isDraft ? facts.detail : facts.isCrossRepository && needsWriter ? "Fork PRs need manual preparation and review follow-up in this version" : needsWriter && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail;
       return { ...fallback, ...facts, needsFeedback, eligible, detail, blockedBy: facts.basePrNumber === null ? null : `${target.slug}#${facts.basePrNumber}` };
     } catch (error) { return { ...fallback, detail: `Inspection failed: ${String(error).slice(0, 300)}` }; }
   }
+  async function advanceRepairLinks(facts: AdvanceFacts, previousThreadId?: string | null) {
+    const links = new Map<string, { id: string; title: string; tier: ThreadTier }>();
+    const offer = (id: string | null, title: string, tier: ThreadTier) => { if (id && !links.has(id)) links.set(id, { id, title, tier }); };
+    const effort = effortStore.owner("prUrl", facts.prUrl);
+    if (effort) for (const worker of effortStore.workers(effort.id, facts.prUrl)) offer(worker.threadId, "PR author or follow-up", "started");
+    for (const run of runs.recent(0, 1_000)) if (run.prUrl?.toLowerCase() === facts.prUrl.toLowerCase()) offer(run.threadId, "Previous PR action", "started");
+    if (facts.path) for (const link of await linkedThreads(facts.path)) offer(link.id, link.title, link.tier);
+    for (const batch of advance.list()) for (const job of batch.jobs) if (job.prUrl.toLowerCase() === facts.prUrl.toLowerCase()) {
+      offer(job.threadId, "Previous Advance worker", "started");
+      for (const attempt of job.previousAttempts) offer(attempt.threadId, "Previous repair worker", "started");
+    }
+    offer(previousThreadId ?? null, "Previous Advance worker", "started");
+    return [...links.values()];
+  }
+  async function advanceRepairCandidates(facts: AdvanceFacts, job: AdvanceJob) {
+    const links = await advanceRepairLinks(facts, job.threadId);
+    const selected = links.filter((link) => link.id !== job.threadId).slice(0, 7);
+    const previous = links.find((link) => link.id === job.threadId);
+    if (previous) selected.push(previous);
+    const candidates = (await Promise.all(selected.map(async (link): Promise<ThreadCandidate | null> => {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: link.id });
+        if (thread.archivedAt !== null || thread.deletedAt !== null || thread.projectId !== facts.projectId) return null;
+        return { ...link, title: (thread.title ?? thread.titleFallback ?? link.title).slice(0, 200), updatedAt: thread.updatedAt,
+          running: thread.status !== "idle" && thread.status !== "error", contextUsed: null, canSpawnChild: thread.canSpawnChild };
+      } catch { return null; }
+    }))).filter((candidate): candidate is ThreadCandidate => candidate !== null);
+    return { candidates, recommendation: recommendThread(facts.needsFeedback ? "address-review" : "resolve-conflicts", candidates, { send: false, subthread: true, contextUsage: false }) };
+  }
   const advance = createAdvanceService(db, {
     inspect: advanceInspect,
+    repairCandidates: advanceRepairCandidates,
+    repairSpawn: async (facts, workerPath, prompt, attemptId, mode, parentThreadId) => {
+      if (!facts.projectId) throw new Error("No project is available for this PR repair");
+      if (mode === "subthread" && parentThreadId === null) throw new Error("A repair subthread needs its validated parent.");
+      if (mode === "new" && parentThreadId !== null) throw new Error("A new repair thread cannot specify a parent.");
+      const thread = await bb.sdk.threads.spawn({ projectId: facts.projectId,
+        title: `${facts.repo.split("/").at(-1)} #${facts.number}: repair ${facts.needsFeedback ? "review feedback" : facts.needsPreparation ? "branch preparation" : "validation"}`,
+        prompt: parentThreadId ? `${prompt}\nAuthor context reference: @thread:${parentThreadId}. Consult its relevant PR decisions only if the live PR description, review discussion, and code do not establish the intended behavior.` : prompt,
+        environment: { type: "host", hostId: facts.hostId, workspace: { type: "unmanaged", path: workerPath } },
+        ...(mode === "subthread" ? { parentThreadId: parentThreadId! } : {}),
+        pluginMetadata: { advanceJobId: attemptId, role: "advance-repair", prUrl: facts.prUrl } });
+      return thread.id;
+    },
     workspace: async (facts, batchId, jobId) => {
       if (!facts.sourcePath) throw new Error("No matching repository source is available");
       const result = await host.call("advanceWorkspace", { sourcePath: facts.sourcePath, prUrl: facts.prUrl,
@@ -2813,6 +2857,8 @@ export default async function plugin(bb: BbPluginApi) {
     advance_get: () => advance.list(),
     advance_cancel: ({ batchId }) => advance.cancel(batchId),
     advance_recheck: ({ batchId }) => advance.recheck(batchId),
+    advance_repair_plan: ({ batchId, jobId }) => advance.repairPlan(batchId, jobId),
+    advance_repair_run: (input) => advance.repairRun(input),
     effort_plan: ({ groupKey }) => effortPlan(groupKey),
     effort_coordinate: async (input) => {
       const result = await coordinators.coordinate(input, await effortPlan(input.groupKey));

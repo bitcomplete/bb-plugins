@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { cn } from "@/lib/utils";
 import { advanceStatus } from "./bulk-advance-results";
 import { advancePreviewAction, advancePreviewSummary } from "./bulk-advance-preview";
+import { ThreadSplitButton } from "./thread-split-button";
 
 const ACTIVE = new Set<AdvanceJob["status"]>(["queued", "launching", "running", "verifying"]);
 const failure = (cause: unknown): string => cause instanceof Error ? cause.message : String(cause);
@@ -132,8 +133,8 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
   </>;
 }
 
-export function AdvanceProgress({ batches, error, onRefresh, onOpenThread }: {
-  batches: AdvanceBatch[]; error: string | null; onRefresh: () => void; onOpenThread: (threadId: string) => void;
+export function AdvanceProgress({ batches, error, onRefresh, onOpenThread, onRepair }: {
+  batches: AdvanceBatch[]; error: string | null; onRefresh: () => void; onOpenThread: (threadId: string) => void; onRepair: (batchId: string, jobId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [busy, setBusy] = useState<string | null>(null);
@@ -170,7 +171,11 @@ export function AdvanceProgress({ batches, error, onRefresh, onOpenThread }: {
           {batch.jobs.map((job) => <li key={job.id} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 py-2">
             <UrlLink href={job.prUrl} className="min-w-0 truncate underline-offset-2 hover:underline" title={`${job.repo} #${job.number} (${job.title})`}><span className="font-medium">{job.repo.split("/").at(-1)} <span className="font-mono">#{job.number}</span></span> <span className="text-muted-foreground">{job.title}</span></UrlLink>
             <span className={cn("text-right", job.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : job.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{advanceStatus(job)}</span>
-            <p className="col-span-2 break-words text-[11px] text-muted-foreground">{job.detail}{job.uncertain ? " Worker state is uncertain. Recheck readiness to reconcile this job; inspect its worker before retrying." : ""}{job.checkedHeadOid ? <span className="ml-1 font-mono">· {job.checkedHeadOid.slice(0, 7)}</span> : null}{job.threadId ? <> · <button type="button" onClick={() => onOpenThread(job.threadId!)} className="rounded underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Open worker</button></> : null}</p>
+            <p className="col-span-2 break-words text-[11px] text-muted-foreground">{job.detail}{job.uncertain ? " Worker state is uncertain. Recheck readiness to reconcile this job; inspect its worker before retrying." : ""}{job.checkedHeadOid ? <span className="ml-1 font-mono">· {job.checkedHeadOid.slice(0, 7)}</span> : null}</p>
+            <div className="col-span-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+              {job.status === "needs-attention" ? <button type="button" onClick={() => onRepair(batch.id, job.id)} className="rounded border border-border px-2 py-0.5 text-foreground outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">Fix…</button> : null}
+              {job.threadId ? <><button type="button" onClick={() => onOpenThread(job.threadId!)} className="rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Open worker</button><ThreadSplitButton threadId={job.threadId} /></> : null}
+            </div>
           </li>)}
         </ul>
       </div>)}

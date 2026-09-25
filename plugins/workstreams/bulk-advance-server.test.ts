@@ -2,7 +2,7 @@ import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/tes
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RawUnit } from "./contract.js";
 import type { AdvanceFacts } from "./advance-contract.js";
-import type { AdvanceBatch, AdvancePreview } from "./bulk-advance.js";
+import type { AdvanceBatch, AdvancePreview, AdvanceRepairPlan } from "./bulk-advance.js";
 import { parsePrList } from "./gh.js";
 import plugin from "./server.js";
 
@@ -12,7 +12,7 @@ const HEAD = "a".repeat(40), BASE = "b".repeat(40);
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 
-async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready?: boolean; fork?: boolean; omitLaunchedThreadsFromList?: boolean; feedback?: "threads" | "approval-note" } = {}) {
+async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready?: boolean; fork?: boolean; omitLaunchedThreadsFromList?: boolean; feedback?: "threads" | "approval-note"; failFirstWorkspace?: boolean; author?: boolean } = {}) {
   const repo = options.mixedCase ? "Example/Widget" : "example/widget";
   const url = `https://github.com/${repo}/pull/42`;
   const pr = { ...parsePrList(JSON.stringify([{ number: 42, url, state: "OPEN", title: "ABC-42 Fix account lookup", reviewDecision: "APPROVED",
@@ -29,8 +29,11 @@ async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready
     unresolvedThreads: options.feedback === "threads" ? 1 : 0, checks: "passed", basePrNumber: null, approvalNotePending: options.feedback === "approval-note" };
   const calls: { method: string; input: unknown }[] = [];
   const threads = new Map<string, ReturnType<typeof makeThreadResponse>>();
+  if (options.author) threads.set("thr-author", makeThreadResponse({ id: "thr-author", title: "ABC-42 Fix account lookup", projectId: "project-example", status: "idle" }));
+  const blockedParents = new Set<string>();
+  let spawned = 0, workspaces = 0;
   const spawn = vi.fn(async (args: Record<string, any>) => {
-    const thread = makeThreadResponse({ id: "thr-rebasing", projectId: args.projectId, title: args.title, status: "active" });
+    const thread = makeThreadResponse({ id: ++spawned === 1 ? "thr-rebasing" : `thr-repair-${spawned}`, projectId: args.projectId, title: args.title, status: "active" });
     threads.set(thread.id, thread); return thread;
   });
   const send = vi.fn(async () => ({} as never));
@@ -39,7 +42,7 @@ async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready
     projects: { list: async () => [{ id: "project-example", name: "Example", sources: [{ hostId: HOST, path: "/p" }] }] as never },
     threads: {
       list: async () => (options.omitLaunchedThreadsFromList ? [] : [...threads.values()]) as never, spawn, send,
-      get: async ({ threadId }: { threadId: string }) => ({ ...threads.get(threadId)!, canSpawnChild: true }) as never,
+      get: async ({ threadId }: { threadId: string }) => ({ ...threads.get(threadId)!, canSpawnChild: !blockedParents.has(threadId) }) as never,
       getPluginMetadata: async () => ({}) as never, output: async () => ({ output: "" }),
       context: async () => ({ usage: null }) as never, events: { list: async () => [] }, interactions: { list: async () => [] as never },
     },
@@ -49,12 +52,22 @@ async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready
     if (method === "authoredPrs") return { owners: [repo.split("/")[0]], entries: [{ repo, pr }], discoveryComplete: true,
       repositories: [{ repo, complete: true }], complete: true, warnings: [] };
     if (method === "advanceInspect") return { ok: true, facts };
-    if (method === "advanceWorkspace") return { ok: true, path: "/synthetic/workstreams/batch/repo/job", workerPath: "/synthetic/workstreams/batch/repo", sourcePath: PATH, created: true };
+    if (method === "advanceWorkspace") {
+      workspaces++;
+      if (options.failFirstWorkspace && workspaces === 1) return { ok: false, error: "The fetched PR base changed. No checkout was created." };
+      return { ok: true, path: `/synthetic/workstreams/batch/repo/${workspaces === 1 ? "job" : (input as { jobId: string }).jobId}`, workerPath: "/synthetic/workstreams/batch/repo", sourcePath: PATH, created: true };
+    }
     throw new Error(`Unexpected host method ${method}`);
   } });
   await plugin(bb); cleanups.push(() => harness.lifecycle.dispose());
   expect((await harness.runCli(["refresh"])).exitCode).toBe(0);
-  return { harness, calls, spawn, send, facts, pr, url, preview: async (prUrl = url) => await harness.callRpc("advance_preview", { prUrls: [prUrl] }) as AdvancePreview };
+  return { harness, calls, spawn, send, facts, pr, url, threads, blockedParents, preview: async (prUrl = url) => await harness.callRpc("advance_preview", { prUrls: [prUrl] }) as AdvancePreview };
+}
+
+async function failedBatch(env: Awaited<ReturnType<typeof setup>>) {
+  const batch = await env.harness.callRpc("advance_start", { token: (await env.preview()).token }) as AdvanceBatch;
+  await vi.waitFor(async () => expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "needs-attention" }] }]));
+  return { batchId: batch.id, jobId: batch.jobs[0]!.id };
 }
 
 describe("bulk advance server integration", () => {
@@ -146,5 +159,67 @@ describe("bulk advance server integration", () => {
     await vi.waitFor(async () => expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{
       status: "waiting-review", checkedHeadOid: pushedHead, detail: "Waiting for approval on the current PR.",
     }] }]));
+  });
+
+  it("previews a failed remote item without writes and repairs it after approval was dismissed", async () => {
+    const env = await setup({ remoteOnly: true, feedback: "threads", failFirstWorkspace: true });
+    const ids = await failedBatch(env);
+    env.facts.reviewDecision = "REVIEW_REQUIRED";
+    env.facts.readiness = "waiting-review";
+    const plan = await env.harness.callRpc("advance_repair_plan", ids) as AdvanceRepairPlan;
+    expect(plan.fresh).toMatchObject({ eligible: true, needsFeedback: true });
+    expect(env.calls.filter((call) => call.method === "advanceWorkspace")).toHaveLength(1);
+    expect(env.spawn).not.toHaveBeenCalled();
+    const result = await env.harness.callRpc("advance_repair_run", { token: plan.token, mode: "new", threadId: null, instruction: "Address the remaining feedback and reply." }) as { batch: AdvanceBatch; threadId: string };
+    expect(result.batch.jobs[0]).toMatchObject({ status: "running", dedicated: true, threadId: result.threadId });
+    const request = env.spawn.mock.calls[0]![0];
+    expect(request).toMatchObject({ projectId: "project-example", title: "widget #42: repair review feedback",
+      environment: { type: "host", hostId: HOST, workspace: { type: "unmanaged", path: "/synthetic/workstreams/batch/repo" } },
+      pluginMetadata: { role: "advance-repair", advanceJobId: result.batch.jobs[0]!.attemptId, prUrl: env.url } });
+    expect(request).not.toHaveProperty("model");
+    expect(request).not.toHaveProperty("parentThreadId");
+    expect(result.batch.jobs[0]!.attemptId).not.toBe(ids.jobId);
+    expect(request.prompt).toContain("Address the remaining feedback and reply.");
+    expect(request.prompt).toContain("do not reset");
+  });
+
+  it("offers a linked author as a parent and rejects arbitrary parent IDs", async () => {
+    const env = await setup({ feedback: "threads", failFirstWorkspace: true, author: true });
+    const plan = await env.harness.callRpc("advance_repair_plan", await failedBatch(env)) as AdvanceRepairPlan;
+    expect(plan.candidates).toContainEqual(expect.objectContaining({ id: "thr-author", canSpawnChild: true, canContinue: false }));
+    await expect(env.harness.callRpc("advance_repair_run", { token: plan.token, mode: "subthread", threadId: "thr-unrelated", instruction: "Fix remaining comments" })).rejects.toThrow();
+    expect(env.spawn).not.toHaveBeenCalled();
+    await env.harness.callRpc("advance_repair_run", { token: plan.token, mode: "subthread", threadId: "thr-author", instruction: "Fix remaining comments" });
+    expect(env.spawn.mock.calls[0]![0]).toMatchObject({ parentThreadId: "thr-author", projectId: "project-example", pluginMetadata: { role: "advance-repair" } });
+    expect(env.spawn.mock.calls[0]![0].prompt).toContain("@thread:thr-author");
+  });
+
+  it("revalidates a parent's child capability before launching the repair", async () => {
+    const env = await setup({ failFirstWorkspace: true, author: true });
+    const plan = await env.harness.callRpc("advance_repair_plan", await failedBatch(env)) as AdvanceRepairPlan;
+    env.blockedParents.add("thr-author");
+    await expect(env.harness.callRpc("advance_repair_run", { token: plan.token, mode: "subthread", threadId: "thr-author", instruction: "Fix the failure" })).rejects.toThrow();
+    expect(env.spawn).not.toHaveBeenCalled();
+    expect(env.calls.filter((call) => call.method === "advanceWorkspace")).toHaveLength(2);
+    expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "needs-attention", uncertain: false, threadId: null }] }]);
+  });
+
+  it("refuses a competing repair while the linked author is actively working", async () => {
+    const env = await setup({ failFirstWorkspace: true, author: true });
+    const ids = await failedBatch(env);
+    env.threads.set("thr-author", { ...env.threads.get("thr-author")!, status: "active" });
+    await expect(env.harness.callRpc("advance_repair_plan", ids)).rejects.toThrow(/Another writer/u);
+    expect(env.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["closed", "draft", "fork"] as const)("refuses %s repairs even when the remaining task has no branch or feedback flag", async (blocker) => {
+    const env = await setup({ failFirstWorkspace: true });
+    const ids = await failedBatch(env);
+    Object.assign(env.facts, { needsPreparation: false, unresolvedThreads: 0, approvalNotePending: false, readiness: "ready", detail: "Current state needs attention" });
+    if (blocker === "closed") env.facts.state = "CLOSED";
+    if (blocker === "draft") env.facts.isDraft = true;
+    if (blocker === "fork") env.facts.isCrossRepository = true;
+    await expect(env.harness.callRpc("advance_repair_plan", ids)).rejects.toThrow();
+    expect(env.spawn).not.toHaveBeenCalled();
   });
 });

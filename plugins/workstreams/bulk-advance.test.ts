@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
+import type { Recommendation, ThreadCandidate } from "./actions.js";
 import { ADVANCE_MIGRATIONS, createAdvanceService, preparationPrompt, type AdvanceFacts } from "./bulk-advance.js";
 
 const fact = (number = 1, overrides: Partial<AdvanceFacts> = {}): AdvanceFacts => ({
@@ -16,9 +17,14 @@ function setup(facts = [fact()]) {
   let time = 1_000;
   const deps = {
     inspect: vi.fn(async (url: string) => ({ ...current.get(url)! })),
+    repairCandidates: vi.fn(async (_facts: AdvanceFacts, _job: unknown): Promise<{ candidates: ThreadCandidate[]; recommendation: Recommendation }> => ({
+      candidates: [{ id: "author", title: "Original PR work", tier: "started", running: false, updatedAt: 0, contextUsed: null, canSpawnChild: true }],
+      recommendation: { mode: "subthread", threadId: "author", reason: "Original PR author context" },
+    })),
+    repairSpawn: vi.fn(async (_facts: AdvanceFacts, _path: string, _prompt: string, _id: string, _mode: "new" | "subthread", _parent: string | null) => "repair-thread"),
     busyNow: vi.fn(() => false), busy: vi.fn(async () => false),
     workspace: vi.fn(async (_: AdvanceFacts, _batch: string, id: string) => ({ path: `/isolated/${id}`, workerPath: "/isolated" })),
-    spawn: vi.fn(async (_facts: AdvanceFacts, _path: string, _prompt: string, _jobId: string) => "thread"), send: vi.fn(async () => {}),
+    spawn: vi.fn(async (_facts: AdvanceFacts, _path: string, _prompt: string, _jobId: string) => "thread"), send: vi.fn(async (_threadId: string, _prompt: string) => {}),
     thread: vi.fn(async () => ({ status: "idle", archivedAt: null, deletedAt: null, output: "" })),
     recover: vi.fn(async (): Promise<string[]> => []), changed: vi.fn(), verified: vi.fn(), now: () => time,
   };
@@ -183,10 +189,10 @@ describe("finite Advance preparation", () => {
     expect(t.service.reserved(fact().prUrl, null)).toBe(false);
     expect(t.deps.spawn).toHaveBeenCalledTimes(1);
   });
-  it("invalidates a verified result when fresh observation changes its base", async () => {
+  it("does not confuse GitHub's historical base snapshot with the live verified base tip", async () => {
     const t = setup([fact(1, { needsPreparation: false, readiness: "ready" })]); await t.start();
     t.service.invalidate([{ url: fact().prUrl, headRefOid: fact().headOid, baseRefOid: "c".repeat(40) }]);
-    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "needs-attention", checkedHeadOid: null });
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "ready", checkedHeadOid: fact().headOid });
   });
   it("invalidates Ready when approval or comments change on the same head", async () => {
     for (const change of [{ reviewDecision: "CHANGES_REQUESTED" }, { unresolvedReviewThreads: 1 }, { unresolvedReviewThreads: null }, { isDraft: true }, { approvalHasBody: true, approvalNoteFollowedUp: false }, { checkConclusions: ["FAILURE"] }]) {
@@ -226,4 +232,181 @@ describe("finite Advance preparation", () => {
     expect(prompt).toContain("do not merge");
     expect(prompt).toContain("untrusted task metadata");
   });
+  it("reconciles success after a worker failed and then resumed, without sending again", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "failed");
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    t.deps.thread.mockResolvedValue({ status: "idle", archivedAt: null, deletedAt: null, output: `Workstreams job ${job.id} complete: prepared` });
+    await t.service.recheck(batch.id);
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "ready", uncertain: false });
+    expect(t.deps.send).not.toHaveBeenCalled();
+  });
+  it("accepts the exact current result event after a failed attempt resumes", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "failed");
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: prepared`);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("ready");
+  });
+  it("launches a dedicated child repair once, preserves history, and ignores the old marker", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    const input = { token: plan.token, mode: "subthread" as const, threadId: "author", instruction: "Fix the failing tests" };
+    const result = await t.service.repairRun(input);
+    expect((await t.service.repairRun(input)).threadId).toBe(result.threadId);
+    expect(t.deps.repairSpawn).toHaveBeenCalledTimes(1);
+    expect(t.deps.repairSpawn.mock.calls[0]?.slice(4)).toEqual(["subthread", "author"]);
+    const repaired = result.batch.jobs[0]!;
+    expect(repaired).toMatchObject({ dedicated: true, threadId: "repair-thread", status: "running" });
+    expect(repaired.attemptId).not.toBe(job.id);
+    expect(repaired.previousAttempts[0]).toMatchObject({ attemptId: job.id, threadId: "thread", status: "needs-attention" });
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("repair-thread", "idle", `Workstreams job ${job.id} complete: prepared`);
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "needs-attention", uncertain: true });
+    await t.service.signal("repair-thread", "idle", `Workstreams job ${repaired.attemptId} complete: prepared`);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("ready");
+  });
+  it("rejects stale repair previews without overwriting the prior failed attempt", async () => {
+    const t = setup(); const batch = await t.start(); const id = batch.jobs[0]!.id;
+    await t.service.signal("thread", "idle", `Workstreams job ${id} complete: blocked`);
+    const plan = await t.service.repairPlan(batch.id, id);
+    t.current.set(fact().prUrl, fact(1, { headOid: "f".repeat(40) }));
+    await expect(t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" })).rejects.toThrow("changed");
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ threadId: "thread", status: "needs-attention", attemptId: null, previousAttempts: [] });
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+  });
+  it("refuses repair while the uncertain original worker is still active", async () => {
+    const t = setup(); const batch = await t.start(); await t.service.signal("thread", "failed");
+    t.deps.thread.mockResolvedValue({ status: "active", archivedAt: null, deletedAt: null, output: "" });
+    await expect(t.service.repairPlan(batch.id, batch.jobs[0]!.id)).rejects.toThrow("still active");
+    expect(t.service.reserved(fact().prUrl, null)).toBe(true);
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+  });
+  it("never reuses a dedicated repair child for the remaining repository queue", async () => {
+    const t = setup([fact(1), fact(2), fact(3)]); const batch = await t.start();
+    await t.service.signal("thread", "idle", `Workstreams job ${batch.jobs[0]!.id} complete: blocked`); await drain();
+    const plan = await t.service.repairPlan(batch.id, batch.jobs[0]!.id);
+    expect(plan.modes).not.toContain("continue");
+    const result = await t.service.repairRun({ token: plan.token, mode: "subthread", threadId: "author", instruction: "" });
+    t.current.set(fact(2).prUrl, fact(2, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("thread", "idle", `Workstreams job ${batch.jobs[1]!.id} complete: prepared`); await drain();
+    t.current.set(fact().prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("repair-thread", "idle", `Workstreams job ${result.batch.jobs[0]!.attemptId} complete: prepared`); await drain();
+    expect(t.deps.send.mock.calls.at(-1)?.[0]).toBe("thread");
+    expect(t.deps.send.mock.calls.some(([thread]) => thread === "repair-thread")).toBe(false);
+    expect(t.service.list()[0]!.jobs[2]!.status).toBe("running");
+  });
+  it("continues only the exclusive stopped worker and preserves its failed checkout", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    t.deps.repairCandidates.mockResolvedValue({ candidates: [{ id: "thread", title: "Rebasing...", tier: "started", running: false, updatedAt: 0, contextUsed: null, canSpawnChild: true }], recommendation: { mode: "continue", threadId: "thread", reason: "Continue stopped work" } });
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    expect(plan.candidates[0]!.canContinue).toBe(true);
+    const workspaces = t.deps.workspace.mock.calls.length;
+    const result = await t.service.repairRun({ token: plan.token, mode: "continue", threadId: "thread", instruction: "Preserve the partial fix" });
+    expect(result.threadId).toBe("thread");
+    expect(t.deps.workspace).toHaveBeenCalledTimes(workspaces);
+    expect(t.deps.send.mock.calls[0]?.[1]).toContain("preserve unfinished changes");
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+  });
+  it("can repair a failed item after its original queue was stopped", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    t.service.cancel(batch.id);
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    await t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" });
+    expect(t.deps.repairSpawn).toHaveBeenCalledTimes(1);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("running");
+  });
+
+  it("does not hand off an older failure while a newer batch owns that PR", async () => {
+    const t = setup(); const old = await t.start();
+    await t.service.signal("thread", "idle", `Workstreams job ${old.jobs[0]!.id} complete: blocked`);
+    const newer = await t.start();
+    expect(newer.id).not.toBe(old.id);
+    await expect(t.service.repairPlan(old.id, old.jobs[0]!.id)).rejects.toThrow("Another batch");
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+  });
+  it("starts a fresh repository worker when the stopped previous worker is unusable", async () => {
+    const t = setup([fact(1), fact(2)]); const batch = await t.start();
+    await t.service.signal("thread", "failed");
+    t.deps.thread.mockResolvedValue({ status: "error", archivedAt: null, deletedAt: null, output: "" });
+    await t.service.recheck(batch.id); await drain();
+    expect(t.deps.spawn).toHaveBeenCalledTimes(2);
+    expect(t.deps.send).not.toHaveBeenCalled();
+    expect(t.service.list()[0]!.jobs[1]).toMatchObject({ status: "running", uncertain: false });
+  });
+  it("treats a parent disappearing during workspace creation as a definite pre-send refusal", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    t.deps.workspace.mockImplementation(async () => {
+      t.deps.repairCandidates.mockResolvedValue({ candidates: [], recommendation: { mode: "new", threadId: null, reason: "Parent disappeared" } });
+      return { path: "/new/path", workerPath: "/new" };
+    });
+    await expect(t.service.repairRun({ token: plan.token, mode: "subthread", threadId: "author", instruction: "" })).rejects.toThrow("parent");
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "needs-attention", uncertain: false, previousAttempts: [] });
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+  });
+  it("recovers a repair launch by its new attempt ID without repeating the write", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    t.deps.repairSpawn.mockRejectedValue(new Error("reply lost"));
+    await expect(t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" })).rejects.toThrow("reply lost");
+    const attempt = t.service.list()[0]!.jobs[0]!.attemptId!;
+    const restored = createAdvanceService(t.db, t.deps);
+    t.deps.recover.mockResolvedValue(["repair-thread"]);
+    t.deps.thread.mockResolvedValue({ status: "idle", archivedAt: null, deletedAt: null, output: `Workstreams job ${attempt} complete: prepared` });
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await restored.recheck(batch.id);
+    expect(t.deps.recover).toHaveBeenCalledWith(attempt, "project");
+    expect(restored.list()[0]!.jobs[0]).toMatchObject({ status: "ready", uncertain: false });
+    expect((await restored.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" })).threadId).toBe("repair-thread");
+    expect(t.deps.repairSpawn).toHaveBeenCalledTimes(1);
+  });
+  it("requires completion evidence for a repair whose fresh PR only needs validation", async () => {
+    const t = setup([fact(1, { needsPreparation: false, readiness: "ready" })]); const batch = await t.start();
+    t.service.invalidate([{ url: fact().prUrl, reviewDecision: "CHANGES_REQUESTED" }]);
+    const plan = await t.service.repairPlan(batch.id, batch.jobs[0]!.id);
+    const result = await t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "Investigate the earlier validation failure" });
+    const job = result.batch.jobs[0]!;
+    expect(t.deps.repairSpawn.mock.calls[0]?.[2]).toContain("including validation or CI failures");
+    await t.service.signal("repair-thread", "idle", `Workstreams job ${job.attemptId} complete: blocked`);
+    await t.service.recheck(batch.id);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("needs-attention");
+  });
+
+  it("persists a new repair identity before workspace IO and never recovers the old worker after interruption", async () => {
+    const t = setup(); const batch = await t.start(); const oldJobId = batch.jobs[0]!.id;
+    await t.service.signal("thread", "idle", `Workstreams job ${oldJobId} complete: blocked`);
+    const plan = await t.service.repairPlan(batch.id, oldJobId);
+    let finishWorkspace!: (value: { path: string; workerPath: string }) => void;
+    t.deps.workspace.mockImplementation(() => new Promise((resolve) => { finishWorkspace = resolve; }));
+    const launching = t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" });
+    const interrupted = expect(launching).rejects.toThrow("interrupted");
+    await drain();
+    const attempt = t.service.list()[0]!.jobs[0]!.attemptId;
+    expect(attempt).toBeTruthy();
+    expect(attempt).not.toBe(oldJobId);
+    expect(t.service.list()[0]!.jobs[0]).toMatchObject({ threadId: null, path: null, dedicated: true, status: "launching" });
+    expect(t.service.list()[0]!.jobs[0]!.previousAttempts[0]).toMatchObject({ attemptId: oldJobId, threadId: "thread" });
+    t.service.dispose();
+    t.deps.recover.mockImplementation(async (id?: string) => id === oldJobId ? ["thread"] : []);
+    t.deps.thread.mockResolvedValue({ status: "idle", archivedAt: null, deletedAt: null, output: `Workstreams job ${oldJobId} complete: prepared` });
+    const restored = createAdvanceService(t.db, t.deps);
+    await restored.tick(true);
+    expect(t.deps.recover).toHaveBeenCalledWith(attempt, "project");
+    await restored.signal("thread", "idle", `Workstreams job ${oldJobId} complete: prepared`);
+    expect(restored.list()[0]!.jobs[0]).toMatchObject({ attemptId: attempt, threadId: null, status: "needs-attention", uncertain: true });
+    finishWorkspace({ path: "/interrupted/workspace", workerPath: "/interrupted" });
+    await interrupted;
+    // A late response from the disposed runtime cannot overwrite reconciliation.
+    const persisted = createAdvanceService(t.db, t.deps);
+    expect(persisted.list()[0]!.jobs[0]).toMatchObject({ attemptId: attempt, threadId: null, status: "needs-attention" });
+    expect(t.deps.repairSpawn).not.toHaveBeenCalled();
+    expect(t.deps.send).not.toHaveBeenCalled();
+  });
+
 });

@@ -573,7 +573,7 @@ export function NudgeDialog({ row, now, onClose }: { row: DirectRow | null; now:
 
 // ---- agent actions ------------------------------------------------------------
 
-type Plan = Extract<Awaited<ReturnType<ReturnType<typeof useRpc<typeof rpcContract>>["call"]>>, { recommendation: unknown }>;
+type Plan = Extract<Awaited<ReturnType<ReturnType<typeof useRpc<typeof rpcContract>>["call"]>>, { recommendation: unknown; capabilities: unknown }>;
 
 const MODE_LABEL: Record<ThreadMode, string> = {
   continue: "Continue in a thread",

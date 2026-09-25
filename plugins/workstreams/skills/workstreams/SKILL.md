@@ -474,6 +474,16 @@ review feedback, checks, branch state, and stack dependencies on the checked hea
 while active workers can finish. Keep worktrees for inspection. Advance never
 merges or deploys. Saved batches retain their original scope; start a new preview
 to authorize feedback work on an earlier result.
+
+Use **Fix…** on a **Needs attention** job to inspect its failure and current PR
+before starting a tracked repair. Choose a child of an existing linked thread
+or a new thread; a stopped worker can continue only when the server confirms
+exclusive ownership. Optional direction is added to the PR and failure handoff.
+The repair does not extend the repository batch queue. Previous attempts and
+worker links remain available. **Threads** on backlog rows combines the local
+thread links with action and batch threads matched by exact PR URL, even when a
+readiness result is stale or the PR has no scanned checkout. The thread menu
+can open a split when the host reports that placement is available.
 One batch runs at a time, with up to two repository workers and 100 selected PRs.
 CI polling runs for up to 30 minutes after a job enters **Waiting for checks**;
 use **Recheck readiness** afterward. If a selected parent update makes a

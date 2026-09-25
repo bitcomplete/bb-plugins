@@ -9,12 +9,19 @@ const oid = z.string().regex(/^[0-9a-f]{40}$/u);
 const viewSchema = z.object({
   url: z.string(), number: z.number().int().positive(), title: z.string(),
   state: z.enum(["OPEN", "CLOSED", "MERGED"]), isDraft: z.boolean(), isCrossRepository: z.boolean(),
-  headRefName: branch, baseRefName: branch, headRefOid: oid, baseRefOid: oid,
+  headRefName: branch, baseRefName: branch, headRefOid: oid,
   reviewDecision: z.string().nullable(), mergeStateStatus: z.string(), mergeable: z.string(),
   latestReviews: z.array(z.object({ state: z.string(), body: z.string().optional() }).passthrough()),
   statusCheckRollup: z.array(z.unknown()),
 });
 const fields = Object.keys(viewSchema.shape).join(",");
+const refsSchema = z.object({ headRefOid: oid, baseRefName: branch, baseRef: z.object({ name: branch, target: z.object({ oid }) }) });
+const refsQuery = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefName baseRef{name target{oid}}}}}";
+
+function refsOf(result: Run) {
+  const body = decoded(result) as { errors?: unknown; data?: { repository?: { pullRequest?: unknown } } } | undefined;
+  return refsSchema.safeParse(body?.errors === undefined ? body?.data?.repository?.pullRequest : undefined);
+}
 
 function decoded(result: Run): unknown {
   if (!result.ok) return undefined;
@@ -49,13 +56,11 @@ export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<Advan
     const first = viewSchema.safeParse(decoded(firstRun));
     if (!first.success) return { ok: false, error: firstRun.ok ? "GitHub returned incomplete PR preparation facts." : `Could not read the PR: ${firstRun.error}`.slice(0, 800) };
     if (first.data.number !== target.number || first.data.url.toLowerCase() !== prUrl.toLowerCase()) return { ok: false, error: "GitHub returned a different pull request." };
-    let reviewHead: string | undefined;
-    let reviewBase: string | undefined;
+    let reviewRefs: z.infer<typeof refsSchema> | undefined;
     const capture: GhRunner = async (args, stdin) => {
       const response = await run(args, stdin);
-      const body = decoded(response) as { data?: { repository?: { pullRequest?: { headRefOid?: string; baseRefOid?: string } } } } | undefined;
-      reviewHead = body?.data?.repository?.pullRequest?.headRefOid;
-      reviewBase = body?.data?.repository?.pullRequest?.baseRefOid;
+      const refs = refsOf(response);
+      if (refs.success) reviewRefs = refs.data;
       return response;
     };
     const [threads, basesRun] = await Promise.all([
@@ -66,11 +71,23 @@ export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<Advan
     const bases = z.array(z.object({ number: z.number().int().positive(), headRefName: z.string() })).safeParse(decoded(basesRun));
     if (!bases.success || bases.data.some((base) => base.headRefName !== first.data.baseRefName)) return { ok: false, error: "Could not verify the PR's stack dependencies." };
     if (bases.data.length > 1) return { ok: false, error: "Multiple open PRs match the base branch; its stack dependency is ambiguous." };
-    const final = viewSchema.safeParse(decoded(await readView()));
+    const [finalRun, finalRefsRun] = await Promise.all([
+      readView(),
+      run(["api", "graphql", ...(target.host === "github.com" ? [] : ["--hostname", target.host]),
+        "-f", `query=${refsQuery}`, "-f", `owner=${target.owner}`, "-f", `name=${target.name}`, "-F", `number=${target.number}`]),
+    ]);
+    const final = viewSchema.safeParse(decoded(finalRun));
+    const finalRefs = refsOf(finalRefsRun);
     if (!final.success) return { ok: false, error: "Could not verify the final PR head and base commits." };
+    if (!reviewRefs || !finalRefs.success) return { ok: false, error: "Could not verify the current base branch tip." };
     // Review/check snapshots must describe the same commits and review decision.
-    const identity = (view: z.infer<typeof viewSchema>) => JSON.stringify([view.url, view.headRefOid, view.baseRefOid, view.headRefName, view.baseRefName, view.state, view.isDraft, view.isCrossRepository, view.reviewDecision, view.latestReviews]);
-    if (identity(first.data) !== identity(final.data) || reviewHead !== final.data.headRefOid || reviewBase !== final.data.baseRefOid) continue;
+    // PR.baseRefOid is a historical per-PR snapshot, not the current ref target.
+    const identity = (view: z.infer<typeof viewSchema>) => JSON.stringify([view.url, view.headRefOid, view.headRefName, view.baseRefName, view.state, view.isDraft, view.isCrossRepository, view.reviewDecision, view.latestReviews]);
+    const refs = finalRefs.data;
+    if (identity(first.data) !== identity(final.data) || reviewRefs.headRefOid !== final.data.headRefOid || refs.headRefOid !== final.data.headRefOid ||
+        reviewRefs.baseRefName !== final.data.baseRefName || refs.baseRefName !== final.data.baseRefName ||
+        reviewRefs.baseRef.name !== final.data.baseRefName || refs.baseRef.name !== final.data.baseRefName ||
+        reviewRefs.baseRef.target.oid !== refs.baseRef.target.oid) continue;
     const view = final.data;
     const checks = advanceChecks(view.statusCheckRollup);
     const approvalNotePending = approvalHasBody(view.latestReviews) && threads.approvalNoteFollowedUp !== true;
@@ -95,7 +112,7 @@ export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<Advan
     else { readiness = "ready"; detail = "Approved, review feedback clear, checks passed, and branch ready to merge."; }
     return { ok: true, facts: {
       prUrl: view.url, number: view.number, title: view.title.slice(0, 300), repo: target.slug,
-      headRefName: view.headRefName, baseRefName: view.baseRefName, headOid: view.headRefOid, baseOid: view.baseRefOid,
+      headRefName: view.headRefName, baseRefName: view.baseRefName, headOid: view.headRefOid, baseOid: refs.baseRef.target.oid,
       state: view.state, isDraft: view.isDraft, isCrossRepository: view.isCrossRepository,
       reviewDecision: view.reviewDecision || null, mergeStateStatus, mergeable: view.mergeable,
       needsPreparation, readiness, detail, unresolvedThreads: threads.count, checks, basePrNumber, approvalNotePending,
