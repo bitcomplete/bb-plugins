@@ -215,8 +215,8 @@ separately: `bb plugin logs workstreams`.
   only select, assign, and name. The board and `list` can never disagree.
 - **Writes require an explicit start.** Scans never run a git mutation or touch
   a pull request. `group` / `ungroup` change a local ticket → effort name map;
-  Board row actions run from their dialog's confirm button. Board v2 starts
-  repair agents only after you select **Run automatically** for a workstream.
+  Board row actions run from their dialog's confirm button. Automatic repair
+  starts only after you select **Run automatically** for an effort.
   See [Row actions](#row-actions).
 - **A manual name always wins.** `group` beats any model assignment.
 - **No single signal groups anything.** Seeding compares four independent
@@ -257,8 +257,9 @@ separately: `bb plugin logs workstreams`.
   `gh auth refresh -h github.com`. Changed paths and therefore surfaces also go
   missing, because the default branch they are diffed against comes from `gh`.
 - **Scans are cached.** `list` reads the last scan; run `refresh` first when
-  freshness matters. A background service rescans on the `refreshMinutes`
-  interval.
+  freshness matters. Git ref changes and idle thread transitions trigger
+  targeted refreshes; a background service also rescans on the
+  `refreshMinutes` interval. Workstreams does not use GitHub webhooks.
 
 ## Settings
 
@@ -349,6 +350,12 @@ the exact prompt before anything runs.
   at large, unrelated threads.
 - **Review approval note** handles written feedback on an approving review,
   separately from unresolved inline comments.
+- **Review, comments, and conflict repairs** inspect the live PR and base,
+  integrate the base when needed, make focused fixes with relevant tests,
+  commit and push code changes, reply to actionable threads and on the PR
+  with the head SHA, then recheck review, checks, threads, and mergeability.
+  Justified nonchanges need an explanation, not an empty commit. Ask for PTAL
+  when changes are still requested; preserve an existing approval. Never merge.
 - If BB will not add a child to a thread, the recommendation falls back to a
   new thread and says why.
 - **Subthread** only accepts a parent linked to that row. New and subthreads
@@ -387,10 +394,10 @@ or finished in the last 24 hours), and an **Agents** line at the top while
 anything is running, waiting on you, or finished in the last 4 hours. BB's
 sidebar shows a count beside Workstreams: needs-you first, else running.
 
-### Automatic dispatch pilot
+### Automatic dispatch
 
-**Board v2** groups by Workstream. Use the dropdown and **Off**, **Preview only**,
-or **Run automatically** controls at the top. Choosing a workstream scrolls to
+Choose an effort, then use **Off**, **Preview only**, or **Run automatically**
+at the top. Choosing an effort scrolls to
 and expands it. Off is the default. Preview only shows the next candidate on
 its PR row without starting a thread. Run automatically starts at most one
 repair thread at a time for failing CI, merge conflicts, requested changes, or
@@ -410,45 +417,50 @@ a later fresh scan confirms progress. **Off** stops future launches but does
 not cancel an already running thread. Workstreams never retries an unchanged
 attempt automatically. GitHub reporting the PR merged is the workflow's end;
 issue intake, PR creation, review requests, and merging remain manual Board
-steps in this pilot.
+steps.
 
-The latest finished Board action appears in the workstream heading's outcome
+The latest finished Board action appears in the effort heading's outcome
 card. The card records the action and result, links its thread, and flags when
 that thread has newer activity.
 
 ## Views
 
 The panel opens on the last view you used in this browser, or the **Map** on
-your first visit. **Map**, **Board**, and **Board v2** have deep links and read
-the same board data. Board keeps the original Action grouping and row actions;
-Board v2 uses Workstream grouping and puts agent action controls at the top.
-Its workstream chooser uses all scanned rows, even when search or filters hide
-some. It counts a PR once by URL and ranks workstreams by their first available
-move: ready to merge, update branch, fix, respond, waiting for review, then
-work in progress and other waiting states. Completed-only workstreams stay in
-the Merged and In release tag cards instead of the chooser.
+your first visit. **Map** and **Board** have deep links and read the same board
+data. **Efforts** groups all tracked checkouts by effort; **PR backlog** groups
+your open PRs by next action. The effort chooser uses all scanned rows, even
+when search or filters hide some.
+It counts a PR once by URL and ranks efforts by their first available move:
+ready to merge, update branch, fix, respond, waiting for review, then work in
+progress and other waiting states. Merged and release-tagged rows remain under
+their effort in collapsed sections; a release tag does not prove deployment.
 
-The Board is an inbox with one row per checkout. **Group by: Action** is the
-default; **Group by: Effort** collects each effort's rows without changing their
-priority or available actions. Efforts with the most urgent work come first,
-and each effort's rows follow action priority, then time in the state. Action
-groups are **Fix** (`blocked`), **Respond** (`awaiting-followup`,
-`approved-with-comments`), **Merge** (`awaiting-merge` not blocked by a stack),
-**Waiting** (`awaiting-review`, `awaiting-rereview`, and any live row stacked on an unmerged PR,
-shown as "Behind #NN"), then, collapsed, **In flight**, a section for work
-merged in the last 7 days (from `gh`'s `mergedAt`), and **Parked**. Within a
-section the row that has been in its state longest comes first. The displayed age
+Efforts shows one row per checkout. Efforts with the most urgent work come
+first, and each effort's rows follow action priority, then time in the state.
+PR backlog groups open PRs into **Ready to merge**, **Approved · next steps**,
+**Fix or respond**, **Waiting for review or another PR**, **Drafts and work in
+progress**, and **Status to verify**. The displayed age
 shows when GitHub opened its PR, with the hover reading "PR opened". A checkout
 without a PR shows its last-commit age, labeled "commit". Older scans without
-a PR open date show no age until the next scan. Keys: `j`/`k`,
+a PR open date show no age until the next scan. Efforts shortcuts: `j`/`k`,
 `Enter` (PR), `a` (the row's action, which asks first), `t` (newest thread),
 `m` (Map), `o` (open the checkout), `n` (start a thread), `/` (search).
 The Board shows a resolved-thread count beside a PR title when GitHub has
 confirmed review threads were resolved; reviewer marks still show the latest
 review states, including approval.
 
+The **PR backlog** lists your open PRs in organizations represented by scanned
+projects. Open PRs without a scanned checkout also appear under **No effort
+assigned** in Efforts. Approved records a review decision; Ready to merge also
+requires checks, threads, branch state, and stack dependencies to clear.
+Direct GitHub actions work on remote PRs; agent repairs need a scanned checkout.
+
+Archive an idle leaf thread from its thread menu. **Archived threads** shows
+archive history and lets you undo it. Threads with children must be archived
+through BB.
+
 The header's ⓘ, or `?` in either view, opens **How this works** in BB's right
-panel. It explains grouping, the states, both views' keys and the Map's marks,
+panel. It explains grouping, the states, view keys and the Map's marks,
 and it shows health: the last scan, the refresh interval, thread-link coverage
 by tier, warnings in full, and the last enrichment's model calls and tokens.
 

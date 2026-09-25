@@ -1,8 +1,7 @@
 // bb-plugin-workstreams — frontend entry.
 //
-// Three views of one fetch: the Map (map.tsx), a spatial picture of the grouping
-// hierarchy, and two Boards (inbox.tsx), inboxes of checkouts ordered by the
-// next action each needs. Everything either shows comes from
+// Two views of one fetch: the Map (map.tsx), a spatial picture of the grouping
+// hierarchy, and the Board (inbox.tsx), ordered by effort or next action. Everything either shows comes from
 // board_get; the server publishes "board-changed" after each scan and the board
 // refetches. Nothing here computes a count or a sentence — the server already
 // did, so the board and the CLI can never disagree.
@@ -221,7 +220,7 @@ function Warnings({ warnings }: { warnings: string[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// The page: one fetch, three views of it.
+// The page: one fetch, two views of it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -231,7 +230,6 @@ function Warnings({ warnings }: { warnings: string[] }) {
 const VIEWS = [
   { id: "map", title: "Map", icon: "GridView" },
   { id: "board", title: "Board", icon: "Columns2" },
-  { id: "board-v2", title: "Board v2", icon: "Columns2" },
 ] as const;
 
 /** Typing in a field is never a view switch. */
@@ -339,7 +337,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
         </div>
       ) : (
         <InboxBoard
-          dispatchControls={id === "board-v2"}
+          dispatchControls
           board={board}
           prefs={prefs}
           onPrefs={update}
@@ -361,7 +359,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   return (
     <div className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
       <header className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60 px-3">
-        {/* Three views share one fetch. */}
+        {/* Map and Board share one fetch. */}
         <div role="tablist" aria-label="Workstreams views" className="flex shrink-0 items-center gap-3">
           {VIEWS.map((entry) => (
             <button
@@ -369,7 +367,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
               type="button"
               role="tab"
               aria-selected={view === entry.id}
-              title={entry.id === "board-v2" ? entry.title : `${entry.title} (V toggles)`}
+              title={`${entry.title} (V toggles)`}
               onClick={() => navigate.toPluginPanel("board", { subPath: entry.id })}
               className={cn(
                 "text-xs transition-colors duration-150",

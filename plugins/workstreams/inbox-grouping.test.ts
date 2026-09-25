@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows } from "./inbox-grouping.js";
+import { completedByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows } from "./inbox-grouping.js";
 import type { Row } from "./inbox.js";
 import type { InboxSection } from "./workstreams.js";
 
@@ -62,4 +62,13 @@ describe("Board grouping", () => {
     expect(visibleCompletedRows(completed, { merged: true, inReleaseTag: false }).map((entry) => entry.key)).toEqual(["p5", "p6"]);
     expect(visibleCompletedRows(completed, { merged: true, inReleaseTag: true }).map((entry) => entry.key)).toEqual(["p5", "p6", "p7"]);
   });
+});
+
+it("keeps merged and release-tagged summaries under their own stable effort keys", () => {
+  const merged = row("p1", "effort-a", "Same name", "shipped", 1);
+  const tagged = row("p2", "effort-b", "Same name", "parked", 2);
+  const groups = completedByEffort({ merged: [merged], inReleaseTag: [tagged] });
+  expect(groups.get("effort-a")).toEqual({ merged: [merged], inReleaseTag: [] });
+  expect(groups.get("effort-b")).toEqual({ merged: [], inReleaseTag: [tagged] });
+  expect(visibleCompletedRows(groups.get("effort-a")!, { merged: false, inReleaseTag: true })).toEqual([]);
 });

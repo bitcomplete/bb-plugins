@@ -17,10 +17,14 @@ import {
   hostContract,
   liveMergeSchema,
   rawUnitSchema,
+  inventoryBoardSchema,
   type GroupLevel,
   type GroupNaming,
   type RawUnit,
+  type Pr,
 } from "./contract.js";
+import { createInventoryStore, EMPTY_INVENTORY, INVENTORY_MIGRATIONS } from "./inventory-store.js";
+import type { InventoryResult } from "./inventory.js";
 import {
   DEFAULT_SURFACE_RULES,
   LENSES,
@@ -95,6 +99,7 @@ import { startThread } from "./spawn.js";
 import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type DirectAction, type MergeMethod } from "./actions.js";
 import { planAgent, runAgent, type AgentSdk } from "./agent.js";
 import { sendRowMessage } from "./threadmessage.js";
+import { archiveLinkedThread, restoreArchivedThread, archiveRecordSchema, ARCHIVE_HISTORY_LIMIT, type ArchiveStore } from "./threadarchive.js";
 import { executeMerge, type WriteResult } from "./direct.js";
 import { prTarget } from "./ghactions.js";
 import { trackTransitions, toLifecycle, unitLifecycle, type Transition } from "./workstreams.js";
@@ -102,6 +107,7 @@ import { TypeSafeClient, choice, score } from "@typesafe-ai/sdk";
 import { RUNS_MIGRATION, createRunStore } from "./runstore.js";
 import { RUN_STATUSES, ROW_RUN_MS, directOutcome, type Run, type ThreadSignal } from "./runs.js";
 import { createRescanQueue } from "./rescan.js";
+import { createPrFreshness } from "./pr-freshness.js";
 import { scanFailure } from "./scancancel.js";
 import { parseLinearKeys, projectNameOf } from "./linear.js";
 import { AGENT_FETCH_MAX, parseAgentAnswer, startLinearFetch } from "./linearagent.js";
@@ -223,6 +229,7 @@ const enrichmentSchema = z.object({
 });
 
 const boardSchema = z.object({
+  prInventory: inventoryBoardSchema.default(EMPTY_INVENTORY),
   groups: z.array(groupSchema),
   /** How many grouping levels survived the collapse: 1, 2 or 3. */
   depth: z.number(),
@@ -277,6 +284,9 @@ const prefsSchema = z.object({
 });
 
 const pathInput = z.object({ path: z.string().max(1_000) }).strict();
+const prUrlInput = z.object({ prUrl: z.string().max(500) }).strict();
+const directInput = z.union([pathInput, prUrlInput]);
+type DirectTarget = z.infer<typeof directInput>;
 const writeResult = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), detail: z.string() }),
   z.object({ ok: z.literal(false), error: z.string() }),
@@ -285,13 +295,14 @@ const threadModeSchema = z.enum(["continue", "subthread", "new"]);
 
 export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
+  inventory_refresh: { input: z.null(), output: z.object({ started: z.boolean() }) },
   dispatch_set: {
     input: z.object({ mode: z.enum(["off", "shadow", "auto"]), effortKey: z.string().nullable() }).strict(),
     output: boardSchema.shape.dispatch,
   },
   /** Read-only: re-read the PR live for the merge dialog. */
   action_merge_preview: {
-    input: pathInput,
+    input: directInput,
     output: z.discriminatedUnion("ok", [
       z.object({
         ok: z.literal(true),
@@ -306,17 +317,19 @@ export const rpcContract = defineRpcContract({
   },
   /** Merge, pinned to the head sha the dialog showed. Re-checked server-side first. */
   action_merge: {
-    input: z
-      .object({ path: z.string().max(1_000), sha: z.string().regex(/^[0-9a-f]{40}$/u), acknowledgeUnresolved: z.boolean() })
-      .strict(),
+    input: z.union([
+      pathInput.extend({ sha: z.string().regex(/^[0-9a-f]{40}$/u), acknowledgeUnresolved: z.boolean() }),
+      prUrlInput.extend({ sha: z.string().regex(/^[0-9a-f]{40}$/u), acknowledgeUnresolved: z.boolean() }),
+    ]),
     output: writeResult,
   },
-  action_update_branch: { input: pathInput, output: writeResult },
+  action_update_branch: { input: directInput, output: writeResult },
   /** Re-request the scan's pending reviewers and/or post a comment (sent to gh on stdin). */
   action_nudge: {
-    input: z
-      .object({ path: z.string().max(1_000), rerequest: z.boolean(), comment: z.string().max(4_000).nullable() })
-      .strict(),
+    input: z.union([
+      pathInput.extend({ rerequest: z.boolean(), comment: z.string().max(4_000).nullable() }),
+      prUrlInput.extend({ rerequest: z.boolean(), comment: z.string().max(4_000).nullable() }),
+    ]),
     output: writeResult,
   },
   /** Read-only: the row's linked threads, live, and where the agent action should run. */
@@ -392,6 +405,9 @@ export const rpcContract = defineRpcContract({
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
   },
+  thread_archive: { input: z.object({ threadId: z.string().max(200) }).strict(), output: writeResult },
+  thread_restore: { input: z.object({ threadId: z.string().max(200) }).strict(), output: writeResult },
+  thread_archived: { input: z.object({}).strict(), output: z.array(archiveRecordSchema) },
   /** Send one user-authored instruction to one thread currently linked to this PR row. */
   thread_message: {
     input: z.object({ path: z.string().max(1_000), prUrl: z.string().max(500), threadId: z.string().max(200), message: z.string().max(4_000) }).strict(),
@@ -549,9 +565,11 @@ export default async function plugin(bb: BbPluginApi) {
     // never read again. Comment text is never stored.
     `CREATE TABLE IF NOT EXISTS pr_linkbacks (url TEXT PRIMARY KEY, ticket TEXT, checked_at INTEGER NOT NULL, final INTEGER NOT NULL)`,
     ...DISPATCH_MIGRATIONS,
+    ...INVENTORY_MIGRATIONS,
   ]);
   const runs = createRunStore(db);
   const dispatch = createDispatchStore(db);
+  const inventory = createInventoryStore(db);
   dispatch.closeStranded();
 
   const host = bb.hosts.experimental_client({ contract: hostContract });
@@ -647,6 +665,83 @@ export default async function plugin(bb: BbPluginApi) {
   const disposal = new AbortController();
   bb.onDispose(() => disposal.abort());
 
+  let inventoryRefreshing = false;
+  let inventoryTargeting = false;
+  function inventoryOwners(): string[] {
+    return [...new Set(readUnits().flatMap((unit) => {
+      const repo = unit.githubRepo ?? (unit.pr === null ? null : prTarget(unit.pr.url)?.slug ?? null);
+      return repo !== null && repo.split("/").length === 2 ? [repo.split("/")[0]!.toLowerCase()] : [];
+    }))].sort();
+  }
+  async function refreshInventory(signal = disposal.signal): Promise<boolean> {
+    if (inventoryRefreshing || inventoryTargeting || signal.aborted) return false;
+    inventoryRefreshing = true;
+    const owners = inventoryOwners();
+    bb.realtime.publish(BOARD_CHANGED, { scanning });
+    try {
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      if (hostId === null) throw new Error("No primary BB host is available to read authored PRs.");
+      const result = await host.call("authoredPrs", { owners }, { hostId, signal, timeoutMs: SCAN_TIMEOUT_MS });
+      inventory.apply(result);
+      return result.complete;
+    } catch (error) {
+      if (!signal.aborted) {
+        const result: InventoryResult = { owners, entries: [], repositories: [], complete: false, discoveryComplete: false,
+          warnings: [`Authored PR refresh failed: ${String(error).slice(0, 400)}`] };
+        inventory.apply(result);
+      }
+      return false;
+    } finally {
+      inventoryRefreshing = false;
+      if (!disposal.signal.aborted) bb.realtime.publish(BOARD_CHANGED, { scanning });
+    }
+  }
+
+  /** Native BB events invalidate these URLs; GitHub remains the facts source. */
+  async function refreshInventoryUrls(prUrls: string[]): Promise<boolean> {
+    if (inventoryRefreshing || inventoryTargeting || disposal.signal.aborted) return false;
+    const urls = [...new Set(prUrls)].filter((url) => inventory.get(url) !== undefined || readUnits().some((unit) => unit.pr?.url === url));
+    if (urls.length === 0) return true;
+    inventoryTargeting = true;
+    try {
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      if (hostId === null) return true;
+      for (let offset = 0; offset < urls.length; offset += 100) {
+        const result = await host.call("inspectPrs", { prUrls: urls.slice(offset, offset + 100) }, { hostId, signal: disposal.signal, timeoutMs: SCAN_TIMEOUT_MS });
+        inventory.inspect(result);
+        const fresh = new Map(result.entries.map((entry) => [entry.pr.url.toLowerCase(), entry.pr]));
+        const closed = new Set(result.closed.map((url) => url.toLowerCase()));
+        const insert = db.prepare(`INSERT OR REPLACE INTO units (path, unit) VALUES (?, ?)`);
+        for (const unit of readUnits()) {
+          if (unit.pr === null) continue;
+          const url = unit.pr.url.toLowerCase();
+          const pr = fresh.get(url);
+          if (pr !== undefined) insert.run(unit.path, JSON.stringify({ ...unit, pr }));
+          else if (closed.has(url)) {
+            // Fetch the checkout too: it distinguishes merged/release-tagged from closed.
+            rescans.add(unit.path);
+          }
+        }
+      }
+      recordTransitions(readUnits());
+      return true;
+    } catch (error) {
+      if (!disposal.signal.aborted) {
+        inventory.inspect({ entries: [], closed: [], failed: urls, warnings: [`PR refresh failed: ${String(error).slice(0, 400)}`] });
+      }
+      return true;
+    } finally {
+      inventoryTargeting = false;
+      if (!disposal.signal.aborted) bb.realtime.publish(BOARD_CHANGED, { scanning });
+    }
+  }
+  const inventoryRefreshes = createRescanQueue({ delayMs: RESCAN_DELAY_MS, rescan: refreshInventoryUrls,
+    onError: (error) => bb.log.warn(`PR refresh queue: ${String(error).slice(0, 300)}`) });
+  function scheduleInventoryUrls(urls: readonly string[]): void {
+    for (const url of urls) inventoryRefreshes.add(url);
+  }
+  bb.onDispose(() => inventoryRefreshes.dispose());
+
   async function resolveRoots(configured: string): Promise<{
     roots: string[];
     warnings: string[];
@@ -705,6 +800,8 @@ export default async function plugin(bb: BbPluginApi) {
       );
       writeUnits(result.units);
       recordTransitions(result.units);
+      inventory.observe(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
+      await refreshInventory(signal);
       warnings.push(...result.warnings);
 
       // Tickets are resolved BEFORE Linear is synced, so a ticket found in a PR
@@ -1267,6 +1364,7 @@ export default async function plugin(bb: BbPluginApi) {
       hostId: (await bb.sdk.system.config()).primaryHostId,
       lastScanAt: (await bb.storage.kv.get<string>("lastScanAt")) ?? null,
       scanning,
+      prInventory: { ...inventory.read(), refreshing: inventoryRefreshing || inventoryTargeting },
       warnings: [
         ...((await bb.storage.kv.get<string[]>("warnings")) ?? []),
         ...warnings,
@@ -1290,6 +1388,35 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Every visible, unarchived thread, with the paths its recent events worked in. */
   let threadFacts = new Map<string, ThreadFacts>();
+  let threadEnvironments = new Map<string, string | null>();
+  const prFreshness = createPrFreshness({
+    subscribe: (environmentId, changed) => bb.sdk.subscribe({
+      event: "environment:changed", environmentId,
+      callback: (event) => { if (event.changes.includes("git-refs-changed")) changed(); },
+    }),
+    schedule: scheduleInventoryUrls,
+    settleMs: 15_000,
+  });
+  // Rebuild local links once per burst; idle IDs additionally refresh their current PRs.
+  const prFreshnessLinks = createRescanQueue({
+    delayMs: 400,
+    rescan: async (idleIds) => {
+      const { clusters } = await readPlacement();
+      const pattern = compilePattern((await settings.get()).ticketPattern);
+      if (disposal.signal.aborted) return true;
+      const links = threadLinks(clusters, pattern);
+      const urlsByCluster = new Map(clusters.map((cluster) => [cluster.ticket,
+        cluster.units.flatMap((unit) => unit.pr?.state === "OPEN" ? [unit.pr.url] : [])]));
+      prFreshness.setLinks([...threadFacts.keys()].map((threadId) => ({
+        threadId, environmentId: threadEnvironments.get(threadId) ?? null,
+        urls: [...(links.get(threadId)?.keys() ?? [])].flatMap((ticket) => urlsByCluster.get(ticket) ?? []),
+      })));
+      for (const threadId of idleIds) if (threadId !== "") prFreshness.threadIdle(threadId);
+      return true;
+    },
+    onError: (error) => bb.log.warn(`PR freshness links: ${String(error).slice(0, 300)}`),
+  });
+  bb.onDispose(() => { prFreshnessLinks.dispose(); prFreshness.dispose(); });
 
   function cachedPaths(threadId: string): WorkedPaths | undefined {
     const row = db
@@ -1457,6 +1584,8 @@ export default async function plugin(bb: BbPluginApi) {
           ),
         ]),
       );
+      threadEnvironments = new Map(rows.map((row) => [row.id, row.environmentId]));
+      prFreshnessLinks.add("");
       bb.log.info(
         `threads: ${rows.length} listed, ${refreshed.read} event logs read, ${refreshed.reused} unchanged, ${refreshed.failed} skipped`,
       );
@@ -1477,12 +1606,16 @@ export default async function plugin(bb: BbPluginApi) {
     row: ThreadRow & { environmentId: string | null; originPluginId: string | null },
     reread: boolean): Promise<void> {
     if (row.visibility !== "visible" || row.archivedAt !== null || row.deletedAt !== null) {
+      threadEnvironments.delete(row.id);
+      prFreshnessLinks.add("");
       if (threadFacts.delete(row.id)) announceThreads();
       return;
     }
     const known = threadFacts.get(row.id);
-    let environment = { branch: known?.environmentBranchName ?? null, path: known?.environmentPath ?? null };
-    if (known === undefined && row.environmentId !== null) {
+    const environmentChanged = threadEnvironments.get(row.id) !== row.environmentId;
+    let environment = environmentChanged ? { branch: null, path: null } :
+      { branch: known?.environmentBranchName ?? null, path: known?.environmentPath ?? null };
+    if ((known === undefined || environmentChanged) && row.environmentId !== null) {
       try {
         const full = await bb.sdk.threads.get({ threadId: row.id, include: "environment" });
         const env = "environment" in full ? full.environment : null;
@@ -1503,6 +1636,8 @@ export default async function plugin(bb: BbPluginApi) {
       worked = refreshed.updates.get(row.id) ?? worked;
     }
     threadFacts.set(row.id, factsOf(row, environment, worked));
+    threadEnvironments.set(row.id, row.environmentId);
+    prFreshnessLinks.add("");
     announceThreads();
   }
 
@@ -1517,7 +1652,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     signalRuns(thread.id, { kind: "idle", text: lastAssistantText });
-    onThreadChanged(thread, true).catch(onThreadError);
+    onThreadChanged(thread, true).then(() => prFreshnessLinks.add(thread.id)).catch(onThreadError);
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
     signalRuns(thread.id, { kind: "failed", text: null, error });
@@ -1528,10 +1663,14 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.archived", ({ thread }) => {
     signalRuns(thread.id, { kind: "gone", reason: "Thread archived" });
+    threadEnvironments.delete(thread.id);
+    prFreshnessLinks.add("");
     if (threadFacts.delete(thread.id)) announceThreads();
   });
   bb.events.on("thread.deleted", ({ thread }) => {
     signalRuns(thread.id, { kind: "gone", reason: "Thread deleted" });
+    threadEnvironments.delete(thread.id);
+    prFreshnessLinks.add("");
     if (threadFacts.delete(thread.id)) announceThreads();
   });
   // A pending interaction IS an event: the agent is waiting on the user.
@@ -1575,6 +1714,8 @@ export default async function plugin(bb: BbPluginApi) {
         for (const unit of result.units) insert.run(unit.path, JSON.stringify(unit));
       })();
       recordTransitions(readUnits());
+      inventory.observe(result.units.flatMap((unit) => unit.pr === null ? [] : [unit.pr]));
+      prFreshnessLinks.add("");
       for (const warning of result.warnings) bb.log.warn(`rescan: ${warning}`);
       bb.log.info(`rescanned ${paths.length} checkout(s) after row actions finished`);
       return true;
@@ -2086,7 +2227,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** The row's open PR and the host to act from, or the reason there is none. */
-  async function actionable(path: string): Promise<{ ok: true; raw: RawUnit; prUrl: string; hostId: string } | { ok: false; error: string }> {
+  async function actionablePath(path: string): Promise<{ ok: true; raw: RawUnit; pr: Pr; prUrl: string; hostId: string } | { ok: false; error: string }> {
     const found = await scannedUnit(path);
     if (found === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
     const { raw } = found;
@@ -2099,7 +2240,28 @@ export default async function plugin(bb: BbPluginApi) {
     if (!local.ok) return { ok: false, error: `${local.error} Rescan before acting.` };
     if (local.rebasing) return { ok: false, error: "A rebase is in progress in this checkout. Finish it and rescan before a direct PR action." };
     if (local.branch === null || local.branch !== raw.branch) return { ok: false, error: "The checkout branch changed since the last scan. Rescan before acting." };
-    return { ok: true, raw, prUrl: raw.pr.url, hostId };
+    return { ok: true, raw, pr: raw.pr, prUrl: raw.pr.url, hostId };
+  }
+
+  async function actionable(input: DirectTarget): Promise<{ ok: true; pr: Pr; prUrl: string; hostId: string } | { ok: false; error: string }> {
+    if ("path" in input) return actionablePath(input.path);
+    const linked = readUnits().filter((unit) => unit.pr?.url.toLowerCase() === input.prUrl.toLowerCase());
+    if (linked.length > 0) {
+      // A URL target must not bypass a rebase or branch-change guard in any checkout.
+      let target: Awaited<ReturnType<typeof actionablePath>> | undefined;
+      for (const unit of linked) {
+        target = await actionablePath(unit.path);
+        if (!target.ok) return target;
+      }
+      return target!;
+    }
+    const entry = inventory.get(input.prUrl);
+    if (entry === undefined || entry.pr.state !== "OPEN" || prTarget(entry.pr.url) === null) {
+      return { ok: false, error: "That open PR is no longer in the authored backlog. Refresh before acting." };
+    }
+    const hostId = (await bb.sdk.system.config()).primaryHostId;
+    if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh from." };
+    return { ok: true, pr: entry.pr, prUrl: entry.pr.url, hostId };
   }
 
   const liveOf = (hostId: string) => (prUrl: string) =>
@@ -2108,6 +2270,17 @@ export default async function plugin(bb: BbPluginApi) {
     host.call("prReviewers", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
   const writeOf = (hostId: string) => (request: Parameters<typeof host.call<"prWrite">>[1]) =>
     host.call("prWrite", request, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+
+  const archiveStore: ArchiveStore = {
+    get: async (id) => archiveRecordSchema.optional().parse(await bb.storage.kv.get(`threadArchive:${id}`)),
+    set: (record) => bb.storage.kv.set(`threadArchive:${record.threadId}`, record),
+    delete: (id) => bb.storage.kv.delete(`threadArchive:${id}`),
+    list: async () => {
+      const records = await Promise.all((await bb.storage.kv.list("threadArchive:")).map(async (key) =>
+        archiveRecordSchema.safeParse(await bb.storage.kv.get(key))));
+      return records.flatMap((record) => record.success ? [record.data] : []);
+    },
+  };
 
   /** The threads the Board links to this row's cluster, strongest first. */
   async function linkedThreads(path: string): Promise<{ id: string; title: string; tier: ThreadTier }[]> {
@@ -2294,8 +2467,26 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   }
 
+  async function directActionRun(input: DirectTarget, action: DirectAction, act: () => Promise<WriteResult>): Promise<WriteResult> {
+    const unit = "path" in input ? readUnits().find((entry) => entry.path === input.path) :
+      readUnits().find((entry) => entry.pr?.url.toLowerCase() === input.prUrl.toLowerCase());
+    try {
+      // Remote-only actions report through their dialog and fresh PR state. Run
+      // history remains checkout-based until it has a real nullable target type.
+      return unit === undefined ? await act() : await directRun(unit.path, action, act);
+    } finally {
+      const url = "prUrl" in input ? input.prUrl : unit?.pr?.url;
+      if (url !== undefined) scheduleInventoryUrls([url]);
+    }
+  }
+
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    inventory_refresh: () => {
+      if (inventoryRefreshing || inventoryTargeting) return { started: false };
+      void refreshInventory();
+      return { started: true };
+    },
     dispatch_set: async ({ mode, effortKey }): Promise<DispatchState> => {
       const current = await board();
       if (mode === "auto" && effortKey === null) throw new Error("Choose an effort before enabling automatic dispatch.");
@@ -2339,6 +2530,16 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return result;
     },
+    thread_archive: async ({ threadId }) => {
+      const clusters = (await board()).groups.flatMap((group) => group.clusters);
+      const cluster = clusters.find((item) => item.threads.some((thread) => thread.id === threadId));
+      const thread = cluster?.threads.find((item) => item.id === threadId);
+      return archiveLinkedThread(bb.sdk.threads, archiveStore, {
+        threadId, link: thread === undefined || cluster === undefined ? undefined : { title: thread.title, ticket: cluster.ticket },
+      });
+    },
+    thread_restore: ({ threadId }) => restoreArchivedThread(bb.sdk.threads, archiveStore, threadId),
+    thread_archived: async () => (await archiveStore.list()).sort((a, b) => b.archivedAt - a.archivedAt).slice(0, ARCHIVE_HISTORY_LIMIT),
     thread_message: async ({ path, prUrl, threadId, message }) => {
       const found = await scannedUnit(path);
       if (found === undefined) return { ok: false as const, error: "That checkout is no longer on the board. Refresh and try again." };
@@ -2358,8 +2559,8 @@ export default async function plugin(bb: BbPluginApi) {
         },
       );
     },
-    action_merge_preview: async ({ path }) => {
-      const target = await actionable(path);
+    action_merge_preview: async (input) => {
+      const target = await actionable(input);
       if (!target.ok) return target;
       const read = await liveOf(target.hostId)(target.prUrl);
       if (!read.ok) return read;
@@ -2373,29 +2574,32 @@ export default async function plugin(bb: BbPluginApi) {
         deleteBranch: shouldDeleteBranch(deleteBranchOnMerge, read.live.stackedAbove),
       };
     },
-    action_merge: ({ path, sha, acknowledgeUnresolved }) =>
-      directRun(path, "merge", async () => {
-        const target = await actionable(path);
+    action_merge: (input) =>
+      directActionRun(input, "merge", async () => {
+        const target = await actionable(input);
         if (!target.ok) return target;
         const { mergeMethod, deleteBranchOnMerge } = await settings.get();
         return executeMerge(
           { live: liveOf(target.hostId), write: writeOf(target.hostId) },
-          { prUrl: target.prUrl, sha, acknowledgeUnresolved, method: mergeMethodOf(mergeMethod), deleteBranchSetting: deleteBranchOnMerge },
+          { prUrl: target.prUrl, sha: input.sha, acknowledgeUnresolved: input.acknowledgeUnresolved, method: mergeMethodOf(mergeMethod), deleteBranchSetting: deleteBranchOnMerge },
         );
       }),
-    action_update_branch: ({ path }) =>
-      directRun(path, "update-branch", async () => {
-        const target = await actionable(path);
-        if (!target.ok) return target;
-        return writeOf(target.hostId)({ kind: "update-branch", prUrl: target.prUrl });
-      }),
-    action_nudge: ({ path, rerequest, comment }) =>
-      directRun(path, "nudge", async () => {
-        const target = await actionable(path);
+    action_update_branch: (input) =>
+      directActionRun(input, "update-branch", async () => {
+        const target = await actionable(input);
         if (!target.ok) return target;
         const live = await reviewersOf(target.hostId)(target.prUrl);
         if (!live.ok) return live;
-        const scanned = target.raw.pr?.reviewRequests ?? [];
+        return writeOf(target.hostId)({ kind: "update-branch", prUrl: target.prUrl });
+      }),
+    action_nudge: (input) =>
+      directActionRun(input, "nudge", async () => {
+        const { rerequest, comment } = input;
+        const target = await actionable(input);
+        if (!target.ok) return target;
+        const live = await reviewersOf(target.hostId)(target.prUrl);
+        if (!live.ok) return live;
+        const scanned = target.pr.reviewRequests;
         if (rerequest && [...live.reviewers].sort().join("\n") !== [...scanned].sort().join("\n")) {
           return { ok: false as const, error: "Pending reviewers changed since the last scan. Rescan and confirm again." };
         }

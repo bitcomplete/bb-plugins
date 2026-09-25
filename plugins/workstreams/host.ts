@@ -8,6 +8,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract, type GroupNaming, type RawUnit } from "./contract.js";
 import {
+  PR_FIELDS,
+  githubRepoFromRemote,
   checkConclusions,
   parseAheadBehind,
   parseLinkback,
@@ -18,6 +20,7 @@ import {
 import { prTarget, readLiveMerge, readReviewThreads, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
 import { namingResponse, type NamedGroupRow } from "./naming.js";
 import { checkoutBranch } from "./rebase.js";
+import { readAuthoredPrs, readInventoryPrs } from "./inventory.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
@@ -154,9 +157,6 @@ function defaultBranchResolver(signal: AbortSignal) {
   };
 }
 
-const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,createdAt,reviewRequests,body";
-
 /** Version-shaped local tags used as a release marker. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;
 
@@ -263,6 +263,7 @@ async function inspect(
     path,
     dirName,
     repo: remote === null ? null : repoFromRemote(remote),
+    githubRepo: remote === null ? null : githubRepoFromRemote(remote),
     branch,
     rebasing,
     dirty: status !== null && status !== "",
@@ -549,6 +550,8 @@ export async function inspectAll(
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    authoredPrs: ({ owners }, context) => readAuthoredPrs(ghRunner(context.signal), owners),
+    inspectPrs: ({ prUrls }, context) => readInventoryPrs(ghRunner(context.signal), prUrls),
     checkoutState: async ({ path }, context) => {
       if (!(await isUnit(path))) return { ok: false as const, error: "Checkout is unavailable." };
       const local = await localBranchState(path, context.signal);

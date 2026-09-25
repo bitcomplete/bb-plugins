@@ -1,11 +1,11 @@
 // "How this works": the secondary information the header used to carry, in
 // one quiet panel. It is a fixed tab in BB's own right panel, so it can stay
-// open beside the Map or either Board. Short sections, in the order a reader
+// open beside the Map or Board. Short sections, in the order a reader
 // asks: how the groups are made, what the rows mean, the keys, the Map's
 // marks, and whether the board is healthy.
 import type { ReactNode } from "react";
 import type { Board, BoardMode } from "./server";
-import { INBOX_SECTION_LABEL, relativeTime } from "./workstreams";
+import { relativeTime } from "./workstreams";
 import { TIER_WORDS } from "./threadmenu";
 import { THREAD_TIERS } from "./threads";
 import { runLabel } from "./runs";
@@ -51,7 +51,7 @@ const MAP_KEYS: [string, string][] = [
 ];
 
 const BOTH_KEYS: [string, string][] = [
-  ["v", "Map to Board; either Board to Map"],
+  ["v", "Switch between Map and Board"],
   ["?", "Open this panel"],
 ];
 
@@ -124,23 +124,32 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
 
       <Section title="What the states mean">
         <p>
-          Board starts grouped by Action and lets you switch to Effort. Board v2 groups by Workstream.
-          Both keep urgent work first within each group and offer the same row actions.
-          Action groups include {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
-          {INBOX_SECTION_LABEL.merge} and {INBOX_SECTION_LABEL.waiting}; in-flight, recently merged, and parked work
-          starts folded. &ldquo;In release tag&rdquo; means the merge commit appears in a local release tag;
+          Efforts groups all tracked checkouts by effort, with open PRs without a scanned checkout under
+          No effort assigned. PR backlog groups your open PRs by next action in organizations represented
+          by scanned projects: Ready to merge, Approved · next steps, Fix or respond, Waiting for review or
+          another PR, Drafts and work in progress, and Status to verify.
+          Remote PRs can use direct GitHub actions, but agent repairs need a scanned checkout.
+          Merged and release-tagged rows remain under their effort in collapsed sections.
+          &ldquo;In release tag&rdquo; means the merge commit appears in a local release tag;
           it does not verify a production deployment.
         </p>
         <p>
-          On Board v2, choose a workstream from the dropdown or its heading. The board scrolls to that workstream
-          and previews the next agent action on its pull request row. Preview only does not start an agent.
+          Approval records a reviewer decision. Ready to merge also requires clear checks, no unresolved
+          review threads, an acceptable branch and merge state, and no unmerged PR below it in a stack.
+          Choose an effort to preview its next agent action. Preview only does not start an agent;
           Run automatically starts at most one repair agent at a time.
         </p>
+        <p>
+          Manual review and conflict repairs inspect the live PR and base, make focused fixes, test,
+          push code changes, reply with the head SHA, and re-read merge gates. They ask for another
+          look only when changes are still requested and never merge.
+        </p>
+        <p>Archive idle leaf threads from their menu. Archived threads shows history and lets you undo an archive.</p>
         <Pairs rows={STATES} />
       </Section>
 
       <Section title="Keyboard shortcuts">
-        <p className="text-foreground">Board and Board v2</p>
+        <p className="text-foreground">Efforts</p>
         <p className="text-muted-foreground">Search accepts ticket IDs, titles, repos, workstreams, and PR numbers such as 2846, #2846, or my-parsley #2846.</p>
         <Pairs rows={BOARD_KEYS} mono />
         <p className="pt-1 text-foreground">Map</p>
@@ -183,6 +192,7 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
                 ],
               ]}
             />
+            <p>Git ref changes and idle thread transitions can trigger targeted refreshes. The configured interval and manual Refresh also update the board; Workstreams does not use GitHub webhooks.</p>
             <p className="pt-1 text-foreground">Recent runs</p>
             {board.runs.length === 0 ? (
               <p>No row actions in the last day.</p>

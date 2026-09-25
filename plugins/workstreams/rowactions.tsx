@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import { UrlLink, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type { Row } from "./inbox";
+import type { Pr } from "./contract";
 import {
   AGENT_LABEL,
   DIRECT_LABEL,
@@ -34,9 +35,15 @@ import { Tip } from "@/components/ui/tooltip";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
 import { toast } from "sonner";
 
+/** Direct actions can target an inventoried PR without inventing a checkout. */
+export type DirectRow = { repo: string; title: string; age: { since: number | null }; unit: { pr: Pr | null; path: string } | { pr: Pr; prUrl: string } };
+function directTarget(row: DirectRow): { path: string } | { prUrl: string } {
+  return "path" in row.unit ? { path: row.unit.path } : { prUrl: row.unit.prUrl };
+}
+
 /** Which dialog is open, and for which row. */
 export type ActionRequest =
-  | { kind: "direct"; action: DirectAction; row: Row }
+  | { kind: "direct"; action: DirectAction; row: DirectRow }
   | { kind: "agent"; action: AgentAction; row: Row };
 
 /**
@@ -248,7 +255,7 @@ function ErrorLine({ error }: { error: string | null }) {
   );
 }
 
-function PrLine({ row }: { row: Row }) {
+function PrLine({ row }: { row: DirectRow }) {
   return (
     <span>
       <span className="font-medium text-foreground">{row.repo}</span>
@@ -266,7 +273,7 @@ type MergePreview = Extract<Awaited<ReturnType<ReturnType<typeof useRpc<typeof r
  * the merge is pinned to exactly that commit: if anything was pushed since,
  * GitHub refuses rather than merging code nobody looked at here.
  */
-export function MergeDialog({ row, onClose }: { row: Row | null; onClose: () => void }) {
+export function MergeDialog({ row, onClose }: { row: DirectRow | null; onClose: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [preview, setPreview] = useState<MergePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -280,7 +287,7 @@ export function MergeDialog({ row, onClose }: { row: Row | null; onClose: () => 
     setError(null);
     setAnyway(false);
     setBusy(false);
-    rpc.call("action_merge_preview", { path: row.unit.path }).then(
+    rpc.call("action_merge_preview", directTarget(row)).then(
       (result) => {
         if (!live) return;
         if (result.ok) setPreview(result as MergePreview);
@@ -303,7 +310,7 @@ export function MergeDialog({ row, onClose }: { row: Row | null; onClose: () => 
     setError(null);
     try {
       const result = await rpc.call("action_merge", {
-        path: row.unit.path,
+        ...directTarget(row),
         sha: facts.live.headRefOid,
         acknowledgeUnresolved: anyway,
       });
@@ -444,7 +451,7 @@ function useWrite(onClose: () => void) {
   return { busy, error, reset, run };
 }
 
-export function UpdateBranchDialog({ row, onClose }: { row: Row | null; onClose: () => void }) {
+export function UpdateBranchDialog({ row, onClose }: { row: DirectRow | null; onClose: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const write = useWrite(onClose);
   useEffect(() => {
@@ -469,7 +476,7 @@ export function UpdateBranchDialog({ row, onClose }: { row: Row | null; onClose:
           </Button>
           <Button
             disabled={write.busy}
-            onClick={() => row !== null && void write.run(() => rpc.call("action_update_branch", { path: row.unit.path }))}
+            onClick={() => row !== null && void write.run(() => rpc.call("action_update_branch", directTarget(row)))}
           >
             {write.busy ? "Updating…" : "Update branch"}
           </Button>
@@ -484,7 +491,7 @@ export function UpdateBranchDialog({ row, onClose }: { row: Row | null; onClose:
  * reviewers GitHub still lists as pending, and post a comment. The comment is
  * prefilled and editable; it reaches gh on stdin, never on a command line.
  */
-export function NudgeDialog({ row, now, onClose }: { row: Row | null; now: number; onClose: () => void }) {
+export function NudgeDialog({ row, now, onClose }: { row: DirectRow | null; now: number; onClose: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const write = useWrite(onClose);
   const reviewers = row?.unit.pr?.reviewRequests ?? [];
@@ -552,7 +559,7 @@ export function NudgeDialog({ row, now, onClose }: { row: Row | null; now: numbe
             onClick={() =>
               row !== null &&
               void write.run(() =>
-                rpc.call("action_nudge", { path: row.unit.path, rerequest, comment: comment ? text : null }),
+                rpc.call("action_nudge", { ...directTarget(row), rerequest, comment: comment ? text : null }),
               )
             }
           >

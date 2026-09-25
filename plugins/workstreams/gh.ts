@@ -8,6 +8,10 @@ import { linkbackTicketOf, ticketRefsOf } from "./tickets.js";
 
 const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
 
+/** Shared by checkout scans and the authored PR inventory. */
+export const PR_FIELDS =
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,createdAt,reviewRequests,body";
+
 /**
  * GitHub's authoritative "can this merge right now" signal, from
  * `gh pr list --json mergeStateStatus`. Anything missing or unrecognized
@@ -27,6 +31,22 @@ export function repoFromRemote(remoteUrl: string): string | null {
   const last = trimmed.split(/[/:]/u).pop();
   if (last === undefined || last === "") return null;
   return last.replace(/\.git$/u, "");
+}
+
+/** Exact GitHub repository identity, without credentials or transport details. */
+export function githubRepoFromRemote(remoteUrl: string): string | null {
+  const remote = remoteUrl.trim();
+  const scp = /^(?:[^@\s]+@)?github\.com:([^\s]+)$/iu.exec(remote);
+  let path = scp?.[1] ?? null;
+  if (path === null) {
+    try {
+      const url = new URL(remote);
+      if (url.hostname.toLowerCase() !== "github.com" || !["https:", "ssh:", "git:"].includes(url.protocol)) return null;
+      path = url.pathname.replace(/^\//u, "");
+    } catch { return null; }
+  }
+  const repo = path.replace(/\/+$/u, "").replace(/\.git$/iu, "");
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/u.test(repo) && ![".", ".."].includes(repo.split("/")[1]!) ? repo : null;
 }
 
 /** `git rev-list --left-right --count @{u}...HEAD` prints "<behind>\t<ahead>". */

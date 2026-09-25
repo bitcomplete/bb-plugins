@@ -56,18 +56,26 @@ via agent** action starts a BB thread only when you confirm it.
 
 - **Map:** Explore the grouping hierarchy. Switch between theme and risk faces,
   filter by status and code surface, and open a linked agent thread.
-- **Board:** Group rows by Action (the default) or Effort. Both views keep
-  urgent work first within each group and offer the same row actions. Direct
+- **Board:** **Efforts** groups all tracked checkouts by effort. Open PRs
+  without a scanned checkout appear under **No effort assigned**. **PR backlog**
+  groups your open PRs by next action in organizations represented by scanned
+  projects, including PRs without a checkout. Approved
+  is a review decision; **Ready to merge** also requires clear checks, review
+  threads, branch state, and stack dependencies. Direct
   merge, branch update, and reviewer nudge actions ask for confirmation. CI,
   conflict, and review work shows the planned steps before you start a
   dedicated agent thread. You can expand and edit its instructions.
+  Agent repairs inspect the PR and base, address actionable feedback, test,
+  commit and push code changes, reply on the PR, and recheck live merge gates.
+  A remote PR needs a scanned checkout for an agent repair; direct GitHub
+  actions remain available without one. Merged and release-tagged work stays
+  under its effort in collapsed sections.
   After the author pushes a newer head, resolves review threads, and posts a
   directed PTAL, the row reads **Awaiting re-review** while GitHub still reports
   changes requested. Workstreams does not send another PTAL or reviewer nudge.
-- **Board v2:** Start with rows grouped by Workstream. Use the workstream
-  dropdown and **Off**, **Preview only**, or **Run automatically** controls at
-  the top. Choosing a workstream scrolls to and expands it. Preview only shows
-  the next candidate on its pull request row without starting an agent. Run
+- **Automatic agent actions:** Choose an effort, then use **Off**,
+  **Preview only**, or **Run automatically**. Preview only shows the next
+  candidate on its pull request row without starting an agent. Run
   automatically starts at most one agent at a time for failing CI, merge
   conflicts, requested changes, or unresolved inline comments.
   The agent works locally and is instructed to ask before pushing or replying
@@ -76,19 +84,23 @@ via agent** action starts a BB thread only when you confirm it.
   confirms it cleared. **Off** stops new dispatches; it does not cancel an
   agent already running. The latest finished Board action appears in the
   workstream's outcome card, which flags newer activity in its linked thread.
-  Run automatically never merges or deploys. The original Board remains
-  available beside Board v2.
+  Run automatically never merges or deploys.
+- **Archived threads:** Archive an idle leaf thread from its thread menu.
+  Use **Archived threads** to review history or undo an archive. Workstreams
+  will not archive a thread with children.
 - **How this works:** Open the ⓘ panel for state definitions, shortcuts, scan
   health, and warnings.
 
-`bb workstreams list [--json]` reads the last scan. Run `bb workstreams refresh`
-when freshness matters. `bb workstreams group <TICKET> <effort name>` sets a
+`bb workstreams list [--json]` reads the last scan. Workstreams also refreshes
+on relevant git ref changes and idle thread transitions, plus its configured
+interval; use `bb workstreams refresh` when freshness matters. It does not
+subscribe to GitHub webhooks. `bb workstreams group <TICKET> <effort name>` sets a
 manual effort name; `bb workstreams ungroup <TICKET>` removes it.
 
 The **In release tag** label means a merged commit appears in a local release
 tag. It does not verify deployment. When a repository has no usable release
 tags, merged work remains `merged` and the board warns.
-Closed pull requests that did not merge are omitted from the Map and both Boards,
+Closed pull requests that did not merge are omitted from the Map and Board,
 even when their checkouts are dirty or ahead of upstream. Merged work remains
 visible.
 
@@ -97,7 +109,7 @@ that may need action; it is distinct from unresolved inline threads. When the
 feedback's threads are resolved and a later fix is pushed, the row leads with
 the current **Approved · ready** state.
 
-Dispatch currently starts from existing PRs with a scanned checkout. It does
+Automatic dispatch starts from existing PRs with a scanned checkout. It does
 not create PRs from issues or checkouts, request review, or merge; those steps
 remain Board actions. Its workflow ends when GitHub reports the PR merged.
 
@@ -105,8 +117,7 @@ remain Board actions. Its workflow ends when GitHub reports the PR merged.
 
 The scanner and Anthropic naming call live in `host.ts`. `server.ts` handles
 settings, local storage, refresh, enrichment, actions, and the CLI. The grouping
-and lifecycle rules live in `workstreams.ts`; `app.tsx` mounts the Map and both
-Board tabs.
+and lifecycle rules live in `workstreams.ts`; `app.tsx` mounts the Map and Board.
 `contract.ts` defines the host RPC schema, and `skills/workstreams/SKILL.md`
 documents the CLI for agents.
 

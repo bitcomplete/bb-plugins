@@ -72,6 +72,7 @@ async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) =
       if (call.method === "scan") return { units: [{ ...unit("DIRTY"), rebasing: options.rebasing ?? false }], warnings: [] };
       if (call.method === "inspectPaths") return { units: [unit("CLEAN")], warnings: [] };
       if (call.method === "checkoutState") return { ok: true, branch: options.liveBranch === undefined ? unit("DIRTY").branch : options.liveBranch, rebasing: options.liveRebasing ?? false };
+      if (call.method === "prReviewers") return { ok: true, reviewers: unit("DIRTY").pr!.reviewRequests };
       if (call.method === "prWrite") return options.prWrite?.(call.input) ?? { ok: true, detail: "Updated the branch of inkwell/quill #42." };
       throw new Error(`unexpected host call ${call.method}`);
     },

@@ -45,10 +45,13 @@ import { toast } from "sonner";
 import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
+import { PrBacklog } from "./pr-backlog-view";
+import { backlogMatches, prBacklog } from "./pr-backlog";
+import { ArchivedThreadsButton } from "./archivedthreads";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
 import { ageHint, primaryHint, rowAge, shortAge, shortVerb, titleHint } from "./rowlabels";
-import { groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
+import { completedByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
 import { latestEffortOutcome, type EffortOutcome } from "./outcomes";
 import { attentionDetail, attentionLabel, hasBoardRows, workstreamAttention, type WorkstreamAttention } from "./workstream-attention";
 import { usePortalScopeProps } from "./lib/portal-scope";
@@ -131,13 +134,23 @@ export function InboxBoard({
   onFocusTicket: (ticket: string | null) => void;
   /** Switch to the Map, which flies to `focusTicket` on arrival. */
   onShowOnMap: () => void;
-  /** Show the dispatcher pilot controls on Board v2. */
+  /** Show effort automation controls and the complete PR backlog. */
   dispatchControls?: boolean;
 }) {
+  const [boardV2View, setBoardV2View] = useState<"efforts" | "backlog">(() => {
+    try { return window.localStorage.getItem("bb-workstreams:board-v2-view") === "backlog" ? "backlog" : "efforts"; }
+    catch { return "efforts"; }
+  });
+  const backlogVisible = dispatchControls && boardV2View === "backlog";
+  const chooseView = (view: "efforts" | "backlog") => {
+    setBoardV2View(view);
+    try { window.localStorage.setItem("bb-workstreams:board-v2-view", view); } catch { /* Storage may be disabled. */ }
+  };
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
+  const unassignedPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
   const allEfforts = useMemo(() => workstreamAttention([...all.values()].flat()), [all]);
   const efforts = useMemo(() => allEfforts.filter(hasBoardRows), [allEfforts]);
   const [dispatch, setDispatch] = useState(board.dispatch);
@@ -207,8 +220,12 @@ export function InboxBoard({
     return counts;
   }, [sections]);
   const completed = useMemo(() => partitionCompletedRows(sections), [sections]);
-  const groups = useMemo(() => groupInboxRows(dispatchControls ? completed.active : sections, groupBy)
-    .filter((group) => !dispatchControls || group.section !== "shipped"), [completed, dispatchControls, sections, groupBy]);
+  const effortCompleted = useMemo(() => completedByEffort(completed), [completed]);
+  const completionWithinEffort = dispatchControls && groupBy === "effort";
+  const groups = useMemo(() => groupInboxRows(dispatchControls && !completionWithinEffort ? completed.active : sections, groupBy)
+    .filter((group) => !dispatchControls || group.section !== "shipped")
+    .map((group) => completionWithinEffort ? { ...group, rows: group.rows.filter((row) => row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped") } : group), [completed, completionWithinEffort, dispatchControls, sections, groupBy]);
+  const [effortCompletedOpen, setEffortCompletedOpen] = useState<Record<string, { merged: boolean; inReleaseTag: boolean }>>({});
   const [completedOpen, setCompletedOpen] = useState({ merged: false, inReleaseTag: false });
   useEffect(() => {
     if (!dispatchControls || initialEffortScroll.current || groups.length === 0) return;
@@ -254,10 +271,10 @@ export function InboxBoard({
   }, []);
 
   // j/k walk the rows the reader can see, top to bottom.
-  const visible = useMemo(() => [
-    ...visibleInboxRows(groups, isOpen),
-    ...(dispatchControls ? visibleCompletedRows(completed, completedOpen) : []),
-  ], [groups, isOpen, dispatchControls, completed, completedOpen]);
+  const visible = useMemo(() => completionWithinEffort
+    ? groups.flatMap((group) => isOpen(group) ? [...group.rows, ...visibleCompletedRows(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, effortCompletedOpen[group.key] ?? { merged: false, inReleaseTag: false })] : [])
+    : [...visibleInboxRows(groups, isOpen), ...(dispatchControls ? visibleCompletedRows(completed, completedOpen) : [])],
+  [groups, isOpen, dispatchControls, completed, completedOpen, completionWithinEffort, effortCompleted, effortCompletedOpen]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selected = visible.find((row) => row.key === selectedKey) ?? null;
 
@@ -273,6 +290,7 @@ export function InboxBoard({
       setEffortOpen((current) => ({ ...current, [row.effortKey]: true }));
       if (dispatchControls && row.unit.lifecycle === "merged") setCompletedOpen((current) => ({ ...current, merged: true }));
       if (dispatchControls && row.unit.lifecycle === "shipped") setCompletedOpen((current) => ({ ...current, inReleaseTag: true }));
+      if (dispatchControls && (row.unit.lifecycle === "merged" || row.unit.lifecycle === "shipped")) setEffortCompletedOpen((current) => ({ ...current, [row.effortKey]: { ...(current[row.effortKey] ?? { merged: false, inReleaseTag: false }), [row.unit.lifecycle === "merged" ? "merged" : "inReleaseTag"]: true } }));
     }
   }, [all, dispatchControls, focusTicket]);
 
@@ -314,6 +332,7 @@ export function InboxBoard({
       setEffortOpen((current) => ({ ...current, [target.effortKey]: true }));
       if (dispatchControls && target.unit.lifecycle === "merged") setCompletedOpen((current) => ({ ...current, merged: true }));
       if (dispatchControls && target.unit.lifecycle === "shipped") setCompletedOpen((current) => ({ ...current, inReleaseTag: true }));
+      if (dispatchControls && (target.unit.lifecycle === "merged" || target.unit.lifecycle === "shipped")) setEffortCompletedOpen((current) => ({ ...current, [target.effortKey]: { ...(current[target.effortKey] ?? { merged: false, inReleaseTag: false }), [target.unit.lifecycle === "merged" ? "merged" : "inReleaseTag"]: true } }));
       setQuery("");
       const patch: Partial<Prefs> = {};
       if (!prefs.showClones && isTicketlessClone(target.unit)) patch.showClones = true;
@@ -391,11 +410,11 @@ export function InboxBoard({
 
   const onKey = useCallback(
     (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null || messaging !== null) return;
+      if (backlogVisible || event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null || messaging !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
-        (target.isContentEditable || target.closest("input, textarea, select, button, a[href], [contenteditable], [role=dialog], [role=menu], [role=combobox]") !== null)
+        (target.isContentEditable || target.closest("input, textarea, select, button, a[href], [contenteditable], [role=dialog], [role=menu], [role=combobox], [data-pr-backlog-row]") !== null)
       ) {
         return;
       }
@@ -450,7 +469,7 @@ export function InboxBoard({
       }
       event.preventDefault();
     },
-    [messaging, navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, request, runPrimary, select, selected, starting, threadsOf, visible],
+    [backlogVisible, messaging, navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, request, runPrimary, select, selected, starting, threadsOf, visible],
   );
   useEffect(() => {
     window.addEventListener("keydown", onKey);
@@ -482,9 +501,44 @@ export function InboxBoard({
     />
   );
 
+  const completionCards = (done: { merged: Row[]; inReleaseTag: Row[] }, effortKey: string | null) => {
+    const open = effortKey === null ? completedOpen : effortCompletedOpen[effortKey] ?? { merged: false, inReleaseTag: false };
+    if (done.merged.length + done.inReleaseTag.length === 0) return null;
+    return <div className={cn("flex flex-col gap-1", effortKey === null ? "mt-6 border-t border-border/60 pt-4" : "ml-7 mt-1 border-l border-border/50 pl-2")}>
+      {([
+        { key: "merged", label: "Merged", rows: done.merged, hint: "Pull requests merged on GitHub" },
+        { key: "inReleaseTag", label: "In release tag", rows: done.inReleaseTag, hint: "Merge commits found in a local release tag; deployment is not verified" },
+      ] as const).filter(({ rows }) => rows.length > 0).map(({ key, label, rows, hint }) => <section key={key} aria-label={label} className="min-w-0">
+        <button type="button" aria-expanded={open[key]} onClick={() => effortKey === null
+          ? setCompletedOpen((current) => ({ ...current, [key]: !current[key] }))
+          : setEffortCompletedOpen((current) => ({ ...current, [effortKey]: { ...open, [key]: !open[key] } }))}
+          className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[11.5px] text-muted-foreground outline-none hover:bg-foreground/[0.025] focus-visible:ring-2 focus-visible:ring-ring">
+          <Icon name="ChevronRight" className={cn("size-3 shrink-0 transition-transform duration-150", open[key] && "rotate-90")} />
+          <span>{label}</span><span className="font-mono text-[10.5px]">{rows.length}</span>
+        </button>
+        {open[key] ? <><p className="px-2 pb-1 text-[10.5px] text-muted-foreground">{hint}</p><ul role="listbox" aria-label={label}>{rows.map((row) => renderRow(row, false, null))}</ul></> : null}
+      </section>)}
+    </div>;
+  };
 
   return (
     <div ref={boardRef} className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      {dispatchControls ? <div className="flex items-center gap-1 border-b border-border/60 px-4 py-1.5" role="group" aria-label="Board view">
+        {(["efforts", "backlog"] as const).map((view) => <button key={view} type="button" aria-pressed={boardV2View === view} onClick={() => chooseView(view)} className={cn("rounded-md px-2.5 py-1 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", boardV2View === view ? "bg-foreground/[0.08] font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{view === "efforts" ? "Efforts" : "PR backlog"}</button>)}
+      </div> : null}
+      {backlogVisible && dispatch.mode === "auto" ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-4 py-2 text-[11.5px] text-muted-foreground">
+        <span>Automatic agent runs · {allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? "selected effort"}</span>
+        <button type="button" onClick={() => {
+          chooseView("efforts");
+          if (dispatch.effortKey !== null) {
+            setEffortOpen((current) => ({ ...current, [dispatch.effortKey!]: true }));
+            requestAnimationFrame(() => effortHeadings.current.get(dispatch.effortKey!)?.scrollIntoView({ block: "start" }));
+          }
+        }} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Go to effort</button>
+        <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button>
+        {dispatchError === null ? null : <span role="alert" className="text-destructive">{dispatchError}</span>}
+      </div> : null}
+      {backlogVisible ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
       <InboxHeader
         searchRef={searchRef}
         query={query}
@@ -494,8 +548,8 @@ export function InboxBoard({
         prefs={prefs}
         onPrefs={onPrefs}
         surfaces={board.surfaces}
-        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0)}
-        total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0)}
+        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0) + (dispatchControls ? unassignedPrs.filter((row) => backlogMatches(row, query)).length : 0)}
+        total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0) + (dispatchControls ? unassignedPrs.length : 0)}
         dispatch={dispatch}
         dispatchBusy={dispatchBusy}
         dispatchError={dispatchError}
@@ -514,15 +568,15 @@ export function InboxBoard({
         <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pb-10">
           {dispatchControls && !selectedEffortVisible ? (
             <div className="flex flex-wrap items-center gap-2 px-2 pt-4 text-[12px] text-muted-foreground">
-              <span>{completedOnlySelected ? "The selected workstream has no current Board v2 rows" : "The selected workstream is outside the current view"}{dispatch.mode === "auto" ? " · Running automatically" : dispatch.mode === "shadow" ? " · Preview only" : " · Off"}.</span>
+              <span>{completedOnlySelected ? "The selected workstream has no current Board rows" : "The selected workstream is outside the current view"}{dispatch.mode === "auto" ? " · Running automatically" : dispatch.mode === "shadow" ? " · Preview only" : " · Off"}.</span>
               {!completedOnlySelected && outcomeRows.has(dispatch.effortKey ?? "") ? (
                 <button type="button" onClick={revealSelectedEffort} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Show workstream</button>
               ) : null}
               {dispatch.mode !== "off" ? <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button> : null}
             </div>
           ) : null}
-          {groups.length === 0 && (!dispatchControls || completed.merged.length + completed.inReleaseTag.length === 0) ? (
-            <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching checkouts.</p>
+          {groups.length === 0 && (!dispatchControls || (completed.merged.length + completed.inReleaseTag.length === 0 && !unassignedPrs.some((row) => backlogMatches(row, query)))) ? (
+            <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching work.</p>
           ) : null}
           {groups.map((group) => {
             const rows = group.rows;
@@ -549,7 +603,7 @@ export function InboxBoard({
                     <h2 className="min-w-0 truncate text-[13px] font-semibold tracking-tight text-foreground">
                       {group.label}
                     </h2>
-                    <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{completionWithinEffort ? rows.length > 0 ? `${rows.length} active` : "Completed" : rows.length}</span>
                   </button>
                   {dispatchControls && group.section === null ? (
                     <EffortOutcomeCard
@@ -558,7 +612,7 @@ export function InboxBoard({
                       threadUpdatedAt={sidebarThreads.find((thread) => thread.id === outcome?.threadId)?.updatedAt ?? null}
                     />
                   ) : null}
-                  {dispatchControls && group.section === null ? (
+                  {dispatchControls && group.section === null && rows.length > 0 ? (
                     <button
                       type="button"
                       disabled={dispatchBusy || dispatch.effortKey === group.key}
@@ -576,46 +630,22 @@ export function InboxBoard({
                 </div>
                 {expanded ? (
                   rows.length === 0 ? (
-                    <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
+                    completionWithinEffort && effortCompleted.has(group.key) ? null : <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
                   ) : (
                     <ul role="listbox" aria-label={group.label} className="flex flex-col">
                       {rows.map((row) => renderRow(row, groupBy === "effort", group.key))}
                     </ul>
                   )
                 ) : null}
+                {expanded && completionWithinEffort ? completionCards(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, group.key) : null}
               </section>
             );
           })}
-          {dispatchControls && (completed.merged.length > 0 || completed.inReleaseTag.length > 0) ? (
-            <div className="mt-6 grid gap-2 border-t border-border/60 pt-4 sm:grid-cols-2">
-              {([
-                { key: "merged", label: "Merged", rows: completed.merged, hint: "Pull requests merged on GitHub" },
-                { key: "inReleaseTag", label: "In release tag", rows: completed.inReleaseTag, hint: "Merge commits found in a local release tag" },
-              ] as const).map(({ key, label, rows, hint }) => (
-                <section key={key} aria-label={label} className={cn("min-w-0 rounded-lg border border-border/70 bg-foreground/[0.025]", completedOpen[key] && "sm:col-span-2")}>
-                  <button
-                    type="button"
-                    aria-expanded={completedOpen[key]}
-                    onClick={() => setCompletedOpen((current) => ({ ...current, [key]: !current[key] }))}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <Icon name="ChevronRight" className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform duration-150", completedOpen[key] && "rotate-90")} />
-                    <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-foreground">{label}</span>
-                    <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
-                  </button>
-                  {completedOpen[key] ? (
-                    <div className="border-t border-border/60 pb-2">
-                      <p className="px-3 pt-2 text-[11px] text-muted-foreground">{hint}</p>
-                      {rows.length > 0 ? <ul role="listbox" aria-label={label} className="flex flex-col">{rows.map((row) => renderRow(row, false, null))}</ul>
-                        : <p className="px-3 pt-2 text-[12px] text-muted-foreground">No matching checkouts.</p>}
-                    </div>
-                  ) : null}
-                </section>
-              ))}
-            </div>
-          ) : null}
+          {dispatchControls ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+          {dispatchControls && !completionWithinEffort ? completionCards(completed, null) : null}
         </div>
       </div>
+      </>}
       <StartThreadDialog row={starting} onClose={() => setStarting(null)} />
       <ActionDialogs request={request} now={now} onClose={() => setRequest(null)} />
       <ThreadMessageDialog row={messaging} threads={messaging === null ? [] : threadsOf(messaging)} onClose={() => setMessaging(null)} />
@@ -1324,17 +1354,18 @@ function InboxHeader({
           {shown === total ? `${total} rows` : `${shown} of ${total}`}
         </span>
         {dispatchControls ? null : <label className="flex h-8 shrink-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
-          Group by
+          View
           <select
             value={groupBy}
             onChange={(event) => onGroupBy(event.target.value as InboxGrouping)}
             aria-label="Group rows by"
             className="h-8 rounded-md border border-border bg-background px-1.5 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            <option value="action">Action</option>
-            <option value="effort">Effort</option>
+            <option value="effort">By effort</option>
+            <option value="action">Next action</option>
           </select>
         </label>}
+        <ArchivedThreadsButton />
         <div ref={rootRef} className="relative shrink-0">
           <Tip label="Filter rows by last commit, surface or clones">
             <button
@@ -1393,7 +1424,7 @@ function InboxHeader({
       </div>
       {dispatchControls ? (
         <div className={cn("mx-auto w-full max-w-6xl items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]", compact ? (tight ? "grid grid-cols-[minmax(0,1fr)_auto]" : "grid grid-cols-[minmax(0,1fr)_auto_auto]") : "flex flex-wrap")}>
-          <span className={cn("shrink-0 font-semibold text-foreground", compact && "sr-only")}>Board v2 · Agent actions</span>
+          <span className={cn("shrink-0 font-semibold text-foreground", compact && "sr-only")}>Agent actions</span>
           <div className={cn("flex min-w-0 items-center gap-1.5 text-muted-foreground", compact && tight && "col-span-2")}>
             <span id="workstream-chooser-label" className={compact ? "sr-only" : undefined}>Workstream</span>
             <SelectPrimitive.Root

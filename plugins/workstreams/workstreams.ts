@@ -1,6 +1,6 @@
 // Pure board logic: no I/O, no SDK. Everything here is unit-tested in
 // workstreams.test.ts, because these rules are the whole point of the plugin.
-import type { MergeStateStatus, RawUnit } from "./contract.js";
+import type { MergeStateStatus, Pr, RawUnit } from "./contract.js";
 import { ticketFinder, type TicketSource } from "./tickets.js";
 
 /**
@@ -310,6 +310,14 @@ export function unitLifecycle(unit: RawUnit): Lifecycle {
   // Red checks on a draft are expected rather than actionable, so a draft stays
   // in the ACTIVE group and never competes with a genuinely blocked PR.
   if (pr.isDraft) return unit.observed?.status !== false && unit.dirty ? "active" : "in-progress";
+  return prLifecycle(pr);
+}
+
+/** Remote PR facts shared by checkout rows and the authored PR inventory. */
+export function prLifecycle(pr: Pr): Lifecycle {
+  if (pr.state === "MERGED") return "merged";
+  if (pr.state === "CLOSED") return "closed";
+  if (pr.isDraft) return "in-progress";
   if (pr.checkConclusions.some((value) => FAILING_CHECKS.has(value))) return "blocked";
   // Changes requested is NOT blocked: the reviewer already acted and the ball
   // is with the author. Merging the two would hide the one state the user can

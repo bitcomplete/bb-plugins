@@ -9,7 +9,7 @@ import type { Row } from "./inbox.js";
 export type InboxGrouping = "action" | "effort";
 export type RowGroup = { key: string; label: string; rows: Row[]; section: InboxSection | null };
 
-/** Board v2 keeps completed checkouts out of the action and effort lists. */
+/** Board v2 separates completed checkouts from active rows. */
 export function partitionCompletedRows(sections: Map<InboxSection, Row[]>): {
   active: Map<InboxSection, Row[]>;
   merged: Row[];
@@ -76,4 +76,17 @@ export function groupInboxRows(sections: Map<InboxSection, Row[]>, by: InboxGrou
 /** Keyboard traversal follows the rows currently shown, including folded groups. */
 export function visibleInboxRows(groups: readonly RowGroup[], isOpen: (group: RowGroup) => boolean): Row[] {
   return groups.flatMap((group) => isOpen(group) ? group.rows : []);
+}
+
+/** Keep completed work under the effort that owns it. */
+export function completedByEffort(completed: Pick<ReturnType<typeof partitionCompletedRows>, "merged" | "inReleaseTag">): Map<string, { merged: Row[]; inReleaseTag: Row[] }> {
+  const efforts = new Map<string, { merged: Row[]; inReleaseTag: Row[] }>();
+  for (const kind of ["merged", "inReleaseTag"] as const) {
+    for (const row of completed[kind]) {
+      const group = efforts.get(row.effortKey) ?? { merged: [], inReleaseTag: [] };
+      group[kind].push(row);
+      efforts.set(row.effortKey, group);
+    }
+  }
+  return efforts;
 }

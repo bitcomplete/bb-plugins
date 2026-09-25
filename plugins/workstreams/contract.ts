@@ -102,6 +102,8 @@ export const rawUnitSchema = z
     path: z.string().max(1_000),
     dirName: z.string().max(300),
     repo: z.string().max(200).nullable(),
+    /** Exact owner/repo from a github.com origin, used to scope authored PR discovery. */
+    githubRepo: z.string().max(200).nullable().optional(),
     branch: z.string().max(300).nullable(),
     /** Git reports a detached HEAD while replaying commits; the original branch remains associated for display. */
     rebasing: z.boolean().optional(),
@@ -130,6 +132,31 @@ export const rawUnitSchema = z
   })
   .strict();
 export type RawUnit = z.infer<typeof rawUnitSchema>;
+
+export const inventoryEntrySchema = z.object({ repo: z.string().max(200), pr: prSchema }).strict();
+export const inventoryResultSchema = z.object({
+  owners: z.array(z.string().max(39)).max(50),
+  entries: z.array(inventoryEntrySchema).max(1_000),
+  discoveryComplete: z.boolean(),
+  repositories: z.array(z.object({ repo: z.string().max(200), complete: z.boolean() }).strict()).max(1_000),
+  complete: z.boolean(),
+  warnings: z.array(z.string().max(500)).max(50),
+}).strict();
+export const inventoryInspectionSchema = z.object({
+  entries: z.array(inventoryEntrySchema).max(100),
+  closed: z.array(z.string().max(500)).max(100),
+  failed: z.array(z.string().max(500)).max(100),
+  warnings: z.array(z.string().max(500)).max(50),
+}).strict();
+export const inventoryBoardSchema = z.object({
+  owners: z.array(z.string()),
+  entries: z.array(inventoryEntrySchema.extend({ stale: z.boolean() })),
+  complete: z.boolean(),
+  lastSuccessAt: z.string().nullable(),
+  lastAttemptAt: z.string().nullable(),
+  refreshing: z.boolean(),
+  warnings: z.array(z.string()),
+});
 
 /** One group as the naming call sees it: label, and what is inside it. */
 export const groupNamingSchema = z
@@ -225,6 +252,14 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
 export type PrWrite = z.infer<typeof prWriteSchema>;
 
 export const hostContract = defineRpcContract({
+  authoredPrs: {
+    input: z.object({ owners: z.array(z.string().max(39)).max(50) }).strict(),
+    output: inventoryResultSchema,
+  },
+  inspectPrs: {
+    input: z.object({ prUrls: z.array(z.string().max(500)).max(100) }).strict(),
+    output: inventoryInspectionSchema,
+  },
   /** Cheap live local guard before a direct PR write; never trusts the last scan's branch state. */
   checkoutState: {
     input: z.object({ path: z.string().max(1_000) }).strict(),

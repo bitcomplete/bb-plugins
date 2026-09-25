@@ -7,7 +7,7 @@ describe("Workstreams view preference", () => {
   it("keeps explicit view links independent of the remembered view", () => {
     expect(viewFromSubPath("map")).toBe("map");
     expect(viewFromSubPath("board/details")).toBe("board");
-    expect(viewFromSubPath("board-v2/details")).toBe("board-v2");
+    expect(viewFromSubPath("board-v2/details")).toBe("board");
     expect(viewFromSubPath("")).toBeNull();
     expect(viewFromSubPath("unknown")).toBeNull();
   });
@@ -25,9 +25,8 @@ describe("Workstreams view preference", () => {
     storeLastView("board");
     expect(values.get(VIEW_STORAGE_KEY)).toBe("board");
     expect(readLastView()).toBe("board");
-    storeLastView("board-v2");
-    expect(values.get(VIEW_STORAGE_KEY)).toBe("board-v2");
-    expect(readLastView()).toBe("board-v2");
+    values.set(VIEW_STORAGE_KEY, "board-v2");
+    expect(readLastView()).toBe("board");
     storeLastView("map");
     expect(readLastView()).toBe("map");
     values.set(VIEW_STORAGE_KEY, "unexpected");
@@ -42,6 +41,5 @@ describe("Workstreams view preference", () => {
     });
     expect(readLastView()).toBe("map");
     expect(() => storeLastView("board")).not.toThrow();
-    expect(() => storeLastView("board-v2")).not.toThrow();
   });
 });
