@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { effortMembersSchema, establishedEffortSchema, sameMembers, type EffortMembers, type EffortStore, type EstablishedEffort } from "./effort-store.js";
+import { effortTitle } from "./effort-title.js";
 
 const failure = z.object({ ok: z.literal(false), error: z.string() });
 export const effortPlanSchema = z.discriminatedUnion("ok", [failure, z.object({
@@ -55,7 +56,7 @@ export function createCoordinatorService(store: EffortStore, sdk: CoordinatorSdk
     const existed = effort !== null;
     effort ??= store.establish({ sourceKey: input.groupKey, name: input.name, goal: input.goal, projectId: input.projectId, members: input.members });
     if (association) {
-      await sdk.rename(association.id, `🧭 ${effort.name}`);
+      await sdk.rename(association.id, effortTitle(effort.name));
       await sdk.associate(association.id, effort.id);
       return { ok: true, effort: store.save({ ...effort, coordinatorThreadId: association.id, coordinatorState: "ready" }) };
     }
@@ -64,7 +65,7 @@ export function createCoordinatorService(store: EffortStore, sdk: CoordinatorSdk
       if (recovered.length === 1) return { ok: true, effort: store.save({ ...effort, coordinatorThreadId: recovered[0]!, coordinatorState: "ready" }) };
       return { ok: false, error: "A coordinator launch was already recorded. Choose an existing thread after checking BB; another coordinator will not be launched automatically." };
     }
-    const thread = await sdk.spawn({ projectId: effort.projectId, title: `🧭 ${effort.name}`, prompt: coordinatorPrompt(effort),
+    const thread = await sdk.spawn({ projectId: effort.projectId, title: effortTitle(effort.name), prompt: coordinatorPrompt(effort),
       pluginMetadata: { effortId: effort.id, role: "coordinator" } });
     return { ok: true, effort: store.save({ ...effort, coordinatorThreadId: thread.id, coordinatorState: "ready" }) };
   }

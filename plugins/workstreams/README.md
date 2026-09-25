@@ -58,6 +58,10 @@ via agent** action starts a BB thread only when you confirm it.
 
 - **Map:** Explore the grouping hierarchy. Switch between theme and risk faces,
   filter by status and code surface, and open a linked agent thread.
+- **Approved filter:** Keep approved open PRs in view across Map, Efforts, and
+  PR backlog; the selection persists across views and reloads. Map dims
+  nonmatching work without changing its layout and counts checkout-backed PRs;
+  Board also includes the PR inventory.
 - **Board:** **Efforts** groups all tracked checkouts by effort. Open PRs
   without a scanned checkout join an effort when a saved PR link or an
   unambiguous ticket match connects them. Other PRs appear under **No effort
@@ -81,7 +85,8 @@ via agent** action starts a BB thread only when you confirm it.
   tickets and PRs, set its name and goal, and choose a matching BB project.
   Create a planning thread in a separate worktree with that project's default
   agent, or link an eligible idle thread. New and explicitly linked coordinator
-  titles use **🧭**. Creating a coordinator establishes a stable effort identity
+  titles use a relevant emoji or a stable, varied fallback, preserving an
+  existing leading emoji. Creating a coordinator establishes a stable effort identity
   that later grouping passes preserve. **Effort thread** opens it from the
   heading. New PR repairs can run beneath the coordinator; later repairs can
   run beneath that PR's earlier worker. The action preview shows the parent.

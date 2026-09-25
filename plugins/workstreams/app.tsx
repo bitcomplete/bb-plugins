@@ -21,6 +21,7 @@ import { HOW_TAB, HowThisWorks } from "./howto";
 import { EASE_CSS } from "./layout";
 import { MapView } from "./map";
 import { InboxBoard } from "./inbox";
+import { countApprovedOpenPrs } from "./approval-filter";
 import { Icon } from "@/components/ui/icon";
 import { Tip } from "@/components/ui/tooltip";
 import { toast } from "sonner";
@@ -75,7 +76,7 @@ function useBoard() {
   return { rpc, board, error, refetch };
 }
 
-const DEFAULT_PREFS: Prefs = { lens: "all", staleness: [], surfaces: [], colorBy: "status", face: "theme", showClones: false };
+const DEFAULT_PREFS: Prefs = { lens: "all", staleness: [], surfaces: [], colorBy: "status", face: "theme", showClones: false, approvedOnly: false };
 
 /**
  * The lens, persisted server-side in plugin kv so it survives a reload. Applied
@@ -293,6 +294,11 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
       storeLastView(explicitView);
     }
   }, [explicitView, navigate, view]);
+  const approvedCount = useMemo(() => {
+    if (board === null) return 0;
+    const local = board.groups.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.map((unit) => unit.pr)));
+    return countApprovedOpenPrs(view === "map" ? local : [...local, ...board.prInventory.entries.map((entry) => entry.pr)]);
+  }, [board, view]);
   const now = useNow(30_000);
   const panel = experimental_useAppPanel();
   const openHow = useCallback(() => {
@@ -358,7 +364,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
 
   return (
     <div className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
-      <header className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60 px-3">
+      <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-3 py-1">
         {/* Map and Board share one fetch. */}
         <div role="tablist" aria-label="Workstreams views" className="flex shrink-0 items-center gap-3">
           {VIEWS.map((entry) => (
@@ -380,6 +386,10 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
             </button>
           ))}
         </div>
+        <Tip label={`Approved open PRs ${view === "map" ? "with scanned checkouts on the Map" : "across tracked checkouts and the PR inventory"}. Approval can still need comment, check, or branch work.`}>
+          <button type="button" aria-pressed={prefs.approvedOnly} disabled={board === null} onClick={() => update({ approvedOnly: !prefs.approvedOnly })}
+            className={cn("shrink-0 rounded-md border px-2 py-1 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50", prefs.approvedOnly ? "border-ring/50 bg-foreground/[0.08]" : "border-border text-muted-foreground")}>Approved {approvedCount}</button>
+        </Tip>
         {board === null ? (
           <p className="truncate text-[11px] text-muted-foreground">Loading…</p>
         ) : (

@@ -53,7 +53,7 @@ describe("established effort coordination through the server", () => {
     const { harness, board, input, plan, spawns } = await setup();
     expect(plan.ok).toBe(true); expect(spawns).toEqual([]);
     expect(await harness.callRpc("effort_coordinate", input)).toMatchObject({ ok: true });
-    expect(spawns[0]).toMatchObject({ title: "🧭 Improve manuscript review", environment: { type: "provider", environmentProviderId: "git-worktree" }, pluginMetadata: { role: "coordinator" } });
+    expect(spawns[0]).toMatchObject({ title: "🔍 Improve manuscript review", environment: { type: "provider", environmentProviderId: "git-worktree" }, pluginMetadata: { role: "coordinator" } });
     expect(spawns[0]).not.toHaveProperty("model"); expect(spawns[0]).not.toHaveProperty("providerId");
     const established = (await board()).efforts[0]!;
     await harness.runCli(["refresh"]);

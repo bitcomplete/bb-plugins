@@ -47,6 +47,7 @@ import { primaryAction, type PrimaryAction } from "./actions";
 import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
 import { PrBacklog } from "./pr-backlog-view";
+import { matchesApprovedFilter } from "./approval-filter";
 import { EffortCoordinatorControl } from "./effort-coordinator-control";
 import { backlogMatches, includeRemoteEfforts, prBacklog, remoteAttentionRows, remotePrsByEffort } from "./pr-backlog";
 import { ArchivedThreadsButton } from "./archivedthreads";
@@ -182,7 +183,8 @@ export function InboxBoard({
     void setDispatchMode(effortKey === null ? "off" : "shadow", effortKey);
   };
   const [query, setQuery] = useState("");
-  const remoteEffortPrs = useMemo(() => remotePrsByEffort(inventoryOnlyPrs, query), [inventoryOnlyPrs, query]);
+  const visibleInventoryPrs = useMemo(() => inventoryOnlyPrs.filter((row) => matchesApprovedFilter(row.pr, prefs.approvedOnly) && backlogMatches(row, query)), [inventoryOnlyPrs, prefs.approvedOnly, query]);
+  const remoteEffortPrs = useMemo(() => remotePrsByEffort(visibleInventoryPrs, ""), [visibleInventoryPrs]);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
   const [boardWidth, setBoardWidth] = useState(0);
@@ -209,6 +211,7 @@ export function InboxBoard({
   // Search and the Filter popover narrow rows; they never reorder them.
   const sections = useMemo(() => {
     const keep = (row: Row) =>
+      matchesApprovedFilter(row.unit.pr, prefs.approvedOnly) &&
       (prefs.showClones || !isTicketlessClone(row.unit)) &&
       (prefs.staleness.length === 0 || prefs.staleness.includes(row.unit.staleness)) &&
       (prefs.surfaces.length === 0 || prefs.surfaces.some((surface) => row.unit.surfaces.includes(surface))) &&
@@ -258,6 +261,7 @@ export function InboxBoard({
     onPrefs({
       staleness: [],
       surfaces: [],
+      approvedOnly: false,
       ...(!prefs.showClones && selectedRows.length > 0 && selectedRows.every((row) => isTicketlessClone(row.unit)) ? { showClones: true } : {}),
     });
     if (dispatch.effortKey !== null) setEffortOpen((current) => ({ ...current, [dispatch.effortKey!]: true }));
@@ -350,6 +354,7 @@ export function InboxBoard({
       if (dispatchControls && (target.unit.lifecycle === "merged" || target.unit.lifecycle === "shipped")) setEffortCompletedOpen((current) => ({ ...current, [target.effortKey]: { ...(current[target.effortKey] ?? { merged: false, inReleaseTag: false }), [target.unit.lifecycle === "merged" ? "merged" : "inReleaseTag"]: true } }));
       setQuery("");
       const patch: Partial<Prefs> = {};
+      if (!matchesApprovedFilter(target.unit.pr, prefs.approvedOnly)) patch.approvedOnly = false;
       if (!prefs.showClones && isTicketlessClone(target.unit)) patch.showClones = true;
       if (prefs.staleness.length > 0 && !prefs.staleness.includes(target.unit.staleness)) patch.staleness = [];
       if (prefs.surfaces.length > 0 && !prefs.surfaces.some((surface) => target.unit.surfaces.includes(surface))) patch.surfaces = [];
@@ -553,7 +558,7 @@ export function InboxBoard({
         <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button>
         {dispatchError === null ? null : <span role="alert" className="text-destructive">{dispatchError}</span>}
       </div> : null}
-      {backlogVisible ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
+      {backlogVisible ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : <>
       <InboxHeader
         searchRef={searchRef}
         query={query}
@@ -563,7 +568,7 @@ export function InboxBoard({
         prefs={prefs}
         onPrefs={onPrefs}
         surfaces={board.surfaces}
-        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0) + (dispatchControls ? inventoryOnlyPrs.filter((row) => backlogMatches(row, query)).length : 0)}
+        shown={[...sections.values()].reduce((sum, rows) => sum + rows.length, 0) + (dispatchControls ? visibleInventoryPrs.length : 0)}
         total={[...all.values()].reduce((sum, rows) => sum + rows.filter((row) => prefs.showClones || !isTicketlessClone(row.unit)).length, 0) + (dispatchControls ? inventoryOnlyPrs.length : 0)}
         dispatch={dispatch}
         dispatchBusy={dispatchBusy}
@@ -572,7 +577,7 @@ export function InboxBoard({
         unavailableEffortName={allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? null}
         focusedVisibleCount={visibleEffortCounts.get(dispatch.effortKey ?? "") ?? 0}
         focusedHasCheckout={[...all.values()].flat().some((row) => row.effortKey === dispatch.effortKey && row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped")}
-        filtersActive={query !== "" || prefs.staleness.length > 0 || prefs.surfaces.length > 0 || prefs.showClones}
+        filtersActive={prefs.approvedOnly || query !== "" || prefs.staleness.length > 0 || prefs.surfaces.length > 0 || prefs.showClones}
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
         dispatchControls={dispatchControls}
@@ -591,7 +596,7 @@ export function InboxBoard({
               {dispatch.mode !== "off" ? <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button> : null}
             </div>
           ) : null}
-          {groups.length === 0 && (!dispatchControls || (completed.merged.length + completed.inReleaseTag.length === 0 && !inventoryOnlyPrs.some((row) => backlogMatches(row, query)))) ? (
+          {groups.length === 0 && (!dispatchControls || (completed.merged.length + completed.inReleaseTag.length === 0 && visibleInventoryPrs.length === 0)) ? (
             <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching work.</p>
           ) : null}
           {groups.map((group) => {
@@ -661,12 +666,12 @@ export function InboxBoard({
                     </ul>
                   )
                 ) : null}
-                {expanded && remoteCount > 0 ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+                {expanded && remoteCount > 0 ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
                 {expanded && completionWithinEffort ? completionCards(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, group.key) : null}
               </section>
             );
           })}
-          {dispatchControls ? <PrBacklog board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+          {dispatchControls ? <PrBacklog onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
           {dispatchControls && !completionWithinEffort ? completionCards(completed, null) : null}
         </div>
       </div>

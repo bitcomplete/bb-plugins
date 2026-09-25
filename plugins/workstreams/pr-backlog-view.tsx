@@ -12,14 +12,17 @@ import { cn } from "@/lib/utils";
 import { Tip } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
+import { matchesApprovedFilter } from "./approval-filter";
 
-export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, embeddedEffortKey, checkoutFiltersActive = false }: {
+export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onCheckout, onStart, onOpenThread, threadsOf, unassignedQuery, embeddedEffortKey, checkoutFiltersActive = false, approvedOnly = false, onClearApproved }: {
   board: Board; locals: Row[]; now: number; width: number;
   /** Embed inventory-only PRs under Efforts without adding another set of controls. */
   unassignedQuery?: string;
   /** When set, render only server-associated siblings under this effort heading. */
   embeddedEffortKey?: string;
   checkoutFiltersActive?: boolean;
+  approvedOnly?: boolean;
+  onClearApproved: () => void;
   onRequest: (request: ActionRequest) => void; onMessage: (row: Row) => void;
   onCheckout: (row: Row) => void; onStart: (row: Row) => void;
   onOpenThread: (id: string) => void; threadsOf: (row: Row) => Row["cluster"]["threads"];
@@ -27,11 +30,10 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
   const rpc = useRpc<typeof rpcContract>();
   const inventory = board.prInventory;
   const [query, setQuery] = useState("");
-  const [approvedOnly, setApprovedOnly] = useState(false);
   const [refreshPending, setRefreshPending] = useState(false);
   const rows = useMemo(() => prBacklog(inventory.entries, locals, now), [inventory.entries, locals, now]);
   const embedded = unassignedQuery !== undefined;
-  const shown = rows.filter((row) => (!embedded || (row.local === null && row.effortKey === embeddedEffortKey)) && (embedded || !approvedOnly || row.pr.reviewDecision === "APPROVED") && backlogMatches(row, unassignedQuery ?? query));
+  const shown = rows.filter((row) => (!embedded || (row.local === null && row.effortKey === embeddedEffortKey)) && matchesApprovedFilter(row.pr, approvedOnly) && backlogMatches(row, unassignedQuery ?? query));
   const approved = rows.filter((row) => row.pr.reviewDecision === "APPROVED").length;
   const ready = rows.filter((row) => row.group === "ready").length;
   const compact = width < 1060;
@@ -48,7 +50,8 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
       const behind = row.action.behind;
       const parent = rows.find((item) => item.repo === row.repo && item.pr.number === behind);
       if (parent !== undefined) {
-        setQuery(""); setApprovedOnly(false);
+        setQuery("");
+        if (!matchesApprovedFilter(parent.pr, approvedOnly)) onClearApproved();
         requestAnimationFrame(() => {
           const target = document.getElementById(`backlog-${parent.pr.url}`) ?? (parent.local === null ? null : document.getElementById(`inbox-${parent.local.key}`));
           if (target !== null) target.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -67,7 +70,6 @@ export function PrBacklog({ board, locals, now, width, onRequest, onMessage, onC
     <>
       {embedded ? null : <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-4 py-2">
         <input aria-label="Search PR backlog" placeholder="Search repo, PR #, title, or effort…" value={query} onChange={(event) => setQuery(event.target.value)} className={cn("h-8 min-w-40 flex-1 rounded-md border border-input bg-background px-2.5 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", tight && "basis-full")} />
-        <button type="button" aria-pressed={approvedOnly} onClick={() => setApprovedOnly((current) => !current)} className={cn("rounded-md border px-2.5 py-1.5 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring", approvedOnly ? "border-ring/50 bg-foreground/[0.08]" : "border-border text-muted-foreground")}>Approved {approved}</button>
         <Button variant="ghost" size="sm" disabled={inventory.refreshing || refreshPending} onClick={() => void refresh()}>{inventory.refreshing || refreshPending ? "Refreshing…" : "Refresh PRs"}</Button>
         <ArchivedThreadsButton />
       </div>}

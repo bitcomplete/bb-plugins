@@ -3,6 +3,7 @@ import { UrlLink, useRpc } from "@get-bb/plugin-sdk/app";
 import type { Board, rpcContract } from "./server";
 import type { EffortPlan } from "./effort-coordinator";
 import type { EstablishedEffort } from "./effort-store";
+import { effortTitle } from "./effort-title";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
@@ -128,7 +129,7 @@ export function EffortCoordinatorControl({ groupKey, name, effort, board, onOpen
             </button>)}
           </div>
           {mode === "new" ? <div className="space-y-1 text-[12px] text-muted-foreground">
-            <p className="font-medium text-foreground">🧭 {effortName.trim() || plan.name}</p>
+            <p className="font-medium text-foreground">{effortTitle(effortName.trim() || plan.name)}</p>
             <p>Uses the selected project's default agent and a separate workspace. The first turn reviews this scope and proposes next actions.</p>
           </div> : <label className="grid gap-1.5 text-[12.5px] font-medium">Existing thread
             <select value={threadId} onChange={(event) => setThreadId(event.target.value)} disabled={busy || projectId === ""}
@@ -136,7 +137,7 @@ export function EffortCoordinatorControl({ groupKey, name, effort, board, onOpen
               <option value="">Choose an idle thread</option>
               {threads.map((thread) => <option key={thread.id} value={thread.id}>{thread.title}</option>)}
             </select>
-            <span className="font-normal text-[11.5px] text-muted-foreground">{projectId !== "" && threads.length === 0 ? "No eligible idle threads in this project." : `Renames this thread to “🧭 ${effortName.trim() || plan.name}” and links it as the coordinator. Existing PR threads keep their current parents.`}</span>
+            <span className="font-normal text-[11.5px] text-muted-foreground">{projectId !== "" && threads.length === 0 ? "No eligible idle threads in this project." : `Renames this thread to “${effortTitle(effortName.trim() || plan.name)}” and links it as the coordinator. Existing PR threads keep their current parents.`}</span>
           </label>}
           {plan.effort?.coordinatorThreadId ? <button type="button" onClick={() => onOpenThread(plan.effort!.coordinatorThreadId!)} className="w-fit rounded text-[12px] text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Open previous effort thread</button> : null}
         </>}

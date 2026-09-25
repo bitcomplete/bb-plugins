@@ -45,7 +45,7 @@ describe("coordinator identity and launch safety", () => {
     expect(sdk.spawn).toHaveBeenCalledTimes(1);
     expect(await service.coordinate({ ...input, threadId: "existing" }, plan)).toMatchObject({ ok: true });
     expect(store.list()).toHaveLength(1);
-    expect(sdk.rename).toHaveBeenCalledWith("existing", "🧭 Improve review");
+    expect(sdk.rename).toHaveBeenCalledWith("existing", "🔍 Improve review");
   });
   it("preserves explicit URL ownership when a title mentions a different effort ticket", () => {
     const { store } = setup();
@@ -61,6 +61,15 @@ describe("coordinator identity and launch safety", () => {
 });
 
 describe("coordinator association guards", () => {
+  it("keeps an already linked coordinator's title when opening its established effort", async () => {
+    const { store, sdk, service } = setup();
+    store.save({ ...store.establish({ sourceKey: input.groupKey, ...input }), coordinatorThreadId: "existing", coordinatorState: "ready" });
+    vi.mocked(sdk.get).mockResolvedValue({ id: "existing", projectId: "proj-1", title: "🧭 Improve review", status: "idle", archivedAt: null, deletedAt: null, canSpawnChild: true });
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: true, effort: { coordinatorThreadId: "existing" } });
+    expect(sdk.rename).not.toHaveBeenCalled();
+    expect(sdk.spawn).not.toHaveBeenCalled();
+  });
+
   it("rejects a stale scope before writing identity or launching anything", async () => {
     const { store, sdk, service } = setup();
     expect(await service.coordinate({ ...input, members: { ...members, tickets: ["ABC-202"] } }, plan)).toMatchObject({ ok: false, error: expect.stringContaining("membership changed") });
@@ -74,7 +83,7 @@ describe("coordinator association guards", () => {
     const args = { ...input, threadId: "existing" };
     expect(await service.coordinate(args, plan)).toMatchObject({ ok: true, effort: { coordinatorThreadId: "existing" } });
     expect(await service.coordinate(args, plan)).toMatchObject({ ok: true, effort: { coordinatorThreadId: "existing" } });
-    expect(sdk.rename).toHaveBeenCalledExactlyOnceWith("existing", "🧭 Improve review");
+    expect(sdk.rename).toHaveBeenCalledExactlyOnceWith("existing", "🔍 Improve review");
     expect(sdk.associate).toHaveBeenCalledExactlyOnceWith("existing", store.list()[0]!.id);
     expect(sdk.spawn).not.toHaveBeenCalled();
     expect(store.list()).toHaveLength(1);

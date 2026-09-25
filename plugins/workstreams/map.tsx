@@ -8,6 +8,7 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { UrlLink, experimental_useSidebarThreads, useBbNavigate } from "@get-bb/plugin-sdk/app";
 import type { Board, Prefs } from "./server";
+import { matchesApprovedFilter } from "./approval-filter";
 import {
   FACES,
   FACE_LABEL,
@@ -28,6 +29,7 @@ import {
   displayTitle,
   isStuck,
   matchesLens,
+  mostUrgent,
   type Lens,
   type Lifecycle,
   type Staleness,
@@ -307,6 +309,8 @@ type Facts = {
   hotCount: number;
   /** Matches the lens: for a group, when anything inside it does. */
   included: boolean;
+  approvedOnly: boolean;
+  unitCount: number;
   full: string;
   short: string;
   block: { width: number; height: number; lines: string[] };
@@ -355,6 +359,7 @@ function untouchedDays(units: readonly Unit[]): number | null {
 function describe(
   circles: readonly MapCircle[],
   lens: Lens,
+  approvedOnly = false,
 ): Map<string, Facts> {
   const fonts = fontFamilies();
   const facts = new Map<string, Facts>();
@@ -365,9 +370,12 @@ function describe(
   // Deepest first, so a parent can read its children's needs.
   for (const circle of [...circles].reverse()) {
     const datum = circle.data;
-    const lifecycle = lifecycleOf(datum);
+    const originalLifecycle = lifecycleOf(datum);
+    let lifecycle = originalLifecycle;
     if (datum.kind === "cluster") {
       const cluster = datum.cluster;
+      const units = stackOrder(cluster.units.filter((unit) => matchesApprovedFilter(unit.pr, approvedOnly)));
+      if (approvedOnly && units.length > 0) lifecycle = mostUrgent(units.map((unit) => unit.lifecycle));
       const ticketWidth = textWidth(cluster.ticket, TYPE.ticket.size, TYPE.ticket.weight, fonts.mono);
       const summary = wrapBlock(
         cluster.summary,
@@ -381,7 +389,6 @@ function describe(
         height: TYPE.ticket.line + summary.height,
         lines: summary.lines,
       };
-      const units = stackOrder(cluster.units);
       const rows = Math.min(units.length, UNIT_LIST_MAX) + (units.length > UNIT_LIST_MAX ? 1 : 0);
       const threadRows =
         cluster.threads.length === 0
@@ -391,12 +398,14 @@ function describe(
       const listNeed = radiusFor(UNIT_LIST_WIDTH, listHeight + TYPE.ticket.line * 2);
       facts.set(circle.key, {
         lifecycle,
-        hot: isHot(lifecycle),
+        hot: (!approvedOnly || units.length > 0) && isHot(lifecycle),
         staleness: cluster.staleness,
-        stuck: isStuck(cluster),
-        untouchedDays: untouchedDays(cluster.units),
+        stuck: (!approvedOnly || units.length > 0) && isStuck({ lifecycle, staleness: cluster.staleness }),
+        untouchedDays: untouchedDays(units),
         hotCount: 0,
-        included: matchesLens(lifecycle, lens),
+        included: (!approvedOnly || units.length > 0) && matchesLens(lifecycle, lens),
+        approvedOnly,
+        unitCount: units.length,
         full: cluster.summary,
         short: cluster.ticket,
         block,
@@ -435,7 +444,9 @@ function describe(
       stuck: false,
       untouchedDays: null,
       hotCount,
-      included: kids.length === 0 ? matchesLens(lifecycle, lens) : kids.some((kid) => kid.facts.included),
+      included: kids.length === 0 ? !approvedOnly && matchesLens(lifecycle, lens) : kids.some((kid) => kid.facts.included),
+      approvedOnly,
+      unitCount: kids.reduce((sum, kid) => sum + kid.facts.unitCount, 0),
       full: group.name,
       short,
       block,
@@ -1266,7 +1277,7 @@ const UnitList = memo(function UnitList({
           {TONE[facts.lifecycle].label}
         </span>
         <span className="font-normal text-muted-foreground">
-          · {facts.units.length} {facts.units.length === 1 ? "checkout" : "checkouts"}
+          · {facts.units.length} {facts.approvedOnly ? "approved " : ""}{facts.units.length === 1 ? "checkout" : "checkouts"}
         </span>
       </p>
       <ul className="flex flex-col">
@@ -1873,14 +1884,14 @@ export function MapView({
   const otherFace: Face = face === "theme" ? "risk" : "theme";
   const layout = layouts[face];
   const circles = useMemo(() => flatten(layout), [layout]);
-  // The map honors the lens only. The Board's staleness and surface filters
-  // have no control here, and an invisible filter is worse than none.
-  const facts = useMemo(() => describe(circles, prefs.lens), [circles, prefs.lens]);
+  // Approval changes emphasis and detail rows, never packing or the view transform.
+  // Checkout staleness and surface filters remain Board-only.
+  const facts = useMemo(() => describe(circles, prefs.lens, prefs.approvedOnly), [circles, prefs.lens, prefs.approvedOnly]);
   // The face a turn would land on, described ahead of time so a turn starts
   // on its first frame rather than after a measuring pass.
   const otherFacts = useMemo(
-    () => describe(flatten(layouts[otherFace]), prefs.lens),
-    [layouts, otherFace, prefs.lens],
+    () => describe(flatten(layouts[otherFace]), prefs.lens, prefs.approvedOnly),
+    [layouts, otherFace, prefs.lens, prefs.approvedOnly],
   );
   const edges = useMemo(
     () =>
@@ -2870,8 +2881,8 @@ export function MapView({
               <p className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                 <span className={cn("size-1.5 rounded-full", PAINT[hoverFacts.lifecycle].dot)} />
                 {hoverCircle.data.kind === "group"
-                  ? `${hoverFacts.hotCount === 0 ? "Nothing needs you" : `${hoverFacts.hotCount} ${hoverFacts.hotCount === 1 ? "needs" : "need"} you`} · ${hoverCircle.data.group.total} checkouts`
-                  : `${TONE[hoverFacts.lifecycle].label} · ${hoverCircle.data.cluster.units.length} ${hoverCircle.data.cluster.units.length === 1 ? "checkout" : "checkouts"}${hoverFacts.stuck ? "" : ` · last commit ${STALE_WORDS[hoverFacts.staleness]}`}`}
+                  ? `${hoverFacts.hotCount === 0 ? "Nothing needs you" : `${hoverFacts.hotCount} ${hoverFacts.hotCount === 1 ? "needs" : "need"} you`} · ${prefs.approvedOnly ? hoverFacts.unitCount : hoverCircle.data.group.total} ${prefs.approvedOnly ? "approved " : ""}checkouts`
+                  : `${TONE[hoverFacts.lifecycle].label} · ${hoverFacts.units.length} ${prefs.approvedOnly ? "approved " : ""}${hoverFacts.units.length === 1 ? "checkout" : "checkouts"}${hoverFacts.stuck ? "" : ` · last commit ${STALE_WORDS[hoverFacts.staleness]}`}`}
               </p>
               {hoverCircle.data.kind === "cluster" && hoverFacts.lifecycle === "shipped" ? (
                 <p className="mt-0.5 text-[11px] text-muted-foreground">

@@ -457,11 +457,18 @@ effort assigned** in Efforts. Approved records a review decision; Ready to merge
 requires checks, threads, branch state, and stack dependencies to clear.
 Direct GitHub actions work on remote PRs; agent repairs need a scanned checkout.
 
+The shared **Approved** filter persists across Map, Efforts, PR backlog, and
+reloads, including approved PRs that still need fixes, checks, or branch work.
+Map dims nonmatches without repacking and counts checkout-backed PRs; Board
+also includes the PR inventory.
+
 **🧭 Coordinate** previews an effort's linked tickets and PRs, editable name and
 goal, and the matching BB projects. Explicit confirmation creates a planning
 thread in a separate worktree using the selected project's default agent, or
-associates an eligible idle thread. An existing thread is renamed to **🧭 <effort name>**
-but keeps its parent; association does not start a turn. The saved
+associates an eligible idle thread. Coordinator titles prefix the effort name
+with a relevant emoji or a stable, varied fallback, preserving an existing leading
+emoji. An explicitly associated thread receives this title but keeps its parent;
+association does not start a turn. The saved
 effort ID preserves the chosen identity and membership across later grouping.
 The heading then opens the effort thread. Team containers and Unsorted do not
 offer this control.

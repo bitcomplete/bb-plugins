@@ -290,6 +290,8 @@ const prefsSchema = z.object({
   face: z.enum(["theme", "risk"]).default("theme"),
   /** The Board's filter: list ticketless default-branch clones under Parked. */
   showClones: z.boolean().default(false),
+  /** Shared display filter for open PRs approved on GitHub. */
+  approvedOnly: z.boolean().default(false),
 });
 
 const pathInput = z.object({ path: z.string().max(1_000) }).strict();
@@ -446,6 +448,7 @@ const DEFAULT_PREFS: Prefs = {
   colorBy: "status",
   face: "theme",
   showClones: false,
+  approvedOnly: false,
 };
 
 export default async function plugin(bb: BbPluginApi) {
