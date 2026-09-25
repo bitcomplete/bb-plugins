@@ -176,10 +176,9 @@ export function InboxBoard({
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
-  const compact = boardWidth < 700;
-  const tablet = boardWidth >= 700 && boardWidth < 1060;
-  const narrowTablet = boardWidth >= 700 && boardWidth < 860;
-  const tight = boardWidth < 420;
+  // Keep a deliberate two-line grid until there is room for every desktop column.
+  const compact = boardWidth < 1060;
+  const tight = boardWidth < 480;
   const [groupBy, setGroupBy] = useState<InboxGrouping>(dispatchControls ? "effort" : "action");
   useEffect(() => setGroupBy(dispatchControls ? "effort" : "action"), [dispatchControls]);
   const [actionOpen, setActionOpen] = useState<Record<InboxSection, boolean>>(() =>
@@ -392,11 +391,11 @@ export function InboxBoard({
 
   const onKey = useCallback(
     (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null || messaging !== null) return;
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null || messaging !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
-        (target.isContentEditable || target.closest("input, textarea, select, [contenteditable]") !== null)
+        (target.isContentEditable || target.closest("input, textarea, select, button, a[href], [contenteditable], [role=dialog], [role=menu], [role=combobox]") !== null)
       ) {
         return;
       }
@@ -466,8 +465,6 @@ export function InboxBoard({
       now={now}
       reviewerColumn={reviewerColumn}
       compact={compact}
-      tablet={tablet}
-      narrowTablet={narrowTablet}
       tight={tight}
       selected={row.key === selected?.key}
       candidate={dispatchControls && groupKey !== null && dispatch.effortKey === groupKey && dispatch.mode !== "off" && dispatch.candidate?.path === row.key ? dispatch.candidate : null}
@@ -509,6 +506,8 @@ export function InboxBoard({
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
         dispatchControls={dispatchControls}
+        compact={compact}
+        tight={boardWidth < 560}
       />
       <AgentsStrip counts={strip} onJump={jumpTo} />
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -907,7 +906,7 @@ function RunChip({ run, ageTip, compact, onOpenThread }: { run: WireRun; ageTip:
   const now = useTick(30_000);
   const label = runLabel(run, now);
   const visibleLabel = compact ? RUN_SHORT_LABEL[run.status] : label;
-  // The run takes the age cell's place, so the age moves into this hover.
+  // Keep the run's detail self-contained when opened from the supporting line.
   const detail = `${label}\n${runDetail(run, (at) => new Date(at).toLocaleString())}\n${ageTip}`;
   const threadId = run.threadId;
   const className = cn(
@@ -952,8 +951,6 @@ function InboxRow({
   now,
   reviewerColumn,
   compact,
-  tablet,
-  narrowTablet,
   tight,
   selected,
   candidate,
@@ -972,8 +969,6 @@ function InboxRow({
   /** Some row on the Board has reviewers: every row keeps the column, so the columns stay aligned. */
   reviewerColumn: boolean;
   compact: boolean;
-  tablet: boolean;
-  narrowTablet: boolean;
   tight: boolean;
   selected: boolean;
   candidate: Board["dispatch"]["candidate"];
@@ -993,12 +988,15 @@ function InboxRow({
   const ageTip = ageHint(displayAge, now);
   const resolvedThreads = unit.pr?.resolvedReviewThreads ?? 0;
   const approvedAfterReview = unit.pr?.reviewDecision === "APPROVED" && unit.pr.unresolvedReviewThreads === 0;
-  const hiddenDetails = tablet ? [
-    ...(narrowTablet && reviewerColumn && reviewersOf(unit.pr).length > 0 ? [`Reviewers: ${reviewersLabel(reviewersOf(unit.pr))}`] : []),
-    ...(narrowTablet && resolvedThreads > 0 ? [`${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved`] : []),
+  const hiddenDetails = compact ? [
+    ...(reviewerColumn && reviewersOf(unit.pr).length > 0 ? [`Reviewers: ${reviewersLabel(reviewersOf(unit.pr))}`] : []),
+    ...(resolvedThreads > 0 ? [`${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved`] : []),
+    ...(unit.observed?.status === false ? ["Working-tree status unavailable; rescan to check local edits"] : []),
+    ...(!showSection ? [`Workstream: ${row.effort}`] : []),
     ...(risk.length > 0 ? [`High risk: ${risk.join(" · ")}`] : []),
     ...(row.cluster.linear?.url != null ? [`Linear: ${row.cluster.linear.url}`] : []),
   ] : [];
+  const portalScope = usePortalScopeProps();
   const titleDetail = [titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear }), ...hiddenDetails].join("\n");
   return (
     <li
@@ -1008,14 +1006,14 @@ function InboxRow({
       aria-description={hiddenDetails.length > 0 ? hiddenDetails.join("; ") : undefined}
       onClick={onSelect}
       className={cn(
-        "group flex min-w-0 cursor-default items-center rounded-md px-2 text-[12.5px]",
-        compact ? "min-h-14 flex-wrap gap-y-1 py-2" : "h-9 gap-3",
+        "group min-w-0 cursor-default items-center rounded-md px-2 text-[12.5px]",
+        compact ? cn("grid gap-x-2 gap-y-1 border-b border-border/40 py-2", tight ? "grid-cols-[minmax(0,1fr)_4rem_3rem]" : "grid-cols-[10.5rem_minmax(0,1fr)_4rem_3rem]") : "flex h-9 gap-3",
         selected ? "bg-foreground/[0.07] ring-1 ring-inset ring-ring/60" : "hover:bg-foreground/[0.035]",
       )}
     >
-      <span className={cn("flex min-w-0 items-center gap-2", compact ? "w-full" : "flex-1", tight && "flex-wrap gap-y-0.5")}>
+      <span className={compact ? "contents" : "flex min-w-0 flex-1 items-center gap-2"}>
         {row.verb === null && !showSection ? null : (
-          <span className={cn("flex shrink-0 items-center gap-1", !compact && (tablet ? "w-[10.5rem]" : "w-[11.5rem]"))}>
+          <span className={cn("flex min-w-0 items-center gap-1", compact ? (tight ? "col-span-2 col-start-1 row-start-2" : "col-start-1 row-start-1") : "w-[11.5rem] shrink-0")}>
             <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
             {unit.lifecycle === "awaiting-rereview" && unit.pr?.mergeStateStatus === "BEHIND" ? (
               <Tip label="The PR branch is behind its base. Update it before merging.">
@@ -1024,7 +1022,7 @@ function InboxRow({
             ) : null}
           </span>
         )}
-        <span className={cn("flex min-w-0 shrink-0 items-center gap-1.5", compact ? "max-w-[11rem]" : "max-w-[11.5rem]")}>
+        <span className={cn("flex min-w-0 items-center gap-1.5", compact ? (tight ? "col-start-1 row-start-1" : "col-start-2 row-start-1") : "max-w-[11.5rem] shrink-0")}>
           <Tip label={row.repo}>
             <span className="min-w-0 max-w-[8rem] truncate font-semibold text-foreground">{row.repo}</span>
           </Tip>
@@ -1040,45 +1038,56 @@ function InboxRow({
             </UrlLink>
           )}
         </span>
-        <Tip label={titleDetail}>
-          <span className={cn("min-w-0 truncate text-foreground/80", tight ? "w-full flex-none" : "flex-1")}>{row.title}</span>
-        </Tip>
-        {candidate !== null ? (
+        {compact ? (
+          <PopoverPrimitive.Root>
+            <PopoverPrimitive.Trigger asChild>
+              <button type="button" aria-label={`Details for ${row.repo}${unit.pr === null ? "" : ` #${unit.pr.number}`}: ${row.title}`} className={cn("min-w-0 truncate text-left text-foreground/80 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring", tight ? "col-span-3 col-start-1 row-start-3" : "col-span-3 col-start-1 row-start-2")}>{row.title}</button>
+            </PopoverPrimitive.Trigger>
+            <PopoverPrimitive.Portal>
+              <PopoverPrimitive.Content {...portalScope} side="bottom" align="start" sideOffset={4} collisionPadding={8} className="z-50 max-w-[min(24rem,calc(100vw-1rem))] whitespace-pre-line break-words rounded-lg border border-border bg-popover p-3 text-[12px] leading-5 text-popover-foreground shadow-md">
+                {titleDetail}
+              </PopoverPrimitive.Content>
+            </PopoverPrimitive.Portal>
+          </PopoverPrimitive.Root>
+        ) : (
+          <Tip label={titleDetail}><span className="min-w-0 flex-1 truncate text-foreground/80">{row.title}</span></Tip>
+        )}
+        {candidate !== null && !compact ? (
           <Tip label={candidate.reason}>
             <span tabIndex={0} aria-label={`Next: ${DISPATCH_ACTION[candidate.action]}. ${candidate.reason}`} className="max-w-full shrink-0 truncate rounded border border-border px-1.5 py-0.5 text-[10.5px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">Next: {DISPATCH_ACTION[candidate.action]}</span>
           </Tip>
         ) : null}
       </span>
-      <span className={cn("flex min-w-0 items-center gap-y-1", compact ? "w-full flex-wrap gap-x-2" : "shrink-0 gap-x-3")}>
-        <span className={cn("flex max-w-full shrink-0 flex-wrap items-center gap-y-1", compact ? "gap-x-2" : tablet ? "gap-x-2" : "gap-x-3")}>
-          {row.run === null ? (
-            <Tip label={ageTip}>
-              <span
-                className={cn(
-                  "w-[4.8rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
-                  displayAge.basis === "pr" ? "text-foreground/80" : "text-muted-foreground/80",
-                )}
-              >
-                {age}
-              </span>
-            </Tip>
-          ) : (
-            <span className={cn("flex min-w-0 shrink-0 items-center", compact || tablet ? "max-w-[8rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
-              <RunChip run={row.run} ageTip={ageTip} compact={compact || tablet} onOpenThread={onOpenThread} />
+      <span className={compact ? "contents" : "flex min-w-0 shrink-0 items-center gap-x-3 gap-y-1"}>
+        <span className={compact ? "contents" : "flex max-w-full shrink-0 flex-wrap items-center gap-x-3 gap-y-1"}>
+          <Tip label={ageTip}>
+            <span
+              className={cn(
+                "shrink-0 text-right font-mono text-[10.5px] tabular-nums",
+                compact ? (tight ? "col-start-2 row-start-1" : "col-start-3 row-start-1") : "w-[4.8rem]",
+                displayAge.basis === "pr" ? "text-foreground/80" : "text-muted-foreground/80",
+              )}
+            >
+              {age}
             </span>
-          )}
-          {resolvedThreads > 0 && !narrowTablet ? (
+          </Tip>
+          {row.run !== null && !compact ? (
+            <span className="flex min-w-0 max-w-[13rem] shrink-0 items-center">
+              <RunChip run={row.run} ageTip={ageTip} compact={false} onOpenThread={onOpenThread} />
+            </span>
+          ) : null}
+          {resolvedThreads > 0 && !compact ? (
             <Tip label={approvedAfterReview
               ? `${resolvedThreads === 1 ? "The review thread is" : `All ${resolvedThreads} review threads are`} resolved; GitHub still marks this PR approved.`
               : `${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved.`}>
               <span tabIndex={0} className="shrink-0 rounded text-[10px] text-muted-foreground/80 outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                {resolvedThreads} {compact ? "resolved" : `${resolvedThreads === 1 ? "thread" : "threads"} resolved`}
+                {resolvedThreads} {resolvedThreads === 1 ? "thread" : "threads"} resolved
               </span>
             </Tip>
           ) : null}
-          {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
-          {reviewerColumn && !narrowTablet ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
-          {risk.length === 0 || tablet ? null : (
+          {unit.observed?.status === false && !compact ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
+          {reviewerColumn && !compact ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
+          {risk.length === 0 || compact ? null : (
             <Tip label="High risk: touches a surface that is hard to undo">
               <span
                 tabIndex={0}
@@ -1090,15 +1099,15 @@ function InboxRow({
             </Tip>
           )}
         </span>
-        <span className={cn("flex max-w-full shrink-0 items-center", compact ? "gap-2" : "gap-3")}>
-          {showSection || tablet ? null : (
+        <span className={cn("flex max-w-full shrink-0 items-center", compact ? (tight ? "col-start-3 row-start-1 justify-end gap-1" : "col-start-4 row-start-1 justify-end gap-1") : "gap-3")}>
+          {showSection || compact ? null : (
             <Tip label={row.effort}>
-              <span className={cn("min-w-0 truncate text-[11.5px] text-muted-foreground/80", compact ? "block max-w-24" : "hidden max-w-32 lg:block")}>
+              <span className="hidden min-w-0 max-w-32 truncate text-[11.5px] text-muted-foreground/80 lg:block">
                 {row.effort}
               </span>
             </Tip>
           )}
-          {row.cluster.linear?.url == null || tablet ? null : (
+          {row.cluster.linear?.url == null || compact ? null : (
             <UrlLink
               href={row.cluster.linear.url}
               onClick={(event) => event.stopPropagation()}
@@ -1125,6 +1134,24 @@ function InboxRow({
           <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />
         </span>
       </span>
+      {compact && row.cluster.linear?.url != null ? (
+        <UrlLink href={row.cluster.linear.url} onClick={(event) => event.stopPropagation()} className={cn("justify-self-end text-[10.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline", tight ? "col-start-3 row-start-2" : "col-start-4 row-start-2")}>Linear</UrlLink>
+      ) : null}
+      {compact && (row.run !== null || resolvedThreads > 0 || candidate !== null) ? (
+        <span className={cn("flex min-w-0 items-center gap-3 overflow-hidden text-[10.5px] text-muted-foreground", tight ? "col-span-3 col-start-1 row-start-4" : "col-span-4 col-start-1 row-start-3")}>
+          {candidate !== null ? (
+            <Tip label={candidate.reason}>
+              <span tabIndex={0} className="min-w-0 truncate font-medium text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">Next: {DISPATCH_ACTION[candidate.action]}</span>
+            </Tip>
+          ) : null}
+          {row.run !== null ? <RunChip run={row.run} ageTip={ageTip} compact onOpenThread={onOpenThread} /> : null}
+          {resolvedThreads > 0 ? (
+            <Tip label={`${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved${approvedAfterReview ? "; GitHub still marks this PR approved" : ""}.`}>
+              <span tabIndex={0} className="min-w-0 truncate outline-none focus-visible:ring-2 focus-visible:ring-ring">{resolvedThreads} resolved{approvedAfterReview ? " · approved" : ""}</span>
+            </Tip>
+          ) : null}
+        </span>
+      ) : null}
     </li>
   );
 }
@@ -1231,6 +1258,8 @@ function InboxHeader({
   onFocusEffort,
   onDispatchMode,
   dispatchControls,
+  compact,
+  tight,
 }: {
   searchRef: React.RefObject<HTMLInputElement | null>;
   query: string;
@@ -1252,6 +1281,8 @@ function InboxHeader({
   onFocusEffort: (key: string | null) => void;
   onDispatchMode: (mode: Board["dispatch"]["mode"]) => void;
   dispatchControls: boolean;
+  compact: boolean;
+  tight: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -1270,7 +1301,7 @@ function InboxHeader({
   return (
     <div className="shrink-0 border-b border-border/60">
       <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-2 px-4 py-2">
-        <label className="flex h-8 min-w-40 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 focus-within:ring-2 focus-within:ring-ring">
+        <label className={cn("flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 focus-within:ring-2 focus-within:ring-ring", tight && !dispatchControls && "basis-full")}>
           <Icon name="Search" className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             ref={searchRef}
@@ -1361,10 +1392,10 @@ function InboxHeader({
         </div>
       </div>
       {dispatchControls ? (
-        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]">
-          <span className="shrink-0 font-semibold text-foreground">Board v2 · Agent actions</span>
-          <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
-            <span id="workstream-chooser-label">Workstream</span>
+        <div className={cn("mx-auto w-full max-w-6xl items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]", compact ? (tight ? "grid grid-cols-[minmax(0,1fr)_auto]" : "grid grid-cols-[minmax(0,1fr)_auto_auto]") : "flex flex-wrap")}>
+          <span className={cn("shrink-0 font-semibold text-foreground", compact && "sr-only")}>Board v2 · Agent actions</span>
+          <div className={cn("flex min-w-0 items-center gap-1.5 text-muted-foreground", compact && tight && "col-span-2")}>
+            <span id="workstream-chooser-label" className={compact ? "sr-only" : undefined}>Workstream</span>
             <SelectPrimitive.Root
               value={dispatch.effortKey ?? "__none__"}
               onValueChange={(value) => onFocusEffort(value === "__none__" ? null : value)}
@@ -1372,7 +1403,7 @@ function InboxHeader({
             >
               <SelectPrimitive.Trigger
                 aria-labelledby="workstream-chooser-label"
-                className="flex h-10 w-64 max-w-[min(19rem,60vw)] min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 text-left text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                className={cn("flex h-10 min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 text-left text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50", compact ? "w-full" : "w-64 max-w-[min(19rem,60vw)]")}
               >
                 <span className="flex min-w-0 flex-1 flex-col items-start leading-tight">
                   <span className="w-full truncate font-medium" title={focused ?? undefined}>{focused ?? "Choose workstream"}</span>
@@ -1411,7 +1442,7 @@ function InboxHeader({
               </SelectPrimitive.Portal>
             </SelectPrimitive.Root>
           </div>
-          <div role="group" aria-label="Agent action mode" className="flex shrink-0 items-center gap-1 rounded-md border border-border p-0.5">
+          <div role="group" aria-label="Agent action mode" className={cn("flex shrink-0 items-center gap-1 rounded-md border border-border p-0.5", compact && "justify-self-start")}>
             {(["off", "shadow"] as const).map((mode) => (
               <button
                 key={mode}
@@ -1441,7 +1472,7 @@ function InboxHeader({
           >
             {dispatch.mode === "auto" ? "Running automatically" : "Run automatically"}
           </button>
-          <span className="min-w-0 text-muted-foreground">
+          <span className={cn("min-w-0 text-muted-foreground", compact && (tight ? "col-span-2" : "col-span-3"))}>
             {dispatch.mode === "auto"
               ? "One agent at a time. Agents ask before pushing or replying. No automatic merges."
               : dispatch.mode === "shadow"
@@ -1449,7 +1480,7 @@ function InboxHeader({
                 : dispatch.effortKey === null ? "Off. Choose a workstream to preview the next action." : "Off. Select Preview only to see the next agent action."}
           </span>
           {focusedAttention !== undefined ? (
-            <p className="min-w-0 basis-full text-[11.5px] text-muted-foreground" aria-live="polite">
+            <p className={cn("min-w-0 basis-full text-[11.5px] text-muted-foreground", compact && (tight ? "col-span-2" : "col-span-3"))} aria-live="polite">
               <span className="font-medium text-foreground">{focusedAttention.name} · What moves next across all checkouts:</span>{" "}
               {attentionDetail(focusedAttention)}
               {filtersActive ? ` ${focusedVisibleCount} match the current view.` : null}
