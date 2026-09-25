@@ -94,6 +94,7 @@ import {
 import { startThread } from "./spawn.js";
 import { AGENT_ACTIONS, MERGE_METHODS, mergeVerdict, shouldDeleteBranch, type DirectAction, type MergeMethod } from "./actions.js";
 import { planAgent, runAgent, type AgentSdk } from "./agent.js";
+import { sendRowMessage } from "./threadmessage.js";
 import { executeMerge, type WriteResult } from "./direct.js";
 import { prTarget } from "./ghactions.js";
 import { trackTransitions, toLifecycle, unitLifecycle, type Transition } from "./workstreams.js";
@@ -388,6 +389,14 @@ export const rpcContract = defineRpcContract({
     input: z.object({ path: z.string().max(1_000), prompt: z.string().max(8_000) }).strict(),
     output: z.discriminatedUnion("ok", [
       z.object({ ok: z.literal(true), threadId: z.string(), ticket: z.string() }),
+      z.object({ ok: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Send one user-authored instruction to one thread currently linked to this PR row. */
+  thread_message: {
+    input: z.object({ path: z.string().max(1_000), prUrl: z.string().max(500), threadId: z.string().max(200), message: z.string().max(4_000) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), delivery: z.enum(["sent", "queued"]) }),
       z.object({ ok: z.literal(false), error: z.string() }),
     ]),
   },
@@ -2082,9 +2091,14 @@ export default async function plugin(bb: BbPluginApi) {
     if (found === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
     const { raw } = found;
     if (raw.pr === null || raw.pr.state !== "OPEN") return { ok: false, error: raw.observed?.pr === false ? "Pull request status is unavailable. Rescan before acting." : "This row has no open pull request." };
+    if (raw.rebasing) return { ok: false, error: "A rebase is in progress in this checkout. Finish it and rescan before a direct PR action." };
     if (prTarget(raw.pr.url) === null) return { ok: false, error: "The pull request URL from the last scan is not one gh can act on." };
     const hostId = (await bb.sdk.system.config()).primaryHostId;
     if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh from." };
+    const local = await host.call("checkoutState", { path }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+    if (!local.ok) return { ok: false, error: `${local.error} Rescan before acting.` };
+    if (local.rebasing) return { ok: false, error: "A rebase is in progress in this checkout. Finish it and rescan before a direct PR action." };
+    if (local.branch === null || local.branch !== raw.branch) return { ok: false, error: "The checkout branch changed since the last scan. Rescan before acting." };
     return { ok: true, raw, prUrl: raw.pr.url, hostId };
   }
 
@@ -2324,6 +2338,25 @@ export default async function plugin(bb: BbPluginApi) {
         announceThreads();
       }
       return result;
+    },
+    thread_message: async ({ path, prUrl, threadId, message }) => {
+      const found = await scannedUnit(path);
+      if (found === undefined) return { ok: false as const, error: "That checkout is no longer on the board. Refresh and try again." };
+      const pr = found.raw.pr;
+      if (pr === null || pr.state !== "OPEN") return { ok: false as const, error: "This row no longer has an open pull request." };
+      if (pr.url !== prUrl) return { ok: false as const, error: "This checkout now points to a different pull request. Refresh the board before sending." };
+      return sendRowMessage(
+        {
+          get: ({ threadId: id }) => bb.sdk.threads.get({ threadId: id }),
+          send: (args) => bb.sdk.threads.send(args),
+        },
+        {
+          threadId,
+          message,
+          links: await linkedThreads(path),
+          pr: { repo: found.raw.repo ?? found.raw.dirName, number: pr.number, title: pr.title, url: pr.url, checkout: path },
+        },
+      );
     },
     action_merge_preview: async ({ path }) => {
       const target = await actionable(path);

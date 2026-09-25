@@ -9,6 +9,33 @@ import type { Row } from "./inbox.js";
 export type InboxGrouping = "action" | "effort";
 export type RowGroup = { key: string; label: string; rows: Row[]; section: InboxSection | null };
 
+/** Board v2 keeps completed checkouts out of the action and effort lists. */
+export function partitionCompletedRows(sections: Map<InboxSection, Row[]>): {
+  active: Map<InboxSection, Row[]>;
+  merged: Row[];
+  inReleaseTag: Row[];
+} {
+  const active = new Map<InboxSection, Row[]>();
+  const merged: Row[] = [];
+  const inReleaseTag: Row[] = [];
+  for (const [section, rows] of sections) {
+    active.set(section, rows.filter((row) => {
+      if (row.unit.lifecycle === "merged") { merged.push(row); return false; }
+      if (row.unit.lifecycle === "shipped") { inReleaseTag.push(row); return false; }
+      return true;
+    }));
+  }
+  return { active, merged, inReleaseTag };
+}
+
+/** Folded completion cards do not participate in keyboard row navigation. */
+export function visibleCompletedRows(
+  completed: Pick<ReturnType<typeof partitionCompletedRows>, "merged" | "inReleaseTag">,
+  open: { merged: boolean; inReleaseTag: boolean },
+): Row[] {
+  return [...(open.merged ? completed.merged : []), ...(open.inReleaseTag ? completed.inReleaseTag : [])];
+}
+
 /** Keep action order inside each effort; use the stable group key to distinguish duplicate names. */
 export function groupInboxRows(sections: Map<InboxSection, Row[]>, by: InboxGrouping): RowGroup[] {
   if (by === "action") {

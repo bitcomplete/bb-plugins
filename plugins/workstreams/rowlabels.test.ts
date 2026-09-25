@@ -1,28 +1,28 @@
-// What a Board row displays. The short forms exist to free width for the
-// title, so each must stay unambiguous, and the full wording must survive in
-// the hover rather than disappear.
+// What a Board row displays. Status labels must distinguish current approval
+// from feedback and waiting; the full action wording survives in the hover.
 import { describe, expect, it } from "vitest";
-import { ageHint, primaryHint, shortAge, shortVerb, titleHint } from "./rowlabels.js";
+import { ageHint, primaryHint, rowAge, shortAge, shortVerb, titleHint } from "./rowlabels.js";
 
 const NOW = Date.UTC(2030, 0, 10, 12);
 const HOUR = 3_600_000;
 
 describe("shortVerb", () => {
-  it("shortens the long verbs so the verb column can shrink, and passes short ones through", () => {
+  it("shows review state before the next action, and shortens unrelated long verbs", () => {
     expect(shortVerb("Resolve conflicts")).toBe("Conflicts");
-    expect(shortVerb("Changes requested")).toBe("Changes req.");
-    expect(shortVerb("Approved, comments open")).toBe("Comments");
-    expect(shortVerb("Ready to merge")).toBe("Ready");
+    expect(shortVerb("Approved, comments open")).toBe("Approved · open threads");
+    expect(shortVerb("Review approval note")).toBe("Approved · review note");
+    expect(shortVerb("Ready to merge")).toBe("Approved · ready");
+    expect(shortVerb("In review")).toBe("Waiting for review");
     expect(shortVerb("Blocked by branch rules")).toBe("Rules block");
     expect(shortVerb("Checking mergeability")).toBe("Checking");
-    for (const verb of ["CI failing", "Update branch", "In review", "Behind #42", "Editing", "In progress"]) {
+    for (const verb of ["CI failing", "Update branch", "Changes requested", "Behind #42", "Editing", "In progress"]) {
       expect(shortVerb(verb)).toBe(verb);
     }
   });
 
-  it("keeps every short label distinct, because two sections showing the same word would be ambiguous", () => {
+  it("keeps every display label distinct, because two states sharing a label would be ambiguous", () => {
     const full = [
-      "CI failing", "Resolve conflicts", "Changes requested", "Approved, comments open", "Ready to merge",
+      "CI failing", "Resolve conflicts", "Changes requested", "Approved, comments open", "Review approval note", "Ready to merge",
       "Update branch", "In review", "Blocked by branch rules", "Checking mergeability", "Editing", "In progress",
     ];
     expect(new Set(full.map(shortVerb)).size).toBe(full.length);
@@ -40,21 +40,23 @@ describe("primaryHint", () => {
 });
 
 describe("age", () => {
-  it("shows the bare unit on the row and the meaning in the hover", () => {
-    const age = { since: NOW - 3 * 24 * HOUR, basis: "state" as const };
+  it("dates a PR from GitHub's open time, regardless of a newer commit", () => {
+    const age = rowAge({ createdAt: new Date(NOW - 3 * 24 * HOUR).toISOString() }, new Date(NOW - HOUR).toISOString());
     expect(shortAge(age, NOW)).toBe("3d");
-    expect(ageHint(age, "CI failing", NOW)).toBe("CI failing for 3d");
+    expect(ageHint(age, NOW)).toBe("PR opened 3d ago");
   });
 
-  it("says when the age is only the last commit, so a quiet branch is not read as time in its state", () => {
-    const age = { since: NOW - 23 * HOUR, basis: "last-commit" as const };
-    expect(shortAge(age, NOW)).toBe("23h");
-    expect(ageHint(age, "In review", NOW)).toBe("No state change seen yet: last commit 23h ago");
+  it("labels the last-commit fallback on a checkout without a PR", () => {
+    const age = rowAge(null, new Date(NOW - 23 * HOUR).toISOString());
+    expect(shortAge(age, NOW)).toBe("commit 23h");
+    expect(ageHint(age, NOW)).toBe("Last commit 23h ago");
   });
 
-  it("shows nothing for an unknown age rather than inventing one", () => {
-    expect(shortAge({ since: null, basis: "last-commit" }, NOW)).toBe("");
-    expect(ageHint({ since: null, basis: "last-commit" }, null, NOW)).toBe("No commit date");
+  it("does not substitute a commit time for a PR in an older scan without createdAt", () => {
+    const age = rowAge({}, new Date(NOW - HOUR).toISOString());
+    expect(shortAge(age, NOW)).toBe("");
+    expect(ageHint(age, NOW)).toBe("PR open date unavailable");
+    expect(ageHint(rowAge(null, null), NOW)).toBe("No commit date");
   });
 });
 

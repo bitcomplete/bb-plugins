@@ -190,6 +190,7 @@ const AGENT_DOING: Record<string, string> = {
   "investigate-ci": "investigating CI",
   "address-review": "addressing review",
   "address-comments": "addressing comments",
+  "review-approval-note": "reviewing approval note",
   "linear-fetch": "fetching Linear details",
 };
 

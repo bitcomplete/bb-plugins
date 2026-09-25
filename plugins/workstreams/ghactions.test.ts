@@ -102,7 +102,7 @@ describe("parseReviewRequests", () => {
 describe("readLiveMerge", () => {
   const view = { state: "OPEN", isDraft: false, reviewDecision: "APPROVED", mergeStateStatus: "CLEAN", headRefOid: SHA, headRefName: "dev/abc-101" };
   const threads = (nodes: { isResolved: boolean }[], hasNextPage = false) =>
-    JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage }, nodes } } } } });
+    JSON.stringify({ data: { repository: { pullRequest: { reviews: { pageInfo: { hasPreviousPage: false }, nodes: [] }, reviewThreads: { pageInfo: { hasNextPage }, nodes } } } } });
   const answers = (stacked: object[], nodes: { isResolved: boolean }[], more = false) => (args: readonly string[]): Run => {
     if (args[1] === "view") return { ok: true, stdout: JSON.stringify(view) };
     if (args[1] === "list") return { ok: true, stdout: JSON.stringify(stacked) };
@@ -123,6 +123,9 @@ describe("readLiveMerge", () => {
         stackedAbove: [58],
         unresolvedThreads: 2,
         unresolvedAtLeast: false,
+        approvalNotes: [],
+        approvalNotesMore: 0,
+        approvalNotesComplete: true,
       },
     });
     expect(calls.find((call) => call.args[1] === "list")?.args).toEqual([
@@ -141,9 +144,126 @@ describe("readLiveMerge", () => {
     const { run } = fakeGh((args) => (args[0] === "api" ? { ok: false, error: "HTTP 502" } : answers([], [])(args)));
     expect(await readLiveMerge(run, TARGET)).toEqual({ ok: false, error: "Could not count unresolved review threads: HTTP 502" });
   });
+
+  it("shows a mixed approval note even after its inline thread is resolved and code moves on", async () => {
+    const body = "The inline change is good. Also update the member-facing copy before merge.";
+    const run = fakeGh((args) => {
+      if (args[1] === "view") return { ok: true, stdout: JSON.stringify(view) };
+      if (args[1] === "list") return { ok: true, stdout: "[]" };
+      return { ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: {
+        headRefOid: SHA,
+        reviews: { pageInfo: { hasPreviousPage: false }, nodes: [{
+          id: "approval-1", state: "APPROVED", body, submittedAt: "2026-09-22T18:11:52Z",
+          author: { login: "reviewer" }, commit: { oid: "a".repeat(40) },
+        }] },
+        reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [{ isResolved: true, comments: { nodes: [{ pullRequestReview: { id: "approval-1" } }] } }] },
+      } } } }) };
+    });
+    const result = await readLiveMerge(run.run, TARGET);
+    expect(result).toMatchObject({ ok: true, live: {
+      unresolvedThreads: 0,
+      approvalNotes: [{ author: "reviewer", body, truncated: false }],
+      approvalNotesMore: 0,
+    } });
+  });
+
+  it("warns when approval history is incomplete, while keeping merge preflight available", async () => {
+    const run = fakeGh((args) => args[0] === "api"
+      ? { ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: {
+        reviews: { pageInfo: { hasPreviousPage: true }, nodes: [{
+          state: "APPROVED", body: "Newest request is still visible.", author: { login: "reviewer" },
+          submittedAt: "2026-09-24T12:00:00Z",
+        }] },
+        reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+      } } } }) }
+      : answers([], [])(args));
+    expect(await readLiveMerge(run.run, TARGET)).toMatchObject({ ok: true, live: {
+      approvalNotes: [{ body: "Newest request is still visible." }], approvalNotesComplete: false,
+    } });
+  });
+
+  it("bounds long approval bodies and reports omitted older notes", async () => {
+    const run = fakeGh((args) => args[0] === "api"
+      ? { ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: {
+        reviews: { pageInfo: { hasPreviousPage: false }, nodes: Array.from({ length: 4 }, (_, index) => ({
+          state: "APPROVED", body: "x".repeat(2_000), author: { login: `reviewer-${index}` },
+          submittedAt: `2026-09-2${index}T12:00:00Z`,
+        })) },
+        reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+      } } } }) }
+      : answers([], [])(args));
+    const result = await readLiveMerge(run.run, TARGET);
+    expect(result.ok && result.live.approvalNotes).toHaveLength(3);
+    expect(result.ok && result.live.approvalNotes[0]?.body).toHaveLength(1_200);
+    expect(result.ok && result.live.approvalNotes[0]?.truncated).toBe(true);
+    expect(result.ok && result.live.approvalNotesMore).toBe(1);
+  });
 });
 
 describe("readReviewThreads", () => {
+  it("recognizes #1098-style author PTAL only after newer code and all review threads are resolved", async () => {
+    const review = { id: "requested-1098", state: "CHANGES_REQUESTED", body: "", author: { login: "shehabPH" }, submittedAt: "2026-09-18T17:49:34Z", commit: { oid: "a".repeat(40) } };
+    const resolved = { isResolved: true, comments: { nodes: [{ pullRequestReview: { id: review.id } }] } };
+    const pr = {
+      headRefOid: "b".repeat(40), author: { login: "mjsz" },
+      reviews: { pageInfo: { hasPreviousPage: false }, nodes: [review] },
+      reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [resolved] },
+      comments: { nodes: [{ author: { login: "mjsz" }, createdAt: "2026-09-25T02:00:23Z", body: "PTAL @shehabPH — the fixes are pushed." }] },
+      commits: { nodes: [{ commit: { oid: "b".repeat(40), committedDate: "2026-09-23T00:11:46Z" } }] },
+    };
+    const read = (value: unknown) => readReviewThreads(fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: value } } }) })).run, TARGET, true);
+    expect(await read(pr)).toMatchObject({ ok: true, count: 0, reviewFollowupPosted: true });
+    expect(await read({ ...pr, reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [{ ...resolved, isResolved: false }] } })).toMatchObject({ ok: true, count: 1 });
+    expect(await read({ ...pr, comments: { nodes: [{ author: { login: "mjsz" }, createdAt: "2026-09-25T02:00:23Z", body: "Fixes pushed." }] } })).toMatchObject({ ok: true, reviewFollowupPosted: false });
+    expect(await read({ ...pr, commits: { nodes: [{ commit: { oid: pr.headRefOid, committedDate: "2026-09-26T00:00:00Z" } }] } })).toMatchObject({ ok: true, reviewFollowupPosted: false });
+    expect(await read({ ...pr, commits: { nodes: [{ commit: { oid: pr.headRefOid, committedDate: "2026-09-18T16:00:00Z" } }] } })).toMatchObject({ ok: true, reviewFollowupPosted: false });
+    expect(await read({ ...pr, comments: { nodes: [{ author: { login: "other" }, createdAt: "2026-09-25T02:00:23Z", body: "PTAL @shehabPH" }] } })).toMatchObject({ ok: true, reviewFollowupPosted: false });
+  });
+  it("treats #2846-style approval text as followed up when its own threads resolve on a later head", async () => {
+    const approval = { id: "approval-2846", state: "APPROVED", body: "Two member-facing points to fix before merge.", author: { login: "reviewer" }, submittedAt: "2026-09-22T18:11:52Z", commit: { oid: "a".repeat(40) } };
+    const pullRequest = {
+      headRefOid: "b".repeat(40),
+      reviews: { pageInfo: { hasPreviousPage: false }, nodes: [approval] },
+      reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [
+        { isResolved: true, comments: { nodes: [{ pullRequestReview: { id: approval.id } }] } },
+        { isResolved: true, comments: { nodes: [{ pullRequestReview: { id: approval.id } }] } },
+      ] },
+    };
+    const read = (pr: unknown) => readReviewThreads(fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: pr } } }) })).run, TARGET);
+    expect(await read(pullRequest)).toMatchObject({ ok: true, count: 0, resolvedCount: 2, approvalNoteFollowedUp: true });
+    expect(await read({ ...pullRequest, headRefOid: approval.commit.oid })).toMatchObject({ ok: true, approvalNoteFollowedUp: false });
+    expect(await read({ ...pullRequest, reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } })).toMatchObject({ ok: true, approvalNoteFollowedUp: false });
+    const laterEmpty = { id: "approval-later", state: "APPROVED", body: "", author: { login: "reviewer" }, submittedAt: "2026-09-24T13:00:00Z", commit: { oid: "b".repeat(40) } };
+    expect(await read({ ...pullRequest, reviews: { pageInfo: { hasPreviousPage: false }, nodes: [approval, laterEmpty] } })).not.toHaveProperty("approvalNoteFollowedUp");
+  });
+
+  it("keeps #988-style standalone approval text actionable when there are no inline threads", async () => {
+    const head = "c".repeat(40);
+    const pr = { headRefOid: head, reviews: { pageInfo: { hasPreviousPage: false }, nodes: [{ id: "approval-988", state: "APPROVED", body: "Dependent name/DOB mismatch needs review.", author: { login: "reviewer" }, submittedAt: "2026-09-24T23:31:34Z", commit: { oid: head } }] }, reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } };
+    const run = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: pr } } }) }));
+    expect(await readReviewThreads(run.run, TARGET)).toMatchObject({ ok: true, count: 0, approvalNoteFollowedUp: false });
+  });
+
+  it("clears a standalone approval note only after a targeted author reply tied to the pushed head", async () => {
+    const head = "b".repeat(40);
+    const review = { id: "approval-988", state: "APPROVED", body: "Please fix the dependent name/DOB mismatch.", author: { login: "adriana" }, submittedAt: "2026-09-24T23:31:34Z", commit: { oid: "a".repeat(40) } };
+    const pr = {
+      headRefOid: head, author: { login: "author" },
+      reviews: { pageInfo: { hasPreviousPage: false }, nodes: [review] },
+      reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+      commits: { nodes: [{ commit: { oid: head, committedDate: "2026-09-25T01:00:00Z" } }] },
+      comments: { nodes: [{ author: { login: "author" }, createdAt: "2026-09-25T02:00:00Z", body: `Approval note for @adriana: fixed the dependent mismatch at ${head.slice(0, 7)}.` }] },
+    };
+    const read = (value: unknown) => readReviewThreads(fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: value } } }) })).run, TARGET, true);
+    expect(await read(pr)).toMatchObject({ ok: true, count: 0, approvalNoteFollowedUp: true });
+    expect(await read({ ...pr, headRefOid: review.commit.oid,
+      commits: { nodes: [{ commit: { oid: review.commit.oid, committedDate: "2026-09-24T20:00:00Z" } }] },
+      comments: { nodes: [{ ...pr.comments.nodes[0], body: `Approval note for @adriana: informational; no code change needed at ${review.commit.oid.slice(0, 7)}.` }] },
+    })).toMatchObject({ ok: true, approvalNoteFollowedUp: true });
+    expect(await read({ ...pr, comments: { nodes: [{ ...pr.comments.nodes[0], body: "PTAL @adriana; fixes pushed." }] } })).toMatchObject({ ok: true, approvalNoteFollowedUp: false });
+    expect(await read({ ...pr, comments: { nodes: [{ ...pr.comments.nodes[0], body: `Approval note for @adriana: fixed at ${"c".repeat(7)}.` }] } })).toMatchObject({ ok: true, approvalNoteFollowedUp: false });
+    expect(await read({ ...pr, comments: { nodes: [{ ...pr.comments.nodes[0], createdAt: "2026-09-24T23:00:00Z" }] } })).toMatchObject({ ok: true, approvalNoteFollowedUp: false });
+  });
   it("counts resolved history only for a complete page, separately from open threads", async () => {
     const resolved = fakeGh(() => ({ ok: true, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: Array.from({ length: 8 }, () => ({ isResolved: true })) } } } } }) }));
     expect(await readReviewThreads(resolved.run, TARGET)).toEqual({ ok: true, count: 0, resolvedCount: 8, hasNextPage: false });

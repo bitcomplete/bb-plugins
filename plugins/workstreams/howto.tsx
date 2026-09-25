@@ -58,14 +58,16 @@ const BOTH_KEYS: [string, string][] = [
 const STATES: [string, string][] = [
   ["Fix · CI failing", "A check failed. Investigate CI hands it to an agent."],
   ["Fix · Resolve conflicts", "GitHub reports a merge conflict with the base."],
-  ["Respond · Changes requested", "A reviewer asked for changes; the ball is with you."],
-  ["Respond · Approved, comments open", "Approved, with unresolved review threads on GitHub."],
+  ["Respond · Changes requested", "A reviewer requested changes. Approval is not in effect."],
+  ["Waiting · Awaiting re-review", "The author pushed a newer head, resolved review threads, and posted PTAL to the reviewer. GitHub still reports changes requested; a branch may also need updating."],
+  ["Respond · Approved · open threads", "Approved, with unresolved review threads on GitHub."],
+  ["Respond · Approved · review note", "The approving review has written notes that may need action. Read them and decide what to do."],
   [
-    "Merge · Ready to merge",
+    "Merge · Approved · ready",
     "Approved; no unresolved review threads; every check finished and green; GitHub mergeStateStatus CLEAN (or HAS_HOOKS, or UNSTABLE for non-required checks); not stacked behind an unmerged PR.",
   ],
   ["Merge · Update branch", "Ready except the branch is behind its base."],
-  ["Waiting · In review", "Nobody has decided yet. Nudge reviewers is one click away."],
+  ["Waiting · Waiting for review", "Nobody has decided yet. Nudge reviewers is one click away."],
   ["Waiting · Behind #N", "Stacked on an unmerged PR, which has to merge first."],
   ["Waiting · Blocked by branch rules", "Branch protection is unsatisfied; clicking merge would not help."],
   ["Waiting · Status unavailable", "A local status check or GitHub PR lookup failed. Rescan to verify this checkout; no PR action is offered."],
@@ -122,18 +124,24 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
 
       <Section title="What the states mean">
         <p>
-          Board starts grouped by Action; Board v2 starts grouped by Effort and adds dispatch controls. Both let you
-          switch grouping, keep urgent work first within each group, and offer the same
-          row actions. Action groups include {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
+          Board starts grouped by Action and lets you switch to Effort. Board v2 groups by Workstream.
+          Both keep urgent work first within each group and offer the same row actions.
+          Action groups include {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
           {INBOX_SECTION_LABEL.merge} and {INBOX_SECTION_LABEL.waiting}; in-flight, recently merged, and parked work
-          starts folded. The internal &ldquo;shipped&rdquo; state means a merge commit appears in a local release tag;
+          starts folded. &ldquo;In release tag&rdquo; means the merge commit appears in a local release tag;
           it does not verify a production deployment.
+        </p>
+        <p>
+          On Board v2, choose a workstream from the dropdown or its heading. The board scrolls to that workstream
+          and previews the next agent action on its pull request row. Preview only does not start an agent.
+          Run automatically starts at most one repair agent at a time.
         </p>
         <Pairs rows={STATES} />
       </Section>
 
       <Section title="Keyboard shortcuts">
         <p className="text-foreground">Board and Board v2</p>
+        <p className="text-muted-foreground">Search accepts ticket IDs, titles, repos, workstreams, and PR numbers such as 2846, #2846, or my-parsley #2846.</p>
         <Pairs rows={BOARD_KEYS} mono />
         <p className="pt-1 text-foreground">Map</p>
         <Pairs rows={MAP_KEYS} mono />

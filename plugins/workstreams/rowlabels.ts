@@ -1,15 +1,16 @@
 // The words a Board row displays, as opposed to the words its rules use. The
 // verbs from `inboxVerb` stay full length (the actions, tests and How-this-works
-// panel read them); the row shows a short form and spells the full one out on
-// hover. Pure, so it is tested apart from the React that draws it.
+// panel read them); the row shows the current state clearly and spells out
+// the action on hover. Pure, so it is tested apart from the React that draws it.
 import type { PrimaryAction } from "./actions.js";
-import { compactAge, type StateAge } from "./workstreams.js";
+import { compactAge } from "./workstreams.js";
 
 const SHORT_VERB: Record<string, string> = {
   "Resolve conflicts": "Conflicts",
-  "Changes requested": "Changes req.",
-  "Approved, comments open": "Comments",
-  "Ready to merge": "Ready",
+  "Approved, comments open": "Approved · open threads",
+  "Review approval note": "Approved · review note",
+  "Ready to merge": "Approved · ready",
+  "In review": "Waiting for review",
   "Blocked by branch rules": "Rules block",
   "Checking mergeability": "Checking",
 };
@@ -32,17 +33,27 @@ export function primaryHint(verb: string, action: PrimaryAction): string {
   return `${verb}: ${does} (a)`;
 }
 
-/** The compact age the row shows: "4d", "23h", or nothing when it is unknown. */
-export function shortAge(age: StateAge, now: number): string {
-  return age.since === null ? "" : compactAge(age.since, now);
+export type RowAge = { since: number | null; basis: "pr" | "last-commit" };
+
+/** PR rows show GitHub's open time; local checkouts use their last commit. */
+export function rowAge(pr: { createdAt?: string | null } | null, lastCommitAt: string | null): RowAge {
+  const date = pr === null ? lastCommitAt : pr.createdAt;
+  const parsed = date === null || date === undefined ? NaN : Date.parse(date);
+  return { since: Number.isNaN(parsed) ? null : parsed, basis: pr === null ? "last-commit" : "pr" };
 }
 
-/** The age's hover, in words: "CI failing for 3d", or "last commit 4d ago" when no state change was seen. */
-export function ageHint(age: StateAge, verb: string | null, now: number): string {
-  if (age.since === null) return age.basis === "state" ? "Time in this state is unknown" : "No commit date";
+/** The compact age keeps the last-commit fallback explicit on the row. */
+export function shortAge(age: RowAge, now: number): string {
+  if (age.since === null) return "";
   const text = compactAge(age.since, now);
-  if (age.basis === "last-commit") return `No state change seen yet: last commit ${text} ago`;
-  return verb === null ? `In this state for ${text}` : `${verb} for ${text}`;
+  return age.basis === "pr" ? text : `commit ${text}`;
+}
+
+/** Explain what the age measures, including unavailable dates. */
+export function ageHint(age: RowAge, now: number): string {
+  if (age.since === null) return age.basis === "pr" ? "PR open date unavailable" : "No commit date";
+  const text = compactAge(age.since, now);
+  return age.basis === "pr" ? `PR opened ${text} ago` : `Last commit ${text} ago`;
 }
 
 /** The title's hover: the PR's full original title, then where it lives. */

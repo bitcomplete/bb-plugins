@@ -59,18 +59,25 @@ via agent** action starts a BB thread only when you confirm it.
 - **Board:** Group rows by Action (the default) or Effort. Both views keep
   urgent work first within each group and offer the same row actions. Direct
   merge, branch update, and reviewer nudge actions ask for confirmation. CI,
-  conflict, and review work starts a dedicated agent thread after you review
-  its prompt.
-- **Board v2:** Start with rows grouped by Effort. Choose one effort, use
-  **Shadow preview** to see
-  the next eligible PR repair, then explicitly enable **Auto**. Auto starts one
-  agent at a time for failing CI, merge conflicts, or review feedback. The
-  agent works locally and is instructed to ask before pushing or replying on
-  GitHub. Workstreams checks the PR again before it calls a transition
+  conflict, and review work shows the planned steps before you start a
+  dedicated agent thread. You can expand and edit its instructions.
+  After the author pushes a newer head, resolves review threads, and posts a
+  directed PTAL, the row reads **Awaiting re-review** while GitHub still reports
+  changes requested. Workstreams does not send another PTAL or reviewer nudge.
+- **Board v2:** Start with rows grouped by Workstream. Use the workstream
+  dropdown and **Off**, **Preview only**, or **Run automatically** controls at
+  the top. Choosing a workstream scrolls to and expands it. Preview only shows
+  the next candidate on its pull request row without starting an agent. Run
+  automatically starts at most one agent at a time for failing CI, merge
+  conflicts, requested changes, or unresolved inline comments.
+  The agent works locally and is instructed to ask before pushing or replying
+  on GitHub. Workstreams checks the PR again before it calls a transition
   verified. An unresolved gate pauses further dispatch until a fresh scan
   confirms it cleared. **Off** stops new dispatches; it does not cancel an
-  agent already running. Auto never merges or deploys. The original Board
-  remains available beside Board v2.
+  agent already running. The latest finished Board action appears in the
+  workstream's outcome card, which flags newer activity in its linked thread.
+  Run automatically never merges or deploys. The original Board remains
+  available beside Board v2.
 - **How this works:** Open the ⓘ panel for state definitions, shortcuts, scan
   health, and warnings.
 
@@ -78,9 +85,18 @@ via agent** action starts a BB thread only when you confirm it.
 when freshness matters. `bb workstreams group <TICKET> <effort name>` sets a
 manual effort name; `bb workstreams ungroup <TICKET>` removes it.
 
-The internal `shipped` state means a merged commit appears in a local release
-tag. It does not establish that the change reached production. When a repository
-has no usable release tags, merged work remains `merged` and the board warns.
+The **In release tag** label means a merged commit appears in a local release
+tag. It does not verify deployment. When a repository has no usable release
+tags, merged work remains `merged` and the board warns.
+Closed pull requests that did not merge are omitted from the Map and both Boards,
+even when their checkouts are dirty or ahead of upstream. Merged work remains
+visible.
+
+**Approved · review note** means the approving review contains written feedback
+that may need action; it is distinct from unresolved inline threads. When the
+feedback's threads are resolved and a later fix is pushed, the row leads with
+the current **Approved · ready** state.
+
 Dispatch currently starts from existing PRs with a scanned checkout. It does
 not create PRs from issues or checkouts, request review, or merge; those steps
 remain Board actions. Its workflow ends when GitHub reports the PR merged.

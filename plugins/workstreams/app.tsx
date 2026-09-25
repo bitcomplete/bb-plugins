@@ -36,14 +36,16 @@ export type Unit = Cluster["units"][number];
 export const TONE: Record<Lifecycle, { dot: string; label: string }> = {
   blocked: { dot: "bg-destructive", label: "Blocked" },
   "awaiting-followup": { dot: "bg-orange-500", label: "Needs your changes" },
+  "awaiting-rereview": { dot: "bg-amber-500", label: "Awaiting re-review" },
   "approved-with-comments": { dot: "bg-yellow-500", label: "Approved, comments open" },
+  "approved-with-note": { dot: "bg-yellow-500", label: "Review approval note" },
   "awaiting-merge": { dot: "bg-emerald-500", label: "Ready to merge" },
   "awaiting-review": { dot: "bg-amber-500", label: "Awaiting review" },
   active: { dot: "bg-sky-400", label: "Being edited" },
   "in-progress": { dot: "bg-sky-600", label: "In progress" },
   unverified: { dot: "bg-amber-400", label: "Status unverified" },
   "up-next": { dot: "bg-muted-foreground/50", label: "Up next" },
-  shipped: { dot: "bg-teal-500", label: "Release tagged" },
+  shipped: { dot: "bg-teal-500", label: "In release tag" },
   merged: { dot: "bg-violet-500", label: "Merged" },
   closed: { dot: "bg-muted-foreground/40", label: "Closed" },
 };

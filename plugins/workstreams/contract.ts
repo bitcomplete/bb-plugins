@@ -43,6 +43,8 @@ export const prSchema = z
     headRefName: z.string().max(300).nullable(),
     /** Each reviewer's latest review, uppercased, from the existing PR list call. */
     latestReviewStates: z.array(z.string().max(40)).max(50),
+    /** GitHub's PR open time. Optional so older persisted scans still load. */
+    createdAt: z.string().max(40).nullable().optional(),
     /**
      * When the PR merged, from the same `gh pr list` call. It dates the Board's
      * Recently merged section. Defaulted so a unit cached before the field
@@ -71,6 +73,12 @@ export const prSchema = z
       .array(z.object({ login: z.string().max(140), state: z.string().max(40) }).strict())
       .max(50)
       .default([]),
+    /** The latest approving review has body text; absent on older scans. */
+    approvalHasBody: z.boolean().optional(),
+    /** Its inline threads were addressed, or the author explicitly replied to its standalone note after a newer head. */
+    approvalNoteFollowedUp: z.boolean().optional(),
+    /** Changes requested remains GitHub's decision, but the author posted a verified PTAL after a newer head. */
+    reviewFollowupPosted: z.boolean().optional(),
     /** Null until review threads are checked; zero means no unresolved threads. */
     unresolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
     /** Complete-page count of resolved review threads; null when unread or incomplete. */
@@ -95,6 +103,8 @@ export const rawUnitSchema = z
     dirName: z.string().max(300),
     repo: z.string().max(200).nullable(),
     branch: z.string().max(300).nullable(),
+    /** Git reports a detached HEAD while replaying commits; the original branch remains associated for display. */
+    rebasing: z.boolean().optional(),
     dirty: z.boolean(),
     /** Explicit scan observations. Missing on older persisted rows, which the server treats as unknown. */
     observed: z.object({ status: z.boolean(), pr: z.boolean() }).strict().optional(),
@@ -176,6 +186,14 @@ export const liveMergeSchema = z
     stackedAbove: z.array(z.number().int()).max(50),
     unresolvedThreads: z.number().int(),
     unresolvedAtLeast: z.boolean(),
+    approvalNotes: z.array(z.object({
+      author: z.string().max(140),
+      body: z.string().max(1_200),
+      submittedAt: z.string().max(40),
+      truncated: z.boolean(),
+    }).strict()).max(3),
+    approvalNotesMore: z.number().int().min(0),
+    approvalNotesComplete: z.boolean(),
   })
   .strict();
 
@@ -207,6 +225,14 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
 export type PrWrite = z.infer<typeof prWriteSchema>;
 
 export const hostContract = defineRpcContract({
+  /** Cheap live local guard before a direct PR write; never trusts the last scan's branch state. */
+  checkoutState: {
+    input: z.object({ path: z.string().max(1_000) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), branch: z.string().max(300).nullable(), rebasing: z.boolean() }).strict(),
+      z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
+    ]),
+  },
   /** Recheck the PR and its pending reviewers immediately before a nudge. */
   prReviewers: {
     input: z.object({ prUrl: z.string().max(500) }).strict(),

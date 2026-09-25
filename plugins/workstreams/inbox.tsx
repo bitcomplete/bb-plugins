@@ -6,6 +6,8 @@
 // workstreams.ts (`inboxSection`, `byInboxOrder`), unit-tested there.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import * as PopoverPrimitive from "@radix-ui/react-popover";
+import * as SelectPrimitive from "@radix-ui/react-select";
 import { UrlLink, experimental_useSidebarThreads, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { Board, Prefs, WireGroup, WireRun, rpcContract } from "./server";
 import {
@@ -41,12 +43,15 @@ import { Tip } from "@/components/ui/tooltip";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { primaryAction, type PrimaryAction } from "./actions";
-import { ActionDialogs, RowActionMenu, type ActionRequest } from "./rowactions";
+import { ActionDialogs, RowActionMenu, ThreadMessageDialog, type ActionRequest } from "./rowactions";
 import { ThreadMenu } from "./threadmenu";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
-import { ageHint, primaryHint, shortAge, shortVerb, titleHint } from "./rowlabels";
-import { groupInboxRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
+import { ageHint, primaryHint, rowAge, shortAge, shortVerb, titleHint } from "./rowlabels";
+import { groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
+import { latestEffortOutcome, type EffortOutcome } from "./outcomes";
+import { attentionDetail, attentionLabel, hasBoardRows, workstreamAttention, type WorkstreamAttention } from "./workstream-attention";
+import { usePortalScopeProps } from "./lib/portal-scope";
 
 type Cluster = WireGroup["clusters"][number];
 type Unit = Cluster["units"][number];
@@ -133,17 +138,8 @@ export function InboxBoard({
   const rpc = useRpc<typeof rpcContract>();
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
-  const efforts = useMemo(() => {
-    const names = new Map<string, string>();
-    for (const row of [...all.values()].flat()) names.set(row.effortKey, row.effort);
-    return [...names].map(([key, name]) => ({ key, name })).sort((a, b) => a.name.localeCompare(b.name));
-  }, [all]);
-  const prLabels = useMemo(() => new Map<string, string>(
-    [...all.values()].flat().filter((row) => row.unit.pr !== null).map((row) => [
-      row.unit.path,
-      `${row.repo} #${row.unit.pr!.number} — ${row.title.length > 48 ? `${row.title.slice(0, 47)}…` : row.title}`,
-    ] as const),
-  ), [all]);
+  const allEfforts = useMemo(() => workstreamAttention([...all.values()].flat()), [all]);
+  const efforts = useMemo(() => allEfforts.filter(hasBoardRows), [allEfforts]);
   const [dispatch, setDispatch] = useState(board.dispatch);
   const [dispatchBusy, setDispatchBusy] = useState(false);
   const [dispatchError, setDispatchError] = useState<string | null>(null);
@@ -160,9 +156,14 @@ export function InboxBoard({
       setDispatchBusy(false);
     }
   };
+  const effortHeadings = useRef(new Map<string, HTMLElement>());
+  const initialEffortScroll = useRef(false);
   const focusEffort = (effortKey: string | null) => {
-    const mode = effortKey === null ? "off" : dispatch.mode === "auto" ? "shadow" : dispatch.mode;
-    void setDispatchMode(mode, effortKey);
+    if (effortKey !== null) {
+      setEffortOpen((current) => ({ ...current, [effortKey]: true }));
+      effortHeadings.current.get(effortKey)?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+    void setDispatchMode(effortKey === null ? "off" : "shadow", effortKey);
   };
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement | null>(null);
@@ -175,7 +176,9 @@ export function InboxBoard({
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
-  const compact = boardWidth < 1060;
+  const compact = boardWidth < 700;
+  const tablet = boardWidth >= 700 && boardWidth < 1060;
+  const narrowTablet = boardWidth >= 700 && boardWidth < 860;
   const tight = boardWidth < 420;
   const [groupBy, setGroupBy] = useState<InboxGrouping>(dispatchControls ? "effort" : "action");
   useEffect(() => setGroupBy(dispatchControls ? "effort" : "action"), [dispatchControls]);
@@ -194,12 +197,50 @@ export function InboxBoard({
       (prefs.staleness.length === 0 || prefs.staleness.includes(row.unit.staleness)) &&
       (prefs.surfaces.length === 0 || prefs.surfaces.some((surface) => row.unit.surfaces.includes(surface))) &&
       matchesInboxQuery(
-        { ticket: row.unit.ticket, title: row.title, repo: row.repo, effort: row.effort },
+        { ticket: row.unit.ticket, title: row.title, repo: row.repo, effort: row.effort, prNumber: row.unit.pr?.number ?? null },
         query,
       );
     return new Map([...all].map(([section, rows]) => [section, rows.filter(keep)]));
   }, [all, prefs, query]);
-  const groups = useMemo(() => groupInboxRows(sections, groupBy), [sections, groupBy]);
+  const visibleEffortCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const row of [...sections.values()].flat()) counts.set(row.effortKey, (counts.get(row.effortKey) ?? 0) + 1);
+    return counts;
+  }, [sections]);
+  const completed = useMemo(() => partitionCompletedRows(sections), [sections]);
+  const groups = useMemo(() => groupInboxRows(dispatchControls ? completed.active : sections, groupBy)
+    .filter((group) => !dispatchControls || group.section !== "shipped"), [completed, dispatchControls, sections, groupBy]);
+  const [completedOpen, setCompletedOpen] = useState({ merged: false, inReleaseTag: false });
+  useEffect(() => {
+    if (!dispatchControls || initialEffortScroll.current || groups.length === 0) return;
+    initialEffortScroll.current = true;
+    if (dispatch.effortKey !== null) {
+      setEffortOpen((current) => ({ ...current, [dispatch.effortKey!]: true }));
+      requestAnimationFrame(() => effortHeadings.current.get(dispatch.effortKey!)?.scrollIntoView({ block: "start" }));
+    }
+  }, [dispatchControls, dispatch.effortKey, groups]);
+  const selectedEffortVisible = dispatch.effortKey === null || groups.some((group) => group.key === dispatch.effortKey);
+  const completedOnlySelected = allEfforts.some((effort) => effort.key === dispatch.effortKey && !hasBoardRows(effort));
+  const revealSelectedEffort = () => {
+    setQuery("");
+    const selectedRows = outcomeRows.get(dispatch.effortKey ?? "") ?? [];
+    onPrefs({
+      staleness: [],
+      surfaces: [],
+      ...(!prefs.showClones && selectedRows.length > 0 && selectedRows.every((row) => isTicketlessClone(row.unit)) ? { showClones: true } : {}),
+    });
+    if (dispatch.effortKey !== null) setEffortOpen((current) => ({ ...current, [dispatch.effortKey!]: true }));
+    requestAnimationFrame(() => requestAnimationFrame(() => effortHeadings.current.get(dispatch.effortKey ?? "")?.scrollIntoView({ block: "start", behavior: "smooth" })));
+  };
+  const outcomeRows = useMemo(() => {
+    const byEffort = new Map<string, Row[]>();
+    for (const row of [...all.values()].flat()) {
+      const rows = byEffort.get(row.effortKey) ?? [];
+      rows.push(row);
+      byEffort.set(row.effortKey, rows);
+    }
+    return byEffort;
+  }, [all]);
   const isOpen = useCallback(
     (group: RowGroup) => group.section === null ? effortOpen[group.key] !== false : actionOpen[group.section],
     [actionOpen, effortOpen],
@@ -214,7 +255,10 @@ export function InboxBoard({
   }, []);
 
   // j/k walk the rows the reader can see, top to bottom.
-  const visible = useMemo(() => visibleInboxRows(groups, isOpen), [groups, isOpen]);
+  const visible = useMemo(() => [
+    ...visibleInboxRows(groups, isOpen),
+    ...(dispatchControls ? visibleCompletedRows(completed, completedOpen) : []),
+  ], [groups, isOpen, dispatchControls, completed, completedOpen]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selected = visible.find((row) => row.key === selectedKey) ?? null;
 
@@ -228,8 +272,10 @@ export function InboxBoard({
       setSelectedKey(row.key);
       setActionOpen((current) => ({ ...current, [row.section]: true }));
       setEffortOpen((current) => ({ ...current, [row.effortKey]: true }));
+      if (dispatchControls && row.unit.lifecycle === "merged") setCompletedOpen((current) => ({ ...current, merged: true }));
+      if (dispatchControls && row.unit.lifecycle === "shipped") setCompletedOpen((current) => ({ ...current, inReleaseTag: true }));
     }
-  }, [all, focusTicket]);
+  }, [all, dispatchControls, focusTicket]);
 
   const select = useCallback(
     (row: Row | null) => {
@@ -260,12 +306,15 @@ export function InboxBoard({
 
   const [starting, setStarting] = useState<Row | null>(null);
   const [request, setRequest] = useState<ActionRequest | null>(null);
+  const [messaging, setMessaging] = useState<Row | null>(null);
 
   /** Select a row anywhere on the Board, even when filters or a group hide it. */
   const reveal = useCallback(
     (target: Row) => {
       setActionOpen((current) => ({ ...current, [target.section]: true }));
       setEffortOpen((current) => ({ ...current, [target.effortKey]: true }));
+      if (dispatchControls && target.unit.lifecycle === "merged") setCompletedOpen((current) => ({ ...current, merged: true }));
+      if (dispatchControls && target.unit.lifecycle === "shipped") setCompletedOpen((current) => ({ ...current, inReleaseTag: true }));
       setQuery("");
       const patch: Partial<Prefs> = {};
       if (!prefs.showClones && isTicketlessClone(target.unit)) patch.showClones = true;
@@ -276,7 +325,7 @@ export function InboxBoard({
       onFocusTicket(target.cluster.ticket);
       requestAnimationFrame(() => document.getElementById(`inbox-${target.key}`)?.scrollIntoView({ block: "nearest" }));
     },
-    [onFocusTicket, onPrefs, prefs],
+    [dispatchControls, onFocusTicket, onPrefs, prefs],
   );
 
   // The Agents strip counts each row's own run, so every count has rows to jump to.
@@ -343,7 +392,7 @@ export function InboxBoard({
 
   const onKey = useCallback(
     (event: KeyboardEvent) => {
-      if (event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null) return;
+      if (event.metaKey || event.ctrlKey || event.altKey || starting !== null || request !== null || messaging !== null) return;
       const target = event.target;
       if (
         target instanceof HTMLElement &&
@@ -402,12 +451,39 @@ export function InboxBoard({
       }
       event.preventDefault();
     },
-    [navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, request, runPrimary, select, selected, starting, threadsOf, visible],
+    [messaging, navigate, onFocusTicket, onShowOnMap, openCheckout, openThread, query, request, runPrimary, select, selected, starting, threadsOf, visible],
   );
   useEffect(() => {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onKey]);
+
+  const renderRow = (row: Row, showSection: boolean, groupKey: string | null) => (
+    <InboxRow
+      key={row.key}
+      row={row}
+      showSection={showSection}
+      now={now}
+      reviewerColumn={reviewerColumn}
+      compact={compact}
+      tablet={tablet}
+      narrowTablet={narrowTablet}
+      tight={tight}
+      selected={row.key === selected?.key}
+      candidate={dispatchControls && groupKey !== null && dispatch.effortKey === groupKey && dispatch.mode !== "off" && dispatch.candidate?.path === row.key ? dispatch.candidate : null}
+      threads={threadsOf(row)}
+      onSelect={() => select(row)}
+      onOpenThread={openThread}
+      onOpenCheckout={() => openCheckout(row)}
+      onStart={() => setStarting(row)}
+      onMessageAgent={() => setMessaging(row)}
+      onPrimary={() => runPrimary(row)}
+      onShowOnMap={() => {
+        onFocusTicket(row.cluster.ticket);
+        onShowOnMap();
+      }}
+    />
+  );
 
 
   return (
@@ -427,7 +503,9 @@ export function InboxBoard({
         dispatchBusy={dispatchBusy}
         dispatchError={dispatchError}
         efforts={efforts}
-        prLabels={prLabels}
+        unavailableEffortName={allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? null}
+        focusedVisibleCount={visibleEffortCounts.get(dispatch.effortKey ?? "") ?? 0}
+        filtersActive={query !== "" || prefs.staleness.length > 0 || prefs.surfaces.length > 0 || prefs.showClones}
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
         dispatchControls={dispatchControls}
@@ -435,15 +513,30 @@ export function InboxBoard({
       <AgentsStrip counts={strip} onJump={jumpTo} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pb-10">
-          {groups.length === 0 ? (
+          {dispatchControls && !selectedEffortVisible ? (
+            <div className="flex flex-wrap items-center gap-2 px-2 pt-4 text-[12px] text-muted-foreground">
+              <span>{completedOnlySelected ? "The selected workstream has no current Board v2 rows" : "The selected workstream is outside the current view"}{dispatch.mode === "auto" ? " · Running automatically" : dispatch.mode === "shadow" ? " · Preview only" : " · Off"}.</span>
+              {!completedOnlySelected && outcomeRows.has(dispatch.effortKey ?? "") ? (
+                <button type="button" onClick={revealSelectedEffort} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Show workstream</button>
+              ) : null}
+              {dispatch.mode !== "off" ? <button type="button" disabled={dispatchBusy} onClick={() => void setDispatchMode("off", dispatch.effortKey)} className="rounded text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">Turn off</button> : null}
+            </div>
+          ) : null}
+          {groups.length === 0 && (!dispatchControls || completed.merged.length + completed.inReleaseTag.length === 0) ? (
             <p className="px-2 pt-5 text-[12px] text-muted-foreground">No matching checkouts.</p>
           ) : null}
           {groups.map((group) => {
             const rows = group.rows;
             const expanded = isOpen(group);
+            const outcome = dispatchControls && group.section === null
+              ? latestEffortOutcome(outcomeRows.get(group.key) ?? [], board.runs, dispatch.attempts)
+              : null;
             return (
               <section key={group.key} aria-label={group.label} className="pt-5">
-                <div className="flex min-w-0 items-center gap-2">
+                <div ref={group.section === null ? (node) => {
+                  if (node === null) effortHeadings.current.delete(group.key);
+                  else effortHeadings.current.set(group.key, node);
+                } : undefined} className="flex min-w-0 flex-wrap items-center gap-2 scroll-mt-3">
                   <button
                     type="button"
                     aria-expanded={expanded}
@@ -460,18 +553,25 @@ export function InboxBoard({
                     <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
                   </button>
                   {dispatchControls && group.section === null ? (
+                    <EffortOutcomeCard
+                      outcome={outcome}
+                      onOpenThread={openThread}
+                      threadUpdatedAt={sidebarThreads.find((thread) => thread.id === outcome?.threadId)?.updatedAt ?? null}
+                    />
+                  ) : null}
+                  {dispatchControls && group.section === null ? (
                     <button
                       type="button"
                       disabled={dispatchBusy || dispatch.effortKey === group.key}
                       onClick={() => focusEffort(group.key)}
-                      aria-label={`Focus ${group.label} for dispatch`}
+                      aria-label={`Choose ${group.label} for agent action preview`}
                       aria-pressed={dispatch.effortKey === group.key}
                       className={cn(
                         "shrink-0 rounded-md px-2 py-1 text-[11px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
                         dispatch.effortKey === group.key ? "bg-foreground/[0.08] text-foreground" : "text-muted-foreground hover:bg-foreground/[0.06]",
                       )}
                     >
-                      {dispatch.effortKey === group.key ? "Focused" : "Focus"}
+                      {dispatch.effortKey === group.key ? "Selected" : "Choose"}
                     </button>
                   ) : null}
                 </div>
@@ -480,39 +580,163 @@ export function InboxBoard({
                     <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
                   ) : (
                     <ul role="listbox" aria-label={group.label} className="flex flex-col">
-                      {rows.map((row) => (
-                        <InboxRow
-                          key={row.key}
-                          row={row}
-                          showSection={groupBy === "effort"}
-                          now={now}
-                          reviewerColumn={reviewerColumn}
-                          compact={compact}
-                          tight={tight}
-                          selected={row.key === selected?.key}
-                          threads={threadsOf(row)}
-                          onSelect={() => select(row)}
-                          onOpenThread={openThread}
-                          onOpenCheckout={() => openCheckout(row)}
-                          onStart={() => setStarting(row)}
-                          onPrimary={() => runPrimary(row)}
-                          onShowOnMap={() => {
-                            onFocusTicket(row.cluster.ticket);
-                            onShowOnMap();
-                          }}
-                        />
-                      ))}
+                      {rows.map((row) => renderRow(row, groupBy === "effort", group.key))}
                     </ul>
                   )
                 ) : null}
               </section>
             );
           })}
+          {dispatchControls && (completed.merged.length > 0 || completed.inReleaseTag.length > 0) ? (
+            <div className="mt-6 grid gap-2 border-t border-border/60 pt-4 sm:grid-cols-2">
+              {([
+                { key: "merged", label: "Merged", rows: completed.merged, hint: "Pull requests merged on GitHub" },
+                { key: "inReleaseTag", label: "In release tag", rows: completed.inReleaseTag, hint: "Merge commits found in a local release tag" },
+              ] as const).map(({ key, label, rows, hint }) => (
+                <section key={key} aria-label={label} className={cn("min-w-0 rounded-lg border border-border/70 bg-foreground/[0.025]", completedOpen[key] && "sm:col-span-2")}>
+                  <button
+                    type="button"
+                    aria-expanded={completedOpen[key]}
+                    onClick={() => setCompletedOpen((current) => ({ ...current, [key]: !current[key] }))}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <Icon name="ChevronRight" className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform duration-150", completedOpen[key] && "rotate-90")} />
+                    <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-foreground">{label}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
+                  </button>
+                  {completedOpen[key] ? (
+                    <div className="border-t border-border/60 pb-2">
+                      <p className="px-3 pt-2 text-[11px] text-muted-foreground">{hint}</p>
+                      {rows.length > 0 ? <ul role="listbox" aria-label={label} className="flex flex-col">{rows.map((row) => renderRow(row, false, null))}</ul>
+                        : <p className="px-3 pt-2 text-[12px] text-muted-foreground">No matching checkouts.</p>}
+                    </div>
+                  ) : null}
+                </section>
+              ))}
+            </div>
+          ) : null}
         </div>
       </div>
       <StartThreadDialog row={starting} onClose={() => setStarting(null)} />
       <ActionDialogs request={request} now={now} onClose={() => setRequest(null)} />
+      <ThreadMessageDialog row={messaging} threads={messaging === null ? [] : threadsOf(messaging)} onClose={() => setMessaging(null)} />
     </div>
+  );
+}
+
+function EffortOutcomeCard({ outcome, onOpenThread, threadUpdatedAt }: { outcome: EffortOutcome | null; onOpenThread: (id: string) => void; threadUpdatedAt: number | null }) {
+  const [open, setOpen] = useState(false);
+  const pinned = useRef(false);
+  const restoreFocus = useRef(false);
+  const suppressFocusOpen = useRef(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
+  const portalScope = usePortalScopeProps();
+  const cancelClose = () => {
+    if (closeTimer.current !== null) clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  };
+  const scheduleClose = () => {
+    if (pinned.current) return;
+    cancelClose();
+    closeTimer.current = setTimeout(() => setOpen(false), 250);
+  };
+  const pinCard = () => {
+    pinned.current = true;
+    cancelClose();
+    setOpen(true);
+    requestAnimationFrame(() => contentRef.current?.focus());
+  };
+  useEffect(() => cancelClose, []);
+  if (outcome === null) return null;
+  const pr = outcome.row.unit.pr;
+  if (pr === null) return null;
+  const prLabel = `${outcome.row.repo} #${pr.number}`;
+  return (
+    <PopoverPrimitive.Root open={open} onOpenChange={(value) => {
+      if (!value) {
+        restoreFocus.current = pinned.current;
+        pinned.current = false;
+      }
+      setOpen(value);
+    }}>
+      <PopoverPrimitive.Anchor asChild>
+        <button
+          ref={anchorRef}
+          type="button"
+          aria-label={`Latest recorded Board action for ${outcome.row.effort}: ${outcome.outcome}`}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onFocus={() => { if (!suppressFocusOpen.current) setOpen(true); }}
+          onBlur={scheduleClose}
+          onPointerEnter={() => { cancelClose(); setOpen(true); }}
+          onPointerLeave={scheduleClose}
+          onClick={pinCard}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            pinCard();
+          }}
+          className="min-w-0 max-w-[min(34%,16rem)] shrink-0 truncate rounded-md px-2 py-1 text-[11px] text-muted-foreground outline-none hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="font-medium">Latest Board action</span>
+          <span aria-hidden className="mx-1">·</span>
+          <span>{outcome.outcome}</span>
+        </button>
+      </PopoverPrimitive.Anchor>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          {...portalScope}
+          ref={contentRef}
+          role="dialog"
+          aria-label={`Recorded Board action for ${prLabel}`}
+          tabIndex={-1}
+          side="bottom"
+          align="end"
+          sideOffset={5}
+          collisionPadding={8}
+          onPointerEnter={cancelClose}
+          onPointerLeave={scheduleClose}
+          onOpenAutoFocus={(event) => event.preventDefault()}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (!restoreFocus.current) return;
+            restoreFocus.current = false;
+            suppressFocusOpen.current = true;
+            anchorRef.current?.focus();
+            requestAnimationFrame(() => { suppressFocusOpen.current = false; });
+          }}
+          onInteractOutside={(event) => {
+            if (anchorRef.current?.contains(event.target as Node)) event.preventDefault();
+          }}
+          className={cn("z-50 w-[min(24rem,calc(100vw-1rem))] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-md outline-none", POINTER_CURSORS)}
+        >
+          <p className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Recorded Board action · {outcome.source}</p>
+          <div className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-1.5 text-[12px]">
+            <UrlLink href={pr.url} className="shrink-0 font-semibold underline underline-offset-2">{prLabel}</UrlLink>
+            <span className="min-w-0 text-muted-foreground">{outcome.row.title}</span>
+          </div>
+          <p className="mt-2 text-[12px] leading-5"><span className="font-medium">{outcome.action}:</span> {outcome.outcome}</p>
+          <p className="mt-2 text-[11px] text-muted-foreground">PR state on board: {outcome.prState}</p>
+          {outcome.threadId !== null && threadUpdatedAt !== null && threadUpdatedAt > outcome.at + 30_000 ? (
+            <p className="mt-1 text-[11px] text-muted-foreground">Thread has newer activity. Open it for the latest update.</p>
+          ) : null}
+          <div className="mt-2 flex items-center justify-between gap-3 border-t border-border/60 pt-2 text-[11px] text-muted-foreground">
+            <time dateTime={new Date(outcome.at).toISOString()}>{new Date(outcome.at).toLocaleString()}</time>
+            {outcome.threadId === null ? null : (
+              <button
+                type="button"
+                onClick={() => { setOpen(false); onOpenThread(outcome.threadId!); }}
+                className="shrink-0 text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Open thread
+              </button>
+            )}
+          </div>
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
   );
 }
 
@@ -728,13 +952,17 @@ function InboxRow({
   now,
   reviewerColumn,
   compact,
+  tablet,
+  narrowTablet,
   tight,
   selected,
+  candidate,
   threads,
   onSelect,
   onOpenThread,
   onOpenCheckout,
   onStart,
+  onMessageAgent,
   onPrimary,
   onShowOnMap,
 }: {
@@ -744,27 +972,40 @@ function InboxRow({
   /** Some row on the Board has reviewers: every row keeps the column, so the columns stay aligned. */
   reviewerColumn: boolean;
   compact: boolean;
+  tablet: boolean;
+  narrowTablet: boolean;
   tight: boolean;
   selected: boolean;
+  candidate: Board["dispatch"]["candidate"];
   threads: readonly ThreadLink[];
   onSelect: () => void;
   onOpenThread: (id: string) => void;
   onOpenCheckout: () => void;
   onStart: () => void;
+  onMessageAgent: () => void;
   onPrimary: () => void;
   onShowOnMap: () => void;
 }) {
   const { unit } = row;
   const risk = unit.surfaces.filter((surface) => ESCALATING.includes(surface));
-  const age = shortAge(row.age, now);
-  const ageTip = ageHint(row.age, row.verb, now);
+  const displayAge = rowAge(unit.pr, unit.lastCommitAt);
+  const age = shortAge(displayAge, now);
+  const ageTip = ageHint(displayAge, now);
   const resolvedThreads = unit.pr?.resolvedReviewThreads ?? 0;
   const approvedAfterReview = unit.pr?.reviewDecision === "APPROVED" && unit.pr.unresolvedReviewThreads === 0;
+  const hiddenDetails = tablet ? [
+    ...(narrowTablet && reviewerColumn && reviewersOf(unit.pr).length > 0 ? [`Reviewers: ${reviewersLabel(reviewersOf(unit.pr))}`] : []),
+    ...(narrowTablet && resolvedThreads > 0 ? [`${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved`] : []),
+    ...(risk.length > 0 ? [`High risk: ${risk.join(" · ")}`] : []),
+    ...(row.cluster.linear?.url != null ? [`Linear: ${row.cluster.linear.url}`] : []),
+  ] : [];
+  const titleDetail = [titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear }), ...hiddenDetails].join("\n");
   return (
     <li
       id={`inbox-${row.key}`}
       role="option"
       aria-selected={selected}
+      aria-description={hiddenDetails.length > 0 ? hiddenDetails.join("; ") : undefined}
       onClick={onSelect}
       className={cn(
         "group flex min-w-0 cursor-default items-center rounded-md px-2 text-[12.5px]",
@@ -774,8 +1015,13 @@ function InboxRow({
     >
       <span className={cn("flex min-w-0 items-center gap-2", compact ? "w-full" : "flex-1", tight && "flex-wrap gap-y-0.5")}>
         {row.verb === null && !showSection ? null : (
-          <span className={cn("flex shrink-0 items-center", !compact && "w-[6.5rem]")}>
+          <span className={cn("flex shrink-0 items-center gap-1", !compact && (tablet ? "w-[10.5rem]" : "w-[11.5rem]"))}>
             <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
+            {unit.lifecycle === "awaiting-rereview" && unit.pr?.mergeStateStatus === "BEHIND" ? (
+              <Tip label="The PR branch is behind its base. Update it before merging.">
+                <span tabIndex={0} aria-label="Branch behind" className="shrink-0 rounded border border-border px-1 text-[10px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">Behind</span>
+              </Tip>
+            ) : null}
           </span>
         )}
         <span className={cn("flex min-w-0 shrink-0 items-center gap-1.5", compact ? "max-w-[11rem]" : "max-w-[11.5rem]")}>
@@ -794,29 +1040,34 @@ function InboxRow({
             </UrlLink>
           )}
         </span>
-        <Tip label={titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear })}>
+        <Tip label={titleDetail}>
           <span className={cn("min-w-0 truncate text-foreground/80", tight ? "w-full flex-none" : "flex-1")}>{row.title}</span>
         </Tip>
+        {candidate !== null ? (
+          <Tip label={candidate.reason}>
+            <span tabIndex={0} aria-label={`Next: ${DISPATCH_ACTION[candidate.action]}. ${candidate.reason}`} className="max-w-full shrink-0 truncate rounded border border-border px-1.5 py-0.5 text-[10.5px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">Next: {DISPATCH_ACTION[candidate.action]}</span>
+          </Tip>
+        ) : null}
       </span>
       <span className={cn("flex min-w-0 items-center gap-y-1", compact ? "w-full flex-wrap gap-x-2" : "shrink-0 gap-x-3")}>
-        <span className={cn("flex max-w-full shrink-0 flex-wrap items-center gap-y-1", compact ? "gap-x-2" : "gap-x-3")}>
+        <span className={cn("flex max-w-full shrink-0 flex-wrap items-center gap-y-1", compact ? "gap-x-2" : tablet ? "gap-x-2" : "gap-x-3")}>
           {row.run === null ? (
             <Tip label={ageTip}>
               <span
                 className={cn(
-                  "w-[2.5rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
-                  row.age.basis === "state" ? "text-foreground/80" : "text-muted-foreground/80",
+                  "w-[4.8rem] shrink-0 text-right font-mono text-[10.5px] tabular-nums",
+                  displayAge.basis === "pr" ? "text-foreground/80" : "text-muted-foreground/80",
                 )}
               >
                 {age}
               </span>
             </Tip>
           ) : (
-            <span className={cn("flex min-w-0 shrink-0 items-center", compact ? "max-w-[8rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
-              <RunChip run={row.run} ageTip={ageTip} compact={compact} onOpenThread={onOpenThread} />
+            <span className={cn("flex min-w-0 shrink-0 items-center", compact || tablet ? "max-w-[8rem]" : "min-w-[2.5rem] max-w-[13rem]")}>
+              <RunChip run={row.run} ageTip={ageTip} compact={compact || tablet} onOpenThread={onOpenThread} />
             </span>
           )}
-          {resolvedThreads > 0 ? (
+          {resolvedThreads > 0 && !narrowTablet ? (
             <Tip label={approvedAfterReview
               ? `${resolvedThreads === 1 ? "The review thread is" : `All ${resolvedThreads} review threads are`} resolved; GitHub still marks this PR approved.`
               : `${resolvedThreads} review ${resolvedThreads === 1 ? "thread" : "threads"} resolved.`}>
@@ -826,8 +1077,8 @@ function InboxRow({
             </Tip>
           ) : null}
           {unit.observed?.status === false ? <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Working-tree status unavailable; rescan to check local edits">git ?</span> : null}
-          {reviewerColumn ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
-          {risk.length === 0 ? null : (
+          {reviewerColumn && !narrowTablet ? <ReviewerMarks reviewers={reviewersOf(unit.pr)} compact={compact} /> : null}
+          {risk.length === 0 || tablet ? null : (
             <Tip label="High risk: touches a surface that is hard to undo">
               <span
                 tabIndex={0}
@@ -840,14 +1091,14 @@ function InboxRow({
           )}
         </span>
         <span className={cn("flex max-w-full shrink-0 items-center", compact ? "gap-2" : "gap-3")}>
-          {showSection ? null : (
+          {showSection || tablet ? null : (
             <Tip label={row.effort}>
               <span className={cn("min-w-0 truncate text-[11.5px] text-muted-foreground/80", compact ? "block max-w-24" : "hidden max-w-32 lg:block")}>
                 {row.effort}
               </span>
             </Tip>
           )}
-          {row.cluster.linear?.url == null ? null : (
+          {row.cluster.linear?.url == null || tablet ? null : (
             <UrlLink
               href={row.cluster.linear.url}
               onClick={(event) => event.stopPropagation()}
@@ -864,7 +1115,9 @@ function InboxRow({
           >
             <RowActionMenu
               hasThreads={threads.length > 0}
+              hasOpenPr={unit.pr?.state === "OPEN"}
               onGoToThread={() => threads[0] !== undefined && onOpenThread(threads[0].id)}
+              onMessageAgent={onMessageAgent}
               onOpenCheckout={onOpenCheckout}
               onNewThread={onStart}
             />
@@ -972,7 +1225,9 @@ function InboxHeader({
   dispatchBusy,
   dispatchError,
   efforts,
-  prLabels,
+  unavailableEffortName,
+  focusedVisibleCount,
+  filtersActive,
   onFocusEffort,
   onDispatchMode,
   dispatchControls,
@@ -990,8 +1245,10 @@ function InboxHeader({
   dispatch: Board["dispatch"];
   dispatchBusy: boolean;
   dispatchError: string | null;
-  efforts: { key: string; name: string }[];
-  prLabels: Map<string, string>;
+  efforts: WorkstreamAttention[];
+  unavailableEffortName: string | null;
+  focusedVisibleCount: number;
+  filtersActive: boolean;
   onFocusEffort: (key: string | null) => void;
   onDispatchMode: (mode: Board["dispatch"]["mode"]) => void;
   dispatchControls: boolean;
@@ -1007,7 +1264,8 @@ function InboxHeader({
     return () => window.removeEventListener("pointerdown", close);
   }, [open]);
   const active = prefs.staleness.length + prefs.surfaces.length + (prefs.showClones ? 1 : 0);
-  const focused = efforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? dispatch.effortKey;
+  const focusedAttention = efforts.find((effort) => effort.key === dispatch.effortKey);
+  const focused = focusedAttention?.name ?? dispatch.effortKey;
 
   return (
     <div className="shrink-0 border-b border-border/60">
@@ -1025,7 +1283,7 @@ function InboxHeader({
                 else event.currentTarget.blur();
               }
             }}
-            placeholder="Search tickets, titles, repos, efforts"
+            placeholder={dispatchControls ? "Search tickets, PRs, titles, repos, workstreams" : "Search tickets, PRs, titles, repos, efforts"}
             aria-label="Search the board"
             className="min-w-0 flex-1 bg-transparent text-[12.5px] outline-none placeholder:text-muted-foreground/70"
           />
@@ -1034,7 +1292,7 @@ function InboxHeader({
         <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
           {shown === total ? `${total} rows` : `${shown} of ${total}`}
         </span>
-        <label className="flex h-8 shrink-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
+        {dispatchControls ? null : <label className="flex h-8 shrink-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
           Group by
           <select
             value={groupBy}
@@ -1045,7 +1303,7 @@ function InboxHeader({
             <option value="action">Action</option>
             <option value="effort">Effort</option>
           </select>
-        </label>
+        </label>}
         <div ref={rootRef} className="relative shrink-0">
           <Tip label="Filter rows by last commit, surface or clones">
             <button
@@ -1102,64 +1360,104 @@ function InboxHeader({
           ) : null}
         </div>
       </div>
-      {dispatchControls ? <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]">
-        <span className="shrink-0 font-semibold text-foreground">Board v2 · Dispatch pilot</span>
-        <label className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
-          Focus
-          <select
-            value={dispatch.effortKey ?? ""}
-            onChange={(event) => onFocusEffort(event.target.value || null)}
-            disabled={dispatchBusy}
-            aria-label="Focused effort for dispatch"
-            className="h-8 max-w-[min(15rem,55vw)] rounded-md border border-border bg-background px-1.5 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-          >
-            <option value="">Choose effort</option>
-            {dispatch.effortKey !== null && !efforts.some((effort) => effort.key === dispatch.effortKey) ? (
-              <option value={dispatch.effortKey}>{dispatch.effortKey} (outside current scan)</option>
-            ) : null}
-            {efforts.map((effort) => <option key={effort.key} value={effort.key}>{effort.name}</option>)}
-          </select>
-        </label>
-        <div role="group" aria-label="Dispatch mode" className="flex shrink-0 items-center gap-1 rounded-md border border-border p-0.5">
-          {(["off", "shadow"] as const).map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              aria-pressed={dispatch.mode === mode}
-              disabled={dispatchBusy || (mode === "shadow" && dispatch.effortKey === null)}
-              onClick={() => onDispatchMode(mode)}
-              className={cn(
-                "rounded px-2 py-1 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40",
-                dispatch.mode === mode ? "bg-foreground/[0.09] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.05]",
-              )}
+      {dispatchControls ? (
+        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]">
+          <span className="shrink-0 font-semibold text-foreground">Board v2 · Agent actions</span>
+          <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+            <span id="workstream-chooser-label">Workstream</span>
+            <SelectPrimitive.Root
+              value={dispatch.effortKey ?? "__none__"}
+              onValueChange={(value) => onFocusEffort(value === "__none__" ? null : value)}
+              disabled={dispatchBusy}
             >
-              {mode === "off" ? "Off" : "Shadow preview"}
-            </button>
-          ))}
+              <SelectPrimitive.Trigger
+                aria-labelledby="workstream-chooser-label"
+                className="flex h-10 w-64 max-w-[min(19rem,60vw)] min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 text-left text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+              >
+                <span className="flex min-w-0 flex-1 flex-col items-start leading-tight">
+                  <span className="w-full truncate font-medium" title={focused ?? undefined}>{focused ?? "Choose workstream"}</span>
+                  {focusedAttention !== undefined ? (
+                    <span className="mt-0.5 max-w-full truncate rounded bg-foreground/[0.06] px-1 text-[10px] text-muted-foreground">{attentionLabel(focusedAttention)}</span>
+                  ) : null}
+                </span>
+                <SelectPrimitive.Icon><Icon name="ChevronDown" className="size-3.5 shrink-0 text-muted-foreground" /></SelectPrimitive.Icon>
+              </SelectPrimitive.Trigger>
+              <SelectPrimitive.Portal>
+                <SelectPrimitive.Content
+                  {...usePortalScopeProps()}
+                  position="popper"
+                  sideOffset={4}
+                  collisionPadding={8}
+                  className="z-50 max-h-[min(24rem,var(--radix-select-content-available-height))] w-[min(24rem,calc(100vw-1rem))] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md outline-none"
+                >
+                  <SelectPrimitive.Viewport className="max-h-[22rem] w-full min-w-0 overflow-y-auto">
+                    <SelectPrimitive.Item value="__none__" className="relative flex cursor-pointer items-center rounded-md px-2 py-2 text-[12px] text-muted-foreground outline-none focus:bg-foreground/[0.07]">
+                      <SelectPrimitive.ItemText>No workstream</SelectPrimitive.ItemText>
+                    </SelectPrimitive.Item>
+                    {dispatch.effortKey !== null && focusedAttention === undefined ? (
+                      <SelectPrimitive.Item value={dispatch.effortKey} className="relative flex cursor-pointer items-center rounded-md px-2 py-2 text-[12px] outline-none focus:bg-foreground/[0.07]">
+                        <SelectPrimitive.ItemText>{unavailableEffortName ?? dispatch.effortKey}</SelectPrimitive.ItemText>
+                        <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">No current rows</span>
+                      </SelectPrimitive.Item>
+                    ) : null}
+                    {efforts.map((effort) => (
+                      <SelectPrimitive.Item key={effort.key} value={effort.key} title={effort.name} className="relative grid w-full min-w-0 cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md px-2 py-2 text-[12px] outline-none focus:bg-foreground/[0.07] data-[state=checked]:bg-foreground/[0.04]">
+                        <SelectPrimitive.ItemText className="min-w-0 overflow-hidden"><span className="block w-full truncate font-medium">{effort.name}</span></SelectPrimitive.ItemText>
+                        <span className="max-w-[10rem] truncate rounded bg-foreground/[0.06] px-1.5 py-0.5 text-[10.5px] text-muted-foreground">{attentionLabel(effort)}</span>
+                      </SelectPrimitive.Item>
+                    ))}
+                  </SelectPrimitive.Viewport>
+                </SelectPrimitive.Content>
+              </SelectPrimitive.Portal>
+            </SelectPrimitive.Root>
+          </div>
+          <div role="group" aria-label="Agent action mode" className="flex shrink-0 items-center gap-1 rounded-md border border-border p-0.5">
+            {(["off", "shadow"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={dispatch.mode === mode}
+                disabled={dispatchBusy || (mode === "shadow" && dispatch.effortKey === null)}
+                onClick={() => onDispatchMode(mode)}
+                className={cn(
+                  "rounded px-2 py-1 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40",
+                  dispatch.mode === mode ? "bg-foreground/[0.09] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.05]",
+                )}
+              >
+                {mode === "off" ? "Off" : "Preview only"}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            aria-pressed={dispatch.mode === "auto"}
+            aria-label={focused ? `${dispatch.mode === "auto" ? "Running automatically" : "Run automatically"} for ${focused}` : "Run automatically"}
+            disabled={dispatchBusy || dispatch.mode !== "shadow" || dispatch.effortKey === null}
+            onClick={() => onDispatchMode("auto")}
+            className={cn(
+              "h-8 max-w-full truncate rounded-md border px-2.5 text-[11.5px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
+              dispatch.mode === "auto" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300" : "border-border text-foreground hover:bg-foreground/[0.05]",
+            )}
+          >
+            {dispatch.mode === "auto" ? "Running automatically" : "Run automatically"}
+          </button>
+          <span className="min-w-0 text-muted-foreground">
+            {dispatch.mode === "auto"
+              ? "One agent at a time. Agents ask before pushing or replying. No automatic merges."
+              : dispatch.mode === "shadow"
+                ? "Shows the next action without starting an agent."
+                : dispatch.effortKey === null ? "Off. Choose a workstream to preview the next action." : "Off. Select Preview only to see the next agent action."}
+          </span>
+          {focusedAttention !== undefined ? (
+            <p className="min-w-0 basis-full text-[11.5px] text-muted-foreground" aria-live="polite">
+              <span className="font-medium text-foreground">{focusedAttention.name} · What moves next across all checkouts:</span>{" "}
+              {attentionDetail(focusedAttention)}
+              {filtersActive ? ` ${focusedVisibleCount} match the current view.` : null}
+            </p>
+          ) : null}
         </div>
-        <button
-          type="button"
-          aria-pressed={dispatch.mode === "auto"}
-          aria-label={focused ? `${dispatch.mode === "auto" ? "Auto on" : "Enable Auto"} for ${focused}` : "Enable Auto"}
-          disabled={dispatchBusy || dispatch.mode !== "shadow" || dispatch.effortKey === null}
-          onClick={() => onDispatchMode("auto")}
-          className={cn(
-            "h-8 max-w-full truncate rounded-md border px-2.5 text-[11.5px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
-            dispatch.mode === "auto" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300" : "border-border text-foreground hover:bg-foreground/[0.05]",
-          )}
-        >
-          {dispatch.mode === "auto" ? "Auto on" : "Enable Auto"}
-        </button>
-        <span className="min-w-0 text-muted-foreground">
-          {dispatch.mode === "auto"
-            ? "One agent at a time. Agents are instructed to ask before pushing or replying. No automatic merges."
-            : dispatch.mode === "shadow"
-              ? "Preview only. Auto starts one agent at a time; agents are instructed to ask before pushing or replying. No automatic merges."
-              : dispatch.effortKey === null ? "Off. Select one effort, then preview in Shadow." : "Off. Preview the focused effort in Shadow."}
-        </span>
-      </div> : null}
+      ) : null}
       {dispatchControls && dispatchError !== null ? <p role="alert" className="mx-auto w-full max-w-6xl px-4 pb-2 text-[12px] text-destructive">{dispatchError}</p> : null}
-      {dispatchControls ? <DispatchActivity dispatch={dispatch} prLabels={prLabels} /> : null}
     </div>
   );
 }
@@ -1169,51 +1467,8 @@ const DISPATCH_ACTION: Record<NonNullable<Board["dispatch"]["candidate"]>["actio
   "resolve-conflicts": "Resolve conflicts",
   "address-review": "Address review",
   "address-comments": "Address comments",
+  "review-approval-note": "Review approval note",
 };
-
-const DISPATCH_STATUS: Record<Board["dispatch"]["attempts"][number]["status"], string> = {
-  launching: "Launching",
-  running: "Running",
-  verifying: "Verifying",
-  verified: "Verified",
-  "needs-you": "Needs you",
-  failed: "Failed",
-};
-
-function DispatchActivity({ dispatch, prLabels }: { dispatch: Board["dispatch"]; prLabels: Map<string, string> }) {
-  const navigate = useBbNavigate();
-  const attempts = [...dispatch.attempts].sort((a, b) => b.startedAt - a.startedAt);
-  const active = attempts.filter((attempt) => ["launching", "running", "verifying"].includes(attempt.status));
-  const needsYou = attempts.filter((attempt) => attempt.status === "needs-you");
-  const completed = attempts.filter((attempt) => attempt.status === "verified" || attempt.status === "failed");
-  const shown = [...active, ...needsYou, ...completed].slice(0, 3);
-  const hidden = attempts.length - shown.length;
-  if (dispatch.candidate === null && attempts.length === 0) return null;
-  return (
-    <div aria-live="polite" className="mx-auto flex w-full max-w-6xl flex-col gap-1.5 border-t border-border/40 px-4 py-2 text-[11.5px]">
-      {dispatch.candidate !== null ? (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className="shrink-0 font-medium text-foreground">{dispatch.mode === "shadow" ? "Preview candidate" : "Next candidate"}</span>
-          <span className="text-foreground">{DISPATCH_ACTION[dispatch.candidate.action]}</span>
-          <UrlLink href={dispatch.candidate.prUrl} className="min-w-0 max-w-full truncate underline underline-offset-2">{prLabels.get(dispatch.candidate.path) ?? dispatch.candidate.prUrl}</UrlLink>
-          <span className="min-w-0 text-muted-foreground">{dispatch.candidate.reason}</span>
-        </div>
-      ) : null}
-      {shown.map((attempt) => (
-        <div key={attempt.id} className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span className={cn("shrink-0 font-medium", attempt.status === "needs-you" || attempt.status === "failed" ? "text-amber-800 dark:text-amber-300" : "text-foreground")}>{DISPATCH_STATUS[attempt.status]}</span>
-          <span className="text-foreground">{DISPATCH_ACTION[attempt.action as keyof typeof DISPATCH_ACTION] ?? attempt.action}</span>
-          <UrlLink href={attempt.prUrl} className="min-w-0 max-w-full truncate underline underline-offset-2">{prLabels.get(attempt.path) ?? attempt.prUrl}</UrlLink>
-          {attempt.threadId !== null ? (
-            <button type="button" onClick={() => navigate.toThread(attempt.threadId!)} className="shrink-0 text-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Thread</button>
-          ) : null}
-          <span className="min-w-0 text-muted-foreground">{attempt.detail}</span>
-        </div>
-      ))}
-      {hidden > 0 ? <span className="text-muted-foreground">{hidden} older {hidden === 1 ? "outcome" : "outcomes"}</span> : null}
-    </div>
-  );
-}
 
 // ---- start a thread: never one click ------------------------------------------
 

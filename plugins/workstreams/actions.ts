@@ -8,7 +8,7 @@ import type { ThreadTier } from "./threads.js";
 import { RESULT_INSTRUCTION } from "./runs.js";
 
 /** Actions that need judgement, so they go to an agent thread. */
-export const AGENT_ACTIONS = ["investigate-ci", "resolve-conflicts", "address-review", "address-comments"] as const;
+export const AGENT_ACTIONS = ["investigate-ci", "resolve-conflicts", "address-review", "address-comments", "review-approval-note"] as const;
 export type AgentAction = (typeof AGENT_ACTIONS)[number];
 
 /** Mechanical GitHub actions the host runs directly, behind a confirm dialog. */
@@ -25,6 +25,7 @@ export const AGENT_LABEL: Record<AgentAction, string> = {
   "resolve-conflicts": "Resolve conflicts",
   "address-review": "Address review and reply",
   "address-comments": "Address comments and reply",
+  "review-approval-note": "Review approval note",
 };
 
 export const DIRECT_LABEL: Record<DirectAction, string> = {
@@ -50,6 +51,7 @@ export function primaryAction(
   if (section === "fix" && verb === "Resolve conflicts") return agent("resolve-conflicts");
   if (section === "respond" && verb === "Changes requested") return agent("address-review");
   if (section === "respond" && verb === "Approved, comments open") return agent("address-comments");
+  if (section === "respond" && verb === "Review approval note") return agent("review-approval-note");
   if (section === "merge" && verb === "Ready to merge") return direct("merge");
   if (section === "merge" && verb === "Update branch") return direct("update-branch");
   if (section === "waiting" && verb === "In review") return direct("nudge");
@@ -179,8 +181,78 @@ function actionBody(action: AgentAction, facts: PromptFacts): string {
       return `Changes were requested on ${pr}, branch ${branch}, checkout ${facts.path}. ${REVIEW_STEPS} Report back with a summary per thread.`;
     case "address-comments":
       return `${pr} is approved but has open review comments, branch ${branch}, checkout ${facts.path}. ${REVIEW_STEPS} Report back with a summary per thread. Do not merge. Report back whether the PR is ready to merge.`;
+    case "review-approval-note":
+      return `${pr} is approved with a written review note, branch ${branch}, checkout ${facts.path}. Read the approving review body and decide which points need code changes; leave informational points alone and explain why. Make focused fixes with relevant tests. Fetch the PR's base branch and integrate it before finishing: rebase if behind, resolve any conflicts preserving both sides' intent, and run the tests again. Commit and push the resulting work; use an exact --force-with-lease if rebased. Reply on the PR to the approving review note, mention its reviewer, and state what changed or why a point needs no change. Start that PR comment with "Approval note for @reviewer:" using the reviewer's actual login, and include the pushed head SHA so the follow-up is tied to the code you checked. After the push and reply, wait for checks to settle, then re-read the live PR state, review decision, unresolved threads, checks, and mergeStateStatus. Verify the PR is actually mergeable before reporting it ready; if any gate remains, name that gate and the next action. Do not merge. Report the fix, branch update, reply, test result, and live merge readiness.`;
     case "resolve-conflicts":
       return `${pr} has merge conflicts with its base. In checkout ${facts.path} on branch ${branch}, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it.`;
+  }
+}
+
+/** Short, default-instruction preview. Scan facts are observations, not live checks. */
+export function actionPreview(
+  action: AgentAction,
+  scan: {
+    checkConclusions?: readonly string[];
+    baseRefName?: string | null;
+    headRefName?: string | null;
+    latestReviews?: readonly { login: string; state: string }[];
+    unresolvedReviewThreads?: number | null;
+    approvalHasBody?: boolean;
+  } | null,
+): { steps: string[]; lastScan: string[] } {
+  const lastScan: string[] = [];
+  switch (action) {
+    case "investigate-ci": {
+      const checks = scan?.checkConclusions;
+      if (checks !== undefined) {
+        const failing = checks.filter((value) => value === "FAILURE" || value === "ERROR").length;
+        if (failing > 0) lastScan.push(`${failing} failing ${failing === 1 ? "check" : "checks"} of ${checks.length}`);
+      }
+      return { steps: ["Investigate the CI failure.", "Propose a fix and report what you found."], lastScan };
+    }
+    case "resolve-conflicts":
+      if (scan?.headRefName && scan.baseRefName) lastScan.push(`${scan.headRefName} → ${scan.baseRefName}`);
+      return {
+        steps: [
+          "Bring in the base branch and resolve conflicts, preserving both sides' intent.",
+          "Run the tests.",
+          "Push the result; use an exact --force-with-lease if rebased. Report the resolutions.",
+        ],
+        lastScan,
+      };
+    case "address-review":
+    case "address-comments": {
+      if (scan?.unresolvedReviewThreads !== null && scan?.unresolvedReviewThreads !== undefined) {
+        lastScan.push(`${scan.unresolvedReviewThreads} open review ${scan.unresolvedReviewThreads === 1 ? "thread" : "threads"}`);
+      }
+      if (action === "address-review") {
+        const reviewers = scan?.latestReviews?.filter((review) => review.state === "CHANGES_REQUESTED") ?? [];
+        if (reviewers.length > 0) {
+          const names = reviewers.slice(0, 3).map((review) => review.login).join(", ");
+          lastScan.push(`Changes requested by ${names}${reviewers.length > 3 ? ` and ${reviewers.length - 3} more` : ""}`);
+        }
+      }
+      return {
+        steps: [
+          "Fetch every review comment and thread; address each in the code.",
+          "Commit and push, then reply on every comment thread with what changed or why it did not.",
+          "Resolve only threads the pushed code demonstrably addresses; summarize each thread. Re-request review only if materially riskier.",
+          ...(action === "address-comments" ? ["Report whether the PR is ready to merge. Do not merge."] : []),
+        ],
+        lastScan,
+      };
+    }
+    case "review-approval-note":
+      return {
+        steps: [
+          "Review each approval note; fix actionable points and explain informational ones.",
+          "Fetch and integrate the base; rebase if behind and resolve conflicts preserving intent.",
+          "Run relevant tests, commit, and push; use an exact --force-with-lease after a rebase.",
+          "Reply on the PR to the approving reviewer with what changed or why no change was needed; include the pushed head SHA.",
+          "Wait for checks, then re-read live approval, threads, checks, and mergeability. Report remaining gates; do not merge.",
+        ],
+        lastScan: scan?.approvalHasBody ? ["Written approval note present"] : [],
+      };
   }
 }
 
@@ -201,6 +273,11 @@ export type LiveMergeFacts = {
   unresolvedThreads: number;
   /** True when there were more review threads than one page could count. */
   unresolvedAtLeast: boolean;
+  /** Written approving reviews from complete live review history, newest first. */
+  approvalNotes: { author: string; body: string; submittedAt: string; truncated: boolean }[];
+  approvalNotesMore: number;
+  /** False when GitHub could not provide the complete review history. */
+  approvalNotesComplete: boolean;
 };
 
 export type MergeVerdict = { refusals: string[]; warnings: string[] };

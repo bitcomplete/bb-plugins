@@ -40,10 +40,19 @@ function facts(overrides: Partial<InboxUnitFacts> = {}): InboxUnitFacts {
 }
 
 describe("inboxSection", () => {
+  it("shows a rebasing checkout and its PR as in flight even when GitHub still reports it approved and clean", () => {
+    const rebasing = facts({ lifecycle: "active", rebasing: true, pr: { mergedAt: null, mergeStateStatus: "CLEAN" } });
+    expect(inboxSection(rebasing, NOW)).toBe("in-flight");
+    expect(inboxVerb(rebasing, "in-flight")).toBe("Rebase in progress");
+    expect(primaryAction(rebasing, "in-flight", "Rebase in progress")).toBeNull();
+  });
+
   const cases: [Lifecycle, InboxSection, string][] = [
     ["blocked", "fix", "red CI is the one thing only a fix clears"],
     ["awaiting-followup", "respond", "the reviewer acted and the ball is with the author"],
+    ["awaiting-rereview", "waiting", "the author has posted a follow-up and the reviewer holds the next decision"],
     ["approved-with-comments", "respond", "approval hides comments the author still has to read"],
+    ["approved-with-note", "respond", "the written approval may contain an actionable note"],
     ["awaiting-merge", "merge", "one button stands between it and done"],
     ["awaiting-review", "waiting", "someone else holds it"],
     ["unverified", "waiting", "scan failure needs a visible rescan cue"],
@@ -155,6 +164,11 @@ describe("DIRTY (merge conflicts) in the inbox precedence", () => {
     expect(inboxSection(unit, NOW)).toBe("fix");
     expect(inboxVerb(unit, "fix")).toBe("Resolve conflicts");
   });
+  it("keeps a followed-up approval note with a live merge conflict out of Ready", () => {
+    const unit = facts({ lifecycle: "awaiting-merge", pr: { mergedAt: null, mergeStateStatus: "DIRTY" } });
+    expect(inboxSection(unit, NOW)).toBe("fix");
+    expect(inboxVerb(unit, "fix")).toBe("Resolve conflicts");
+  });
 
   it("is outranked by CI failing, because the fix and the reason are the same section either way", () => {
     const unit = facts({ lifecycle: "blocked", pr: { mergedAt: null, mergeStateStatus: "DIRTY" } });
@@ -187,7 +201,7 @@ describe("the recently merged window", () => {
   it("applies the same window to shipped", () => {
     const shipped = facts({ lifecycle: "shipped", pr: { mergedAt: new Date(NOW - DAY_MS).toISOString() } });
     expect(inboxSection(shipped, NOW)).toBe("shipped");
-    expect(inboxVerb(shipped, "shipped")).toBe("Release tagged");
+    expect(inboxVerb(shipped, "shipped")).toBe("In release tag");
   });
 
   it("parks merged work with no or unreadable merge time rather than inventing recency", () => {
@@ -210,6 +224,7 @@ describe("inboxVerb", () => {
   it("names the action in the row's own words", () => {
     expect(inboxVerb(facts({ lifecycle: "blocked" }), "fix")).toBe("CI failing");
     expect(inboxVerb(facts({ lifecycle: "awaiting-followup" }), "respond")).toBe("Changes requested");
+    expect(inboxVerb(facts({ lifecycle: "awaiting-rereview", pr: { mergeStateStatus: "BEHIND" } }), "waiting")).toBe("Awaiting re-review");
     expect(inboxVerb(facts({ lifecycle: "approved-with-comments" }), "respond")).toBe("Approved, comments open");
     expect(inboxVerb(facts({ lifecycle: "awaiting-merge" }), "merge")).toBe("Ready to merge");
     expect(inboxVerb(facts({ lifecycle: "awaiting-review" }), "waiting")).toBe("In review");
@@ -336,6 +351,17 @@ describe("matchesInboxQuery", () => {
       expect(matchesInboxQuery(row, query)).toBe(true);
     }
     expect(matchesInboxQuery(row, "colophon")).toBe(false);
+  });
+
+  it("finds an exact PR number alone, with #, or prefixed by its repo", () => {
+    const pr = { ...row, repo: "my-parsley", prNumber: 2846 };
+    for (const query of ["2846", "#2846", "MY-PARSLEY #2846", "my-parsley#2846"]) {
+      expect(matchesInboxQuery(pr, query)).toBe(true);
+    }
+    for (const query of ["#284", "12846", "another-repo #2846"]) {
+      expect(matchesInboxQuery(pr, query)).toBe(false);
+    }
+    expect(matchesInboxQuery({ ...pr, prNumber: null }, "#2846")).toBe(false);
   });
 });
 

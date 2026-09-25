@@ -4,12 +4,13 @@
 // click. The decisions themselves live in actions.ts, where they are tested.
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
+import { UrlLink, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type { Row } from "./inbox";
 import {
   AGENT_LABEL,
   DIRECT_LABEL,
+  actionPreview,
   actionPrompt,
   nudgeComment,
   type AgentAction,
@@ -17,6 +18,7 @@ import {
   type ThreadMode,
 } from "./actions";
 import { compactAge } from "./workstreams";
+import { defaultMessageTarget, orderMessageTargets } from "./threadmessage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -45,12 +47,16 @@ export type ActionRequest =
  */
 export function RowActionMenu({
   hasThreads,
+  hasOpenPr,
   onGoToThread,
+  onMessageAgent,
   onOpenCheckout,
   onNewThread,
 }: {
   hasThreads: boolean;
+  hasOpenPr: boolean;
   onGoToThread: () => void;
+  onMessageAgent: () => void;
   onOpenCheckout: () => void;
   onNewThread: () => void;
 }) {
@@ -102,11 +108,125 @@ export function RowActionMenu({
           className="absolute right-0 top-7 z-30 flex w-56 flex-col rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
         >
           {hasThreads ? item("Go to thread", "t", onGoToThread) : null}
+          {hasThreads && hasOpenPr ? item("Message agent", "", onMessageAgent) : null}
           {item("Open checkout", "o", onOpenCheckout)}
           {item("Start a new thread", "n", onNewThread)}
         </span>
       ) : null}
     </span>
+  );
+}
+
+const LINK_REASON = {
+  started: "Started from this workstream",
+  environment: "Uses this checkout or branch",
+  ticket: "Title names this ticket",
+  paths: "Worked in this checkout",
+} as const;
+
+/** A short user-authored instruction to one linked thread, with row context added by the server. */
+export function ThreadMessageDialog({
+  row,
+  threads,
+  onClose,
+}: {
+  row: Row | null;
+  threads: readonly Row["cluster"]["threads"][number][];
+  onClose: () => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [threadId, setThreadId] = useState("");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const ordered = orderMessageTargets(threads);
+  const option = (thread: (typeof ordered)[number]) => (
+    <option key={thread.id} value={thread.id}>
+      {thread.active ? "Running · " : ""}{thread.title} · {LINK_REASON[thread.tier]} · {thread.id}
+    </option>
+  );
+  useEffect(() => {
+    setThreadId(defaultMessageTarget(threads));
+    setMessage("");
+    setBusy(false);
+    setError(null);
+  }, [row]);
+
+  const send = async () => {
+    if (row === null || row.unit.pr === null || threadId === "" || message.trim() === "" || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await rpc.call("thread_message", { path: row.unit.path, prUrl: row.unit.pr.url, threadId, message: message.trim() });
+      if (!result.ok) {
+        setError(result.error);
+      } else {
+        toast.success(result.delivery === "queued" ? "Message queued for the agent" : "Message sent to the agent");
+        onClose();
+        return;
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+    setBusy(false);
+  };
+
+  return (
+    <Dialog open={row !== null} onOpenChange={(next) => (next ? null : onClose())}>
+      <DialogContent className={cn("max-w-lg", POINTER_CURSORS)}>
+        <DialogHeader>
+          <DialogTitle>Message an agent</DialogTitle>
+          <DialogDescription>{row === null ? null : <PrLine row={row} />}</DialogDescription>
+        </DialogHeader>
+        <label className="flex flex-col gap-1.5 text-[12.5px]">
+          <span className="font-medium">Agent thread</span>
+          <select
+            value={threadId}
+            onChange={(event) => setThreadId(event.target.value)}
+            className="w-full rounded-md border border-input bg-background px-2.5 py-2 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {threads.length === 1 ? null : <option value="">Choose a thread</option>}
+            {ordered.some((thread) => thread.tier === "started" || thread.tier === "environment") ? (
+              <optgroup label="Started here or same environment">
+                {ordered.filter((thread) => thread.tier === "started" || thread.tier === "environment").map(option)}
+              </optgroup>
+            ) : null}
+            {ordered.some((thread) => thread.tier === "ticket") ? (
+              <optgroup label="Title names this ticket">
+                {ordered.filter((thread) => thread.tier === "ticket").map(option)}
+              </optgroup>
+            ) : null}
+            {ordered.some((thread) => thread.tier === "paths") ? (
+              <optgroup label="Possible match · worked in checkout">
+                {ordered.filter((thread) => thread.tier === "paths").map(option)}
+              </optgroup>
+            ) : null}
+          </select>
+          <span className="text-[11.5px] text-muted-foreground">
+            Ticket and path matches are inferred. Choose the thread handling this PR.
+          </span>
+        </label>
+        <label className="flex flex-col gap-1.5 text-[12.5px]">
+          <span className="font-medium">What should the agent do?</span>
+          <textarea
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            maxLength={4_000}
+            rows={3}
+            placeholder="Rebase and nudge the PR with PTAL"
+            className="min-h-20 w-full resize-y rounded-md border border-input bg-background px-2.5 py-2 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </label>
+        <p className="text-[11.5px] text-muted-foreground">The agent also receives the PR link, title, and checkout path. BB starts a turn on an idle thread, steers a running one, or queues the message while the thread is waiting.</p>
+        <ErrorLine error={error} />
+        <DialogFooter className="gap-2">
+          <Button variant="ghost" disabled={busy} onClick={onClose}>Cancel</Button>
+          <Button disabled={busy || threadId === "" || message.trim() === ""} onClick={() => void send()}>
+            {busy ? "Sending…" : "Send message"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -201,7 +321,7 @@ export function MergeDialog({ row, onClose }: { row: Row | null; onClose: () => 
 
   return (
     <Dialog open={row !== null} onOpenChange={(next) => (next ? null : onClose())}>
-      <DialogContent className={cn("max-w-lg", POINTER_CURSORS)}>
+      <DialogContent className={cn("max-h-[calc(100dvh-2rem)] max-w-lg overflow-y-auto", POINTER_CURSORS)}>
         <DialogHeader>
           <DialogTitle>Merge pull request</DialogTitle>
           <DialogDescription>{row === null ? null : <PrLine row={row} />}</DialogDescription>
@@ -221,6 +341,22 @@ export function MergeDialog({ row, onClose }: { row: Row | null; onClose: () => 
                   Merge anyway
                 </label>
               </div>
+            ) : null}
+            {facts.live.approvalNotes.length > 0 || !facts.live.approvalNotesComplete ? (
+              <section aria-label="Written approval history" className="rounded-md border border-amber-500/40 bg-amber-500/[0.06] px-3 py-2 text-[12px]">
+                <p className="font-semibold">Written approval history</p>
+                <p className="mt-0.5 text-muted-foreground">These notes may have been addressed since the review. Check their requests before merging.</p>
+                <ul className="mt-2 max-h-[35vh] space-y-2 overflow-y-auto">
+                  {facts.live.approvalNotes.map((note, index) => (
+                    <li key={`${note.author}-${note.submittedAt}-${index}`} className="border-t border-border/60 pt-2 first:border-0 first:pt-0">
+                      <p className="text-muted-foreground">{note.author} · <time dateTime={note.submittedAt}>{new Date(note.submittedAt).toLocaleDateString()}</time></p>
+                      <blockquote className="mt-1 whitespace-pre-wrap break-words text-foreground">{note.body}{note.truncated ? "…" : ""}</blockquote>
+                    </li>
+                  ))}
+                </ul>
+                {facts.live.approvalNotesMore > 0 ? <p className="mt-2 text-muted-foreground">{facts.live.approvalNotesMore} older written {facts.live.approvalNotesMore === 1 ? "approval" : "approvals"} on GitHub.</p> : null}
+                {!facts.live.approvalNotesComplete ? <p className="mt-2 font-medium text-amber-800 dark:text-amber-300">Review history is incomplete. {row?.unit.pr === null || row === null ? "Check all reviews on GitHub" : <UrlLink href={row.unit.pr.url} className="underline underline-offset-2">Check all reviews on GitHub</UrlLink>} before merging.</p> : null}
+              </section>
             ) : null}
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[12.5px]">
               <Fact label="State" tone={facts.live.state === "OPEN" ? undefined : "bad"}>
@@ -499,6 +635,14 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
   };
   const ready =
     plan !== null && prompt.trim() !== "" && (mode === "new" || (chosen !== null && (mode !== "subthread" || chosen.canSpawnChild)));
+  const preview = request === null ? null : actionPreview(request.action, request.row.unit.pr);
+  const defaultPrompt = request === null ? "" : actionPrompt(request.action, {
+    repo: request.row.repo,
+    prNumber: request.row.unit.pr?.number ?? null,
+    title: request.row.unit.pr === null ? null : request.row.title,
+    branch: request.row.unit.branch,
+    path: request.row.unit.path,
+  });
 
   const run = async () => {
     if (request === null || !ready || busy) return;
@@ -526,7 +670,7 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
 
   return (
     <Dialog open={request !== null} onOpenChange={(next) => (next ? null : onClose())}>
-      <DialogContent className={cn("max-w-xl", POINTER_CURSORS)}>
+      <DialogContent className={cn("max-h-[calc(100dvh-2rem)] max-w-xl overflow-y-auto", POINTER_CURSORS)}>
         <DialogHeader>
           <DialogTitle>{request === null ? "" : AGENT_LABEL[request.action]}</DialogTitle>
           <DialogDescription>{request === null ? null : <PrLine row={request.row} />}</DialogDescription>
@@ -572,19 +716,36 @@ export function AgentDialog({ request, onClose }: { request: { action: AgentActi
             )}
           </>
         )}
-        <textarea
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              void run();
-            }
-          }}
-          aria-label="Prompt"
-          rows={7}
-          className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-[13px] leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        />
+        {preview === null ? null : (
+          <section aria-label="Action preview" className="space-y-2 rounded-md border border-border px-3 py-2.5 text-[12.5px]">
+            <h3 className="font-medium">Planned next steps for this {mode === "subthread" ? "subthread" : "thread"}</h3>
+            <ol className="list-decimal space-y-1 pl-5 leading-relaxed">
+              {preview.steps.map((step) => <li key={step}>{step}</li>)}
+            </ol>
+            {preview.lastScan.length > 0 ? (
+              <p className="text-muted-foreground">Last scan: {preview.lastScan.join(" · ")}</p>
+            ) : null}
+            {prompt !== defaultPrompt ? (
+              <p className="text-muted-foreground">This preview follows the default instructions. Your edits may change what the agent does.</p>
+            ) : null}
+          </section>
+        )}
+        <details className="group rounded-md border border-border px-3 py-2 text-[12.5px]">
+          <summary className="cursor-pointer font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">View or edit instructions</summary>
+          <textarea
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                void run();
+              }
+            }}
+            aria-label="Prompt"
+            rows={7}
+            className="mt-2 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-[13px] leading-relaxed outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </details>
         <ErrorLine error={error} />
         <DialogFooter className="gap-2">
           <Button variant="ghost" onClick={onClose} disabled={busy}>

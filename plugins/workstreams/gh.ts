@@ -87,6 +87,16 @@ export function latestReviewers(reviews: unknown): { login: string; state: strin
     .slice(0, 50);
 }
 
+/** Approval-body notes have no GitHub resolution state, unlike inline threads. */
+export function approvalHasBody(reviews: unknown): boolean {
+  return Array.isArray(reviews) && reviews.some((entry) => {
+    if (entry === null || typeof entry !== "object") return false;
+    const review = entry as Record<string, unknown>;
+    return typeof review.state === "string" && review.state.toUpperCase() === "APPROVED" &&
+      typeof review.body === "string" && review.body.trim() !== "";
+  });
+}
+
 /** `gh pr list --json mergeCommit` gives `{ oid }`, or null before a merge. */
 export function mergeCommitOf(value: unknown): string | null {
   if (value === null || typeof value !== "object") return null;
@@ -135,11 +145,16 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
     latestReviewStates: latestReviewStates(view.latestReviews),
     reviewRequests: parseReviewRequests(view.reviewRequests),
     latestReviews: latestReviewers(view.latestReviews),
+    approvalHasBody: approvalHasBody(view.latestReviews),
     unresolvedReviewThreads: null,
     resolvedReviewThreads: null,
     mergedAt:
       typeof view.mergedAt === "string" && !Number.isNaN(Date.parse(view.mergedAt))
         ? view.mergedAt.slice(0, 40)
+        : null,
+    createdAt:
+      typeof view.createdAt === "string" && !Number.isNaN(Date.parse(view.createdAt))
+        ? view.createdAt.slice(0, 40)
         : null,
     // The description is reduced to the ticket IDs it states, here, and dropped.
     ticketRefs: ticketRefsOf(view.body),

@@ -68,9 +68,9 @@ export function stackedArgv(target: PrTarget, headRefName: string): string[] {
 
 /** Constant: the only variables are passed as typed -f/-F fields, never spliced in. */
 export const REVIEW_THREADS_QUERY =
-  "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved}}}}}";
+  "query($owner:String!,$name:String!,$number:Int!,$includeFollowup:Boolean!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid author{login} reviews(last:100){pageInfo{hasPreviousPage}nodes{id state body submittedAt author{login} commit{oid}}} reviewThreads(first:100){pageInfo{hasNextPage}nodes{isResolved comments(first:1){nodes{pullRequestReview{id}}}}} comments(last:100) @include(if:$includeFollowup){pageInfo{hasPreviousPage}nodes{body createdAt author{login}}} commits(last:1) @include(if:$includeFollowup){nodes{commit{oid committedDate}}}}}}";
 
-export function threadsArgv(target: PrTarget): string[] {
+export function threadsArgv(target: PrTarget, includeFollowup = false): string[] {
   return [
     "api",
     "graphql",
@@ -83,6 +83,8 @@ export function threadsArgv(target: PrTarget): string[] {
     `name=${target.name}`,
     "-F",
     `number=${target.number}`,
+    "-F",
+    `includeFollowup=${includeFollowup}`,
   ];
 }
 
@@ -117,27 +119,125 @@ function json(run: Run): unknown {
 
 export type LiveRead = { ok: true; live: LiveMergeFacts } | { ok: false; error: string };
 
+export type ApprovalNote = { author: string; body: string; submittedAt: string; truncated: boolean };
+const APPROVAL_NOTE_MAX = 1_200;
+const APPROVAL_NOTES_SHOWN = 3;
+
+function approvalNotesOf(reviews: unknown): { notes: ApprovalNote[]; more: number; complete: boolean } {
+  const incomplete = { notes: [], more: 0, complete: false };
+  if (reviews === null || typeof reviews !== "object") return incomplete;
+  const page = reviews as { pageInfo?: { hasPreviousPage?: unknown }; nodes?: unknown };
+  if (typeof page.pageInfo?.hasPreviousPage !== "boolean" || !Array.isArray(page.nodes)) return incomplete;
+  const notes: ApprovalNote[] = [];
+  for (const entry of page.nodes) {
+    if (entry === null || typeof entry !== "object") return incomplete;
+    const review = entry as { state?: unknown; body?: unknown; submittedAt?: unknown; author?: { login?: unknown } };
+    if (review.state !== "APPROVED" || typeof review.body !== "string" || review.body.trim() === "") continue;
+    if (typeof review.author?.login !== "string" || typeof review.submittedAt !== "string" ||
+        Number.isNaN(Date.parse(review.submittedAt))) return incomplete;
+    const body = review.body.trim();
+    notes.push({ author: review.author.login.slice(0, 140), body: body.slice(0, APPROVAL_NOTE_MAX),
+      submittedAt: review.submittedAt, truncated: body.length > APPROVAL_NOTE_MAX });
+  }
+  notes.sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
+  return { notes: notes.slice(0, APPROVAL_NOTES_SHOWN), more: Math.max(0, notes.length - APPROVAL_NOTES_SHOWN), complete: !page.pageInfo.hasPreviousPage };
+}
+
 /** Read only the first page: a positive count is enough to block merge; an empty
  * page with more pages is unknown, never clear. */
-export async function readReviewThreads(run: GhRunner, target: PrTarget): Promise<{ ok: true; count: number; resolvedCount: number | null; hasNextPage: boolean } | { ok: false; error: string }> {
-  const result = await run(threadsArgv(target));
+export async function readReviewThreads(run: GhRunner, target: PrTarget, includeFollowup = false, includeApprovalNotes = false): Promise<{ ok: true; count: number; resolvedCount: number | null; hasNextPage: boolean; approvalNoteFollowedUp?: boolean; reviewFollowupPosted?: boolean; approvalNotes?: ApprovalNote[]; approvalNotesMore?: number; approvalNotesComplete?: boolean } | { ok: false; error: string }> {
+  const result = await run(threadsArgv(target, includeFollowup));
   if (!result.ok) return { ok: false, error: result.error };
-  const body = json(result) as { errors?: unknown; data?: { repository?: { pullRequest?: { reviewThreads?: unknown } } } } | undefined;
+  const body = json(result) as { errors?: unknown; data?: { repository?: { pullRequest?: { reviewThreads?: unknown; reviews?: unknown; headRefOid?: unknown; author?: unknown; comments?: unknown; commits?: unknown } } } } | undefined;
   if (body === undefined || body.errors !== undefined) return { ok: false, error: "GitHub did not return complete review thread data." };
-  const threads = body.data?.repository?.pullRequest?.reviewThreads as { pageInfo?: { hasNextPage?: unknown }; nodes?: unknown } | undefined;
+  const pr = body.data?.repository?.pullRequest;
+  const threads = pr?.reviewThreads as { pageInfo?: { hasNextPage?: unknown }; nodes?: unknown } | undefined;
   if (!Array.isArray(threads?.nodes) || typeof threads.pageInfo?.hasNextPage !== "boolean" ||
       !threads.nodes.every((node) => node !== null && typeof node === "object" && typeof node.isResolved === "boolean")) {
     return { ok: false, error: "GitHub did not return the PR's review threads." };
   }
-  const count = threads.nodes.filter((node) => node.isResolved === false).length;
+  const threadNodes = threads.nodes as { isResolved: boolean; comments?: { nodes?: { pullRequestReview?: { id?: string } }[] } }[];
+  const count = threadNodes.filter((node) => node.isResolved === false).length;
   if (count === 0 && threads.pageInfo.hasNextPage) {
     return { ok: false, error: "More review thread pages remain unread." };
+  }
+  const reviews = pr?.reviews as { pageInfo?: { hasPreviousPage?: unknown }; nodes?: unknown } | undefined;
+  const approvalHistory = includeApprovalNotes ? approvalNotesOf(reviews) : undefined;
+  let approvalNoteFollowedUp: boolean | undefined;
+  let reviewFollowupPosted: boolean | undefined;
+  if (count === 0 && !threads.pageInfo.hasNextPage && SHA.test(String(pr?.headRefOid)) &&
+      reviews?.pageInfo?.hasPreviousPage === false && Array.isArray(reviews.nodes)) {
+    // GitHub's latestReviews is per reviewer. Match that scope so a later
+    // empty review supersedes an old approval-body note from the same person.
+    const latest = new Map<string, { id?: string; state?: string; body?: string; submittedAt?: string; commit?: { oid?: string } }>();
+    let complete = true;
+    for (const review of reviews.nodes) {
+      const author = review?.author?.login;
+      const submittedAt = review?.submittedAt;
+      if (typeof author !== "string" || typeof submittedAt !== "string" || Number.isNaN(Date.parse(submittedAt))) {
+        complete = false;
+        break;
+      }
+      if ((latest.get(author)?.submittedAt ?? "") <= submittedAt) latest.set(author, review);
+    }
+    if (complete) {
+      const latestReviews = [...latest.entries()];
+      const writtenApprovals = latestReviews.map(([, review]) => review).filter((review) =>
+        review.state === "APPROVED" && typeof review.body === "string" && review.body.trim() !== "");
+      if (writtenApprovals.length > 0) {
+        const comments = pr?.comments as { nodes?: unknown } | undefined;
+        const commits = pr?.commits as { nodes?: unknown } | undefined;
+        const author = (pr?.author as { login?: unknown } | undefined)?.login;
+        const headCommit = Array.isArray(commits?.nodes) ? commits.nodes[0]?.commit : undefined;
+        const commentNodes = Array.isArray(comments?.nodes) ? comments.nodes as { author?: { login?: string }; createdAt?: string; body?: string }[] : [];
+        approvalNoteFollowedUp = writtenApprovals.every((review) => {
+          if (typeof review.id !== "string" || typeof review.commit?.oid !== "string") return false;
+          if (review.commit.oid !== pr?.headRefOid &&
+              threadNodes.some((thread) => thread.comments?.nodes?.[0]?.pullRequestReview?.id === review.id)) return true;
+          if (!includeFollowup || typeof author !== "string" || typeof review.submittedAt !== "string" ||
+              headCommit?.oid !== pr?.headRefOid || typeof headCommit?.committedDate !== "string" ||
+              Number.isNaN(Date.parse(headCommit.committedDate))) return false;
+          const reviewer = latestReviews.find(([, value]) => value === review)?.[0];
+          if (reviewer === undefined) return false;
+          return commentNodes.some((comment) =>
+            comment.author?.login === author && typeof comment.createdAt === "string" &&
+            Date.parse(comment.createdAt) > Date.parse(review.submittedAt!) &&
+            Date.parse(comment.createdAt) >= Date.parse(headCommit.committedDate) &&
+            typeof comment.body === "string" && /\bapproval\s+note\b/iu.test(comment.body) &&
+            comment.body.toLowerCase().includes(`@${reviewer.toLowerCase()}`) &&
+            comment.body.toLowerCase().includes(String(pr?.headRefOid).slice(0, 7).toLowerCase()));
+        });
+      }
+      if (includeFollowup && threadNodes.length > 0) {
+        const comments = pr?.comments as { nodes?: unknown } | undefined;
+        const commits = pr?.commits as { nodes?: unknown } | undefined;
+        const author = (pr?.author as { login?: unknown } | undefined)?.login;
+        const headCommit = Array.isArray(commits?.nodes) ? commits.nodes[0]?.commit : undefined;
+        const commentNodes = Array.isArray(comments?.nodes) ? comments.nodes as { author?: { login?: string }; createdAt?: string; body?: string }[] : null;
+        const requested = latestReviews.filter(([, review]) => review.state === "CHANGES_REQUESTED");
+        if (typeof author === "string" && commentNodes !== null &&
+            headCommit?.oid === pr?.headRefOid && typeof headCommit?.committedDate === "string" && requested.length > 0) {
+          reviewFollowupPosted = requested.every(([reviewer, review]) =>
+            typeof review.submittedAt === "string" &&
+            Date.parse(headCommit.committedDate) > Date.parse(review.submittedAt) &&
+            commentNodes.some((comment) =>
+              comment?.author?.login === author && typeof comment.createdAt === "string" &&
+              Date.parse(comment.createdAt) > Date.parse(review.submittedAt!) &&
+              Date.parse(comment.createdAt) >= Date.parse(headCommit.committedDate) &&
+              typeof comment.body === "string" && /\bPTAL\b/iu.test(comment.body) &&
+              comment.body.toLowerCase().includes(`@${reviewer.toLowerCase()}`)));
+        }
+      }
+    }
   }
   return {
     ok: true,
     count,
-    resolvedCount: threads.pageInfo.hasNextPage ? null : threads.nodes.length - count,
+    resolvedCount: threads.pageInfo.hasNextPage ? null : threadNodes.length - count,
     hasNextPage: threads.pageInfo.hasNextPage,
+    ...(approvalNoteFollowedUp === undefined ? {} : { approvalNoteFollowedUp }),
+    ...(reviewFollowupPosted === undefined ? {} : { reviewFollowupPosted }),
+    ...(approvalHistory === undefined ? {} : { approvalNotes: approvalHistory.notes, approvalNotesMore: approvalHistory.more, approvalNotesComplete: approvalHistory.complete }),
   };
 }
 
@@ -154,7 +254,7 @@ export async function readLiveMerge(run: GhRunner, target: PrTarget): Promise<Li
   const head = typeof view.headRefName === "string" && !view.headRefName.startsWith("-") ? view.headRefName : null;
   const [stacked, threads] = await Promise.all([
     head === null ? Promise.resolve<Run>({ ok: true, stdout: "[]" }) : run(stackedArgv(target, head)),
-    readReviewThreads(run, target),
+    readReviewThreads(run, target, false, true),
   ]);
   if (!stacked.ok) return { ok: false, error: `Could not check for stacked PRs: ${stacked.error}` };
   if (!threads.ok) return { ok: false, error: `Could not count unresolved review threads: ${threads.error}` };
@@ -172,6 +272,9 @@ export async function readLiveMerge(run: GhRunner, target: PrTarget): Promise<Li
         : [],
       unresolvedThreads: threads.count,
       unresolvedAtLeast: threads.hasNextPage,
+      approvalNotes: threads.approvalNotes ?? [],
+      approvalNotesMore: threads.approvalNotesMore ?? 0,
+      approvalNotesComplete: threads.approvalNotesComplete ?? false,
     },
   };
 }

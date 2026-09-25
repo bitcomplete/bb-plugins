@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupInboxRows, visibleInboxRows } from "./inbox-grouping.js";
+import { groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows } from "./inbox-grouping.js";
 import type { Row } from "./inbox.js";
 import type { InboxSection } from "./workstreams.js";
 
@@ -47,5 +47,19 @@ describe("Board grouping", () => {
     const groups = groupInboxRows(filtered, "effort");
     expect(visibleInboxRows(groups, () => true).map((entry) => entry.key)).toEqual(["p1", "p4"]);
     expect(visibleInboxRows(groups, (group) => group.key !== "effort-a").map((entry) => entry.key)).toEqual(["p4"]);
+  });
+
+  it("counts merged and release-tagged rows across recent and parked sections after filtering", () => {
+    const merged = { ...row("p5", "effort-a", "Payments", "shipped", 1), unit: { lifecycle: "merged" } } as Row;
+    const olderMerged = { ...row("p6", "effort-a", "Payments", "parked", 1), unit: { lifecycle: "merged" } } as Row;
+    const tagged = { ...row("p7", "effort-a", "Payments", "parked", 1), unit: { lifecycle: "shipped" } } as Row;
+    const filtered = new Map<InboxSection, Row[]>([["fix", [older]], ["shipped", [merged]], ["parked", [olderMerged, tagged]]]);
+    const completed = partitionCompletedRows(filtered);
+    expect(completed.merged.map((entry) => entry.key)).toEqual(["p5", "p6"]);
+    expect(completed.inReleaseTag.map((entry) => entry.key)).toEqual(["p7"]);
+    expect(groupInboxRows(completed.active, "effort").flatMap((group) => group.rows.map((entry) => entry.key))).toEqual(["p1"]);
+    expect(visibleCompletedRows(completed, { merged: false, inReleaseTag: false })).toEqual([]);
+    expect(visibleCompletedRows(completed, { merged: true, inReleaseTag: false }).map((entry) => entry.key)).toEqual(["p5", "p6"]);
+    expect(visibleCompletedRows(completed, { merged: true, inReleaseTag: true }).map((entry) => entry.key)).toEqual(["p5", "p6", "p7"]);
   });
 });

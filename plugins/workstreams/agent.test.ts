@@ -129,6 +129,9 @@ function liveFacts(overrides: Partial<LiveMergeFacts> = {}): LiveMergeFacts {
     stackedAbove: [],
     unresolvedThreads: 0,
     unresolvedAtLeast: false,
+    approvalNotes: [],
+    approvalNotesMore: 0,
+    approvalNotesComplete: true,
     ...overrides,
   };
 }

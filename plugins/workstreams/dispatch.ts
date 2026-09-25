@@ -38,7 +38,7 @@ export function gateOf(pr: NonNullable<Board["groups"][number]["clusters"][numbe
   { action: AgentAction; reason: string } | null {
   if (pr.checkConclusions.some((check) => BAD_CHECKS.has(check))) return { action: "investigate-ci", reason: "CI checks are failing" };
   if (pr.mergeStateStatus === "DIRTY") return { action: "resolve-conflicts", reason: "PR has merge conflicts" };
-  if (pr.reviewDecision === "CHANGES_REQUESTED" || pr.latestReviewStates.includes("CHANGES_REQUESTED")) {
+  if (!pr.reviewFollowupPosted && (pr.reviewDecision === "CHANGES_REQUESTED" || pr.latestReviewStates.includes("CHANGES_REQUESTED"))) {
     return { action: "address-review", reason: "Reviewers requested changes" };
   }
   if (pr.unresolvedReviewThreads !== null && pr.unresolvedReviewThreads > 0) {
@@ -50,7 +50,8 @@ export function gateOf(pr: NonNullable<Board["groups"][number]["clusters"][numbe
 export function gateStillOpen(pr: NonNullable<Board["groups"][number]["clusters"][number]["units"][number]["pr"]>, action: string): boolean {
   if (action === "investigate-ci") return pr.checkConclusions.some((check) => BAD_CHECKS.has(check));
   if (action === "resolve-conflicts") return pr.mergeStateStatus === "DIRTY";
-  if (action === "address-review") return pr.reviewDecision === "CHANGES_REQUESTED" || pr.latestReviewStates.includes("CHANGES_REQUESTED");
+  if (action === "address-review") return !pr.reviewFollowupPosted &&
+    (pr.reviewDecision === "CHANGES_REQUESTED" || pr.latestReviewStates.includes("CHANGES_REQUESTED"));
   if (action === "address-comments") return pr.unresolvedReviewThreads === null || pr.unresolvedReviewThreads > 0;
   return true;
 }
@@ -58,7 +59,7 @@ export function gateStillOpen(pr: NonNullable<Board["groups"][number]["clusters"
 function fingerprint(unit: Board["groups"][number]["clusters"][number]["units"][number], action: AgentAction): string {
   const pr = unit.pr!;
   return JSON.stringify([pr.url, action, unit.lastCommitAt, pr.checkConclusions, pr.mergeStateStatus,
-    pr.reviewDecision, pr.latestReviewStates, pr.unresolvedReviewThreads]);
+    pr.reviewDecision, pr.latestReviewStates, pr.unresolvedReviewThreads, pr.reviewFollowupPosted]);
 }
 
 export function selectCandidate(
@@ -74,7 +75,7 @@ export function selectCandidate(
   }
   for (const cluster of effort.clusters) for (const unit of [...cluster.units].sort((a, b) => a.path.localeCompare(b.path))) {
     const pr = unit.pr;
-    if (unit.dirty || (unit.stack !== null && unit.stack.blockedBelow !== null) ||
+    if (unit.dirty || unit.rebasing || (unit.stack !== null && unit.stack.blockedBelow !== null) ||
       unit.observed?.status !== true || unit.observed?.pr !== true || pr === null || pr.state !== "OPEN" ||
       pr.isDraft || pr.mergeStateStatus === "UNKNOWN" || counts.get(pr.url) !== 1 ||
       cluster.threads.some((thread) => thread.active) ||

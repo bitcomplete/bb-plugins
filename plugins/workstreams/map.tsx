@@ -116,7 +116,9 @@ type Paint = {
 const PAINT: Record<Lifecycle, Paint> = {
   blocked: { ring: "text-rose-500", fill: null, dot: "bg-rose-500" },
   "awaiting-followup": { ring: "text-rose-500", fill: null, dot: "bg-orange-500" },
+  "awaiting-rereview": { ring: "text-indigo-400", fill: null, dot: "bg-amber-500" },
   "approved-with-comments": { ring: "text-rose-500", fill: null, dot: "bg-amber-500" },
+  "approved-with-note": { ring: "text-rose-500", fill: null, dot: "bg-amber-500" },
   "awaiting-merge": { ring: "text-rose-500", fill: null, dot: "bg-emerald-500" },
   "awaiting-review": { ring: "text-indigo-400", fill: null, dot: "bg-indigo-400" },
   active: { ring: "text-blue-500", fill: "bg-blue-500/30", dot: "bg-blue-500" },
@@ -1294,7 +1296,9 @@ const UnitList = memo(function UnitList({
               <span
                 role="img"
                 aria-label={TONE[unit.lifecycle].label}
-                title={TONE[unit.lifecycle].label}
+                title={unit.lifecycle === "shipped"
+                  ? "In release tag: merge commit is in a local release tag; deployment is not verified."
+                  : TONE[unit.lifecycle].label}
                 className={cn(
                   "absolute left-1 top-1/2 size-[7px] -translate-y-1/2 rounded-full",
                   PAINT[unit.lifecycle].dot,
@@ -2869,6 +2873,11 @@ export function MapView({
                   ? `${hoverFacts.hotCount === 0 ? "Nothing needs you" : `${hoverFacts.hotCount} ${hoverFacts.hotCount === 1 ? "needs" : "need"} you`} · ${hoverCircle.data.group.total} checkouts`
                   : `${TONE[hoverFacts.lifecycle].label} · ${hoverCircle.data.cluster.units.length} ${hoverCircle.data.cluster.units.length === 1 ? "checkout" : "checkouts"}${hoverFacts.stuck ? "" : ` · last commit ${STALE_WORDS[hoverFacts.staleness]}`}`}
               </p>
+              {hoverCircle.data.kind === "cluster" && hoverFacts.lifecycle === "shipped" ? (
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Merge commit is in a local release tag; deployment is not verified.
+                </p>
+              ) : null}
               {hoverTicketSources === null ? null : (
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   Ticket found in {hoverTicketSources}

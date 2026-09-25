@@ -11,13 +11,15 @@ import { ticketFinder, type TicketSource } from "./tickets.js";
  * hierarchy. The Board's inbox is the one list that sorts by next action (see
  * `inboxSection`), and it uses its own section order, not this one.
  *
- * `closed` preserves abandoned work so a closed PR still renders under Done.
- * It is excluded from the attention rail by `ACTIONABLE`.
+ * `closed` remains a lifecycle for persisted state, but abandoned PRs are
+ * omitted from the board before grouping.
  */
 export const LIFECYCLES = [
   "blocked",
   "awaiting-followup",
+  "awaiting-rereview",
   "approved-with-comments",
+  "approved-with-note",
   "awaiting-merge",
   "awaiting-review",
   "unverified",
@@ -39,7 +41,9 @@ export const LIFECYCLE_GROUPS = {
   waiting: [
     "blocked",
     "awaiting-followup",
+    "awaiting-rereview",
     "approved-with-comments",
+    "approved-with-note",
     "awaiting-merge",
     "awaiting-review",
     "unverified",
@@ -299,6 +303,9 @@ export function unitLifecycle(unit: RawUnit): Lifecycle {
     return unit.shipped === true ? "shipped" : "merged";
   }
   if (pr.state === "CLOSED") return "closed";
+  // GitHub still describes the remote head while a local rebase is replaying
+  // commits. Keep its PR visible, but do not describe this checkout as ready.
+  if (unit.rebasing) return unit.observed?.status === false ? "unverified" : "active";
   // A draft is still open, so the WAITING rules below would otherwise claim it.
   // Red checks on a draft are expected rather than actionable, so a draft stays
   // in the ACTIVE group and never competes with a genuinely blocked PR.
@@ -307,10 +314,11 @@ export function unitLifecycle(unit: RawUnit): Lifecycle {
   // Changes requested is NOT blocked: the reviewer already acted and the ball
   // is with the author. Merging the two would hide the one state the user can
   // clear on their own.
-  if (pr.reviewDecision === "CHANGES_REQUESTED") return "awaiting-followup";
+  if (pr.reviewDecision === "CHANGES_REQUESTED") return pr.reviewFollowupPosted ? "awaiting-rereview" : "awaiting-followup";
   if (pr.reviewDecision === "APPROVED") {
     if (pr.unresolvedReviewThreads === null) return "unverified";
     if (pr.unresolvedReviewThreads > 0) return "approved-with-comments";
+    if (pr.approvalHasBody && !pr.approvalNoteFollowedUp) return "approved-with-note";
     if (checksGreen(pr.checkConclusions)) return "awaiting-merge";
   }
   return "awaiting-review";
@@ -638,8 +646,11 @@ export function buildBoard(
   const workstreamOf = new Map<string, string>();
   const all: Unit[] = [];
 
-  const findTicket = ticketFinder(options.pattern, rawUnits, { teams: options.teams, linkbacks: options.linkbacks });
-  for (const raw of rawUnits) {
+  // A closed PR is no longer work for the board, even when its checkout has
+  // local changes. A later branch with no closed PR association still appears.
+  const boardUnits = rawUnits.filter((raw) => raw.pr?.state !== "CLOSED");
+  const findTicket = ticketFinder(options.pattern, boardUnits, { teams: options.teams, linkbacks: options.linkbacks });
+  for (const raw of boardUnits) {
     const found = findTicket(raw);
     const ticket = found?.ticket ?? null;
     const surfaces = classifySurfaces(raw.changedPaths, rules);
@@ -1040,6 +1051,7 @@ export const ACTIONABLE: readonly Lifecycle[] = [
   "blocked",
   "awaiting-followup",
   "approved-with-comments",
+  "approved-with-note",
   "awaiting-merge",
 ];
 
@@ -1137,7 +1149,9 @@ export function rollupSentence(clusters: Cluster[]): string {
 
   for (const [lifecycle, phrase] of [
     ["awaiting-followup", "waiting on your changes"],
+    ["awaiting-rereview", "waiting on another review"],
     ["approved-with-comments", "approved with open comments"],
+    ["approved-with-note", "approved with a review note"],
     ["awaiting-review", "awaiting review"],
     ["active", "being edited"],
     ["in-progress", "in draft"],
@@ -1983,6 +1997,7 @@ export const RECENTLY_SHIPPED_DAYS = 7;
 export type InboxUnitFacts = {
   ticket: string | null;
   lifecycle: Lifecycle;
+  rebasing?: boolean;
   stack: { blockedBelow: number | null } | null;
   pr: { mergedAt?: string | null; mergeStateStatus?: MergeStateStatus } | null;
   observed?: RawUnit["observed"];
@@ -2020,7 +2035,9 @@ function mergedWithin(mergedAt: string | null | undefined, now: number): boolean
  */
 const OPEN_PR_LIFECYCLES = new Set<Lifecycle>([
   "awaiting-followup",
+  "awaiting-rereview",
   "approved-with-comments",
+  "approved-with-note",
   "awaiting-merge",
   "awaiting-review",
   "unverified",
@@ -2078,13 +2095,17 @@ function mergeReadiness(status: MergeStateStatus | undefined): { section: InboxS
  */
 export function inboxSection(unit: InboxUnitFacts, now: number): InboxSection {
   if (isTicketlessClone(unit)) return "parked";
+  if (unit.rebasing && unit.pr !== null && unit.lifecycle === "active") return "in-flight";
   if (waitingBehind(unit) !== null) return "waiting";
   if (unit.lifecycle === "blocked") return "fix";
   if (hasUnresolvedConflict(unit)) return "fix";
   switch (unit.lifecycle) {
     case "awaiting-followup":
     case "approved-with-comments":
+    case "approved-with-note":
       return "respond";
+    case "awaiting-rereview":
+      return "waiting";
     case "awaiting-merge":
       return mergeReadiness(unit.pr?.mergeStateStatus).section;
     case "awaiting-review":
@@ -2105,12 +2126,14 @@ export function inboxSection(unit: InboxUnitFacts, now: number): InboxSection {
 const VERB: Partial<Record<Lifecycle, string>> = {
   blocked: "CI failing",
   "awaiting-followup": "Changes requested",
+  "awaiting-rereview": "Awaiting re-review",
   "approved-with-comments": "Approved, comments open",
+  "approved-with-note": "Review approval note",
   "awaiting-review": "In review",
   unverified: "Status unavailable",
   active: "Editing",
   "in-progress": "In progress",
-  shipped: "Release tagged",
+  shipped: "In release tag",
   merged: "Merged",
 };
 
@@ -2122,6 +2145,7 @@ const VERB: Partial<Record<Lifecycle, string>> = {
  */
 export function inboxVerb(unit: InboxUnitFacts, section: InboxSection): string | null {
   if (section === "parked") return null;
+  if (unit.rebasing && unit.pr !== null && unit.lifecycle === "active") return "Rebase in progress";
   const behind = waitingBehind(unit);
   if (behind !== null) return `Behind #${behind}`;
   if (hasUnresolvedConflict(unit)) return "Resolve conflicts";
@@ -2249,16 +2273,20 @@ export function byInboxOrder(a: InboxOrderFacts, b: InboxOrderFacts): number {
   );
 }
 
-/** Case-insensitive substring over ticket, title, repo and effort. */
+/** Case-insensitive text search plus exact PR number, with optional repo prefix. */
 export function matchesInboxQuery(
-  row: { ticket: string | null; title: string; repo: string; effort: string },
+  row: { ticket: string | null; title: string; repo: string; effort: string; prNumber?: number | null },
   query: string,
 ): boolean {
   const needle = query.trim().toLowerCase();
   if (needle === "") return true;
-  return [row.ticket ?? "", row.title, row.repo, row.effort].some((field) =>
+  if ([row.ticket ?? "", row.title, row.repo, row.effort].some((field) =>
     field.toLowerCase().includes(needle),
-  );
+  )) return true;
+  if (row.prNumber === null || row.prNumber === undefined) return false;
+  if (/^#?\d+$/.test(needle)) return Number(needle.replace(/^#/, "")) === row.prNumber;
+  const withRepo = /^(.+?)\s*#(\d+)$/.exec(needle);
+  return withRepo !== null && withRepo[1]!.trim() === row.repo.toLowerCase() && Number(withRepo[2]) === row.prNumber;
 }
 
 // ---- starting a thread -----------------------------------------------------

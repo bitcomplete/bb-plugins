@@ -99,6 +99,13 @@ describe("parseTicket", () => {
 });
 
 describe("unitLifecycle", () => {
+  it("keeps a PR visible during a detached rebase without claiming its remote approval makes the local checkout ready", () => {
+    const rebasing = unit({ branch: "dev/abc-101-show-gift-card-balance", rebasing: true, dirty: true,
+      pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], mergeStateStatus: "CLEAN" }) });
+    expect(unitLifecycle(rebasing)).toBe("active");
+    expect(unitLifecycle({ ...rebasing, observed: { status: false, pr: true } })).toBe("unverified");
+  });
+
   it("calls a merged PR merged regardless of check or review state, because the work already landed", () => {
     expect(
       unitLifecycle(
@@ -155,6 +162,14 @@ describe("unitLifecycle", () => {
     ).toBe("blocked");
   });
 
+  it("waits for another review after the author posts a verified follow-up without erasing GitHub's changes-requested decision", () => {
+    const reviewed = pr({ reviewDecision: "CHANGES_REQUESTED", reviewFollowupPosted: true, mergeStateStatus: "BEHIND" });
+    expect(unitLifecycle(unit({ pr: reviewed }))).toBe("awaiting-rereview");
+    expect(reviewed.reviewDecision).toBe("CHANGES_REQUESTED");
+    expect(reviewed.mergeStateStatus).toBe("BEHIND");
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "CHANGES_REQUESTED" }) }))).toBe("awaiting-followup");
+  });
+
   it("keeps an approved PR with a historical COMMENTED review ready to merge after all threads resolve", () => {
     expect(
       unitLifecycle(
@@ -174,6 +189,16 @@ describe("unitLifecycle", () => {
   it("keeps an approved, green PR out of Merge while a thread is unresolved or its resolution is unknown", () => {
     expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["COMMENTED", "APPROVED"], unresolvedReviewThreads: 1 }) }))).toBe("approved-with-comments");
     expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: ["SUCCESS"], latestReviewStates: ["COMMENTED", "APPROVED"], unresolvedReviewThreads: null }) }))).toBe("unverified");
+  });
+
+  it("keeps a written approval in Respond even when GitHub reports zero inline threads", () => {
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", approvalHasBody: true, unresolvedReviewThreads: 0 }) }))).toBe("approved-with-note");
+  });
+
+  it("lets resolved inline feedback supersede its approval summary without erasing the note's history", () => {
+    const reviewed = pr({ reviewDecision: "APPROVED", approvalHasBody: true, approvalNoteFollowedUp: true, unresolvedReviewThreads: 0, resolvedReviewThreads: 6 });
+    expect(unitLifecycle(unit({ pr: reviewed }))).toBe("awaiting-merge");
+    expect(reviewed.approvalHasBody).toBe(true);
   });
 
   it("calls an approved PR with green checks and no open comments awaiting-merge, because it is waiting on nothing but a button", () => {
@@ -380,6 +405,33 @@ describe("buildBoard", () => {
       options,
     );
     expect(board[0]?.clusters[0]?.lifecycle).toBe("awaiting-followup");
+  });
+
+  it("excludes closed PRs before grouping, so abandoned work cannot add a Map node or consume Board attention", () => {
+    const board = buildBoard([
+      unit({ path: "/c/closed-only", branch: "dev/abc-102-abandoned", pr: pr({ state: "CLOSED", number: 1 }) }),
+      unit({ path: "/c/closed-same-ticket", pr: pr({ state: "CLOSED", number: 2, checkConclusions: ["FAILURE"] }) }),
+      unit({ path: "/c/open", pr: pr({ number: 3, reviewDecision: "APPROVED" }) }),
+      unit({ path: "/c/merged", pr: pr({ state: "MERGED", number: 4 }) }),
+      unit({ path: "/c/tagged", pr: pr({ state: "MERGED", number: 5 }), shipped: true }),
+    ], options);
+    expect(board.flatMap((group) => group.clusters.map((cluster) => cluster.ticket))).toEqual(["ABC-101"]);
+    expect(board[0]?.clusters[0]?.units).toHaveLength(3);
+    expect(board[0]?.clusters[0]?.units.map((entry) => [entry.path, entry.lifecycle])).toEqual(expect.arrayContaining([
+      ["/c/merged", "merged"],
+      ["/c/open", "awaiting-merge"],
+      ["/c/tagged", "shipped"],
+    ]));
+  });
+
+  it("ignores a closed PR even when its checkout is dirty or ahead, while a separate local branch remains visible", () => {
+    const board = buildBoard([
+      unit({ path: "/c/dirty-closed", dirty: true, pr: pr({ state: "CLOSED" }) }),
+      unit({ path: "/c/ahead-closed", ahead: 2, pr: pr({ state: "CLOSED" }) }),
+      unit({ path: "/c/new-local", pr: null, dirty: true }),
+    ], options);
+    expect(board.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.map((entry) => entry.path)))).toEqual(["/c/new-local"]);
+    expect(board[0]?.clusters[0]?.lifecycle).toBe("active");
   });
 
   it("gives every unparseable checkout its own Unsorted cluster, because they share nothing but the absence of a ticket", () => {

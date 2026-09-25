@@ -1,9 +1,9 @@
 // Per-machine scanning. Runs in the BB host worker, so node:child_process and
 // node:fs are available here and only here.
 import { execFile } from "node:child_process";
-import { readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract, type GroupNaming, type RawUnit } from "./contract.js";
@@ -17,6 +17,7 @@ import {
 } from "./gh.js";
 import { prTarget, readLiveMerge, readReviewThreads, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
 import { namingResponse, type NamedGroupRow } from "./naming.js";
+import { checkoutBranch } from "./rebase.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
@@ -82,6 +83,35 @@ async function git(
   return result.ok ? result.stdout.trim() : null;
 }
 
+/** Read only Git's per-worktree rebase metadata, not a reflog guess. */
+async function rebaseHeadName(
+  path: string,
+  kind: "rebase-merge" | "rebase-apply",
+  signal: AbortSignal,
+): Promise<{ present: boolean; name: string | null }> {
+  const gitPath = await git(["rev-parse", "--git-path", `${kind}/head-name`], path, signal);
+  if (gitPath === null || gitPath === "") return { present: false, name: null };
+  try {
+    const name = await readFile(isAbsolute(gitPath) ? gitPath : join(path, gitPath), "utf8");
+    return { present: true, name: name.slice(0, 500) };
+  } catch (error) {
+    return { present: (error as NodeJS.ErrnoException).code !== "ENOENT", name: null };
+  }
+}
+
+async function localBranchState(path: string, signal: AbortSignal): Promise<{ branch: string | null; rebasing: boolean } | null> {
+  const head = await git(["rev-parse", "--abbrev-ref", "HEAD"], path, signal);
+  if (head === null) return null;
+  // Normal checkouts add no rebase metadata probes to a scan or a preflight.
+  const rebaseHeads = head === "HEAD"
+    ? await Promise.all([
+        rebaseHeadName(path, "rebase-merge", signal),
+        rebaseHeadName(path, "rebase-apply", signal),
+      ])
+    : [];
+  return checkoutBranch(head, rebaseHeads);
+}
+
 async function isUnit(path: string): Promise<boolean> {
   // `.git` is a directory in a normal clone and a file in a worktree.
   try {
@@ -125,7 +155,7 @@ function defaultBranchResolver(signal: AbortSignal) {
 }
 
 const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,reviewRequests,body";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,mergeCommit,mergedAt,createdAt,reviewRequests,body";
 
 /** Version-shaped local tags used as a release marker. */
 const RELEASE_TAG = /^v?\d+(\.\d+){0,3}$/u;
@@ -215,24 +245,26 @@ async function inspect(
     path: string,
     mergeCommit: string | null,
   ) => Promise<boolean | null>,
-  reviewThreadsOf: (url: string) => Promise<Awaited<ReturnType<typeof readReviewThreads>>>,
+  reviewThreadsOf: (url: string, includeFollowup: boolean) => Promise<Awaited<ReturnType<typeof readReviewThreads>>>,
   warn: (message: string) => void,
   signal: AbortSignal,
 ): Promise<RawUnit> {
   const dirName = path.split("/").filter(Boolean).pop() ?? path;
-  const [remote, branch, status, upstream, lastCommitAt] = await Promise.all([
+  const [remote, local, status, upstream, lastCommitAt] = await Promise.all([
     git(["remote", "get-url", "origin"], path, signal),
-    git(["rev-parse", "--abbrev-ref", "HEAD"], path, signal),
+    localBranchState(path, signal),
     git(["status", "--porcelain"], path, signal),
     git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], path, signal),
     git(["log", "-1", "--format=%cI"], path, signal),
   ]);
+  const { branch, rebasing } = local ?? { branch: null, rebasing: false };
   const counts = upstream === null ? null : parseAheadBehind(upstream);
   const unit: RawUnit = {
     path,
     dirName,
     repo: remote === null ? null : repoFromRemote(remote),
-    branch: branch === null || branch === "" ? null : branch,
+    branch,
+    rebasing,
     dirty: status !== null && status !== "",
     observed: { status: status !== null, pr: false },
     ahead: counts?.ahead ?? null,
@@ -279,12 +311,16 @@ async function inspect(
   }
   unit.observed = { status: status !== null, pr: true };
   unit.pr = parsed.pr;
-  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft && parsed.pr.reviewDecision === "APPROVED") {
-    const threads = await reviewThreadsOf(parsed.pr.url);
+  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft &&
+      (parsed.pr.reviewDecision === "APPROVED" || parsed.pr.reviewDecision === "CHANGES_REQUESTED")) {
+    const threads = await reviewThreadsOf(parsed.pr.url,
+      parsed.pr.reviewDecision === "CHANGES_REQUESTED" || parsed.pr.approvalHasBody === true);
     if (!threads.ok) warn(`${dirName}: cannot check PR review threads: ${threads.error}`);
     else {
       unit.pr.unresolvedReviewThreads = threads.count;
       unit.pr.resolvedReviewThreads = threads.resolvedCount;
+      unit.pr.approvalNoteFollowedUp = threads.approvalNoteFollowedUp;
+      unit.pr.reviewFollowupPosted = threads.reviewFollowupPosted;
     }
   }
   if (parsed.pr.state === "MERGED") {
@@ -483,14 +519,15 @@ export async function inspectAll(
   const defaultBranchOf = defaultBranchResolver(signal);
   const shippedOf = shippedResolver(warn, signal);
   const threadReads = new Map<string, Promise<Awaited<ReturnType<typeof readReviewThreads>>>>();
-  const reviewThreadsOf = (url: string): Promise<Awaited<ReturnType<typeof readReviewThreads>>> => {
-    const cached = threadReads.get(url);
+  const reviewThreadsOf = (url: string, includeFollowup: boolean): Promise<Awaited<ReturnType<typeof readReviewThreads>>> => {
+    const key = `${url}:${includeFollowup}`;
+    const cached = threadReads.get(key);
     if (cached !== undefined) return cached;
     const target = prTarget(url);
     const pending = target === null
       ? Promise.resolve({ ok: false as const, error: "invalid PR URL" })
-      : readReviewThreads(ghRunner(signal), target);
-    threadReads.set(url, pending);
+      : readReviewThreads(ghRunner(signal), target, includeFollowup);
+    threadReads.set(key, pending);
     return pending;
   };
   const units = await mapBounded(paths, async (path) => {
@@ -512,6 +549,13 @@ export async function inspectAll(
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
+    checkoutState: async ({ path }, context) => {
+      if (!(await isUnit(path))) return { ok: false as const, error: "Checkout is unavailable." };
+      const local = await localBranchState(path, context.signal);
+      return local === null
+        ? { ok: false as const, error: "Could not read the checkout's branch." }
+        : { ok: true as const, ...local };
+    },
     scan: async ({ roots }, context) => {
       const candidates = new Set<string>();
       const early: string[] = [];

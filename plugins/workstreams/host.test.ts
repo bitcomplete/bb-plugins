@@ -142,6 +142,12 @@ describe("parsePrList", () => {
     ]);
   });
 
+  it("records a written approval separately from inline review threads", () => {
+    const written = row({ latestReviews: [{ author: { login: "reviewer" }, state: "APPROVED", body: "Please fix the dependent DOB path." }] });
+    expect(parsePrList(written)?.pr.approvalHasBody).toBe(true);
+    expect(parsePrList(row({ latestReviews: [{ state: "APPROVED", body: "  " }] }))?.pr.approvalHasBody).toBe(false);
+  });
+
   it("returns the merge commit beside the PR rather than on it, because it is an input to a local git check and not a fact the board renders", () => {
     const merged = parsePrList(row({ state: "MERGED", mergeCommit: { oid: "deadbeef1234" } }));
     expect(merged?.mergeCommit).toBe("deadbeef1234");
@@ -159,6 +165,14 @@ describe("parsePrList", () => {
   it("reads a missing or unreadable merge time as null rather than inventing one", () => {
     expect(parsePrList(row())?.pr.mergedAt).toBeNull();
     expect(parsePrList(row({ mergedAt: "yesterday-ish" }))?.pr.mergedAt).toBeNull();
+  });
+
+  it("carries the GitHub PR open time and accepts older scans without it", () => {
+    expect(parsePrList(row({ createdAt: "2030-01-01T10:00:00Z" }))?.pr.createdAt).toBe("2030-01-01T10:00:00Z");
+    expect(parsePrList(row({ createdAt: "yesterday-ish" }))?.pr.createdAt).toBeNull();
+    const parsed = parsePrList(row())!.pr;
+    const { createdAt: _oldField, ...older } = parsed;
+    expect(prSchema.parse(older).createdAt).toBeUndefined();
   });
 
   it("reads unparseable output as no pull request rather than throwing", () => {

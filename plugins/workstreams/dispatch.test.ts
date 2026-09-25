@@ -18,9 +18,19 @@ function groups(entry = unit, threads: Board["groups"][number]["clusters"][numbe
 }
 
 describe("dispatch candidate selection", () => {
+  it("does not auto-dispatch written approval notes without an explicit resolution gate", () => {
+    const noted = { ...unit, pr: { ...unit.pr!, mergeStateStatus: "CLEAN" as const, approvalHasBody: true } };
+    expect(selectCandidate(groups(noted), "leaf", [], [])).toBeNull();
+  });
+  it("does not dispatch another review response after a verified PTAL", () => {
+    const followed = { ...unit, pr: { ...unit.pr!, mergeStateStatus: "BEHIND" as const, reviewDecision: "CHANGES_REQUESTED", reviewFollowupPosted: true } };
+    expect(selectCandidate(groups(followed), "leaf", [], [])).toBeNull();
+    expect(gateStillOpen(followed.pr, "address-review")).toBe(false);
+  });
   it("selects one eligible PR from a collapsed leaf and ignores unsafe facts", () => {
     expect(selectCandidate(groups(), "leaf", [], [])?.candidate).toMatchObject({ path: unit.path, prUrl: URL, action: "resolve-conflicts" });
     expect(selectCandidate(groups({ ...unit, dirty: true }), "leaf", [], [])).toBeNull();
+    expect(selectCandidate(groups({ ...unit, rebasing: true }), "leaf", [], [])).toBeNull();
     expect(selectCandidate(groups({ ...unit, observed: { status: false, pr: true } }), "leaf", [], [])).toBeNull();
     expect(selectCandidate(groups({ ...unit, stack: { id: "s", position: 1, size: 2, blockedBelow: 41 } }), "leaf", [], [])).toBeNull();
     expect(selectCandidate(groups({ ...unit, pr: { ...unit.pr!, mergeStateStatus: "UNKNOWN" } }), "leaf", [], [])).toBeNull();

@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AGENT_ACTIONS,
+  actionPreview,
   actionPrompt,
   mergeVerdict,
   nudgeComment,
@@ -39,7 +40,9 @@ describe("primaryAction", () => {
       action: "resolve-conflicts",
     });
     expect(actionOf(unit({ lifecycle: "awaiting-followup" }))).toMatchObject({ kind: "agent", action: "address-review" });
+    expect(actionOf(unit({ lifecycle: "awaiting-rereview" }))).toBeNull();
     expect(actionOf(unit({ lifecycle: "approved-with-comments" }))).toMatchObject({ kind: "agent", action: "address-comments" });
+    expect(actionOf(unit({ lifecycle: "approved-with-note" }))).toMatchObject({ kind: "agent", action: "review-approval-note" });
   });
 
   it("offers the direct actions only where GitHub says they apply", () => {
@@ -173,6 +176,20 @@ describe("actionPrompt", () => {
     expect(text).toContain("Do not merge. Report back whether the PR is ready to merge.");
   });
 
+  it("finishes approval feedback and branch conflicts before claiming the PR is mergeable", () => {
+    const prompt = actionPrompt("review-approval-note", FACTS);
+    const preview = actionPreview("review-approval-note", { approvalHasBody: true, unresolvedReviewThreads: 0 });
+    expect(prompt).toContain("leave informational points alone and explain why");
+    expect(prompt).toMatch(/Make focused fixes with relevant tests.*Fetch the PR's base branch.*rebase if behind, resolve any conflicts.*run the tests again.*Commit and push.*exact --force-with-lease/us);
+    expect(prompt).toContain("Reply on the PR to the approving review note, mention its reviewer, and state what changed or why a point needs no change.");
+    expect(prompt).toContain('Start that PR comment with "Approval note for @reviewer:" using the reviewer\'s actual login, and include the pushed head SHA');
+    expect(prompt).toMatch(/After the push and reply, wait for checks to settle, then re-read the live PR state, review decision, unresolved threads, checks, and mergeStateStatus.*Verify the PR is actually mergeable before reporting it ready/us);
+    expect(prompt).toContain("if any gate remains, name that gate and the next action. Do not merge.");
+    expect(preview.steps.join(" ")).toMatch(/Review each approval note.*rebase if behind and resolve conflicts.*Run relevant tests, commit, and push.*Reply on the PR.*Wait for checks, then re-read live approval, threads, checks, and mergeability/us);
+    expect(preview.lastScan).toEqual(["Written approval note present"]);
+    expect(preview.steps.join(" ")).toContain("Report remaining gates; do not merge.");
+  });
+
   it("asks the conflict prompt for an exact --force-with-lease, in the right checkout", () => {
     expect(actionPrompt("resolve-conflicts", FACTS)).toBe(
       "folio #47 (Show gift card balance) has merge conflicts with its base. In checkout /p/folio-abc-101 on branch dev/abc-101, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it. End your final message with a line starting 'Result:' that says what happened in under 12 words.",
@@ -196,6 +213,49 @@ describe("actionPrompt", () => {
   });
 });
 
+describe("actionPreview", () => {
+  it("presents CI as investigation and a proposed fix, without promising a code push", () => {
+    const preview = actionPreview("investigate-ci", { checkConclusions: ["SUCCESS", "FAILURE", "ERROR"] });
+    expect(preview.steps).toEqual(["Investigate the CI failure.", "Propose a fix and report what you found."]);
+    expect(preview.steps.join(" ")).not.toMatch(/commit|push|merge/u);
+    expect(actionPrompt("investigate-ci", FACTS)).toContain("Investigate the failure and propose a fix.");
+    expect(preview.lastScan).toEqual(["2 failing checks of 3"]);
+    expect(actionPreview("investigate-ci", { checkConclusions: ["SUCCESS"] }).lastScan).toEqual([]);
+  });
+
+  it("tracks the conflict prompt's base, test, and conditional safe push", () => {
+    const preview = actionPreview("resolve-conflicts", { headRefName: "dev/abc-101", baseRefName: "main" });
+    expect(preview.lastScan).toEqual(["dev/abc-101 → main"]);
+    expect(preview.steps.join(" ")).toMatch(/base branch.*resolve conflicts.*Run the tests.*Push.*--force-with-lease if rebased/us);
+    expect(actionPrompt("resolve-conflicts", FACTS)).toContain("push with an exact --force-with-lease if you rebased");
+  });
+
+  for (const action of ["address-review", "address-comments"] as const) {
+    it(`${action} includes the prompt's code push, replies, and demonstrated-only resolution`, () => {
+      const preview = actionPreview(action, { unresolvedReviewThreads: 2 });
+      const steps = preview.steps.join(" ");
+      expect(preview.lastScan).toEqual(["2 open review threads"]);
+      expect(steps).toMatch(/Fetch every review comment and thread.*Commit and push.*reply on every comment thread.*Resolve only threads the pushed code demonstrably addresses/us);
+      expect(steps).toContain("Re-request review only if materially riskier.");
+      expect(actionPrompt(action, FACTS)).toContain("Resolve only the threads the pushed code demonstrably addresses.");
+      expect(steps.includes("Do not merge.")).toBe(action === "address-comments");
+    });
+  }
+
+  it("names only reviewers who requested changes and bounds the scan detail", () => {
+    const preview = actionPreview("address-review", {
+      latestReviews: [
+        { login: "ada", state: "CHANGES_REQUESTED" },
+        { login: "bea", state: "APPROVED" },
+        { login: "cam", state: "CHANGES_REQUESTED" },
+        { login: "dee", state: "CHANGES_REQUESTED" },
+        { login: "eli", state: "CHANGES_REQUESTED" },
+      ],
+    });
+    expect(preview.lastScan).toEqual(["Changes requested by ada, cam, dee and 1 more"]);
+  });
+});
+
 function live(overrides: Partial<LiveMergeFacts> = {}): LiveMergeFacts {
   return {
     state: "OPEN",
@@ -206,6 +266,9 @@ function live(overrides: Partial<LiveMergeFacts> = {}): LiveMergeFacts {
     stackedAbove: [],
     unresolvedThreads: 0,
     unresolvedAtLeast: false,
+    approvalNotes: [],
+    approvalNotesMore: 0,
+    approvalNotesComplete: true,
     ...overrides,
   };
 }

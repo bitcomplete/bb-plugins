@@ -65,40 +65,56 @@ need the details; use the plain form when you need the shape.
 
 ## Lifecycles
 
-Each unit gets one lifecycle, and a cluster takes its most urgent member's. The
-twelve states fall into three groups, and **those groups are the lenses**.
+Each displayed unit gets one lifecycle, and a cluster takes its most urgent
+member's. The thirteen displayed states fall into three groups, and **those
+groups are the lenses**. Closed pull requests that did not merge are omitted
+before grouping, even when their checkouts are dirty or ahead of upstream.
 
 | Group | Lifecycle | Meaning |
 | --- | --- | --- |
 | Waiting | `blocked` | A check is FAILURE or ERROR |
 | Waiting | `awaiting-followup` | CHANGES_REQUESTED — the reviewer acted, the ball is with you |
+| Waiting | `awaiting-rereview` | CHANGES_REQUESTED remains in effect, but the author has pushed a newer head, resolved the inline threads, and posted PTAL to the reviewer; wait for another review |
 | Waiting | `approved-with-comments` | APPROVED, with unresolved review threads |
+| Waiting | `approved-with-note` | APPROVED with a written approval note and no unresolved inline comments; review the note before merging |
 | Waiting | `awaiting-merge` | APPROVED, checks green, nothing outstanding |
 | Waiting | `awaiting-review` | Open PR with no review decision yet |
 | Waiting | `unverified` | Local or GitHub status could not be checked; rescan to verify it |
 | Active | `active` | Working tree is dirty — edits are open right now |
 | Active | `in-progress` | Commits ahead of upstream, or a draft PR, tree clean |
 | Active | `up-next` | Branch exists, nothing ahead, and no PR was found |
-| Done | `shipped` | Merged, and the merge commit is contained in a local release tag; this does not verify deployment |
+| Done | `shipped` | Shown as **In release tag**: merged, and the merge commit is contained in a local release tag; this does not verify deployment |
 | Done | `merged` | Merged, not yet in a release tag |
-| Done | `closed` | Closed without merging |
 
 New unit JSON records whether git status and the GitHub PR lookup completed.
 Older persisted units have no observation flags and appear as `unverified`
 until the next successful scan. Failed checks remain visible as unavailable;
 they do not prove that a tree is clean or a pull request is absent.
 
-Precedence runs top to bottom in that table. Two distinctions matter most:
+Precedence runs top to bottom in that table. Key distinctions:
 
 - `awaiting-followup` is **not** `blocked`. One needs your edit; the other needs
   CI. A red check still outranks it, because fixing review comments would not
   make that PR mergeable.
+- `awaiting-rereview` requires a complete review-thread check, a head commit
+  newer than the changes-requested review, and a PR-author `PTAL @reviewer`
+  comment posted after that commit. GitHub still reports `CHANGES_REQUESTED`.
+  The Board offers no automatic reviewer nudge or PTAL for this state. A branch
+  behind its base remains visible as a separate signal.
 - Draft pull requests stay in the **Active** group whatever their check state.
   Red CI on unfinished work is expected and must not compete with a PR that is
   genuinely stuck.
+- `approved-with-note` means a reviewer wrote a note with approval. It is
+  distinct from `approved-with-comments`, which has unresolved inline comments.
+  For a standalone note, the author replies on the PR with `Approval note for
+  @reviewer:` and the current head SHA. A later scan checks that reply against
+  the approving review and head commit. The row reads ready only when GitHub
+  still reports approval, checks pass, no review threads remain open, and the
+  merge state permits it.
 
-`shipped` is derived from **local git tags only**: the merge commit is tested
-for containment in the newest release tag with `git merge-base --is-ancestor`.
+**In release tag** (`shipped` internally) is derived from **local git tags
+only**: the merge commit is tested for containment in the newest release tag
+with `git merge-base --is-ancestor`.
 No GitHub deployments API call is made, so this state does not establish a
 production deployment. If a repo has no release tags or the check fails, the
 unit remains `merged` and the board warns once per repo.
@@ -197,10 +213,11 @@ separately: `bb plugin logs workstreams`.
 - **Code owns every number.** Counts, sorting, rollup sentences, lifecycle
   derivation, stack order, and the confidence cut are all deterministic. Models
   only select, assign, and name. The board and `list` can never disagree.
-- **Every write asks first.** Scans never run a git mutation or touch a pull
-  request. The only writes are `group` / `ungroup` (one key-value map of
-  ticket → effort name) and the Board's row actions, each of which runs only
-  from the confirm button of its own dialog. See [Row actions](#row-actions).
+- **Writes require an explicit start.** Scans never run a git mutation or touch
+  a pull request. `group` / `ungroup` change a local ticket → effort name map;
+  Board row actions run from their dialog's confirm button. Board v2 starts
+  repair agents only after you select **Run automatically** for a workstream.
+  See [Row actions](#row-actions).
 - **A manual name always wins.** `group` beats any model assignment.
 - **No single signal groups anything.** Seeding compares four independent
   signals: code areas (where in the repo a branch changes files), branch and PR
@@ -221,7 +238,8 @@ separately: `bb plugin logs workstreams`.
   force-fitted into a confident-looking effort. A checkout with no recognizable
   ticket and no pull request also lands there and is never sent to a model. With
   no ticket but an open pull request it is grouped like any ticket; with a merged
-  or closed one it is filed under No ticket, never sent to a model.
+  one it is filed under No ticket, never sent to a model. Closed pull requests
+  are omitted from the board.
 - **One-offs are filed by team, not grouped.** An effort holding a single
   cluster rolls into a container per ticket prefix, named from the `teamNames`
   setting, else the Linear team name, else the prefix ("ABC · 14 one-offs").
@@ -273,7 +291,9 @@ only from the dialog's confirm button.
 | Fix · CI failing | Investigate CI | Agent |
 | Fix · Resolve conflicts | Resolve conflicts | Agent |
 | Respond · Changes requested | Address review and reply | Agent |
+| Waiting · Awaiting re-review | Wait for the reviewer; no repeat PTAL or nudge | None |
 | Respond · Approved, comments open | Address comments and reply (never merges) | Agent |
+| Respond · Review approval note | Review the written approval note (distinct from unresolved inline comments) | Agent |
 | Merge · Ready to merge | Merge | Direct |
 | Merge · Update branch | Update branch | Direct |
 | Waiting · In review | Nudge reviewers | Direct |
@@ -315,7 +335,9 @@ reviewers, only the comment is offered, and the dialog says so.
 
 The dialog reads the row's linked threads live and recommends where to start a
 dedicated thread, with its reason in one line. You can choose a linked parent
-for a subthread or start a new thread, and edit the prompt before anything runs.
+for a subthread or start a new thread. It previews the planned steps and facts
+from the last scan; expand **View or edit instructions** to inspect or change
+the exact prompt before anything runs.
 
 - **Investigate CI and Resolve conflicts** are repairs: a **subthread** of the
   most relevant linked thread of any tier (strongest tier, then most recently
@@ -325,6 +347,8 @@ for a subthread or start a new thread, and edit the prompt before anything runs.
   that wrote the PR (a `started` or `environment` link). Only weak links
   (`ticket`, `paths`) or none → a **new** thread, because weak links often point
   at large, unrelated threads.
+- **Review approval note** handles written feedback on an approving review,
+  separately from unresolved inline comments.
 - If BB will not add a child to a thread, the recommendation falls back to a
   new thread and says why.
 - **Subthread** only accepts a parent linked to that row. New and subthreads
@@ -365,13 +389,16 @@ sidebar shows a count beside Workstreams: needs-you first, else running.
 
 ### Automatic dispatch pilot
 
-**Board v2** can focus one effort for automatic PR repair. **Off** is the default.
-**Shadow preview** shows the next candidate without starting a thread. **Auto**
-starts at most one repair thread at a time for failing CI, merge conflicts, or
-review feedback in that effort. It skips dirty or unverified checkouts, stacked
-PRs blocked below, duplicate checkouts for a PR, and items with active work.
-The agent uses the BB project's default harness and is instructed to repair
-locally, test, and ask before a push or GitHub reply. The dispatcher itself
+**Board v2** groups by Workstream. Use the dropdown and **Off**, **Preview only**,
+or **Run automatically** controls at the top. Choosing a workstream scrolls to
+and expands it. Off is the default. Preview only shows the next candidate on
+its PR row without starting a thread. Run automatically starts at most one
+repair thread at a time for failing CI, merge conflicts, requested changes, or
+unresolved inline comments in that workstream. Written approval notes remain
+a manual row action. It skips dirty or unverified checkouts, stacked PRs blocked
+below, duplicate checkouts for a PR, and items with active work. The agent uses
+the BB project's default harness and is instructed to repair locally, test,
+and ask before a push or GitHub reply. The dispatcher itself
 does not write to GitHub, merge, or deploy.
 
 Each launch has a durable attempt record. Before launch, Workstreams inspects
@@ -385,25 +412,35 @@ attempt automatically. GitHub reporting the PR merged is the workflow's end;
 issue intake, PR creation, review requests, and merging remain manual Board
 steps in this pilot.
 
+The latest finished Board action appears in the workstream heading's outcome
+card. The card records the action and result, links its thread, and flags when
+that thread has newer activity.
+
 ## Views
 
 The panel opens on the last view you used in this browser, or the **Map** on
 your first visit. **Map**, **Board**, and **Board v2** have deep links and read
 the same board data. Board keeps the original Action grouping and row actions;
-Board v2 starts with Effort grouping and adds dispatch controls above the rows.
+Board v2 uses Workstream grouping and puts agent action controls at the top.
+Its workstream chooser uses all scanned rows, even when search or filters hide
+some. It counts a PR once by URL and ranks workstreams by their first available
+move: ready to merge, update branch, fix, respond, waiting for review, then
+work in progress and other waiting states. Completed-only workstreams stay in
+the Merged and In release tag cards instead of the chooser.
 
 The Board is an inbox with one row per checkout. **Group by: Action** is the
 default; **Group by: Effort** collects each effort's rows without changing their
 priority or available actions. Efforts with the most urgent work come first,
-and each effort's rows follow action priority, then age within a state. Action
+and each effort's rows follow action priority, then time in the state. Action
 groups are **Fix** (`blocked`), **Respond** (`awaiting-followup`,
 `approved-with-comments`), **Merge** (`awaiting-merge` not blocked by a stack),
-**Waiting** (`awaiting-review`, and any live row stacked on an unmerged PR,
+**Waiting** (`awaiting-review`, `awaiting-rereview`, and any live row stacked on an unmerged PR,
 shown as "Behind #NN"), then, collapsed, **In flight**, a section for work
 merged in the last 7 days (from `gh`'s `mergedAt`), and **Parked**. Within a
-section the row that has been in its state longest comes first. The age is
-measured from the scan that saw the checkout enter its state. Until one has,
-the row shows its last-commit age and labels it "last commit". Keys: `j`/`k`,
+section the row that has been in its state longest comes first. The displayed age
+shows when GitHub opened its PR, with the hover reading "PR opened". A checkout
+without a PR shows its last-commit age, labeled "commit". Older scans without
+a PR open date show no age until the next scan. Keys: `j`/`k`,
 `Enter` (PR), `a` (the row's action, which asks first), `t` (newest thread),
 `m` (Map), `o` (open the checkout), `n` (start a thread), `/` (search).
 The Board shows a resolved-thread count beside a PR title when GitHub has

@@ -56,6 +56,7 @@ async function load(threads: ReturnType<typeof makeThreadResponse>[] = []) {
     experimental_callHostRpc: ({ method }) => {
       hostCalls.push(method);
       if (method === "scan") return { units: [unit], warnings: [] };
+      if (method === "checkoutState") return { ok: true, branch: unit.branch, rebasing: false };
       if (method === "prReviewers") return { ok: true, reviewers: liveReviewers };
       if (method === "prWrite") return { ok: true, detail: "Re-requested review." };
       throw new Error(`unexpected host call ${method}`);

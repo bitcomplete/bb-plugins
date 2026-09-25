@@ -47,7 +47,7 @@ function unit(mergeStateStatus: "DIRTY" | "CLEAN"): RawUnit {
 
 const thread = (id: string, status: "active" | "idle" | "error" = "active") => makeThreadResponse({ id, status });
 
-async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) => unknown } = {}) {
+async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) => unknown; rebasing?: boolean; liveRebasing?: boolean; liveBranch?: string | null } = {}) {
   const rpcCalls: { method: string; input: unknown }[] = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "workstreams",
@@ -60,7 +60,7 @@ async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) =
         spawn: async () => thread("thr-quill-new"),
         get: async ({ threadId }: { threadId: string }) => ({ ...thread(threadId, "idle"), canSpawnChild: true }) as never,
         context: async () => ({ usage: null }) as never,
-        send: async () => ({}) as never,
+        send: async () => ({ ok: true, delivery: "sent" }) as never,
         output: async () => ({ output: "Rebased.\nResult: Resolved 2 conflicts and pushed" }),
         getPluginMetadata: async () => ({}) as never,
         events: { list: async () => [] },
@@ -69,8 +69,9 @@ async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) =
     },
     experimental_callHostRpc: (call) => {
       rpcCalls.push({ method: call.method, input: call.input });
-      if (call.method === "scan") return { units: [unit("DIRTY")], warnings: [] };
+      if (call.method === "scan") return { units: [{ ...unit("DIRTY"), rebasing: options.rebasing ?? false }], warnings: [] };
       if (call.method === "inspectPaths") return { units: [unit("CLEAN")], warnings: [] };
+      if (call.method === "checkoutState") return { ok: true, branch: options.liveBranch === undefined ? unit("DIRTY").branch : options.liveBranch, rebasing: options.liveRebasing ?? false };
       if (call.method === "prWrite") return options.prWrite?.(call.input) ?? { ok: true, detail: "Updated the branch of inkwell/quill #42." };
       throw new Error(`unexpected host call ${call.method}`);
     },
@@ -86,6 +87,23 @@ async function load(options: { threads?: unknown[]; prWrite?: (input: unknown) =
 afterEach(() => vi.useRealTimers());
 
 describe("agent runs through the server", () => {
+  it("messages only a thread still linked to the PR row, without creating a synthetic run", async () => {
+    const linked = {
+      ...thread("thr-quill-author", "idle"),
+      environmentPath: PATH,
+      environmentBranchName: "dev/abc-101-gift-card-balance",
+      hasPendingInteraction: false,
+    };
+    const { harness, open } = await load({ threads: [linked] });
+    expect(await harness.callRpc("thread_message", { path: PATH, prUrl: PR_URL, threadId: "thr-elsewhere", message: "PTAL" })).toMatchObject({ ok: false });
+    expect(harness.sdk.callsTo("threads.send")).toEqual([]);
+    expect(await harness.callRpc("thread_message", { path: PATH, prUrl: "https://github.com/inkwell/quill/pull/99", threadId: "thr-quill-author", message: "PTAL" })).toMatchObject({ ok: false });
+    expect(harness.sdk.callsTo("threads.send")).toEqual([]);
+    expect(await harness.callRpc("thread_message", { path: PATH, prUrl: PR_URL, threadId: "thr-quill-author", message: "Rebase, then post PTAL" })).toEqual({ ok: true, delivery: "sent" });
+    expect(harness.sdk.callsTo("threads.send")).toEqual([[expect.objectContaining({ threadId: "thr-quill-author", mode: "auto" })]]);
+    expect(await open()).toEqual([]);
+  });
+
   it("records a run as running when the action launches, with the row's ticket and PR", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const { harness, open } = await load();
@@ -164,6 +182,25 @@ describe("agent runs through the server", () => {
 });
 
 describe("direct runs through the server", () => {
+  it("refuses direct PR actions during a rebase while retaining the PR in the board", async () => {
+    const { harness, board, rpcCalls } = await load({ rebasing: true });
+    expect((await board()).groups.flatMap((group) => group.clusters).flatMap((cluster) => cluster.units)
+      .some((entry) => entry.pr?.url === PR_URL && entry.rebasing)).toBe(true);
+    expect(await harness.callRpc("action_merge_preview", { path: PATH })).toMatchObject({ ok: false, error: expect.stringContaining("rebase") });
+    expect(await harness.callRpc("action_update_branch", { path: PATH })).toMatchObject({ ok: false, error: expect.stringContaining("rebase") });
+    expect(rpcCalls.some((call) => call.method === "prLive" || call.method === "prWrite")).toBe(false);
+  });
+
+  it("rechecks the checkout before a direct action when a rebase or branch change starts after the scan", async () => {
+    const rebasing = await load({ liveRebasing: true });
+    expect(await rebasing.harness.callRpc("action_update_branch", { path: PATH })).toMatchObject({ ok: false, error: expect.stringContaining("rebase") });
+    expect(rebasing.rpcCalls.some((call) => call.method === "prWrite")).toBe(false);
+
+    const switched = await load({ liveBranch: "someone-elses-branch" });
+    expect(await switched.harness.callRpc("action_update_branch", { path: PATH })).toMatchObject({ ok: false, error: expect.stringContaining("branch changed") });
+    expect(switched.rpcCalls.some((call) => call.method === "prWrite")).toBe(false);
+  });
+
   it("records a succeeded direct action with a short reason and rescans its row", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const { harness, board, rpcCalls } = await load();
