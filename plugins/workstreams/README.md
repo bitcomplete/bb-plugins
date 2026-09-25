@@ -81,21 +81,25 @@ via agent** action starts a BB thread only when you confirm it.
   After the author pushes a newer head, resolves review threads, and posts a
   directed PTAL, the row reads **Awaiting re-review** while GitHub still reports
   changes requested. Workstreams does not send another PTAL or reviewer nudge.
-- **Bulk preparation:** In **PR backlog**, select approved PRs and choose
-  **Advance selected**. Review the exact selection, planned branch work, and
-  skips before starting. Each repository uses one **Rebasing...** thread, with
-  a separate turn and isolated worktree for each PR. Preparation integrates the
-  base, resolves conflicts, tests, pushes with an exact commit lease when
-  needed, and posts a summary after a pushed change. PRs that only need
-  verification run without an agent. The Board keeps per-PR results and checks
-  current approval, feedback, checks, and stack dependencies before reporting
-  **Ready to merge**. **Stop queued PRs** stops work that has not started;
-  active workers can finish. Comment fixes remain a separate action, and the
-  batch never merges PRs. Worktrees remain available for inspection. One batch
-  runs at a time, with up to two repository workers. If a parent update makes a
-  verification-only child need branch edits, preview that child again to
-  authorize the added work. Fork preparation and mixed BB project mappings
-  within one repository need separate handling; the batch reports these skips.
+- **Bulk advance:** In **PR backlog**, select approved PRs and choose
+  **Advance selected**. Review the exact selection, planned feedback and branch
+  work, and skips before starting. Each repository uses one **Rebasing...**
+  thread, with a separate turn and isolated worktree for each PR. The worker
+  reads reviews and current code, verifies fixes already made, addresses
+  remaining feedback, and integrates the base where needed. It tests changes,
+  pushes with an exact commit lease when rewriting history, replies with
+  evidence, and resolves only feedback verified as addressed. A pushed change
+  receives a PR summary. PRs that only need verification run without an agent.
+  The Board keeps per-PR results and checks current approval, feedback, checks,
+  and stack dependencies before reporting **Ready to merge**. **Stop queued PRs**
+  stops work that has not started; active workers can finish. The batch never
+  merges PRs. Worktrees remain available for inspection. One batch runs at a
+  time, with up to two repository workers. Saved batches keep their original
+  scope; start a new preview to authorize feedback work on an earlier result.
+  If a parent update makes a verification-only child need edits, preview that
+  child again to authorize the added work. Fork writes and mixed BB project
+  mappings within one repository need separate handling; the batch reports
+  these skips.
 - **Effort threads:** Choose **🧭 Coordinate** on an effort to review its linked
   tickets and PRs, set its name and goal, and choose a matching BB project.
   Create a planning thread in a separate worktree with that project's default

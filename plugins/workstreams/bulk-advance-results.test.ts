@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { advanceJobSchema } from "./bulk-advance";
-import { advanceResultForPr } from "./bulk-advance-results";
+import { advanceResultForPr, advanceStatus } from "./bulk-advance-results";
 
 const job = (patch: Record<string, unknown> = {}) => advanceJobSchema.parse({
   id: "job-1", prUrl: "https://github.com/acme/app/pull/1", repo: "acme/app", number: 1, title: "Improve account settings",
@@ -32,5 +32,13 @@ describe("inline advance results", () => {
   it("keeps active preparation visible before there is a verified commit", () => {
     const running = job({ status: "running", checkedHeadOid: null });
     expect(advanceResultForPr([running], { url: running.prUrl, headRefOid: "c".repeat(40) }, true)).toBe(running);
+  });
+});
+
+describe("advance work labels", () => {
+  it("identifies active feedback work while preserving saved preparation labels", () => {
+    expect(advanceStatus({ status: "running", needsFeedback: true })).toBe("Addressing feedback");
+    expect(advanceStatus({ status: "running" })).toBe("Preparing branch");
+    expect(advanceStatus({ status: "needs-attention", needsFeedback: true })).toBe("Needs attention");
   });
 });

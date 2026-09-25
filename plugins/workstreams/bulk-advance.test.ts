@@ -5,7 +5,7 @@ import { ADVANCE_MIGRATIONS, createAdvanceService, preparationPrompt, type Advan
 const fact = (number = 1, overrides: Partial<AdvanceFacts> = {}): AdvanceFacts => ({
   prUrl: `https://github.com/acme/app/pull/${number}`, number, repo: "acme/app", title: `Fix ${number}`,
   headOid: `${number}`.repeat(40), baseOid: "a".repeat(40), headRefName: `fix-${number}`, baseRefName: "main",
-  needsPreparation: true, eligible: true, detail: "Needs rebase", workspace: "create", projectId: "project",
+  needsPreparation: true, needsFeedback: false, eligible: true, detail: "Needs rebase", workspace: "create", projectId: "project",
   hostId: "host", sourcePath: "/source", path: `/checkout/${number}`, readiness: "needs-attention", blockedBy: null, ...overrides,
 });
 const drain = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
@@ -37,6 +37,57 @@ describe("finite Advance preparation", () => {
     expect(t.service.list()[0]!.jobs[0]).toMatchObject({ status: "ready", checkedHeadOid: fact().headOid });
     expect(t.deps.spawn).not.toHaveBeenCalled();
     expect(t.deps.verified).toHaveBeenCalledWith(fact().prUrl, fact().path);
+  });
+  it("starts a feedback-only worker and reuses it for the next PR in the repository", async () => {
+    const one = fact(1, { needsPreparation: false, needsFeedback: true });
+    const two = fact(2, { needsPreparation: false, needsFeedback: true });
+    const t = setup([one, two]); const batch = await t.start();
+    expect(t.deps.workspace).toHaveBeenCalledTimes(1);
+    expect(t.deps.spawn).toHaveBeenCalledTimes(1);
+    expect(t.service.list()[0]!.jobs[0]!.detail).toContain("review feedback");
+    t.current.set(one.prUrl, { ...one, needsFeedback: false, readiness: "ready", detail: "Feedback addressed" });
+    await t.service.signal("thread", "idle", `Workstreams job ${batch.jobs[0]!.id} complete: prepared`); await drain();
+    expect(t.deps.spawn).toHaveBeenCalledTimes(1);
+    expect(t.deps.send).toHaveBeenCalledTimes(1);
+    expect(t.deps.workspace).toHaveBeenCalledTimes(2);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("ready");
+    expect(t.service.list()[0]!.jobs[1]!.status).toBe("running");
+  });
+  it("keeps blocked feedback work blocked when GitHub looks ready but completion was not confirmed", async () => {
+    const feedback = fact(1, { needsPreparation: false, needsFeedback: true });
+    const t = setup([feedback]); const batch = await t.start();
+    t.current.set(feedback.prUrl, { ...feedback, needsFeedback: false, readiness: "ready" });
+    await t.service.signal("thread", "idle", `Workstreams job ${batch.jobs[0]!.id} complete: blocked`);
+    await t.service.recheck(batch.id);
+    expect(t.service.list()[0]!.jobs[0]!.status).toBe("needs-attention");
+    expect(t.service.list()[0]!.jobs[0]!.detail).toContain("Requested work was not confirmed");
+  });
+  it("rejects feedback appearing after a verify-only preview", async () => {
+    const current = fact(1, { needsPreparation: false, needsFeedback: false });
+    const t = setup([current]); const plan = await t.service.preview([current.prUrl]);
+    t.current.set(current.prUrl, { ...current, needsFeedback: true });
+    await expect(t.service.start(plan.token)).rejects.toThrow("changed");
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+  });
+  it("defaults legacy persisted jobs to no feedback permission and never adds writes during recovery", async () => {
+    for (const feedbackAppeared of [false, true]) {
+      const current = fact(1, { needsPreparation: false, needsFeedback: false, readiness: "ready" });
+      const t = setup([current]); const batch = await t.start(); t.service.dispose();
+      const row = t.db.prepare("SELECT body FROM advance_batches WHERE id = ?").get(batch.id) as { body: string };
+      const saved = JSON.parse(row.body);
+      saved.jobs[0].status = "queued";
+      saved.prepared = {};
+      delete saved.jobs[0].needsFeedback;
+      delete saved.facts[saved.jobs[0].id].needsFeedback;
+      t.db.prepare("UPDATE advance_batches SET body = ? WHERE id = ?").run(JSON.stringify(saved), batch.id);
+      t.current.set(current.prUrl, { ...current, needsFeedback: feedbackAppeared });
+      const restored = createAdvanceService(t.db, t.deps);
+      expect(restored.list()[0]!.jobs[0]!.needsFeedback).toBe(false);
+      await restored.tick(true); await drain();
+      expect(t.deps.spawn).not.toHaveBeenCalled();
+      expect(t.deps.workspace).not.toHaveBeenCalled();
+      expect(restored.list()[0]!.jobs[0]!.status).toBe(feedbackAppeared ? "needs-attention" : "ready");
+    }
   });
   it("never promotes a preview skip if its busy writer finishes before confirmation", async () => {
     const t = setup([fact(1), fact(2)]);
@@ -154,6 +205,19 @@ describe("finite Advance preparation", () => {
     const t = setup(); const plan = await t.service.preview([fact().prUrl]); t.deps.busyNow.mockReturnValue(true);
     await expect(t.service.start(plan.token)).rejects.toThrow("Another action");
     expect(t.deps.spawn).not.toHaveBeenCalled();
+  });
+  it("instructs feedback fixes, evidence-based replies, safe resolutions, and no-op bookkeeping", () => {
+    const prompt = preparationPrompt(fact(1, { needsPreparation: false, needsFeedback: true }), "/isolated/job");
+    expect(prompt).toContain("all paginated review threads");
+    expect(prompt).toContain("prior author replies");
+    expect(prompt).toContain("integrate the current PR base");
+    expect(prompt).toContain("no new commit or push is required");
+    expect(prompt).toContain("Never resolve unanswered disagreements");
+    expect(prompt).toContain('explicitly says "approval note"');
+    expect(prompt).toContain("actual @reviewer");
+    expect(prompt).toContain("current head SHA");
+    expect(prompt).toContain("ask PTAL only when another review is needed");
+    expect(prompt).not.toContain("do not make unrelated review fixes");
   });
   it("pins detached-worktree pushes to the original remote head and forbids merge", () => {
     const prompt = preparationPrompt(fact(), "/isolated/job");

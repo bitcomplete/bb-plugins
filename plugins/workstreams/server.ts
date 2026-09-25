@@ -2515,16 +2515,18 @@ export default async function plugin(bb: BbPluginApi) {
       .find((entry) => entry.project?.hostId === hostId);
     const fallback: AdvanceFacts = { prUrl, repo: target.slug, number: tracked.number, title: tracked.title,
       headOid: "", baseOid: "", baseRefName: tracked.baseRefName ?? "", headRefName: tracked.headRefName ?? "",
-      needsPreparation: false, eligible: false, detail: "GitHub inspection failed", workspace: source ? "create" : "unavailable",
+      needsPreparation: false, needsFeedback: false, eligible: false, detail: "GitHub inspection failed", workspace: source ? "create" : "unavailable",
       projectId: source?.project?.projectId ?? null, hostId, sourcePath: source?.unit.path ?? null,
       path: units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.path ?? null, readiness: "needs-attention", blockedBy: null };
     try {
       const result = await host.call("advanceInspect", { prUrl }, { hostId, timeoutMs: 60_000, signal: disposal.signal });
       if (!result.ok) return { ...fallback, detail: result.error };
       const facts = result.facts;
-      const eligible = facts.state === "OPEN" && facts.reviewDecision === "APPROVED" && !facts.isDraft && (!facts.needsPreparation || (!facts.isCrossRepository && !!source));
-      const detail = facts.isCrossRepository && facts.needsPreparation ? "Fork PRs need manual preparation in this version" : facts.state !== "OPEN" || facts.reviewDecision !== "APPROVED" || facts.isDraft ? "Select an open, approved, non-draft PR" : facts.needsPreparation && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail;
-      return { ...fallback, ...facts, eligible, detail, blockedBy: facts.basePrNumber === null ? null : `${target.slug}#${facts.basePrNumber}` };
+      const needsFeedback = facts.unresolvedThreads > 0 || facts.approvalNotePending;
+      const needsWriter = facts.needsPreparation || needsFeedback;
+      const eligible = facts.state === "OPEN" && facts.reviewDecision === "APPROVED" && !facts.isDraft && (!needsWriter || (!facts.isCrossRepository && !!source));
+      const detail = facts.state !== "OPEN" || facts.isDraft ? facts.detail : facts.isCrossRepository && needsWriter ? "Fork PRs need manual preparation and review follow-up in this version" : needsWriter && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail;
+      return { ...fallback, ...facts, needsFeedback, eligible, detail, blockedBy: facts.basePrNumber === null ? null : `${target.slug}#${facts.basePrNumber}` };
     } catch (error) { return { ...fallback, detail: `Inspection failed: ${String(error).slice(0, 300)}` }; }
   }
   const advance = createAdvanceService(db, {

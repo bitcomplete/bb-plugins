@@ -5,7 +5,8 @@ import type { AdvanceBatch, AdvanceJob, AdvancePreview } from "./bulk-advance";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { ADVANCE_STATUS } from "./bulk-advance-results";
+import { advanceStatus } from "./bulk-advance-results";
+import { advancePreviewAction, advancePreviewSummary } from "./bulk-advance-preview";
 
 const ACTIVE = new Set<AdvanceJob["status"]>(["queued", "launching", "running", "verifying"]);
 const failure = (cause: unknown): string => cause instanceof Error ? cause.message : String(cause);
@@ -75,9 +76,9 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
     finally { setStarting(false); }
   };
   const eligible = plan?.jobs.filter((job) => job.eligible) ?? [];
-  const preparation = eligible.filter((job) => job.needsPreparation);
+  const summary = advancePreviewSummary(plan?.jobs ?? []);
   const repositories = [...new Set(plan?.jobs.map((job) => job.repo) ?? [])];
-  const workers = new Set(preparation.map((job) => job.repo)).size;
+  const workers = summary.workers;
   const expired = plan !== null && plan.expiresAt <= clock;
   return <>
     <Button size="sm" disabled={disabled || prUrls.length === 0} onClick={() => {
@@ -90,12 +91,12 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
       <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Advance approved PRs</DialogTitle>
-          <DialogDescription>Prepare the selected branches, then verify their current merge readiness.</DialogDescription>
+          <DialogDescription>Address feedback, prepare branches where needed, and verify current merge readiness.</DialogDescription>
         </DialogHeader>
         {loading ? <p role="status" className="text-[12px] text-muted-foreground">Refreshing {selection.length} selected PRs and checking workspaces…</p> : null}
         {plan === null ? null : <>
           <div className="space-y-1 text-[12px]">
-            <p className="font-medium">{preparation.length} to prepare · {eligible.length - preparation.length} to verify · {plan.jobs.length - eligible.length} skipped</p>
+            <p className="font-medium">{summary.agentJobs} with agent · {summary.verifyJobs} verify only · {summary.skipped} skipped</p>
             <p className="text-muted-foreground">{workers === 0 ? "Verification runs without an agent worker." : workers === 1 ? "One repository worker named Rebasing... processes PRs sequentially in separate checkouts." : `${workers} repository workers, each named Rebasing..., process PRs sequentially in separate checkouts.`}</p>
           </div>
           <div className="space-y-3">
@@ -105,17 +106,18 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
                 {plan.jobs.filter((job) => job.repo === repo).map((job) => <li key={job.prUrl} className="space-y-1 py-2 text-[11.5px]">
                   <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                     <UrlLink href={job.prUrl} className="min-w-0 flex-1 break-words text-foreground underline-offset-2 hover:underline"><span className="font-mono">#{job.number}</span> {job.title}</UrlLink>
-                    <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-[10.5px]", job.eligible ? "bg-foreground/[0.06]" : "bg-amber-500/10 text-amber-700 dark:text-amber-300")}>{!job.eligible ? "Skip" : job.needsPreparation ? "Prepare + verify" : "Verify only"}</span>
+                    <span className={cn("max-w-full shrink-0 break-words rounded px-1.5 py-0.5 text-[10.5px]", job.eligible ? "bg-foreground/[0.06]" : "bg-amber-500/10 text-amber-700 dark:text-amber-300")}>{advancePreviewAction(job)}</span>
                   </div>
                   <p className="break-words text-muted-foreground">{job.detail}</p>
-                  {job.eligible && job.needsPreparation ? <p className="text-muted-foreground">{job.workspace === "create" ? "Create an isolated checkout" : job.workspace === "existing" ? "Use the matched checkout" : "Workspace unavailable"}{job.baseRefName ? ` · integrate ${job.baseRefName}` : ""}</p> : null}
+                  {job.eligible && (job.needsPreparation || job.needsFeedback) ? <p className="text-muted-foreground">{job.workspace === "create" ? "Create an isolated checkout" : job.workspace === "existing" ? "Use the matched checkout" : "Workspace unavailable"}{job.needsPreparation && job.baseRefName ? ` · integrate ${job.baseRefName}` : ""}</p> : null}
                 </li>)}
               </ul>
             </section>)}
           </div>
           <div className="space-y-1 rounded-md bg-foreground/[0.035] px-3 py-2 text-[11.5px] text-muted-foreground">
-            <p>Check approval, unresolved feedback, checks, and mergeability against the final commit. Feedback that needs code changes stays in Needs attention for a separate pass.</p>
-            {preparation.length > 0 ? <p>Starting authorizes branch updates, conflict fixes, tests, pushes, and a PR summary of the preparation work. Rewrites use an exact commit lease. No PRs are merged.</p> : <p>This batch only reads readiness. No PRs are merged.</p>}
+            {summary.hasFeedback ? <p>For listed feedback, read reviews and current code, verify fixes already made, and address remaining changes. Check and integrate the current base as needed, test and push changes, reply with evidence, and resolve only feedback verified as addressed.</p> : null}
+            {summary.hasPreparation ? <p>Update the listed branches and resolve conflicts, then test and push.</p> : null}
+            <p>{summary.agentJobs > 0 ? "Push only when changes are needed, use an exact commit lease for rewritten history, and post a PR summary after pushed changes. " : "This batch only reads readiness. "}Check approval, unresolved feedback, checks, and mergeability against the final commit. No PRs are merged.</p>
           </div>
         </>}
         {error === null ? null : <p role="alert" className="text-[12px] text-destructive">{error}</p>}
@@ -123,7 +125,7 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
         <DialogFooter className="flex-wrap gap-2">
           <Button variant="ghost" disabled={starting} onClick={() => setOpen(false)}>Cancel</Button>
           {!loading && (plan === null || expired || error !== null) ? <Button variant="outline" disabled={starting} onClick={() => void preview(selection)}>Refresh preview</Button> : null}
-          <Button disabled={disabled || loading || starting || expired || eligible.length === 0} onClick={() => void start()}>{starting ? "Starting…" : preparation.length > 0 ? `Start preparation · ${eligible.length}` : `Verify ${eligible.length} ${eligible.length === 1 ? "PR" : "PRs"}`}</Button>
+          <Button disabled={disabled || loading || starting || expired || eligible.length === 0} onClick={() => void start()}>{starting ? "Starting…" : summary.agentJobs > 0 ? `Start advance · ${eligible.length}` : `Verify ${eligible.length} ${eligible.length === 1 ? "PR" : "PRs"}`}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -167,7 +169,7 @@ export function AdvanceProgress({ batches, error, onRefresh, onOpenThread }: {
         <ul className="mt-1 divide-y divide-border/50">
           {batch.jobs.map((job) => <li key={job.id} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 py-2">
             <UrlLink href={job.prUrl} className="min-w-0 truncate underline-offset-2 hover:underline" title={`${job.repo} #${job.number} (${job.title})`}><span className="font-medium">{job.repo.split("/").at(-1)} <span className="font-mono">#{job.number}</span></span> <span className="text-muted-foreground">{job.title}</span></UrlLink>
-            <span className={cn("text-right", job.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : job.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{ADVANCE_STATUS[job.status]}</span>
+            <span className={cn("text-right", job.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : job.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{advanceStatus(job)}</span>
             <p className="col-span-2 break-words text-[11px] text-muted-foreground">{job.detail}{job.uncertain ? " Worker state is uncertain. Recheck readiness to reconcile this job; inspect its worker before retrying." : ""}{job.checkedHeadOid ? <span className="ml-1 font-mono">· {job.checkedHeadOid.slice(0, 7)}</span> : null}{job.threadId ? <> · <button type="button" onClick={() => onOpenThread(job.threadId!)} className="rounded underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Open worker</button></> : null}</p>
           </li>)}
         </ul>

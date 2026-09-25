@@ -458,16 +458,22 @@ requires checks, threads, branch state, and stack dependencies to clear.
 Direct GitHub actions work on remote PRs; single-PR agent repairs need a scanned checkout.
 
 In **PR backlog**, select approved open PRs and choose **Advance selected** to
-preview a finite preparation batch. Confirmation authorizes the listed branch
-updates, conflict fixes, tests, pushes, and preparation summaries. Each repository
-uses one **Rebasing...** worker, with a separate turn and isolated worktree per PR;
-remote PRs can use a worktree from an exactly matched scanned repository.
+preview a finite batch. The preview distinguishes feedback work, branch
+preparation, both, and verification only. Confirmation authorizes the listed
+work. Each repository uses one **Rebasing...** worker, with a separate turn and
+isolated worktree per PR; remote PRs can use a worktree from an exactly matched
+scanned repository. For feedback, the worker reads reviews and current code,
+verifies fixes already made, addresses remaining changes, and integrates the
+current base as needed. It tests changes, pushes when needed, replies with
+evidence, and resolves only feedback verified as addressed. History rewrites
+use an exact commit lease. Pushed changes receive a PR summary.
 Verification-only jobs do not spawn an agent. Saved per-PR results appear in
 **Advance progress** across Board lenses. Readiness requires fresh approval,
 review feedback, checks, branch state, and stack dependencies on the checked head.
 **Recheck readiness** reads current facts; **Stop queued PRs** stops pending work
-while active workers can finish. Keep worktrees for inspection. Comment fixes
-remain a separate action; preparation never merges or deploys.
+while active workers can finish. Keep worktrees for inspection. Advance never
+merges or deploys. Saved batches retain their original scope; start a new preview
+to authorize feedback work on an earlier result.
 One batch runs at a time, with up to two repository workers and 100 selected PRs.
 CI polling runs for up to 30 minutes after a job enters **Waiting for checks**;
 use **Recheck readiness** afterward. If a selected parent update makes a
