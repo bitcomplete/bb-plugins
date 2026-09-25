@@ -158,10 +158,20 @@ function where(facts: PromptFacts): { pr: string; branch: string } {
 }
 
 const REVIEW_STEPS =
-  "Fetch every review comment and review thread with gh. Address each one in the code, commit, and push. " +
-  "Then reply on every comment thread saying what changed, or why you did not change it. " +
-  "Resolve only the threads the pushed code demonstrably addresses. " +
-  "Do not re-request review unless your change is materially riskier than what was reviewed.";
+  "Read the live PR, its base branch, every review comment and review thread with gh. Make focused code fixes for actionable feedback with relevant tests; explain justified nonchanges. " +
+  "Fetch and integrate the PR base if behind, resolving conflicts while preserving both sides' intent, then rerun relevant tests. " +
+  "Commit and push code changes; if no change is needed, explain why and use the current head SHA. If you rebased, use an exact --force-with-lease. " +
+  "Reply to each actionable review thread with what changed or why no change was needed. Resolve only threads demonstrably addressed by the pushed code. " +
+  "Post a PR summary comment that mentions the actual reviewers, describes the changes and justified nonchanges, and includes the head SHA (the pushed SHA if code changed). " +
+  "If changes are still requested and reviewer follow-up is needed, ask those reviewers to take another look (PTAL) in the PR comment; preserve an existing approval and do not re-request review otherwise. " +
+  "After the replies and any push, re-read live PR state, review decision, unresolved threads, checks, and mergeStateStatus. Report any remaining gate and next action. Do not merge.";
+
+const CONFLICT_STEPS =
+  "Read the live PR and fetch its base branch. Integrate the base in the checkout, resolving conflicts while preserving both sides' intent. " +
+  "Make only fixes needed by the integration, run relevant tests, commit, and push; if you rebased, use an exact --force-with-lease. " +
+  "Post a PR summary comment mentioning the actual reviewers, describing the resolution and including the pushed head SHA. " +
+  "If changes are still requested and reviewer follow-up is needed, ask those reviewers to take another look (PTAL) in the PR comment; preserve an existing approval and do not re-request review otherwise. " +
+  "After the push and reply, re-read live PR state, review decision, unresolved threads, checks, and mergeStateStatus. Report any remaining gate and next action. Do not merge.";
 
 /**
  * The editable prompt an agent action starts from. Every field is substituted,
@@ -180,11 +190,11 @@ function actionBody(action: AgentAction, facts: PromptFacts): string {
     case "address-review":
       return `Changes were requested on ${pr}, branch ${branch}, checkout ${facts.path}. ${REVIEW_STEPS} Report back with a summary per thread.`;
     case "address-comments":
-      return `${pr} is approved but has open review comments, branch ${branch}, checkout ${facts.path}. ${REVIEW_STEPS} Report back with a summary per thread. Do not merge. Report back whether the PR is ready to merge.`;
+      return `${pr} is approved but has open review comments, branch ${branch}, checkout ${facts.path}. ${REVIEW_STEPS} Report back with a summary per thread and whether the PR is ready to merge.`;
     case "review-approval-note":
       return `${pr} is approved with a written review note, branch ${branch}, checkout ${facts.path}. Read the approving review body and decide which points need code changes; leave informational points alone and explain why. Make focused fixes with relevant tests. Fetch the PR's base branch and integrate it before finishing: rebase if behind, resolve any conflicts preserving both sides' intent, and run the tests again. Commit and push the resulting work; use an exact --force-with-lease if rebased. Reply on the PR to the approving review note, mention its reviewer, and state what changed or why a point needs no change. Start that PR comment with "Approval note for @reviewer:" using the reviewer's actual login, and include the pushed head SHA so the follow-up is tied to the code you checked. After the push and reply, wait for checks to settle, then re-read the live PR state, review decision, unresolved threads, checks, and mergeStateStatus. Verify the PR is actually mergeable before reporting it ready; if any gate remains, name that gate and the next action. Do not merge. Report the fix, branch update, reply, test result, and live merge readiness.`;
     case "resolve-conflicts":
-      return `${pr} has merge conflicts with its base. In checkout ${facts.path} on branch ${branch}, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it.`;
+      return `${pr} has merge conflicts with its base. In checkout ${facts.path} on branch ${branch}, ${CONFLICT_STEPS} Report what conflicted and how you resolved it.`;
   }
 }
 
@@ -214,9 +224,10 @@ export function actionPreview(
       if (scan?.headRefName && scan.baseRefName) lastScan.push(`${scan.headRefName} → ${scan.baseRefName}`);
       return {
         steps: [
-          "Bring in the base branch and resolve conflicts, preserving both sides' intent.",
-          "Run the tests.",
-          "Push the result; use an exact --force-with-lease if rebased. Report the resolutions.",
+          "Read the live PR, fetch and integrate its base, and resolve conflicts preserving both sides' intent.",
+          "Run relevant tests, commit, and push; use an exact --force-with-lease if rebased.",
+          "Post a PR summary with actual reviewer mentions, resolutions, and pushed head SHA; ask for PTAL only if changes are still requested, preserving approval otherwise.",
+          "Re-read live PR state, review, threads, checks, and mergeability. Report remaining gates; do not merge.",
         ],
         lastScan,
       };
@@ -234,10 +245,11 @@ export function actionPreview(
       }
       return {
         steps: [
-          "Fetch every review comment and thread; address each in the code.",
-          "Commit and push, then reply on every comment thread with what changed or why it did not.",
-          "Resolve only threads the pushed code demonstrably addresses; summarize each thread. Re-request review only if materially riskier.",
-          ...(action === "address-comments" ? ["Report whether the PR is ready to merge. Do not merge."] : []),
+          "Read the live PR, base, review comments, and threads; fix actionable feedback and explain justified nonchanges.",
+          "Integrate the base if behind, resolve conflicts, run relevant tests, and commit and push code changes; explain justified nonchanges and use an exact --force-with-lease if rebased.",
+          "Reply to actionable threads; resolve only those the pushed code demonstrably addresses.",
+          "Post a PR summary with actual reviewer mentions and head SHA (pushed SHA if code changed); request PTAL if changes are still requested, preserving approval otherwise.",
+          "Re-read live PR state, review, threads, checks, and mergeability. Report remaining gates; do not merge.",
         ],
         lastScan,
       };

@@ -162,18 +162,23 @@ describe("recommendThread for repairs (CI, conflicts)", () => {
 const FACTS = { repo: "folio", prNumber: 47, title: "Show gift card balance", branch: "dev/abc-101", path: "/p/folio-abc-101" };
 
 describe("actionPrompt", () => {
-  it("substitutes every field into the address-review prompt, and forbids a gratuitous re-request", () => {
+  it("substitutes every field into the address-review prompt and requires complete PR follow-through", () => {
     const text = actionPrompt("address-review", FACTS);
     expect(text).toMatch(/^Changes were requested on folio #47 \(Show gift card balance\), branch dev\/abc-101, checkout \/p\/folio-abc-101\. /u);
-    expect(text).toContain("Resolve only the threads the pushed code demonstrably addresses.");
-    expect(text).toContain("Do not re-request review unless");
+    expect(text).toMatch(/Read the live PR, its base branch, every review comment and review thread.*Make focused code fixes for actionable feedback.*explain justified nonchanges/us);
+    expect(text).toMatch(/Fetch and integrate the PR base if behind.*resolving conflicts.*rerun relevant tests.*Commit and push code changes; if no change is needed, explain why and use the current head SHA.*exact --force-with-lease/us);
+    expect(text).toContain("Resolve only threads demonstrably addressed by the pushed code.");
+    expect(text).toMatch(/Reply to each actionable review thread.*Post a PR summary comment that mentions the actual reviewers.*includes the head SHA \(the pushed SHA if code changed\)/us);
+    expect(text).toMatch(/If changes are still requested.*ask those reviewers to take another look \(PTAL\) in the PR comment; preserve an existing approval and do not re-request review otherwise/us);
+    expect(text).toMatch(/re-read live PR state, review decision, unresolved threads, checks, and mergeStateStatus.*Report any remaining gate and next action. Do not merge/us);
     expect(text).toContain("Report back with a summary per thread.");
   });
 
-  it("opens the address-comments prompt with the approval, and ends by forbidding the merge", () => {
+  it("opens the address-comments prompt with the approval and preserves it while finishing review", () => {
     const text = actionPrompt("address-comments", FACTS);
     expect(text.startsWith("folio #47 (Show gift card balance) is approved but has open review comments")).toBe(true);
-    expect(text).toContain("Do not merge. Report back whether the PR is ready to merge.");
+    expect(text).toContain("preserve an existing approval and do not re-request review otherwise.");
+    expect(text).toContain("Do not merge. Report back with a summary per thread and whether the PR is ready to merge.");
   });
 
   it("finishes approval feedback and branch conflicts before claiming the PR is mergeable", () => {
@@ -190,10 +195,12 @@ describe("actionPrompt", () => {
     expect(preview.steps.join(" ")).toContain("Report remaining gates; do not merge.");
   });
 
-  it("asks the conflict prompt for an exact --force-with-lease, in the right checkout", () => {
-    expect(actionPrompt("resolve-conflicts", FACTS)).toBe(
-      "folio #47 (Show gift card balance) has merge conflicts with its base. In checkout /p/folio-abc-101 on branch dev/abc-101, bring in the base branch, resolve the conflicts preserving both sides' intent, run the tests, and push with an exact --force-with-lease if you rebased. Report what conflicted and how you resolved it. End your final message with a line starting 'Result:' that says what happened in under 12 words.",
-    );
+  it("requires the conflict repair to integrate base, publish the resolution, and recheck live gates", () => {
+    const text = actionPrompt("resolve-conflicts", FACTS);
+    expect(text).toMatch(/^folio #47 \(Show gift card balance\) has merge conflicts with its base. In checkout \/p\/folio-abc-101 on branch dev\/abc-101/u);
+    expect(text).toMatch(/Read the live PR and fetch its base branch.*Integrate the base.*resolving conflicts.*run relevant tests, commit, and push.*exact --force-with-lease/us);
+    expect(text).toMatch(/Post a PR summary comment mentioning the actual reviewers.*pushed head SHA.*ask those reviewers to take another look \(PTAL\).*preserve an existing approval and do not re-request review otherwise/us);
+    expect(text).toMatch(/re-read live PR state, review decision, unresolved threads, checks, and mergeStateStatus.*Report any remaining gate and next action. Do not merge/us);
   });
 
   it("reuses the existing Fix prompt for CI", () => {
@@ -223,22 +230,21 @@ describe("actionPreview", () => {
     expect(actionPreview("investigate-ci", { checkConclusions: ["SUCCESS"] }).lastScan).toEqual([]);
   });
 
-  it("tracks the conflict prompt's base, test, and conditional safe push", () => {
+  it("tracks the conflict prompt's base, test, push, reply, and live gate check", () => {
     const preview = actionPreview("resolve-conflicts", { headRefName: "dev/abc-101", baseRefName: "main" });
     expect(preview.lastScan).toEqual(["dev/abc-101 → main"]);
-    expect(preview.steps.join(" ")).toMatch(/base branch.*resolve conflicts.*Run the tests.*Push.*--force-with-lease if rebased/us);
-    expect(actionPrompt("resolve-conflicts", FACTS)).toContain("push with an exact --force-with-lease if you rebased");
+    expect(preview.steps.join(" ")).toMatch(/live PR.*integrate its base.*resolve conflicts.*Run relevant tests, commit, and push.*--force-with-lease if rebased.*PR summary.*pushed head SHA.*PTAL.*Re-read live PR state.*remaining gates; do not merge/us);
+    expect(actionPrompt("resolve-conflicts", FACTS)).toContain("use an exact --force-with-lease");
   });
 
   for (const action of ["address-review", "address-comments"] as const) {
-    it(`${action} includes the prompt's code push, replies, and demonstrated-only resolution`, () => {
+    it(`${action} previews the prompt's base integration, replies, PR summary, and live gates`, () => {
       const preview = actionPreview(action, { unresolvedReviewThreads: 2 });
       const steps = preview.steps.join(" ");
       expect(preview.lastScan).toEqual(["2 open review threads"]);
-      expect(steps).toMatch(/Fetch every review comment and thread.*Commit and push.*reply on every comment thread.*Resolve only threads the pushed code demonstrably addresses/us);
-      expect(steps).toContain("Re-request review only if materially riskier.");
-      expect(actionPrompt(action, FACTS)).toContain("Resolve only the threads the pushed code demonstrably addresses.");
-      expect(steps.includes("Do not merge.")).toBe(action === "address-comments");
+      expect(steps).toMatch(/Read the live PR, base, review comments, and threads.*Integrate the base if behind.*resolve conflicts.*commit and push code changes.*Reply to actionable threads.*resolve only those the pushed code demonstrably addresses.*PR summary.*head SHA.*PTAL.*Re-read live PR state.*remaining gates; do not merge/us);
+      expect(actionPrompt(action, FACTS)).toContain("Resolve only threads demonstrably addressed by the pushed code.");
+      expect(steps).toContain("do not merge.");
     });
   }
 
