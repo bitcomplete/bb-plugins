@@ -1,7 +1,7 @@
 // bb-plugin-workstreams — frontend entry.
 //
-// Two views of one fetch: the Map (map.tsx), a spatial picture of the grouping
-// hierarchy, and the Board (inbox.tsx), an inbox of checkouts ordered by the
+// Three views of one fetch: the Map (map.tsx), a spatial picture of the grouping
+// hierarchy, and two Boards (inbox.tsx), inboxes of checkouts ordered by the
 // next action each needs. Everything either shows comes from
 // board_get; the server publishes "board-changed" after each scan and the board
 // refetches. Nothing here computes a count or a sentence — the server already
@@ -219,16 +219,17 @@ function Warnings({ warnings }: { warnings: string[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// The page: one fetch, two views of it.
+// The page: one fetch, three views of it.
 // ---------------------------------------------------------------------------
 
 /**
- * Both views have explicit paths so panel history keeps walking with browser
+ * Each view has an explicit path so panel history keeps walking with browser
  * back and forward. The panel root redirects to the last view opened here.
  */
 const VIEWS = [
   { id: "map", title: "Map", icon: "GridView" },
   { id: "board", title: "Board", icon: "Columns2" },
+  { id: "board-v2", title: "Board v2", icon: "Columns2" },
 ] as const;
 
 /** Typing in a field is never a view switch. */
@@ -240,7 +241,7 @@ function isEditable(target: EventTarget | null): boolean {
 }
 
 /**
- * The two views crossfade: the outgoing one fades and settles back a hair, the
+ * The views crossfade: the outgoing one fades and settles back a hair, the
  * incoming one rises into place. Transform and opacity only, on the page's one
  * easing; reduced motion swaps instantly. No shared-element morph — a circle
  * and a table row are not the same shape, and pretending costs more than it says.
@@ -299,8 +300,8 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
       toast.error("Could not open How this works", { description: "Open BB's right panel and choose its How this works tab." });
     }
   }, [panel]);
-  // The one selection both views share: a cluster focused on the Map is the
-  // row the Board opens on, and the circle the Map flies back to.
+  // The selection all views share: a cluster focused on the Map is the
+  // row either Board opens on, and the circle the Map flies back to.
   const [focusTicket, setFocusTicket] = useState<string | null>(null);
 
   const [leaving, setLeaving] = useState<ViewId | null>(null);
@@ -313,29 +314,30 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
     return () => window.clearTimeout(timer);
   }, [view]);
 
-  // `V` toggles the views from anywhere on the page. The Map's own keys are
+  // `V` toggles Map and Board from anywhere on the page. The Map's own keys are
   // + − 0 Esc Backspace and the arrows, and Tab stays focus navigation.
-  // `?` opens How this works from either view.
+  // `?` opens How this works from any view.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "v" && event.key !== "V" && event.key !== "?") return;
       if (event.metaKey || event.ctrlKey || event.altKey || isEditable(event.target)) return;
       event.preventDefault();
       if (event.key === "?") openHow();
-      else navigate.toPluginPanel("board", { subPath: view === "board" ? "map" : "board" });
+      else navigate.toPluginPanel("board", { subPath: view === "map" ? "board" : "map" });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [navigate, openHow, view]);
 
   const render = (id: ViewId) =>
-    id === "board" ? (
+    id !== "map" ? (
       board === null ? (
         <div className="p-4">
           <Notice>Loading the board…</Notice>
         </div>
       ) : (
         <InboxBoard
+          dispatchControls={id === "board-v2"}
           board={board}
           prefs={prefs}
           onPrefs={update}
@@ -357,8 +359,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   return (
     <div className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
       <header className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60 px-3">
-        {/* Two views of one fetch, one keystroke apart. Quiet on purpose: the
-            map is the surface, and this is only the way to the other view. */}
+        {/* Three views share one fetch. */}
         <div role="tablist" aria-label="Workstreams views" className="flex shrink-0 items-center gap-3">
           {VIEWS.map((entry) => (
             <button
@@ -366,7 +367,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
               type="button"
               role="tab"
               aria-selected={view === entry.id}
-              title={`${entry.title} (V toggles)`}
+              title={entry.id === "board-v2" ? entry.title : `${entry.title} (V toggles)`}
               onClick={() => navigate.toPluginPanel("board", { subPath: entry.id })}
               className={cn(
                 "text-xs transition-colors duration-150",

@@ -61,14 +61,16 @@ via agent** action starts a BB thread only when you confirm it.
   merge, branch update, and reviewer nudge actions ask for confirmation. CI,
   conflict, and review work starts a dedicated agent thread after you review
   its prompt.
-- **Dispatch:** Choose one effort in the Board, use **Shadow preview** to see
+- **Board v2:** Start with rows grouped by Effort. Choose one effort, use
+  **Shadow preview** to see
   the next eligible PR repair, then explicitly enable **Auto**. Auto starts one
   agent at a time for failing CI, merge conflicts, or review feedback. The
   agent works locally and is instructed to ask before pushing or replying on
   GitHub. Workstreams checks the PR again before it calls a transition
   verified. An unresolved gate pauses further dispatch until a fresh scan
   confirms it cleared. **Off** stops new dispatches; it does not cancel an
-  agent already running. Auto never merges or deploys.
+  agent already running. Auto never merges or deploys. The original Board
+  remains available beside Board v2.
 - **How this works:** Open the ⓘ panel for state definitions, shortcuts, scan
   health, and warnings.
 
@@ -87,7 +89,8 @@ remain Board actions. Its workflow ends when GitHub reports the PR merged.
 
 The scanner and Anthropic naming call live in `host.ts`. `server.ts` handles
 settings, local storage, refresh, enrichment, actions, and the CLI. The grouping
-and lifecycle rules live in `workstreams.ts`; `app.tsx` mounts the Map and Board.
+and lifecycle rules live in `workstreams.ts`; `app.tsx` mounts the Map and both
+Board tabs.
 `contract.ts` defines the host RPC schema, and `skills/workstreams/SKILL.md`
 documents the CLI for agents.
 

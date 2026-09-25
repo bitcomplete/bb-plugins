@@ -4,9 +4,10 @@ import { readLastView, storeLastView, viewFromSubPath, VIEW_STORAGE_KEY } from "
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Workstreams view preference", () => {
-  it("keeps explicit Map and Board links independent of the remembered view", () => {
+  it("keeps explicit view links independent of the remembered view", () => {
     expect(viewFromSubPath("map")).toBe("map");
     expect(viewFromSubPath("board/details")).toBe("board");
+    expect(viewFromSubPath("board-v2/details")).toBe("board-v2");
     expect(viewFromSubPath("")).toBeNull();
     expect(viewFromSubPath("unknown")).toBeNull();
   });
@@ -24,13 +25,16 @@ describe("Workstreams view preference", () => {
     storeLastView("board");
     expect(values.get(VIEW_STORAGE_KEY)).toBe("board");
     expect(readLastView()).toBe("board");
+    storeLastView("board-v2");
+    expect(values.get(VIEW_STORAGE_KEY)).toBe("board-v2");
+    expect(readLastView()).toBe("board-v2");
     storeLastView("map");
     expect(readLastView()).toBe("map");
     values.set(VIEW_STORAGE_KEY, "unexpected");
     expect(readLastView()).toBe("map");
   });
 
-  it("keeps both views usable when browser storage is unavailable", () => {
+  it("keeps every view usable when browser storage is unavailable", () => {
     vi.stubGlobal("window", {
       get localStorage(): Storage {
         throw new Error("Storage disabled");
@@ -38,5 +42,6 @@ describe("Workstreams view preference", () => {
     });
     expect(readLastView()).toBe("map");
     expect(() => storeLastView("board")).not.toThrow();
+    expect(() => storeLastView("board-v2")).not.toThrow();
   });
 });

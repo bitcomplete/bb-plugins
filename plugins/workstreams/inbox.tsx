@@ -116,6 +116,7 @@ export function InboxBoard({
   focusTicket,
   onFocusTicket,
   onShowOnMap,
+  dispatchControls = false,
 }: {
   board: Board;
   prefs: Prefs;
@@ -125,6 +126,8 @@ export function InboxBoard({
   onFocusTicket: (ticket: string | null) => void;
   /** Switch to the Map, which flies to `focusTicket` on arrival. */
   onShowOnMap: () => void;
+  /** Show the dispatcher pilot controls on Board v2. */
+  dispatchControls?: boolean;
 }) {
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
@@ -174,7 +177,8 @@ export function InboxBoard({
   }, []);
   const compact = boardWidth < 1060;
   const tight = boardWidth < 420;
-  const [groupBy, setGroupBy] = useState<InboxGrouping>("action");
+  const [groupBy, setGroupBy] = useState<InboxGrouping>(dispatchControls ? "effort" : "action");
+  useEffect(() => setGroupBy(dispatchControls ? "effort" : "action"), [dispatchControls]);
   const [actionOpen, setActionOpen] = useState<Record<InboxSection, boolean>>(() =>
     Object.fromEntries(INBOX_SECTIONS.map((section) => [section, !INBOX_COLLAPSED[section]])) as Record<
       InboxSection,
@@ -426,6 +430,7 @@ export function InboxBoard({
         prLabels={prLabels}
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
+        dispatchControls={dispatchControls}
       />
       <AgentsStrip counts={strip} onJump={jumpTo} />
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -454,7 +459,7 @@ export function InboxBoard({
                     </h2>
                     <span className="font-mono text-[11px] text-muted-foreground">{rows.length}</span>
                   </button>
-                  {group.section === null ? (
+                  {dispatchControls && group.section === null ? (
                     <button
                       type="button"
                       disabled={dispatchBusy || dispatch.effortKey === group.key}
@@ -970,6 +975,7 @@ function InboxHeader({
   prLabels,
   onFocusEffort,
   onDispatchMode,
+  dispatchControls,
 }: {
   searchRef: React.RefObject<HTMLInputElement | null>;
   query: string;
@@ -988,6 +994,7 @@ function InboxHeader({
   prLabels: Map<string, string>;
   onFocusEffort: (key: string | null) => void;
   onDispatchMode: (mode: Board["dispatch"]["mode"]) => void;
+  dispatchControls: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -1095,8 +1102,8 @@ function InboxHeader({
           ) : null}
         </div>
       </div>
-      <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]">
-        <span className="shrink-0 font-semibold text-foreground">Dispatch</span>
+      {dispatchControls ? <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/40 px-4 py-2 text-[11.5px]">
+        <span className="shrink-0 font-semibold text-foreground">Board v2 · Dispatch pilot</span>
         <label className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
           Focus
           <select
@@ -1150,9 +1157,9 @@ function InboxHeader({
               ? "Preview only. Auto starts one agent at a time; agents are instructed to ask before pushing or replying. No automatic merges."
               : dispatch.effortKey === null ? "Off. Select one effort, then preview in Shadow." : "Off. Preview the focused effort in Shadow."}
         </span>
-      </div>
-      {dispatchError !== null ? <p role="alert" className="mx-auto w-full max-w-6xl px-4 pb-2 text-[12px] text-destructive">{dispatchError}</p> : null}
-      <DispatchActivity dispatch={dispatch} prLabels={prLabels} />
+      </div> : null}
+      {dispatchControls && dispatchError !== null ? <p role="alert" className="mx-auto w-full max-w-6xl px-4 pb-2 text-[12px] text-destructive">{dispatchError}</p> : null}
+      {dispatchControls ? <DispatchActivity dispatch={dispatch} prLabels={prLabels} /> : null}
     </div>
   );
 }

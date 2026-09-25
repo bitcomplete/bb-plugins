@@ -1,6 +1,6 @@
 // "How this works": the secondary information the header used to carry, in
 // one quiet panel. It is a fixed tab in BB's own right panel, so it can stay
-// open beside the Map or the Board. Short sections, in the order a reader
+// open beside the Map or either Board. Short sections, in the order a reader
 // asks: how the groups are made, what the rows mean, the keys, the Map's
 // marks, and whether the board is healthy.
 import type { ReactNode } from "react";
@@ -51,7 +51,7 @@ const MAP_KEYS: [string, string][] = [
 ];
 
 const BOTH_KEYS: [string, string][] = [
-  ["v", "Switch between Map and Board"],
+  ["v", "Map to Board; either Board to Map"],
   ["?", "Open this panel"],
 ];
 
@@ -122,7 +122,8 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
 
       <Section title="What the states mean">
         <p>
-          Group by Action (the default) or Effort. Both keep urgent work first within each group and offer the same
+          Board starts grouped by Action; Board v2 starts grouped by Effort and adds dispatch controls. Both let you
+          switch grouping, keep urgent work first within each group, and offer the same
           row actions. Action groups include {INBOX_SECTION_LABEL.fix}, {INBOX_SECTION_LABEL.respond},{" "}
           {INBOX_SECTION_LABEL.merge} and {INBOX_SECTION_LABEL.waiting}; in-flight, recently merged, and parked work
           starts folded. The internal &ldquo;shipped&rdquo; state means a merge commit appears in a local release tag;
@@ -132,7 +133,7 @@ export function HowThisWorks({ board, now }: { board: Board | null; now: number 
       </Section>
 
       <Section title="Keyboard shortcuts">
-        <p className="text-foreground">Board</p>
+        <p className="text-foreground">Board and Board v2</p>
         <Pairs rows={BOARD_KEYS} mono />
         <p className="pt-1 text-foreground">Map</p>
         <Pairs rows={MAP_KEYS} mono />

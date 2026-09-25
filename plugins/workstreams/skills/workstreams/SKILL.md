@@ -365,7 +365,7 @@ sidebar shows a count beside Workstreams: needs-you first, else running.
 
 ### Automatic dispatch pilot
 
-The Board can focus one effort for automatic PR repair. **Off** is the default.
+**Board v2** can focus one effort for automatic PR repair. **Off** is the default.
 **Shadow preview** shows the next candidate without starting a thread. **Auto**
 starts at most one repair thread at a time for failing CI, merge conflicts, or
 review feedback in that effort. It skips dirty or unverified checkouts, stacked
@@ -388,8 +388,9 @@ steps in this pilot.
 ## Views
 
 The panel opens on the last view you used in this browser, or the **Map** on
-your first visit. Both the Map and **Board** have deep links and read the same
-board data.
+your first visit. **Map**, **Board**, and **Board v2** have deep links and read
+the same board data. Board keeps the original Action grouping and row actions;
+Board v2 starts with Effort grouping and adds dispatch controls above the rows.
 
 The Board is an inbox with one row per checkout. **Group by: Action** is the
 default; **Group by: Effort** collects each effort's rows without changing their
