@@ -308,19 +308,27 @@ function BriefHeaderAction({
           align="end"
           sideOffset={6}
           collisionPadding={8}
-          // A five-field brief is easily taller than a phone viewport, so the
-          // panel has to cap its height and scroll inside. Radix measures the
-          // room it actually has and publishes it as this variable; the vh
-          // fallback covers the case where collision detection is skipped.
-          // Inline rather than a Tailwind arbitrary value so it cannot depend
-          // on what the plugin's Tailwind pass chose to emit.
+          // Every layout-critical property is an inline style. The plugin's
+          // Tailwind output is scoped to its own subtree, and this content is
+          // portalled, so leaning on those classes for sizing is a bet this
+          // panel does not need to take. Cosmetics stay in className, where a
+          // miss is only cosmetic.
           style={{
+            // A five-field brief is easily taller than a phone viewport.
             maxHeight: "var(--radix-popover-content-available-height, 70vh)",
+            // ...and `100vw` is not the room this panel has: it is anchored to
+            // a trigger near the right edge, so a viewport-wide panel hangs off
+            // the screen and its text wraps out of sight. Radix measures the
+            // width actually available from where it was placed; cap by that.
+            maxWidth: "var(--radix-popover-content-available-width, calc(100vw - 1rem))",
+            width: isCompactViewport ? "calc(100vw - 1rem)" : "20rem",
+            overflowY: "auto",
+            overscrollBehavior: "contain",
+            // Long unbroken strings (URLs, branch names) must not force the
+            // panel wider than its cap.
+            overflowWrap: "anywhere",
           }}
-          className={`z-50 overflow-y-auto overscroll-contain rounded-md border border-border bg-card p-3 shadow-md ${
-            // Near-full width on a phone; a fixed column on a wide screen.
-            isCompactViewport ? "w-[calc(100vw-1rem)]" : "w-80"
-          }`}
+          className="z-50 rounded-md border border-border bg-card p-3 shadow-md"
         >
           <BriefBody state={state} onPick={onPick} onRefresh={onRefresh} />
         </Popover.Content>

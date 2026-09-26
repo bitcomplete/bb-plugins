@@ -147,39 +147,56 @@ describe("the header popover", () => {
     slot.lifecycle.unmount();
   });
 
-  it("caps its height and scrolls, so a long brief is reachable on a phone", async () => {
-    const slot = await render({ isCompactViewport: true });
+  /**
+   * These assert the *inline style*, not class names. An earlier version
+   * checked `className` contained `w-[calc(100vw-1rem)]` and passed happily
+   * while the panel rendered unconstrained: the class name being present says
+   * nothing about whether a rule reached the element, and this content is
+   * portalled out of the plugin's scoped stylesheet.
+   */
+  const openPanel = async (isCompactViewport: boolean) => {
+    const slot = await render({ isCompactViewport });
     fireEvent.click(await slot.findByRole("button", { name: "Thread brief" }));
+    const panel = (
+      await slot.findByText("Ship the thread-briefs plugin")
+    ).closest("[style*='max-height']") as HTMLElement | null;
+    return { slot, panel };
+  };
 
-    const goal = await slot.findByText("Ship the thread-briefs plugin");
-    const panel = goal.closest("[style*='max-height']") as HTMLElement | null;
+  it("caps its height and scrolls, so a long brief is reachable on a phone", async () => {
+    const { slot, panel } = await openPanel(true);
     expect(panel).not.toBeNull();
-    // Without both of these the panel grows past the viewport with no way to
-    // reach the fields below the fold.
     expect(panel?.style.maxHeight).toContain(
       "--radix-popover-content-available-height",
     );
-    expect(panel?.className).toContain("overflow-y-auto");
+    expect(panel?.style.overflowY).toBe("auto");
+    slot.lifecycle.unmount();
+  });
 
+  it("never exceeds the width Radix measured, so it cannot run off-screen", async () => {
+    const { slot, panel } = await openPanel(true);
+    // The bug this replaces: a 100vw-wide panel anchored near the right edge
+    // hangs off the screen and its text wraps out of sight.
+    expect(panel?.style.maxWidth).toContain(
+      "--radix-popover-content-available-width",
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("wraps long unbroken strings rather than widening", async () => {
+    const { slot, panel } = await openPanel(true);
+    expect(panel?.style.overflowWrap).toBe("anywhere");
     slot.lifecycle.unmount();
   });
 
   it("goes near-full-width on a compact viewport and a fixed column otherwise", async () => {
-    const compact = await render({ isCompactViewport: true });
-    fireEvent.click(await compact.findByRole("button", { name: "Thread brief" }));
-    const compactPanel = (
-      await compact.findByText("Ship the thread-briefs plugin")
-    ).closest("[style*='max-height']") as HTMLElement | null;
-    expect(compactPanel?.className).toContain("w-[calc(100vw-1rem)]");
-    compact.lifecycle.unmount();
+    const compact = await openPanel(true);
+    expect(compact.panel?.style.width).toBe("calc(100vw - 1rem)");
+    compact.slot.lifecycle.unmount();
 
-    const wide = await render({ isCompactViewport: false });
-    fireEvent.click(await wide.findByRole("button", { name: "Thread brief" }));
-    const widePanel = (
-      await wide.findByText("Ship the thread-briefs plugin")
-    ).closest("[style*='max-height']") as HTMLElement | null;
-    expect(widePanel?.className).toContain("w-80");
-    wide.lifecycle.unmount();
+    const wide = await openPanel(false);
+    expect(wide.panel?.style.width).toBe("20rem");
+    wide.slot.lifecycle.unmount();
   });
 
   it("sets a manual stage", async () => {
