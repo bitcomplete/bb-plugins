@@ -41,13 +41,19 @@ Re-summarize is available in the header popover; it bypasses the debounce.
 
 Hidden threads (plugin workers) and deleted threads never get briefs.
 
-**Briefs are not backfilled.** The sweep will give a briefless thread its first
-brief only if it was active in the last 24 hours (`BACKFILL_WINDOW_MS`).
-Anything dormant longer stays briefless and the header popover says so, with a
-**Summarize now** button. This is deliberate: without the bound, every briefless
-thread would be re-enqueued on every sweep forever — an unbounded burst of
-requests the first time a key is configured, and an endless retry for any thread
-whose summary keeps failing.
+**Briefs are never backfilled — activity earns a brief.** A thread gets its
+first brief from a turn happening while the plugin is running. The sweep will
+only give a *briefless* thread a first brief if its last activity postdates the
+current plugin load, which is activity whose `thread.idle` should have arrived
+and may have been missed. A thread that has been dormant since before the plugin
+started stays briefless, however old or recent, and the header popover says so
+with a **Summarize now** button. Work on it again and it gets a brief like any
+other thread.
+
+This is deliberate: without the bound, every briefless thread would be
+re-enqueued on every sweep forever — an unbounded burst of requests across the
+whole thread list the first time a key is configured, and an endless retry for
+any thread whose summary keeps failing.
 
 So a thread reports `summarizing` only while work is genuinely debounced,
 queued, or in flight; otherwise it reports `absent`, which the UI renders as an
@@ -97,5 +103,5 @@ trip to stay current.
   `experimental_setThreadRowStatus`, which the content script feature-detects.
 - Briefs stuck on "Summarizing…": check `apiKey` is set and
   `bb plugin logs thread-briefs` for HTTP errors from `baseUrl`.
-- "No brief for this thread yet" on an old thread is expected, not a fault —
-  briefs are not backfilled past the 24h window. Use **Summarize now**.
+- "No brief for this thread yet" on an older thread is expected, not a fault —
+  briefs are never backfilled. Work the thread, or use **Summarize now**.

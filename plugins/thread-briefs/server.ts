@@ -31,12 +31,6 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const SWEEP_CRON = "*/10 * * * *";
 /** Threads considered per sweep, newest first. */
 const SWEEP_LIMIT = 200;
-/**
- * How far back the sweep will reach to give a briefless thread its first
- * brief. Bounds the work to threads that were active recently enough to still
- * be worth summarizing; anything older is summarized on request instead.
- */
-const BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export { rpcContract };
 
@@ -102,6 +96,12 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------ queue/timers
 
   const lifetime = new AbortController();
+  /**
+   * When this plugin generation started. The cutoff for "has there been
+   * activity?": threads that last moved before we were running are not
+   * backfilled.
+   */
+  const loadedAt = Date.now();
   /** Per-thread debounce timers: the thread must stay quiet to be summarized. */
   const debounces = new Map<string, ReturnType<typeof setTimeout>>();
   /** Threads waiting for the single worker, in arrival order. */
@@ -386,9 +386,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (typeof values.apiKey !== "string" || values.apiKey.trim() === "") return;
 
     const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
-    const now = Date.now();
-    const quietBefore = now - Math.max(1, values.quietSeconds) * 1000;
-    const backfillAfter = now - BACKFILL_WINDOW_MS;
+    const quietBefore = Date.now() - Math.max(1, values.quietSeconds) * 1000;
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;
@@ -399,13 +397,17 @@ export default async function plugin(bb: BbPluginApi) {
 
       const stored = await readBrief(thread.id);
       if (stored === null) {
-        // No brief and no backfill: a thread already dormant when the plugin
-        // arrived stays briefless until someone asks, and the UI reports that
-        // honestly. Without this bound, every briefless thread would be
-        // re-enqueued on every sweep forever — an unbounded burst the first
-        // time a key is configured, and an endless retry for any thread whose
-        // summary keeps failing.
-        if (thread.updatedAt >= backfillAfter) enqueue(thread.id);
+        // Briefs are never backfilled. A thread gets its first brief from
+        // activity — `thread.idle` while we are running — so the sweep only
+        // considers a briefless thread whose activity postdates this load,
+        // which is activity whose event we should have seen and may have
+        // missed. Anything older stays briefless until it is next worked on.
+        //
+        // Without this bound every briefless thread would be re-enqueued on
+        // every sweep forever: an unbounded burst across the whole thread list
+        // the first time a key is configured, and an endless ten-minute retry
+        // for any thread whose summary keeps failing.
+        if (thread.updatedAt > loadedAt) enqueue(thread.id);
         continue;
       }
       // A stored brief older than the thread's last activity means activity we
