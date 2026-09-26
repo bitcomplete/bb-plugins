@@ -1,17 +1,14 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { BRIEF_STAGES, type BriefStage } from "./shared.js";
 
 /**
  * Where the thread is in its arc. A semantic judgement the summarizer makes
- * from the transcript, which the user can override by hand.
+ * from the transcript, which the user can override by hand. Built from the
+ * plain list in `shared.ts` so the stages have one definition.
  */
-export const briefStageSchema = z.enum([
-  "discovery",
-  "planning",
-  "implementation",
-  "review",
-]);
-export type BriefStage = z.infer<typeof briefStageSchema>;
+export const briefStageSchema = z.enum(BRIEF_STAGES);
+export type { BriefStage };
 
 /**
  * Who the thread is waiting on. Derived mechanically rather than asked of the
@@ -25,7 +22,7 @@ export const briefStatusSchema = z.enum([
 ]);
 export type BriefStatus = z.infer<typeof briefStatusSchema>;
 
-export const BRIEF_STAGES: readonly BriefStage[] = briefStageSchema.options;
+export { BRIEF_STAGES };
 
 /**
  * The five prose fields, exactly as the summarizer is asked to return them.
@@ -127,8 +124,7 @@ export const rowSignalSchema = z
   .strict();
 export type RowSignal = z.infer<typeof rowSignalSchema>;
 
-/** Realtime channel the server pokes when any brief changes. */
-export const BRIEFS_CHANGED_CHANNEL = "briefs-changed";
+export { BRIEFS_CHANGED_CHANNEL } from "./shared.js";
 
 export const rpcContract = defineRpcContract({
   /** The brief for one thread, for the thread-header popover. */

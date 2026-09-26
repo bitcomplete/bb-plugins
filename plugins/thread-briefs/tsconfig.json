@@ -21,6 +21,7 @@
     "skipLibCheck": false
   },
   "include": [
+    "shared.ts",
     "contract.ts",
     "brief.ts",
     "transcript.ts",

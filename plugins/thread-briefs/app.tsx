@@ -7,15 +7,19 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
+// Types only: `contract.ts` reaches the SDK root, which the app build cannot
+// resolve, so this import must erase. Runtime values come from `shared.ts`.
+import type {
+  BriefState,
+  ResolvedBrief,
+  RowSignal,
+  rpcContract,
+} from "./contract.js";
 import {
   BRIEFS_CHANGED_CHANNEL,
-  type BriefState,
+  BRIEF_STAGES,
   type BriefStage,
-  type ResolvedBrief,
-  type RowSignal,
-  type rpcContract,
-} from "./contract.js";
-import { BRIEF_STAGES } from "./contract.js";
+} from "./shared.js";
 import { rowDecoration, STAGE_LABELS, STATUS_LABELS } from "./brief.js";
 
 type Decoration = {
