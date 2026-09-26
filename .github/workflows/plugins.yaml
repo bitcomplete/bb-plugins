@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [kubernetes-provider, workstreams]
+        plugin: [kubernetes-provider, thread-briefs, workstreams]
     defaults:
       run:
         working-directory: plugins/${{ matrix.plugin }}
