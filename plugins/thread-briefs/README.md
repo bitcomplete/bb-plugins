@@ -35,6 +35,11 @@ unsent-draft pencil and displacing that everywhere would cost more than it says.
 are skipped), the derived status, a stage control for the manual override, and
 Re-summarize. It works the same on mobile and desktop; nothing depends on hover.
 
+Briefs are **not backfilled**: a thread dormant for more than a day when the
+plugin arrives stays briefless, and the popover offers **Summarize now** instead
+of a spinner that would never resolve. The alternative — summarizing every old
+thread — is an unbounded burst the first time a key is configured.
+
 ## How it is built
 
 | Concern | Mechanism |
