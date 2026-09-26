@@ -11,7 +11,7 @@ export const advancePreviewJobSchema = z.object({
 export const advancePreviewSchema = z.object({ token: z.string(), expiresAt: z.number(), jobs: z.array(advancePreviewJobSchema) });
 const advanceAttemptSchema = z.object({ attemptId: z.string(), threadId: z.string().nullable(), path: z.string().nullable(), detail: z.string(), status: z.string(), updatedAt: z.number() });
 export const advanceJobSchema = advancePreviewJobSchema.extend({
-  id: z.string(), hiddenFromProgress: z.boolean().default(false), status: z.enum(["queued", "launching", "running", "verifying", "ready", "waiting-checks", "waiting-review", "needs-attention", "cancelled"]),
+  id: z.string(), hiddenFromProgress: z.boolean().default(false), status: z.enum(["queued", "launching", "running", "verifying", "ready", "waiting-checks", "waiting-review", "needs-attention", "cancelled", "merged", "closed"]),
   attemptId: z.string().nullable().default(null), dedicated: z.boolean().default(false), previousAttempts: z.array(advanceAttemptSchema).max(5).default([]),
   threadId: z.string().nullable(), path: z.string().nullable(), checkedHeadOid: z.string().nullable(), checkedBaseOid: z.string().nullable().optional(), updatedAt: z.number(), uncertain: z.boolean().default(false),
 });
@@ -32,12 +32,12 @@ export type AdvanceRepairRun = z.infer<typeof advanceRepairRunSchema>;
 export type AdvanceRepairResult = z.infer<typeof advanceRepairResultSchema>;
 export type AdvanceFacts = AdvancePreviewJob & {
   baseOid: string; projectId: string | null; hostId: string; sourcePath: string | null; path: string | null;
-  readiness: "ready" | "waiting-checks" | "waiting-review" | "needs-attention";
+  readiness: "ready" | "waiting-checks" | "waiting-review" | "needs-attention" | "merged" | "closed";
   blockedBy: string | null;
 };
 const advanceRoutingSchema = advancePreviewJobSchema.extend({
   baseOid: z.string(), projectId: z.string().nullable(), hostId: z.string(), sourcePath: z.string().nullable(), path: z.string().nullable(),
-  readiness: z.enum(["ready", "waiting-checks", "waiting-review", "needs-attention"]), blockedBy: z.string().nullable(),
+  readiness: z.enum(["ready", "waiting-checks", "waiting-review", "needs-attention", "merged", "closed"]), blockedBy: z.string().nullable(),
 });
 const savedSchema = advanceBatchSchema.extend({ facts: z.record(z.string(), advanceRoutingSchema), token: z.string().uuid(), pollUntil: z.number(), prepared: z.record(z.string(), z.boolean()).default({}), repairs: z.record(z.string(), z.object({ jobId: z.string(), attemptId: z.string(), threadId: z.string().nullable() })).default({}) });
 type Saved = z.infer<typeof savedSchema>;
@@ -54,6 +54,7 @@ export function createAdvanceService(db: RunDb, deps: {
   repairCandidates(facts: AdvanceFacts, job: AdvanceJob): Promise<{ candidates: ThreadCandidate[]; recommendation: Recommendation }>;
   repairSpawn(facts: AdvanceFacts, workerPath: string, prompt: string, attemptId: string, mode: "new" | "subthread", parentThreadId: string | null): Promise<string>;
   workspace(facts: AdvanceFacts, batchId: string, jobId: string): Promise<{ path: string; workerPath: string }>;
+  assertAdvanceAllowed?(prUrl: string): void;
   busyNow(prUrl: string, path: string | null): boolean;
   busy(prUrl: string, path: string | null, ownThreadId?: string): Promise<boolean>;
   spawn(facts: AdvanceFacts, path: string, prompt: string, jobId: string): Promise<string>;
@@ -95,14 +96,22 @@ export function createAdvanceService(db: RunDb, deps: {
   function reserved(prUrl: string, path: string | null) {
     return [...batches.values()].some((batch) => batch.jobs.some((job) => owns(job) && (job.prUrl.toLowerCase() === prUrl.toLowerCase() || (path !== null && job.path === path))));
   }
-  async function verify(batch: Saved, job: AdvanceJob) {
+  function finishTerminal(batch: Saved, job: AdvanceJob, facts: Pick<AdvanceFacts, "readiness" | "detail" | "headOid" | "baseOid">): boolean {
+    if (facts.readiness !== "merged" && facts.readiness !== "closed") return false;
+    if (job.status === facts.readiness && job.hiddenFromProgress) return true;
+    update(batch, job, { status: facts.readiness, detail: facts.detail, hiddenFromProgress: true,
+      eligible: false, uncertain: false, checkedHeadOid: facts.headOid || null, checkedBaseOid: facts.baseOid || null });
+    return true;
+  }
+  async function verify(batch: Saved, job: AdvanceJob, inspected?: AdvanceFacts) {
     if (verifying.has(job.id) || stopped) return;
     verifying.add(job.id);
     const previousStatus = job.status;
     update(batch, job, { status: "verifying", detail: "Verifying current GitHub head, reviews, checks, and mergeability" });
     try {
-      const facts = await deps.inspect(job.prUrl);
+      const facts = inspected ?? await deps.inspect(job.prUrl);
       if (stopped) return;
+      if (finishTerminal(batch, job, facts)) { deps.verified(job.prUrl, batch.facts[job.id]!.path); return; }
       const failedPreparation = (job.dedicated || needsWorker(job)) && !batch.prepared[job.id];
       if (facts.readiness === "waiting-checks" && previousStatus !== "waiting-checks") batch.pollUntil = Math.max(batch.pollUntil, now() + 30 * 60_000);
       update(batch, job, { status: failedPreparation ? "needs-attention" : facts.readiness,
@@ -138,6 +147,8 @@ export function createAdvanceService(db: RunDb, deps: {
           try {
             const facts = await deps.inspect(job.prUrl);
             if (interrupted(batch, job)) continue;
+            if (finishTerminal(batch, job, facts)) continue;
+            deps.assertAdvanceAllowed?.(job.prUrl);
             // A selected parent may legitimately advance this child's base during this batch.
             const completedParent = batch.jobs.find((parent) => parent.repo === repo && parent.headRefName === job.baseRefName && parent.checkedHeadOid === facts.baseOid);
             if (completedParent) batch.facts[job.id]!.baseOid = facts.baseOid;
@@ -166,6 +177,7 @@ export function createAdvanceService(db: RunDb, deps: {
               if (thread.status !== "idle" || thread.archivedAt !== null || thread.deletedAt !== null) throw new Error("Repository worker changed while preparing the workspace. Inspect it before continuing this queue.");
             }
             const prompt = preparationPrompt(job, path) + `\nIf all requested work and validation succeeded, finish with the exact line: ${marker(job)}\nIf tests fail, work is incomplete, or you stop for any blocker, finish with: ${blockedMarker(job)}`;
+            deps.assertAdvanceAllowed?.(job.prUrl);
             // Persist intent before the SDK write. A timeout never triggers an automatic duplicate.
             update(batch, job, { status: "launching", path, threadId, detail: `Starting ${workLabel(job)}` });
             if (threadId) {
@@ -173,7 +185,7 @@ export function createAdvanceService(db: RunDb, deps: {
               if (job.status === "launching") update(batch, job, { status: "running", detail: `Working on ${workLabel(job)} in Rebasing...` });
             } else {
               const id = await deps.spawn(facts, workerPath, prompt, job.id);
-              update(batch, job, { threadId: id, status: "running", detail: `Working on ${workLabel(job)} in Rebasing...` });
+              update(batch, job, job.status === "launching" ? { threadId: id, status: "running", detail: `Working on ${workLabel(job)} in Rebasing...` } : { threadId: id });
             }
           } catch (error) {
             update(batch, job, { status: "needs-attention", uncertain: job.status === "launching", detail: `${job.status === "launching" ? "Launch outcome is uncertain; inspect the worker before retrying. " : ""}${String(error).slice(0, 300)}` });
@@ -218,7 +230,7 @@ export function createAdvanceService(db: RunDb, deps: {
     if (conflictingJob(job, batch.facts[job.id]!.path)) throw new Error("Another batch already owns this PR or checkout");
     const availability = await repairAvailability(batch, job);
     const facts = await deps.inspect(job.prUrl, true);
-    if (!facts.eligible) throw new Error(facts.detail);
+    if (finishTerminal(batch, job, facts) || !facts.eligible) throw new Error(facts.detail);
     if (!facts.projectId || !facts.sourcePath) throw new Error("No matching repository workspace is available for a repair");
     if (await deps.busy(job.prUrl, facts.path, job.threadId ?? undefined)) throw new Error("Another writer owns this PR or checkout. Let it finish before repairing this item.");
     const routing = await deps.repairCandidates(facts, job);
@@ -279,6 +291,7 @@ export function createAdvanceService(db: RunDb, deps: {
       const availability = await repairAvailability(batch, previous);
       if (input.mode === "continue" && !availability.canContinue) throw new Error("The previous worker is no longer available to continue. Open the preview again.");
       const facts = await deps.inspect(job.prUrl, true);
+      if (finishTerminal(batch, job, facts)) throw new Error(facts.detail);
       if (!facts.eligible || fingerprint(facts) !== fingerprint(preview.facts)) throw new Error("The PR or repair scope changed since the preview. Open it again.");
       if (await deps.busy(job.prUrl, facts.path, previous.threadId ?? undefined)) throw new Error("Another writer started on this PR. Open the repair preview again.");
       if (stopped) throw new Error("Plugin reloaded before the repair launched");
@@ -315,7 +328,8 @@ export function createAdvanceService(db: RunDb, deps: {
         batch.facts[job.id] = oldFacts;
         if (previouslyPrepared === undefined) delete batch.prepared[job.id]; else batch.prepared[job.id] = previouslyPrepared;
         delete batch.repairs[input.token];
-        Object.assign(job, previous, { hiddenFromProgress: false }); save(batch);
+        if (job.status !== "merged" && job.status !== "closed") Object.assign(job, previous, { hiddenFromProgress: false });
+        save(batch);
       } else update(batch, job, { status: "needs-attention", uncertain: true, detail: `Repair launch outcome is uncertain; recheck before retrying. ${String(error).slice(0, 250)}` });
       throw error;
     }
@@ -324,8 +338,12 @@ export function createAdvanceService(db: RunDb, deps: {
     reserved, repairPlan, repairRun,
     invalidate(observed: readonly { url: string; headRefOid?: string | null; baseRefOid?: string | null; state?: string; reviewDecision?: string | null; mergeStateStatus?: string; unresolvedReviewThreads?: number | null; checkConclusions?: string[]; isDraft?: boolean; approvalHasBody?: boolean; approvalNoteFollowedUp?: boolean }[]) {
       for (const batch of batches.values()) for (const job of batch.jobs) {
-        if (ACTIVE.has(job.status) || job.checkedHeadOid === null) continue;
         const pr = observed.find((entry) => entry.url.toLowerCase() === job.prUrl.toLowerCase());
+        if (pr?.state === "MERGED" || pr?.state === "CLOSED") {
+          finishTerminal(batch, job, { readiness: pr.state === "MERGED" ? "merged" : "closed", detail: pr.state === "MERGED" ? "PR merged." : "PR closed without merging.", headOid: pr.headRefOid ?? "", baseOid: "" });
+          continue;
+        }
+        if (job.status === "merged" || job.status === "closed" || ACTIVE.has(job.status) || job.checkedHeadOid === null) continue;
         const noLongerReady = job.status === "ready" && pr && (pr.state !== undefined && pr.state !== "OPEN" || pr.reviewDecision !== undefined && pr.reviewDecision !== "APPROVED" ||
           pr.isDraft === true || pr.unresolvedReviewThreads === null || (pr.approvalHasBody === true && pr.approvalNoteFollowedUp !== true) ||
           pr.mergeStateStatus !== undefined && !["CLEAN", "HAS_HOOKS"].includes(pr.mergeStateStatus) || (pr.unresolvedReviewThreads ?? 0) > 0 ||
@@ -372,7 +390,7 @@ export function createAdvanceService(db: RunDb, deps: {
         }
         if (stopped || fresh.some((fact) => fact.eligible && deps.busyNow(fact.prUrl, fact.path))) throw new Error("Another action started on this selection. Preview again.");
         const id = randomUUID();
-        const jobs = fresh.map((facts): AdvanceJob => ({ ...advancePreviewJobSchema.parse(facts), id: randomUUID(), hiddenFromProgress: false, status: facts.eligible ? "queued" : "needs-attention", attemptId: null, dedicated: false, previousAttempts: [], threadId: null, path: facts.path, checkedHeadOid: null, updatedAt: now(), uncertain: false }));
+        const jobs = fresh.map((facts): AdvanceJob => ({ ...advancePreviewJobSchema.parse(facts), id: randomUUID(), hiddenFromProgress: facts.readiness === "merged" || facts.readiness === "closed", status: facts.readiness === "merged" || facts.readiness === "closed" ? facts.readiness : facts.eligible ? "queued" : "needs-attention", attemptId: null, dedicated: false, previousAttempts: [], threadId: null, path: facts.path, checkedHeadOid: null, updatedAt: now(), uncertain: false }));
         const batch: Saved = { id, token, createdAt: now(), cancelled: false, jobs, facts: Object.fromEntries(jobs.map((job, index) => [job.id, fresh[index]!])), pollUntil: now() + 30 * 60_000, prepared: {}, repairs: {} };
         batches.set(id, batch); save(batch); queueMicrotask(() => void pump()); return publicBatch(batch);
       } finally { starting = false; }
@@ -385,6 +403,7 @@ export function createAdvanceService(db: RunDb, deps: {
     },
     progressVisibility(batchId: string, jobId: string, hidden: boolean): AdvanceBatch {
       const { batch, job } = findJob(batchId, jobId);
+      if (job.status === "merged" || job.status === "closed") return publicBatch(batch);
       if (hidden && (job.uncertain || ["launching", "running", "verifying"].includes(job.status))) throw new Error("Wait for this item's worker to stop and reconcile its result before removing it");
       update(batch, job, { hiddenFromProgress: hidden, ...(hidden && job.status === "queued" ? { status: "cancelled" as const, detail: "Removed from progress before requested work started" } : {}) });
       void pump();
@@ -393,8 +412,18 @@ export function createAdvanceService(db: RunDb, deps: {
     async recheck(id: string, jobId?: string): Promise<AdvanceBatch> {
       const batch = batches.get(id); if (!batch) throw new Error("Batch not found");
       const jobs = jobId === undefined ? batch.jobs : [findJob(id, jobId).job];
-      if (jobId !== undefined) update(batch, jobs[0]!, { hiddenFromProgress: false });
-      for (const job of jobs) if ((!ACTIVE.has(job.status) && job.status !== "cancelled") || (job.status === "running" && job.uncertain)) {
+      if (jobId !== undefined && !["merged", "closed"].includes(jobs[0]!.status)) update(batch, jobs[0]!, { hiddenFromProgress: false });
+      for (const job of jobs) {
+        if (["cancelled", "merged", "closed"].includes(job.status)) continue;
+        let facts: AdvanceFacts;
+        try { facts = await deps.inspect(job.prUrl); }
+        catch (error) {
+          if (!stopped && !ACTIVE.has(job.status)) update(batch, job, { status: "needs-attention", detail: `Verification failed: ${String(error).slice(0, 300)}`, checkedHeadOid: null });
+          continue;
+        }
+        if (stopped) break;
+        if (finishTerminal(batch, job, facts)) continue;
+        if (ACTIVE.has(job.status) && !(job.status === "running" && job.uncertain)) continue;
         if (job.uncertain && !job.threadId) {
           const matches = await deps.recover(attemptId(job), batch.facts[job.id]!.projectId!);
           if (matches.length === 0 && !working && now() - job.updatedAt > 30_000) { update(batch, job, { uncertain: false, detail: "No worker exists for this launch. Requested work did not start; fix this item with an agent." }); continue; }
@@ -411,7 +440,7 @@ export function createAdvanceService(db: RunDb, deps: {
           // Read-only reconciliation can release a proven stopped worker, but only its
           // current attempt's success marker confirms local work and validation.
         }
-        await verify(batch, job);
+        await verify(batch, job, facts);
       }
       void pump();
       return publicBatch(batch);

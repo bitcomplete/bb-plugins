@@ -457,6 +457,8 @@ effort assigned** in Efforts. Approved records a review decision; Ready to merge
 requires checks, threads, branch state, and stack dependencies to clear.
 Direct GitHub actions work on remote PRs; single-PR agent repairs need a scanned checkout.
 
+PR row menus include **Put on hold** with an optional reason; held PRs remain under their effort and in the backlog’s **Held** group with readiness and thread access intact. Hold excludes Advance selection and automatic actions; **Release hold** restores the current readiness group without changing GitHub.
+
 In **PR backlog**, select approved open PRs and choose **Advance selected** to
 preview a finite batch. The preview distinguishes feedback work, branch
 preparation, both, and verification only. Confirmation authorizes the listed

@@ -1,4 +1,5 @@
 import type { AgentAction } from "./actions.js";
+import { prHoldFor, type PrHolds } from "./pr-holds.js";
 import type { RunDb } from "./runstore.js";
 import type { Board } from "./server.js";
 
@@ -64,7 +65,7 @@ function fingerprint(unit: Board["groups"][number]["clusters"][number]["units"][
 
 export function selectCandidate(
   groups: Board["groups"], effortKey: string | null, attempts: readonly (DispatchAttempt & { fingerprint: string })[],
-  openRuns: readonly Pick<Board["runs"][number], "path" | "prUrl" | "status">[],
+  openRuns: readonly Pick<Board["runs"][number], "path" | "prUrl" | "status">[], holds: PrHolds = {},
 ): { candidate: DispatchCandidate; fingerprint: string } | null {
   if (effortKey === null) return null;
   const effort = groups.find((group) => group.key === effortKey && !groups.some((child) => child.parentKey === group.key));
@@ -77,7 +78,7 @@ export function selectCandidate(
     const pr = unit.pr;
     if (unit.dirty || unit.rebasing || (unit.stack !== null && unit.stack.blockedBelow !== null) ||
       unit.observed?.status !== true || unit.observed?.pr !== true || pr === null || pr.state !== "OPEN" ||
-      pr.isDraft || pr.mergeStateStatus === "UNKNOWN" || counts.get(pr.url) !== 1 ||
+      prHoldFor(pr.url, holds) !== null || pr.isDraft || pr.mergeStateStatus === "UNKNOWN" || counts.get(pr.url) !== 1 ||
       cluster.threads.some((thread) => thread.active) ||
       openRuns.some((run) => (run.path === unit.path || run.prUrl === pr.url) && (run.status === "running" || run.status === "needs-you")) ||
       attempts.some((attempt) => (ACTIVE.has(attempt.status) || attempt.status === "needs-you") &&

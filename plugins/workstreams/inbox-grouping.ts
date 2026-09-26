@@ -90,3 +90,15 @@ export function completedByEffort(completed: Pick<ReturnType<typeof partitionCom
   }
   return efforts;
 }
+
+/** Hold keeps open work under its effort without presenting it as an active next step. */
+export function heldByEffort(sections: ReadonlyMap<InboxSection, readonly Row[]>): Map<string, Row[]> {
+  const groups = new Map<string, Row[]>();
+  for (const rows of sections.values()) for (const row of rows) {
+    if (!row.hold || row.unit.pr?.state !== "OPEN") continue;
+    const held = groups.get(row.effortKey) ?? [];
+    held.push(row);
+    groups.set(row.effortKey, held);
+  }
+  return groups;
+}

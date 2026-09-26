@@ -48,6 +48,24 @@ const board = () => [
 ];
 
 describe("rolling one-offs into containers", () => {
+  it("preserves one ticket spanning distinct active PRs as an outcome effort", () => {
+    const cluster = clusterOf("ABC-3", "api");
+    cluster.units.push(...clusterOf("ABC-3", "ui").units);
+    cluster.summary = "Restore subscription cancellation";
+    const outcome = effort("seed:ABC-3", [cluster]); outcome.name = cluster.summary;
+    const rolled = rollOneOffs([...board(), outcome], none);
+    expect(rolled.efforts.find((entry) => entry.key === outcome.key)?.name).toBe(cluster.summary);
+    expect(rolled.containers[0]!.clusters.map((entry) => entry.ticket)).toEqual(["ABC-1", "ABC-2"]);
+  });
+  it("does not promote checkout duplicates or historical multi-PR tickets", () => {
+    const duplicate = clusterOf("ABC-3", "api");
+    duplicate.units.push({ ...duplicate.units[0]!, path: "/another-checkout", pr: { ...duplicate.units[0]!.pr!, url: duplicate.units[0]!.pr!.url.toUpperCase() + "/" } });
+    const historical = clusterOf("ABC-4", "active");
+    historical.units.push(...clusterOf("ABC-4", "merged", "MERGED").units, ...clusterOf("ABC-4", "closed", "MERGED").units.map((unit) => ({ ...unit, pr: { ...unit.pr!, state: "CLOSED" as const } })));
+    const rolled = rollOneOffs([...board(), effort("Duplicate", [duplicate]), effort("History", [historical])], none);
+    expect(rolled.containers[0]!.clusters.map((entry) => entry.ticket)).toEqual(["ABC-1", "ABC-2", "ABC-3", "ABC-4"]);
+  });
+
   it("files one-cluster efforts by ticket prefix and leaves real efforts alone", () => {
     const { efforts, containers } = rollOneOffs(board(), none);
     expect(containers.map((group) => [group.key, group.level, group.name, group.clusters.map((c) => c.ticket)])).toEqual([

@@ -84,3 +84,14 @@ describe("inventory effort associations", () => {
     expect(workstreamAttention(remoteAttentionRows(prBacklog([entry()], [], now)))).toEqual([]);
   });
 });
+
+it("keeps hold separate from GitHub readiness and effort attention", () => {
+  const held = { reason: "Awaiting launch approval", heldAt: now };
+  const source = { ...entry(), effortKey: "effort:launch", effortName: "Account launch" };
+  const rows = prBacklog([source], [], now, { [source.pr.url]: held });
+  expect(rows[0]).toMatchObject({ group: "held", hold: held, verb: "Ready to merge", lifecycle: "awaiting-merge" });
+  const attention = workstreamAttention(remoteAttentionRows(rows));
+  expect(attention[0]).toMatchObject({ held: 1, ready: 0, fix: 0, update: 0 });
+  expect(hasBoardRows(attention[0]!)).toBe(true);
+  expect(prBacklog([source], [], now)[0]?.group).toBe("ready");
+});

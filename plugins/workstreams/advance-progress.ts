@@ -6,7 +6,7 @@ export function canRemoveProgressJob(job: Pick<AdvanceJob, "status" | "uncertain
 }
 
 export function canRecheckProgressJob(job: Pick<AdvanceJob, "status" | "uncertain">): boolean {
-  return job.status !== "cancelled" && (!ACTIVE.has(job.status) || (job.status === "running" && job.uncertain));
+  return !["cancelled", "merged", "closed"].includes(job.status) && (!ACTIVE.has(job.status) || (job.status === "running" && job.uncertain));
 }
 
 /** Keep older active work in sight when a more recent completed batch exists. */

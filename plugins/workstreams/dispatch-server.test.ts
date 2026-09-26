@@ -22,6 +22,7 @@ function unit(mergeStateStatus: "DIRTY" | "CLEAN"): RawUnit {
 }
 
 async function setup(second = false) {
+  const beforeProjects = vi.fn(async () => {});
   const spawn = vi.fn(async () => makeThreadResponse({ id: "thr-dispatch", status: "active" }));
   const another = { ...unit("DIRTY"), path: "/p/web-abc-101", dirName: "web-abc-101", repo: "acme/web",
     pr: { ...unit("DIRTY").pr!, number: 43, url: "https://github.com/acme/web/pull/43" } };
@@ -33,7 +34,7 @@ async function setup(second = false) {
     settings: { scanRoots: "/p" },
     sdk: {
       system: { config: async () => ({ primaryHostId: HOST }) as never },
-      projects: { list: async () => [{ id: "proj-a", sources: [{ hostId: HOST, path: "/p" }] }] as never },
+      projects: { list: async () => { await beforeProjects(); return [{ id: "proj-a", sources: [{ hostId: HOST, path: "/p" }] }] as never; } },
       threads: {
         list: async () => [] as never, spawn,
         get: async ({ threadId }: { threadId: string }) => ({ ...makeThreadResponse({ id: threadId, status: "idle" }), canSpawnChild: true }) as never,
@@ -59,12 +60,29 @@ async function setup(second = false) {
   const current = await board();
   const leaf = current.groups.find((group) => !current.groups.some((child) => child.parentKey === group.key));
   expect(leaf).toBeDefined();
-  return { harness, board, leafKey: leaf!.key, spawn, inspectCount: () => inspectCount,
+  return { harness, board, leafKey: leaf!.key, spawn, beforeProjects, inspectCount: () => inspectCount,
     setInspection: (next: RawUnit) => { inspected.set(next.path, next); },
     setFullScan: (next: RawUnit) => { fullScan = [next]; } };
 }
 
 describe("dispatcher server wiring", () => {
+  it("excludes held work from Auto while still allowing a manual agent", async () => {
+    const env = await setup();
+    await env.harness.callRpc("pr_hold_set", { prUrl: URL, held: true });
+    await env.harness.callRpc("dispatch_set", { mode: "auto", effortKey: env.leafKey });
+    expect((await env.board()).dispatch.candidate).toBeNull();
+    expect(env.spawn).not.toHaveBeenCalled();
+    expect(await env.harness.callRpc("agent_run", { path: PATH, action: "resolve-conflicts", mode: "new", threadId: null, prompt: "Fix the conflict without merging" })).toMatchObject({ ok: true });
+    expect(env.spawn).toHaveBeenCalledOnce();
+  });
+  it("refuses Auto when a hold arrives during the final project lookup", async () => {
+    const env = await setup();
+    env.beforeProjects.mockImplementationOnce(async () => { await env.harness.callRpc("pr_hold_set", { prUrl: URL, held: true }); });
+    await env.harness.callRpc("dispatch_set", { mode: "auto", effortKey: env.leafKey });
+    await vi.waitFor(async () => expect((await env.board()).dispatch.attempts[0]).toMatchObject({ status: "failed", detail: expect.stringContaining("On hold") }));
+    expect(env.spawn).not.toHaveBeenCalled();
+    expect((await env.board()).runs).toEqual([]);
+  });
   it("keeps Off and Shadow read-only, then preflights and launches once after Auto is selected", async () => {
     const env = await setup();
     expect((await env.board()).dispatch).toMatchObject({ mode: "off", candidate: null, attempts: [] });

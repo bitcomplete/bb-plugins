@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { advanceChecks, readAdvancePr } from "./advance-host.js";
+import { advanceInspectionSchema } from "./advance-contract.js";
 import type { GhRunner } from "./ghactions.js";
 
 const head = "a".repeat(40);
@@ -32,6 +33,22 @@ function fixture(options: { view?: Record<string, unknown>; review?: Record<stri
 }
 
 describe("bulk advance verification", () => {
+  it.each(["MERGED", "CLOSED"] as const)("recognizes %s without review reads or surviving branch refs", async (state) => {
+    const fake = fixture({ view: { state, headRefName: null, headRefOid: null, baseRefName: null, latestReviews: null, statusCheckRollup: null } });
+    const result = await readAdvancePr(fake.run, url);
+    expect(result).toMatchObject({ ok: true, facts: { state, readiness: state.toLowerCase(), needsPreparation: false, baseOid: "", headOid: "" } });
+    expect(advanceInspectionSchema.safeParse(result).success).toBe(true);
+    expect(fake.calls).toHaveLength(1);
+  });
+  it("requires commit identities in open inspection contracts", async () => {
+    const result = await readAdvancePr(fixture().run, url);
+    if (!result.ok) throw new Error(result.error);
+    expect(advanceInspectionSchema.safeParse({ ...result, facts: { ...result.facts, baseOid: "" } }).success).toBe(false);
+  });
+  it("still validates the identity of completed PR responses", async () => {
+    expect(await readAdvancePr(fixture({ view: { state: "MERGED", number: 43 } }).run, url)).toMatchObject({ ok: false, error: "GitHub returned a different pull request." });
+  });
+
   it("calls a PR ready only after approval, feedback, checks, stack, and commit identities agree", async () => {
     const result = await readAdvancePr(fixture().run, url);
     expect(result).toMatchObject({ ok: true, facts: { readiness: "ready", headOid: head, baseOid: base, needsPreparation: false } });

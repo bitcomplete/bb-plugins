@@ -58,14 +58,18 @@ export function RowActionMenu({
   onGoToThread,
   onMessageAgent,
   onOpenCheckout,
-  onNewThread,
+  onNewThread, onHold, onReleaseHold, held, onHeldAction,
 }: {
   hasThreads: boolean;
   hasOpenPr: boolean;
-  onGoToThread: () => void;
-  onMessageAgent: () => void;
-  onOpenCheckout: () => void;
-  onNewThread: () => void;
+  onGoToThread?: () => void;
+  onMessageAgent?: () => void;
+  onOpenCheckout?: () => void;
+  onNewThread?: () => void;
+  onHold?: () => void;
+  onReleaseHold?: () => void;
+  held?: boolean;
+  onHeldAction?: { label: string; run: () => void };
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLSpanElement | null>(null);
@@ -114,10 +118,13 @@ export function RowActionMenu({
           role="menu"
           className="absolute right-0 top-7 z-30 flex w-56 flex-col rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
         >
-          {hasThreads ? item("Go to thread", "t", onGoToThread) : null}
-          {hasThreads && hasOpenPr ? item("Message agent", "", onMessageAgent) : null}
-          {item("Open checkout", "o", onOpenCheckout)}
-          {item("Start a new thread", "n", onNewThread)}
+          {hasThreads && onGoToThread ? item("Go to thread", "t", onGoToThread) : null}
+          {hasThreads && hasOpenPr && onMessageAgent ? item("Message agent", "", onMessageAgent) : null}
+          {onOpenCheckout ? item("Open checkout", "o", onOpenCheckout) : null}
+          {onNewThread ? item("Start a new thread", "n", onNewThread) : null}
+          {onHeldAction ? item(onHeldAction.label, "", onHeldAction.run) : null}
+          {hasOpenPr && onHold ? item(held ? "Edit hold reason" : "Put on hold…", "", onHold) : null}
+          {held && onReleaseHold ? item("Release hold", "", onReleaseHold) : null}
         </span>
       ) : null}
     </span>

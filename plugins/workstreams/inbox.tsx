@@ -4,6 +4,8 @@
 // Map, position here DOES follow status: this is a list you work through, and
 // the sections and in-section order come from the pure rules in
 // workstreams.ts (`inboxSection`, `byInboxOrder`), unit-tested there.
+import { prHoldFor, type PrHold } from "./pr-holds";
+import { PrHoldDialog, usePrHoldControls } from "./pr-hold-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
@@ -56,7 +58,7 @@ import { ArchivedThreadsButton } from "./archivedthreads";
 import { rowRun, runDetail, runLabel, stripCounts, type RunStatus, type StripCounts } from "./runs";
 import { REVIEWER_MARK, reviewerInitials, reviewersLabel, reviewersOf, visibleReviewers, type Reviewer, type ReviewerState } from "./reviewers";
 import { ageHint, primaryHint, rowAge, shortAge, shortVerb, titleHint } from "./rowlabels";
-import { completedByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
+import { completedByEffort, heldByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows, type InboxGrouping, type RowGroup } from "./inbox-grouping";
 import { latestEffortOutcome, type EffortOutcome } from "./outcomes";
 import { attentionDetail, attentionLabel, hasBoardRows, workstreamAttention, type WorkstreamAttention } from "./workstream-attention";
 import { usePortalScopeProps } from "./lib/portal-scope";
@@ -67,6 +69,7 @@ type Unit = Cluster["units"][number];
 /** One inbox row: a checkout and everything the row shows about it. */
 export type Row = {
   key: string;
+  hold?: PrHold | null;
   unit: Unit;
   cluster: Cluster;
   effortKey: string;
@@ -95,6 +98,7 @@ export function inboxRows(board: Board, now: number): Map<InboxSection, Row[]> {
         const verb = inboxVerb(unit, section);
         rows.push({
           key: unit.path,
+          hold: unit.pr?.state === "OPEN" ? prHoldFor(unit.pr.url, board.prHolds) : null,
           unit,
           cluster,
           effortKey: group.key,
@@ -154,6 +158,7 @@ export function InboxBoard({
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
   const advance = useAdvanceBatches();
+  const holdControls = usePrHoldControls();
   const advanceJobs = useMemo(() => advance.batches.flatMap((batch) => batch.jobs), [advance.batches]);
   const [repairTarget, setRepairTarget] = useState<{ batchId: string; jobId: string } | null>(null);
   const repairJob = (jobId: string) => {
@@ -162,7 +167,7 @@ export function InboxBoard({
   };
   const now = useMemo(() => Date.now(), [board]);
   const all = useMemo(() => inboxRows(board, now), [board, now]);
-  const inventoryOnlyPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now).filter((row) => row.local === null), [board.prInventory.entries, all, now]);
+  const inventoryOnlyPrs = useMemo(() => prBacklog(board.prInventory.entries, [...all.values()].flat(), now, board.prHolds).filter((row) => row.local === null), [board.prInventory.entries, all, now, board.prHolds]);
   const allEfforts = useMemo(() => workstreamAttention([...Array.from(all.values()).flat(), ...remoteAttentionRows(inventoryOnlyPrs)]), [all, inventoryOnlyPrs]);
   const efforts = useMemo(() => allEfforts.filter(hasBoardRows), [allEfforts]);
   const [dispatch, setDispatch] = useState(board.dispatch);
@@ -236,13 +241,15 @@ export function InboxBoard({
     for (const [key, rows] of remoteEffortPrs) counts.set(key, (counts.get(key) ?? 0) + rows.length);
     return counts;
   }, [sections, remoteEffortPrs]);
+  const effortHeld = useMemo(() => heldByEffort(sections), [sections]);
+  const [heldOpen, setHeldOpen] = useState<Record<string, boolean>>({});
   const completed = useMemo(() => partitionCompletedRows(sections), [sections]);
   const effortCompleted = useMemo(() => completedByEffort(completed), [completed]);
   const completionWithinEffort = dispatchControls && groupBy === "effort";
   const groups = useMemo(() => {
     const localGroups = groupInboxRows(dispatchControls && !completionWithinEffort ? completed.active : sections, groupBy)
       .filter((group) => !dispatchControls || group.section !== "shipped")
-      .map((group) => completionWithinEffort ? { ...group, rows: group.rows.filter((row) => row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped") } : group);
+      .map((group) => completionWithinEffort ? { ...group, rows: group.rows.filter((row) => row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped" && !row.hold) } : group);
     return completionWithinEffort ? includeRemoteEfforts(localGroups, remoteEffortPrs) : localGroups;
   }, [completed, completionWithinEffort, dispatchControls, sections, groupBy, remoteEffortPrs]);
   const [effortCompletedOpen, setEffortCompletedOpen] = useState<Record<string, { merged: boolean; inReleaseTag: boolean }>>({});
@@ -300,9 +307,9 @@ export function InboxBoard({
 
   // j/k walk the rows the reader can see, top to bottom.
   const visible = useMemo(() => completionWithinEffort
-    ? groups.flatMap((group) => isOpen(group) ? [...group.rows, ...visibleCompletedRows(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, effortCompletedOpen[group.key] ?? { merged: false, inReleaseTag: false })] : [])
+    ? groups.flatMap((group) => isOpen(group) ? [...group.rows, ...(heldOpen[group.key] ? effortHeld.get(group.key) ?? [] : []), ...visibleCompletedRows(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, effortCompletedOpen[group.key] ?? { merged: false, inReleaseTag: false })] : [])
     : [...visibleInboxRows(groups, isOpen), ...(dispatchControls ? visibleCompletedRows(completed, completedOpen) : [])],
-  [groups, isOpen, dispatchControls, completed, completedOpen, completionWithinEffort, effortCompleted, effortCompletedOpen]);
+  [groups, isOpen, dispatchControls, completed, completedOpen, completionWithinEffort, effortCompleted, effortCompletedOpen, heldOpen, effortHeld]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const selected = visible.find((row) => row.key === selectedKey) ?? null;
 
@@ -356,6 +363,7 @@ export function InboxBoard({
   /** Select a row anywhere on the Board, even when filters or a group hide it. */
   const reveal = useCallback(
     (target: Row) => {
+      if (target.hold) setHeldOpen((current) => ({ ...current, [target.effortKey]: true }));
       setActionOpen((current) => ({ ...current, [target.section]: true }));
       setEffortOpen((current) => ({ ...current, [target.effortKey]: true }));
       if (dispatchControls && target.unit.lifecycle === "merged") setCompletedOpen((current) => ({ ...current, merged: true }));
@@ -398,6 +406,7 @@ export function InboxBoard({
    */
   const runPrimary = useCallback(
     (row: Row) => {
+      if (row.hold && row.unit.pr) { void holdControls.release(row.unit.pr.url); return; }
       const action = row.action;
       if (action === null) return;
       if (action.kind === "agent") setRequest({ kind: "agent", action: action.action, row });
@@ -411,7 +420,7 @@ export function InboxBoard({
         reveal(target);
       }
     },
-    [all, reveal],
+    [all, reveal, holdControls.release],
   );
 
   /**
@@ -515,7 +524,7 @@ export function InboxBoard({
       compact={compact}
       tight={tight}
       selected={row.key === selected?.key}
-      candidate={dispatchControls && groupKey !== null && dispatch.effortKey === groupKey && dispatch.mode !== "off" && dispatch.candidate?.path === row.key ? dispatch.candidate : null}
+      candidate={!row.hold && dispatchControls && groupKey !== null && dispatch.effortKey === groupKey && dispatch.mode !== "off" && dispatch.candidate?.path === row.key ? dispatch.candidate : null}
       threads={threadsOf(row)}
       onSelect={() => select(row)}
       onOpenThread={openThread}
@@ -523,6 +532,8 @@ export function InboxBoard({
       onStart={() => setStarting(row)}
       onMessageAgent={() => setMessaging(row)}
       onPrimary={() => runPrimary(row)}
+      onHold={() => row.unit.pr && holdControls.edit({ url: row.unit.pr.url, label: `${row.repo} #${row.unit.pr.number} (${row.title})`, hold: row.hold })}
+      onHeldAction={row.action?.kind === "agent" ? () => row.action?.kind === "agent" && setRequest({ kind: "agent", action: row.action.action, row }) : undefined}
       onShowOnMap={() => {
         onFocusTicket(row.cluster.ticket);
         onShowOnMap();
@@ -555,6 +566,7 @@ export function InboxBoard({
       {dispatchControls ? <div className="flex items-center gap-1 border-b border-border/60 px-4 py-1.5" role="group" aria-label="Board view">
         {(["efforts", "backlog"] as const).map((view) => <button key={view} type="button" aria-pressed={boardV2View === view} onClick={() => chooseView(view)} className={cn("rounded-md px-2.5 py-1 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", boardV2View === view ? "bg-foreground/[0.08] font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{view === "efforts" ? "Efforts" : "PR backlog"}</button>)}
       </div> : null}
+      <PrHoldDialog target={holdControls.target} onClose={holdControls.close} />
       <AdvanceRepairDialog target={repairTarget} onClose={() => setRepairTarget(null)} onStarted={advance.refresh} onOpenThread={openThread} />
       <AdvanceProgress width={boardWidth} onRepair={(batchId, jobId) => setRepairTarget({ batchId, jobId })} batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
       {backlogVisible && dispatch.mode === "auto" ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-4 py-2 text-[11.5px] text-muted-foreground">
@@ -587,7 +599,7 @@ export function InboxBoard({
         efforts={efforts}
         unavailableEffortName={allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? null}
         focusedVisibleCount={visibleEffortCounts.get(dispatch.effortKey ?? "") ?? 0}
-        focusedHasCheckout={[...all.values()].flat().some((row) => row.effortKey === dispatch.effortKey && row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped")}
+        focusedHasCheckout={[...all.values()].flat().some((row) => row.effortKey === dispatch.effortKey && row.unit.lifecycle !== "merged" && row.unit.lifecycle !== "shipped" && !row.hold)}
         filtersActive={prefs.approvedOnly || query !== "" || prefs.staleness.length > 0 || prefs.surfaces.length > 0 || prefs.showClones}
         onFocusEffort={focusEffort}
         onDispatchMode={(mode) => void setDispatchMode(mode, dispatch.effortKey)}
@@ -612,7 +624,9 @@ export function InboxBoard({
           ) : null}
           {groups.map((group) => {
             const rows = group.rows;
-            const remoteCount = completionWithinEffort ? remoteEffortPrs.get(group.key)?.length ?? 0 : 0;
+            const remoteRows = completionWithinEffort ? remoteEffortPrs.get(group.key) ?? [] : [];
+            const remoteCount = remoteRows.filter((row) => !row.hold).length;
+            const heldCount = (effortHeld.get(group.key)?.length ?? 0) + remoteRows.filter((row) => row.hold).length;
             const established = board.efforts.find((effort) => effort.key === group.key) ?? null;
             const canCoordinate = established !== null || (board.groups.some((entry) => entry.key === group.key && entry.level === "effort") && !outsideGrouping(group.key));
             const expanded = isOpen(group);
@@ -638,7 +652,7 @@ export function InboxBoard({
                     <h2 className="min-w-0 truncate text-[13px] font-semibold tracking-tight text-foreground">
                       {group.label}
                     </h2>
-                    <span className="font-mono text-[11px] text-muted-foreground">{completionWithinEffort ? rows.length + remoteCount > 0 ? `${rows.length + remoteCount} active` : "Completed" : rows.length}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{completionWithinEffort ? rows.length + remoteCount > 0 ? `${rows.length + remoteCount} active` : heldCount > 0 ? `${heldCount} held` : "Completed" : rows.length}</span>
                   </button>
                   {dispatchControls && group.section === null && canCoordinate ? <EffortCoordinatorControl groupKey={group.key} name={group.label} effort={established} board={board} onOpenThread={openThread} onCoordinated={(key) => {
                     setEffortOpen((current) => ({ ...current, [key]: true }));
@@ -670,7 +684,7 @@ export function InboxBoard({
                 </div>
                 {expanded ? (
                   rows.length === 0 ? (
-                    completionWithinEffort && (effortCompleted.has(group.key) || remoteCount > 0) ? null : <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
+                    completionWithinEffort && (effortCompleted.has(group.key) || remoteCount > 0 || heldCount > 0) ? null : <p className="px-2 pb-1 pl-8 text-[12px] text-muted-foreground/80">{group.section === null ? "No matching checkouts." : EMPTY[group.section]}</p>
                   ) : (
                     <ul role="listbox" aria-label={group.label} className="flex flex-col">
                       {rows.map((row) => renderRow(row, groupBy === "effort", group.key))}
@@ -678,6 +692,10 @@ export function InboxBoard({
                   )
                 ) : null}
                 {expanded && remoteCount > 0 ? <PrBacklog advanceJobs={advanceJobs} onRepair={repairJob} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} checkoutFiltersActive={prefs.staleness.length > 0 || prefs.surfaces.length > 0} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /> : null}
+                {expanded && completionWithinEffort && heldCount > 0 ? <section aria-label={`Held in ${group.label}`} className="ml-7 mt-1 border-l border-border/50 pl-2">
+                  <button type="button" aria-expanded={Boolean(heldOpen[group.key])} onClick={() => setHeldOpen((current) => ({ ...current, [group.key]: !current[group.key] }))} className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[11.5px] text-muted-foreground outline-none hover:bg-foreground/[0.025] focus-visible:ring-2 focus-visible:ring-ring"><Icon name="ChevronRight" className={cn("size-3 shrink-0", heldOpen[group.key] && "rotate-90")} />Held<span className="font-mono text-[10.5px]">{heldCount}</span></button>
+                  {heldOpen[group.key] ? <><ul role="listbox" aria-label={`Held in ${group.label}`}>{(effortHeld.get(group.key) ?? []).map((row) => renderRow(row, false, null))}</ul><PrBacklog heldOnly advanceJobs={advanceJobs} onRepair={repairJob} onClearApproved={() => onPrefs({ approvedOnly: false })} approvedOnly={prefs.approvedOnly} board={board} locals={[...all.values()].flat()} now={now} width={boardWidth} unassignedQuery={query} embeddedEffortKey={group.key} onRequest={setRequest} onMessage={setMessaging} onCheckout={openCheckout} onStart={setStarting} onOpenThread={openThread} threadsOf={threadsOf} /></> : null}
+                </section> : null}
                 {expanded && completionWithinEffort ? completionCards(effortCompleted.get(group.key) ?? { merged: [], inReleaseTag: [] }, group.key) : null}
               </section>
             );
@@ -1032,6 +1050,8 @@ function InboxRow({
   onStart,
   onMessageAgent,
   onPrimary,
+  onHold,
+  onHeldAction,
   onShowOnMap,
 }: {
   row: Row;
@@ -1050,6 +1070,8 @@ function InboxRow({
   onStart: () => void;
   onMessageAgent: () => void;
   onPrimary: () => void;
+  onHold: () => void;
+  onHeldAction?: () => void;
   onShowOnMap: () => void;
 }) {
   const { unit } = row;
@@ -1068,7 +1090,7 @@ function InboxRow({
     ...(row.cluster.linear?.url != null ? [`Linear: ${row.cluster.linear.url}`] : []),
   ] : [];
   const portalScope = usePortalScopeProps();
-  const titleDetail = [titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear }), ...hiddenDetails].join("\n");
+  const titleDetail = [row.hold ? `${row.verb ?? ""} · On hold${row.hold.reason ? `: ${row.hold.reason}` : ""}` : null, titleHint({ title: row.title, repo: row.repo, pr: unit.pr, branch: unit.branch, linear: row.cluster.linear }), ...hiddenDetails].filter(Boolean).join("\n");
   return (
     <li
       id={`inbox-${row.key}`}
@@ -1083,9 +1105,9 @@ function InboxRow({
       )}
     >
       <span className={compact ? "contents" : "flex min-w-0 flex-1 items-center gap-2"}>
-        {row.verb === null && !showSection ? null : (
+        {row.verb === null && !showSection && !row.hold ? null : (
           <span className={cn("flex min-w-0 items-center gap-1", compact ? (tight ? "col-span-2 col-start-1 row-start-2" : "col-start-1 row-start-1") : "w-[11.5rem] shrink-0")}>
-            <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />
+            {row.hold ? <span className="flex min-w-0 flex-col items-start gap-0.5"><button type="button" onClick={(event) => { event.stopPropagation(); onPrimary(); }} className="rounded border border-border px-1.5 py-0.5 text-[11px] outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">Release hold</button><span title={row.hold.reason || "On hold"} className="max-w-full truncate text-[10px] text-muted-foreground">{row.verb} · On hold</span></span> : <VerbChip verb={row.verb ?? INBOX_SECTION_LABEL[row.section]} section={row.section} action={row.action} onPrimary={onPrimary} />}
             {unit.lifecycle === "awaiting-rereview" && unit.pr?.mergeStateStatus === "BEHIND" ? (
               <Tip label="The PR branch is behind its base. Update it before merging.">
                 <span tabIndex={0} aria-label="Branch behind" className="shrink-0 rounded border border-border px-1 text-[10px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">Behind</span>
@@ -1200,6 +1222,8 @@ function InboxRow({
               onMessageAgent={onMessageAgent}
               onOpenCheckout={onOpenCheckout}
               onNewThread={onStart}
+              held={Boolean(row.hold)} onHold={onHold} onReleaseHold={onPrimary}
+              onHeldAction={row.hold && onHeldAction && row.action ? { label: row.action.label, run: onHeldAction } : undefined}
             />
           </span>
           <ThreadMark threads={threads} onOpen={onOpenThread} onMore={onShowOnMap} />

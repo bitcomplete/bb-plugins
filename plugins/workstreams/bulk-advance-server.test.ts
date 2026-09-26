@@ -10,12 +10,12 @@ const PATH = "/p/widget-checkout";
 const HOST = "host-example";
 const HEAD = "a".repeat(40), BASE = "b".repeat(40);
 const cleanups: (() => Promise<void>)[] = [];
-afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
+afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); vi.useRealTimers(); });
 
-async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready?: boolean; fork?: boolean; omitLaunchedThreadsFromList?: boolean; feedback?: "threads" | "approval-note"; failFirstWorkspace?: boolean; author?: boolean } = {}) {
+async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready?: boolean; fork?: boolean; omitLaunchedThreadsFromList?: boolean; feedback?: "threads" | "approval-note"; failFirstWorkspace?: boolean; author?: boolean; terminal?: "MERGED" | "CLOSED"; savedBatch?: { id: string; body: string } } = {}) {
   const repo = options.mixedCase ? "Example/Widget" : "example/widget";
   const url = `https://github.com/${repo}/pull/42`;
-  const pr = { ...parsePrList(JSON.stringify([{ number: 42, url, state: "OPEN", title: "ABC-42 Fix account lookup", reviewDecision: "APPROVED",
+  const pr = { ...parsePrList(JSON.stringify([{ number: 42, url, state: options.terminal ?? "OPEN", title: "ABC-42 Fix account lookup", reviewDecision: "APPROVED",
     isDraft: false, headRefName: "abc-42-lookup", baseRefName: "main", headRefOid: HEAD, baseRefOid: BASE, mergeStateStatus: options.ready ? "CLEAN" : "DIRTY",
     mergeable: options.ready ? "MERGEABLE" : "CONFLICTING", statusCheckRollup: [{ conclusion: "SUCCESS" }], latestReviews: [], reviewRequests: [] }]))!.pr,
     unresolvedReviewThreads: options.feedback === "threads" ? 1 : 0, resolvedReviewThreads: 0 };
@@ -23,11 +23,12 @@ async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready
     dirty: false, ahead: 0, behind: 0, lastCommitAt: null, defaultBranch: "main", pr: options.remoteOnly ? null : pr,
     shipped: null, changedPaths: [], observed: { status: true, pr: true } };
   const facts: AdvanceFacts = { prUrl: url, number: 42, title: pr.title, repo, headRefName: "abc-42-lookup", baseRefName: "main", headOid: HEAD, baseOid: BASE,
-    state: "OPEN", isDraft: false, isCrossRepository: options.fork ?? false, reviewDecision: "APPROVED", mergeStateStatus: options.ready ? "CLEAN" : "DIRTY",
-    mergeable: options.ready ? "MERGEABLE" : "CONFLICTING", needsPreparation: !options.ready, readiness: options.ready && !options.feedback ? "ready" : "needs-attention",
+    state: options.terminal ?? "OPEN", isDraft: false, isCrossRepository: options.fork ?? false, reviewDecision: "APPROVED", mergeStateStatus: options.ready ? "CLEAN" : "DIRTY",
+    mergeable: options.ready ? "MERGEABLE" : "CONFLICTING", needsPreparation: !options.ready, readiness: options.terminal === "MERGED" ? "merged" : options.terminal === "CLOSED" ? "closed" : options.ready && !options.feedback ? "ready" : "needs-attention",
     detail: options.feedback ? "Review feedback needs attention" : options.ready ? "Approved and ready to merge" : "Resolve branch conflicts",
     unresolvedThreads: options.feedback === "threads" ? 1 : 0, checks: "passed", basePrNumber: null, approvalNotePending: options.feedback === "approval-note" };
   const calls: { method: string; input: unknown }[] = [];
+  const beforeWorkspace = vi.fn(async () => {});
   const threads = new Map<string, ReturnType<typeof makeThreadResponse>>();
   if (options.author) threads.set("thr-author", makeThreadResponse({ id: "thr-author", title: "ABC-42 Fix account lookup", projectId: "project-example", status: "idle" }));
   const blockedParents = new Set<string>();
@@ -46,22 +47,31 @@ async function setup(options: { remoteOnly?: boolean; mixedCase?: boolean; ready
       getPluginMetadata: async () => ({}) as never, output: async () => ({ output: "" }),
       context: async () => ({ usage: null }) as never, events: { list: async () => [] }, interactions: { list: async () => [] as never },
     },
-  }, experimental_callHostRpc: ({ method, input }) => {
+  }, experimental_callHostRpc: async ({ method, input }) => {
     calls.push({ method, input });
     if (method === "scan" || method === "inspectPaths") return { units: [unit], warnings: [] };
-    if (method === "authoredPrs") return { owners: [repo.split("/")[0]], entries: [{ repo, pr }], discoveryComplete: true,
+    if (method === "authoredPrs") return { owners: [repo.split("/")[0]], entries: pr.state === "OPEN" ? [{ repo, pr }] : [], discoveryComplete: true,
       repositories: [{ repo, complete: true }], complete: true, warnings: [] };
     if (method === "advanceInspect") return { ok: true, facts };
+    if (method === "inspectPrs") return facts.state === "OPEN"
+      ? { entries: [{ repo, pr }], closed: [], failed: [], warnings: [] }
+      : { entries: [], closed: [url], failed: [], warnings: [] };
     if (method === "advanceWorkspace") {
+      await beforeWorkspace();
       workspaces++;
       if (options.failFirstWorkspace && workspaces === 1) return { ok: false, error: "The fetched PR base changed. No checkout was created." };
       return { ok: true, path: `/synthetic/workstreams/batch/repo/${workspaces === 1 ? "job" : (input as { jobId: string }).jobId}`, workerPath: "/synthetic/workstreams/batch/repo", sourcePath: PATH, created: true };
     }
     throw new Error(`Unexpected host method ${method}`);
   } });
+  if (options.savedBatch) {
+    const db = bb.storage.database();
+    db.prepare("CREATE TABLE IF NOT EXISTS advance_batches (id TEXT PRIMARY KEY, body TEXT NOT NULL)").run();
+    db.prepare("INSERT INTO advance_batches (id, body) VALUES (?, ?)").run(options.savedBatch.id, options.savedBatch.body);
+  }
   await plugin(bb); cleanups.push(() => harness.lifecycle.dispose());
   expect((await harness.runCli(["refresh"])).exitCode).toBe(0);
-  return { harness, calls, spawn, send, facts, pr, url, threads, blockedParents, preview: async (prUrl = url) => await harness.callRpc("advance_preview", { prUrls: [prUrl] }) as AdvancePreview };
+  return { harness, calls, spawn, send, facts, pr, url, threads, blockedParents, beforeWorkspace, savedBatch: (id: string) => bb.storage.database().prepare("SELECT id, body FROM advance_batches WHERE id = ?").get(id) as { id: string; body: string }, preview: async (prUrl = url) => await harness.callRpc("advance_preview", { prUrls: [prUrl] }) as AdvancePreview };
 }
 
 async function failedBatch(env: Awaited<ReturnType<typeof setup>>) {
@@ -71,6 +81,77 @@ async function failedBatch(env: Awaited<ReturnType<typeof setup>>) {
 }
 
 describe("bulk advance server integration", () => {
+  it("automatically retires a saved failed item when complete discovery loses its merged PR", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const env = await setup({ remoteOnly: true, failFirstWorkspace: true });
+    await failedBatch(env);
+    env.pr.state = "MERGED";
+    Object.assign(env.facts, { state: "MERGED", readiness: "merged", detail: "GitHub confirms this PR merged" });
+    await env.harness.runCli(["refresh"]);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "merged", hiddenFromProgress: true }] }]);
+    const inspections = env.calls.filter((call) => call.method === "inspectPrs").length;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(env.calls.filter((call) => call.method === "inspectPrs")).toHaveLength(inspections);
+    expect(env.spawn).not.toHaveBeenCalled();
+  });
+  it("reconciles a saved item missing from inventory once on startup", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const previous = await setup({ remoteOnly: true, failFirstWorkspace: true });
+    const ids = await failedBatch(previous);
+    const savedBatch = previous.savedBatch(ids.batchId);
+    await previous.harness.lifecycle.dispose();
+    const env = await setup({ remoteOnly: true, terminal: "CLOSED", savedBatch });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "closed", hiddenFromProgress: true }] }]);
+    expect(env.calls.filter((call) => call.method === "inspectPrs")).toHaveLength(1);
+    expect(env.spawn).not.toHaveBeenCalled();
+  });
+  it("blocks Advance if Hold arrives while the separate checkout is being prepared", async () => {
+    const env = await setup();
+    env.beforeWorkspace.mockImplementationOnce(async () => { await env.harness.callRpc("pr_hold_set", { prUrl: env.url, held: true }); });
+    const batch = await env.harness.callRpc("advance_start", { token: (await env.preview()).token }) as AdvanceBatch;
+    await vi.waitFor(async () => expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ id: batch.id, jobs: [{ status: "needs-attention", uncertain: false, detail: expect.stringContaining("On hold") }] }]));
+    expect(env.spawn).not.toHaveBeenCalled();
+    expect(env.send).not.toHaveBeenCalled();
+  });
+  it("does not stop a worker that was already running when a PR is held", async () => {
+    const env = await setup();
+    await env.harness.callRpc("advance_start", { token: (await env.preview()).token });
+    await vi.waitFor(() => expect(env.spawn).toHaveBeenCalledOnce());
+    await env.harness.callRpc("pr_hold_set", { prUrl: env.url, held: true });
+    expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "running", threadId: "thr-rebasing" }] }]);
+    expect(env.send).not.toHaveBeenCalled();
+  });
+  it("rechecks a saved failed PR after it leaves tracked inventory and confirms it merged", async () => {
+    const env = await setup({ remoteOnly: true, failFirstWorkspace: true });
+    const ids = await failedBatch(env);
+    env.pr.state = "MERGED";
+    Object.assign(env.facts, { state: "MERGED", needsPreparation: false, readiness: "merged", detail: "GitHub confirms this PR merged" });
+    await env.harness.runCli(["refresh"]);
+    expect(await env.harness.callRpc("board_get", null)).toMatchObject({ prInventory: { entries: [] } });
+    expect(await env.harness.callRpc("advance_recheck", ids)).toMatchObject({ jobs: [{ status: "merged", hiddenFromProgress: true }] });
+    expect(env.spawn).not.toHaveBeenCalled();
+    await expect(env.preview("https://github.com/example/widget/pull/999")).rejects.toThrow("no longer tracked");
+  });
+  it("excludes held PRs from Advance and invalidates previews when a hold is added", async () => {
+    const env = await setup(); const plan = await env.preview();
+    await env.harness.callRpc("pr_hold_set", { prUrl: env.url.toUpperCase().replace("HTTPS:", "https:"), held: true, reason: "Await launch decision" });
+    expect((await env.preview()).jobs[0]).toMatchObject({ eligible: false, detail: expect.stringContaining("On hold") });
+    await expect(env.harness.callRpc("advance_start", { token: plan.token })).rejects.toThrow("changed");
+    expect(env.spawn).not.toHaveBeenCalled();
+    expect(env.calls.some((call) => call.method === "advanceWorkspace")).toBe(false);
+  });
+  it("allows an explicit repair of a held PR and preserves its hold", async () => {
+    const env = await setup({ failFirstWorkspace: true, author: true });
+    const ids = await failedBatch(env);
+    await env.harness.callRpc("pr_hold_set", { prUrl: env.url, held: true });
+    const plan = await env.harness.callRpc("advance_repair_plan", ids) as AdvanceRepairPlan;
+    expect(plan.fresh.eligible).toBe(true);
+    await env.harness.callRpc("advance_repair_run", { token: plan.token, mode: "new", threadId: null, instruction: "Fix validation only" });
+    expect(env.spawn).toHaveBeenCalledOnce();
+    expect(await env.harness.callRpc("board_get", null)).toMatchObject({ prHolds: { [env.url]: { reason: "" } } });
+  });
   it("removes and restores progress through the RPC without deleting results or launching workers", async () => {
     const env = await setup({ ready: true });
     const batch = await env.harness.callRpc("advance_start", { token: (await env.preview()).token }) as AdvanceBatch;

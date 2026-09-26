@@ -1,3 +1,4 @@
+import { prHoldFor, type PrHold, type PrHolds } from "./pr-holds.js";
 import type { Pr } from "./contract.js";
 import type { Row } from "./inbox.js";
 import type { AttentionRow } from "./workstream-attention.js";
@@ -5,21 +6,21 @@ import type { RowGroup } from "./inbox-grouping.js";
 import { primaryAction, type PrimaryAction } from "./actions.js";
 import { displayTitle, inboxSection, inboxVerb, prLifecycle, unitLifecycle, type InboxSection, type Lifecycle } from "./workstreams.js";
 
-export const BACKLOG_GROUPS = ["ready", "approved", "respond", "waiting", "draft", "unknown"] as const;
+export const BACKLOG_GROUPS = ["ready", "approved", "respond", "waiting", "draft", "unknown", "held"] as const;
 export type BacklogGroup = (typeof BACKLOG_GROUPS)[number];
 export const BACKLOG_LABEL: Record<BacklogGroup, string> = {
-  ready: "Ready to merge", approved: "Approved · next steps", respond: "Fix or respond",
+  held: "Held", ready: "Ready to merge", approved: "Approved · next steps", respond: "Fix or respond",
   waiting: "Waiting for review or another PR", draft: "Drafts and work in progress", unknown: "Status to verify",
 };
 export type BacklogEntry = { repo: string; pr: Pr; stale: boolean; effortKey?: string; effortName?: string };
 export type BacklogRow = BacklogEntry & {
-  group: BacklogGroup; lifecycle: Lifecycle; section: InboxSection; verb: string; action: PrimaryAction | null; local: Row | null;
+  hold?: PrHold | null; group: BacklogGroup; lifecycle: Lifecycle; section: InboxSection; verb: string; action: PrimaryAction | null; local: Row | null;
   parent: { repo: string; pr: Pr } | null;
 };
 const urlKey = (url: string) => url.replace(/\/$/u, "").toLowerCase();
 
 /** Inventory owns membership and remote facts; a real checkout only adds local context. */
-export function prBacklog(entries: readonly BacklogEntry[], locals: readonly Row[], now: number): BacklogRow[] {
+export function prBacklog(entries: readonly BacklogEntry[], locals: readonly Row[], now: number, holds: PrHolds = {}): BacklogRow[] {
   const unique = new Map<string, BacklogEntry>();
   for (const entry of entries) {
     if (entry.pr.state !== "OPEN") continue;
@@ -33,6 +34,7 @@ export function prBacklog(entries: readonly BacklogEntry[], locals: readonly Row
   }
   const result = [...unique.values()].map((entry): BacklogRow => {
     const { pr } = entry;
+    const hold = prHoldFor(pr.url, holds);
     const original = localByUrl.get(urlKey(pr.url)) ?? null;
     const parent = pr.baseRefName === null ? null : [...unique.values()].find((candidate) =>
       candidate.repo.toLowerCase() === entry.repo.toLowerCase() && candidate.pr.number !== pr.number && candidate.pr.headRefName === pr.baseRefName,
@@ -47,15 +49,15 @@ export function prBacklog(entries: readonly BacklogEntry[], locals: readonly Row
     const action = entry.stale ? null : primaryAction(facts, section, verb);
     const local = original === null ? null : {
       ...original, unit: { ...original.unit, pr, lifecycle, stack: parent === null ? original.unit.stack : { ...original.unit.stack, id: original.unit.stack?.id ?? parent.pr.url, blockedBelow: parent.pr.number, size: original.unit.stack?.size ?? 2, position: original.unit.stack?.position ?? 2 } },
-      title: displayTitle(pr.title), section, verb, action,
+      title: displayTitle(pr.title), section, verb, action, hold,
     };
-    const group: BacklogGroup = entry.stale || lifecycle === "unverified" ? "unknown"
+    const group: BacklogGroup = hold !== null ? "held" : entry.stale || lifecycle === "unverified" ? "unknown"
       : pr.isDraft || original?.unit.rebasing ? "draft"
       : stack?.blockedBelow != null ? "waiting"
       : verb === "Ready to merge" ? "ready"
       : pr.reviewDecision === "APPROVED" ? "approved"
       : section === "fix" || section === "respond" ? "respond" : "waiting";
-    return { ...entry, group, lifecycle, section, verb, action, local, parent };
+    return { ...entry, hold, group, lifecycle, section, verb, action, local, parent };
   });
   return result.sort((a, b) => BACKLOG_GROUPS.indexOf(a.group) - BACKLOG_GROUPS.indexOf(b.group) ||
     a.repo.localeCompare(b.repo) || a.pr.number - b.pr.number);
@@ -91,7 +93,7 @@ export function includeRemoteEfforts(groups: readonly RowGroup[], remote: Readon
 export function remoteAttentionRows(rows: readonly BacklogRow[]): AttentionRow[] {
   return rows.flatMap((row) => row.local !== null || row.effortKey === undefined ? [] : [{
     effortKey: row.effortKey, effort: row.effortName ?? row.effortKey,
-    section: row.stale ? "waiting" : row.section, verb: row.verb,
+    section: row.stale ? "waiting" : row.section, verb: row.verb, hold: row.hold,
     unit: { ticket: null, pr: row.pr, lifecycle: row.stale ? "unverified" : row.lifecycle },
   }]);
 }

@@ -14,6 +14,7 @@ export type WorkstreamAttention = {
   unknown: number;
   inFlight: number;
   parked: number;
+  held: number;
   merged: number;
   inReleaseTag: number;
   oldCommits: number;
@@ -21,12 +22,12 @@ export type WorkstreamAttention = {
 type CountKey = Exclude<keyof WorkstreamAttention, "key" | "name">;
 
 /** Attention needs PR facts, not a checkout path. */
-export type AttentionRow = Pick<Row, "effortKey" | "effort" | "section" | "verb"> & {
+export type AttentionRow = Pick<Row, "effortKey" | "effort" | "section" | "verb" | "hold"> & {
   unit: Pick<Row["unit"], "ticket" | "pr" | "lifecycle"> & Partial<Pick<Row["unit"], "observed" | "staleness">>;
 };
 
 const PRIORITY: CountKey[] = [
-  "ready", "update", "fix", "respond", "waitingRereview", "waitingReview", "inFlight", "waitingOther", "unknown", "parked", "merged", "inReleaseTag",
+  "ready", "update", "fix", "respond", "waitingRereview", "waitingReview", "inFlight", "waitingOther", "unknown", "parked", "held", "merged", "inReleaseTag",
 ];
 
 /** Rank tracked workstreams by the first available forward move, then name. */
@@ -44,12 +45,13 @@ export function workstreamAttention<T extends AttentionRow>(rows: readonly T[]):
     let item = byKey.get(row.effortKey);
     if (item === undefined) {
       item = { key: row.effortKey, name: row.effort, ready: 0, update: 0, fix: 0, respond: 0,
-        waitingRereview: 0, waitingReview: 0, waitingOther: 0, unknown: 0, inFlight: 0, parked: 0,
+        waitingRereview: 0, waitingReview: 0, waitingOther: 0, unknown: 0, inFlight: 0, parked: 0, held: 0,
         merged: 0, inReleaseTag: 0, oldCommits: 0 };
       byKey.set(row.effortKey, item);
     }
     if (row.unit.lifecycle === "shipped") item.inReleaseTag++;
     else if (row.unit.lifecycle === "merged") item.merged++;
+    else if (row.hold) item.held++;
     else if (row.section === "merge" && row.verb === "Ready to merge") item.ready++;
     else if (row.section === "merge") item.update++;
     else if (row.section === "fix") item.fix++;
@@ -72,7 +74,7 @@ const WORDS: [CountKey, string][] = [
   ["respond", "to respond"], ["waitingRereview", "awaiting re-review"], ["waitingReview", "waiting for review"],
   ["inFlight", "in progress"], ["waitingOther", "otherwise waiting"],
   ["unknown", "with unknown status"], ["parked", "parked"],
-  ["merged", "merged"], ["inReleaseTag", "in release tag"],
+  ["held", "on hold"], ["merged", "merged"], ["inReleaseTag", "in release tag"],
 ];
 
 /** Native select options use the first useful state; the detail line shows the full mix. */

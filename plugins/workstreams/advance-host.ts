@@ -14,6 +14,24 @@ const viewSchema = z.object({
   latestReviews: z.array(z.object({ state: z.string(), body: z.string().optional() }).passthrough()),
   statusCheckRollup: z.array(z.unknown()),
 });
+const terminalSchema = viewSchema.pick({ url: true, number: true, title: true, state: true });
+/** Completed PRs need no surviving branch or review history to leave the queue. */
+function terminalFacts(value: unknown, prUrl: string, repo: string, number: number): AdvanceInspection | null {
+  const parsed = terminalSchema.safeParse(value);
+  if (!parsed.success || parsed.data.state === "OPEN") return null;
+  const view = parsed.data;
+  if (view.number !== number || view.url.toLowerCase() !== prUrl.toLowerCase()) return { ok: false, error: "GitHub returned a different pull request." };
+  const raw = value as Record<string, unknown>;
+  return { ok: true, facts: {
+    prUrl: view.url, number, title: view.title.slice(0, 300), repo,
+    headRefName: branch.safeParse(raw.headRefName).data ?? "", baseRefName: branch.safeParse(raw.baseRefName).data ?? "",
+    headOid: oid.safeParse(raw.headRefOid).data ?? "", baseOid: "",
+    state: view.state, isDraft: false, isCrossRepository: raw.isCrossRepository === true,
+    reviewDecision: null, mergeStateStatus: "UNKNOWN", mergeable: "UNKNOWN", needsPreparation: false,
+    readiness: view.state === "MERGED" ? "merged" : "closed", detail: view.state === "MERGED" ? "PR merged." : "PR closed without merging.",
+    unresolvedThreads: 0, checks: "unknown", basePrNumber: null, approvalNotePending: false,
+  } };
+}
 const fields = Object.keys(viewSchema.shape).join(",");
 const refsSchema = z.object({ headRefOid: oid, baseRefName: branch, baseRef: z.object({ name: branch, target: z.object({ oid }) }) });
 const refsQuery = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefName baseRef{name target{oid}}}}}";
@@ -53,6 +71,8 @@ export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<Advan
   const readView = () => run(["pr", "view", String(target.number), "--repo", target.slug, "--json", fields]);
   for (let attempt = 0; attempt < 3; attempt++) {
     const firstRun = await readView();
+    const terminal = terminalFacts(decoded(firstRun), prUrl, target.slug, target.number);
+    if (terminal) return terminal;
     const first = viewSchema.safeParse(decoded(firstRun));
     if (!first.success) return { ok: false, error: firstRun.ok ? "GitHub returned incomplete PR preparation facts." : `Could not read the PR: ${firstRun.error}`.slice(0, 800) };
     if (first.data.number !== target.number || first.data.url.toLowerCase() !== prUrl.toLowerCase()) return { ok: false, error: "GitHub returned a different pull request." };
@@ -76,6 +96,8 @@ export async function readAdvancePr(run: GhRunner, prUrl: string): Promise<Advan
       run(["api", "graphql", ...(target.host === "github.com" ? [] : ["--hostname", target.host]),
         "-f", `query=${refsQuery}`, "-f", `owner=${target.owner}`, "-f", `name=${target.name}`, "-F", `number=${target.number}`]),
     ]);
+    const completed = terminalFacts(decoded(finalRun), prUrl, target.slug, target.number);
+    if (completed) return completed;
     const final = viewSchema.safeParse(decoded(finalRun));
     const finalRefs = refsOf(finalRefsRun);
     if (!final.success) return { ok: false, error: "Could not verify the final PR head and base commits." };

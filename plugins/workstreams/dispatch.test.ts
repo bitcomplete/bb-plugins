@@ -18,6 +18,13 @@ function groups(entry = unit, threads: Board["groups"][number]["clusters"][numbe
 }
 
 describe("dispatch candidate selection", () => {
+  it("excludes a held PR without changing its GitHub approval or repair gate", () => {
+    const holds = { [URL]: { reason: "Await release decision", heldAt: 123 } };
+    const mixedCase = { ...unit, pr: { ...unit.pr!, url: "https://github.com/ACME/App/pull/42" } };
+    expect(selectCandidate(groups(mixedCase), "leaf", [], [], holds)).toBeNull();
+    expect(selectCandidate(groups(mixedCase), "leaf", [], [], {})?.candidate.action).toBe("resolve-conflicts");
+    expect(mixedCase.pr.reviewDecision).toBe("APPROVED");
+  });
   it("does not auto-dispatch written approval notes without an explicit resolution gate", () => {
     const noted = { ...unit, pr: { ...unit.pr!, mergeStateStatus: "CLEAN" as const, approvalHasBody: true } };
     expect(selectCandidate(groups(noted), "leaf", [], [])).toBeNull();

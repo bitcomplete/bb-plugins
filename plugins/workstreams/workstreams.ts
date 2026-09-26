@@ -1668,11 +1668,12 @@ export function rollOneOffs(
   const buckets = new Map<string, BoardGroup[]>();
   for (const effort of efforts) {
     const only = effort.clusters.length === 1 ? effort.clusters[0] : undefined;
+    const substantial = only !== undefined && only.units.some((unit) => unit.ticket !== null) && new Set(only.units.flatMap((unit) => unit.pr?.state === "OPEN" ? [unit.pr.url.replace(/\/$/u, "").toLowerCase()] : [])).size >= 2;
     const overridden = only !== undefined && (options.overrides[only.ticket] ?? "").trim() !== "";
     const prefix =
       effort.key === NO_TICKET
         ? NO_TICKET
-        : only === undefined || overridden || outsideGrouping(effort.key)
+        : only === undefined || substantial || overridden || outsideGrouping(effort.key)
           ? null
           : containerPrefix(only);
     if (prefix === null) {

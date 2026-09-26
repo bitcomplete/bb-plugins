@@ -163,6 +163,8 @@ Automatic dispatch starts from existing PRs with a scanned checkout. It does
 not create PRs from issues or checkouts, request review, or merge; those steps
 remain Board actions. Its workflow ends when GitHub reports the PR merged.
 
+PR row menus include **Put on hold** with an optional reason; held PRs keep their GitHub readiness and thread access, appear under **Held** in their effort and PR backlog, and are excluded from Advance and automatic actions. **Release hold** returns a PR to its current readiness group without changing GitHub.
+
 ## Develop
 
 The scanner and Anthropic naming call live in `host.ts`. `server.ts` handles

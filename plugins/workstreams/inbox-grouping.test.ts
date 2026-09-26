@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { completedByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows } from "./inbox-grouping.js";
+import { completedByEffort, heldByEffort, groupInboxRows, partitionCompletedRows, visibleCompletedRows, visibleInboxRows } from "./inbox-grouping.js";
 import type { Row } from "./inbox.js";
 import type { InboxSection } from "./workstreams.js";
 
@@ -71,4 +71,14 @@ it("keeps merged and release-tagged summaries under their own stable effort keys
   expect(groups.get("effort-a")).toEqual({ merged: [merged], inReleaseTag: [] });
   expect(groups.get("effort-b")).toEqual({ merged: [], inReleaseTag: [tagged] });
   expect(visibleCompletedRows(groups.get("effort-a")!, { merged: false, inReleaseTag: true })).toEqual([]);
+});
+
+it("keeps held open checkouts under their own effort without folding completed PRs into Hold", () => {
+  const held = { reason: "Launch timing", heldAt: 1 };
+  const first = { ...row("p1", "effort-a", "Payments", "merge", 1), hold: held, unit: { pr: { state: "OPEN" } } } as Row;
+  const second = { ...row("p2", "effort-b", "Payments", "fix", 1), hold: held, unit: { pr: { state: "OPEN" } } } as Row;
+  const completed = { ...first, key: "p3", unit: { pr: { state: "MERGED" } } } as Row;
+  const groups = heldByEffort(new Map([["merge", [first, completed]], ["fix", [second]]]));
+  expect(groups.get("effort-a")).toEqual([first]);
+  expect(groups.get("effort-b")).toEqual([second]);
 });

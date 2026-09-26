@@ -34,6 +34,86 @@ function setup(facts = [fact()]) {
 }
 
 describe("finite Advance preparation", () => {
+  it.each(["merged", "closed"] as const)("removes %s failed work without requiring a success marker, retaining durable history", async (readiness) => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", "Worker stopped without a prepared marker");
+    expect(job).toMatchObject({ status: "needs-attention", uncertain: true });
+    t.current.set(job.prUrl, fact(1, { readiness, eligible: false, needsPreparation: false, detail: `PR ${readiness}.`, baseOid: "" }));
+    t.deps.thread.mockRejectedValueOnce(new Error("Old worker was deleted"));
+    await t.service.recheck(batch.id, job.id);
+    expect(job).toMatchObject({ status: readiness, hiddenFromProgress: true, uncertain: false, threadId: "thread" });
+    expect(t.service.reserved(job.prUrl, job.path)).toBe(false);
+    t.service.progressVisibility(batch.id, job.id, false);
+    t.deps.inspect.mockRejectedValueOnce(new Error("Old PR unavailable"));
+    await t.service.recheck(batch.id);
+    expect(job).toMatchObject({ status: readiness, hiddenFromProgress: true });
+    await expect(t.service.repairPlan(batch.id, job.id)).rejects.toThrow("not awaiting a repair");
+    t.service.dispose();
+    expect(createAdvanceService(t.db, t.deps).list()[0]!.jobs[0]).toMatchObject({ status: readiness, hiddenFromProgress: true, threadId: "thread" });
+  });
+  it.each(["MERGED", "CLOSED"])("fresh %s observations remove failed jobs even without a checked head", async (state) => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    expect(job.checkedHeadOid).toBeNull();
+    t.service.invalidate([{ url: job.prUrl, state }]);
+    expect(job).toMatchObject({ status: state.toLowerCase(), hiddenFromProgress: true });
+    t.deps.changed.mockClear();
+    t.service.invalidate([{ url: job.prUrl, state }]);
+    expect(t.deps.changed).not.toHaveBeenCalled();
+    t.service.invalidate([{ url: job.prUrl, state: "OPEN", headRefOid: "c".repeat(40) }]);
+    expect(job.hiddenFromProgress).toBe(true);
+  });
+  it("only retires an active item when live terminal state is proven", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    t.deps.inspect.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    await t.service.recheck(batch.id, job.id);
+    expect(job.status).toBe("running");
+    expect(t.service.reserved(job.prUrl, job.path)).toBe(true);
+    await t.service.recheck(batch.id, job.id);
+    expect(job.status).toBe("running");
+    t.current.set(job.prUrl, fact(1, { readiness: "merged", eligible: false }));
+    await t.service.recheck(batch.id, job.id);
+    expect(job).toMatchObject({ status: "merged", hiddenFromProgress: true });
+  });
+  it("a late spawn response cannot resurrect a PR already observed merged", async () => {
+    const t = setup(); let finish!: (id: string) => void;
+    t.deps.spawn.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const batch = await t.start(); const job = batch.jobs[0]!;
+    expect(job.status).toBe("launching");
+    t.service.invalidate([{ url: job.prUrl, state: "MERGED" }]);
+    finish("late-thread"); await drain();
+    expect(job).toMatchObject({ status: "merged", hiddenFromProgress: true, threadId: "late-thread" });
+  });
+  it("records a failed recheck per item and continues checking other selected PRs", async () => {
+    const t = setup([fact(1, { needsPreparation: false, readiness: "ready" }), fact(2, { needsPreparation: false, readiness: "ready" })]);
+    const batch = await t.start(); await drain();
+    t.deps.inspect.mockRejectedValueOnce(new Error("GitHub unavailable"));
+    t.current.set(fact(2).prUrl, fact(2, { readiness: "closed", eligible: false, needsPreparation: false }));
+    await t.service.recheck(batch.id);
+    expect(batch.jobs[0]).toMatchObject({ status: "needs-attention", detail: expect.stringContaining("GitHub unavailable") });
+    expect(batch.jobs[1]).toMatchObject({ status: "closed", hiddenFromProgress: true });
+  });
+  it("does not launch a queued PR that merged while the earlier repository job ran", async () => {
+    const t = setup([fact(1), fact(2)]); const batch = await t.start();
+    t.current.set(fact(2).prUrl, fact(2, { readiness: "merged", eligible: false, needsPreparation: false }));
+    t.current.set(fact(1).prUrl, fact(1, { readiness: "ready", needsPreparation: false }));
+    await t.service.signal("thread", "idle", `Workstreams job ${batch.jobs[0]!.id} complete: prepared`); await drain();
+    expect(batch.jobs[1]).toMatchObject({ status: "merged", hiddenFromProgress: true });
+    expect(t.deps.workspace).toHaveBeenCalledTimes(1);
+    expect(t.deps.send).not.toHaveBeenCalled();
+  });
+  it("checks the hold policy after provisioning and before any worker launch", async () => {
+    const t = setup(); let held = false;
+    const assertAdvanceAllowed = vi.fn(() => { if (held) throw new Error("PR is on hold"); });
+    t.deps.workspace.mockImplementationOnce(async () => { held = true; return { path: "/isolated/job", workerPath: "/isolated" }; });
+    t.service.dispose();
+    const service = createAdvanceService(t.db, { ...t.deps, assertAdvanceAllowed });
+    const plan = await service.preview([fact().prUrl]); const batch = await service.start(plan.token); await drain();
+    expect(batch.jobs[0]).toMatchObject({ status: "needs-attention", uncertain: false, detail: "Error: PR is on hold" });
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+    expect(assertAdvanceAllowed).toHaveBeenCalledTimes(2);
+  });
+
   it("removes only the queued item and never requeues it when progress visibility is restored", async () => {
     const t = setup([fact(1), fact(2), fact(3)]); const batch = await t.start();
     const [first, removed, next] = batch.jobs;

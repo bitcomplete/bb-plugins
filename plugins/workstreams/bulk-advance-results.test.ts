@@ -10,6 +10,12 @@ const job = (patch: Record<string, unknown> = {}) => advanceJobSchema.parse({
 });
 
 describe("inline advance results", () => {
+  it.each(["merged", "closed"] as const)("does not show a %s attempt as an active PR result", (status) => {
+    const completed = job({ status, hiddenFromProgress: true });
+    expect(advanceResultForPr([completed], { url: completed.prUrl }, true)).toBeNull();
+    expect(advanceStatus(completed)).toBe(status === "merged" ? "Merged" : "Closed");
+  });
+
   it("does not claim readiness after a newer push or fall back to another old batch", () => {
     expect(advanceResultForPr([job(), job({ id: "old", checkedHeadOid: "c".repeat(40) })], { url: job().prUrl, headRefOid: "c".repeat(40) }, true)).toBeNull();
   });

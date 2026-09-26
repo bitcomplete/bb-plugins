@@ -27,7 +27,9 @@ import { createEffortStore, EFFORT_MIGRATIONS, establishedEffortSchema, normaliz
 import { createCoordinatorService, coordinateInputSchema, coordinateResultSchema, effortPlanSchema, type EffortPlan } from "./effort-coordinator.js";
 import { planGroupingRepair, reviewGroupingRepair, repairRequestEstimate } from "./grouping-repair.js";
 import { effortParent, activeCheckoutThread } from "./effort-routing.js";
-import { inventoryEffort } from "./effort-membership.js";
+import { inventoryEffort, inventoryTicketEfforts } from "./effort-membership.js";
+import { canonicalPrUrl, prHoldsSchema } from "./pr-holds.js";
+import { createPrHoldStore, PR_HOLD_MIGRATIONS } from "./pr-hold-store.js";
 import { createInventoryStore, EMPTY_INVENTORY, INVENTORY_MIGRATIONS } from "./inventory-store.js";
 import type { InventoryResult } from "./inventory.js";
 import {
@@ -38,6 +40,10 @@ import {
   STALENESS,
   UNSORTED,
   buildBoard,
+  prLifecycle,
+  mostUrgent,
+  freshest,
+  stalenessOf,
   outsideGrouping,
   parseTeamNames,
   rollOneOffs,
@@ -241,6 +247,7 @@ const enrichmentSchema = z.object({
 const boardSchema = z.object({
   efforts: z.array(establishedEffortSchema).default([]),
   prInventory: inventoryBoardSchema.default(EMPTY_INVENTORY),
+  prHolds: prHoldsSchema.default({}),
   groups: z.array(groupSchema),
   /** How many grouping levels survived the collapse: 1, 2 or 3. */
   depth: z.number(),
@@ -308,6 +315,7 @@ const threadModeSchema = z.enum(["continue", "subthread", "new"]);
 
 export const rpcContract = defineRpcContract({
   board_get: { input: z.null(), output: boardSchema },
+  pr_hold_set: { input: z.object({ prUrl: z.string().max(500).refine((value) => canonicalPrUrl(value) !== null, "Choose a valid GitHub PR URL"), held: z.boolean(), reason: z.string().max(1_000).optional() }).strict(), output: prHoldsSchema },
   effort_plan: { input: z.object({ groupKey: z.string().min(1).max(500) }).strict(), output: effortPlanSchema },
   effort_coordinate: { input: coordinateInputSchema, output: coordinateResultSchema },
   advance_preview: { input: z.object({ prUrls: z.array(z.string().max(500)).min(1).max(100) }).strict(), output: advancePreviewSchema },
@@ -594,10 +602,16 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE TABLE IF NOT EXISTS grouping_repairs (ticket TEXT PRIMARY KEY, label TEXT NOT NULL, hash TEXT NOT NULL, evidence TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS grouping_legacy_labels (hash TEXT PRIMARY KEY, label TEXT NOT NULL)`,
     ...ADVANCE_MIGRATIONS,
+    ...PR_HOLD_MIGRATIONS,
   ]);
   const runs = createRunStore(db);
   const dispatch = createDispatchStore(db);
   const inventory = createInventoryStore(db);
+  const prHolds = createPrHoldStore(db);
+  const holdMessage = (prUrl: string): string | null => {
+    const hold = prHolds.get(prUrl);
+    return hold ? `On hold${hold.reason ? `: ${hold.reason}` : ""}. Release the hold before advancing or merging this PR.` : null;
+  };
   const effortStore = createEffortStore(db);
   dispatch.closeStranded();
 
@@ -702,6 +716,10 @@ export default async function plugin(bb: BbPluginApi) {
       return repo !== null && repo.split("/").length === 2 ? [repo.split("/")[0]!.toLowerCase()] : [];
     }))].sort();
   }
+  function pendingAdvanceJobs() {
+    return advance.list().flatMap((batch) => batch.jobs.filter((job) => !["merged", "closed", "cancelled"].includes(job.status))
+      .map((job) => ({ batchId: batch.id, job })));
+  }
   async function refreshInventory(signal = disposal.signal): Promise<boolean> {
     if (inventoryRefreshing || inventoryTargeting || signal.aborted) return false;
     inventoryRefreshing = true;
@@ -713,6 +731,12 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await host.call("authoredPrs", { owners }, { hostId, signal, timeoutMs: SCAN_TIMEOUT_MS });
       inventory.apply(result);
       advance.invalidate(result.entries.map((entry) => entry.pr));
+      const coverage = new Map(result.repositories.map((repo) => [repo.repo.toLowerCase(), repo.complete]));
+      scheduleInventoryUrls(pendingAdvanceJobs().filter(({ job }) => {
+        const repo = prTarget(job.prUrl)?.slug.toLowerCase();
+        return repo !== undefined && inventory.get(job.prUrl) === undefined &&
+          (coverage.get(repo) === true || (result.discoveryComplete && result.owners.includes(repo.split("/")[0]!) && !coverage.has(repo)));
+      }).map(({ job }) => job.prUrl));
       return result.complete;
     } catch (error) {
       if (!signal.aborted) {
@@ -730,7 +754,8 @@ export default async function plugin(bb: BbPluginApi) {
   /** Native BB events invalidate these URLs; GitHub remains the facts source. */
   async function refreshInventoryUrls(prUrls: string[]): Promise<boolean> {
     if (inventoryRefreshing || inventoryTargeting || disposal.signal.aborted) return false;
-    const urls = [...new Set(prUrls)].filter((url) => inventory.get(url) !== undefined || readUnits().some((unit) => unit.pr?.url === url));
+    const savedUrls = new Set(pendingAdvanceJobs().map(({ job }) => canonicalPrUrl(job.prUrl)));
+    const urls = [...new Set(prUrls)].filter((url) => inventory.get(url) !== undefined || readUnits().some((unit) => unit.pr?.url === url) || savedUrls.has(canonicalPrUrl(url)));
     if (urls.length === 0) return true;
     inventoryTargeting = true;
     try {
@@ -742,6 +767,15 @@ export default async function plugin(bb: BbPluginApi) {
         advance.invalidate(result.entries.map((entry) => entry.pr));
         const fresh = new Map(result.entries.map((entry) => [entry.pr.url.toLowerCase(), entry.pr]));
         const closed = new Set(result.closed.map((url) => url.toLowerCase()));
+        // The inventory reports closed URLs without distinguishing merged from
+        // closed. Re-read only those saved jobs; never infer state from absence.
+        const completed = pendingAdvanceJobs().filter(({ job }) => closed.has(job.prUrl.toLowerCase()));
+        for (let index = 0; index < completed.length; index += 4) {
+          await Promise.all(completed.slice(index, index + 4).map(async ({ batchId, job }) => {
+            try { await advance.recheck(batchId, job.id); }
+            catch (error) { bb.log.warn(`Advance terminal refresh: ${String(error).slice(0, 300)}`); }
+          }));
+        }
         const insert = db.prepare(`INSERT OR REPLACE INTO units (path, unit) VALUES (?, ?)`);
         for (const unit of readUnits()) {
           if (unit.pr === null) continue;
@@ -1409,7 +1443,7 @@ export default async function plugin(bb: BbPluginApi) {
     const dispatchAttempts = dispatch.attempts();
     const dispatchPaused = dispatchAttempts.some((attempt) =>
       attempt.status === "launching" || attempt.status === "running" || attempt.status === "verifying" || attempt.status === "needs-you");
-    const dispatchChoice = dispatchPaused ? null : selectCandidate(wired, dispatchPolicy.effort_key, dispatchAttempts, runs.recent(Number.MAX_SAFE_INTEGER));
+    const dispatchChoice = dispatchPaused ? null : selectCandidate(wired, dispatchPolicy.effort_key, dispatchAttempts, runs.recent(Number.MAX_SAFE_INTEGER), prHolds.list());
     const established = await Promise.all(effortStore.list().map(async (effort) => {
       if (!effort.coordinatorThreadId) return effort;
       try {
@@ -1419,17 +1453,30 @@ export default async function plugin(bb: BbPluginApi) {
       } catch { return { ...effort, coordinatorState: "unavailable" as const }; }
     }));
     const storedInventory = inventory.read();
+    const inventoryTickets = storedInventory.entries.flatMap((entry) => ticketsIn(`${entry.pr.title}\n${entry.pr.headRefName ?? ""}`, pattern));
+    const ticketTitles = new Map([...linear.read(inventoryTickets)].flatMap(([ticket, detail]) => detail.title ? [[ticket, detail.title] as const] : []));
+    const remoteEfforts = inventoryTicketEfforts(storedInventory.entries, wired, established, pattern, ticketTitles);
+    const remoteMembership = new Map(remoteEfforts.flatMap((effort) => effort.prUrls.map((url) => [url, { effortKey: effort.key, effortName: effort.name }] as const)));
+    const remoteGroups: Board["groups"] = remoteEfforts.map((effort) => {
+      const urls = new Set(effort.prUrls);
+      const members = storedInventory.entries.filter((entry) => urls.has(entry.pr.url.toLowerCase()));
+      return { key: effort.key, name: effort.name, level: "effort", parentKey: null, clusters: [], cohesion: null,
+        rollup: `${effort.prUrls.length} open PRs for ${effort.ticket}`, repoCount: effort.repoCount, total: effort.prUrls.length, merged: 0,
+        lifecycle: mostUrgent(members.map((entry) => prLifecycle(entry.pr))),
+        staleness: freshest(members.map((entry) => stalenessOf(entry.pr.createdAt ?? null, Date.now()))), surfaces: [], risk: "none" };
+    });
     return {
+      prHolds: prHolds.list(),
       efforts: established,
-      groups: wired,
-      depth: hierarchyDepth(groups),
+      groups: [...wired, ...remoteGroups],
+      depth: Math.max(hierarchyDepth(groups), remoteGroups.length > 0 ? 1 : 0),
       surfaces,
       mode,
       hostId: (await bb.sdk.system.config()).primaryHostId,
       lastScanAt: (await bb.storage.kv.get<string>("lastScanAt")) ?? null,
       scanning,
       prInventory: { ...storedInventory, entries: storedInventory.entries.map((entry) => ({ ...entry,
-        ...(inventoryEffort(entry.pr, wired, established, pattern) ?? {}),
+        ...(inventoryEffort(entry.pr, wired, established, pattern) ?? remoteMembership.get(entry.pr.url.toLowerCase()) ?? {}),
       })), refreshing: inventoryRefreshing || inventoryTargeting },
       warnings: [
         ...((await bb.storage.kv.get<string[]>("warnings")) ?? []),
@@ -1473,9 +1520,12 @@ export default async function plugin(bb: BbPluginApi) {
       const links = threadLinks(clusters, pattern);
       const urlsByCluster = new Map(clusters.map((cluster) => [cluster.ticket,
         cluster.units.flatMap((unit) => unit.pr?.state === "OPEN" ? [unit.pr.url] : [])]));
-      prFreshness.setLinks([...threadFacts.keys()].map((threadId) => ({
+      const savedJobs = pendingAdvanceJobs().map(({ job }) => job);
+      const linkedIds = new Set([...threadFacts.keys(), ...savedJobs.flatMap((job) => job.threadId ? [job.threadId] : [])]);
+      prFreshness.setLinks([...linkedIds].map((threadId) => ({
         threadId, environmentId: threadEnvironments.get(threadId) ?? null,
-        urls: [...(links.get(threadId)?.keys() ?? [])].flatMap((ticket) => urlsByCluster.get(ticket) ?? []),
+        urls: [...new Set([...[...(links.get(threadId)?.keys() ?? [])].flatMap((ticket) => urlsByCluster.get(ticket) ?? []),
+          ...savedJobs.filter((job) => job.threadId === threadId).map((job) => job.prUrl)])],
       })));
       for (const threadId of idleIds) if (threadId !== "") prFreshness.threadIdle(threadId);
       return true;
@@ -2255,10 +2305,12 @@ export default async function plugin(bb: BbPluginApi) {
     // One-offs are filed into containers by code: never named, never assigned a program.
     const rolled = boardEfforts(placement, true);
     const inContainer = new Set(rolled.containers.flatMap((group) => group.clusters.map((cluster) => cluster.ticket)));
+    const exactTicketEfforts = new Set(rolled.efforts.filter((group) => group.clusters.length === 1 &&
+      new Set(group.clusters[0]!.units.flatMap((unit) => unit.pr?.state === "OPEN" ? [unit.pr.url.toLowerCase()] : [])).size >= 2).map((group) => group.clusters[0]!.ticket));
     if (naming !== null) {
       const grouped = new Map<string, Cluster[]>();
       for (const entry of placement.labelled) {
-        if (outsideGrouping(entry.label) || inContainer.has(entry.cluster.ticket) || effortStore.get(entry.label)) continue;
+        if (outsideGrouping(entry.label) || inContainer.has(entry.cluster.ticket) || exactTicketEfforts.has(entry.cluster.ticket) || effortStore.get(entry.label)) continue;
         if (entry.fit < assignmentConfidenceThreshold) continue;
         const bucket = grouped.get(entry.label);
         if (bucket === undefined) grouped.set(entry.label, [entry.cluster]);
@@ -2395,8 +2447,11 @@ export default async function plugin(bb: BbPluginApi) {
     host.call("prLive", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
   const reviewersOf = (hostId: string) => (prUrl: string) =>
     host.call("prReviewers", { prUrl }, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
-  const writeOf = (hostId: string) => (request: Parameters<typeof host.call<"prWrite">>[1]) =>
-    host.call("prWrite", request, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+  const writeOf = (hostId: string) => async (request: Parameters<typeof host.call<"prWrite">>[1]): Promise<WriteResult> => {
+    const held = request.kind === "merge" ? holdMessage(request.prUrl) : null;
+    if (held) return { ok: false, error: held };
+    return host.call("prWrite", request, { hostId, timeoutMs: HOST_ACTION_TIMEOUT_MS });
+  };
 
   const archiveStore: ArchiveStore = {
     get: async (id) => archiveRecordSchema.optional().parse(await bb.storage.kv.get(`threadArchive:${id}`)),
@@ -2436,13 +2491,16 @@ export default async function plugin(bb: BbPluginApi) {
     for (let pass = 0; pass < 3; pass++) for (const entry of current.groups) if (entry.parentKey && keys.has(entry.parentKey)) keys.add(entry.key);
     const clusters = current.groups.filter((entry) => keys.has(entry.key)).flatMap((entry) => entry.clusters);
     const members: EffortMembers = established?.members ?? normalizeMembers({
-      tickets: clusters.map((cluster) => cluster.ticket),
+      tickets: [...clusters.map((cluster) => cluster.ticket), ...(group?.key.startsWith("ticket:") && clusters.length === 0 ? [group.key.slice(7)] : [])],
       prUrls: [...clusters.flatMap((cluster) => cluster.units.flatMap((unit) => unit.pr ? [unit.pr.url] : [])),
         ...current.prInventory.entries.filter((entry) => entry.effortKey && keys.has(entry.effortKey)).map((entry) => entry.pr.url)],
     });
     if (members.tickets.length === 0 && members.prUrls.length === 0) return { ok: false, error: "This group has no tracked work to coordinate." };
     const allProjects = await bb.sdk.projects.list();
-    const paths = clusters.flatMap((cluster) => cluster.units.map((unit) => unit.path));
+    const memberUrls = new Set(members.prUrls);
+    const memberRepos = new Set(current.prInventory.entries.filter((entry) => memberUrls.has(entry.pr.url.toLowerCase())).map((entry) => entry.repo.toLowerCase()));
+    const paths = [...clusters.flatMap((cluster) => cluster.units.map((unit) => unit.path)),
+      ...readUnits().filter((unit) => unit.githubRepo && memberRepos.has(unit.githubRepo.toLowerCase())).map((unit) => unit.path)];
     const projects = allProjects.filter((project) => project.id === established?.projectId || project.sources.some((source) => paths.some((path) => withinPath(path, source.path))))
       .map((project) => ({ id: project.id, name: project.name }));
     const choices = (await bb.sdk.threads.list({ archived: false, limit: 100 })).filter((thread) =>
@@ -2505,7 +2563,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
   async function advanceInspect(prUrl: string, repair = false): Promise<AdvanceFacts> {
     const units = readUnits();
-    const tracked = units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.pr ?? inventory.get(prUrl)?.pr;
+    const tracked = units.find((unit) => unit.pr?.url.toLowerCase() === prUrl.toLowerCase())?.pr ?? inventory.get(prUrl)?.pr
+      ?? advance.list().flatMap((batch) => batch.jobs).find((job) => canonicalPrUrl(job.prUrl) === canonicalPrUrl(prUrl));
     if (!tracked) throw new Error("That PR is no longer tracked. Refresh the backlog.");
     const target = prTarget(prUrl);
     if (!target) throw new Error("Invalid tracked PR URL");
@@ -2527,8 +2586,9 @@ export default async function plugin(bb: BbPluginApi) {
       const facts = result.facts;
       const needsFeedback = facts.unresolvedThreads > 0 || facts.approvalNotePending;
       const needsWriter = repair || facts.needsPreparation || needsFeedback;
-      const eligible = facts.state === "OPEN" && (repair || facts.reviewDecision === "APPROVED") && !facts.isDraft && (!needsWriter || (!facts.isCrossRepository && !!source));
-      const detail = facts.state !== "OPEN" || facts.isDraft ? facts.detail : facts.isCrossRepository && needsWriter ? "Fork PRs need manual preparation and review follow-up in this version" : needsWriter && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail;
+      const held = repair ? null : holdMessage(prUrl);
+      const eligible = held === null && facts.state === "OPEN" && (repair || facts.reviewDecision === "APPROVED") && !facts.isDraft && (!needsWriter || (!facts.isCrossRepository && !!source));
+      const detail = held ?? (facts.state !== "OPEN" || facts.isDraft ? facts.detail : facts.isCrossRepository && needsWriter ? "Fork PRs need manual preparation and review follow-up in this version" : needsWriter && !source ? "No matching scanned repository in a BB project; add it and rescan" : facts.detail);
       return { ...fallback, ...facts, needsFeedback, eligible, detail, blockedBy: facts.basePrNumber === null ? null : `${target.slug}#${facts.basePrNumber}` };
     } catch (error) { return { ...fallback, detail: `Inspection failed: ${String(error).slice(0, 300)}` }; }
   }
@@ -2563,6 +2623,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
   const advance = createAdvanceService(db, {
     inspect: advanceInspect,
+    assertAdvanceAllowed: (prUrl) => {
+      const held = holdMessage(prUrl);
+      if (held) throw new Error(held);
+    },
     repairCandidates: advanceRepairCandidates,
     repairSpawn: async (facts, workerPath, prompt, attemptId, mode, parentThreadId) => {
       if (!facts.projectId) throw new Error("No project is available for this PR repair");
@@ -2633,10 +2697,14 @@ export default async function plugin(bb: BbPluginApi) {
   });
   const advanceTimer = setInterval(() => { void advance.tick().catch(onThreadError); }, 30_000);
   bb.onDispose(() => { clearInterval(advanceTimer); advance.dispose(); });
-  queueMicrotask(() => { void advance.tick(true).catch(onThreadError); });
+  queueMicrotask(() => {
+    void advance.tick(true).catch(onThreadError);
+    const scanned = new Set(readUnits().flatMap((unit) => unit.pr ? [canonicalPrUrl(unit.pr.url)] : []));
+    scheduleInventoryUrls(pendingAdvanceJobs().filter(({ job }) => inventory.get(job.prUrl) === undefined && !scanned.has(canonicalPrUrl(job.prUrl))).map(({ job }) => job.prUrl));
+  });
 
   const launchingCheckouts = new Set<string>();
-  const agentSdk: AgentSdk = {
+  const agentSdkFor = (beforeSpawn?: () => void): AgentSdk => ({
     projects: { list: () => bb.sdk.projects.list() },
     threads: {
       spawn: async (args) => {
@@ -2658,6 +2726,7 @@ export default async function plugin(bb: BbPluginApi) {
           const metadata = effort && raw?.pr ? { ...args.pluginMetadata, effortId: effort.id, role, prUrl: raw.pr.url } : args.pluginMetadata;
           const { parentThreadId: _previous, ...request } = args;
           const prompt = effort ? `${request.prompt}\nEffort context (data): ${JSON.stringify({ name: effort.name, goal: effort.goal, coordinatorThreadId: effort.coordinatorThreadId })}. Keep this action scoped to the requested PR and report the outcome and remaining blockers.` : request.prompt;
+          beforeSpawn?.();
           const thread = await bb.sdk.threads.spawn({ ...request, prompt, ...(parentThreadId ? { parentThreadId } : {}), pluginMetadata: metadata });
           if (effort && raw?.pr) effortStore.recordWorker(effort.id, thread.id, raw.pr.url, role);
           return thread;
@@ -2666,7 +2735,8 @@ export default async function plugin(bb: BbPluginApi) {
       get: (args) => bb.sdk.threads.get(args),
       context: (args) => bb.sdk.threads.context(args),
     },
-  };
+  });
+  const agentSdk = agentSdkFor();
 
   function recoverDispatch(): void {
     const units = readUnits();
@@ -2736,13 +2806,13 @@ export default async function plugin(bb: BbPluginApi) {
     dispatching = true;
     try {
       const current = await board();
-      const choice = selectCandidate(current.groups, current.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER));
+      const choice = selectCandidate(current.groups, current.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER), prHolds.list());
       if (choice === null) return;
       // The board may have been built from an old scan. Inspect this checkout before committing to a launch.
       if (!(await rescanPaths([choice.candidate.path]))) return;
       if (dispatch.policy().mode !== "auto" || disposal.signal.aborted) return;
       const fresh = await board();
-      const checked = selectCandidate(fresh.groups, fresh.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER));
+      const checked = selectCandidate(fresh.groups, fresh.dispatch.effortKey, dispatch.attempts(), runs.recent(Number.MAX_SAFE_INTEGER), prHolds.list());
       if (checked === null) return;
       if (checked.candidate.path !== choice.candidate.path || checked.candidate.prUrl !== choice.candidate.prUrl ||
         checked.candidate.action !== choice.candidate.action) {
@@ -2780,9 +2850,18 @@ export default async function plugin(bb: BbPluginApi) {
         dispatch.update(id, "needs-you", "Automatic dispatch was switched off before launch");
         return;
       }
+      const held = holdMessage(candidate.prUrl);
+      if (held) {
+        runs.discard(runId);
+        dispatch.update(id, "failed", held);
+        return;
+      }
       let result: Awaited<ReturnType<typeof runAgent>>;
       try {
-        result = await runAgent(agentSdk, {
+        result = await runAgent(agentSdkFor(() => {
+          const held = holdMessage(candidate.prUrl);
+          if (held) throw new Error(held);
+        }), {
           unit: { path: found.raw.path, ticket: found.ticket }, mode, threadId: recommendation.threadId,
           prompt, linked: linked.map((thread) => thread.id),
         });
@@ -2839,6 +2918,8 @@ export default async function plugin(bb: BbPluginApi) {
     const unit = "path" in input ? readUnits().find((entry) => entry.path === input.path) :
       readUnits().find((entry) => entry.pr?.url.toLowerCase() === input.prUrl.toLowerCase());
     const prUrl = "prUrl" in input ? input.prUrl : unit?.pr?.url;
+    const held = action === "merge" && prUrl ? holdMessage(prUrl) : null;
+    if (held) return { ok: false, error: held };
     if (prUrl && (advance.reserved(prUrl, unit?.path ?? null) || manualPrWrites.has(prUrl.toLowerCase()))) return { ok: false, error: "A batch or another action owns this PR." };
     if (prUrl) manualPrWrites.add(prUrl.toLowerCase());
     try {
@@ -2853,6 +2934,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     board_get: () => board(),
+    pr_hold_set: ({ prUrl, held, reason }) => {
+      const holds = prHolds.set(prUrl, held, reason);
+      bb.realtime.publish(BOARD_CHANGED, { scanning });
+      return holds;
+    },
     advance_preview: ({ prUrls }) => advance.preview(prUrls),
     advance_start: ({ token }) => advance.start(token),
     advance_get: () => advance.list(),
@@ -2956,6 +3042,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (!read.ok) return read;
       const { mergeMethod, deleteBranchOnMerge } = await settings.get();
       const verdict = mergeVerdict(read.live);
+      const held = holdMessage(target.prUrl);
+      if (held) verdict.refusals.unshift(held);
       return {
         ok: true as const,
         live: read.live,

@@ -27,3 +27,8 @@ describe("compact advance progress", () => {
     expect(canRemoveProgressJob(job({ status: "needs-attention", uncertain: true }))).toBe(false);
   });
 });
+
+it("does not offer recheck after GitHub confirms a PR merged or closed", () => {
+  expect(canRecheckProgressJob({ status: "merged", uncertain: false })).toBe(false);
+  expect(canRecheckProgressJob({ status: "closed", uncertain: false })).toBe(false);
+});
