@@ -62,11 +62,16 @@ describe("the header popover", () => {
     getBrief?: () => BriefState;
     setStageOverride?: (input: unknown) => BriefState;
     refresh?: () => { queued: boolean };
+    isCompactViewport?: boolean;
   }) => {
     const captured = await loadApp();
     return renderSlot(
       captured.threadHeaderActions[0]!,
-      { threadId: "thr_1", projectId: "proj_1", isCompactViewport: false },
+      {
+        threadId: "thr_1",
+        projectId: "proj_1",
+        isCompactViewport: options.isCompactViewport ?? false,
+      },
       {
         rpc: {
           getBrief: options.getBrief ?? (() => READY),
@@ -140,6 +145,41 @@ describe("the header popover", () => {
     fireEvent.click(await slot.findByRole("button", { name: "Thread brief" }));
     expect(await slot.findByText("No next step — this thread reads as done.")).toBeTruthy();
     slot.lifecycle.unmount();
+  });
+
+  it("caps its height and scrolls, so a long brief is reachable on a phone", async () => {
+    const slot = await render({ isCompactViewport: true });
+    fireEvent.click(await slot.findByRole("button", { name: "Thread brief" }));
+
+    const goal = await slot.findByText("Ship the thread-briefs plugin");
+    const panel = goal.closest("[style*='max-height']") as HTMLElement | null;
+    expect(panel).not.toBeNull();
+    // Without both of these the panel grows past the viewport with no way to
+    // reach the fields below the fold.
+    expect(panel?.style.maxHeight).toContain(
+      "--radix-popover-content-available-height",
+    );
+    expect(panel?.className).toContain("overflow-y-auto");
+
+    slot.lifecycle.unmount();
+  });
+
+  it("goes near-full-width on a compact viewport and a fixed column otherwise", async () => {
+    const compact = await render({ isCompactViewport: true });
+    fireEvent.click(await compact.findByRole("button", { name: "Thread brief" }));
+    const compactPanel = (
+      await compact.findByText("Ship the thread-briefs plugin")
+    ).closest("[style*='max-height']") as HTMLElement | null;
+    expect(compactPanel?.className).toContain("w-[calc(100vw-1rem)]");
+    compact.lifecycle.unmount();
+
+    const wide = await render({ isCompactViewport: false });
+    fireEvent.click(await wide.findByRole("button", { name: "Thread brief" }));
+    const widePanel = (
+      await wide.findByText("Ship the thread-briefs plugin")
+    ).closest("[style*='max-height']") as HTMLElement | null;
+    expect(widePanel?.className).toContain("w-80");
+    wide.lifecycle.unmount();
   });
 
   it("sets a manual stage", async () => {

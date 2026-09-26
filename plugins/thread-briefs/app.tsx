@@ -307,7 +307,20 @@ function BriefHeaderAction({
         <Popover.Content
           align="end"
           sideOffset={6}
-          className="z-50 w-80 max-w-[calc(100vw-2rem)] rounded-md border border-border bg-card p-3 shadow-md"
+          collisionPadding={8}
+          // A five-field brief is easily taller than a phone viewport, so the
+          // panel has to cap its height and scroll inside. Radix measures the
+          // room it actually has and publishes it as this variable; the vh
+          // fallback covers the case where collision detection is skipped.
+          // Inline rather than a Tailwind arbitrary value so it cannot depend
+          // on what the plugin's Tailwind pass chose to emit.
+          style={{
+            maxHeight: "var(--radix-popover-content-available-height, 70vh)",
+          }}
+          className={`z-50 overflow-y-auto overscroll-contain rounded-md border border-border bg-card p-3 shadow-md ${
+            // Near-full width on a phone; a fixed column on a wide screen.
+            isCompactViewport ? "w-[calc(100vw-1rem)]" : "w-80"
+          }`}
         >
           <BriefBody state={state} onPick={onPick} onRefresh={onRefresh} />
         </Popover.Content>
