@@ -206,14 +206,14 @@ describe("summarizing", () => {
     expect(["summarizing", "ready"]).toContain(pending.state);
   });
 
-  it("does not backfill a thread dormant longer than the backfill window", async () => {
+  it("never backfills a thread whose last activity predates this load", async () => {
     const fetchMock = fakeCompletion(SUMMARY);
     const stale = makeThreadResponse({
       id: "thr_old",
       title: "Ancient",
       visibility: "visible",
       status: "idle",
-      // Two days idle: past the 24h backfill window.
+      // Last touched well before the plugin started: no activity to react to.
       updatedAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
     });
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
@@ -247,24 +247,72 @@ describe("summarizing", () => {
     expect(state.state).toBe("absent");
   });
 
-  it("still backfills a thread quiet for a while but inside the window", async () => {
+  it("gives a long-dormant thread a brief once it sees activity", async () => {
+    // The whole point of not backfilling: dormant costs nothing, and the next
+    // turn is what earns a brief.
     const fetchMock = fakeCompletion(SUMMARY);
-    // Ten minutes idle: past the quiet period, inside the 24h backfill window.
-    const recent = makeThreadResponse({
-      id: "thr_recent",
-      title: "Recent",
+    const old = makeThreadResponse({
+      id: "thr_1",
+      title: "Dormant for months",
       visibility: "visible",
       status: "idle",
-      updatedAt: Date.now() - 10 * 60 * 1000,
+      updatedAt: Date.now() - 90 * 24 * 60 * 60 * 1000,
     });
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
     current = createFakePluginHost({
       pluginId: "thread-briefs",
-      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1" },
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
       sdk: {
         threads: {
-          get: async () => recent,
-          list: async () => [recent],
+          get: async () => old,
+          list: async () => [old],
+          output: async () => ({ output: "Picked this back up." }),
+          conversationOutline: async () => ({
+            items: [
+              { id: "1", role: "user", preview: "resume this", attachmentSummary: null },
+            ],
+            maxSeq: 9,
+          }),
+          interactions: { list: async () => [] },
+        },
+      },
+    }) as typeof current;
+    await plugin(current!.bb);
+
+    // Nothing from the sweep, because nothing has happened.
+    await current!.harness.behavior.runSchedule("brief-sweep");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Now the thread is worked on again.
+    await current!.harness.behavior.emitThreadEvent("thread.idle", {
+      thread: old,
+      lastAssistantText: "Picked this back up.",
+    });
+    const state = await waitFor(async () => {
+      const result = (await current!.harness.behavior.callRpc("getBrief", {
+        threadId: "thr_1",
+      })) as BriefState;
+      return result.state === "ready" ? result : null;
+    });
+    if (state.state !== "ready") throw new Error("unreachable");
+    expect(state.brief.goal).toBe(SUMMARY.goal);
+  });
+
+  it("catches a briefless thread whose activity postdates this load", async () => {
+    // The sweep's one job for a briefless thread: activity that happened while
+    // we were running, whose `thread.idle` we apparently missed.
+    const fetchMock = fakeCompletion(SUMMARY);
+    let sweepThread = makeThreadResponse({ id: "thr_live", status: "idle" });
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    current = createFakePluginHost({
+      pluginId: "thread-briefs",
+      // A 1s quiet period keeps the test fast.
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
+      sdk: {
+        threads: {
+          get: async () => sweepThread,
+          list: async () => [sweepThread],
           output: async () => ({ output: "progress" }),
           conversationOutline: async () => ({
             items: [
@@ -277,6 +325,14 @@ describe("summarizing", () => {
       },
     }) as typeof current;
     await plugin(current!.bb);
+
+    // Activity just after load, then let the quiet period elapse.
+    sweepThread = makeThreadResponse({
+      id: "thr_live",
+      status: "idle",
+      updatedAt: Date.now() + 5,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
 
     await current!.harness.behavior.runSchedule("brief-sweep");
     await waitFor(async () => (fetchMock.mock.calls.length > 0 ? true : null));
