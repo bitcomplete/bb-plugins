@@ -41,6 +41,18 @@ Re-summarize is available in the header popover; it bypasses the debounce.
 
 Hidden threads (plugin workers) and deleted threads never get briefs.
 
+**Briefs are not backfilled.** The sweep will give a briefless thread its first
+brief only if it was active in the last 24 hours (`BACKFILL_WINDOW_MS`).
+Anything dormant longer stays briefless and the header popover says so, with a
+**Summarize now** button. This is deliberate: without the bound, every briefless
+thread would be re-enqueued on every sweep forever — an unbounded burst of
+requests the first time a key is configured, and an endless retry for any thread
+whose summary keeps failing.
+
+So a thread reports `summarizing` only while work is genuinely debounced,
+queued, or in flight; otherwise it reports `absent`, which the UI renders as an
+offer rather than a spinner. A failed summary drops back to `absent`.
+
 ## Stage and status
 
 `stage` is a semantic judgement from the transcript: discovery, planning,
@@ -85,3 +97,5 @@ trip to stay current.
   `experimental_setThreadRowStatus`, which the content script feature-detects.
 - Briefs stuck on "Summarizing…": check `apiKey` is set and
   `bb plugin logs thread-briefs` for HTTP errors from `baseUrl`.
+- "No brief for this thread yet" on an old thread is expected, not a fault —
+  briefs are not backfilled past the 24h window. Use **Summarize now**.

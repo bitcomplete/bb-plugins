@@ -169,6 +169,24 @@ function BriefBody({
   if (state.state === "summarizing") {
     return <div className="text-sm text-muted-foreground">Summarizing…</div>;
   }
+  if (state.state === "absent") {
+    // Threads that were already dormant when the plugin arrived are not
+    // backfilled, so say so and offer to make one rather than spinning.
+    return (
+      <div className="space-y-2">
+        <div className="text-sm text-muted-foreground">
+          No brief for this thread yet.
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="rounded border border-border px-2 py-1 text-xs text-foreground hover:bg-card"
+        >
+          Summarize now
+        </button>
+      </div>
+    );
+  }
   if (state.state === "unconfigured" || state.state === "error") {
     return <div className="text-sm text-muted-foreground">{state.message}</div>;
   }

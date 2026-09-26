@@ -98,12 +98,18 @@ export const resolvedBriefSchema = briefFieldsSchema
 export type ResolvedBrief = z.infer<typeof resolvedBriefSchema>;
 
 /**
- * What the frontend sees for one thread. `summarizing` covers both "never
- * summarized" and "queued for a refresh", which the UI renders the same way.
+ * What the frontend sees for one thread.
+ *
+ * `summarizing` means work is genuinely pending — debounced, queued, or in
+ * flight. `absent` means there is no brief and none is coming, which is the
+ * normal state for a thread that was already dormant when the plugin arrived:
+ * briefs are not backfilled, so the UI offers to make one on demand rather
+ * than claiming a summary is on its way.
  */
 export const briefStateSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("ready"), brief: resolvedBriefSchema }).strict(),
   z.object({ state: z.literal("summarizing") }).strict(),
+  z.object({ state: z.literal("absent") }).strict(),
   z.object({ state: z.literal("unconfigured"), message: z.string() }).strict(),
   z.object({ state: z.literal("error"), message: z.string() }).strict(),
 ]);

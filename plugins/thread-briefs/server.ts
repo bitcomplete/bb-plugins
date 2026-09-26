@@ -31,6 +31,12 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const SWEEP_CRON = "*/10 * * * *";
 /** Threads considered per sweep, newest first. */
 const SWEEP_LIMIT = 200;
+/**
+ * How far back the sweep will reach to give a briefless thread its first
+ * brief. Bounds the work to threads that were active recently enough to still
+ * be worth summarizing; anything older is summarized on request instead.
+ */
+const BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export { rpcContract };
 
@@ -102,7 +108,13 @@ export default async function plugin(bb: BbPluginApi) {
   const queue: string[] = [];
   /** Threads to summarize even when the activity cursor has not moved. */
   const forced = new Set<string>();
+  /** The thread the single worker is summarizing right now, if any. */
+  let inFlight: string | null = null;
   let draining = false;
+
+  /** Whether a summary for this thread is genuinely pending or running. */
+  const isPending = (threadId: string) =>
+    debounces.has(threadId) || queue.includes(threadId) || inFlight === threadId;
 
   const enqueue = (threadId: string) => {
     if (!queue.includes(threadId)) queue.push(threadId);
@@ -142,6 +154,7 @@ export default async function plugin(bb: BbPluginApi) {
         const threadId = queue.shift();
         if (threadId === undefined) break;
         const force = forced.delete(threadId);
+        inFlight = threadId;
         try {
           const changed = await summarizeThread(threadId, force);
           if (changed) announce();
@@ -151,6 +164,11 @@ export default async function plugin(bb: BbPluginApi) {
               error instanceof Error ? error.message : String(error)
             }`,
           );
+        } finally {
+          inFlight = null;
+          // The thread drops back to `absent` on failure, so the UI stops
+          // saying "summarizing" and offers an explicit retry instead.
+          announce();
         }
       }
     } finally {
@@ -274,7 +292,10 @@ export default async function plugin(bb: BbPluginApi) {
           message: "Add an API key in this plugin's settings to generate briefs.",
         };
       }
-      return { state: "summarizing" };
+      // Only claim a summary is coming when one actually is. A thread that was
+      // already dormant when the plugin arrived is never backfilled, so it sits
+      // at `absent` until someone asks for a brief.
+      return isPending(threadId) ? { state: "summarizing" } : { state: "absent" };
     }
     return {
       state: "ready",
@@ -365,7 +386,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (typeof values.apiKey !== "string" || values.apiKey.trim() === "") return;
 
     const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
-    const quietBefore = Date.now() - Math.max(1, values.quietSeconds) * 1000;
+    const now = Date.now();
+    const quietBefore = now - Math.max(1, values.quietSeconds) * 1000;
+    const backfillAfter = now - BACKFILL_WINDOW_MS;
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;
@@ -375,12 +398,20 @@ export default async function plugin(bb: BbPluginApi) {
       if (debounces.has(thread.id) || queue.includes(thread.id)) continue;
 
       const stored = await readBrief(thread.id);
-      // A thread with no brief yet, or one whose timestamp predates its last
-      // activity, is a candidate. `summarizeThread` re-checks the real cursor
-      // before spending a request.
-      if (stored === null || stored.lastSummarizedAt < thread.updatedAt) {
-        enqueue(thread.id);
+      if (stored === null) {
+        // No brief and no backfill: a thread already dormant when the plugin
+        // arrived stays briefless until someone asks, and the UI reports that
+        // honestly. Without this bound, every briefless thread would be
+        // re-enqueued on every sweep forever — an unbounded burst the first
+        // time a key is configured, and an endless retry for any thread whose
+        // summary keeps failing.
+        if (thread.updatedAt >= backfillAfter) enqueue(thread.id);
+        continue;
       }
+      // A stored brief older than the thread's last activity means activity we
+      // missed. `summarizeThread` re-checks the real cursor before spending a
+      // request.
+      if (stored.lastSummarizedAt < thread.updatedAt) enqueue(thread.id);
     }
   });
 

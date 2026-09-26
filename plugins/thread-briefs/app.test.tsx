@@ -104,6 +104,23 @@ describe("the header popover", () => {
     slot.lifecycle.unmount();
   });
 
+  it("offers to summarize a thread that has no brief, rather than spinning", async () => {
+    const slot = await render({ getBrief: () => ({ state: "absent" }) });
+    fireEvent.click(await slot.findByRole("button", { name: "Thread brief" }));
+
+    expect(await slot.findByText("No brief for this thread yet.")).toBeTruthy();
+    // A dormant thread is never backfilled, so "Summarizing…" would never resolve.
+    expect(slot.queryByText("Summarizing…")).toBeNull();
+
+    fireEvent.click(await slot.findByRole("button", { name: "Summarize now" }));
+    await waitFor(() =>
+      expect(
+        slot.inspection.rpcCalls.some((call) => call.method === "refresh"),
+      ).toBe(true),
+    );
+    slot.lifecycle.unmount();
+  });
+
   it("surfaces the unconfigured message instead of an empty brief", async () => {
     const slot = await render({
       getBrief: () => ({ state: "unconfigured", message: "Add an API key." }),
