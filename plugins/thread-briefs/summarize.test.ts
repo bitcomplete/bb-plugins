@@ -77,6 +77,12 @@ describe("parseSummary", () => {
 });
 
 describe("chatCompletionsUrl", () => {
+  it("appends the path to an API root", () => {
+    expect(chatCompletionsUrl("https://api.openai.com/v1")).toBe(
+      "https://api.openai.com/v1/chat/completions",
+    );
+  });
+
   it("tolerates a trailing slash", () => {
     expect(chatCompletionsUrl("https://api.openai.com/v1/")).toBe(
       "https://api.openai.com/v1/chat/completions",
@@ -85,6 +91,26 @@ describe("chatCompletionsUrl", () => {
 
   it("tolerates surrounding whitespace", () => {
     expect(chatCompletionsUrl("  https://x.test/v1  ")).toBe(
+      "https://x.test/v1/chat/completions",
+    );
+  });
+
+  // Providers document the full endpoint, so it gets pasted in as the base URL.
+  // Appending blindly produced /chat/completions/chat/completions and a 404.
+  it("leaves a full Fireworks endpoint alone", () => {
+    expect(
+      chatCompletionsUrl("https://api.fireworks.ai/inference/v1/chat/completions"),
+    ).toBe("https://api.fireworks.ai/inference/v1/chat/completions");
+  });
+
+  it("accepts the Fireworks API root too", () => {
+    expect(chatCompletionsUrl("https://api.fireworks.ai/inference/v1")).toBe(
+      "https://api.fireworks.ai/inference/v1/chat/completions",
+    );
+  });
+
+  it("leaves a full endpoint with a trailing slash alone", () => {
+    expect(chatCompletionsUrl("https://x.test/v1/chat/completions/")).toBe(
       "https://x.test/v1/chat/completions",
     );
   });

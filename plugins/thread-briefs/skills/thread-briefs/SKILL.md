@@ -16,7 +16,7 @@ Set these with `bb plugin config thread-briefs set <key> <value>`.
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `baseUrl` | `https://api.openai.com/v1` | OpenAI-compatible API root. `/chat/completions` is appended; a trailing slash is fine. |
+| `baseUrl` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. Either the API root or the full `/chat/completions` URL works; trailing slashes are fine. |
 | `apiKey` | _(unset, secret)_ | Bearer token for that endpoint. The plugin reports `needs-configuration` until it is set. |
 | `model` | `gpt-4o-mini` | Model used for summarizing. Any small instruction-following model works. |
 | `jsonMode` | `true` | Send `response_format: {type: "json_object"}`. Turn **off** for endpoints that reject it (many local servers do). |
@@ -24,6 +24,18 @@ Set these with `bb plugin config thread-briefs set <key> <value>`.
 
 The key is a secret setting, so it stays on the server and is never sent to the
 frontend.
+
+Worked example, Fireworks:
+
+```sh
+bb plugin config thread-briefs set baseUrl "https://api.fireworks.ai/inference/v1"
+bb plugin config thread-briefs set model "accounts/fireworks/models/glm-5p3-flash"
+bb plugin config thread-briefs set apiKey "<key>"
+```
+
+A 404 naming a doubled path (`/chat/completions/chat/completions`) meant an older
+build appended the path to a `baseUrl` that already ended in it. Both spellings
+are accepted now.
 
 ## When a brief is regenerated
 

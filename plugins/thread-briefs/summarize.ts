@@ -131,9 +131,21 @@ export interface CompletionConfig {
   jsonMode: boolean;
 }
 
-/** Trailing slashes are the single most common way a base URL is mistyped. */
+/**
+ * Accept either the API root or the full chat-completions endpoint.
+ *
+ * Providers document the full URL — Fireworks publishes
+ * `https://api.fireworks.ai/inference/v1/chat/completions`, OpenAI the same
+ * shape — so pasting that into a setting labelled "base URL" is the natural
+ * mistake, and appending blindly produced
+ * `/v1/chat/completions/chat/completions` and a 404. Trailing slashes are the
+ * other common way to mistype it.
+ */
 export function chatCompletionsUrl(baseUrl: string): string {
-  return `${baseUrl.trim().replace(/\/+$/u, "")}/chat/completions`;
+  const trimmed = baseUrl.trim().replace(/\/+$/u, "");
+  return /\/chat\/completions$/u.test(trimmed)
+    ? trimmed
+    : `${trimmed}/chat/completions`;
 }
 
 export async function requestSummary(

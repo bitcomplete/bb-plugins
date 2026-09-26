@@ -38,7 +38,7 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     baseUrl: {
       type: "string",
-      label: "API base URL",
+      label: "API base URL (root or full /chat/completions endpoint)",
       default: "https://api.openai.com/v1",
     },
     apiKey: { type: "string", label: "API key", secret: true },
