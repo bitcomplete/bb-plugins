@@ -71,6 +71,24 @@ async function failedBatch(env: Awaited<ReturnType<typeof setup>>) {
 }
 
 describe("bulk advance server integration", () => {
+  it("removes and restores progress through the RPC without deleting results or launching workers", async () => {
+    const env = await setup({ ready: true });
+    const batch = await env.harness.callRpc("advance_start", { token: (await env.preview()).token }) as AdvanceBatch;
+    const ids = { batchId: batch.id, jobId: batch.jobs[0]!.id };
+    await vi.waitFor(async () => expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ status: "ready", hiddenFromProgress: false }] }]));
+    expect(await env.harness.callRpc("advance_progress_visibility", { ...ids, hidden: true })).toMatchObject({ jobs: [{ status: "ready", hiddenFromProgress: true }] });
+    expect(await env.harness.callRpc("advance_get", null)).toMatchObject([{ jobs: [{ hiddenFromProgress: true }] }]);
+    expect(await env.harness.callRpc("advance_recheck", ids)).toMatchObject({ jobs: [{ status: "ready", hiddenFromProgress: false }] });
+    expect(await env.harness.callRpc("advance_progress_visibility", { ...ids, hidden: false })).toMatchObject({ jobs: [{ status: "ready", hiddenFromProgress: false }] });
+    expect(env.spawn).not.toHaveBeenCalled();
+    await expect(env.harness.callRpc("advance_recheck", { ...ids, jobId: "00000000-0000-4000-8000-000000000000" })).rejects.toThrow("item is no longer available");
+  });
+  it("rejects removing an active worker through the progress RPC", async () => {
+    const env = await setup();
+    const batch = await env.harness.callRpc("advance_start", { token: (await env.preview()).token }) as AdvanceBatch;
+    await vi.waitFor(() => expect(env.spawn).toHaveBeenCalledOnce());
+    await expect(env.harness.callRpc("advance_progress_visibility", { batchId: batch.id, jobId: batch.jobs[0]!.id, hidden: true })).rejects.toThrow("reconcile");
+  });
   it("previews without writes and routes a remote PR to a separate checkout in the exact matched project", async () => {
     const env = await setup({ remoteOnly: true });
     const plan = await env.preview();

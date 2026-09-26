@@ -100,7 +100,11 @@ via agent** action starts a BB thread only when you confirm it.
   split panes.
   The Board keeps per-PR results and checks current approval, feedback, checks,
   and stack dependencies before reporting **Ready to merge**. **Stop queued PRs**
-  stops work that has not started; active workers can finish. The batch never
+  stops work that has not started; active workers can finish. Each progress row
+  offers details, repair, threads, and readiness recheck. Removing a queued item
+  cancels only that item; removing a finished item hides its progress record,
+  which you can restore without requeueing it. Running items cannot be removed,
+  and removal never deletes the PR, thread, or history. The batch never
   merges PRs. Worktrees remain available for inspection. One batch runs at a
   time, with up to two repository workers. Saved batches keep their original
   scope; start a new preview to authorize feedback work on an earlier result.

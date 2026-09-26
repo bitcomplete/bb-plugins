@@ -11,7 +11,7 @@ export const advancePreviewJobSchema = z.object({
 export const advancePreviewSchema = z.object({ token: z.string(), expiresAt: z.number(), jobs: z.array(advancePreviewJobSchema) });
 const advanceAttemptSchema = z.object({ attemptId: z.string(), threadId: z.string().nullable(), path: z.string().nullable(), detail: z.string(), status: z.string(), updatedAt: z.number() });
 export const advanceJobSchema = advancePreviewJobSchema.extend({
-  id: z.string(), status: z.enum(["queued", "launching", "running", "verifying", "ready", "waiting-checks", "waiting-review", "needs-attention", "cancelled"]),
+  id: z.string(), hiddenFromProgress: z.boolean().default(false), status: z.enum(["queued", "launching", "running", "verifying", "ready", "waiting-checks", "waiting-review", "needs-attention", "cancelled"]),
   attemptId: z.string().nullable().default(null), dedicated: z.boolean().default(false), previousAttempts: z.array(advanceAttemptSchema).max(5).default([]),
   threadId: z.string().nullable(), path: z.string().nullable(), checkedHeadOid: z.string().nullable(), checkedBaseOid: z.string().nullable().optional(), updatedAt: z.number(), uncertain: z.boolean().default(false),
 });
@@ -89,7 +89,8 @@ export function createAdvanceService(db: RunDb, deps: {
     deps.changed();
   }
   function update(batch: Saved, job: AdvanceJob, patch: Partial<AdvanceJob>) {
-    Object.assign(job, patch, { updatedAt: now() }); save(batch);
+    const resurfaces = patch.status && (["queued", "launching", "running"].includes(patch.status) || (patch.status === "needs-attention" && job.status !== "needs-attention"));
+    Object.assign(job, resurfaces ? { hiddenFromProgress: false } : {}, patch, { updatedAt: now() }); save(batch);
   }
   function reserved(prUrl: string, path: string | null) {
     return [...batches.values()].some((batch) => batch.jobs.some((job) => owns(job) && (job.prUrl.toLowerCase() === prUrl.toLowerCase() || (path !== null && job.path === path))));
@@ -106,10 +107,11 @@ export function createAdvanceService(db: RunDb, deps: {
       if (facts.readiness === "waiting-checks" && previousStatus !== "waiting-checks") batch.pollUntil = Math.max(batch.pollUntil, now() + 30 * 60_000);
       update(batch, job, { status: failedPreparation ? "needs-attention" : facts.readiness,
         detail: failedPreparation ? `Requested work was not confirmed. GitHub: ${facts.detail}` : facts.detail,
-        checkedHeadOid: facts.headOid || null, checkedBaseOid: facts.baseOid || null, uncertain: false });
+        checkedHeadOid: facts.headOid || null, checkedBaseOid: facts.baseOid || null, uncertain: false,
+        hiddenFromProgress: job.hiddenFromProgress && !((failedPreparation || facts.readiness === "needs-attention") && previousStatus !== "needs-attention") });
       deps.verified(job.prUrl, batch.facts[job.id]!.path);
     } catch (error) {
-      if (!stopped) update(batch, job, { status: "needs-attention", detail: `Verification failed: ${String(error).slice(0, 300)}`, checkedHeadOid: null });
+      if (!stopped) update(batch, job, { status: "needs-attention", detail: `Verification failed: ${String(error).slice(0, 300)}`, checkedHeadOid: null, hiddenFromProgress: job.hiddenFromProgress && previousStatus === "needs-attention" });
     } finally { verifying.delete(job.id); }
   }
   async function pump() {
@@ -313,7 +315,7 @@ export function createAdvanceService(db: RunDb, deps: {
         batch.facts[job.id] = oldFacts;
         if (previouslyPrepared === undefined) delete batch.prepared[job.id]; else batch.prepared[job.id] = previouslyPrepared;
         delete batch.repairs[input.token];
-        Object.assign(job, previous); save(batch);
+        Object.assign(job, previous, { hiddenFromProgress: false }); save(batch);
       } else update(batch, job, { status: "needs-attention", uncertain: true, detail: `Repair launch outcome is uncertain; recheck before retrying. ${String(error).slice(0, 250)}` });
       throw error;
     }
@@ -370,7 +372,7 @@ export function createAdvanceService(db: RunDb, deps: {
         }
         if (stopped || fresh.some((fact) => fact.eligible && deps.busyNow(fact.prUrl, fact.path))) throw new Error("Another action started on this selection. Preview again.");
         const id = randomUUID();
-        const jobs = fresh.map((facts): AdvanceJob => ({ ...advancePreviewJobSchema.parse(facts), id: randomUUID(), status: facts.eligible ? "queued" : "needs-attention", attemptId: null, dedicated: false, previousAttempts: [], threadId: null, path: facts.path, checkedHeadOid: null, updatedAt: now(), uncertain: false }));
+        const jobs = fresh.map((facts): AdvanceJob => ({ ...advancePreviewJobSchema.parse(facts), id: randomUUID(), hiddenFromProgress: false, status: facts.eligible ? "queued" : "needs-attention", attemptId: null, dedicated: false, previousAttempts: [], threadId: null, path: facts.path, checkedHeadOid: null, updatedAt: now(), uncertain: false }));
         const batch: Saved = { id, token, createdAt: now(), cancelled: false, jobs, facts: Object.fromEntries(jobs.map((job, index) => [job.id, fresh[index]!])), pollUntil: now() + 30 * 60_000, prepared: {}, repairs: {} };
         batches.set(id, batch); save(batch); queueMicrotask(() => void pump()); return publicBatch(batch);
       } finally { starting = false; }
@@ -381,9 +383,18 @@ export function createAdvanceService(db: RunDb, deps: {
       for (const job of batch.jobs) if (job.status === "queued") Object.assign(job, { status: "cancelled", detail: "Cancelled before requested work started", updatedAt: now() });
       save(batch); return publicBatch(batch);
     },
-    async recheck(id: string): Promise<AdvanceBatch> {
+    progressVisibility(batchId: string, jobId: string, hidden: boolean): AdvanceBatch {
+      const { batch, job } = findJob(batchId, jobId);
+      if (hidden && (job.uncertain || ["launching", "running", "verifying"].includes(job.status))) throw new Error("Wait for this item's worker to stop and reconcile its result before removing it");
+      update(batch, job, { hiddenFromProgress: hidden, ...(hidden && job.status === "queued" ? { status: "cancelled" as const, detail: "Removed from progress before requested work started" } : {}) });
+      void pump();
+      return publicBatch(batch);
+    },
+    async recheck(id: string, jobId?: string): Promise<AdvanceBatch> {
       const batch = batches.get(id); if (!batch) throw new Error("Batch not found");
-      for (const job of batch.jobs) if ((!ACTIVE.has(job.status) && job.status !== "cancelled") || (job.status === "running" && job.uncertain)) {
+      const jobs = jobId === undefined ? batch.jobs : [findJob(id, jobId).job];
+      if (jobId !== undefined) update(batch, jobs[0]!, { hiddenFromProgress: false });
+      for (const job of jobs) if ((!ACTIVE.has(job.status) && job.status !== "cancelled") || (job.status === "running" && job.uncertain)) {
         if (job.uncertain && !job.threadId) {
           const matches = await deps.recover(attemptId(job), batch.facts[job.id]!.projectId!);
           if (matches.length === 0 && !working && now() - job.updatedAt > 30_000) { update(batch, job, { uncertain: false, detail: "No worker exists for this launch. Requested work did not start; fix this item with an agent." }); continue; }
@@ -411,6 +422,7 @@ export function createAdvanceService(db: RunDb, deps: {
         const currentResult = finalLine(text ?? "");
         const recoverableResult = job.status === "needs-attention" && signal === "idle" && (currentResult === marker(job) || currentResult === blockedMarker(job));
         if (!["launching", "running"].includes(job.status) && !recoverableResult) continue;
+        if (recoverableResult && job.hiddenFromProgress) update(batch, job, { hiddenFromProgress: false });
         if (signal === "idle") {
           if (finalLine(text ?? "") === blockedMarker(job)) { update(batch, job, { status: "needs-attention", detail: "Worker reported incomplete work or failed validation; inspect its result", uncertain: false }); continue; }
           if (finalLine(text ?? "") !== marker(job)) { update(batch, job, { status: "needs-attention", uncertain: true, detail: "Worker stopped without this job's completion marker; recheck after inspecting its thread" }); continue; }

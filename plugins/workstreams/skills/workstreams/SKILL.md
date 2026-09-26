@@ -483,7 +483,11 @@ The repair does not extend the repository batch queue. Previous attempts and
 worker links remain available. **Threads** on backlog rows combines the local
 thread links with action and batch threads matched by exact PR URL, even when a
 readiness result is stale or the PR has no scanned checkout. The thread menu
-can open a split when the host reports that placement is available.
+can open a split when the host reports that placement is available. Each progress
+row offers details, repair, threads, and readiness recheck; removing a queued
+item cancels only that item, while removing a finished item hides a record you
+can restore without requeueing it. Running items cannot be removed, and removal
+never deletes the PR, thread, or history.
 One batch runs at a time, with up to two repository workers and 100 selected PRs.
 CI polling runs for up to 30 minutes after a job enters **Waiting for checks**;
 use **Recheck readiness** afterward. If a selected parent update makes a

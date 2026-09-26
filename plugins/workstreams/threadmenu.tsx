@@ -28,6 +28,7 @@ export const TIER_WORDS: Record<ThreadTier, string> = {
 export function ThreadMenu({
   threads,
   showAll = false,
+  ariaLabel,
   onOpenThread,
   onMore,
   heading,
@@ -41,6 +42,7 @@ export function ThreadMenu({
   /** Already in display order. */
   threads: readonly MenuThread[];
   showAll?: boolean;
+  ariaLabel?: string;
   onOpenThread: (id: string) => void;
   /** "+N more": fly to the cluster on the Map, where the full list is. */
   onMore: () => void;
@@ -78,7 +80,7 @@ export function ThreadMenu({
   useEffect(() => cancel, [cancel]);
 
   const { shown, more } = menuEntries(threads, showAll ? threads.length : undefined);
-  const label = threadDotLabel(threads.length);
+  const label = ariaLabel ?? threadDotLabel(threads.length);
   const entries = (): HTMLButtonElement[] =>
     listRef.current === null ? [] : Array.from(listRef.current.querySelectorAll<HTMLButtonElement>("[data-thread-entry]:not(:disabled)"));
 

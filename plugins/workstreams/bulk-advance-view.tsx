@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { UrlLink, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
+import { UrlLink, experimental_useSidebarThreads, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type { AdvanceBatch, AdvanceJob, AdvancePreview } from "./bulk-advance";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,12 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { cn } from "@/lib/utils";
 import { advanceStatus } from "./bulk-advance-results";
 import { advancePreviewAction, advancePreviewSummary } from "./bulk-advance-preview";
-import { ThreadSplitButton } from "./thread-split-button";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { ThreadMenu } from "./threadmenu";
+import { backlogThreads } from "./backlog-threads";
+import { canRecheckProgressJob, canRemoveProgressJob, progressBatches, progressCounts } from "./advance-progress";
+import { usePortalScopeProps } from "./lib/portal-scope";
+import { Icon } from "@/components/ui/icon";
 
 const ACTIVE = new Set<AdvanceJob["status"]>(["queued", "launching", "running", "verifying"]);
 const failure = (cause: unknown): string => cause instanceof Error ? cause.message : String(cause);
@@ -133,54 +138,99 @@ export function AdvancePreviewButton({ prUrls, disabled, onStarted }: {
   </>;
 }
 
-export function AdvanceProgress({ batches, error, onRefresh, onOpenThread, onRepair }: {
-  batches: AdvanceBatch[]; error: string | null; onRefresh: () => void; onOpenThread: (threadId: string) => void; onRepair: (batchId: string, jobId: string) => void;
+function AdvanceProgressRow({ batchId, job, compact, liveThreads, busy, onRepair, onOpenThread, onRecheck, onVisibility }: {
+  batchId: string; job: AdvanceJob; compact: boolean; liveThreads: Parameters<typeof backlogThreads>[4]; busy: boolean;
+  onRepair: (batchId: string, jobId: string) => void; onOpenThread: (threadId: string) => void;
+  onRecheck: () => void; onVisibility: (hidden: boolean) => void;
+}) {
+  const [details, setDetails] = useState(false);
+  const portalScope = usePortalScopeProps();
+  const label = `${job.repo} #${job.number} (${job.title})`;
+  const threads = backlogThreads(job.prUrl, [], [], [job], liveThreads);
+  const detailId = `advance-detail-${batchId}-${job.id}`;
+  const menuItem = "cursor-pointer rounded px-2 py-1.5 text-[12px] outline-none focus:bg-foreground/[0.06] data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+  return <li data-advance-progress-row className={cn("grid min-w-0 items-center gap-x-3 gap-y-0.5 border-b border-border/40 px-2 py-1.5 text-[12px] hover:bg-foreground/[0.025]", compact ? "grid-cols-[minmax(0,1fr)_9.5rem]" : "grid-cols-[11rem_minmax(0,1fr)_10rem_9.5rem]")}>
+    <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-1">
+      <button type="button" aria-label={`${details ? "Hide" : "Show"} details for ${label}`} aria-expanded={details} aria-controls={detailId} onClick={() => setDetails((current) => !current)} className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+        <Icon name="ChevronRight" className={cn("size-3", details && "rotate-90")} />
+      </button>
+      <UrlLink href={job.prUrl} title={label} className={cn("flex min-w-0 items-baseline gap-1.5 underline-offset-2 hover:underline", job.hiddenFromProgress && "text-muted-foreground")}><span className="truncate font-semibold">{job.repo.split("/").at(-1)}</span><span className="shrink-0 font-mono text-[11px]">#{job.number}</span></UrlLink>
+    </div>
+    <span title={job.title} className={cn("min-w-0 truncate text-foreground/75", compact ? "col-start-1 row-start-2 pl-6 text-[11px]" : "col-start-2 row-start-1", job.hiddenFromProgress && "text-muted-foreground")}>{job.title}</span>
+    <span className={cn("text-[11px]", compact ? "col-start-2 row-start-2 text-right" : "col-start-3 row-start-1", job.hiddenFromProgress ? "text-muted-foreground" : job.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : job.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{job.hiddenFromProgress ? "Removed" : advanceStatus(job)}</span>
+    <div className={cn("flex items-center justify-end gap-1", compact ? "col-start-2 row-start-1" : "col-start-4 row-start-1")}>
+      {job.hiddenFromProgress ? <button type="button" disabled={busy} aria-label={`Restore ${label} to progress`} title="Show in progress again; does not requeue work" onClick={() => onVisibility(false)} className="rounded px-2 py-0.5 text-[11px] text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40">Restore</button> : job.status === "needs-attention" ? <button type="button" disabled={busy} aria-label={`Fix ${label}`} onClick={() => onRepair(batchId, job.id)} className="rounded border border-border px-2 py-0.5 text-[11px] outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">Fix…</button> : null}
+      {threads.length > 0 ? <ThreadMenu showAll ariaLabel={`Threads for ${label}`} threads={threads} onOpenThread={onOpenThread} onMore={() => onOpenThread(threads[0]!.id)} className={cn("flex h-6 shrink-0 items-center rounded px-1 text-[10.5px] outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring", threads.some((thread) => thread.active) ? "text-sky-700 dark:text-sky-400" : "text-muted-foreground")}>Threads {threads.length}</ThreadMenu> : null}
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger asChild><button type="button" aria-label={`More actions for ${label}`} className="flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground outline-none hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"><Icon name="MoreHorizontal" className="size-3.5" /></button></DropdownMenu.Trigger>
+        <DropdownMenu.Portal><DropdownMenu.Content {...portalScope} side="bottom" align="end" sideOffset={4} collisionPadding={8} className="z-50 min-w-44 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md">
+          <DropdownMenu.Item aria-label={`${details ? "Hide" : "Show"} details for ${label}`} className={menuItem} onSelect={() => setDetails((current) => !current)}>{details ? "Hide details" : "Show details"}</DropdownMenu.Item>
+          {!job.hiddenFromProgress ? <DropdownMenu.Item aria-label={`Recheck readiness for ${label}`} className={menuItem} disabled={busy || !canRecheckProgressJob(job)} onSelect={onRecheck}>Recheck readiness</DropdownMenu.Item> : null}
+          {job.hiddenFromProgress ? <DropdownMenu.Item aria-label={`Restore ${label} to progress`} className={menuItem} disabled={busy} onSelect={() => onVisibility(false)}>Restore to progress</DropdownMenu.Item> : canRemoveProgressJob(job) ? <DropdownMenu.Item aria-label={`Remove ${label} from ${job.status === "queued" ? "queue" : "progress"}`} className={menuItem} disabled={busy} onSelect={() => onVisibility(true)}>{job.status === "queued" ? "Remove from queue" : "Remove from progress"}</DropdownMenu.Item> : null}
+        </DropdownMenu.Content></DropdownMenu.Portal>
+      </DropdownMenu.Root>
+    </div>
+    {details ? <div id={detailId} className="col-span-full min-w-0 space-y-1 pb-1 pl-6 pt-1 text-[11px] text-muted-foreground">
+      <p className="break-words font-medium text-foreground/80">{job.title}</p>
+      <p className="whitespace-pre-wrap break-words">{job.detail}</p>
+      {job.uncertain ? <p>Worker state is uncertain. Inspect its thread and recheck readiness before retrying.</p> : null}
+      {job.hiddenFromProgress ? <p>Removed from progress. Restoring shows this record again without requeueing work.</p> : null}
+      <p className="flex flex-wrap gap-x-3 gap-y-1">{job.checkedHeadOid ? <span>Checked commit <span className="break-all font-mono">{job.checkedHeadOid}</span></span> : null}<span>Updated {new Date(job.updatedAt).toLocaleString()}</span></p>
+    </div> : null}
+  </li>;
+}
+
+export function AdvanceProgress({ batches, error, onRefresh, onOpenThread, onRepair, width }: {
+  batches: AdvanceBatch[]; error: string | null; onRefresh: () => void; onOpenThread: (threadId: string) => void; onRepair: (batchId: string, jobId: string) => void; width: number;
 }) {
   const rpc = useRpc<typeof rpcContract>();
+  const liveThreads = experimental_useSidebarThreads().threads;
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(true);
   const [history, setHistory] = useState(false);
-  const act = async (batchId: string, action: "cancel" | "recheck") => {
-    setBusy(batchId);
+  const [removedOpen, setRemovedOpen] = useState<Record<string, boolean>>({});
+  const act = async (batchId: string, action: "cancel" | "recheck" | "hide" | "restore", jobId?: string) => {
+    setBusy(jobId ?? batchId);
     setActionError(null);
     try {
       if (action === "cancel") await rpc.call("advance_cancel", { batchId });
-      else await rpc.call("advance_recheck", { batchId });
+      else if (action === "recheck") await rpc.call("advance_recheck", { batchId, ...(jobId ? { jobId } : {}) });
+      else await rpc.call("advance_progress_visibility", { batchId, jobId: jobId!, hidden: action === "hide" });
       onRefresh();
     } catch (cause) { setActionError(failure(cause)); }
     finally { setBusy(null); }
   };
   if (batches.length === 0 && error === null) return null;
-  const visible = history ? batches : batches.slice(0, 1);
+  const visible = progressBatches(batches, history);
+  const counts = progressCounts(visible.flatMap((batch) => batch.jobs));
+  const previous = batches.length - progressBatches(batches, false).length;
   return <section aria-label="Advance batch progress" className="shrink-0 border-b border-border/60 bg-foreground/[0.015] text-[11.5px]">
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-1.5">
       <button type="button" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)} className="rounded text-left font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">{expanded ? "▾" : "▸"} Advance progress</button>
-      {batches[0] ? <span className="text-muted-foreground">{batches[0].jobs.filter((job) => job.status === "ready").length} ready · {batches[0].jobs.filter((job) => ACTIVE.has(job.status)).length} in progress · {batches[0].jobs.filter((job) => job.status === "needs-attention").length} need attention{batches[0].jobs.some((job) => job.status === "waiting-checks" || job.status === "waiting-review") ? ` · ${batches[0].jobs.filter((job) => job.status === "waiting-checks" || job.status === "waiting-review").length} waiting` : ""}</span> : null}
+      <span className="text-muted-foreground">{counts.ready} ready · {counts.active} in progress · {counts.attention} need attention{counts.waiting > 0 ? ` · ${counts.waiting} waiting` : ""}</span>
       {error === null ? null : <><span role="alert" className="text-destructive">{error}</span><button type="button" className="underline" onClick={onRefresh}>Retry</button></>}
     </div>
-    {expanded ? <div className="max-h-[35vh] space-y-3 overflow-y-auto px-4 pb-3">
-      {visible.map((batch) => <div key={batch.id} className="rounded-md border border-border bg-background px-3 py-2">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="font-medium">{batch.jobs.length} PRs · {new Date(batch.createdAt).toLocaleString()}</span>
-          <button type="button" disabled={busy !== null || !batch.jobs.some((job) => !ACTIVE.has(job.status) && job.status !== "cancelled")} onClick={() => void act(batch.id, "recheck")} className="rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40">{busy === batch.id ? "Updating…" : "Recheck readiness"}</button>
-          {batch.jobs.some((job) => job.status === "queued") && !batch.cancelled ? <button type="button" disabled={busy !== null} onClick={() => void act(batch.id, "cancel")} className="rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40">Stop queued PRs</button> : null}
-          {batch.cancelled ? <span className="text-muted-foreground">Queue stopped; active work may finish.</span> : null}
-        </div>
-        <ul className="mt-1 divide-y divide-border/50">
-          {batch.jobs.map((job) => <li key={job.id} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-0.5 py-2">
-            <UrlLink href={job.prUrl} className="min-w-0 truncate underline-offset-2 hover:underline" title={`${job.repo} #${job.number} (${job.title})`}><span className="font-medium">{job.repo.split("/").at(-1)} <span className="font-mono">#{job.number}</span></span> <span className="text-muted-foreground">{job.title}</span></UrlLink>
-            <span className={cn("text-right", job.status === "ready" ? "text-emerald-700 dark:text-emerald-400" : job.status === "needs-attention" ? "text-amber-700 dark:text-amber-300" : "text-muted-foreground")}>{advanceStatus(job)}</span>
-            <p className="col-span-2 break-words text-[11px] text-muted-foreground">{job.detail}{job.uncertain ? " Worker state is uncertain. Recheck readiness to reconcile this job; inspect its worker before retrying." : ""}{job.checkedHeadOid ? <span className="ml-1 font-mono">· {job.checkedHeadOid.slice(0, 7)}</span> : null}</p>
-            <div className="col-span-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
-              {job.status === "needs-attention" ? <button type="button" onClick={() => onRepair(batch.id, job.id)} className="rounded border border-border px-2 py-0.5 text-foreground outline-none hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring">Fix…</button> : null}
-              {job.threadId ? <><button type="button" onClick={() => onOpenThread(job.threadId!)} className="rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">Open worker</button><ThreadSplitButton threadId={job.threadId} /></> : null}
-            </div>
-          </li>)}
-        </ul>
-      </div>)}
-      {actionError === null ? null : <p role="alert" className="text-destructive">{actionError}</p>}
-      {batches.length > 1 ? <button type="button" onClick={() => setHistory((current) => !current)} className="rounded text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">{history ? "Hide previous batches" : `Previous batches · ${batches.length - 1}`}</button> : null}
+    {expanded ? <div className="max-h-[35vh] overflow-y-auto px-4 pb-2">
+      <div className="mx-auto w-full max-w-6xl">
+      {visible.map((batch) => {
+        const hidden = batch.jobs.filter((job) => job.hiddenFromProgress).length;
+        const shown = batch.jobs.filter((job) => !job.hiddenFromProgress || removedOpen[batch.id]);
+        return <section key={batch.id} aria-label={`Advance batch ${new Date(batch.createdAt).toLocaleString()}`} className="pt-1.5 first:pt-0">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-2 py-1 text-[10.5px] text-muted-foreground">
+            <span>{batch.jobs.length - hidden} PRs · {new Date(batch.createdAt).toLocaleString()}</span>
+            <button type="button" disabled={busy !== null || !batch.jobs.some((job) => !job.hiddenFromProgress && canRecheckProgressJob(job))} onClick={() => void act(batch.id, "recheck")} className="rounded underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40">Recheck all</button>
+            {batch.jobs.some((job) => !job.hiddenFromProgress && job.status === "queued") && !batch.cancelled ? <button type="button" disabled={busy !== null} onClick={() => void act(batch.id, "cancel")} className="rounded underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40">Stop queued PRs</button> : null}
+            {hidden > 0 ? <button type="button" aria-expanded={removedOpen[batch.id] ?? false} onClick={() => setRemovedOpen((current) => ({ ...current, [batch.id]: !current[batch.id] }))} className="rounded underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">{removedOpen[batch.id] ? "Hide removed" : `Show removed · ${hidden}`}</button> : null}
+            {batch.cancelled ? <span>Queue stopped; active work may finish.</span> : null}
+          </div>
+          <ul>{shown.map((job) => <AdvanceProgressRow key={job.id} batchId={batch.id} job={job} compact={width < 1060} liveThreads={liveThreads} busy={busy !== null} onRepair={onRepair} onOpenThread={onOpenThread} onRecheck={() => void act(batch.id, "recheck", job.id)} onVisibility={(hidden) => void act(batch.id, hidden ? "hide" : "restore", job.id)} />)}</ul>
+          {shown.length === 0 ? <p className="px-2 py-1 text-[11px] text-muted-foreground">All items removed from progress.</p> : null}
+        </section>;
+      })}
+      {actionError === null ? null : <p role="alert" className="px-2 py-1 text-destructive">{actionError}</p>}
+      {previous > 0 ? <button type="button" onClick={() => setHistory((current) => !current)} className="mt-2 rounded px-2 text-[10.5px] text-muted-foreground underline underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-ring">{history ? "Hide previous batches" : `Previous batches · ${previous}`}</button> : null}
+      </div>
     </div> : null}
   </section>;
 }

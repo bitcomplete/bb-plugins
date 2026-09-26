@@ -34,6 +34,107 @@ function setup(facts = [fact()]) {
 }
 
 describe("finite Advance preparation", () => {
+  it("removes only the queued item and never requeues it when progress visibility is restored", async () => {
+    const t = setup([fact(1), fact(2), fact(3)]); const batch = await t.start();
+    const [first, removed, next] = batch.jobs;
+    t.service.progressVisibility(batch.id, removed!.id, true);
+    expect(removed).toMatchObject({ status: "cancelled", hiddenFromProgress: true });
+    expect(batch.cancelled).toBe(false);
+    t.service.progressVisibility(batch.id, removed!.id, false);
+    expect(removed).toMatchObject({ status: "cancelled", hiddenFromProgress: false });
+    t.current.set(first!.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("thread", "idle", `Workstreams job ${first!.id} complete: prepared`); await drain();
+    expect(next!.status).toBe("running");
+    expect(t.deps.send).toHaveBeenCalledTimes(1);
+    expect(t.deps.send.mock.calls[0]![1]).toContain(`Workstreams job ${next!.id} complete: prepared`);
+    expect(t.deps.workspace.mock.calls.map(([facts]) => facts.number)).toEqual([1, 3]);
+    expect(t.service.list()[0]!.jobs).toHaveLength(3);
+  });
+  it("cancels a queued item even while its checkout is being provisioned", async () => {
+    const t = setup();
+    let finish!: (workspace: { path: string; workerPath: string }) => void;
+    t.deps.workspace.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const batch = await t.start();
+    expect(t.deps.workspace).toHaveBeenCalledOnce();
+    t.service.progressVisibility(batch.id, batch.jobs[0]!.id, true);
+    finish({ path: "/isolated/job", workerPath: "/isolated" }); await drain();
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+    expect(batch.jobs[0]).toMatchObject({ status: "cancelled", hiddenFromProgress: true });
+  });
+  it.each(["launching", "running", "verifying", "uncertain"])("keeps %s work visible until its writer is reconciled", async (status) => {
+    const t = setup(); const batch = await t.start(); t.service.dispose();
+    const saved = JSON.parse((t.db.prepare("SELECT body FROM advance_batches WHERE id = ?").get(batch.id) as { body: string }).body);
+    Object.assign(saved.jobs[0], { status: status === "uncertain" ? "needs-attention" : status, uncertain: status === "uncertain" });
+    t.db.prepare("UPDATE advance_batches SET body = ? WHERE id = ?").run(JSON.stringify(saved), batch.id);
+    const restored = createAdvanceService(t.db, t.deps);
+    expect(() => restored.progressVisibility(batch.id, batch.jobs[0]!.id, true)).toThrow("reconcile");
+    expect(restored.list()[0]!.jobs[0]!.hiddenFromProgress).toBe(false);
+    expect(restored.reserved(fact().prUrl, fact().path)).toBe(true);
+  });
+  it("persists hidden results and defaults older stored jobs to visible without relaunching work", async () => {
+    const t = setup([fact(1, { needsPreparation: false, readiness: "ready" })]); const batch = await t.start();
+    t.service.progressVisibility(batch.id, batch.jobs[0]!.id, true); t.service.dispose();
+    const restored = createAdvanceService(t.db, t.deps);
+    expect(restored.list()[0]!.jobs[0]!.hiddenFromProgress).toBe(true);
+    restored.progressVisibility(batch.id, batch.jobs[0]!.id, false);
+    await restored.tick(true); restored.dispose();
+    const saved = JSON.parse((t.db.prepare("SELECT body FROM advance_batches WHERE id = ?").get(batch.id) as { body: string }).body);
+    delete saved.jobs[0].hiddenFromProgress;
+    t.db.prepare("UPDATE advance_batches SET body = ? WHERE id = ?").run(JSON.stringify(saved), batch.id);
+    expect(createAdvanceService(t.db, t.deps).list()[0]!.jobs[0]!.hiddenFromProgress).toBe(false);
+    expect(t.deps.spawn).not.toHaveBeenCalled();
+    expect(t.deps.workspace).not.toHaveBeenCalled();
+  });
+  it("rechecks only the requested item and restores its progress visibility", async () => {
+    const t = setup([fact(1, { needsPreparation: false, readiness: "ready" }), fact(2, { needsPreparation: false, readiness: "ready" })]);
+    const batch = await t.start(); await drain();
+    for (const job of batch.jobs) t.service.progressVisibility(batch.id, job.id, true);
+    t.current.set(fact().prUrl, fact(1, { needsPreparation: false, readiness: "waiting-review" }));
+    t.deps.inspect.mockClear();
+    await t.service.recheck(batch.id, batch.jobs[0]!.id);
+    expect(t.deps.inspect.mock.calls).toEqual([[fact().prUrl]]);
+    expect(batch.jobs[0]).toMatchObject({ status: "waiting-review", hiddenFromProgress: false });
+    expect(batch.jobs[1]).toMatchObject({ status: "ready", hiddenFromProgress: true });
+    await expect(t.service.recheck(batch.id, "missing")).rejects.toThrow("item is no longer available");
+    expect(() => t.service.progressVisibility(batch.id, "missing", true)).toThrow("item is no longer available");
+  });
+  it("keeps background checks and batch rechecks hidden until a new actionable blocker appears", async () => {
+    const t = setup([fact(1, { needsPreparation: false, readiness: "waiting-checks" })]); const batch = await t.start();
+    const job = batch.jobs[0]!;
+    t.service.progressVisibility(batch.id, job.id, true);
+    await t.service.tick();
+    expect(job).toMatchObject({ status: "waiting-checks", hiddenFromProgress: true });
+    await t.service.recheck(batch.id);
+    expect(job.hiddenFromProgress).toBe(true);
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "needs-attention", detail: "Checks failed" }));
+    await t.service.tick();
+    expect(job).toMatchObject({ status: "needs-attention", hiddenFromProgress: false });
+    t.service.progressVisibility(batch.id, job.id, true);
+    await t.service.recheck(batch.id);
+    expect(job.hiddenFromProgress).toBe(true);
+  });
+  it("restores a hidden failed item when its worker reports a new completed result", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    t.service.progressVisibility(batch.id, job.id, true);
+    t.current.set(job.prUrl, fact(1, { needsPreparation: false, readiness: "ready" }));
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: prepared`);
+    expect(job).toMatchObject({ status: "ready", hiddenFromProgress: false });
+  });
+  it("restores a hidden failed item when its worker resumes or an explicit repair starts", async () => {
+    const t = setup(); const batch = await t.start(); const job = batch.jobs[0]!;
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    t.service.progressVisibility(batch.id, job.id, true);
+    t.deps.thread.mockResolvedValue({ status: "active", archivedAt: null, deletedAt: null, output: "" });
+    await t.service.recheck(batch.id);
+    expect(job).toMatchObject({ status: "running", hiddenFromProgress: false });
+    await t.service.signal("thread", "idle", `Workstreams job ${job.id} complete: blocked`);
+    t.deps.thread.mockResolvedValue({ status: "idle", archivedAt: null, deletedAt: null, output: "" });
+    t.service.progressVisibility(batch.id, job.id, true);
+    const plan = await t.service.repairPlan(batch.id, job.id);
+    await t.service.repairRun({ token: plan.token, mode: "new", threadId: null, instruction: "" });
+    expect(job).toMatchObject({ status: "running", hiddenFromProgress: false, threadId: "repair-thread" });
+  });
   it("verifies already current PRs without a worker and keeps selection/idempotency", async () => {
     const t = setup([fact(1, { needsPreparation: false, readiness: "ready", detail: "Ready" })]);
     const plan = await t.service.preview([fact().prUrl, fact().prUrl]);

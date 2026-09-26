@@ -556,7 +556,7 @@ export function InboxBoard({
         {(["efforts", "backlog"] as const).map((view) => <button key={view} type="button" aria-pressed={boardV2View === view} onClick={() => chooseView(view)} className={cn("rounded-md px-2.5 py-1 text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-ring", boardV2View === view ? "bg-foreground/[0.08] font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{view === "efforts" ? "Efforts" : "PR backlog"}</button>)}
       </div> : null}
       <AdvanceRepairDialog target={repairTarget} onClose={() => setRepairTarget(null)} onStarted={advance.refresh} onOpenThread={openThread} />
-      <AdvanceProgress onRepair={(batchId, jobId) => setRepairTarget({ batchId, jobId })} batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
+      <AdvanceProgress width={boardWidth} onRepair={(batchId, jobId) => setRepairTarget({ batchId, jobId })} batches={advance.batches} error={advance.error} onRefresh={advance.refresh} onOpenThread={openThread} />
       {backlogVisible && dispatch.mode === "auto" ? <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-4 py-2 text-[11.5px] text-muted-foreground">
         <span>Automatic agent runs · {allEfforts.find((effort) => effort.key === dispatch.effortKey)?.name ?? "selected effort"}</span>
         <button type="button" onClick={() => {
