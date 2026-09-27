@@ -75,6 +75,13 @@ function ghRunner(signal: AbortSignal): GhRunner {
           resolve({ ok: true, stdout: stdout.toString() });
         },
       );
+      // `gh` can exit before it ever reads stdin — an unauthenticated or
+      // immediately-failing invocation does exactly that. Writing to the
+      // closed pipe then raises EPIPE asynchronously, and with no listener on
+      // the stream it surfaces as a process-level uncaught exception rather
+      // than an error on this call. The execFile callback above still reports
+      // the real failure, so the write error is genuinely nothing to act on.
+      child.stdin?.on("error", () => {});
       child.stdin?.end(stdin ?? "");
     });
 }
