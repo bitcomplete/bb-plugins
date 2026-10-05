@@ -73,6 +73,11 @@ export function renderTranscript(input: TranscriptInput): string {
     const previous = input.previousBrief;
     parts.push(
       [
+        // Only the fields that should hold still from one summary to the next.
+        // `nextStep`, `blockedOn` and the status are left out: they describe
+        // where the thread stands *now*, and handed back as a starting point
+        // they survive the turns that made them obsolete — a step the agent
+        // has since retired, a rollout that has since finished.
         "Previous brief (update it; keep what is still true, correct what is not):",
         // Fed back so the name only moves when the work moved. Without it the
         // model renames from scratch every summary and a settled thread
@@ -80,8 +85,6 @@ export function renderTranscript(input: TranscriptInput): string {
         `  title: ${previous.title || "(empty)"}`,
         `  goal: ${previous.goal || "(empty)"}`,
         `  currentState: ${previous.currentState || "(empty)"}`,
-        `  nextStep: ${previous.nextStep || "(empty)"}`,
-        `  blockedOn: ${previous.blockedOn || "(empty)"}`,
         `  constraints: ${previous.constraints || "(empty)"}`,
       ].join("\n"),
     );

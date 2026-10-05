@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  deriveStatus,
+  legacyStatus,
   effectiveStage,
   effectiveStatus,
   idleFor,
@@ -40,30 +40,59 @@ const stored = (overrides: Partial<StoredBrief> = {}): StoredBrief => ({
   ...overrides,
 });
 
-describe("deriveStatus", () => {
+describe("effectiveStatus", () => {
+  it("reports the status the summarizer judged", () => {
+    // Done with a suggestion still standing: nextStep no longer decides.
+    expect(effectiveStatus(stored({ modelStatus: "done" }))).toBe("done");
+    expect(
+      effectiveStatus(
+        stored({ modelStatus: "waiting-on-me", fields: { ...stored().fields, nextStep: "" } }),
+      ),
+    ).toBe("waiting-on-me");
+  });
+
+  it("reads a brief written before status was asked for the old way", () => {
+    // Not backfilled: such a brief keeps its reading until the thread is
+    // next summarized.
+    expect(effectiveStatus(stored())).toBe("waiting-on-me");
+    expect(
+      effectiveStatus(stored({ fields: { ...stored().fields, nextStep: "" } })),
+    ).toBe("done");
+  });
+
+  it("lets a pin in force win over the model", () => {
+    expect(
+      effectiveStatus(
+        stored({ modelStatus: "waiting-on-me", statusOverride: "done", statusOverrideSeq: 50 }),
+      ),
+    ).toBe("done");
+  });
+});
+
+describe("legacyStatus", () => {
   it("reports done only when nothing is outstanding and nothing blocking", () => {
-    expect(deriveStatus({ nextStep: "   ", blockedOn: "" })).toBe("done");
+    expect(legacyStatus({ nextStep: "   ", blockedOn: "" })).toBe("done");
   });
 
   it("does not call a blocked thread done, whatever the next step says", () => {
     // The prompt promises a non-empty nextStep whenever anything is
     // outstanding. This is the guard for when it does not deliver one.
-    expect(deriveStatus({ nextStep: "", blockedOn: "Review from Dylan" })).toBe(
+    expect(legacyStatus({ nextStep: "", blockedOn: "Review from Dylan" })).toBe(
       "waiting-on-other",
     );
-    expect(deriveStatus({ nextStep: "  ", blockedOn: "  Upstream fix " })).toBe(
+    expect(legacyStatus({ nextStep: "  ", blockedOn: "  Upstream fix " })).toBe(
       "waiting-on-other",
     );
   });
 
   it("reports waiting-on-other when something is blocking", () => {
     expect(
-      deriveStatus({ nextStep: "Merge it", blockedOn: "Review from Dylan" }),
+      legacyStatus({ nextStep: "Merge it", blockedOn: "Review from Dylan" }),
     ).toBe("waiting-on-other");
   });
 
   it("falls back to waiting-on-me for unfinished, unblocked work", () => {
-    expect(deriveStatus({ nextStep: "Pick an approach", blockedOn: "" })).toBe(
+    expect(legacyStatus({ nextStep: "Pick an approach", blockedOn: "" })).toBe(
       "waiting-on-me",
     );
   });
@@ -71,16 +100,16 @@ describe("deriveStatus", () => {
   it("does not need a trailing question to report waiting-on-me", () => {
     // An idle thread with work left needs a human look either way, so the
     // question signal no longer changes the outcome.
-    expect(deriveStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
+    expect(legacyStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
       "waiting-on-me",
     );
   });
 });
 
-describe("deriveStatus with an actor", () => {
+describe("legacyStatus with an actor", () => {
   it("treats an external actor as blocked even with no blockedOn text", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Land the upstream PR",
         blockedOn: "",
         nextStepActor: "other",
@@ -90,7 +119,7 @@ describe("deriveStatus with an actor", () => {
 
   it("reports waiting-on-me for a step only the user can take", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Try it and say whether the glyph looks right",
         blockedOn: "",
         nextStepActor: "me",
@@ -100,7 +129,7 @@ describe("deriveStatus with an actor", () => {
 
   it("reports waiting-on-me for a step the agent could take, since the nudge is ours", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Keep porting the remaining call sites",
         blockedOn: "",
         nextStepActor: "agent",
@@ -110,21 +139,21 @@ describe("deriveStatus with an actor", () => {
 
   it("lets done win over any actor, so a finished thread is never a prompt", () => {
     expect(
-      deriveStatus({ nextStep: "", blockedOn: "", nextStepActor: "other" }),
+      legacyStatus({ nextStep: "", blockedOn: "", nextStepActor: "other" }),
     ).toBe("done");
   });
 
   it("preserves the actor-free behaviour when the actor is absent", () => {
     // Every brief written before this field existed lands here.
-    expect(deriveStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
-      deriveStatus({
+    expect(legacyStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
+      legacyStatus({
         nextStep: "Keep going",
         blockedOn: "",
         nextStepActor: undefined,
       }),
     );
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Keep going",
         blockedOn: "",
         nextStepActor: undefined,
@@ -213,7 +242,7 @@ describe("status overrides", () => {
       statusOverrideSeq: 50,
       lastActivitySeen: 50,
     });
-    expect(deriveStatus(brief.fields)).toBe("waiting-on-me");
+    expect(legacyStatus(brief.fields)).toBe("waiting-on-me");
     expect(effectiveStatus(brief)).toBe("done");
     expect(isStatusOverrideStale(brief)).toBe(false);
   });

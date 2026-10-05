@@ -6,8 +6,8 @@ import {
   extractJson,
   normalizeRefresher,
   normalizeTitle,
+  normalizeStatus,
   parseSummary,
-  reconcileStage,
 } from "./summarize.js";
 import { MAX_REFRESHER_LENGTH, MAX_TITLE_LENGTH } from "./contract.js";
 import {
@@ -26,6 +26,7 @@ const full = {
   blockedOn: "",
   constraints: "",
   stage: "implementation",
+  status: "waiting-on-me",
 };
 
 describe("extractJson", () => {
@@ -258,60 +259,56 @@ describe("normalizeRefresher", () => {
   });
 });
 
-describe("reconcileStage", () => {
-  it("promotes implementation to review when nothing is owed", () => {
-    expect(reconcileStage("implementation", "")).toBe("review");
+describe("normalizeStatus", () => {
+  it("keeps each status the model can answer, case and spacing aside", () => {
+    expect(normalizeStatus("done", "")).toBe("done");
+    expect(normalizeStatus(" Waiting-On-Me ", "")).toBe("waiting-on-me");
+    expect(normalizeStatus("waiting-on-other", "Review from Sam")).toBe(
+      "waiting-on-other",
+    );
   });
 
-  it("leaves implementation alone while a next step stands", () => {
-    expect(reconcileStage("implementation", "Run the tests")).toBe("implementation");
+  it("falls back to waiting-on-me, the reading whose mistake is cheap", () => {
+    // A wrong waiting-on-me is sidebar noise; a wrong done is archived two
+    // days later. An answer we cannot read must land on the cheap side.
+    expect(normalizeStatus(undefined, "")).toBe("waiting-on-me");
+    expect(normalizeStatus("finished", "")).toBe("waiting-on-me");
+    expect(normalizeStatus(true, "")).toBe("waiting-on-me");
   });
 
-  it("never promotes a stage with no work behind it", () => {
-    // A discovery or planning thread with nothing owed was dropped before any
-    // work existed; calling it review would claim there is something to review.
-    expect(reconcileStage("discovery", "")).toBe("discovery");
-    expect(reconcileStage("planning", "")).toBe("planning");
-  });
-
-  it("leaves review where it is", () => {
-    expect(reconcileStage("review", "")).toBe("review");
+  it("never calls a thread done while it names something it is waiting on", () => {
+    expect(normalizeStatus("done", "Review from Sam")).toBe("waiting-on-other");
   });
 });
 
-describe("parseSummary stage reconciliation", () => {
-  it("reads a completion narrative as review, not implementation", () => {
-    // The bug this exists for: one call returns both keys, and an agent signing
-    // off with what it built gets an empty nextStep beside an unmoved stage.
-    const parsed = parseSummary(
-      reply({ ...full, nextStep: "", stage: "implementation" }),
-      null,
-    );
-    expect(parsed.stage).toBe("review");
+describe("parseSummary status", () => {
+  it("takes the status the model answered, not one read off nextStep", () => {
+    // A finished thread may carry a suggestion; an unfinished one may have no
+    // step written down. Neither field decides the other.
+    expect(
+      parseSummary(reply({ ...full, nextStep: "Add a lint rule", status: "done" }), null)
+        .status,
+    ).toBe("done");
+    expect(
+      parseSummary(reply({ ...full, nextStep: "", status: "waiting-on-me" }), null)
+        .status,
+    ).toBe("waiting-on-me");
   });
 
-  it("promotes the fallback stage too", () => {
-    // An unusable stage falls back to implementation, and a thread owing
-    // nothing is better guessed as review than as mid-build.
+  it("applies the blockedOn guard after empty synonyms are cleared", () => {
     expect(
-      parseSummary(reply({ ...full, nextStep: "", stage: "vibes" }), null).stage,
-    ).toBe("review");
+      parseSummary(reply({ ...full, blockedOn: "None", status: "done" }), null).status,
+    ).toBe("done");
+    expect(
+      parseSummary(reply({ ...full, blockedOn: "Sam's review", status: "done" }), null)
+        .status,
+    ).toBe("waiting-on-other");
   });
 
-  it("treats an empty synonym as nothing owed", () => {
+  it("leaves the stage as the model judged it, whatever nextStep says", () => {
     expect(
-      parseSummary(reply({ ...full, nextStep: "N/A", stage: "implementation" }), null)
+      parseSummary(reply({ ...full, nextStep: "", stage: "implementation" }), null)
         .stage,
-    ).toBe("review");
-  });
-
-  it("leaves a pinned stage pinned", () => {
-    // The pin's promise is that it is returned whatever the transcript says.
-    expect(
-      parseSummary(
-        reply({ ...full, nextStep: "", stage: "review" }),
-        "implementation",
-      ).stage,
     ).toBe("implementation");
   });
 });
@@ -382,7 +379,7 @@ describe("selectOutline", () => {
 });
 
 describe("renderTranscript", () => {
-  it("includes the previous brief so the summarizer updates rather than restarts", () => {
+  it("feeds back the settled fields of the previous brief, not where it stood", () => {
     const text = renderTranscript({
       title: "Thread briefs",
       outline: [{ role: "user", preview: "Build it" }],
@@ -397,7 +394,11 @@ describe("renderTranscript", () => {
     });
     expect(text).toContain("Previous brief");
     expect(text).toContain("kv rows cap at 256KB");
-    expect(text).toContain("blockedOn: (empty)");
+    expect(text).toContain("currentState: half done");
+    // nextStep and blockedOn are re-read from the transcript every time: handed
+    // back, they outlive the turns that made them obsolete.
+    expect(text).not.toContain("nextStep");
+    expect(text).not.toContain("blockedOn");
     expect(text).toContain("User: Build it");
   });
 

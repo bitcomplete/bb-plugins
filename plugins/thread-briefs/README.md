@@ -6,35 +6,75 @@ every thread a short, durable **brief**, generated outside the working chat:
 
 - **goal** — what the thread is actually trying to achieve
 - **currentState** — what exists now, including half-done work
-- **nextStep** — the single most concrete next action, or empty when nobody owes
-  the thread one. An open PR, a patch carried on a fork, or a workaround still in
-  place is owed; open-ended watching is not
-- **nextStepActor** — who has to take it: `me`, `agent`, or `other`. The one
-  judgement the status needs that the prose cannot supply, since "test it and
-  tell me" and "keep going" read alike
-- **blockedOn** — the party or artifact it is waiting on, when someone could go
-  chase it
+- **nextStep** — the most useful next action, if there is one. Descriptive only:
+  a finished thread may still carry a suggestion here
+- **nextStepActor** — who would take it: `me`, `agent`, or `other`
+- **blockedOn** — the party or artifact outside the thread it is waiting on, when
+  someone could go chase it
 - **constraints** — facts learned in the thread that would break a naive re-plan
 - **title** — a 4–6 word name for the work, which can optionally replace bb's
   own thread title
 
-Plus a derived **stage** (discovery / planning / implementation / review) and
-**status** (working / waiting-on-me / waiting-on-other / done) — where `working`
-comes from bb's live thread state and the other three from the brief.
+Plus a **stage** (discovery / planning / implementation / review) and a
+**status** (working / waiting-on-me / waiting-on-other / done). `working` comes
+from bb's live thread state; the other three statuses and the stage are asked of
+the model directly.
 
-The two are orthogonal — stage says how far the work has got, status says who
-owes the next move — but they are answered by one model call over one transcript,
-and nothing in that call holds them to agreeing. So the parser reconciles them:
-an empty `nextStep` means nobody owes the thread an action, which is only true
-once the work is made, so a `stage` of `implementation` beside one is read as
-`review`. Without it an agent's closing summary of what it built lands as
-"Implementation — Done". A pinned stage is exempt; a pin is returned as given.
+The status question is one sentence: *assume you do whatever the thread asks of
+you — is the task then finished, or does the thread have more to do?* Yes is
+`done`, even when a step is left that only you can take ("approve PR #12", "run
+the rollout check"), because nothing more will happen in the thread either way.
+No, because your answer or go-ahead starts more work here, is `waiting-on-me`.
+No, because something outside the thread has to act first, is
+`waiting-on-other`, and names that thing in `blockedOn`.
+
+### Why status is asked for, not derived
+
+Status used to be derived: an empty `nextStep` and an empty `blockedOn` meant
+done. That made Done a side effect of the model leaving two strings blank, while
+the same prompt asked for "the single most concrete next action" — and a model
+asked for one finds one. Four rules accumulated in the prompt pulling the
+boundary one way and the other, and on the bb-dylan server 11 of 21 Done threads
+were Done only because someone had pinned them by hand. Reading each of those 11
+against its transcript gave three causes:
+
+- an offer or optional check recorded as the step ("want me to file an issue?",
+  "if you want the hash confirmed, run…");
+- a `nextStep` or `blockedOn` carried over from the previous brief, which was fed
+  back as the starting point and outlived the turns that retired it;
+- a step that was the user's, done outside the thread.
+
+So the model now answers the status itself, with one definition and one example
+per value; `nextStep` no longer decides anything; and the previous brief fed back
+into the next summary carries only the fields that should hold still — title,
+goal, currentState, constraints. `nextStep` and `blockedOn` are re-read from the
+transcript every time.
+
+The parser applies one rule on top, which holds whatever the model thinks: a
+brief that names a `blockedOn` is never `done`. An unreadable status falls back
+to `waiting-on-me`, the reading whose mistake is cheap. There are no other
+field-against-field corrections — stage and status are stored as answered.
+
+A brief written before this change has no stored status and keeps the old
+derivation until its thread is next summarized. They are deliberately not
+re-summarized in bulk: every old idle thread that now read done would be past
+the archive threshold already, and the next sweep would take them all at once.
+
+### Measuring a prompt change
+
+`eval/` holds the harness that produced the numbers behind this. `export.ts`
+freezes threads from a running server into fixtures (outline, last message, the
+stored brief); `run.ts` runs a checkout's prompt over them against the live model
+and reports agreement with hand-given labels, false Dones and missed Dones, with
+and without the previous brief fed back. Point `--src` at a `git worktree` of
+`main` to score the old prompt against the same set. Fixtures are real
+transcripts and bb-plugins is public, so they live outside the repository.
 
 Either can be pinned by hand in the Brief panel, anchored to the thread's
 activity cursor so the pin retires on the next real turn. The status pin is what
 closes a thread whose next step was carried out somewhere the transcript cannot
-see — "reload a client and confirm the panel opens" leaves nothing for a summary
-to read, so the derivation would say `waiting-on-me` forever.
+see — a go-ahead you gave in another thread, a PR you merged on github.com —
+leaves nothing for a summary to read.
 
 ## Install
 
@@ -159,7 +199,7 @@ takes it over; turning grouping off deletes the three sections and restores the
 sidebar preferences it changed, but cannot put a hand-made placement back.
 
 **The side panel** — a **Brief** tab holding the full five fields (empty ones
-are skipped), the derived status, when it was last summarized, status and stage
+are skipped), the status, when it was last summarized, status and stage
 controls for the manual overrides, and Re-summarize. The **Brief** button in the thread
 header opens it; so does the panel's own new-tab launcher, under Actions. It
 works the same on mobile and desktop — on a compact viewport the host reveals
@@ -325,8 +365,8 @@ obvious:
   a statement that the model was right, and pinning it there would leave a pin
   that does nothing until it silently expires.
 - Dragging **out of** Done pins `waiting-on-me` rather than clearing the status
-  pin, because a done reading can come from the derivation as well as from a pin —
-  and clearing in that case would hand the card straight back to a derivation
+  pin, because a done reading can come from the model as well as from a pin —
+  and clearing in that case would hand the card straight back to a model reading
   that still says done, snapping it into the column you just dragged it out of.
 - **No stage** is not a drop target in either direction.
 
@@ -385,6 +425,14 @@ The [grey ring](#where-briefs-show-up) is the warning: both go through the same
 sweep will take once the second threshold passes. A day of grey is the notice
 period.
 
+Done is not "nothing left anywhere": a done thread may still carry a step that is
+yours alone, such as approving a PR, and it is archived on the same clock. That
+is deliberate. The step stays on the card in the Done section for two days and
+the hover label says "archiving soon" for the second; a thread archived anyway is
+one click from back, and un-archiving it is final (below). Waiting on you would
+have kept it in the sidebar indefinitely, which is the failure this status was
+rewritten to fix.
+
 Every other rule is a reason *not* to archive, which is the right default for a
 sweep that runs unattended — a thread wrongly left in the sidebar costs a glance,
 a thread wrongly archived costs a search for something you believe you left on
@@ -413,7 +461,7 @@ so a sweep running up to an hour late is invisible.
 | Concern | Mechanism |
 | --- | --- |
 | Trigger | `bb.events.on("thread.idle")` + a per-thread quiet-period debounce, with a `*/10 * * * *` sweep as the backstop. A thread with no brief yet skips the quiet period, and is summarized from `thread.active` as well — mid-turn, so a long first turn is not spent briefless |
-| Summarizer input | `threads.conversationOutline()` head + tail with the middle elided, `threads.output()` for the last message in full, and the previous brief |
+| Summarizer input | `threads.conversationOutline()` head + tail with the middle elided, `threads.output()` for the last message in full, and the previous brief's title, goal, currentState and constraints |
 | Storage | `bb.storage.kv`, one row per thread at `brief:<threadId>` |
 | Sidebar glyph | a content script's `experimental_setThreadRowStatus`, fed by an `experimental_appOverlay` that owns the rpc + realtime subscription |
 | Ring artwork | `app.experimental_icons.register`, one inline SVG per stage plus the done ring, in every palette colour, plus one grey done ring — since a row status takes an icon *name* and not a component, every combination has to be registered at init, before any project is known |

@@ -135,10 +135,11 @@ export const storedRefresherSchema = refresherProseSchema
   .strict();
 export type StoredRefresher = z.infer<typeof storedRefresherSchema>;
 
-/** What the summarizer returns: the five fields, the stage, the refresher. */
+/** What the summarizer returns: the five fields, the stage, the status, the refresher. */
 export const summaryResultSchema = briefFieldsSchema
   .extend({
     stage: briefStageSchema,
+    status: storedBriefStatusSchema,
     /**
      * Null when the model returned nothing usable for either variant. A brief
      * with no refresher is a brief that simply never shows one — the same
@@ -153,10 +154,10 @@ export type SummaryResult = z.infer<typeof summaryResultSchema>;
  * The persisted row, one per thread, under kv key `brief:<threadId>`.
  *
  * `stage` and `status` are deliberately absent: `stage` is
- * `stageOverride ?? modelStage` and `status` is `statusOverride` falling back to
- * a derivation over `nextStep`, `blockedOn` and `nextStepActor`, all resolved on
- * read so none goes stale between summaries. The live `working` override is applied later still, per row
- * on the client.
+ * `stageOverride ?? modelStage` and `status` is `statusOverride ?? modelStatus`,
+ * both resolved on read so a pin that has expired stops applying without a
+ * write. The live `working` override is applied later still, per row on the
+ * client.
  *
  * New fields must be optional and `version` must stay at 1. `readBrief` deletes
  * any row that fails this parse, and briefs are never backfilled, so a required
@@ -170,6 +171,16 @@ export const storedBriefSchema = z
     fields: briefFieldsSchema,
     /** The stage the summarizer judged from the transcript. */
     modelStage: briefStageSchema,
+    /**
+     * The status the summarizer judged from the transcript.
+     *
+     * Absent on a brief written before the summarizer was asked for a status.
+     * Those keep the old reading, derived from `nextStep` and `blockedOn` (see
+     * `legacyStatus`), until their thread is next summarized; they are not
+     * backfilled, because re-summarizing every idle thread at once would put
+     * every one that now reads done straight onto the archive clock.
+     */
+    modelStatus: storedBriefStatusSchema.optional(),
     /** A manual stage that wins over `modelStage` until real new activity. */
     stageOverride: briefStageSchema.nullable(),
     /**

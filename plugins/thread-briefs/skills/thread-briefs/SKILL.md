@@ -134,16 +134,10 @@ override it; the override is anchored to the thread's activity cursor and retire
 itself on the next real turn. Clicking the active manual stage clears it. The
 override moves the row's ring too, immediately.
 
-Stage and `nextStep` come back from one model call, and nothing in that call
-makes the model answer both consistently — the usual failure is a stage left at
-`implementation` beside an empty `nextStep`, on a thread whose agent has just
-narrated what it built and deployed. Since an empty `nextStep` derives `done`,
-that pair renders as "Implementation — Done" and drags out of the board's Done
-column back into Implementation. `reconcileStage` in `summarize.ts` promotes it:
-nothing owed means the work is made, so the stage is `review`. Only from
-`implementation` — a `discovery` or `planning` thread with nothing owed was
-dropped before any work existed, and there is nothing there to review. A pinned
-stage short-circuits it, since a pin promises to come back as given.
+Stage and status come back from one model call and are stored as answered.
+The parser does not correct one against the other: "Implementation — Done" is a
+model answer to fix in the prompt, not to paper over. A pinned stage is passed to
+the model as fixed and returned as given.
 
 Both overrides share that anchor rule, and "the next real turn" means a summary
 whose conversation cursor has moved past where the pin was set — so
@@ -151,22 +145,42 @@ whose conversation cursor has moved past where the pin was set — so
 actual turn drops it. The anchor is never re-stamped to the new cursor; one that
 advanced in step with the activity meant to expire it would never expire.
 
-`status` is derived mechanically, so it stays correct between summaries. It has
-a live half and a stored half, and the live half wins:
+`status` has a live half and a stored half, and the live half wins:
 
 - the thread is `active`, `starting` or `pending` → **working**, whatever the
   brief says. A run in flight is newer information than the brief, which
   describes the last turn that finished.
 - otherwise, from the stored brief:
-  - a manual status override in force → that status, whatever the fields say
-  - `nextStep` **and** `blockedOn` both empty → **done**
-  - `blockedOn` non-empty, or `nextStepActor` is `other` → **waiting-on-other**
-  - otherwise → **waiting-on-me**
+  - a manual status override in force → that status
+  - the status the summarizer answered (`modelStatus` on the row)
+  - a brief written before the summarizer was asked for a status has none, and
+    reads the old way until its thread is next summarized: `nextStep` and
+    `blockedOn` both empty → done, `blockedOn` set or `nextStepActor` `other` →
+    waiting-on-other, otherwise waiting-on-me
 
-**done** needs both fields empty, so a blocked thread cannot read as done even
-if a summary comes back without a next step. And **waiting-on-me** is the
-fallback: an idle thread with work left needs a human look whether or not its
-last turn ended in a question, and whether or not the actor is known.
+The summarizer is asked one question: **assume you do whatever the thread asks of
+you — is the task then finished, or does the thread have more to do?**
+
+- **done** — finished. A step that is only yours ("approve PR #12", "run the
+  rollout check"), an offer of extra work ("want me to add a lint rule?") and an
+  optional check do not keep it open: nothing more happens in the thread either
+  way. `nextStep` may still carry it, as a suggestion.
+- **waiting-on-me** — your answer, decision or go-ahead starts more work in the
+  thread ("the diff is ready but uncommitted — should I push?"), or the task is
+  otherwise unfinished.
+- **waiting-on-other** — the work cannot go on until something outside the
+  thread acts, named in `blockedOn`.
+
+One rule holds whatever the model says: a brief with a non-empty `blockedOn` is
+never **done** — it reads **waiting-on-other**. A status the parser cannot read
+falls back to **waiting-on-me**, because a thread wrongly left waiting costs a
+glance and one wrongly called done is archived two days later.
+
+`nextStep` and `blockedOn` are **not** fed back into the next summary as part of
+the previous brief; only title, goal, currentState and constraints are. Fed
+back, they outlived the turns that retired them — a step the agent had since
+dropped, a rollout that had since finished — and kept finished threads out of
+Done. Both are re-read from the transcript every time.
 
 ### Overriding the status by hand
 
@@ -175,19 +189,15 @@ is anchored to the thread's activity cursor, retires on the next real turn, and
 clears if you click the one that is already pinned. It moves the sidebar
 section as well as the row, because sections are keyed on this status.
 
-**Why it exists.** The derivation reads the brief's prose, and the prose can
-record a `nextStep` that is addressed to you and carried out somewhere the
-transcript cannot see — "reload an open client and confirm the panel tab
-opens", "check the rollout landed", "confirm the glyph looks right". Doing it
-leaves no trace for any summary to read, so **Re-summarize** just writes the
-same unresolved instruction back and the thread is **waiting-on-me** forever.
-The pin is the only way to say you did it.
+**Why it exists.** The summarizer only sees the transcript. A go-ahead you gave
+somewhere else, or a PR you merged on github.com that the thread was waiting
+on, leaves no trace for any summary to read, so **Re-summarize** reads the same
+open question back. The pin is the way to say it is settled — or simply that you
+read the thread differently from the model.
 
-The pin sits *in front of* the derivation rather than editing the fields it
-reads. Blanking `nextStep` in storage would not work: `renderTranscript` feeds
-the previous brief into the next summary as a starting point, so the field would
-simply come back. A pin is a separate fact the summarizer is never shown and
-cannot undo.
+The pin sits *in front of* the model's status rather than replacing it. It is a
+separate fact the summarizer is never shown as a status and cannot undo; it is
+told about it only so the refresher prose agrees.
 
 Dragging the row into another sidebar section is **not** a substitute. Section
 assignment never feeds back into a brief, so the next reconcile — on plugin
@@ -195,64 +205,18 @@ start, after any batch of briefs, or on a settings change — files the thread
 straight back where its status says. Pin the status instead and the section
 follows.
 
-`nextStepActor` is the one input the model judges rather than the code: "try it
-and tell me if the glyph looks right" and "keep porting the call sites" are both
-concrete next actions, and nothing in the prose separates them. It is **optional**
-— absent means unknown, which covers both a brief written before the field
-existed and one whose `nextStep` is empty — and an actor the parser does not
-recognise is dropped rather than failing the brief, the same bar as an
-unrecognised stage. Either way the status falls back to the rules above with the
-actor clause skipped.
+`nextStepActor` says who would take `nextStep` — `me`, `agent` or `other` — and
+no longer feeds the status. It is optional, dropped when `nextStep` is empty or
+the word is not one of the three. Its one use is the board's
+`agent can continue` hint.
 
-An actor of `agent` — an idle thread the agent could carry on by itself — has no
-status of its own and currently reads **waiting-on-me**, because the nudge is
-yours to give. If that bucket turns out to be common it earns its own status
-then.
+**Re-summarize** re-reads a thread under the current prompt. Old briefs are not
+re-summarized in bulk: every idle thread that now read done would already be
+past the archive threshold, and the next sweep would take them all at once.
 
-Briefs are not re-summarized to pick the field up: old rows gain an actor on
-their next natural summary. To see how far that has spread, compare the rows
-that have one against the total.
-
-Beyond that guard, **done** is only as good as the summarizer's bar for
-"finished", and the prompt sets that bar at **whether anybody owes the thread an
-action** — something a person or team must do, that will not happen on its own,
-and that would be dropped if the brief did not record it.
-
-That test cuts both ways, and the prompt names both halves because each has its
-own failure:
-
-- An obligation **outside the chat** still counts, and is the one that gets
-  silently dropped: a PR open for review or merge, a patch carried on a fork
-  until it lands upstream, a temporary workaround to undo, a rollout to finish
-  and confirm. These earn a `nextStep` and a `blockedOn`, so the thread reads
-  **waiting-on-other** rather than done.
-- **Nothing is owed to the passage of time.** Open-ended watching — "check back
-  in a few days", "keep an eye on it", "confirm it behaves in real use" — has no
-  owner and no definite outcome, so it does not keep a thread open. Neither does
-  work the transcript puts out of scope, nor an idea nobody adopted.
-
-The second half exists because the first, on its own, made `done` a function of
-the agent's closing rhetoric rather than of the work. Agents habitually hedge
-when they sign off — "worth a glance", "I'd flag this as open" — and a bar of
-"nothing outstanding anywhere" is unfalsifiable, so any such sentence kept a
-finished thread out of Done. Two threads that had both shipped and rolled out
-landed in different sections purely because one agent volunteered a caveat. The
-prompt now says to judge the state of the work, not the tone of the sign-off.
-
-`blockedOn` carries a **higher** bar than `nextStep`, because it is the field
-that jams the door: any non-empty value forces **waiting-on-other**, and
-`renderTranscript` feeds the previous brief back into the next summary, so a
-stray value is sticky. It must name a party or artifact someone could go
-chase — a specific review, a person, an upstream fix, a running build, an access
-grant — never a duration, "real usage", or "more data". The Blocked section is
-meant to be a list of things you could go poke; if you cannot say who would be
-chased, it is not blocked.
-
-A thread whose brief disagrees with this bar is usually one written before the
-bar changed: **Re-summarize** from the Brief panel. That re-reads the
-transcript under the current prompt, but note it also feeds the old brief back
-as a starting point, so a wrong `blockedOn` can survive if the transcript still
-reads as though it were true.
+The numbers behind the current prompt, and the harness to re-measure a change
+to it, are in the plugin's `eval/` directory and README ("Measuring a prompt
+change").
 
 ## The re-entry refresher
 
@@ -337,8 +301,8 @@ shown.
 
 The pin is scoped to the two prose fields in the prompt, and the prompt says so:
 the five fields still describe the work as the transcript leaves it, for the
-same reason the pin sits in front of the derivation rather than editing what it
-reads.
+same reason the pin sits in front of the model's status rather than editing
+what it reads.
 
 ### Where it renders
 
@@ -471,6 +435,12 @@ gains the reason: `Review — Done · idle 2 days, archiving soon`. At
 bb plugin config thread-briefs set doneStaleHours 24    # 0 keeps every done ring coloured
 bb plugin config thread-briefs set doneArchiveHours 48  # 0 never auto-archives
 ```
+
+A done thread may still carry a step that is yours — approving a PR, running a
+check — and is archived on the same clock. That is deliberate: the step sits on
+the card in the Done section for two days, the hover label warns for the second,
+and an archived thread un-archived by hand is never auto-archived again. If you
+want longer, raise `doneArchiveHours`.
 
 The grey **replaces** the project hue; there is no `-c<n>` variant of it. The row
 has one channel, colour on it means a live project, and a thread about to leave
@@ -611,8 +581,8 @@ project's colour (the same glyph as the sidebar row, including the grey one for 
 cold done thread), a status badge, `blockedOn`, the project, and the idle age.
 
 `agent can continue` appears when `nextStepActor` is `agent` and the status is
-`waiting-on-me`. The derivation collapses those two cases (see
-[Stage and status](#stage-and-status)), so this is the only place the difference
+`waiting-on-me`. That status covers both a thread waiting on your answer and
+one the agent could carry on by itself, so this is the only place the difference
 shows.
 
 Order inside a column: pinned threads, then `waiting-on-me` → Blocked → Working →
@@ -634,8 +604,8 @@ is what the `pinned` marker on the card is warning about.
 | to or from **No stage** | nothing |
 
 Dragging out of Done *pins* rather than clears because a done reading can come
-from the derivation as well as a pin; clearing would hand the card back to a
-derivation that still says done and it would snap straight back.
+from the model as well as a pin; clearing would hand the card back to a model
+reading that still says done and it would snap straight back.
 
 Drag-and-drop does not work on touch, so the **expanded card carries the panel's
 own stage and status controls**. On a compact viewport the columns stack into one
@@ -773,10 +743,14 @@ no preference writes.
   prompt — is named by the pre-turn brief instead of waiting. If such a row keeps
   its prompt, the rename failed: check `bb plugin logs thread-briefs` for
   `could not rename`.
-- A thread stuck on **Waiting on you** whose next step you have already carried
-  out: expected if the step happened outside the thread, because nothing in the
-  transcript can record that. Pin the status to **Done** in the Brief panel —
-  see [Overriding the status by hand](#overriding-the-status-by-hand).
+- A finished thread stuck on **Waiting on you**: first check the brief is new —
+  a brief written before the summarizer answered status reads the old way, and
+  **Re-summarize** rewrites it. If it is new and the thread waits on a go-ahead
+  you gave elsewhere, pin the status to **Done** in the Brief panel — see
+  [Overriding the status by hand](#overriding-the-status-by-hand).
+- A **Done** thread that still shows a next step: expected. Done means nothing
+  more happens in the thread once you do what it asked; the step left on the
+  card is yours, and the thread is archived on the usual clock.
 - A thread that will not stay in the section you drag it to: sections are keyed
   on status and nothing feeds an assignment back into a brief, so the next
   reconcile undoes the move. Pin the status instead.
@@ -804,7 +778,7 @@ no preference writes.
   the `pinned` marker on the card says one is in force.
 - A card that will not stay out of **Done**: pin the status to something else from
   the expanded card. Dragging already does this, but a re-summary after the next
-  turn will re-derive `done` if the brief still has nothing outstanding.
+  turn may read `done` again if the transcript still says the task is finished.
 - Drag does nothing on a phone or tablet: expected — it is an HTML5 pointer drag.
   Use the stage and status controls on the expanded card.
 - No **Briefs** item in the sidebar: it is a nav panel, so it can be hidden or

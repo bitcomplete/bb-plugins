@@ -13,7 +13,6 @@ import {
 import {
   briefCardFor,
   briefKey,
-  deriveStatus,
   effectiveStatus,
   overrideHolds,
   planRename,
@@ -517,8 +516,9 @@ export default async function plugin(bb: BbPluginApi) {
 
     // A stage override in force is passed to the model as fixed; one the thread
     // has moved past is dropped here, which is what "sticks until real thread
-    // activity" means. The status override needs no such handoff — the model is
-    // never asked for a status — but expires on the same terms.
+    // activity" means. The status override expires on the same terms, but is not
+    // passed as fixed: the model still judges the status from the transcript,
+    // and only the refresher prose is told about the pin.
     const stagePin = carryOverride(
       stored?.stageOverride,
       stored?.stageOverrideSeq,
@@ -586,7 +586,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? null
         : {
             ...summary.refresher,
-            writtenForStatus: statusPin.value ?? deriveStatus(fields),
+            writtenForStatus: statusPin.value ?? summary.status,
           };
 
     await writeBrief({
@@ -594,6 +594,7 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       fields,
       modelStage: summary.stage,
+      modelStatus: summary.status,
       stageOverride: stagePin.value,
       stageOverrideSeq: stagePin.seq,
       statusOverride: statusPin.value,
@@ -1263,6 +1264,4 @@ export default async function plugin(bb: BbPluginApi) {
   });
 }
 
-// Re-exported for tests that exercise the derivation without a server.
-export { deriveStatus };
 export type { BriefStage };

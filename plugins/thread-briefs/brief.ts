@@ -57,73 +57,41 @@ export function isStatusOverrideStale(stored: StoredBrief): boolean {
 
 /**
  * The status this brief reports: the manual one while it holds, otherwise the
- * derivation over the brief's own fields.
+ * one the summarizer judged.
  *
- * The override sits *in front of* {@link deriveStatus} rather than editing the
- * fields it reads, because `renderTranscript` feeds the previous brief into the
- * next summary as a starting point: a `nextStep` blanked in storage would
- * simply be written back, where a pin is a separate fact the summarizer never
- * sees and cannot undo.
- *
- * It exists for the one thing the derivation cannot see. A `nextStep` addressed
- * to you and carried out *outside the thread* — reload a client, check a
- * rollout, confirm a glyph — leaves no trace in the transcript, so no summary
- * can retire it and re-summarizing reads the same unresolved instruction back.
- * That thread is `waiting-on-me` forever unless you can say otherwise.
+ * The manual pin exists for the one thing no summary can see: a step carried
+ * out somewhere the transcript does not reach. The summarizer is asked whether
+ * the task is finished *assuming* you do what the thread asks of you, so a step
+ * that is only yours already reads done; the pin is for the rest — a thread
+ * waiting on your go-ahead that you settled elsewhere, or a reading you simply
+ * disagree with.
  */
 export function effectiveStatus(stored: StoredBrief): StoredBriefStatus {
   const override = stored.statusOverride ?? null;
   if (override !== null && !isStatusOverrideStale(stored)) return override;
-  return deriveStatus({
-    nextStep: stored.fields.nextStep,
-    blockedOn: stored.fields.blockedOn,
-    nextStepActor: stored.fields.nextStepActor,
-  });
+  return stored.modelStatus ?? legacyStatus(stored.fields);
 }
 
 /**
- * Status as far as a *stored* brief can tell. Mechanical rather than a model
- * judgement, so it stays right between summaries:
+ * The status of a brief written before the summarizer was asked for one, read
+ * from its fields the way it used to be: nothing to do and nothing blocking is
+ * done, a blocker or an outside actor is waiting on someone else, and anything
+ * else is waiting on you.
  *
- * - nothing to do and nothing blocking → the work is done
- * - blocked on something → waiting on someone else
- * - otherwise → waiting on me
- *
- * `done` requires *both* fields empty. The summarizer's prompt already promises
- * a non-empty `nextStep` whenever anything is outstanding, but testing
- * `blockedOn` here makes "a blocked thread is not done" a guarantee of this
- * code rather than of the prompt, so one wayward summary cannot put a green
- * tick on a thread that is waiting for a review.
- *
- * `nextStepActor` is the one input the model has to judge: a next step only we
- * can take ("test it", "decide X", "reply to Y") reads the same in prose as one
- * the agent could take unprompted. An actor of `other` therefore means waiting
- * on someone else even when the summarizer named no `blockedOn`.
- *
- * `waiting-on-me` is the fallback because an idle thread with unfinished work
- * needs a human look by default — whether or not the agent's last turn happened
- * to end in a question, and whether or not we know the actor.
- *
- * `working` is deliberately absent: it is live thread state, not a property of
- * a brief, so it is applied per row by {@link rowDecoration}. The return type
- * says so — narrowing to the stored statuses is what lets a caller that needs
- * one, like the refresher's `writtenForStatus`, take this value without a cast.
+ * Only for old rows. Such a brief stays on this reading until its thread is
+ * next summarized, which writes a `modelStatus` that replaces it.
  */
-export function deriveStatus(args: {
+export function legacyStatus(fields: {
   nextStep: string;
   blockedOn: string;
   nextStepActor?: NextStepActor | undefined;
 }): StoredBriefStatus {
-  const nextStep = args.nextStep.trim();
-  const blockedOn = args.blockedOn.trim();
+  const nextStep = fields.nextStep.trim();
+  const blockedOn = fields.blockedOn.trim();
   if (nextStep === "" && blockedOn === "") return "done";
-  if (blockedOn !== "" || args.nextStepActor === "other") {
+  if (blockedOn !== "" || fields.nextStepActor === "other") {
     return "waiting-on-other";
   }
-  // `agent` — an idle thread the agent could carry on by itself — has no status
-  // of its own yet, and collapses into waiting-on-me because the nudge is ours
-  // to give. If that turns out to be a common bucket in practice it earns its
-  // own status then, rather than being guessed at now.
   return "waiting-on-me";
 }
 

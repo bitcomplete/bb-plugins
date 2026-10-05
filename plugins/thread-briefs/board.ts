@@ -646,8 +646,8 @@ export function countByStatus(
 /**
  * The one thing the status badge cannot say.
  *
- * `deriveStatus` collapses a next step the *agent* could take by itself into
- * `waiting-on-me`, because the nudge is ours to give — so two cards reading
+ * `waiting-on-me` covers a thread the *agent* could carry on by itself as well
+ * as one that needs your answer, because the nudge is ours to give — so two cards reading
  * "Waiting on you" can want completely different amounts of work from you. On a
  * board, where the whole task is choosing between them, that difference is worth
  * a word.

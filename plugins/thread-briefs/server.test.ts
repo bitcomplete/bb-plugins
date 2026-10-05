@@ -13,6 +13,7 @@ const SUMMARY = {
   blockedOn: "",
   constraints: "bb exposes no additive per-row sidebar slot",
   stage: "review",
+  status: "waiting-on-me",
 };
 
 function fakeCompletion(body: unknown) {
@@ -227,6 +228,26 @@ describe("summarizing", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
       expect(stored?.fields.goal).toBe(SUMMARY.goal);
+    });
+
+    it("stores a done reading beside the suggestion it still carries", async () => {
+      const fetchMock = fakeCompletion({ ...SUMMARY, status: "done" });
+      current = host({ fetch: fetchMock });
+      await plugin(current.bb);
+      vi.useFakeTimers();
+
+      await current.harness.behavior.emitThreadEvent("thread.idle", {
+        thread,
+        lastAssistantText: "done",
+      });
+      await settle(6_000);
+
+      // Stored as the model answered: neither field is rewritten to agree
+      // with the other.
+      const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      expect(stored?.modelStatus).toBe("done");
+      expect(stored?.fields.nextStep).toBe(SUMMARY.nextStep);
+      expect(stored?.refresher?.writtenForStatus ?? "done").toBe("done");
     });
 
     it("summarizes a briefless thread as soon as it starts running", async () => {

@@ -3,6 +3,7 @@ import {
   MAX_REFRESHER_LENGTH,
   MAX_TITLE_LENGTH,
   nextStepActorSchema,
+  storedBriefStatusSchema,
   summaryResultSchema,
   type BriefStage,
   type NextStepActor,
@@ -18,29 +19,26 @@ Return ONLY a JSON object with exactly these keys:
   "title"         A name for this thread, 4-6 words, that someone scanning a sidebar would recognise a day later. Name the work, not the conversation: the subsystem, file, or feature plus what is being done to it. No trailing punctuation, no quotes, no "thread"/"discussion"/"chat", no leading verb like "Add" unless adding is genuinely the whole job.
   "goal"          One line: what this thread is actually trying to achieve. Not the opening prompt restated — the underlying objective, as it stands now.
   "currentState"  What exists now, including half-finished work. Name the concrete artifacts (files, branches, PRs) where the transcript names them.
-  "nextStep"      The single most concrete next action, phrased so the reader could start it without thinking. ONE action, not a plan. Empty string if nobody owes this thread an action.
-  "nextStepActor" Who has to take that next step. One of: "me" if only the user can (try it and report back, decide between options, reply to someone, merge, grant access), "agent" if the agent could carry on unprompted, "other" if it depends on someone or something outside this thread (a review, a colleague, an upstream fix, a rollout).
-  "blockedOn"     The party or artifact the thread is waiting on, when someone could go chase it. Empty string otherwise.
+  "status"        Picture the user having done everything this thread asks of them: run the command, merged or approved, checked the thing, answered the offer. Is the task then finished, with nothing left to happen in this thread? One of:
+                  "done" — yes. Steps that are the user's alone, offers of extra work, and optional checks do not keep it open. Example: "Merged and deployed. Run kubectl rollout status to confirm — and want me to add a lint rule too?"
+                  "waiting-on-me" — no: the user's answer, decision, or go-ahead starts more work in this thread, such as committing or shipping work the agent has made, or the task is otherwise unfinished. Example: "The diff is ready but uncommitted. Should I commit and push?"
+                  "waiting-on-other" — no: the work cannot go on until the party in "blockedOn" acts. Example: "Waiting on Sam's review of PR #12 before I merge."
+  "nextStep"      The most useful next action, if there is one, phrased so the reader could start it without thinking. ONE action, not a plan. A finished thread may still carry a suggestion here. Empty string if there is nothing worth doing.
+  "nextStepActor" Who would take "nextStep": "me" (the user), "agent", or "other" (someone outside this thread). Omit it when "nextStep" is empty.
+  "blockedOn"     The party or artifact outside this thread that the work is waiting on, named so someone could go chase it: a review, a person, an upstream fix, an access grant. Never a duration, and never something that will finish on its own. Empty string otherwise.
   "constraints"   Facts learned during the thread that would break a naive re-plan: API limits, rejected approaches, assumptions proven wrong. Empty string if none.
   "stage"         How far round the arc the work itself has got. One of: "discovery" (still establishing what is true or what is wanted), "planning" (the shape is agreed, the making has not started), "implementation" (the work is being made), "review" (the work is made, and is being checked, tried, or waited on for a verdict). Judge the work, not the conversation: a thread whose agent has finished building and described what it built is at "review", whether or not anyone has looked at it yet.
   "refresherShort" One or two sentences of plain prose, addressed to the user as "you", for someone reopening this thread after a few hours: what they were doing, how far it got, what to do next.
   "refresherFull"  The same thing for someone who has been away for days: two or three sentences, with enough named detail to stand on its own.
 
 Rules:
-- Every field is a string except "nextStepActor", which is one of the three words above. Keep each to one or two lines.
+- Every key above is required except "nextStepActor". Every field is a string; "nextStepActor" and "status" are one of the words listed for them. Keep each to one or two lines.
 - The two "refresher" fields are prose, not labelled fields: flowing sentences, no "Goal:" / "Next:" prefixes, no bullet points, no headings. Write them as you would say them to the person over their shoulder as they sit back down.
 - Write them in that order — what you were doing, how far it got, what to do next — and name things concretely: the file, the branch, the PR, the command. "You were partway through the sidebar sections" is useless; "the section sync lands but the order is not pinned yet" is the point.
 - Mention what is blocking, or a constraint learned in the thread, ONLY when it changes what to do next. A blocker that has already been routed around is history, not orientation.
-- When "nextStep" is empty, the refreshers say so plainly — what the thread landed, and that nothing is owed. Never manufacture a next action for them that "nextStep" itself would not carry.
+- When "status" is "done", the refreshers say what the thread landed, and offer "nextStep" (if any) as an option rather than as owed work.
 - "refresherFull" is not "refresherShort" with adjectives. It is allowed the detail the short one had to drop: the second half of the state, the constraint that will bite, the name of the thing that is blocked.
 - "title" describes what the thread turned out to be about, not what its opening message asked for. A thread that set out to fix a test and ended up rewriting the scheduler is named for the scheduler.
-- Omit "nextStepActor" entirely when "nextStep" is the empty string — there is no actor for a step that does not exist.
-- When "blockedOn" is non-empty, "nextStepActor" is "other".
-- A thread is finished when nobody owes it an action. For any candidate next step, ask: must a person or team actually do this, will it not happen on its own, and would it be dropped if this brief did not record it? Yes to all three — that is "nextStep", and the thread is not done. Otherwise "nextStep" is the empty string. Never invent one; a brief that manufactures work devalues every real item next to it.
-- An action can be owed outside the chat, and those are the ones that get silently dropped: a PR open for review or merge, a patch carried on a fork or side branch until it lands upstream, a temporary workaround to undo, a build or rollout to finish and confirm, a question put to someone who has not answered. Recording these is not inventing work — the transcript already named them.
-- Nothing is owed to the passage of time. Open-ended watching has no owner and no definite outcome — "check back in a few days", "keep an eye on it", "confirm it behaves in real use" — and does NOT keep a thread open. Nor does work the transcript puts out of scope, nor an idea raised and not adopted. Judge the state of the work, not the tone of the sign-off: agents habitually hedge when they finish ("worth a glance", "I'd flag this as open"), and an item nobody must act on does not block done however the transcript labels it. Keep anything worth remembering in "currentState" or "constraints".
-- "stage" and "nextStep" describe the same thread and must agree. An empty "nextStep" means nothing is owed, which is only true once the work is made — so the stage is "review". Never return "implementation" alongside an empty "nextStep".
-- "blockedOn" is held to a higher bar than "nextStep": name a party or artifact someone could go chase — a specific review, a person, an upstream fix, a running build, an access grant. Never a duration, never "real usage" or "more data". If you cannot say who would be chased, leave it empty.
 - Use empty strings, not "none" / "N/A" / "nothing".
 - Write plainly and specifically. No preamble, no hedging, no restating these instructions.
 - Base every claim on the transcript. Do not speculate about what the code or the user probably wants.`;
@@ -258,31 +256,27 @@ export function normalizeRefresher(record: {
 }
 
 /**
- * The stage a summary lands on once it is reconciled with its own `nextStep`.
+ * The status a summary reports, or `waiting-on-me` when the model gave none we
+ * recognise.
  *
- * Stage and `nextStep` come back in one JSON object from one call, and nothing
- * holds the model to answering both consistently. The commonest way a good
- * brief comes back wrong is `"implementation"` beside an empty `nextStep` — an
- * agent whose last turn narrated what it built, deployed and handed over.
- * `deriveStatus` reads that empty `nextStep` as `done`, so the pair renders as
- * "Implementation — Done", and dragging the card out of the board's Done column
- * puts it back into Implementation rather than Review.
+ * `waiting-on-me` is the fallback because it is the reading whose error is
+ * cheap: a thread wrongly left waiting is noise in the sidebar, where one
+ * wrongly called done goes grey and is archived two days later.
  *
- * An empty `nextStep` means nobody owes the thread an action, which is only
- * true once the work is made — so the stage is `review`. The prompt asks for
- * exactly this; doing it here as well is what makes it a guarantee of this code
- * rather than of the prompt, in the same spirit as `deriveStatus` testing
- * `blockedOn` for itself.
- *
- * Only from `implementation`. A `discovery` or `planning` thread with nothing
- * owed was concluded or abandoned before any work existed, and calling that
- * `review` would claim there is something to review.
+ * The one rule applied on top of the model is true whatever the model thinks: a
+ * thread that names something it is waiting on is not finished. It reads the
+ * model's own `blockedOn` rather than any judgement about it, so it is a hard
+ * invariant, not a tie-break between two answers.
  */
-export function reconcileStage(
-  stage: BriefStage,
-  nextStep: string,
-): BriefStage {
-  return stage === "implementation" && nextStep === "" ? "review" : stage;
+export function normalizeStatus(
+  value: unknown,
+  blockedOn: string,
+): StoredBriefStatus {
+  const parsed = storedBriefStatusSchema.safeParse(
+    typeof value === "string" ? value.trim().toLowerCase() : value,
+  );
+  const status = parsed.success ? parsed.data : "waiting-on-me";
+  return status === "done" && blockedOn !== "" ? "waiting-on-other" : status;
 }
 
 export function parseSummary(
@@ -296,21 +290,19 @@ export function parseSummary(
   const record = raw as Record<string, unknown>;
 
   const nextStep = normalizeField(record.nextStep);
+  const blockedOn = normalizeField(record.blockedOn);
 
-  // A pinned stage short-circuits both the fallback and the reconciliation: the
-  // prompt promises the user's pick is returned whatever the transcript says,
-  // and a pin overruled here would be a pin that silently did not hold.
+  // A pinned stage short-circuits the fallback: the prompt promises the user's
+  // pick is returned whatever the transcript says, and a pin overruled here
+  // would be a pin that silently did not hold.
   const rawStage = typeof record.stage === "string" ? record.stage.trim() : "";
   const stage: BriefStage =
     fixedStage ??
-    reconcileStage(
-      BRIEF_STAGES.includes(rawStage as BriefStage)
-        ? (rawStage as BriefStage)
-        : // An unrecognized stage is not worth failing the whole brief over;
-          // implementation is the safest neutral guess.
-          "implementation",
-      nextStep,
-    );
+    (BRIEF_STAGES.includes(rawStage as BriefStage)
+      ? (rawStage as BriefStage)
+      : // An unrecognized stage is not worth failing the whole brief over;
+        // implementation is the safest neutral guess.
+        "implementation");
 
   return summaryResultSchema.parse({
     title: normalizeTitle(record.title),
@@ -318,9 +310,10 @@ export function parseSummary(
     currentState: normalizeField(record.currentState),
     nextStep,
     nextStepActor: normalizeActor(record.nextStepActor, nextStep),
-    blockedOn: normalizeField(record.blockedOn),
+    blockedOn,
     constraints: normalizeField(record.constraints),
     stage,
+    status: normalizeStatus(record.status, blockedOn),
     refresher: normalizeRefresher({
       short: record.refresherShort,
       full: record.refresherFull,
