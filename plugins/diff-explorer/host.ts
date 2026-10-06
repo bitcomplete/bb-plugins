@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
@@ -203,6 +203,13 @@ export default experimental_defineHostEntry({
     },
     async read({ path: file }) {
       return { content: await readFile(file, "utf8") };
+    },
+    async write({ path: file, content, expected }) {
+      if ((await readFile(file, "utf8")) !== expected) {
+        throw new Error(`${path.basename(file)} changed on disk since it was loaded. Refresh to see the new version; this discards your edit.`);
+      }
+      await writeFile(file, content, "utf8");
+      return null;
     },
   },
   async dispose() {

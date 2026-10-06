@@ -23,6 +23,10 @@ export const hostContract = defineRpcContract({
     input: z.object({ path: z.string().startsWith("/") }),
     output: z.object({ content: z.string() }),
   },
+  write: {
+    input: z.object({ path: z.string().startsWith("/"), content: z.string(), expected: z.string() }),
+    output: z.null(),
+  },
   warm: {
     input: z.object({ root: z.string().startsWith("/"), paths: z.array(z.string().startsWith("/")) }),
     output: z.null(),
@@ -71,5 +75,9 @@ export const rpcContract = defineRpcContract({
   read: {
     input: z.object({ environmentId: z.string(), path: z.string().startsWith("/") }),
     output: z.object({ content: z.string() }),
+  },
+  write: {
+    input: z.object({ environmentId: z.string(), path: z.string().startsWith("/"), content: z.string(), expected: z.string() }),
+    output: z.null(),
   },
 });

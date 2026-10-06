@@ -92,6 +92,12 @@ export default async function plugin(bb: BbPluginApi) {
       return host.call("definition", { root, ...position }, { hostId });
     },
 
+    async write({ environmentId, path: filePath, content, expected }) {
+      const { root, hostId } = await environment(environmentId);
+      if (path.relative(root, filePath).startsWith("..")) throw new Error(`${filePath} is outside the workspace`);
+      return host.call("write", { path: filePath, content, expected }, { hostId });
+    },
+
     async read({ environmentId, path: filePath }) {
       const { hostId } = await environment(environmentId);
       return host.call("read", { path: filePath }, { hostId });

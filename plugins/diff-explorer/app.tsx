@@ -124,20 +124,79 @@ const EDITOR_OPTIONS = {
   gotoLocation: { multipleDefinitions: "goto" },
 } satisfies Monaco.editor.IEditorOptions;
 
+// The new side is the file on disk and is editable; the gutter arrows revert a block to the old side.
 const DIFF_OPTIONS = {
   ...EDITOR_OPTIONS,
+  readOnly: false,
+  originalEditable: false,
+  renderMarginRevertIcon: true,
   renderSideBySide: false,
   hideUnchangedRegions: { enabled: true },
 } satisfies Monaco.editor.IDiffEditorOptions;
+const DELETED_DIFF_OPTIONS = { ...DIFF_OPTIONS, readOnly: true } satisfies Monaco.editor.IDiffEditorOptions;
+const SAVE_DELAY_MS = 600;
+
+type FileModels = {
+  original: Monaco.editor.ITextModel;
+  modified: Monaco.editor.ITextModel;
+  // What the file on disk holds as far as we know; a save must find exactly this there.
+  saved: string;
+  saving: Promise<void>;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  listener: Monaco.IDisposable;
+};
+type SaveFile = (path: string, content: string, expected: string) => Promise<unknown>;
 
 const LINE_HEIGHT = 19;
 const HEADER_HEIGHT = 40;
 
-function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: string; root: string; files: DiffFile[] }) {
+function MultiDiff({
+  bundle,
+  panelId,
+  root,
+  files,
+  save,
+  onError,
+}: {
+  bundle: Bundle;
+  panelId: string;
+  root: string;
+  files: DiffFile[];
+  save: SaveFile;
+  onError(message: string | null): void;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<ReturnType<Bundle["createMultiDiffEditor"]> | null>(null);
   // Models per path, updated in place on refresh so each file keeps its editor and your scroll place.
-  const models = useRef(new Map<string, { original: Monaco.editor.ITextModel; modified: Monaco.editor.ITextModel }>());
+  const models = useRef(new Map<string, FileModels>());
+  const saveRef = useRef({ save, onError });
+  saveRef.current = { save, onError };
+
+  // Saves run one at a time per file, so each one expects what the previous one wrote.
+  const flush = useCallback((path: string, m: FileModels) => {
+    clearTimeout(m.timer);
+    const content = m.modified.getValue();
+    m.saving = m.saving.then(async () => {
+      if (content === m.saved) return;
+      try {
+        await saveRef.current.save(path, content, m.saved);
+        m.saved = content;
+        saveRef.current.onError(null);
+      } catch (cause) {
+        saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
+      }
+    });
+  }, []);
+
+  const release = useCallback(
+    (path: string, m: FileModels) => {
+      m.listener.dispose();
+      if (m.timer !== undefined) flush(path, m);
+      m.original.dispose();
+      m.modified.dispose();
+    },
+    [flush],
+  );
 
   useEffect(() => {
     const created = bundle.createMultiDiffEditor(container.current!, []);
@@ -145,13 +204,10 @@ function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: 
     const owned = models.current;
     return () => {
       created.dispose();
-      for (const m of owned.values()) {
-        m.original.dispose();
-        m.modified.dispose();
-      }
+      for (const [path, m] of owned) release(path, m);
       owned.clear();
     };
-  }, [bundle]);
+  }, [bundle, release]);
 
   useEffect(() => {
     const { monaco } = bundle;
@@ -161,19 +217,35 @@ function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: 
       let m = current.get(abs);
       if (m === undefined) {
         const language = languageFor(monaco, file.path);
-        m = {
+        const modified = monaco.editor.createModel(file.newText, language, monaco.Uri.from({ scheme: NEW, authority: panelId, path: abs }));
+        const created: FileModels = {
           original: monaco.editor.createModel(file.oldText, language, monaco.Uri.from({ scheme: OLD, authority: panelId, path: abs })),
-          modified: monaco.editor.createModel(file.newText, language, monaco.Uri.from({ scheme: NEW, authority: panelId, path: abs })),
+          modified,
+          saved: file.newText,
+          saving: Promise.resolve(),
+          timer: undefined,
+          listener: modified.onDidChangeContent(() => {
+            clearTimeout(created.timer);
+            created.timer = setTimeout(() => flush(abs, created), SAVE_DELAY_MS);
+          }),
         };
+        m = created;
         current.set(abs, m);
       } else {
         if (m.original.getValue() !== file.oldText) m.original.setValue(file.oldText);
-        if (m.modified.getValue() !== file.newText) m.modified.setValue(file.newText);
+        const value = m.modified.getValue();
+        if (file.newText === value) m.saved = value;
+        // A file with unsaved edits keeps them; its next save then reports the change on disk.
+        else if (value === m.saved) {
+          m.saved = file.newText;
+          m.modified.setValue(file.newText);
+        }
       }
       return {
-        ...m,
+        original: m.original,
+        modified: m.modified,
         label: `${file.path} · ${file.changeKind}`,
-        options: DIFF_OPTIONS,
+        options: file.changeKind === "deleted" ? DELETED_DIFF_OPTIONS : DIFF_OPTIONS,
         // Placeholder height until the widget renders the file; ~ changed lines plus collapsed-region rows.
         estimatedHeight: HEADER_HEIGHT + (file.additions + file.deletions + 8) * LINE_HEIGHT,
       };
@@ -182,11 +254,10 @@ function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: 
     const kept = new Set(documents.map((d) => d.modified));
     for (const [abs, m] of current) {
       if (kept.has(m.modified)) continue;
-      m.original.dispose();
-      m.modified.dispose();
+      release(abs, m);
       current.delete(abs);
     }
-  }, [bundle, panelId, root, files]);
+  }, [bundle, panelId, root, files, flush, release]);
 
   return <div ref={container} className="h-full" />;
 }
@@ -320,7 +391,7 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
               <option value="uncommitted">Uncommitted</option>
             </select>
             <span className="text-muted-foreground">
-              {data === null ? "Loading…" : `${data.files.length} files · ⌘-click a symbol to go to its definition`}
+              {data === null ? "Loading…" : `${data.files.length} files · ⌘-click a symbol to go to its definition · edits auto-save`}
             </span>
           </>
         ) : (
@@ -350,7 +421,14 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
               </p>
             )}
             <div className="min-h-0 flex-1">
-              <MultiDiff bundle={bundle} panelId={panelId} root={data.root} files={data.files} />
+              <MultiDiff
+                bundle={bundle}
+                panelId={panelId}
+                root={data.root}
+                files={data.files}
+                save={(path, content, expected) => rpc.call("write", { environmentId: data.environmentId, path, content, expected })}
+                onError={setError}
+              />
             </div>
           </div>
           {top === undefined ? null : (
