@@ -5,6 +5,7 @@
   "plugins": [
     { "name": "workstreams", "source": "./plugins/workstreams" },
     { "name": "kubernetes-provider", "source": "./plugins/kubernetes-provider" },
-    { "name": "devbox-provider", "source": "./plugins/devbox-provider" }
+    { "name": "devbox-provider", "source": "./plugins/devbox-provider" },
+    { "name": "diff-explorer", "source": "./plugins/diff-explorer" }
   ]
 }
