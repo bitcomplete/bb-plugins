@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [devbox-provider, kubernetes-provider, thread-briefs, workstreams]
+        plugin: [devbox-provider, kubernetes-provider, team-setup, thread-briefs, workstreams]
     defaults:
       run:
         working-directory: plugins/${{ matrix.plugin }}

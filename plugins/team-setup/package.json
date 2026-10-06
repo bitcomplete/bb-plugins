@@ -1,0 +1,49 @@
+{
+  "name": "bb-plugin-team-setup",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "First-run checklist for a bb-gate server: Claude or Codex, GitHub, devbox, first machine",
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.15"
+  },
+  "bb": {
+    "name": "Team setup",
+    "description": "The steps a new server needs before agents can work: sign in to Claude or Codex, GitHub and devbox, and make a machine.",
+    "branding": {
+      "icon": "ListTodo"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build"
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.3.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.15",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cron-parser": "^5.10.1",
+    "hono": "^4.11.9",
+    "react": "^19.0.0",
+    "react-dom": "^19.3.0",
+    "tailwind-merge": "^3.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  },
+  "license": "MIT"
+}
