@@ -73,6 +73,12 @@ A 404 naming a doubled path (`/chat/completions/chat/completions`) meant an olde
 build appended the path to a `baseUrl` that already ended in it. Both spellings
 are accepted now.
 
+Clearing `baseUrl` or `model` in the settings form stores an empty string, and
+a stored value wins over the deployment's — so an older build then requested
+`/chat/completions` with no host and every brief failed with `Failed to parse
+URL`. A blank stored value is now read as unset and falls back like `unset`
+does; on a build that predates this, run `unset` instead of clearing the field.
+
 ## When a brief is regenerated
 
 1. `thread.idle` fires at every turn boundary and starts a `quietSeconds`
@@ -752,6 +758,12 @@ no preference writes.
 - Briefs stuck on "Summarizing…": check `apiKey` is set, or
   `THREAD_BRIEFS_API_KEY` in the server's environment, and
   `bb plugin logs thread-briefs` for HTTP errors from `baseUrl`.
+- Every brief failing with `Failed to parse URL from /chat/completions`: the
+  effective `baseUrl` is empty. `bb plugin config thread-briefs` shows
+  `baseUrl = ""` — a cleared field stored as a blank, which beat the
+  deployment's `THREAD_BRIEFS_BASE_URL`. `bb plugin config thread-briefs unset
+  baseUrl` (and `unset model` if it is blank too) restores the deployment's
+  value; current builds treat the blank as unset on their own.
 - A brief that describes work already finished: read the **Summarized …** line
   under the status. Briefs are only rewritten after `quietSeconds` of quiet, so
   one that predates the last few turns is expected rather than broken;

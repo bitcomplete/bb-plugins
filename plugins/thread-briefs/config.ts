@@ -71,21 +71,33 @@ export function resolveApiKey(stored: unknown, env: Env): string | null {
   return fromEnv(env, ENV_API_KEY) ?? null;
 }
 
+/** A stored string setting, or undefined when it is missing or blank. */
+function stored(value: unknown): string | undefined {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text ? text : undefined;
+}
+
 /**
  * The request configuration for one summary, or null when no key is
  * configured anywhere. Settings already carry the environment's defaults for
- * everything but the key.
+ * everything but the key — but only until something is stored, and the host
+ * persists a cleared field as `""`, which then wins over the default by
+ * construction. A blank `baseUrl` or `model` therefore reads as unset here
+ * too: a request to `/chat/completions` with no host cannot be what anyone
+ * meant, and the description on each setting says "unset" is the way back
+ * to the deployment's value.
  */
 export function resolveCompletion(
-  values: { baseUrl: string; apiKey?: unknown; model: string; jsonMode: boolean },
+  values: { baseUrl?: unknown; apiKey?: unknown; model?: unknown; jsonMode: boolean },
   env: Env,
 ): CompletionConfig | null {
   const apiKey = resolveApiKey(values.apiKey, env);
   if (apiKey === null) return null;
+  const defaults = settingDefaults(env);
   return {
-    baseUrl: values.baseUrl,
+    baseUrl: stored(values.baseUrl) ?? defaults.baseUrl,
     apiKey,
-    model: values.model,
+    model: stored(values.model) ?? defaults.model,
     jsonMode: values.jsonMode,
   };
 }

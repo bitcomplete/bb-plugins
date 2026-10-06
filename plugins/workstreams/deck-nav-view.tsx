@@ -30,6 +30,7 @@ import { useInventory } from "./inventory-screen";
 import { useNotesConfirm } from "./notes-flow";
 import { EASE, FLIP_MS, flipMotion, flipper, focusNamesCard, ghostOf, playFlip, settleFlip, type FlipMotion } from "./deck-flip";
 import { MergePreviewDialog } from "./merge-preview-dialog";
+import { ArchivedThreadsDialog } from "./archivedthreads";
 import type { SeedProposal } from "./linear-seed";
 import { deckLinkStep } from "./view-preference";
 
@@ -105,6 +106,9 @@ export function DeckNavView({ onView, openCard = null }: { onView(target: Header
   const [busy, setBusy] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
   const [merging, setMerging] = useState<{ target: string; n: null }[] | null>(null);
+  const [archivingThread, setArchivingThread] = useState<string | null>(null);
+  const archivingRef = useRef(false);
+  const [archivedOpen, setArchivedOpen] = useState(false);
   const [pile, setPile] = useState<"hold" | "done" | null>(null);
   const [flash, setFlash] = useState<{ text: string; undo: boolean } | null>(null);
   const [seenNote, setSeenNote] = useState<string | null>(null);
@@ -699,6 +703,25 @@ export function DeckNavView({ onView, openCard = null }: { onView(target: Header
   const runRef = useRef(runAction);
   runRef.current = runAction;
 
+  const archiveThread = async (command: Extract<DeckCommand, { kind: "archive-thread" }>) => {
+    if (archivingRef.current) return;
+    archivingRef.current = true; setArchivingThread(command.id);
+    try {
+      const result = await rpc.call("thread_archive", { threadId: command.id, cardId: command.cardId });
+      if (!result.ok) { say(result.error); return; }
+      let used = false;
+      setUndo({ label: `Archive ${command.title}`, live: () => !used, run: async () => {
+        used = true;
+        try {
+          const restored = await rpc.call("thread_restore", { threadId: command.id });
+          say(restored.ok ? `Restored ${command.title}.` : restored.error); load();
+        } catch { say("Couldn't restore the thread. Try Archived threads."); }
+      } });
+      say(`Archived ${command.title}.`, true, 15_000); load();
+    } catch (cause) { say(`Couldn't confirm the archive. Check Archived threads before retrying. ${message(cause)}`); }
+    finally { archivingRef.current = false; setArchivingThread(null); }
+  };
+
   const run = (command: DeckCommand) => {
     switch (command.kind) {
       case "action": runAction(command.id, command.line); return;
@@ -722,6 +745,8 @@ export function DeckNavView({ onView, openCard = null }: { onView(target: Header
       case "undo-batch": void rpc.call("deck_batch_undo", { batchId: command.batchId }).then((result) => { say(result.ok ? "Undone. Nothing was sent." : result.error); load(); },
         (cause: unknown) => say(message(cause))); return;
       case "thread": navigate.toThread(command.id); return;
+      case "archive-thread": void archiveThread(command); return;
+      case "archived-threads": setArchivedOpen(true); return;
       case "jump": navigate.toPluginPanel("board", { subPath: inventoryPrPath(command.prUrl) }); return;
       case "resume": { const item = view?.held.find((entry) => entry.id === command.id); if (item) void movePile("resume", item); return; }
       case "reopen": { const item = view?.done.find((entry) => entry.id === command.id); if (item) void movePile("reopen", item); return; }
@@ -792,11 +817,12 @@ export function DeckNavView({ onView, openCard = null }: { onView(target: Header
     open: item.card.stats.open }] : []; })];
 
   return <>
+    <ArchivedThreadsDialog open={archivedOpen} onOpenChange={(open) => { setArchivedOpen(open); if (!open) load(); }} />
     <DeckPane chips={chips} cur={cur} card={card} overview={cur === "overview" && view ? overview : null} rules={rules} held={pileItems.held} done={pileItems.done} pile={pile} announce={announce}
       read={{ text: view ? readText(view, now) : "Reading…", error, busy: !!view?.refreshing, onRefresh: view ? refresh.all : undefined }}
       seen={{ changed: changedHere, available: context.seenAvailable, note: seenNote }}
       kit={{ lines: rowLines, picked: new Set(selected.map((line) => line.prUrl)), live: batch.live, left: batch.details, working: batch.working?.prUrls,
-        reading: new Set([...refreshing.keys(), ...refresh.reading]), refusal: batch.refusal }}
+        reading: new Set([...refreshing.keys(), ...refresh.reading]), refusal: batch.refusal, archivingThread }}
       open={new Set(here.open)} panel={here.panel as Panel | null} on={on} hints={hintKeys(context, on)}
       flash={flash ?? (refresh.progress ? { text: refresh.progress, undo: false, busy: true } : batch.sending ? { text: batch.sending, undo: false, busy: true } : null)}
       run={run} onPalette={() => runAction("palette")} onHelp={() => runAction("help")}

@@ -7,6 +7,7 @@ import {
   removeRepo,
   resolveRepoEntry,
   serializeReposFile,
+  setRepoBranch,
   validateRepoSet,
   MAX_REPOS,
 } from "./repos.js";
@@ -226,6 +227,27 @@ describe("edits", () => {
     expect(missing.ok).toBe(false);
     if (missing.ok) return;
     expect(missing.error).toContain("nope");
+  });
+
+  it("sets, changes and clears a repo's base branch without touching its shape", () => {
+    const inferred = { version: 1 as const, repos: [{ dir: "a", url: "https://example.com/a", inferredDir: true }] };
+    const set = setRepoBranch(inferred, "a", "release");
+    expect(set.ok).toBe(true);
+    if (!set.ok) return;
+    expect(set.value.repos[0]).toEqual({ dir: "a", url: "https://example.com/a", inferredDir: true, branch: "release" });
+    // Serialized, the inferred dir stays absent and the branch is the only addition.
+    expect(JSON.parse(serializeReposFile(set.value)).repos[0]).toEqual({ url: "https://example.com/a", branch: "release" });
+    const cleared = setRepoBranch(set.value, "a", null);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    expect(cleared.value.repos[0]).toEqual(inferred.repos[0]);
+    const blank = setRepoBranch(set.value, "a", "   ");
+    expect(blank.ok && blank.value.repos[0].branch).toBeUndefined();
+  });
+
+  it("refuses a branch for an unknown repo or one that reads as an option", () => {
+    expect(setRepoBranch(base, "nope", "main").ok).toBe(false);
+    expect(setRepoBranch(base, "a", "--upload-pack=x").ok).toBe(false);
   });
 
   it("finds an existing repo by dir or by equivalent url", () => {

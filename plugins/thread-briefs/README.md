@@ -91,7 +91,8 @@ A deployment running a server per developer can hand them all one summarizer
 instead: set `THREAD_BRIEFS_API_KEY`, and optionally `THREAD_BRIEFS_BASE_URL`,
 `THREAD_BRIEFS_MODEL` and `THREAD_BRIEFS_JSON_MODE`, in the server's environment.
 A developer's own setting still wins; `bb plugin config thread-briefs unset
-<key>` goes back to the deployment's.
+<key>` goes back to the deployment's, and a `baseUrl` or `model` stored blank
+is read as unset too.
 
 ## Where briefs show up
 

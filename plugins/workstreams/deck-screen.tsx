@@ -15,7 +15,7 @@ import { ACTION, KEY_GROUPS, type DeckActionId } from "./deck-keys";
 import type { Availability, CardScreen, Chip, DeckLine, Finish, Mismatch, Move, NotesScreen, OverviewScreen, PaletteItem, Strength, SuggestGroup, TicketChip, Tone }
   from "./deck-view-model";
 import { SEND_DELAY_MS } from "./deck-shared";
-import { effortReadSummary, prReadState, prStatuses, threadRefs, threadStatus, type PrStatus, type StatusLabel } from "./deck-status";
+import { effortReadSummary, prReadState, prStatuses, threadRefs, threadStatus, threadReadSummary, type PrStatus, type StatusLabel } from "./deck-status";
 import { inventoryPrPath, inventoryRoute } from "./view-preference";
 import { NOTES_MAX } from "./effort-notes";
 import { behind as cardsBehind, LAYERS, layerTransform } from "./deck-flip";
@@ -37,6 +37,7 @@ export type DeckCommand =
   | { kind: "fold"; key: string } | { kind: "panel"; key: Panel }
   | { kind: "group"; key: string } | { kind: "undo-group"; key: string } | { kind: "undo-batch"; batchId: string }
   | { kind: "thread"; id: string } | { kind: "jump"; prUrl: string }
+  | { kind: "archive-thread"; id: string; cardId: string; title: string } | { kind: "archived-threads" }
   | { kind: "resume"; id: string } | { kind: "reopen"; id: string }
   | { kind: "rule-remove"; id: string } | { kind: "pile"; pile: "hold" | "done" | null }
   /** The Notes panel's editor: what you typed, save (⌘↵), or cancel (esc). */
@@ -234,7 +235,7 @@ function Stack({ behind, run, children }: { behind: readonly Chip[]; run: Run; c
  * why the last Address left a PR out; the rows a batch is planning; and the rows a Refresh is reading.
  */
 export type RowKit = { lines: ReadonlyMap<string, InventoryLine>; picked: ReadonlySet<string>; live?: LiveItems; left?: ReadonlyMap<string, string>;
-  working?: ReadonlySet<string>; reading?: ReadonlySet<string>;
+  working?: ReadonlySet<string>; reading?: ReadonlySet<string>; archivingThread?: string | null;
   /** Each row's ticket chip, which the card fills in from its screen. */
   tickets?: ReadonlyMap<string, TicketChip>;
   /** Why the last Address started nothing. */
@@ -308,15 +309,24 @@ function FinishLine({ finish, open, run }: { finish: Finish; open: boolean; run:
   </div>;
 }
 
-function ThreadList({ threads, run, screen }: { threads: CardScreen["threads"]; run: Run; screen?: CardScreen }) {
-  return threads.length ? <div className="grid">{threads.map((thread) => <button key={thread.id} type="button" onClick={() => run({ kind: "thread", id: thread.id })}
-    data-deck-thread={thread.id} title={`Open "${thread.title}"`}
-    className={cn("grid min-h-9 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-0.5 rounded px-1.5 py-1 text-left text-[12px] hover:bg-foreground/[0.04]", RING)}>
-    <span className="min-w-0"><span className="block truncate">{thread.dot ? <><Changed title="Changed since you looked" /> </> : null}{thread.title}</span>
-      <small className="block truncate text-[11px] text-muted-foreground" title={screen ? threadRefs(screen, thread) : thread.ref}>
-        {(screen ? threadRefs(screen, thread) : thread.ref) || "Linked thread"}{thread.age ? ` · ${thread.age} ago` : ""}</small></span>
-    <span className={cn("text-[11.5px]", TONE[threadStatus(thread).tone].text)}>{threadStatus(thread).text}</span>
-  </button>)}</div> : <p className="text-[12px] text-muted-foreground">No threads yet.</p>;
+function ThreadList({ threads, run, screen, archiving }: { threads: CardScreen["threads"]; run: Run; screen?: CardScreen; archiving?: string | null }) {
+  return threads.length ? <ul className="grid list-none">{threads.map((thread) => {
+    const refs = screen ? threadRefs(screen, thread) : thread.ref;
+    const at = screen?.card.threads.find((t) => t.id === thread.id)?.lastActivityAt;
+    return <li key={thread.id} className="flex min-w-0 items-center gap-1.5">
+      <button type="button" onClick={() => run({ kind: "thread", id: thread.id })} data-deck-thread={thread.id} title={`Open "${thread.title}"`}
+        className={cn("grid min-h-9 min-w-0 flex-1 grid-cols-[minmax(0,1fr)] items-center gap-x-3 gap-y-0.5 rounded px-1.5 py-1 text-left text-[12px] hover:bg-foreground/[0.04] @min-[480px]:grid-cols-[minmax(0,1fr)_auto]", RING)}>
+        <span className="min-w-0"><span className="block break-words @min-[480px]:truncate">{thread.dot ? <><Changed title="Changed since you looked" /> </> : null}{thread.title}</span>
+          <small className="block break-words text-[11px] text-muted-foreground @min-[480px]:truncate" title={`${refs || "Linked thread"}${at != null ? ` · Last activity ${new Date(at).toLocaleString()}` : ""}`}>
+            {refs === "parent" ? "Effort thread" : refs || "Linked thread"} · {thread.age ? `Last activity ${thread.age} ago` : "Activity unknown"}</small></span>
+        <span className={cn("text-[11.5px]", TONE[threadStatus(thread).tone].text)}>{threadStatus(thread).text}</span>
+      </button>
+      {screen ? <button type="button" data-deck-thread-archive={thread.id} disabled={!!archiving || thread.status !== "idle"}
+        aria-label={`Archive ${thread.title}`} aria-busy={archiving === thread.id || undefined}
+        title={thread.status === "idle" ? "Archive this idle thread. Threads with subthreads must be archived from BB." : "Only idle threads can be archived here."}
+        onClick={() => run({ kind: "archive-thread", id: thread.id, cardId: screen.card.id, title: thread.title })} className={cn(GHOST, "shrink-0 px-1 text-[11px]")}>{archiving === thread.id ? "Archiving…" : "Archive"}</button> : null}
+    </li>;
+  })}</ul> : <p className="text-[12px] text-muted-foreground">No threads yet.</p>;
 }
 
 function StatusBadge({ status }: { status: StatusLabel }) {
@@ -416,8 +426,6 @@ export function Card({ screen, kit, open, panel, run, on, notes, markdown }: { s
   run: Run; on: Availability; notes?: NotesEdit | null; markdown?: (body: string) => ReactNode }) {
   const { card } = screen;
   const statuses = prStatuses(screen, kit.live);
-  const linked = new Set(statuses.flatMap((pr) => pr.thread ? [pr.thread.id] : []));
-  const unlinked = screen.threads.filter((thread) => !linked.has(thread.id));
   const toggles = ([["notes", screen.notes ? "Notes" : null], ["linear", card.linear.known ? "Linear details" : null]] as [Panel, string | null][]).filter(([, label]) => label);
   return <section data-deck-card={card.id} aria-label={card.name} className="@container min-w-0 rounded-[10px] border border-border/60 bg-background p-4">
     <div className="flex min-w-0 items-start justify-between gap-3">
@@ -425,6 +433,7 @@ export function Card({ screen, kit, open, panel, run, on, notes, markdown }: { s
         {card.goal ? <p className="mt-1 break-words text-[12.5px] text-muted-foreground">{card.goal}</p> : null}</div>
       <details className="shrink-0 text-[11.5px] text-muted-foreground"><summary className={cn("cursor-pointer rounded-sm", RING)}>Manage effort</summary>
         <div className="mt-2 grid gap-1">
+          <button type="button" onClick={() => run({ kind: "archived-threads" })} className={GHOST}>Archived threads…</button>
           {card.pile === "held" ? <button type="button" onClick={() => run({ kind: "resume", id: card.id })} className={GHOST}>Resume</button>
             : card.kind === "service" ? <ActionButton id="promote" on={on} run={run} label="Promote to effort…" />
             : card.kind === "effort" && !card.oneOff ? <><ActionButton id="hold" on={on} run={run} label="Hold effort…" /><ActionButton id="complete" on={on} run={run} label="Complete effort…" /></> : <span>No effort changes</span>}
@@ -436,8 +445,13 @@ export function Card({ screen, kit, open, panel, run, on, notes, markdown }: { s
       <PrStatusList prs={statuses} run={run} kit={kit} />
       <p className="mt-2 text-[11px] text-muted-foreground">{plural(statuses.length, "open PR")} · Open a PR to advance it in All PRs.</p>
     </section> : <p data-deck-empty className="py-3 text-[12px] text-muted-foreground">No open PRs.</p>}
-    {unlinked.length ? <section aria-label="Thread status" className="mt-3 border-t border-border/50 pt-2">
-      <h2 className="mb-1 text-[12px] font-medium">Threads</h2><ThreadList threads={unlinked} screen={screen} run={run} />
+    {screen.threads.length ? <section aria-label="Thread status" className="mt-3 border-t border-border/50 pt-2">
+      <details data-deck-threads open={!statuses.length || undefined}>
+        <summary className={cn("cursor-pointer rounded-sm text-[12px] font-medium", RING)}>Threads <span className="text-muted-foreground">{screen.threads.length}</span>
+          <span data-deck-thread-summary className="mt-0.5 block text-[11.5px] font-normal text-muted-foreground">{threadReadSummary(screen)}</span></summary>
+        <div className="mt-2"><ThreadList threads={screen.threads} screen={screen} run={run} archiving={kit.archivingThread} /></div>
+        <button type="button" onClick={() => run({ kind: "archived-threads" })} className={cn(GHOST, "mt-1")}>Archived threads…</button>
+      </details>
     </section> : null}
     {screen.finish || toggles.length ? <div data-deck-toggles className="mt-4 border-t border-border/50 pt-2">
       {screen.finish ? <FinishLine finish={screen.finish} open={open.has("progress")} run={run} /> : null}

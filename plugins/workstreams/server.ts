@@ -468,7 +468,7 @@ export const rpcContract = defineRpcContract({
   },
   prefs_get: { input: z.null(), output: prefsSchema },
   prefs_set: { input: prefsSchema, output: prefsSchema },
-  thread_archive: { input: z.object({ threadId: z.string().max(200) }).strict(), output: writeResult },
+  thread_archive: { input: z.object({ threadId: z.string().max(200), cardId: z.string().min(1).max(500).optional() }).strict(), output: writeResult },
   thread_restore: { input: z.object({ threadId: z.string().max(200) }).strict(), output: writeResult },
   thread_archived: { input: z.object({}).strict(), output: z.array(archiveRecordSchema) },
   /** Send one user-authored instruction to one thread currently linked to this PR row. */
@@ -5306,13 +5306,20 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set("prefs", next);
       return next;
     },
-    thread_archive: async ({ threadId }) => {
-      const clusters = (await board()).groups.flatMap((group) => group.clusters);
-      const cluster = clusters.find((item) => item.threads.some((thread) => thread.id === threadId));
-      const thread = cluster?.threads.find((item) => item.id === threadId);
-      return archiveLinkedThread(bb.sdk.threads, archiveStore, {
-        threadId, link: thread === undefined || cluster === undefined ? undefined : { title: thread.title, ticket: cluster.ticket },
-      });
+    thread_archive: async ({ threadId, cardId }) => {
+      let link: { title: string; ticket: string } | undefined;
+      if (cardId) {
+        const view = await deckGet();
+        const card = [...view.active, ...view.held].find((c) => c.id === cardId);
+        const thread = card?.threads.find((t) => t.id === threadId);
+        if (card && thread) link = { title: thread.title, ticket: card.name };
+      } else {
+        const clusters = (await board()).groups.flatMap((group) => group.clusters);
+        const cluster = clusters.find((item) => item.threads.some((thread) => thread.id === threadId));
+        const thread = cluster?.threads.find((item) => item.id === threadId);
+        if (thread && cluster) link = { title: thread.title, ticket: cluster.ticket };
+      }
+      return archiveLinkedThread(bb.sdk.threads, archiveStore, { threadId, link });
     },
     thread_restore: ({ threadId }) => restoreArchivedThread(bb.sdk.threads, archiveStore, threadId),
     thread_archived: async () => (await archiveStore.list()).sort((a, b) => b.archivedAt - a.archivedAt).slice(0, ARCHIVE_HISTORY_LIMIT),

@@ -12,6 +12,7 @@
     "skipLibCheck": false
   },
   "include": [
+    "names.ts",
     "paths.ts",
     "repos.ts",
     "layout.ts",
@@ -30,6 +31,8 @@
     "host.ts",
     "server.ts",
     "repos-panel.tsx",
+    "new-project-form.tsx",
+    "add-repo-row.tsx",
     "changes-panel.tsx",
     "app.tsx",
     "*.test.ts",

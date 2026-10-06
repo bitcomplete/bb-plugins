@@ -27,7 +27,14 @@ Then pick **Multi-repo workspace** as the environment when creating a thread.
 
 ## Getting started
 
-Two ways in, identical afterwards.
+Open the **Repos** panel and press **New project**. One form: a name, the
+machine the project's `.bb` checkout lives on, where it goes (suggested as
+`~/bb/<name>`, editable), and either the repos to start with or the URL of an
+existing `.bb` repo to clone. The plugin initializes or clones the checkout,
+commits it, and creates the project pointing at it. Then pick **Multi-repo
+workspace** as the environment when you start a thread there.
+
+The same two ways in exist without the panel, and are identical afterwards.
 
 **From scratch.** Create a project pointing at an empty directory. The first
 thread initializes `.bb` in it — `git init`, a seeded `AGENTS.md`, an empty
@@ -38,10 +45,10 @@ travel.
 **Shared.** Clone an existing `.bb` repo and create the project pointing at it.
 A teammate gets the whole workspace definition from one URL.
 
-Then give it a repo set. `--project` targets a project you are not currently
-working in, which is the usual case when setting one up; without it the
-commands act on the project in context. Either this or the Repos panel will
-create `.bb` if it does not exist yet.
+Then give it a repo set, in the panel or from the CLI. `--project` targets a
+project you are not currently working in, which is the usual case when setting
+one up; without it the commands act on the project in context. Either this or
+the panel will create `.bb` if it does not exist yet.
 
 ```sh
 bb repos add git@github.com:you/bb-dylan.git  --project proj_abc123
@@ -84,7 +91,7 @@ parse fails the launch with a message naming the offending entry.
 
 | Where | What |
 |---|---|
-| **Repos** nav panel | The repo set, each repo's object-cache state, and an editor for `repos.json` with loud validation. |
+| **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form that creates a multi-repo project in one step. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
 | **Changes** thread panel | Per-repo diff and pull request. Opened from the thread panel's Actions list. |
 | Composer banner | One row above the composer naming the repos that changed, their file counts and the `+`/`−` totals. Click it to open the Changes panel. Hidden when nothing has changed. |
 | `bb repos` | `list`, `add`, `remove` (each takes `--project`), and `status` for the current thread. |
@@ -277,7 +284,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 129 tests, including end-to-end provisioning against real git repos
+npm test          # 167 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

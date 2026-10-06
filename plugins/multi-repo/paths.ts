@@ -14,26 +14,8 @@ import { createHash } from "node:crypto";
 
 export class MultiRepoPathError extends Error {}
 
-/**
- * A single path segment, safe on every platform bb runs on.
- *
- * Rejects separators in both directions (a `\` is a separator on Windows and
- * an ordinary character on Linux, so a name carrying one is never intended),
- * the two dot segments, leading dots (which would shadow `.bb` or `.git`),
- * NUL, and anything long enough to be a filesystem argument rather than a
- * name.
- */
-export function isSafeSegment(value: string): boolean {
-  if (value.length === 0 || value.length > 100) return false;
-  if (value === "." || value === "..") return false;
-  if (value.startsWith(".")) return false;
-  if (value.includes("/") || value.includes("\\")) return false;
-  if (value.includes("\0")) return false;
-  // A trailing dot or space is silently trimmed by Windows, so two entries
-  // that differ only there would collide on one machine and not another.
-  if (value !== value.trim() || value.endsWith(".")) return false;
-  return true;
-}
+export { isSafeSegment, normalizeRemoteUrl } from "./names.js";
+import { isSafeSegment, normalizeRemoteUrl } from "./names.js";
 
 export function assertSafeSegment(value: string, what: string): string {
   if (!isSafeSegment(value)) {
@@ -70,31 +52,4 @@ export function cacheKeyForUrl(url: string): string {
     .replace(/^[-.]+|[-.]+$/gu, "")
     .slice(0, 40);
   return `${slug.length > 0 ? slug : "repo"}-${digest}`;
-}
-
-/**
- * The comparison form of a remote URL, for "is this checkout a mirror of that
- * repo" and for keying the cache.
- *
- * Git accepts the same GitHub repo as `git@github.com:you/r.git`,
- * `ssh://git@github.com/you/r`, and `https://github.com/you/r/` — treating
- * those as three repos would mean three cache entries and a missed local
- * mirror, so they are folded to one. Nothing here rewrites the URL that is
- * actually handed to git; this form is only ever compared.
- */
-export function normalizeRemoteUrl(url: string): string {
-  let value = url.trim().replace(/\/+$/u, "");
-  value = value.replace(/\.git$/u, "");
-  // scp-style `user@host:path` → `ssh://user@host/path`, so one parse covers both.
-  const scp = /^([^/@]+@)?([^/:]+):(?!\/)(.+)$/u.exec(value);
-  if (scp !== null && !value.includes("://")) {
-    value = `ssh://${scp[1] ?? ""}${scp[2]}/${scp[3]}`;
-  }
-  const withScheme = /^([a-z][a-z0-9+.-]*):\/\/(?:[^@/]*@)?(.+)$/iu.exec(value);
-  if (withScheme !== null) {
-    // The scheme and any credentials are transport, not identity: the same
-    // repo over ssh and https is the same repo.
-    return withScheme[2].toLowerCase();
-  }
-  return value;
 }

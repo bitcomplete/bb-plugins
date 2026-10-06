@@ -27,6 +27,7 @@ import {
   type CacheEntry,
   type RepoPullRequest,
   type RepoRequest,
+  type RepoSeed,
   type RepoTarget,
 } from "./contract.js";
 import {
@@ -48,6 +49,9 @@ import {
   removeRepo,
   resolveRepoEntry,
   serializeReposFile,
+  setRepoBranch,
+  validateRepoSet,
+  type RepoEntry,
   type ReposFile,
 } from "./repos.js";
 import { PROJECT_SOURCE_DIR, normalizeRemoteUrl } from "./paths.js";
@@ -484,6 +488,93 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   }
 
   /**
+   * The three structured edits, shared by the CLI, the agent tools and the
+   * panel so each surface commits the same one-line diff with the same
+   * message. A failure carries a code the CLI can surface and a sentence the
+   * other two can show as it is.
+   */
+  type EditOutcome = { ok: true; dir: string } | { ok: false; code: string; error: string };
+
+  async function addRepoToProject(
+    location: SourceLocation,
+    seed: RepoSeed,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: true }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const entry = resolveRepoEntry(seed);
+    if (entry === null) {
+      return {
+        ok: false,
+        code: "dir_required",
+        error: `Could not derive a directory name from ${seed.url}. Give the repo an explicit directory name.`,
+      };
+    }
+    const clash = findRepo(current.file, { dir: entry.dir, url: seed.url });
+    if (clash !== null) {
+      return { ok: false, code: "duplicate_repo", error: `${clash.dir} is already in the repo set (${clash.url}).` };
+    }
+    const edited = addRepo(current.file, entry);
+    if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
+    await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal);
+    return { ok: true, dir: entry.dir };
+  }
+
+  async function removeRepoFromProject(
+    location: SourceLocation,
+    dir: string,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: false }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const edited = removeRepo(current.file, dir);
+    if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
+    await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal);
+    return { ok: true, dir };
+  }
+
+  async function setProjectRepoBranch(
+    location: SourceLocation,
+    dir: string,
+    branch: string | null,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: false }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const edited = setRepoBranch(current.file, dir, branch);
+    if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
+    const next = edited.value.repos.find((repo) => repo.dir === dir)?.branch;
+    const message = next === undefined ? `Use the default branch for ${dir}` : `Base ${dir} on ${next}`;
+    await writeRepoSet(location, edited.value, message, signal);
+    return { ok: true, dir };
+  }
+
+  /**
+   * Resolve and validate a repo set a person assembled in the panel before a
+   * project existed to commit it to. Returns the first problem as the panel
+   * should show it, or the entries ready to seed a fresh `repos.json`.
+   */
+  function resolveSeed(seed: readonly RepoSeed[]): { ok: true; repos: RepoEntry[] } | { ok: false; error: string } {
+    if (seed.length > MAX_REPOS) return { ok: false, error: `A workspace may hold at most ${MAX_REPOS} repos.` };
+    const repos: RepoEntry[] = [];
+    for (const entry of seed) {
+      const resolved = resolveRepoEntry(entry);
+      if (resolved === null) {
+        return { ok: false, error: `Could not derive a directory name from ${entry.url}. Give it an explicit directory name.` };
+      }
+      repos.push(resolved);
+    }
+    const problem = validateRepoSet(repos);
+    return problem === null ? { ok: true, repos } : { ok: false, error: problem };
+  }
+
+  /**
    * Every git checkout bb knows about on one machine.
    *
    * Feeds two things: the object cache's local-mirror step, and the repo-set
@@ -831,30 +922,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async execute(input, { threadId, signal }) {
       const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const current = await readRepoSet(location, { bootstrap: true }, signal);
-      if (current.file === null) throw new Error(current.error ?? `${REPOS_FILE} could not be read.`);
-
-      const entry = resolveRepoEntry({
+      const seed: RepoSeed = {
         ...(input.dir === undefined ? {} : { dir: input.dir }),
         url: input.url,
         ...(input.branch === undefined ? {} : { branch: input.branch }),
-      });
-      if (entry === null) {
-        throw new Error(`Could not derive a directory name from ${input.url}. Pass an explicit "dir".`);
-      }
-      const dir = entry.dir;
-      const clash = findRepo(current.file, { dir, url: input.url });
-      if (clash !== null) {
-        throw new Error(`${clash.dir} is already in the repo set (${clash.url}).`);
-      }
-
-      const edited = addRepo(current.file, entry);
-      if (!edited.ok) throw new Error(edited.error);
-
+      };
       // All three writes run host-side: the commit in the canonical checkout,
       // the cache population, and the clone into the live workspace. That is
       // what makes this work while the agent is sandboxed.
-      await writeRepoSet(location, edited.value, `Add ${dir} to the repo set`, signal);
+      const outcome = await addRepoToProject(location, seed, signal);
+      if (!outcome.ok) throw new Error(outcome.error);
+      const dir = outcome.dir;
+      const entry = resolveRepoEntry(seed);
+      if (entry === null) throw new Error(`Could not derive a directory name from ${input.url}.`);
 
       const added = await host.call(
         "addWorkspaceRepo",
@@ -899,11 +979,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async execute(input, { threadId, signal }) {
       const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const current = await readRepoSet(location, { bootstrap: true }, signal);
-      if (current.file === null) throw new Error(current.error ?? `${REPOS_FILE} could not be read.`);
-      const edited = removeRepo(current.file, input.dir);
-      if (!edited.ok) throw new Error(edited.error);
-      await writeRepoSet(location, edited.value, `Remove ${input.dir} from the repo set`, signal);
+      const outcome = await removeRepoFromProject(location, input.dir, signal);
+      if (!outcome.ok) throw new Error(outcome.error);
       // Deliberately leaves the checkout alone. A workspace should not mutate
       // under a running thread, and deleting a directory the agent may have
       // uncommitted work in would be the worst possible way to learn that.
@@ -1062,28 +1139,24 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const set = await readRepoSet(location, { bootstrap: true }, ctx.signal);
-            if (set.file === null) {
-              throw new PluginCliError(set.error ?? `${REPOS_FILE} could not be read.`, { code: "invalid_repos_json" });
-            }
-            const url = input.positionals.url;
-            const entry = resolveRepoEntry({
-              ...(input.options.dir === undefined ? {} : { dir: input.options.dir }),
-              url,
-              ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
-            });
-            if (entry === null) {
-              throw new PluginCliError(`Could not derive a directory name from ${url}.`, {
-                code: "dir_required",
-                hint: "Pass --dir <name>.",
+            const outcome = await addRepoToProject(
+              location,
+              {
+                ...(input.options.dir === undefined ? {} : { dir: input.options.dir }),
+                url: input.positionals.url,
+                ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
+              },
+              ctx.signal,
+            );
+            if (!outcome.ok) {
+              throw new PluginCliError(outcome.error, {
+                code: outcome.code,
+                ...(outcome.code === "dir_required" ? { hint: "Pass --dir <name>." } : {}),
               });
             }
-            const edited = addRepo(set.file, entry);
-            if (!edited.ok) throw new PluginCliError(edited.error, { code: "invalid_repo_set" });
-            await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, ctx.signal);
             return {
               exitCode: 0,
-              stdout: `Added ${entry.dir}. New threads in this project will get it; existing workspaces are unchanged.`,
+              stdout: `Added ${outcome.dir}. New threads in this project will get it; existing workspaces are unchanged.`,
             };
           },
         }),
@@ -1094,14 +1167,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           options: { project: PROJECT_OPTION },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const set = await readRepoSet(location, { bootstrap: false }, ctx.signal);
-            if (set.file === null) {
-              throw new PluginCliError(set.error ?? `${REPOS_FILE} could not be read.`, { code: "invalid_repos_json" });
-            }
-            const edited = removeRepo(set.file, input.positionals.dir);
-            if (!edited.ok) throw new PluginCliError(edited.error, { code: "unknown_repo" });
-            await writeRepoSet(location, edited.value, `Remove ${input.positionals.dir} from the repo set`, ctx.signal);
-            return { exitCode: 0, stdout: `Removed ${input.positionals.dir}. Existing workspaces are unchanged.` };
+            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal);
+            if (!outcome.ok) throw new PluginCliError(outcome.error, { code: outcome.code });
+            return { exitCode: 0, stdout: `Removed ${outcome.dir}. Existing workspaces are unchanged.` };
           },
         }),
 
@@ -1245,6 +1313,120 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         return { ok: true, error: null };
       } catch (error) {
         return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async addRepo({ projectId, repo }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await addRepoToProject(location, repo);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async removeRepo({ projectId, dir }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await removeRepoFromProject(location, dir);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async setRepoBranch({ projectId, dir, branch }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await setProjectRepoBranch(location, dir, branch);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async suggestRepos({ hostId, path }) {
+      return { checkouts: await localCheckouts(hostId, path) };
+    },
+
+    async hosts() {
+      const [all, config] = await Promise.all([bb.sdk.hosts.list(), bb.sdk.system.config()]);
+      return {
+        hosts: all
+          .filter((entry) => entry.lifecycle.phase === "active")
+          .map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            connected: entry.status === "connected",
+            primary: entry.id === config.primaryHostId,
+          })),
+      };
+    },
+
+    async suggestProjectSource({ hostId, name }) {
+      return host.call("suggestProjectSourcePath", { name }, { hostId, timeoutMs: READ_TIMEOUT_MS });
+    },
+
+    async createProject({ name, hostId, path, source }) {
+      const warnings: string[] = [];
+      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings });
+
+      // Refuse to stack a second project on a directory one already owns. Core
+      // may or may not reject it, and either way the panel would then show two
+      // projects editing one repos.json.
+      const existing = await bb.sdk.projects.list({ includePersonal: true });
+      const taken = existing.find((project) =>
+        project.sources.some((entry) => entry.type === "local_path" && entry.hostId === hostId && entry.path === path),
+      );
+      if (taken !== undefined) return fail(`${path} is already the source of the project "${taken.name}".`);
+
+      // The git work first: a failure here leaves no project behind.
+      try {
+        if (source.kind === "fresh") {
+          const resolved = resolveSeed(source.repos);
+          if (!resolved.ok) return fail(resolved.error);
+          const prepared = await host.call(
+            "prepareProjectSource",
+            { path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: source.repos },
+            { hostId, timeoutMs: READ_TIMEOUT_MS },
+          );
+          warnings.push(...prepared.warnings);
+          if (!prepared.bootstrapped && source.repos.length > 0) {
+            // Adopting a directory that is already a `.bb` repo: the seed was
+            // not written, so merge the entries in the ordinary way.
+            const location: SourceLocation = { hostId, path };
+            for (const entry of source.repos) {
+              const outcome = await addRepoToProject(location, entry);
+              if (!outcome.ok) warnings.push(outcome.error);
+            }
+          }
+        } else {
+          const cloned = await host.call(
+            "cloneProjectSource",
+            { url: source.url, path },
+            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
+          );
+          if (!cloned.ok) return fail(cloned.message ?? "Could not clone the .bb repo.");
+        }
+      } catch (error) {
+        return fail(errorMessage(error));
+      }
+
+      try {
+        const project = await bb.sdk.projects.create({
+          name,
+          source: { type: "local_path", hostId, path },
+        });
+        changed();
+        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20) };
+      } catch (error) {
+        return fail(
+          `${path} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${path}\`.`,
+        );
       }
     },
 

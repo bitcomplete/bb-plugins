@@ -1,0 +1,36 @@
+{
+  "name": "bb-plugin-diff-explorer",
+  "version": "0.1.3",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "bb": ">=0.44",
+    "bbPluginSdk": ">=0.5.29"
+  },
+  "bb": {
+    "name": "Diff Explorer",
+    "description": "Scrollable diff of every changed file, with go to definition.",
+    "branding": {
+      "icon": "FileDiff"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./host.ts",
+    "skills": []
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.5.29",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "esbuild": "^0.28.2",
+    "monaco-editor": "0.56.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "build:monaco": "scripts/build-monaco.sh"
+  }
+}

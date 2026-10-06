@@ -790,3 +790,6 @@ Idle PRs offer **Start fresh thread** in All PRs. This starts a new code-work co
 
 
 Both Your turn and Other open PRs support checkbox selection. **Advance selected** previews the exact selected scope and starts one fresh code-work thread across those PRs, including mixed selections. The Other heading checkbox selects that list. Holds, stopped efforts, changed heads, and unavailable checkouts are skipped with reasons; older workers do not block the explicit start. **Address** remains specific to unanswered feedback on Your turn. Advancement does not merge.
+
+
+Effort cards expose **Threads** with status counts, last activity, exact PR links, and per-thread **Archive**. The reversible action rechecks live idle status and refuses threads with descendants; opening a thread in BB provides family management. **Undo** and **Archived threads…** restore archived conversations without starting an agent. Thread insights read the existing cached snapshot rather than fetching additional event logs.

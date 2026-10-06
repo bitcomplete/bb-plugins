@@ -43,6 +43,21 @@ export const repoRequestSchema = z
 
 export type RepoRequest = z.infer<typeof repoRequestSchema>;
 
+/**
+ * One repo as a person writes it: `dir` and `branch` optional, resolved later
+ * by `resolveRepoEntry`. The shape of a row in the panel's add form and of an
+ * entry seeded into a brand-new `repos.json`.
+ */
+export const repoSeedSchema = z
+  .object({
+    dir: z.string().min(1).max(100).optional(),
+    url: z.string().min(1).max(2000),
+    branch: z.string().min(1).max(300).optional(),
+  })
+  .strict();
+
+export type RepoSeed = z.infer<typeof repoSeedSchema>;
+
 /** A repo the panel or the diff layer already knows the location of. */
 export const repoTargetSchema = z
   .object({
@@ -180,6 +195,11 @@ export const hostContract = defineRpcContract({
          * as a side effect of a read.
          */
         bootstrap: z.boolean(),
+        /**
+         * The repo set a bootstrapped `repos.json` starts with. Ignored when
+         * the directory is already a repo: nothing here overwrites a file.
+         */
+        seed: z.array(repoSeedSchema).max(64).optional(),
       })
       .strict(),
     output: z
@@ -211,6 +231,28 @@ export const hostContract = defineRpcContract({
         message: z.string().max(600).nullable(),
       })
       .strict(),
+  },
+
+  /**
+   * Clone an existing `.bb` repo to become this machine's canonical checkout.
+   *
+   * The shared way into a project: a teammate's workspace definition from one
+   * URL. Refuses a destination that already holds anything, because a clone
+   * into a directory with contents is either a mistake or a second project.
+   */
+  cloneProjectSource: {
+    input: z.object({ url: z.string().min(1).max(2000), path: absolutePath }).strict(),
+    output: z.object({ ok: z.boolean(), message: z.string().max(600).nullable() }).strict(),
+  },
+
+  /**
+   * Where a new project's `.bb` checkout would go by default on this machine,
+   * and whether something is already there. The panel shows it as an editable
+   * suggestion; it decides nothing.
+   */
+  suggestProjectSourcePath: {
+    input: z.object({ name: z.string().min(1).max(300) }).strict(),
+    output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
   },
 
   /**
@@ -463,6 +505,11 @@ export const workspaceViewSchema = z
 
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
+/** The outcome of one structured edit to `repos.json`. */
+export const editResultSchema = z
+  .object({ ok: z.boolean(), error: z.string().max(2000).nullable() })
+  .strict();
+
 export const rpcContract = defineRpcContract({
   /**
    * Every project, for the Repos panel's own picker.
@@ -501,6 +548,105 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ ok: z.boolean(), error: z.string().max(2000).nullable() }).strict(),
   },
+
+  /*
+   * Structured edits. Each one is a single commit with a message naming the
+   * change, which is what the CLI and the agent tools already produce and what
+   * `saveRepoSet` — a whole-file replacement — never could.
+   */
+  addRepo: {
+    input: z.object({ projectId: z.string().min(1).max(100), repo: repoSeedSchema }).strict(),
+    output: editResultSchema,
+  },
+  removeRepo: {
+    input: z.object({ projectId: z.string().min(1).max(100), dir: z.string().min(1).max(100) }).strict(),
+    output: editResultSchema,
+  },
+  setRepoBranch: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        dir: z.string().min(1).max(100),
+        /** Null returns the repo to its default branch. */
+        branch: z.string().max(300).nullable(),
+      })
+      .strict(),
+    output: editResultSchema,
+  },
+
+  /**
+   * Local checkouts on the project's machine, for the add form's autocomplete.
+   * The same discovery that seeds the object cache and proposes a repo set for
+   * an empty project; here it is a person choosing rather than the plugin.
+   */
+  suggestRepos: {
+    /**
+     * Keyed by machine and `.bb` path rather than project, because the form
+     * for a project that does not exist yet has no id to offer — only the
+     * machine it chose and the path it was suggested.
+     */
+    input: z.object({ hostId: z.string().min(1).max(100), path: absolutePath }).strict(),
+    output: z.object({ checkouts: z.array(discoveredCheckoutSchema).max(500) }).strict(),
+  },
+
+  /** Machines a new project's `.bb` checkout could live on. */
+  hosts: {
+    input: z.null(),
+    output: z
+      .object({
+        hosts: z
+          .array(
+            z
+              .object({
+                id: z.string().max(100),
+                name: z.string().max(300),
+                connected: z.boolean(),
+                /** The server's own machine, which is the sensible default. */
+                primary: z.boolean(),
+              })
+              .strict(),
+          )
+          .max(200),
+      })
+      .strict(),
+  },
+
+  /** A default `.bb` location for a project that does not exist yet. */
+  suggestProjectSource: {
+    input: z.object({ hostId: z.string().min(1).max(100), name: z.string().min(1).max(300) }).strict(),
+    output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
+  },
+
+  /**
+   * Create a project whose source is a `.bb` checkout, in one step.
+   *
+   * Either initializes a fresh checkout seeded with `repos`, or clones an
+   * existing `.bb` repo. The git work runs first so a failure there leaves no
+   * dangling project; a failure after it leaves an initialized directory,
+   * which the next attempt adopts rather than re-creates.
+   */
+  createProject: {
+    input: z
+      .object({
+        name: z.string().min(1).max(300),
+        hostId: z.string().min(1).max(100),
+        path: absolutePath,
+        source: z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("fresh"), repos: z.array(repoSeedSchema).max(64) }).strict(),
+          z.object({ kind: z.literal("clone"), url: z.string().min(1).max(2000) }).strict(),
+        ]),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        projectId: z.string().max(100).nullable(),
+        error: z.string().max(2000).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
+      })
+      .strict(),
+  },
+
   /** The thread's workspace manifest, or null when the thread has none. */
   workspace: {
     input: z.object({ threadId: z.string().min(1).max(100) }).strict(),

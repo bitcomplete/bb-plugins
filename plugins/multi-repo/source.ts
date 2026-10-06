@@ -15,8 +15,10 @@
  * Everything in this module runs host-side, outside the agent's sandbox. That
  * is what makes the write-back in {@link pushGuidance} possible at all.
  */
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
+import { slugify } from "./names.js";
 import { git, gitIn, gitInOrThrow, gitLine, firstProblemLine } from "./git.js";
 import { REPOS_FILE, serializeReposFile, type ReposFile } from "./repos.js";
 
@@ -135,6 +137,47 @@ async function exists(target: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Clone an existing `.bb` repo into `dir`, making it this machine's canonical
+ * checkout.
+ *
+ * Refuses a destination with contents rather than cloning beside them: a
+ * populated directory is either a second project or a mistake, and git's own
+ * refusal reads as a stack trace. A directory that exists but is empty is
+ * fine — `mkdir -p` by a previous attempt is the common way to get one.
+ */
+export async function cloneProjectSource(
+  url: string,
+  dir: string,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; message: string | null }> {
+  if (url.startsWith("-")) return { ok: false, message: `${JSON.stringify(url)} is not a clone URL.` };
+  const entries = await readdir(dir).catch(() => null);
+  if (entries !== null && entries.length > 0) {
+    return { ok: false, message: `${dir} already exists and is not empty.` };
+  }
+  await mkdir(path.dirname(dir), { recursive: true });
+  const result = await git(["clone", "--quiet", "--", url, dir], {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  if (result.code !== 0) return { ok: false, message: firstProblemLine(result) };
+  return { ok: true, message: null };
+}
+
+/**
+ * Where a new project's `.bb` checkout goes unless someone says otherwise:
+ * `~/bb/<slug>`. Under the home directory because that is the one place on a
+ * machine that is reliably writable and survives a plugin uninstall, and
+ * under one `bb` folder so several projects' definitions sit together — and
+ * beside any checkouts the user keeps there, which the mirror discovery scans
+ * as siblings of the project source.
+ */
+export async function defaultProjectSourcePath(name: string): Promise<{ path: string; exists: boolean }> {
+  const target = path.join(homedir(), "bb", slugify(name));
+  return { path: target, exists: await exists(target) };
 }
 
 /**

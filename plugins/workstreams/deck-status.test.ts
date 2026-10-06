@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { inkwellDeck, INVENTORY_EFFORTS, INVENTORY_NOW } from "./inkwell-fixtures.js";
 import { cardScreen } from "./deck-view-model.js";
-import { prStatuses, threadRefs, threadStatus } from "./deck-status.js";
+import { prStatuses, threadRefs, threadStatus, threadReadSummary } from "./deck-status.js";
 
 const url = (repo: string, number: number) => `https://github.com/inkwell/${repo}/pull/${number}`;
 const screen = () => cardScreen(inkwellDeck().active.find((card) => card.oneOff)!, { rows: {} }, { now: INVENTORY_NOW });
@@ -52,4 +52,23 @@ describe("visible PR and thread status", () => {
     card.lines.slice(0, 2).forEach((line) => { line.row = { ...line.row!, thread: { id: thread.id, title: thread.title, active: true } }; });
     expect(threadRefs(card, thread)).toBe(card.lines.slice(0, 2).map((line) => line.ref).join(" · "));
   });
+});
+
+
+it("summarizes needs-you and working threads and selects the newest activity even when the parent is listed first", () => {
+  const view = inkwellDeck();
+  const card = view.active[0]!;
+  const HOUR = 3_600_000;
+  card.threads = [
+    { id: "parent", title: "Effort", role: "parent", prUrl: null, status: "idle", lastActivityAt: INVENTORY_NOW - 48 * HOUR },
+    { id: "answer", title: "Question", role: "linked", prUrl: null, status: "idle", waiting: true, lastActivityAt: INVENTORY_NOW - 2 * HOUR },
+    { id: "work", title: "Fix", role: "linked", prUrl: null, status: "active", lastActivityAt: null },
+  ];
+  let s = cardScreen(card, { rows: {} }, { now: INVENTORY_NOW });
+  expect(threadReadSummary(s)).toContain("1 needs you");
+  expect(threadReadSummary(s)).toContain("1 working");
+  expect(threadReadSummary(s)).toContain("Last activity 2h ago");
+  card.threads.forEach((t) => { t.lastActivityAt = null; });
+  s = cardScreen(card, { rows: {} }, { now: INVENTORY_NOW });
+  expect(threadReadSummary(s)).not.toContain("Last activity");
 });

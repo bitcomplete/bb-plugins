@@ -76,4 +76,24 @@ describe("resolveCompletion", () => {
       apiKey: "mine",
     });
   });
+
+  it("treats a blank stored URL or model as unset and falls back to the deployment's", () => {
+    const env = {
+      [ENV_API_KEY]: "shared",
+      [ENV_BASE_URL]: "https://api.fireworks.ai/inference/v1",
+      [ENV_MODEL]: "accounts/fireworks/models/glm-5p3-flash",
+    };
+    expect(resolveCompletion({ baseUrl: "", model: "  ", jsonMode: true }, env)).toEqual({
+      baseUrl: "https://api.fireworks.ai/inference/v1",
+      apiKey: "shared",
+      model: "accounts/fireworks/models/glm-5p3-flash",
+      jsonMode: true,
+    });
+  });
+
+  it("falls back to the plugin's own defaults when a blank setting has no deployment value", () => {
+    expect(
+      resolveCompletion({ baseUrl: "", model: undefined, jsonMode: true }, { [ENV_API_KEY]: "k" }),
+    ).toEqual({ baseUrl: DEFAULT_BASE_URL, apiKey: "k", model: DEFAULT_MODEL, jsonMode: true });
+  });
 });

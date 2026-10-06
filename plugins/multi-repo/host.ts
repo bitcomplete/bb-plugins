@@ -18,9 +18,12 @@ import { cacheStatus, refreshCaches, type CacheProgress } from "./cache.js";
 import { discoverCheckouts } from "./discovery.js";
 import { filePatch, repoChanges, repoLiveStatus } from "./diff.js";
 import { readPullRequests, runPrAction } from "./gh.js";
-import { EMPTY_REPOS } from "./repos.js";
+import { EMPTY_REPOS, resolveRepoEntry, type ReposFile } from "./repos.js";
+import type { RepoSeed } from "./contract.js";
 import {
   bootstrapProjectSource,
+  cloneProjectSource,
+  defaultProjectSourcePath,
   projectSourceBranch,
   projectSourceRemote,
   pushGuidance,
@@ -29,6 +32,24 @@ import {
   writeReposJson,
 } from "./source.js";
 import { addWorkspaceRepo, provisionWorkspace, removeWorkspace } from "./workspace.js";
+
+/**
+ * The repo set a fresh `.bb` starts with.
+ *
+ * Entries are resolved but not validated here: the server validated the set
+ * before asking, and an entry whose `dir` cannot be inferred is dropped rather
+ * than failing the bootstrap, because a project with one fewer repo is
+ * recoverable from the panel and a project with no checkout is not.
+ */
+function seedFile(seed: readonly RepoSeed[] | undefined): ReposFile {
+  if (seed === undefined || seed.length === 0) return EMPTY_REPOS;
+  const repos: ReposFile["repos"] = [];
+  for (const entry of seed) {
+    const resolved = resolveRepoEntry(entry);
+    if (resolved !== null) repos.push(resolved);
+  }
+  return { version: EMPTY_REPOS.version, repos };
+}
 
 /**
  * Relay a long call's progress into the launch report.
@@ -66,7 +87,7 @@ export function createMultiRepoHostEntry() {
       async prepareProjectSource(input, context) {
         const warnings: string[] = [];
         const bootstrap = input.bootstrap
-          ? await bootstrapProjectSource(input.path, EMPTY_REPOS, context.signal)
+          ? await bootstrapProjectSource(input.path, seedFile(input.seed), context.signal)
           : { bootstrapped: false, warnings: [] as string[] };
         warnings.push(...bootstrap.warnings);
         if (!bootstrap.bootstrapped) {
@@ -79,6 +100,14 @@ export function createMultiRepoHostEntry() {
           defaultBranch: await projectSourceBranch(input.path, context.signal),
           warnings: warnings.slice(0, 20),
         };
+      },
+
+      async cloneProjectSource(input, context) {
+        return cloneProjectSource(input.url, input.path, context.signal);
+      },
+
+      async suggestProjectSourcePath(input) {
+        return defaultProjectSourcePath(input.name);
       },
 
       async writeProjectSourceRepos(input, context) {

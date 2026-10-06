@@ -15,7 +15,10 @@
  * filesystem, no git — the caller owns both ends.
  */
 import { z } from "zod";
-import { PROJECT_SOURCE_DIR, isSafeSegment, normalizeRemoteUrl } from "./paths.js";
+import { PROJECT_SOURCE_DIR } from "./paths.js";
+import { dirFromUrl, isSafeSegment, normalizeRemoteUrl } from "./names.js";
+
+export { dirFromUrl };
 
 export const REPOS_FILE = "repos.json";
 export const REPOS_VERSION = 1;
@@ -212,20 +215,6 @@ export type EditResult =
   | { ok: true; value: ReposFile }
   | { ok: false; error: string };
 
-/**
- * The directory name a repo gets when the caller did not pick one: the URL's
- * last component, minus `.git`.
- *
- * Returns null rather than a fallback when nothing usable comes out, so
- * `workspace_add_repo` asks for an explicit `dir` instead of inventing
- * `repo-1` and leaving the agent to discover what it got.
- */
-export function dirFromUrl(url: string): string | null {
-  const trimmed = url.trim().replace(/\/+$/u, "").replace(/\.git$/u, "");
-  const candidate = trimmed.split(/[/:\\]/u).pop() ?? "";
-  return isSafeSegment(candidate) ? candidate : null;
-}
-
 export function addRepo(file: ReposFile, entry: RepoEntryInput): EditResult {
   if (file.repos.length >= MAX_REPOS) {
     return { ok: false, error: `A workspace may hold at most ${MAX_REPOS} repos.` };
@@ -244,6 +233,28 @@ export function removeRepo(file: ReposFile, dir: string): EditResult {
   if (repos.length === file.repos.length) {
     return { ok: false, error: `No repo named ${JSON.stringify(dir)} is in ${REPOS_FILE}.` };
   }
+  return { ok: true, value: { version: REPOS_VERSION, repos } };
+}
+
+/**
+ * Change one repo's base branch in place; `null` returns it to the default.
+ *
+ * The entry keeps its position and its inferred-`dir` flag, so the commit is
+ * the one-line diff a branch change should be.
+ */
+export function setRepoBranch(file: ReposFile, dir: string, branch: string | null): EditResult {
+  const index = file.repos.findIndex((repo) => repo.dir === dir);
+  if (index === -1) {
+    return { ok: false, error: `No repo named ${JSON.stringify(dir)} is in ${REPOS_FILE}.` };
+  }
+  const trimmed = branch?.trim() ?? "";
+  if (trimmed.length > 300 || trimmed.startsWith("-")) {
+    return { ok: false, error: `${JSON.stringify(trimmed)} is not a usable branch name.` };
+  }
+  const { branch: _previous, ...rest } = file.repos[index];
+  const next = trimmed.length === 0 ? rest : { ...rest, branch: trimmed };
+  const repos = [...file.repos];
+  repos[index] = next;
   return { ok: true, value: { version: REPOS_VERSION, repos } };
 }
 

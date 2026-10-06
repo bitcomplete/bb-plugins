@@ -70,7 +70,7 @@ describe("the effort deck's markup", () => {
     expect(text(html)).toContain("Wait for the store launch");
     expect(text(html)).toContain("Work on folio #330");
     expect(text(html)).toContain("Idle");
-    expect(html.match(/data-deck-thread="thr_folio_330"/gu)).toHaveLength(1);
+    expect(html.match(/data-deck-thread="thr_folio_330"/gu)).toHaveLength(2);
     expect(html.match(/data-deck-pr-link=/gu)).toHaveLength(5);
     expect(html).not.toMatch(/data-deck-pr-action|data-deck-moves|data-deck-advance|type="checkbox"/u);
   });
@@ -400,5 +400,35 @@ describe("queued work on read cards", () => {
     expect(text(part(html, "data-deck-pr-status", urls[0]!))).toContain("Address feedback · Sending");
     expect(text(part(html, "data-deck-pr-status", urls[1]!))).toContain("Address feedback · Not sent");
     expect(html).not.toMatch(/data-deck-pr-action|data-inventory-action|type="checkbox"/u);
+  });
+});
+
+
+describe("thread insights on effort cards", () => {
+  it("shows a compact activity summary and every thread, including PR-linked workers, with archive controls", () => {
+    const view = inkwellDeck(inkwellThreads());
+    const card = view.active.find((c) => c.id === SHELF)!;
+    const html = pane(view, SHELF);
+    expect(html).toContain("data-deck-thread-summary");
+    expect(text(html)).toContain("Last activity");
+    const all = html.slice(html.indexOf("data-deck-threads"));
+    for (const t of card.threads) {
+      expect(all).toContain(`data-deck-thread="${t.id}"`);
+      const control = new RegExp(`data-deck-thread-archive="${t.id}"([^>]*)>`, "u").exec(all)!;
+      expect(control).not.toBeNull();
+      expect(control[1]!.includes('disabled=""')).toBe(t.status !== "idle");
+    }
+    expect(text(all)).toContain("Archived threads…");
+    expect(html).not.toMatch(/data-deck-pr-action/u);
+  });
+
+  it("keeps history reachable without live threads and disables duplicate archives while starting", () => {
+    const view = inkwellDeck(inkwellThreads());
+    const card = view.active.find((c) => c.id === SHELF)!;
+    const busy = pane(view, SHELF, { kit: { lines: LINES, picked: new Set(), archivingThread: card.threads[0]!.id } });
+    expect(text(busy)).toContain("Archiving…");
+    for (const m of busy.matchAll(/data-deck-thread-archive="[^"]+"([^>]*)>/gu)) expect(m[1]).toContain('disabled=""');
+    card.threads = [];
+    expect(text(pane(view, SHELF))).toContain("Archived threads…");
   });
 });

@@ -7,14 +7,21 @@
  * and assert the properties the design depends on.
  */
 import { access, mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cacheDefaultBranch, cachePathFor, cacheStatus, ensureCache, findMirror } from "./cache.js";
 import { workspaceRepoSchema } from "./contract.js";
 import { repoChanges, repoLiveStatus, filePatch } from "./diff.js";
 import { git, gitIn, gitLine } from "./git.js";
-import { bootstrapProjectSource, pushGuidance, readReposJson, writeReposJson } from "./source.js";
+import {
+  bootstrapProjectSource,
+  cloneProjectSource,
+  defaultProjectSourcePath,
+  pushGuidance,
+  readReposJson,
+  writeReposJson,
+} from "./source.js";
 import { EMPTY_REPOS, parseReposFile } from "./repos.js";
 import { provisionWorkspace, removeWorkspace, workspaceRoot } from "./workspace.js";
 
@@ -695,5 +702,64 @@ describe("standing up a brand new project", () => {
     const written = await writeReposJson(dir, `{"version":1,"repos":[]}\n`, "Update the repo set");
     expect(written.committed).toBe(false);
     expect(written.message).not.toBeNull();
+  });
+});
+
+describe("creating a project source", () => {
+  it("seeds a fresh .bb with the repos it was given, and leaves an existing one alone", async () => {
+    const dir = path.join(scratch, "fresh");
+    const seeded = await bootstrapProjectSource(dir, {
+      version: 1,
+      repos: [{ dir: "alpha", url: "https://example.com/alpha", inferredDir: true }],
+    });
+    expect(seeded.bootstrapped).toBe(true);
+    const text = await readReposJson(dir);
+    expect(text).not.toBeNull();
+    const parsed = parseReposFile(text ?? "");
+    expect(parsed.ok && parsed.value.repos.map((repo) => repo.dir)).toEqual(["alpha"]);
+    // The inferred dir is written as the absence it was.
+    expect(JSON.parse(text ?? "")).toEqual({ version: 1, repos: [{ url: "https://example.com/alpha" }] });
+    // Committed, so the project can be cloned from here on.
+    expect(await gitLine(dir, ["rev-parse", "HEAD"])).not.toBeNull();
+
+    const again = await bootstrapProjectSource(dir, {
+      version: 1,
+      repos: [{ dir: "beta", url: "https://example.com/beta" }],
+    });
+    expect(again.bootstrapped).toBe(false);
+    expect(await readReposJson(dir)).toBe(text);
+  });
+
+  it("clones an existing .bb repo into an empty or absent directory", async () => {
+    const remote = await makeRemote("shared-bb");
+    await writeFile(path.join(remote, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await gitIn(remote, ["add", "-A"]);
+    await gitIn(remote, ["commit", "--quiet", "-m", "repo set"]);
+
+    const absent = path.join(scratch, "projects", "absent");
+    expect(await cloneProjectSource(remote, absent)).toEqual({ ok: true, message: null });
+    expect(await readReposJson(absent)).toBe('{"version":1,"repos":[]}\n');
+    expect(await gitLine(absent, ["config", "--get", "remote.origin.url"])).toBe(remote);
+
+    const empty = path.join(scratch, "projects", "empty");
+    await mkdir(empty, { recursive: true });
+    expect((await cloneProjectSource(remote, empty)).ok).toBe(true);
+  });
+
+  it("refuses to clone over a directory with contents, and a URL that reads as an option", async () => {
+    const remote = await makeRemote("shared-bb");
+    const occupied = path.join(scratch, "projects", "occupied");
+    await mkdir(occupied, { recursive: true });
+    await writeFile(path.join(occupied, "note.txt"), "x", "utf8");
+    const result = await cloneProjectSource(remote, occupied);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("not empty");
+    expect((await cloneProjectSource("--upload-pack=x", path.join(scratch, "projects", "opt"))).ok).toBe(false);
+  });
+
+  it("suggests a location under the home directory, named after the project", async () => {
+    const suggestion = await defaultProjectSourcePath("My Project");
+    expect(suggestion.path).toBe(path.join(homedir(), "bb", "my-project"));
+    expect(typeof suggestion.exists).toBe("boolean");
   });
 });

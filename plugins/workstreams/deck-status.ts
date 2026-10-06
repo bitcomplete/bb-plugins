@@ -96,3 +96,18 @@ export function effortReadSummary(screen: CardScreen, prs: readonly PrStatus[]):
   if (working) return `${working} ${working === 1 ? "worker is" : "workers are"} working.`;
   return prs.length ? `${prs.length} open ${prs.length === 1 ? "PR" : "PRs"}. ${screen.blocked.length ? "Waiting on dependencies or review." : "No feedback waiting on you."}` : screen.threads.length ? "No open PRs. Linked threads below." : "No open work.";
 }
+
+
+/** Cached thread facts only; activity is BB's last update, not another event-log fetch. */
+export function threadReadSummary(screen: CardScreen): string {
+  const counts = new Map<string, number>();
+  for (const thread of screen.threads) {
+    const label = threadStatus(thread).text;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  const parts = [...counts].map(([label, n]) => `${n} ${label === "Needs you" ? n === 1 ? "needs you" : "need you" : label.toLowerCase()}`);
+  const latest = screen.card.threads.filter((t) => t.lastActivityAt !== null).sort((a, b) => b.lastActivityAt! - a.lastActivityAt!)[0];
+  const last = latest && screen.threads.find((t) => t.id === latest.id)?.age;
+  if (last) parts.push(`Last activity ${last} ago`);
+  return parts.join(" · ");
+}

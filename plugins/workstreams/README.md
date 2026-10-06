@@ -246,3 +246,6 @@ npm run build
 
 After editing the plugin, run `bb plugin reload workstreams`. The build creates
 the distributable files in `dist/` for git or npm installs.
+
+
+Effort cards include an expandable **Threads** section with status counts and last activity. It lists all linked threads, including PR workers, with exact PR references and per-thread activity times. **Archive** accepts idle threads after checking their current status and descendants; **Undo** or **Archived threads…** restores them without starting the agent. Threads with subthreads are managed from BB. This uses cached thread facts, without fetching extra event logs for the card.
