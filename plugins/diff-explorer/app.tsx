@@ -53,7 +53,7 @@ function loadMonaco(baseUrl: string): Promise<Bundle> {
     link.rel = "stylesheet";
     link.href = `${baseUrl}/editor.css`;
     document.head.appendChild(link);
-    (globalThis as any).MonacoEnvironment = {
+    (globalThis as any).DiffExplorerMonacoEnvironment = {
       getWorker: () => new Worker(new URL(`${baseUrl}/editor.worker.js`, window.location.origin), { type: "module" }),
     };
     const bundle: Bundle = await import(/* @vite-ignore */ `${baseUrl}/editor.js`);
