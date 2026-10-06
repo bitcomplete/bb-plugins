@@ -19,8 +19,6 @@ class DocumentItem {
     this.collapsed = observableValue(this, false);
     this.lastTemplateData = observableValue(this, { contentHeight: documentDiffItem.estimatedHeight, selections: undefined });
     this.isActive = derived(this, (reader) => editorViewModel.activeDiffItem.read(reader) === this);
-    this._isFocusedSource = observableValue(this, constObservable(false));
-    this.isFocused = derived(this, (reader) => this._isFocusedSource.read(reader).read(reader));
     this.isAlive = constObservable(true);
     const options = instantiationService.createInstance(DiffEditorOptions, documentDiffItem.options);
     this.diffEditorViewModelRef = RefCounted.create(
@@ -37,9 +35,7 @@ class DocumentItem {
   get modifiedUri() {
     return this.documentDiffItem.modified?.uri;
   }
-  setIsFocused(source, tx) {
-    this._isFocusedSource.set(source, tx);
-  }
+  setIsFocused() {} // Required by the widget; it reads focus from the editor templates.
   getKey() {
     return JSON.stringify([this.originalUri?.toString(), this.modifiedUri?.toString()]);
   }
@@ -49,12 +45,11 @@ class DocumentItem {
 }
 
 class EditorViewModel {
-  constructor(documents, instantiationService) {
+  constructor(instantiationService) {
     this.instantiationService = instantiationService;
     this.activeDiffItem = observableValue(this, undefined);
     this.activeDiffItem.setCache = (value, tx) => this.activeDiffItem.set(value, tx);
     this.items = observableValue(this, []);
-    this.setDocuments(documents);
     this.isLoading = constObservable(false);
     this.contextKeys = undefined;
   }
@@ -79,12 +74,12 @@ class EditorViewModel {
 /**
  * documents: { original: ITextModel, modified: ITextModel, label: string, options: IDiffEditorOptions, estimatedHeight: number }[]
  */
-export function createMultiDiffEditor(element, documents) {
+export function createMultiDiffEditor(element) {
   const instantiationService = StandaloneServices.get(IInstantiationService);
   // monaco.editor.create does this; without it the theme stylesheet (token and diff colors) is never injected.
   const theme = StandaloneServices.get(IStandaloneThemeService).registerEditorContainer(element);
-  const viewModel = new EditorViewModel(documents, instantiationService);
-  let labels = new Map(documents.map((d) => [d.modified.uri.toString(), d.label]));
+  const viewModel = new EditorViewModel(instantiationService);
+  let labels = new Map();
   const dimension = observableValue("dimension", undefined);
   const viewModelSource = observableValue("viewModel", undefined);
   const widget = instantiationService.createInstance(

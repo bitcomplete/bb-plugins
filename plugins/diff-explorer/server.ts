@@ -15,7 +15,7 @@ export default async function plugin(bb: BbPluginApi) {
     const env = await bb.sdk.environments.get({ environmentId });
     if (!env.path) throw new Error("This environment has no workspace path");
     if (!env.hostId) throw new Error("This environment has no host");
-    return { root: env.path, hostId: env.hostId };
+    return { root: env.path, hostId: env.hostId, baseBranch: env.mergeBaseBranch ?? env.baseBranch ?? env.defaultBranch };
   }
 
   let preview: { baseUrl: string; expiresAtMs: number } | null = null;
@@ -32,11 +32,7 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = await bb.sdk.threads.get({ threadId });
       if (!thread.environmentId) throw new Error("This thread has no environment");
       const environmentId = thread.environmentId;
-      const env = await bb.sdk.environments.get({ environmentId });
-      if (!env.path) throw new Error("This environment has no workspace path");
-      if (!env.hostId) throw new Error("This environment has no host");
-      const root = env.path;
-      const baseBranch = env.mergeBaseBranch ?? env.baseBranch ?? env.defaultBranch;
+      const { root, hostId, baseBranch } = await environment(environmentId);
       if (baseBranch === null) throw new Error("This environment has no base branch");
       // "all" = everything since the merge base with the base branch, committed or not.
       const diff = await bb.sdk.environments.diffFiles(
@@ -79,9 +75,9 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
       const files = [...byPath.values()];
-      host.call("watch", { root }, { hostId: env.hostId }).catch((error) => bb.log.warn(`File watch failed: ${error}`));
+      host.call("watch", { root }, { hostId }).catch((error) => bb.log.warn(`File watch failed: ${error}`));
       host
-        .call("warm", { root, paths: files.filter((f) => f.newText !== "").map((f) => path.join(root, f.path)) }, { hostId: env.hostId })
+        .call("warm", { root, paths: files.filter((f) => f.newText !== "").map((f) => path.join(root, f.path)) }, { hostId })
         .catch((error) => bb.log.warn(`Language server warm-up failed: ${error}`));
       const skipped = diff.files.filter((f) => f.binary || f.loadMode === "too_large").map((f) => f.path);
       return { environmentId, root, baseBranch, files, skipped };

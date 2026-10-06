@@ -31,6 +31,7 @@
     "typescript": "^5.7.0"
   },
   "scripts": {
-    "build:monaco": "scripts/build-monaco.sh"
+    "build:monaco": "scripts/build-monaco.sh",
+    "test": "esbuild host.test.ts app.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js"
   }
 }

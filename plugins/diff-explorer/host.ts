@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
@@ -169,6 +169,9 @@ function serverFor(root: string, cmd: string[]) {
 // ponytail: one watcher per workspace root for the worker's lifetime; dispose idle roots if watcher count matters
 const watches = new Map<string, Promise<{ dispose(): Promise<void> }>>();
 
+// ponytail: serializes this worker's saves only; external writers need a shared locking protocol.
+const writes = new Map<string, Promise<null>>();
+
 export default experimental_defineHostEntry({
   contract: hostContract,
   experimental_signals: hostSignals,
@@ -193,23 +196,35 @@ export default experimental_defineHostEntry({
     },
     // Opens one file per language server so it indexes the project before the first click.
     async warm({ root, paths }) {
-      const first = new Map<string[], [string, string]>();
-      for (const file of paths) {
+      const warmed = new Set<LanguageServer>();
+      await Promise.all(paths.map(async (file) => {
         const spec = SERVERS[path.extname(file).toLowerCase()];
-        if (spec !== undefined && !first.has(spec.cmd)) first.set(spec.cmd, [file, spec.languageId]);
-      }
-      await Promise.all([...first].map(([cmd, [file, languageId]]) => serverFor(root, cmd).open(file, languageId)));
+        if (spec === undefined) return;
+        const server = serverFor(root, spec.cmd);
+        if (warmed.has(server)) return;
+        warmed.add(server);
+        await server.open(file, spec.languageId);
+      }));
       return null;
     },
     async read({ path: file }) {
       return { content: await readFile(file, "utf8") };
     },
     async write({ path: file, content, expected }) {
-      if ((await readFile(file, "utf8")) !== expected) {
-        throw new Error(`${path.basename(file)} changed on disk since it was loaded. Refresh to see the new version; this discards your edit.`);
+      const key = await realpath(file);
+      const saving = (writes.get(key) ?? Promise.resolve(null)).catch(() => null).then(async () => {
+        if ((await readFile(key, "utf8")) !== expected) {
+          throw new Error(`${path.basename(file)} changed on disk since it was loaded. Refresh to see the new version; this discards your edit.`);
+        }
+        await writeFile(key, content, "utf8");
+        return null;
+      });
+      writes.set(key, saving);
+      try {
+        return await saving;
+      } finally {
+        if (writes.get(key) === saving) writes.delete(key);
       }
-      await writeFile(file, content, "utf8");
-      return null;
     },
   },
   async dispose() {

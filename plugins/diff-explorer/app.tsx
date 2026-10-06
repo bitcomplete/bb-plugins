@@ -40,10 +40,7 @@ type MultiDiffDocument = {
 };
 type Bundle = {
   monaco: MonacoApi;
-  createMultiDiffEditor(
-    element: HTMLElement,
-    documents: MultiDiffDocument[],
-  ): { update(documents: MultiDiffDocument[]): void; dispose(): void };
+  createMultiDiffEditor(element: HTMLElement): { update(documents: MultiDiffDocument[]): void; dispose(): void };
 };
 let bundlePromise: Promise<Bundle> | null = null;
 
@@ -199,7 +196,7 @@ function MultiDiff({
   );
 
   useEffect(() => {
-    const created = bundle.createMultiDiffEditor(container.current!, []);
+    const created = bundle.createMultiDiffEditor(container.current!);
     editor.current = created;
     const owned = models.current;
     return () => {
@@ -302,34 +299,30 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const root = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    let cancelled = false;
     setData(null);
     setStack([]);
+  }, [threadId, target]);
+
+  useEffect(() => {
+    let cancelled = false;
     Promise.all([rpc.call("assets", null).then(({ baseUrl }) => loadMonaco(baseUrl)), rpc.call("load", { threadId, target })]).then(
       ([b, loaded]) => {
         if (cancelled) return;
         setBundle(b);
-        setData(loaded);
+        setData((prev) => (prev !== null && JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
         setError(null);
       },
-      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+      (cause) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      },
     );
     return () => {
       cancelled = true;
     };
   }, [rpc, threadId, target, reload]);
 
-  const current = useRef({ target, root: data?.root });
-  current.current = { target, root: data?.root };
   useRealtime("changed", (payload) => {
-    if ((payload as { root: string }).root !== current.current.root) return;
-    rpc.call("load", { threadId, target }).then(
-      (loaded) => {
-        if (current.current.target !== target) return;
-        setData((prev) => (prev !== null && JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
-      },
-      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
-    );
+    if ((payload as { root: string }).root === data?.root) setReload((n) => n + 1);
   });
 
   useEffect(() => {
