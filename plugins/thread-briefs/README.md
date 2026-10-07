@@ -412,7 +412,9 @@ the built-in sidebar does. The two are folded together by pure functions in
 without mounting anything.
 
 The **count on the sidebar row** — bb calls it a panel accessory — is threads
-waiting on you, and it costs nothing: the overlay that draws the row glyphs has
+waiting on you, among the threads the sidebar is showing: the badge and the
+board it opens are read off the same list, so an archived thread whose last
+brief said "waiting on you" counts on neither. It costs nothing: the overlay that draws the row glyphs has
 already folded the briefs against the live thread list, so the badge reads that
 same store rather than making a second request per window. Nothing is drawn at
 zero; the accessory shares the row's trailing column with bb's own options
