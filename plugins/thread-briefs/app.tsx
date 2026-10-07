@@ -170,6 +170,12 @@ function BriefSync() {
     return ids;
   }, [threads]);
 
+  /** Every thread this window's sidebar is showing, by id. */
+  const sidebarIds = useMemo(
+    () => new Set(threads.map((thread) => thread.id)),
+    [threads],
+  );
+
   /**
    * The project each row belongs to.
    *
@@ -223,17 +229,23 @@ function BriefSync() {
     const next = new Map<string, Decoration>();
     let waitingOnMe = 0;
     for (const signal of signals) {
+      // A brief with no row beside it belongs to a thread this window is not
+      // showing — archived, most often, since archiving keeps the brief. The
+      // board is driven by the sidebar's threads and never draws such a card,
+      // so the badge must not count it either: a "2" over a board of nothing
+      // but Done is a badge that cannot be trusted.
+      const inSidebar = sidebarIds.has(signal.threadId);
       // The same live fold the decoration below makes, counted before it: a
       // thread whose agent is running is `working`, and is not waiting on you.
       if (
+        inSidebar &&
         !workingIds.has(signal.threadId) &&
         signal.status === "waiting-on-me"
       ) {
         waitingOnMe += 1;
       }
       // A thread with no row in the sidebar has no cursor to age, so it simply
-      // never greys: the one place this can happen is a thread the current
-      // window is not showing, which has no glyph to draw either.
+      // never greys, and has no glyph to draw either.
       const latestAttentionAt = attentionByThreadId.get(signal.threadId);
       const stale =
         latestAttentionAt !== undefined &&
@@ -261,6 +273,7 @@ function BriefSync() {
     attentionByThreadId,
     now,
     projectByThreadId,
+    sidebarIds,
     signals,
     thresholds,
     workingIds,

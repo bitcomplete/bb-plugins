@@ -796,6 +796,23 @@ describe("the board's sidebar badge", () => {
     overlay.lifecycle.unmount();
   });
 
+  it("does not count a thread the sidebar is not showing", async () => {
+    // Archiving a thread keeps its brief, so the kv scan still returns the
+    // signal. The board draws only the sidebar's threads, and the badge on the
+    // way to it must agree with what it opens onto.
+    const { overlay, badge } = await mountBoth({
+      signals: [waiting("thr_1"), waiting("thr_archived")],
+      threads: [sidebarThread({ id: "thr_1" })],
+    });
+    await waitFor(() =>
+      expect(
+        badge.getByRole("status", { name: "1 thread waiting on you" }),
+      ).toBeTruthy(),
+    );
+    badge.lifecycle.unmount();
+    overlay.lifecycle.unmount();
+  });
+
   it("does not count a thread whose agent is running", async () => {
     // The same live fold the row glyph makes: the agent has it, so it is not
     // waiting on you.
