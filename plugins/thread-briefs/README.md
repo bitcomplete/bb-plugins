@@ -268,10 +268,15 @@ summarizing every existing thread — is an unbounded burst the first time a key
 configured.
 
 What *does* count as activity is deliberately early: a thread that starts
-running has earned a brief, before the turn it is running has finished. The
-quiet period is there to stop a busy thread being re-summarized every turn, and
-a thread with no brief has nothing to protect — only an empty panel, a missing
-ring and no section, for as long as its first turn takes.
+running has earned a brief, before the turn it is running has finished. A
+thread with no brief has only an empty panel, a missing ring and no section, for
+as long as its first turn takes.
+
+There is no quiet period. Every turn boundary starts a summary at once, so the
+brief and the status follow the turn by the length of one summarizer call. A
+thread in quick back-and-forth is kept from being summarized every turn the
+other way round: a turn that ends while the previous summary is still running
+aborts it, and the newest transcript is summarized instead.
 
 ## The board
 
@@ -469,7 +474,7 @@ so a sweep running up to an hour late is invisible.
 
 | Concern | Mechanism |
 | --- | --- |
-| Trigger | `bb.events.on("thread.idle")` + a per-thread quiet-period debounce, with a `*/10 * * * *` sweep as the backstop. A thread with no brief yet skips the quiet period, and is summarized from `thread.active` as well — mid-turn, so a long first turn is not spent briefless |
+| Trigger | `bb.events.on("thread.idle")`, summarizing at once; a later idle on the same thread aborts a summary still in flight and starts over. A `*/10 * * * *` sweep is the backstop. A thread with no brief yet is summarized from `thread.active` as well — mid-turn, so a long first turn is not spent briefless |
 | Summarizer input | `threads.conversationOutline()` head + tail with the middle elided, `threads.output()` for the last message in full, and the previous brief's title, goal, currentState and constraints |
 | Storage | `bb.storage.kv`, one row per thread at `brief:<threadId>` |
 | Sidebar glyph | a content script's `experimental_setThreadRowStatus`, fed by an `experimental_appOverlay` that owns the rpc + realtime subscription |

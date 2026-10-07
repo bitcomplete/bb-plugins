@@ -30,7 +30,6 @@ Set these with `bb plugin config thread-briefs set <key> <value>`.
 | `apiKey` | _(unset, secret)_ | Bearer token for that endpoint. The plugin reports `needs-configuration` until it is set here or in the [server's environment](#deployment-wide-defaults). |
 | `model` | `gpt-4o-mini` | Model used for summarizing. Any small instruction-following model works. |
 | `jsonMode` | `true` | Send `response_format: {type: "json_object"}`. Turn **off** for endpoints that reject it (many local servers do). |
-| `quietSeconds` | `120` | How long a thread must be quiet before it is **re**-summarized. A thread's first brief does not wait for it — see [When a brief is regenerated](#when-a-brief-is-regenerated). |
 | `refresherIdleHours` | `8` | Idle hours before opening a thread shows the re-entry refresher above the composer. `0` turns it off. See [The re-entry refresher](#the-re-entry-refresher). |
 | `renameThreads` | `false` | `true` renames each thread to the short name its brief chose. See [Thread titles](#thread-titles). |
 | `doneStaleHours` | `24` | Idle hours after which a `done` thread's ring goes grey instead of taking its project's colour. `0` keeps every done ring coloured. See [Stale done threads](#stale-done-threads). |
@@ -81,9 +80,14 @@ does; on a build that predates this, run `unset` instead of clearing the field.
 
 ## When a brief is regenerated
 
-1. `thread.idle` fires at every turn boundary and starts a `quietSeconds`
-   debounce for that thread. `thread.active` cancels it — a thread mid-burst is
-   not summarized until the burst stops.
+1. `thread.idle` fires at every turn boundary and the thread is summarized at
+   once — there is no quiet period. If a summary of that thread is still in
+   flight from the previous turn boundary, it is aborted and the thread is
+   summarized again from the newer transcript: the last turn boundary wins, and
+   the brief that lands is never older than the thread it describes.
+   `thread.active` does not cancel anything — a running summary describes a real
+   turn boundary and is left to finish; the turn that just started supersedes
+   it when it ends.
 2. A `*/10 * * * *` sweep is the backstop for activity whose `thread.idle` never
    arrived (server restart, plugin reload, a turn that ended in `error`). It only
    enqueues threads whose stored cursor is behind the thread's own.
@@ -91,28 +95,28 @@ does; on a build that predates this, run `unset` instead of clearing the field.
    `conversationOutline().maxSeq` against `lastActivitySeen` and skips threads
    that have not actually moved.
 
-Re-summarize is available in the Brief panel; it bypasses the debounce.
+Summaries run one at a time, so on a server with many threads finishing at
+once a brief can queue behind the others. The panel says **Summarizing…** while
+it waits. An aborted request may still be billed for its input by the
+provider; that is the cost of briefs that follow the turn rather than a timer.
 
-### The first brief does not wait
+Re-summarize is available in the Brief panel; it runs even when the thread has
+not moved.
 
-A thread with **no brief yet** is on a 5-second delay instead of `quietSeconds`,
-and is summarized from `thread.active` — while its first turn is still
-running — rather than waiting for that turn to end:
+### The first brief does not wait for the turn
 
-- The quiet period exists to stop a thread in active back-and-forth being
-  re-summarized every turn. On the first brief there is nothing to protect, and
-  it is the cheapest summary that thread will ever cost, because the transcript
-  is at its shortest.
-- It is also where the absence shows: until the first brief lands there is no row
+A thread with **no brief yet** is summarized from `thread.active` — while its
+first turn is still running — rather than waiting for that turn to end:
+
+- It is where the absence shows: until the first brief lands there is no row
   glyph, no sidebar section, an empty Brief panel, and bb's opening-prompt title
   still on the thread. An agentic first turn can run for ten minutes, and waiting
   for it means the thread spends all ten looking like one the plugin has never
   heard of.
+- It is the cheapest summary that thread will ever cost, because the transcript
+  is at its shortest.
 - The opening prompt alone is enough for a goal, a `discovery` ring and a
   sidebar section. Every field is corrected by the summary that follows the turn.
-
-The delay is capped at `quietSeconds`, so setting that below five seconds makes
-first briefs faster rather than slower.
 
 With `renameThreads` on, a pre-turn brief renames the thread **only if bb never
 named it** — a null `title`, where the sidebar falls back to the opening prompt
@@ -148,8 +152,8 @@ re-enqueued on every sweep forever — an unbounded burst of requests across the
 whole thread list the first time a key is configured, and an endless retry for
 any thread whose summary keeps failing.
 
-So a thread reports `summarizing` only while work is genuinely debounced,
-queued, or in flight; otherwise it reports `absent`, which the UI renders as an
+So a thread reports `summarizing` only while work is genuinely queued or in
+flight; otherwise it reports `absent`, which the UI renders as an
 offer rather than a spinner. A failed summary drops back to `absent`.
 
 ## Stage and status
@@ -765,10 +769,9 @@ no preference writes.
   baseUrl` (and `unset model` if it is blank too) restores the deployment's
   value; current builds treat the blank as unset on their own.
 - A brief that describes work already finished: read the **Summarized …** line
-  under the status. Briefs are only rewritten after `quietSeconds` of quiet, so
-  one that predates the last few turns is expected rather than broken;
-  **Re-summarize** forces it. Note this does not apply to a *first* brief, which
-  does not wait.
+  under the status. A brief is rewritten at every turn boundary, so one that
+  predates the last turn is only expected while that summary is still running
+  (the panel says **Summarizing…**); **Re-summarize** forces one otherwise.
 - A brand-new thread whose brief reads as though the work has not started: also
   expected. That is the pre-turn brief, written from the opening prompt while the
   first turn runs, and the summary after that turn replaces it.

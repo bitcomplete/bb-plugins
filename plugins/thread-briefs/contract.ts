@@ -289,8 +289,7 @@ export type ResolvedBrief = z.infer<typeof resolvedBriefSchema>;
 /**
  * What the frontend sees for one thread.
  *
- * `summarizing` means work is genuinely pending — debounced, queued, or in
- * flight. `absent` means there is no brief and none is coming, which is the
+ * `summarizing` means work is genuinely pending — queued or in flight. `absent` means there is no brief and none is coming, which is the
  * normal state for a thread that was already dormant when the plugin arrived:
  * briefs are not backfilled, so the UI offers to make one on demand rather
  * than claiming a summary is on its way.
@@ -464,7 +463,7 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: briefStateSchema,
   },
-  /** Queue an immediate re-summary, bypassing the quiet-period debounce. */
+  /** Queue a re-summary even if the thread has not moved since the last one. */
   refresh: {
     input: z.object({ threadId: z.string().min(1) }).strict(),
     output: z.object({ queued: z.boolean() }).strict(),

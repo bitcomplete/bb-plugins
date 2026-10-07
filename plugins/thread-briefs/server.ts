@@ -56,27 +56,6 @@ import {
 
 /** Cap on one summarizer call, so a hung endpoint cannot stall the queue. */
 const REQUEST_TIMEOUT_MS = 60_000;
-/**
- * Delay before a thread's **first** brief, in place of `quietSeconds`.
- *
- * The quiet period exists to stop a thread in active back-and-forth being
- * re-summarized every turn. On the first brief there is nothing to protect —
- * and that is when the absence shows most: no row glyph, no sidebar section, an
- * empty Brief panel, and bb's opening-prompt title still on the thread. It is
- * also the cheapest summary that thread will ever cost, because the transcript
- * is at its shortest.
- *
- * Long enough to coalesce a thread that goes idle and straight back to work,
- * short enough that the panel's "Summarizing…" arrives while you are looking.
- */
-const FIRST_BRIEF_DELAY_MS = 5_000;
-
-/**
- * The first-brief delay, never longer than the quiet period it stands in for —
- * a `quietSeconds` tuned below it is asking for briefs sooner, not later.
- */
-const firstBriefDelayMs = (quietMs: number) =>
-  Math.min(FIRST_BRIEF_DELAY_MS, quietMs);
 /** Backstop sweep: catches activity whose `thread.idle` we never saw. */
 const SWEEP_CRON = "*/10 * * * *";
 /** Threads considered per sweep, newest first. */
@@ -172,11 +151,6 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "Send response_format json_object. Turn off for endpoints that reject it. The deployment's THREAD_BRIEFS_JSON_MODE sets the default.",
       default: envDefaults.jsonMode,
-    },
-    quietSeconds: {
-      type: "number",
-      label: "Quiet period before summarizing (seconds)",
-      default: 120,
     },
     refresherIdleHours: {
       type: "number",
@@ -308,8 +282,13 @@ export default async function plugin(bb: BbPluginApi) {
    * backfilled.
    */
   const loadedAt = Date.now();
-  /** Per-thread debounce timers: the thread must stay quiet to be summarized. */
-  const debounces = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Aborts the summary the worker is running right now. A later turn boundary
+   * on the same thread trips it: the brief it was about to write describes a
+   * state the thread has already left, so it is dropped and the thread is
+   * summarized again from the newer transcript. See {@link supersede}.
+   */
+  let inFlightRun: AbortController | null = null;
   /** Threads waiting for the single worker, in arrival order. */
   const queue: string[] = [];
   /** Threads to summarize even when the activity cursor has not moved. */
@@ -326,7 +305,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Whether a summary for this thread is genuinely pending or running. */
   const isPending = (threadId: string) =>
-    debounces.has(threadId) || queue.includes(threadId) || inFlight === threadId;
+    queue.includes(threadId) || inFlight === threadId;
 
   const enqueue = (threadId: string) => {
     if (!queue.includes(threadId)) queue.push(threadId);
@@ -334,28 +313,20 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /**
-   * Debounce a thread. `thread.idle` fires on every turn boundary, so a thread
-   * in active back-and-forth would otherwise be re-summarized every turn; we
-   * want the brief written once the burst has actually stopped.
+   * Summarize a thread now, dropping any summary of it still in flight.
+   *
+   * There is no quiet period. `thread.idle` fires at every turn boundary and
+   * each one starts a summary at once, so the brief, ring and status follow
+   * the turn by the length of one summarizer call rather than by a timer. A
+   * thread in quick back-and-forth is protected the other way round: a turn
+   * that ends while its predecessor's summary is still running aborts that
+   * request — its result was going to be stale on arrival — and the newest
+   * transcript is summarized instead. The last turn boundary always wins, and
+   * the brief that lands is never older than the thread it describes.
    */
-  const scheduleSummary = (threadId: string, delayMs: number) => {
-    const existing = debounces.get(threadId);
-    if (existing !== undefined) clearTimeout(existing);
-    const timer = setTimeout(() => {
-      debounces.delete(threadId);
-      enqueue(threadId);
-    }, delayMs);
-    // Never hold the process open for a brief.
-    timer.unref?.();
-    debounces.set(threadId, timer);
-  };
-
-  const cancelSummary = (threadId: string) => {
-    const existing = debounces.get(threadId);
-    if (existing !== undefined) {
-      clearTimeout(existing);
-      debounces.delete(threadId);
-    }
+  const supersede = (threadId: string) => {
+    if (inFlight === threadId) inFlightRun?.abort();
+    enqueue(threadId);
   };
 
   async function drain() {
@@ -369,13 +340,22 @@ export default async function plugin(bb: BbPluginApi) {
         const force = forced.delete(threadId);
         const beforeFirstTurn = preTurn.delete(threadId);
         inFlight = threadId;
+        const run = new AbortController();
+        inFlightRun = run;
         try {
-          const changed = await summarizeThread(threadId, { force, beforeFirstTurn });
+          const changed = await summarizeThread(threadId, {
+            force,
+            beforeFirstTurn,
+            signal: run.signal,
+          });
           if (changed) {
             wrote = true;
             announce();
           }
         } catch (error) {
+          // Superseded by a later turn boundary, and already re-queued: not a
+          // failure, and not worth a line in the log.
+          if (run.signal.aborted) continue;
           bb.log.warn(
             `brief for ${threadId} failed: ${
               error instanceof Error ? error.message : String(error)
@@ -383,6 +363,7 @@ export default async function plugin(bb: BbPluginApi) {
           );
         } finally {
           inFlight = null;
+          inFlightRun = null;
           // The thread drops back to `absent` on failure, so the UI stops
           // saying "summarizing" and offers an explicit retry instead.
           announce();
@@ -505,7 +486,11 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function summarizeThread(
     threadId: string,
-    { force, beforeFirstTurn }: { force: boolean; beforeFirstTurn: boolean },
+    {
+      force,
+      beforeFirstTurn,
+      signal: superseded,
+    }: { force: boolean; beforeFirstTurn: boolean; signal: AbortSignal },
   ): Promise<boolean> {
     const thread = await bb.sdk.threads
       .get({ threadId })
@@ -562,7 +547,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
 
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const signal = AbortSignal.any([timeout, lifetime.signal]);
+    const signal = AbortSignal.any([timeout, lifetime.signal, superseded]);
     const reply = await requestSummary(
       config,
       buildUserPrompt({
@@ -575,6 +560,9 @@ export default async function plugin(bb: BbPluginApi) {
       }),
       signal,
     );
+    // The request can return in the same tick the abort lands. A superseded
+    // summary writes nothing: a newer one is already queued behind it.
+    if (superseded.aborted) return false;
     const summary = parseSummary(reply, stagePin.value);
 
     // A thread bb has already named waits for its first turn to end before this
@@ -784,7 +772,6 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     refresh: ({ threadId }) => {
-      cancelSummary(threadId);
       // An explicit Re-summarize is a full brief, title included, even if a
       // pre-turn one was already queued for this thread.
       preTurn.delete(threadId);
@@ -827,7 +814,6 @@ export default async function plugin(bb: BbPluginApi) {
    * `summarizeThread` would otherwise decide there is nothing new to say.
    */
   const rewriteRefresher = (threadId: string) => {
-    cancelSummary(threadId);
     forced.add(threadId);
     enqueue(threadId);
   };
@@ -1092,42 +1078,29 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.idle", ({ thread }) => {
     // A turn boundary has been reached, so whatever we write now is a real
-    // brief and may name the thread.
+    // brief and may name the thread — including a pre-turn brief still in
+    // flight, which `supersede` aborts and this re-queues as a post-turn one.
     preTurn.delete(thread.id);
-    void (async () => {
-      const values = await settings.get();
-      // A thread with no brief yet skips the quiet period: nothing is being
-      // protected from re-summarizing, and the empty state is what makes the
-      // plugin feel unresponsive. See {@link FIRST_BRIEF_DELAY_MS}.
-      const quietMs = Math.max(1, values.quietSeconds) * 1000;
-      const first = (await readBrief(thread.id)) === null;
-      scheduleSummary(thread.id, first ? firstBriefDelayMs(quietMs) : quietMs);
-    })();
+    supersede(thread.id);
   });
 
   bb.events.on("thread.active", ({ thread }) => {
-    // A summary already pending on this thread was scheduled by a `thread.idle`,
-    // so a turn has ended and its brief is entitled to name the thread. Read
-    // before the cancel below clears it.
-    const afterATurn = isPending(thread.id);
-    // A thread that started running again is not quiet; let the next idle
-    // restart its debounce rather than summarizing mid-turn.
-    cancelSummary(thread.id);
+    // A summary already running or queued was started by a `thread.idle`. It
+    // describes a real turn boundary, so it is left to finish: the turn that
+    // just started will supersede it when it ends.
+    if (isPending(thread.id)) return;
     if (thread.visibility === "hidden") return;
     void (async () => {
-      const values = await settings.get();
-      if (!hasApiKey(values)) return;
-      // Except on a thread with no brief at all: the opening prompt is enough
-      // for a goal, a discovery-stage ring and a sidebar section, and waiting
-      // for the turn to end means a long first turn spends its whole length
-      // looking like a thread the plugin has never heard of. Every field is
-      // corrected by the summary that follows the turn.
+      if (!hasApiKey(await settings.get())) return;
+      // A thread that already has a brief is not summarized mid-turn. One with
+      // no brief at all is: the opening prompt is enough for a goal, a
+      // discovery-stage ring and a sidebar section, and waiting for the turn
+      // to end means a long first turn spends its whole length looking like a
+      // thread the plugin has never heard of. Every field is corrected by the
+      // summary that follows the turn.
       if ((await readBrief(thread.id)) !== null) return;
-      if (!afterATurn) preTurn.add(thread.id);
-      scheduleSummary(
-        thread.id,
-        firstBriefDelayMs(Math.max(1, values.quietSeconds) * 1000),
-      );
+      preTurn.add(thread.id);
+      enqueue(thread.id);
     })();
   });
 
@@ -1138,7 +1111,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.deleted", ({ thread }) => {
-    cancelSummary(thread.id);
+    if (inFlight === thread.id) inFlightRun?.abort();
     preTurn.delete(thread.id);
     void deleteBrief(thread.id).then(announce);
   });
@@ -1156,14 +1129,12 @@ export default async function plugin(bb: BbPluginApi) {
     if (!hasApiKey(values)) return;
 
     const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
-    const quietBefore = Date.now() - Math.max(1, values.quietSeconds) * 1000;
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;
       if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
       if (thread.status === "active" || thread.status === "starting") continue;
-      if (thread.updatedAt > quietBefore) continue;
-      if (debounces.has(thread.id) || queue.includes(thread.id)) continue;
+      if (isPending(thread.id)) continue;
 
       const stored = await readBrief(thread.id);
       if (stored === null) {
@@ -1276,8 +1247,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(() => {
     lifetime.abort();
-    for (const timer of debounces.values()) clearTimeout(timer);
-    debounces.clear();
     if (sectionTimer !== null) clearTimeout(sectionTimer);
     queue.length = 0;
     forced.clear();

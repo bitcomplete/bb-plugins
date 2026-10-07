@@ -35,6 +35,37 @@ const thread = makeThreadResponse({
   status: "idle",
 });
 
+/**
+ * A completion that does not answer until released, and rejects when its
+ * request is aborted — the part of `fetch` the supersede path depends on.
+ */
+function slowCompletion(body: unknown) {
+  const pending: (() => void)[] = [];
+  const fn = vi.fn(
+    (_url: string, init: RequestInit) =>
+      new Promise<Response>((resolve, reject) => {
+        const signal = init.signal!;
+        const fail = () => reject(signal.reason ?? new Error("aborted"));
+        if (signal.aborted) {
+          fail();
+          return;
+        }
+        signal.addEventListener("abort", fail, { once: true });
+        pending.push(() =>
+          resolve(
+            new Response(
+              JSON.stringify({
+                choices: [{ message: { content: JSON.stringify(body) } }],
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          ),
+        );
+      }),
+  );
+  return { fn, release: (index: number) => pending[index]!() };
+}
+
 function host(options: { fetch: ReturnType<typeof fakeCompletion> }) {
   globalThis.fetch = options.fetch as unknown as typeof globalThis.fetch;
   return createFakePluginHost({
@@ -44,7 +75,6 @@ function host(options: { fetch: ReturnType<typeof fakeCompletion> }) {
       baseUrl: "https://api.test/v1",
       model: "test-model",
       jsonMode: true,
-      quietSeconds: 120,
     },
     sdk: {
       threads: {
@@ -283,13 +313,13 @@ describe("summarizing", () => {
     expect(JSON.parse(String(init.body)).model).toBe("test-model");
   });
 
-  it("does not summarize a thread with a brief the moment it goes idle", async () => {
+  it("re-summarizes a thread with a brief the moment it goes idle", async () => {
     const fetchMock = fakeCompletion(SUMMARY);
     current = host({ fetch: fetchMock });
     await plugin(current.bb);
-    // Behind the thread's cursor, so only the quiet period is holding it back.
+    // Behind the thread's cursor: a turn has happened since this brief.
     await current.bb.storage.kv.set("brief:thr_1", {
-      ...storedBrief("thr_1", {}),
+      ...storedBrief("thr_1", { goal: "stale" }),
       lastActivitySeen: 5,
     });
 
@@ -297,29 +327,106 @@ describe("summarizing", () => {
       thread,
       lastAssistantText: "done",
     });
-    // The quiet period has to elapse first.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(fetchMock).not.toHaveBeenCalled();
+    // No quiet period: the brief follows the turn by one summarizer call.
+    const stored = await waitFor(async () => {
+      const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      return row?.lastActivitySeen === 12 ? row : null;
+    });
+    expect(stored.fields.goal).toBe(SUMMARY.goal);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   /**
-   * The first brief skips the quiet period, and arrives before the first turn
-   * has even finished. Timers are faked because the delays involved are seconds,
-   * and asserted on `fetch` rather than by polling: under fake timers the poll
-   * in {@link waitFor} would never tick.
+   * The protection against re-summarizing a busy thread every turn is not a
+   * delay but a cancel: a turn boundary that arrives while the previous one's
+   * summary is still running aborts that request and starts over.
+   */
+  describe("a later turn boundary", () => {
+    const seeded = async () => {
+      await current!.bb.storage.kv.set("brief:thr_1", {
+        ...storedBrief("thr_1", { goal: "stale" }),
+        lastActivitySeen: 5,
+      });
+    };
+    const idle = () =>
+      current!.harness.behavior.emitThreadEvent("thread.idle", {
+        thread,
+        lastAssistantText: "done",
+      });
+    const requests = (fn: ReturnType<typeof vi.fn>, n: number) =>
+      waitFor(async () => (fn.mock.calls.length >= n ? true : null));
+
+    it("aborts the summary it overtook and summarizes again", async () => {
+      const slow = slowCompletion(SUMMARY);
+      current = host({ fetch: slow.fn });
+      await plugin(current.bb);
+      await seeded();
+
+      await idle();
+      await requests(slow.fn, 1);
+      const first = (slow.fn.mock.calls[0]![1] as RequestInit).signal!;
+      expect(first.aborted).toBe(false);
+
+      await idle();
+      await requests(slow.fn, 2);
+      expect(first.aborted).toBe(true);
+      // The overtaken run wrote nothing.
+      const between = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      expect(between?.fields.goal).toBe("stale");
+
+      slow.release(1);
+      const stored = await waitFor(async () => {
+        const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+        return row?.lastActivitySeen === 12 ? row : null;
+      });
+      expect(stored.fields.goal).toBe(SUMMARY.goal);
+      expect(slow.fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("is the only thing that cancels: a new turn starting does not", async () => {
+      const slow = slowCompletion(SUMMARY);
+      current = host({ fetch: slow.fn });
+      await plugin(current.bb);
+      await seeded();
+
+      await idle();
+      await requests(slow.fn, 1);
+      // The thread picks up again. The running summary describes a real turn
+      // boundary, so it is left to land; the turn that just started will
+      // supersede it when it ends.
+      await current.harness.behavior.emitThreadEvent("thread.active", { thread });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const first = (slow.fn.mock.calls[0]![1] as RequestInit).signal!;
+      expect(first.aborted).toBe(false);
+
+      slow.release(0);
+      const stored = await waitFor(async () => {
+        const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+        return row?.lastActivitySeen === 12 ? row : null;
+      });
+      expect(stored.fields.goal).toBe(SUMMARY.goal);
+      expect(slow.fn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * The first brief arrives before the first turn has even finished. Timers
+   * are faked so the queue drains deterministically, and the tests assert on
+   * `fetch` rather than by polling: under fake timers the poll in
+   * {@link waitFor} would never tick.
    */
   describe("the first brief", () => {
     afterEach(() => {
       vi.useRealTimers();
     });
 
-    /** Let the debounce fire and the queue drain. */
+    /** Let the queue drain. */
     const settle = async (ms: number) => {
       await vi.advanceTimersByTimeAsync(ms);
       await vi.advanceTimersByTimeAsync(0);
     };
 
-    it("skips the quiet period when the thread has no brief", async () => {
+    it("is written as soon as the thread goes idle", async () => {
       const fetchMock = fakeCompletion(SUMMARY);
       current = host({ fetch: fetchMock });
       await plugin(current.bb);
@@ -329,8 +436,7 @@ describe("summarizing", () => {
         thread,
         lastAssistantText: "done",
       });
-      // Well inside the 120s quiet period this host is configured with.
-      await settle(6_000);
+      await settle(0);
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
@@ -389,7 +495,7 @@ describe("summarizing", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it("cancels a pending first brief when the thread starts running again", async () => {
+    it("is not written twice when the thread starts running again", async () => {
       const fetchMock = fakeCompletion(SUMMARY);
       current = host({ fetch: fetchMock });
       await plugin(current.bb);
@@ -399,13 +505,10 @@ describe("summarizing", () => {
         thread,
         lastAssistantText: "done",
       });
-      await vi.advanceTimersByTimeAsync(2_000);
+      // The post-turn brief is already pending, so `thread.active` does not
+      // queue a pre-turn one on top of it.
       await current.harness.behavior.emitThreadEvent("thread.active", { thread });
-      // The timer restarts from the new event rather than firing at 5s.
-      await settle(3_500);
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      await settle(2_000);
+      await settle(0);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
@@ -508,7 +611,7 @@ describe("summarizing", () => {
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
     current = createFakePluginHost({
       pluginId: "thread-briefs",
-      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1" },
       sdk: {
         threads: {
           get: async () => old,
@@ -554,8 +657,7 @@ describe("summarizing", () => {
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
     current = createFakePluginHost({
       pluginId: "thread-briefs",
-      // A 1s quiet period keeps the test fast.
-      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1" },
       sdk: {
         threads: {
           get: async () => sweepThread,
@@ -573,21 +675,21 @@ describe("summarizing", () => {
     }) as typeof current;
     await plugin(current!.bb);
 
-    // Activity just after load, then let the quiet period elapse.
+    // Activity just after load, whose `thread.idle` never arrived.
     sweepThread = makeThreadResponse({
       id: "thr_live",
       status: "idle",
       updatedAt: Date.now() + 5,
     });
-    await new Promise((resolve) => setTimeout(resolve, 1200));
 
     await current!.harness.behavior.runSchedule("brief-sweep");
     await waitFor(async () => (fetchMock.mock.calls.length > 0 ? true : null));
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves a thread still inside its quiet period alone", async () => {
-    // `thread` defaults to updatedAt = now, so the sweep must not touch it.
+  it("leaves a briefless thread whose activity predates load alone", async () => {
+    // `thread` was built before the plugin loaded, so the sweep must not
+    // backfill it.
     const fetchMock = fakeCompletion(SUMMARY);
     current = host({ fetch: fetchMock });
     await plugin(current.bb);
@@ -697,7 +799,6 @@ describe("the auto-archive sweep", () => {
         apiKey: "test-key",
         baseUrl: "https://api.test/v1",
         model: "test-model",
-        quietSeconds: 120,
         doneArchiveHours: options.doneArchiveHours ?? 48,
       },
       sdk: {
@@ -914,7 +1015,6 @@ describe("status override", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
       },
       sdk: {
         threads: {
@@ -1100,7 +1200,6 @@ describe("sidebar grouping by status", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         sidebarGrouping: options.grouping ?? "status",
       },
       sdk: {
@@ -1519,7 +1618,6 @@ describe("renaming threads", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         renameThreads: options.renameThreads ?? true,
       },
       sdk: {
@@ -1787,7 +1885,6 @@ describe("re-entry refresher", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         refresherIdleHours: options.refresherIdleHours ?? 1,
       },
       sdk: {
