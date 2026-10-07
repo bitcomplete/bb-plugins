@@ -13,10 +13,10 @@
 
 export const UPDATE_PATH = "/_bb-gate/update";
 export const POLL_MS = 60_000;
-export const RESTART_POLL_MS = 3_000;
-// A restart that has not come back by then is not one the banner can
-// explain; reload and let the gate's starting page take over.
-export const RESTART_TIMEOUT_MS = 4 * 60_000;
+export const RESTART_POLL_MS = 500;
+// A restart the Deployment has not reported within this long is not one the
+// banner can explain; reload anyway and let the gate sort it out.
+export const RESTART_TIMEOUT_MS = 15_000;
 
 export type UpdateState =
   | { status: "unknown" }
@@ -24,8 +24,8 @@ export type UpdateState =
   | { status: "unavailable" }
   | { status: "current" }
   | { status: "pending" }
-  // The developer pressed the button; the server is going down and coming
-  // back, and the page reloads when it has.
+  // The developer pressed the button; the page reloads as soon as the
+  // server has gone down, onto the gate's starting page.
   | { status: "restarting" }
   | { status: "error"; message: string };
 
@@ -48,7 +48,7 @@ export interface UpdateStore {
   subscribe(listener: () => void): () => void;
   /** Ask the router now, outside the poll. */
   refresh(): Promise<void>;
-  /** POST the update and follow the restart until the server is back. */
+  /** POST the update and reload once the server has gone down. */
   apply(): Promise<void>;
 }
 
@@ -106,19 +106,24 @@ export function createUpdateStore(deps: UpdateStoreDeps): UpdateStore {
     schedule();
   };
 
-  // Follow the restart: the Deployment reports not-ready once the old pod
-  // is gone, then ready when the new one answers. Reload on ready after
-  // not-ready, or when the clock runs out.
+  // Follow the restart only as far as its first step: the Deployment
+  // reports not-ready as soon as the old pod is gone, and from then on the
+  // router answers a page load with its starting page, which reloads itself
+  // until the new pod is up. Handing over to that page right away is the
+  // point: a bb whose server has just left is a dead UI, every request and
+  // socket failing, and there is nothing it could show that is better than
+  // the gate's own page.
+  //
+  // Waiting for not-ready, rather than reloading at once, keeps the reload
+  // from landing on the old pod in its last moments and loading the full
+  // app only to lose it again.
   const follow = async () => {
     const started = deps.now();
-    let wentDown = false;
     while (deps.now() - started < RESTART_TIMEOUT_MS) {
       await new Promise<void>((resolve) => deps.setTimeout(resolve, RESTART_POLL_MS));
       try {
         const s = await get();
-        if (s === "unavailable") break;
-        if (!s.ready) wentDown = true;
-        else if (wentDown) break;
+        if (s === "unavailable" || !s.ready) break;
       } catch {
         // The router itself is briefly away, or the gateway is; keep waiting.
       }
@@ -132,6 +137,14 @@ export function createUpdateStore(deps: UpdateStoreDeps): UpdateStore {
     try {
       const r = await deps.fetch(UPDATE_PATH, { method: "POST", headers: { Accept: "application/json" } });
       if (!r.ok) throw new Error(`bb-gate answered ${r.status}`);
+      const { applied } = (await r.json().catch(() => ({}))) as { applied?: unknown };
+      if (applied === false) {
+        // Nothing to apply after all: the server was already current, or
+        // the quiet window got there first. Nothing restarts, so do not
+        // wait for it to.
+        set({ status: "current" });
+        return;
+      }
     } catch (e) {
       set({ status: "error", message: e instanceof Error ? e.message : String(e) });
       return;
