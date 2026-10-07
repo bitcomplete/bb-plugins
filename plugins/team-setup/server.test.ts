@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
-import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LOGIN_TTL_MS } from "./server.js";
+import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS } from "./server.js";
 
 // A gh whose `auth login` the test drives: print lines, then exit.
 function fakeGh(runs: Record<string, GhResult> = {}) {
@@ -43,6 +43,7 @@ interface World {
   builtInGit?: { status: string; statusMessage: string };
   pool?: unknown;
   devbox?: unknown;
+  linear?: unknown;
   hosts?: Array<{ name: string }>;
   runs?: Record<string, GhResult>;
   settings?: Record<string, string>;
@@ -52,7 +53,7 @@ async function setup(world: World = {}) {
   const gh = fakeGh(world.runs);
   const { bb, harness } = createFakePluginHost({ pluginId: "team-setup", settings: world.settings ?? {} });
   harness.sdk.stub("plugins.list", async () => ({
-    plugins: (world.plugins ?? [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }]).map((p) => ({ ...p, name: p.id })),
+    plugins: (world.plugins ?? [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }, { id: LINEAR_ID, enabled: true }]).map((p) => ({ ...p, name: p.id })),
   }));
   harness.sdk.stub("system.machineEnvironment", async () => ({
     builtInGit: world.builtInGit ?? { status: "not logged in", statusMessage: "gh is not logged in on the server" },
@@ -78,6 +79,8 @@ async function setup(world: World = {}) {
       [`${ACCOUNT_POOL_ID}:codexLogin.cancel`]: { cancelled: true },
       [`${DEVBOX_ID}:status`]: world.devbox ?? { connected: false, project: null },
       [`${DEVBOX_ID}:connect`]: { url: "https://devbox.example/connect/authorize?state=s" },
+      [`${LINEAR_ID}:status`]: world.linear ?? { connected: false, configured: true, user: null, organization: null },
+      [`${LINEAR_ID}:connect`]: { url: "https://linear.example/oauth/authorize?state=s" },
     };
     if (!(key in answers)) throw new Error(`no answer for ${key}`);
     return args.outputSchema.parse(answers[key]);
@@ -92,8 +95,9 @@ declare function statusType(): Promise<{
   ai: { available: boolean; message: string | null; accounts: Array<{ label: string }> };
   github: { status: string; login: string | null; orgMember: boolean | null; pending: { code: string; url: string } | null; lastError: string | null };
   devbox: { available: boolean; connected: boolean; project: string | null; message: string | null };
+  linear: { available: boolean; connected: boolean; configured: boolean; user: string | null; organization: string | null; message: string | null };
   machines: { names: string[] };
-  steps: { ai: string; github: string; devbox: string; machine: string };
+  steps: { ai: string; github: string; devbox: string; linear: string; machine: string };
   complete: boolean;
 }>;
 
@@ -106,7 +110,7 @@ describe("status", () => {
   it("starts with everything to do", async () => {
     const { status } = await setup();
     const s = await status();
-    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", machine: "todo" });
+    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "todo", machine: "todo" });
     expect(s.complete).toBe(false);
     expect(s.github.login).toBeNull();
   });
@@ -116,12 +120,14 @@ describe("status", () => {
       builtInGit: { status: "logged in", statusMessage: "ok" },
       pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
       devbox: { connected: true, project: "dylan" },
+      linear: { connected: true, configured: true, user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
       hosts: [{ name: "box" }],
       runs: signedIn,
     });
     const s = await status();
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", linear: "done", machine: "done" });
     expect(s.complete).toBe(true);
+    expect(s.linear).toMatchObject({ connected: true, user: "jane", organization: "Acme" });
     expect(s.github.login).toBe("octocat");
     expect(s.github.orgMember).toBe(true);
     // Identity is cached between status calls.
@@ -146,8 +152,15 @@ describe("status", () => {
     const s = await status();
     expect(s.devbox.available).toBe(false);
     expect(s.devbox.message).toContain("turned off");
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", machine: "done" });
     expect(s.complete).toBe(true);
+  });
+
+  it("does not ask the developer to connect Linear while the server has no OAuth client ID", async () => {
+    const { status } = await setup({ linear: { connected: false, configured: false, user: null, organization: null } });
+    const s = await status();
+    expect(s.steps.linear).toBe("unavailable");
+    expect(s.linear).toMatchObject({ available: true, configured: false });
   });
 
   it("warns about an account outside the organization", async () => {
@@ -266,6 +279,11 @@ describe("Account Pool and devbox flows", () => {
     expect(await harness.callRpc("devboxConnect", null)).toEqual({ url: "https://devbox.example/connect/authorize?state=s" });
   });
 
+  it("starts Linear's connect", async () => {
+    const { harness } = await setup();
+    expect(await harness.callRpc("linearConnect", null)).toEqual({ url: "https://linear.example/oauth/authorize?state=s" });
+  });
+
   it("reports a plugin that does not answer", async () => {
     const { harness, status } = await setup();
     harness.sdk.stub("plugins.callRpc", async () => {
@@ -275,5 +293,6 @@ describe("Account Pool and devbox flows", () => {
     expect(s.ai.available).toBe(false);
     expect(s.ai.message).toContain("boom");
     expect(s.devbox.available).toBe(false);
+    expect(s.linear.available).toBe(false);
   });
 });

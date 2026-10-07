@@ -211,7 +211,7 @@ function Checklist({ compact }: { compact: boolean }) {
     return <p className="text-sm text-muted-foreground">{error ?? "Checking…"}</p>;
   }
 
-  const { ai, github, devbox, machines, steps } = status;
+  const { ai, github, devbox, linear, machines, steps } = status;
 
   if (compact && complete) {
     const aiLabel = ai.accounts
@@ -223,6 +223,7 @@ function Checklist({ compact }: { compact: boolean }) {
         All set: {aiLabel !== "" ? `${aiLabel}; ` : ""}
         {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
         {devbox.project !== null ? `devbox project ${devbox.project}; ` : steps.devbox === "done" ? "devbox; " : ""}
+        {linear.user !== null ? `Linear as ${linear.user}; ` : steps.linear === "done" ? "Linear; " : ""}
         {machines.names.length === 1 ? "1 machine" : `${machines.names.length} machines`}.{" "}
         <SettingsLink pluginId="team-setup">Details</SettingsLink>
       </p>
@@ -413,6 +414,36 @@ function Checklist({ compact }: { compact: boolean }) {
             <p>Connected{devbox.project !== null ? ` to project ${devbox.project}` : ""}.</p>
           ) : (
             <p>Connect your devbox project so bb can create machines in it. You approve it on devbox, which sends you back here.</p>
+          )}
+        </Step>
+
+        <Step
+          state={steps.linear}
+          title="Linear"
+          action={
+            linear.available && linear.configured && !linear.connected ? (
+              <Button size="sm" disabled={busy !== null} onClick={() => void run("linear", async () => {
+                const { url } = await rpc.call("linearConnect");
+                open(url);
+              })}>
+                Connect Linear
+              </Button>
+            ) : null
+          }
+        >
+          {!linear.available ? (
+            <p>{linear.message ?? "Linear is unavailable."} <SettingsLink pluginId="linear">Linear settings</SettingsLink></p>
+          ) : !linear.configured ? (
+            <p>
+              No Linear OAuth client ID is set on this server, so there is nothing to connect yet.{" "}
+              <SettingsLink pluginId="linear">Linear settings</SettingsLink>
+            </p>
+          ) : linear.connected ? (
+            <p>
+              Connected{linear.user !== null ? ` as ${linear.user}` : ""}{linear.organization !== null ? ` in ${linear.organization}` : ""}. Threads read and update issues as you.
+            </p>
+          ) : (
+            <p>Connect your Linear account so threads can read and update issues as you. You approve it on Linear, which sends you back here.</p>
           )}
         </Step>
 

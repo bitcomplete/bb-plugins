@@ -9,6 +9,7 @@
 //            built-in row), so the step is a headless `gh auth login`.
 //   devbox   devbox-provider's connection. Started here, finished by its own
 //            callback.
+//   Linear   the linear plugin's connection, the same shape as devbox's.
 //   machine  Any machine at all. Created from devbox-provider's section.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -24,6 +25,7 @@ import {
 
 export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
+export const LINEAR_ID = "linear";
 export const CHANGED = "changed";
 
 // GitHub device codes last 15 minutes; gh gives up itself around then.
@@ -74,8 +76,16 @@ export const rpcContract = defineRpcContract({
         connected: z.boolean(),
         project: z.string().nullable(),
       }),
+      linear: z.object({
+        available: z.boolean(),
+        message: z.string().nullable(),
+        connected: z.boolean(),
+        configured: z.boolean(),
+        user: z.string().nullable(),
+        organization: z.string().nullable(),
+      }),
       machines: z.object({ names: z.array(z.string()) }),
-      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, machine: stepStateSchema }),
+      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, machine: stepStateSchema }),
       complete: z.boolean(),
     }),
   },
@@ -108,6 +118,8 @@ export const rpcContract = defineRpcContract({
   codexCancel: { input: z.object({ sessionId: z.string() }).strict(), output: z.object({ ok: z.boolean() }) },
   // devbox: devbox-provider's connect; its callback finishes the job.
   devboxConnect: { input: z.null(), output: z.object({ url: z.string() }) },
+  // Linear: the linear plugin's connect, likewise.
+  linearConnect: { input: z.null(), output: z.object({ url: z.string() }) },
 });
 
 export const SETTING_DESCRIPTORS = {
@@ -161,6 +173,15 @@ const poolCodexPollSchema = z.discriminatedUnion("status", [
 const poolCancelSchema = z.object({ cancelled: z.boolean() }).loose();
 const devboxStatusSchema = z.object({ connected: z.boolean(), project: z.string().nullable() }).loose();
 const devboxConnectSchema = z.object({ url: z.string() }).loose();
+const linearStatusSchema = z
+  .object({
+    connected: z.boolean(),
+    configured: z.boolean(),
+    user: z.object({ name: z.string() }).loose().nullable(),
+    organization: z.object({ name: z.string() }).loose().nullable(),
+  })
+  .loose();
+const linearConnectSchema = z.object({ url: z.string() }).loose();
 
 interface PendingLogin {
   process: GhProcess;
@@ -332,9 +353,10 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
 
     bb.rpc.register(rpcContract, {
       async status() {
-        const [poolState, devboxState, github, hosts] = await Promise.all([
+        const [poolState, devboxState, linearState, github, hosts] = await Promise.all([
           pluginState(ACCOUNT_POOL_ID),
           pluginState(DEVBOX_ID),
+          pluginState(LINEAR_ID),
           githubStatus(),
           bb.sdk.hosts.list().then(
             (list) => list.map((h) => h.name),
@@ -369,6 +391,20 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           }
         }
 
+        const linear = { ...linearState, connected: false, configured: false, user: null as string | null, organization: null as string | null };
+        if (linearState.available) {
+          try {
+            const l = await call(LINEAR_ID, "status", null, linearStatusSchema);
+            linear.connected = l.connected;
+            linear.configured = l.configured;
+            linear.user = l.user?.name ?? null;
+            linear.organization = l.organization?.name ?? null;
+          } catch (error) {
+            linear.available = false;
+            linear.message = `Linear did not answer: ${errorMessage(error)}`;
+          }
+        }
+
         const aiReady = ai.accounts.some((a) => a.enabled && ai.routing[a.provider]);
         const steps = {
           ai: !ai.available ? "unavailable" : aiReady ? "done" : "todo",
@@ -379,12 +415,16 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
                 ? "unavailable"
                 : "todo",
           devbox: !devbox.available ? "unavailable" : devbox.connected ? "done" : "todo",
+          // A server whose operator has not set up the OAuth application
+          // cannot connect, and that is not the developer's to-do.
+          linear: !linear.available || !linear.configured ? "unavailable" : linear.connected ? "done" : "todo",
           machine: hosts.length > 0 ? "done" : "todo",
         } as const;
         return {
           ai,
           github,
           devbox,
+          linear,
           machines: { names: hosts },
           steps,
           complete: Object.values(steps).every((s) => s !== "todo"),
@@ -437,6 +477,10 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
 
       async devboxConnect() {
         const { url } = await call(DEVBOX_ID, "connect", null, devboxConnectSchema);
+        return { url };
+      },
+      async linearConnect() {
+        const { url } = await call(LINEAR_ID, "connect", null, linearConnectSchema);
         return { url };
       },
     });

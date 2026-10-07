@@ -10,7 +10,8 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [thread-briefs](plugins/thread-briefs) | Gives every thread a durable goal / current state / next step brief, summarized outside the working chat |
 | [multi-repo](plugins/multi-repo) | Gives a project a set of git repos and every thread a workspace holding a checkout of each |
 | [diff-explorer](plugins/diff-explorer) | Scrollable diff of every changed file, with ⌘-click go to definition and Ctrl+- to go back |
-| [team-setup](plugins/team-setup) | First-run checklist for a bb-gate server: sign in to Claude or Codex, GitHub (headless `gh auth login`) and devbox, make a machine |
+| [team-setup](plugins/team-setup) | First-run checklist for a bb-gate server: sign in to Claude or Codex, GitHub (headless `gh auth login`), devbox and Linear, make a machine |
+| [linear](plugins/linear) | Connect Linear once with OAuth; threads then read, search, comment on and move issues through native tools, as you |
 
 Install one:
 
