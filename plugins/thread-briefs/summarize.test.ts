@@ -188,6 +188,23 @@ describe("buildUserPrompt", () => {
     expect(prompt).toContain("The other fields still describe the work");
   });
 
+  it("tells the model what to do with a block note, when there is one", () => {
+    // Unlike the pinned-status line this one is addressed to the fields: the
+    // note is a fact the transcript lacks, and the model is to write
+    // `blockedOn` and `status` from it as it would from a message.
+    const prompt = buildUserPrompt({
+      transcript: "t",
+      fixedStage: null,
+      hasBlockReason: true,
+    });
+    expect(prompt).toContain('marked "User\'s note"');
+    expect(prompt).toContain("Treat it as true unless the conversation after that line");
+    expect(prompt).toContain('"status" is "waiting-on-other"');
+    expect(
+      buildUserPrompt({ transcript: "t", fixedStage: null, hasBlockReason: false }),
+    ).not.toContain("User's note");
+  });
+
   it("tells them not to hand out a next step on a thread pinned done", () => {
     const prompt = buildUserPrompt({
       transcript: "t",
@@ -400,6 +417,47 @@ describe("renderTranscript", () => {
     expect(text).not.toContain("nextStep");
     expect(text).not.toContain("blockedOn");
     expect(text).toContain("User: Build it");
+  });
+
+  it("places the block note after the user message it followed", () => {
+    const text = renderTranscript({
+      title: null,
+      outline: [
+        { role: "user", preview: "Build it" },
+        { role: "assistant", preview: "Built." },
+        { role: "user", preview: "Where were we?" },
+      ],
+      lastAssistantText: null,
+      previousBrief: null,
+      blockReason: {
+        text: "not before the release",
+        recordedAt: Date.UTC(2026, 9, 3),
+        userMessagesSeen: 1,
+      },
+    });
+    const lines = text.split("\n");
+    const note = lines.findIndex((line) => line.startsWith("[User's note"));
+    expect(lines[note]).toBe(
+      "[User's note, recorded 2026-10-03: this thread is blocked because \"not before the release\"]",
+    );
+    expect(lines[note - 1]).toBe("Agent: Built.");
+    expect(lines[note + 1]).toBe("User: Where were we?");
+  });
+
+  it("keeps the block note through elision", () => {
+    const outline = Array.from({ length: 100 }, (_, n) => ({
+      role: "user" as const,
+      preview: `m${n}`,
+    }));
+    const text = renderTranscript({
+      title: null,
+      outline,
+      lastAssistantText: null,
+      previousBrief: null,
+      blockReason: { text: "parked", recordedAt: 0, userMessagesSeen: 50 },
+    });
+    expect(text).toContain("[User's note");
+    expect(text).toContain("earlier messages elided");
   });
 
   it("marks where the middle was elided", () => {

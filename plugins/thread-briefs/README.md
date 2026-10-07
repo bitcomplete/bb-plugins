@@ -74,7 +74,17 @@ Either can be pinned by hand in the Brief panel, anchored to the thread's
 activity cursor so the pin retires on the next real turn. The status pin is what
 closes a thread whose next step was carried out somewhere the transcript cannot
 see — a go-ahead you gave in another thread, a PR you merged on github.com —
-leaves nothing for a summary to read.
+leaves nothing for a summary to read. A pin in force draws a dot in the centre
+of the row's ring.
+
+Pinning **Blocked** is how a thread is parked, and it takes a reason. The reason
+is not written into the brief; it is placed in the conversation the summarizer
+reads, as a dated note, with an instruction to treat it as true until the
+conversation after it shows the block resolved — so the model writes `blockedOn`
+and `status` from it in its own words, and the refresher says the thread was
+parked and why. The reason outlives the pin: it is handed to every later summary
+until it is cleared by hand, or until a summary that follows a new user message
+reads the thread as no longer blocked. See the skill's "Parking a thread".
 
 ## Install
 

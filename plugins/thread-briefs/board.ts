@@ -15,9 +15,9 @@ import type {
 } from "./contract.js";
 import {
   STAGE_LABELS,
-  STALE_DONE_RING_ICON,
   STATUS_LABELS,
   doneRingIcon,
+  staleDoneRingIcon,
   stageRingIcon,
 } from "./brief.js";
 import {
@@ -673,11 +673,12 @@ export function actorHint(
  */
 export function cardRingIcon(row: BoardRow): string | null {
   if (row.card === null) return null;
-  if (row.stale !== null) return STALE_DONE_RING_ICON;
+  const pinned = isPinnedByHand(row.card);
+  if (row.stale !== null) return staleDoneRingIcon(pinned);
   const colorIndex =
     row.project === null ? undefined : projectColorIndex(row.project.id);
-  if (row.status === "done") return doneRingIcon(colorIndex);
-  return stageRingIcon(row.card.stage, colorIndex);
+  if (row.status === "done") return doneRingIcon(colorIndex, pinned);
+  return stageRingIcon(row.card.stage, colorIndex, pinned);
 }
 
 /** Whether either pin is in force on this card, for the "pinned" marker. */

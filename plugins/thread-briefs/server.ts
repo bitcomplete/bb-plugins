@@ -7,6 +7,7 @@ import {
   type BriefStage,
   type BriefState,
   type RefresherState,
+  type StoredBlockReason,
   type StoredBrief,
   type StoredRefresher,
 } from "./contract.js";
@@ -467,6 +468,28 @@ export default async function plugin(bb: BbPluginApi) {
     return { value: kept, seq: anchorSeq ?? cursor };
   }
 
+  /** How many user messages an outline holds: the cursor a block note sits on. */
+  const countUserMessages = (items: readonly { role: string }[]): number =>
+    items.filter((item) => item.role === "user").length;
+
+  /**
+   * A block reason as stored, placed at the thread's current user-message
+   * count. Null for a blank, which is how both callers spell "clear".
+   */
+  async function recordBlockReason(
+    threadId: string,
+    text: string | null | undefined,
+  ): Promise<StoredBlockReason | null> {
+    const trimmed = text?.trim() ?? "";
+    if (trimmed === "") return null;
+    const outline = await bb.sdk.threads.conversationOutline({ threadId });
+    return {
+      text: trimmed,
+      recordedAt: Date.now(),
+      userMessagesSeen: countUserMessages(outline.items),
+    };
+  }
+
   /**
    * Returns true when a brief was written (so callers know to announce).
    *
@@ -537,6 +560,7 @@ export default async function plugin(bb: BbPluginApi) {
       outline.maxSeq,
     );
 
+    const blockReason = stored?.blockReason ?? null;
     const transcript = renderTranscript({
       title: thread.title ?? thread.titleFallback,
       outline: outline.items.map(
@@ -544,6 +568,7 @@ export default async function plugin(bb: BbPluginApi) {
       ),
       lastAssistantText: output,
       previousBrief: stored?.fields ?? null,
+      blockReason,
     });
 
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -557,6 +582,7 @@ export default async function plugin(bb: BbPluginApi) {
         // fields keep describing the work, and only the paragraph that tells
         // the user what to do is asked to agree with what they pinned.
         pinnedStatus: statusPin.value,
+        hasBlockReason: blockReason !== null,
       }),
       signal,
     );
@@ -564,6 +590,24 @@ export default async function plugin(bb: BbPluginApi) {
     // summary writes nothing: a newer one is already queued behind it.
     if (superseded.aborted) return false;
     const summary = parseSummary(reply, stagePin.value);
+
+    // The reason outlives the pin, but not the user's own say-so: a summary
+    // that follows a *new user message* and still reads the thread as not
+    // blocked means the model read that message as resolving it, and the
+    // reason is released. A summary over the same messages — a forced
+    // re-summary, an agent turn finishing — keeps it whatever the model said,
+    // because nothing the user did has changed, and a small model's one bad
+    // reading must not quietly un-park a thread.
+    const userMessages = countUserMessages(outline.items);
+    const keepReason =
+      blockReason !== null &&
+      !(
+        userMessages > blockReason.userMessagesSeen &&
+        summary.status !== "waiting-on-other"
+      );
+    if (blockReason !== null && !keepReason) {
+      bb.log.info(`block reason on ${threadId} released: the thread moved on`);
+    }
 
     // A thread bb has already named waits for its first turn to end before this
     // plugin renames it; one showing nothing but its own opening prompt does
@@ -609,6 +653,7 @@ export default async function plugin(bb: BbPluginApi) {
       stageOverrideSeq: stagePin.seq,
       statusOverride: statusPin.value,
       statusOverrideSeq: statusPin.seq,
+      blockReason: keepReason ? blockReason : null,
       endedWithQuestion: endsWithQuestion(output),
       appliedTitle,
       refresher,
@@ -752,21 +797,50 @@ export default async function plugin(bb: BbPluginApi) {
       return briefState(threadId);
     },
 
-    setStatusOverride: async ({ threadId, status }) => {
+    setStatusOverride: async ({ threadId, status, reason }) => {
       const stored = await readBrief(threadId);
       if (stored === null) return briefState(threadId);
+      // The reason rides with a Blocked pin and is cleared by any other pin:
+      // pinning a thread done or waiting-on-you is the user saying the block
+      // is over, and a note that kept telling the summarizer otherwise would
+      // argue with them on the next summary. Clearing the pin (null) leaves
+      // the note alone — the pin retiring is not a change of mind.
+      const blockReason =
+        status === "waiting-on-other"
+          ? reason === undefined
+            ? (stored.blockReason ?? null)
+            : await recordBlockReason(threadId, reason)
+          : status === null
+            ? (stored.blockReason ?? null)
+            : null;
       await writeBrief({
         ...stored,
         statusOverride: status,
         // Anchored to the activity the user was looking at, so the next real
         // turn retires it — the same contract as the stage override.
         statusOverrideSeq: status === null ? null : stored.lastActivitySeen,
+        blockReason,
       });
       announce();
       // The status is what the sidebar sections are keyed on, so a pin has to
       // move the thread as well as its glyph. Debounced, so clicking through a
       // few threads is still one pass.
       scheduleReconcile();
+      rewriteRefresher(threadId);
+      return briefState(threadId);
+    },
+
+    setBlockReason: async ({ threadId, text }) => {
+      const stored = await readBrief(threadId);
+      if (stored === null) return briefState(threadId);
+      await writeBrief({
+        ...stored,
+        blockReason: await recordBlockReason(threadId, text),
+      });
+      announce();
+      // The note changes what the summarizer writes for `blockedOn` and
+      // `status`, and the sections key on the status, so it is re-read now
+      // rather than on the next turn. Same path as a pin.
       rewriteRefresher(threadId);
       return briefState(threadId);
     },

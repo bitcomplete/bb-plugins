@@ -56,6 +56,50 @@ export type NextStepActor = z.infer<typeof nextStepActorSchema>;
 export const MAX_TITLE_LENGTH = 48;
 
 /**
+ * How long a block reason may run.
+ *
+ * It is a line the summarizer is handed every time, not a field it writes, and
+ * it is shown back to the user as their own note. A paragraph would be a second
+ * brief inside the brief; a line is "waiting on the design review" or "not
+ * before the release", which is all the summary needs to carry it forward.
+ */
+export const MAX_BLOCK_REASON_LENGTH = 240;
+
+/**
+ * A reason the user gave for a thread being blocked, as the UI sees it.
+ *
+ * Not a field of the brief and never written by the model. It is handed to the
+ * summarizer as a fact it cannot read from the transcript — the way a stage
+ * pin is handed as fixed — and the model writes `blockedOn` and `status` from
+ * it, in its own words. That is why the UI shows it as *your note* and not in
+ * the Blocked-on slot: the brief says what the model made of it.
+ */
+export const blockReasonSchema = z
+  .object({
+    text: z.string().min(1).max(MAX_BLOCK_REASON_LENGTH),
+    recordedAt: z.number(),
+  })
+  .strict();
+export type BlockReason = z.infer<typeof blockReasonSchema>;
+
+/**
+ * The stored form of {@link blockReasonSchema}: the note plus where in the
+ * conversation it was made.
+ *
+ * `userMessagesSeen` is the count of user messages in the thread when the
+ * reason was recorded. The outline carries no per-item sequence, so a count is
+ * the only cursor that can place the note *between* messages — which the
+ * summarizer needs (the transcript marks the spot) and the release rule needs
+ * (a summary that follows a new user message and reads the thread as not
+ * blocked retires the reason; one that merely re-reads the same messages does
+ * not).
+ */
+export const storedBlockReasonSchema = blockReasonSchema
+  .extend({ userMessagesSeen: z.number().int().nonnegative() })
+  .strict();
+export type StoredBlockReason = z.infer<typeof storedBlockReasonSchema>;
+
+/**
  * The fields the summarizer is asked to return, exactly as it returns them.
  *
  * The five prose fields are strings, where an empty string means "nothing to
@@ -211,6 +255,20 @@ export const storedBriefSchema = z
      */
     statusOverrideSeq: z.number().nullable().optional(),
     /**
+     * Why the user says this thread is blocked, if they said.
+     *
+     * Outlives the status pin beside it. The pin is a hard override and retires
+     * on the next turn like every pin; the reason is *guidance*, fed to the
+     * summarizer on every summary until it is cleared — by hand, or by a
+     * summary that follows a new user message and still reads the thread as
+     * not blocked (see `summarizeThread`). That split is what lets "park this
+     * thread" survive the running turn finishing: the pin may go, the reason
+     * stays, and the next summary reads blocked from it again.
+     *
+     * Optional and nullable, like every field added after version 1.
+     */
+    blockReason: storedBlockReasonSchema.nullable().optional(),
+    /**
      * Whether the thread's last assistant turn read as a question.
      *
      * No longer an input to `status`: an idle thread that is neither done nor
@@ -281,6 +339,8 @@ export const resolvedBriefSchema = briefFieldsSchema
     stageOverride: briefStageSchema.nullable(),
     /** The manual status, only while it is still in force. */
     statusOverride: storedBriefStatusSchema.nullable(),
+    /** The user's own note on why the thread is blocked, while one is held. */
+    blockReason: blockReasonSchema.nullable(),
     lastSummarizedAt: z.number(),
   })
   .strict();
@@ -364,6 +424,7 @@ export const briefCardSchema = z
     status: storedBriefStatusSchema,
     stageOverride: briefStageSchema.nullable(),
     statusOverride: storedBriefStatusSchema.nullable(),
+    blockReason: blockReasonSchema.nullable(),
     nextStep: z.string(),
     nextStepActor: nextStepActorSchema.optional(),
     blockedOn: z.string(),
@@ -384,6 +445,14 @@ export const rowSignalSchema = z
      * thing that names it.
      */
     label: z.string(),
+    /**
+     * Whether a stage or status pin is in force on this thread.
+     *
+     * The one bit on the row the model did not decide. It draws as the centre
+     * dot, and it is true exactly while a human is overriding the summarizer —
+     * once a pin retires and the model agrees, there is nothing to mark.
+     */
+    pinned: z.boolean(),
   })
   .strict();
 export type RowSignal = z.infer<typeof rowSignalSchema>;
@@ -459,6 +528,29 @@ export const rpcContract = defineRpcContract({
       .object({
         threadId: z.string().min(1),
         status: storedBriefStatusSchema.nullable(),
+        /**
+         * A reason, when pinning `waiting-on-other`: "park this, because".
+         * Written in the same call so the gesture is one write. Ignored for
+         * any other status, which clears the reason instead — pinning a
+         * thread done or waiting-on-you is the user saying the block is over.
+         */
+        reason: z.string().max(MAX_BLOCK_REASON_LENGTH).optional(),
+      })
+      .strict(),
+    output: briefStateSchema,
+  },
+  /**
+   * Set, replace or clear the block reason on its own.
+   *
+   * Separate from the pin because the two have different lifetimes: editing
+   * the note on a thread whose pin has already retired must not re-pin it, and
+   * clearing the note must not clear a pin that still holds.
+   */
+  setBlockReason: {
+    input: z
+      .object({
+        threadId: z.string().min(1),
+        text: z.string().max(MAX_BLOCK_REASON_LENGTH).nullable(),
       })
       .strict(),
     output: briefStateSchema,

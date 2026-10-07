@@ -1,4 +1,5 @@
 import type {
+  BlockReason,
   BriefCard,
   BriefStage,
   BriefStatus,
@@ -95,6 +96,25 @@ export function legacyStatus(fields: {
   return "waiting-on-me";
 }
 
+/**
+ * The user's block reason as the UI shows it, without the cursor the server
+ * keeps beside it.
+ */
+export function blockReasonOf(stored: StoredBrief): BlockReason | null {
+  const reason = stored.blockReason ?? null;
+  return reason === null
+    ? null
+    : { text: reason.text, recordedAt: reason.recordedAt };
+}
+
+/** Whether a stage or status pin is in force right now. */
+export function isPinned(stored: StoredBrief): boolean {
+  return (
+    (stored.stageOverride !== null && !isStageOverrideStale(stored)) ||
+    ((stored.statusOverride ?? null) !== null && !isStatusOverrideStale(stored))
+  );
+}
+
 export function resolveBrief(stored: StoredBrief): ResolvedBrief {
   return {
     ...stored.fields,
@@ -107,6 +127,7 @@ export function resolveBrief(stored: StoredBrief): ResolvedBrief {
     statusOverride: isStatusOverrideStale(stored)
       ? null
       : (stored.statusOverride ?? null),
+    blockReason: blockReasonOf(stored),
     lastSummarizedAt: stored.lastSummarizedAt,
   };
 }
@@ -207,8 +228,15 @@ export const STATUS_LABELS: Record<BriefStatus, string> = {
  * grouping says it in the section header, but grouping is off by default and
  * nothing else on an ungrouped row says it at all.
  */
-export function rowLabelFor(stage: BriefStage, status: BriefStatus): string {
-  return `${STAGE_LABELS[stage]} — ${STATUS_LABELS[status]}`;
+export function rowLabelFor(
+  stage: BriefStage,
+  status: BriefStatus,
+  pinned = false,
+): string {
+  const base = `${STAGE_LABELS[stage]} — ${STATUS_LABELS[status]}`;
+  // The dot on the ring is the only mark that is not the model's; the label is
+  // where it gets its name.
+  return pinned ? `${base} · set by hand` : base;
 }
 
 /**
@@ -231,6 +259,7 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
     status: effectiveStatus(stored),
     stageOverride: resolved.stageOverride,
     statusOverride: resolved.statusOverride,
+    blockReason: resolved.blockReason,
     nextStep: resolved.nextStep,
     // Spread rather than assigned, so an absent actor stays absent: the schema
     // is `.strict()` and an explicit `undefined` is not the same as no key.
@@ -243,11 +272,13 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
 }
 
 export function rowSignalFor(brief: ResolvedBrief): RowSignal {
+  const pinned = brief.stageOverride !== null || brief.statusOverride !== null;
   return {
     threadId: brief.threadId,
     status: brief.status,
     stage: brief.stage,
-    label: rowLabelFor(brief.stage, brief.status),
+    label: rowLabelFor(brief.stage, brief.status, pinned),
+    pinned,
   };
 }
 
@@ -263,8 +294,27 @@ const ICON_PREFIX = "thread-briefs/";
  * `BRIEF_STAGES` cannot get a name without also getting artwork: `app.tsx`
  * registers its icons by mapping this same function over the same list.
  */
-export function stageRingIcon(stage: BriefStage, colorIndex?: number): string {
-  return `${ICON_PREFIX}stage-${stage}${ringColorSuffix(colorIndex)}`;
+export function stageRingIcon(
+  stage: BriefStage,
+  colorIndex?: number,
+  pinned = false,
+): string {
+  return `${ICON_PREFIX}stage-${stage}${pinSuffix(pinned)}${ringColorSuffix(
+    colorIndex,
+  )}`;
+}
+
+/**
+ * The suffix on a ring's registry name when it carries the centre dot.
+ *
+ * A pin is a human overriding the summarizer, and it is the one fact on the
+ * row the model did not decide — so it gets the one mark the ring has room
+ * for in its centre. Before the dot meant this, a filled centre meant `done`;
+ * done now closes the ring and adds a thin outer ring instead, so the two
+ * cannot be confused and a pinned done thread can show both.
+ */
+function pinSuffix(pinned: boolean): string {
+  return pinned ? "-pinned" : "";
 }
 
 /**
@@ -280,18 +330,27 @@ function ringColorSuffix(colorIndex: number | undefined): string {
 }
 
 /** {@link DONE_RING_ICON} in a project's colour, or neutral without one. */
-export function doneRingIcon(colorIndex?: number): string {
-  return `${DONE_RING_ICON}${ringColorSuffix(colorIndex)}`;
+export function doneRingIcon(colorIndex?: number, pinned = false): string {
+  return `${DONE_RING_ICON}${pinSuffix(pinned)}${ringColorSuffix(colorIndex)}`;
+}
+
+/** {@link STALE_DONE_RING_ICON}, with the centre dot when a pin holds. */
+export function staleDoneRingIcon(pinned = false): string {
+  return `${STALE_DONE_RING_ICON}${pinSuffix(pinned)}`;
 }
 
 /**
- * The closed, filled ring drawn for `done`, in place of any stage ring.
+ * The closed ring with a thin outer ring, drawn for `done` in place of any
+ * stage ring.
  *
  * `done` is a status, not a fifth stage: the arc is over, so which stage it
  * ended in stops being the interesting fact about the row. Keeping it off the
  * ring is also what holds the ring at four 90° segments, and four is the point
  * where the fill's endpoint lands on a clock position you can read without
  * counting marks. A fifth segment in a 16px glyph is where that stops working.
+ *
+ * The outer ring rather than a filled centre, because the centre now means
+ * "pinned" — see {@link stageRingIcon}.
  */
 export const DONE_RING_ICON = `${ICON_PREFIX}done`;
 
@@ -387,19 +446,19 @@ export function rowDecoration(
     project === null ? undefined : projectColorIndex(project.id);
   const label =
     staleDone === null
-      ? rowLabelFor(signal.stage, signal.status)
+      ? rowLabelFor(signal.stage, signal.status, signal.pinned)
       : // The grey is not self-explanatory the way the ring's shape is, so the
         // label is where "why has this one gone flat" gets answered — including
         // the fact that it is on its way out, which nothing else says.
-        `${rowLabelFor(signal.stage, signal.status)} · idle ${idleFor(
+        `${rowLabelFor(signal.stage, signal.status, signal.pinned)} · idle ${idleFor(
           staleDone.idleMs,
         )}${staleDone.archiving ? ", archiving soon" : ""}`;
   return {
     icon: staleDone !== null
-      ? STALE_DONE_RING_ICON
+      ? staleDoneRingIcon(signal.pinned)
       : isDone
-        ? doneRingIcon(colorIndex)
-        : stageRingIcon(signal.stage, colorIndex),
+        ? doneRingIcon(colorIndex, signal.pinned)
+        : stageRingIcon(signal.stage, colorIndex, signal.pinned),
     // Never `success`. The colour channel belongs to the project now, and a
     // green that showed up only on the rows this function happens to be handed
     // no project for would be a second, invisible rule competing with it.

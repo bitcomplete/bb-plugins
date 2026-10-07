@@ -18,6 +18,7 @@ import {
 } from "./shared.js";
 import {
   doneRingIcon,
+  staleDoneRingIcon,
   stageRingIcon,
   STALE_DONE_RING_ICON,
 } from "./brief.js";
@@ -37,6 +38,7 @@ const READY: BriefState = {
     status: "waiting-on-me",
     stageOverride: null,
     statusOverride: null,
+    blockReason: null,
     lastSummarizedAt: 1_000,
   },
 };
@@ -107,12 +109,25 @@ describe("registrations", () => {
       }
       expect(names).toContain(doneRingIcon(colorIndex));
     }
-    // Every ring in every colour, plus the one grey done ring — one, because
-    // grey replaces a project's hue rather than varying with it.
+    // Every ring in every colour, each with and without the pin dot, plus the
+    // grey done ring — two, because grey replaces a project's hue rather than
+    // varying with it, and only the pin still varies.
     expect(names).toContain(STALE_DONE_RING_ICON);
+    expect(names).toContain(staleDoneRingIcon(true));
     expect(captured.icons).toHaveLength(
-      (BRIEF_STAGES.length + 1) * (PROJECT_RING_HUES.length + 1) + 1,
+      (BRIEF_STAGES.length + 1) * 2 * (PROJECT_RING_HUES.length + 1) + 2,
     );
+  });
+
+  it("registers a pinned twin of every ring, dot included", async () => {
+    const captured = await loadApp();
+    const names = new Set(captured.icons.map((entry) => entry.name));
+    for (const stage of BRIEF_STAGES) {
+      expect(names).toContain(stageRingIcon(stage, undefined, true));
+      expect(names).toContain(stageRingIcon(stage, 3, true));
+    }
+    expect(names).toContain(doneRingIcon(undefined, true));
+    expect(names).toContain(doneRingIcon(3, true));
   });
 
   /** The artwork one registered icon draws, rendered on its own. */
@@ -122,10 +137,16 @@ describe("registrations", () => {
     const Artwork = entry.component;
     const { container } = render(<Artwork />);
     const paths = Array.from(container.querySelectorAll("path"));
+    const circles = Array.from(container.querySelectorAll("circle"));
     return {
       quarters: paths.length,
       solid: paths.filter((path) => path.getAttribute("opacity") === "1").length,
-      hasCentre: container.querySelector("circle") !== null,
+      // The dot is filled; the outer ring is stroked. Telling them apart is
+      // the point of the test below.
+      hasDot: circles.some((circle) => circle.getAttribute("fill") !== null),
+      hasOuterRing: circles.some(
+        (circle) => circle.getAttribute("stroke") !== null,
+      ),
     };
   };
 
@@ -142,16 +163,38 @@ describe("registrations", () => {
     }
   });
 
-  it("marks the done ring's centre, so it is not just the review ring again", async () => {
+  it("rings the done ring, so it is not just the review ring again", async () => {
     // Both close the ring, because done is not a fifth stage. At 16px the
-    // filled centre is the only thing telling them apart.
+    // thin outer ring is the only thing telling them apart — and the centre
+    // stays free for the pin, so a plain done ring has no dot.
     expect(await drawIcon("thread-briefs/done")).toMatchObject({
       solid: 4,
-      hasCentre: true,
+      hasOuterRing: true,
+      hasDot: false,
     });
     expect(await drawIcon("thread-briefs/stage-review")).toMatchObject({
       solid: 4,
-      hasCentre: false,
+      hasOuterRing: false,
+      hasDot: false,
+    });
+  });
+
+  it("dots the centre of a pinned ring and nothing else about it", async () => {
+    // The dot is the one mark on the row the model did not decide. It has to
+    // be additive: a pinned done thread shows both the outer ring and the dot.
+    expect(await drawIcon("thread-briefs/stage-planning-pinned")).toMatchObject({
+      solid: 2,
+      hasOuterRing: false,
+      hasDot: true,
+    });
+    expect(await drawIcon("thread-briefs/done-pinned")).toMatchObject({
+      solid: 4,
+      hasOuterRing: true,
+      hasDot: true,
+    });
+    expect(await drawIcon(staleDoneRingIcon(true))).toMatchObject({
+      hasOuterRing: true,
+      hasDot: true,
     });
   });
 
@@ -401,6 +444,76 @@ describe("the brief panel", () => {
     slot.lifecycle.unmount();
   });
 
+  it("asks why when Blocked is pinned, and writes the reason on its own", async () => {
+    // Pick Blocked, say why: the park gesture. The pin is written on the click
+    // and the editor opens for the reason, which is written separately so the
+    // pin does not wait on typing.
+    const pinned: BriefState = {
+      state: "ready",
+      brief: {
+        ...READY.brief!,
+        status: "waiting-on-other",
+        statusOverride: "waiting-on-other",
+      },
+    };
+    const slot = await render({ getBrief: () => pinned });
+    const input = await slot.findByPlaceholderText(/waiting on the design review/u);
+    fireEvent.change(input, { target: { value: "not before the release" } });
+    fireEvent.submit(input.closest("form")!);
+
+    await waitFor(() =>
+      expect(
+        slot.inspection.rpcCalls.some(
+          (call) =>
+            call.method === "setBlockReason" &&
+            (call.input as { text: string }).text === "not before the release",
+        ),
+      ).toBe(true),
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the reason as your note, and clears it", async () => {
+    const noted: BriefState = {
+      state: "ready",
+      brief: {
+        ...READY.brief!,
+        status: "waiting-on-other",
+        blockedOn: "the release",
+        blockReason: { text: "not before the release", recordedAt: 1_000 },
+      },
+    };
+    const slot = await render({ getBrief: () => noted });
+    expect(await slot.findByText("not before the release")).toBeTruthy();
+    expect(slot.getByText(/Your note/u)).toBeTruthy();
+    // The model's own reading still has its slot, labelled as the brief's.
+    expect(slot.getByText("Blocked on")).toBeTruthy();
+    expect(slot.getByText("the release")).toBeTruthy();
+
+    fireEvent.click(slot.getByRole("button", { name: "Clear" }));
+    await waitFor(() =>
+      expect(
+        slot.inspection.rpcCalls.some(
+          (call) =>
+            call.method === "setBlockReason" &&
+            (call.input as { text: string | null }).text === null,
+        ),
+      ).toBe(true),
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("offers no reason editor on a thread the model read as blocked, only a way in", async () => {
+    const modelBlocked: BriefState = {
+      state: "ready",
+      brief: { ...READY.brief!, status: "waiting-on-other", blockedOn: "CI" },
+    };
+    const slot = await render({ getBrief: () => modelBlocked });
+    expect(await slot.findByText("Add a reason…")).toBeTruthy();
+    expect(slot.queryByPlaceholderText(/design review/u)).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("says when the status came from you rather than from the brief", async () => {
     // A "Done" heading over a live next step otherwise reads as a bug.
     const slot = await render({
@@ -423,6 +536,7 @@ describe("sidebar row glyphs", () => {
     status: "done",
     stage: "review",
     label: "Review — Done",
+    pinned: false,
     ...overrides,
   });
 
@@ -777,6 +891,7 @@ describe("the board's sidebar badge", () => {
     status: "waiting-on-me",
     stage: "planning",
     label: "Planning — Waiting on you",
+    pinned: false,
   });
 
   it("counts the threads waiting on you", async () => {

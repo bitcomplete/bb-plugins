@@ -236,6 +236,53 @@ start, after any batch of briefs, or on a settings change — files the thread
 straight back where its status says. Pin the status instead and the section
 follows.
 
+### Parking a thread: the block reason
+
+Pinning **Blocked** is how you park a thread — "not now" — and the panel asks
+why as you do it. The reason is optional, one line, and is the one input the
+summarizer gets that is not the transcript.
+
+It is **guidance, not a field**. The reason is not copied into `blockedOn`;
+it is placed in the conversation the summarizer reads, as a note at the point
+you made it (`[User's note, recorded 2026-10-03: this thread is blocked
+because "…"]`), with an instruction to treat it as true unless the
+conversation after it shows the block resolved. The model then writes
+`blockedOn` and `status` from it in its own words, as it would from a message,
+and the refresher prose says the thread was parked, why, and what resuming
+would take. Because a non-empty `blockedOn` is never `done`, the status
+follows without any further rule.
+
+The panel shows the reason as **Your note**, with its date and Edit and Clear,
+under the status buttons — not in the Blocked-on slot, which is the model's
+reading. The note is what you typed; the slot is what the summary made of it.
+The board's expanded card has the same control.
+
+**It outlives the pin.** The pin retires on the next turn like any pin, and a
+turn the agent was still running when you parked the thread counts. The
+reason does not retire with it: it is handed to every later summary until one
+of two things happens.
+
+- **You clear it**, in the panel or the card. Pinning the thread to any status
+  other than Blocked also clears it — pinning done or waiting-on-you is you
+  saying the block is over. Clearing a Blocked pin does *not* clear it.
+- **You write to the thread and the summary reads it as resolved.** A summary
+  that follows a *new user message* and comes back with a status other than
+  `waiting-on-other` releases the reason: the model read your message as
+  lifting the block. A summary over the same user messages — a forced
+  re-summary, an agent turn finishing — keeps the reason whatever the model
+  said, because nothing you did has changed, and one bad reading by a small
+  model must not quietly un-park a thread. `bb plugin logs thread-briefs`
+  records a release as `block reason on <id> released`.
+
+The note's place in the conversation is a count of user messages at the time
+it was recorded, because the outline carries no per-message sequence. It is
+rendered just before the user message that followed it rather than straight
+after the one before, since a thread is nearly always parked after reading the
+agent's reply.
+
+Setting or clearing a reason queues the same forced re-summary a pin does, so
+the status, the section and the refresher follow within seconds.
+
 `nextStepActor` says who would take `nextStep` — `me`, `agent` or `other` — and
 no longer feeds the status. It is optional, dropped when `nextStep` is empty or
 the word is not one of the three. Its one use is the board's
@@ -410,16 +457,31 @@ stage the thread has reached:
 | half (ends at 6) | planning |
 | three quarters (ends at 9) | implementation |
 | closed ring, hollow | review |
-| closed ring, centre filled | status `done`, any stage |
+| closed ring with a **thin outer ring** | status `done`, any stage |
+| a **dot in the centre** | a stage or status set by hand — see [the pin dot](#the-pin-dot) |
 | the ring's **colour** | which project the thread is in |
 
 Names are registered by the app through `app.experimental_icons.register` as
-`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in a `-c<n>`
-variant per palette slot, plus `thread-briefs/done-stale`; a row status takes an
-icon *name*, not a component, so the artwork has to go in the registry first.
-They are mapped off `BRIEF_STAGES` and `PROJECT_RING_HUES`, so adding a stage or
-a hue adds its rings. `done-stale` has no `-c<n>` variants — see
-[Stale done threads](#stale-done-threads).
+`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in a
+`-pinned` variant and a `-c<n>` variant per palette slot (in that order:
+`stage-review-pinned-c3`), plus `thread-briefs/done-stale` and
+`done-stale-pinned`; a row status takes an icon *name*, not a component, so the
+artwork has to go in the registry first. They are mapped off `BRIEF_STAGES` and
+`PROJECT_RING_HUES`, so adding a stage or a hue adds its rings. `done-stale` has
+no `-c<n>` variants — see [Stale done threads](#stale-done-threads).
+
+### The pin dot
+
+The dot marks the one fact on the row the model did not decide: a stage or
+status pinned by hand is in force. It is drawn exactly while the pin holds and
+gone the moment the pin retires, so a dot means "a human is overriding the
+summarizer right now", never "was overridden once". The hover label says the
+same in words: `Implementation — Blocked · set by hand`.
+
+It is additive. A pinned done thread shows the outer ring *and* the dot; a cold
+pinned done thread shows both in grey. The centre is the only mark the ring has
+room for at the 12px the stage picker draws it at, which is why the pin got it
+and `done` moved out to the outer ring.
 
 ### The project colour
 
@@ -520,10 +582,11 @@ from done. `done` stays off the ring as a status, not a fifth stage — four
 segments is where you can read the fill's endpoint as a clock position instead of
 counting marks.
 
-**What this costs.** `waiting-on-me` and `waiting-on-other` draw the **same**
-ring. Grouping tells them apart; with grouping off, only the hover label does
-(`Implementation — Blocked`). If that bites, the cheap fix is a centre mark on
-the blocked ring rather than a different glyph family.
+**What this costs.** A `waiting-on-me` and a model-read `waiting-on-other` draw
+the **same** ring. Grouping tells them apart; with grouping off, only the hover
+label does (`Implementation — Blocked`). A thread *you* blocked is the
+exception: the pin dot marks it for as long as the pin holds — see
+[Parking a thread](#parking-a-thread-the-block-reason).
 
 `working` still draws **nothing**, so the live override reads as a
 **suppression**: a running thread shows no brief glyph, and its stored ring comes
@@ -791,6 +854,20 @@ no preference writes.
 - A thread that will not stay in the section you drag it to: sections are keyed
   on status and nothing feeds an assignment back into a brief, so the next
   reconcile undoes the move. Pin the status instead.
+- A thread you parked is back in **Waiting on you**: you wrote to it, and the
+  summary after that message read the block as resolved, which releases the
+  reason — `bb plugin logs thread-briefs` says `block reason on <id> released`.
+  If the block still stands, say so in the thread, or pin Blocked again with
+  the reason; the panel's **Your note** block shows whether one is held.
+- A thread you parked still reads Blocked after you said the block was over:
+  the summary after your message still answered blocked, so the reason was
+  kept. Clear it by hand from **Your note**, or pin another status, which
+  clears it too.
+- A dot in the centre of a ring: a stage or status pin is in force on that
+  thread. It goes with the pin, on the next real turn.
+- A thread the model read as Blocked shows **Add a reason…** and no editor:
+  expected. The editor opens by itself only when *you* pin Blocked; a reason
+  can still be added to a model-read block from that link.
 - No re-entry refresher on a thread you have not touched in days: check
   `refresherIdleHours` is not `0`, that the thread has a brief at all, and that
   you have not already dismissed it for that activity — it shows once per new

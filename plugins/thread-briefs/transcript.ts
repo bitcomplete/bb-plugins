@@ -5,12 +5,70 @@ export interface OutlineItem {
   preview: string;
 }
 
+/**
+ * A block reason, placed in the conversation.
+ *
+ * `userMessagesSeen` is how many user messages the thread held when the note
+ * was made; the renderer puts the note after that many, so the model can tell
+ * what was said before the user called the thread blocked from what was said
+ * after — which is the whole of "treat it as true unless the conversation
+ * since shows it resolved".
+ */
+export interface BlockReasonNote {
+  text: string;
+  recordedAt: number;
+  userMessagesSeen: number;
+}
+
 export interface TranscriptInput {
   title: string | null;
   outline: readonly OutlineItem[];
   /** The last assistant text in full, from `threads.output`. */
   lastAssistantText: string | null;
   previousBrief: BriefFields | null;
+  /** The user's note on why the thread is blocked, if one is held. */
+  blockReason?: BlockReasonNote | null;
+}
+
+/** The marker the note is rendered under, so the prompt can name it. */
+export const BLOCK_NOTE_MARKER = "User's note";
+
+/** One line of conversation as the model sees it: a message or the note. */
+type Line = { kind: "message"; item: OutlineItem } | { kind: "note" };
+
+/**
+ * The outline with the block note slotted in just before the user message
+ * that followed it.
+ *
+ * Before the next *user* message rather than straight after the last one,
+ * because the count cannot see the agent's reply in between — and a thread is
+ * nearly always parked after reading that reply, not before it. A note
+ * recorded before any message — a count of zero — leads; one recorded after
+ * more user messages than the outline now holds trails, which still reads
+ * correctly: it was made after everything shown.
+ */
+export function placeBlockNote(
+  outline: readonly OutlineItem[],
+  note: BlockReasonNote | null | undefined,
+): Line[] {
+  const lines: Line[] = outline.map((item) => ({ kind: "message", item }));
+  if (note === null || note === undefined) return lines;
+  let seen = 0;
+  for (const [index, item] of outline.entries()) {
+    if (item.role !== "user") continue;
+    if (seen === note.userMessagesSeen) {
+      lines.splice(index, 0, { kind: "note" });
+      return lines;
+    }
+    seen += 1;
+  }
+  lines.push({ kind: "note" });
+  return lines;
+}
+
+/** A date the model can quote back, without a time it would misread. */
+function noteDate(recordedAt: number): string {
+  return new Date(recordedAt).toISOString().slice(0, 10);
 }
 
 /** Keep the opening exchanges: the goal is anchored there. */
@@ -34,9 +92,9 @@ function clamp(text: string, limit: number): string {
  * brief can most afford to lose, and dropping it is what keeps the prompt
  * bounded on threads that run for days.
  */
-export function selectOutline(
-  outline: readonly OutlineItem[],
-): { items: OutlineItem[]; elided: number } {
+export function selectOutline<T>(
+  outline: readonly T[],
+): { items: T[]; elided: number } {
   if (outline.length <= HEAD_ITEMS + TAIL_ITEMS) {
     return { items: [...outline], elided: 0 };
   }
@@ -90,14 +148,38 @@ export function renderTranscript(input: TranscriptInput): string {
     );
   }
 
-  const { items, elided } = selectOutline(input.outline);
+  const note = input.blockReason ?? null;
+  const placed = placeBlockNote(input.outline, note);
+  let { items, elided } = selectOutline(placed);
+  // The note is a line the prompt refers to by name, so it must survive
+  // elision. One that fell in the elided middle is re-placed at the cut: it
+  // was made after the head and before the tail, which is all the cut says.
+  if (note !== null && !items.some((line) => line.kind === "note")) {
+    items = [
+      ...items.slice(0, HEAD_ITEMS),
+      { kind: "note" },
+      ...items.slice(HEAD_ITEMS),
+    ];
+  }
   const lines: string[] = [];
-  items.forEach((item, index) => {
+  items.forEach((line, index) => {
     if (elided > 0 && index === HEAD_ITEMS) {
       lines.push(`[… ${elided} earlier messages elided …]`);
     }
-    const speaker = item.role === "user" ? "User" : "Agent";
-    lines.push(`${speaker}: ${clamp(item.preview, PREVIEW_CHARS)}`);
+    if (line.kind === "note") {
+      // Only reached with a note held; the guard above is what makes the
+      // non-null assertion safe, and it is kept out of the type to keep
+      // `Line` free of the note's payload.
+      const held = note as BlockReasonNote;
+      lines.push(
+        `[${BLOCK_NOTE_MARKER}, recorded ${noteDate(
+          held.recordedAt,
+        )}: this thread is blocked because "${clamp(held.text, PREVIEW_CHARS)}"]`,
+      );
+      return;
+    }
+    const speaker = line.item.role === "user" ? "User" : "Agent";
+    lines.push(`${speaker}: ${clamp(line.item.preview, PREVIEW_CHARS)}`);
   });
   parts.push(
     lines.length === 0

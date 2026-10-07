@@ -9,12 +9,26 @@
  * same two writes as a tappable control, and the honest way to do that is the
  * control the panel already uses rather than a second one that looks different.
  */
+import { useEffect, useState } from "react";
 import {
   experimental_Icon as Icon,
 } from "@get-bb/plugin-sdk/app";
-import type { BriefStage, BriefStatus, StoredBriefStatus } from "./contract.js";
+import type {
+  BlockReason,
+  BriefStage,
+  BriefStatus,
+  StoredBriefStatus,
+} from "./contract.js";
 import { BRIEF_STAGES, STORED_BRIEF_STATUSES } from "./shared.js";
 import { STAGE_LABELS, STATUS_LABELS, stageRingIcon } from "./brief.js";
+
+/**
+ * The longest a reason may be, mirrored from the contract so the input can
+ * stop at the limit rather than let the server refuse the write. Kept as a
+ * literal because `contract.ts` cannot be imported for its values here — see
+ * the note at the top of `shared.ts`.
+ */
+const MAX_REASON_LENGTH = 240;
 
 export function Field({ label, value }: { label: string; value: string }) {
   if (value.trim() === "") return null;
@@ -33,6 +47,146 @@ function PinNote() {
   return (
     <div className="text-[11px] text-muted-foreground">
       Set by hand · clears on the next turn
+    </div>
+  );
+}
+
+/** A date for the note's byline, short enough to sit on the same line. */
+function noteDate(recordedAt: number): string {
+  return new Date(recordedAt).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/**
+ * The user's own reason for a block: shown as theirs, editable, clearable.
+ *
+ * It is drawn as *a note from you* and not in the Blocked-on slot, because the
+ * two are different things. The slot is what the model made of the thread —
+ * including of this note, which it is handed as a fact — and the note is what
+ * you typed. Showing the note verbatim where the model's words go would claim
+ * the brief said it; hiding it would leave something steering every summary
+ * with no way to see or stop it.
+ *
+ * Under the status buttons rather than beside the field, because this is where
+ * a block is set by hand: pick Blocked, say why. The editor opens on its own
+ * when Blocked is pinned with no reason yet, so the gesture is one click and
+ * a line of typing, and the reason is optional — closing the editor leaves a
+ * plain pin.
+ */
+export function BlockReasonControl({
+  status,
+  statusOverride,
+  blockReason,
+  onSet,
+}: {
+  status: BriefStatus;
+  statusOverride: StoredBriefStatus | null;
+  blockReason: BlockReason | null;
+  onSet: (text: string | null) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  // A Blocked pin just placed, with nothing said yet, is the moment to ask.
+  // Keyed on the pin rather than the status so a model-read Blocked does not
+  // open an editor nobody asked for.
+  const invite = statusOverride === "waiting-on-other" && blockReason === null;
+  useEffect(() => {
+    if (invite) setDraft((current) => current ?? "");
+  }, [invite]);
+
+  const editing = draft !== null;
+  if (!editing && blockReason === null && status !== "waiting-on-other") {
+    return null;
+  }
+
+  const save = () => {
+    const text = (draft ?? "").trim();
+    setDraft(null);
+    if (text === "" && blockReason === null) return;
+    onSet(text === "" ? null : text);
+  };
+
+  if (editing) {
+    return (
+      <form
+        className="space-y-1"
+        onSubmit={(event) => {
+          event.preventDefault();
+          save();
+        }}
+      >
+        <label className="block text-[11px] text-muted-foreground">
+          Why is it blocked? The summary will carry it until it is resolved.
+          <input
+            autoFocus
+            value={draft}
+            maxLength={MAX_REASON_LENGTH}
+            placeholder="waiting on the design review · not before the release"
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setDraft(null);
+            }}
+            className="mt-1 w-full rounded border border-border bg-background px-1.5 py-1 text-xs text-foreground"
+          />
+        </label>
+        <div className="flex gap-1">
+          <button
+            type="submit"
+            className="rounded border border-border px-1.5 py-0.5 text-xs text-foreground hover:bg-card"
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            onClick={() => setDraft(null)}
+            className="rounded border border-transparent px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-card"
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    );
+  }
+
+  if (blockReason === null) {
+    return (
+      <button
+        type="button"
+        onClick={() => setDraft("")}
+        className="text-[11px] text-muted-foreground hover:text-foreground"
+      >
+        Add a reason…
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-0.5 rounded border border-border bg-card/50 px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>Your note · {noteDate(blockReason.recordedAt)}</span>
+        <span className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setDraft(blockReason.text)}
+            className="hover:text-foreground"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            onClick={() => onSet(null)}
+            className="hover:text-foreground"
+          >
+            Clear
+          </button>
+        </span>
+      </div>
+      <div className="text-sm leading-snug text-foreground">{blockReason.text}</div>
+      <div className="text-[11px] text-muted-foreground">
+        Guides every summary until you clear it, or write to the thread and it
+        reads as resolved.
+      </div>
     </div>
   );
 }
@@ -116,11 +270,15 @@ export function StageControl({
 export function StatusControl({
   status,
   statusOverride,
+  blockReason,
   onPick,
+  onSetBlockReason,
 }: {
   status: BriefStatus;
   statusOverride: StoredBriefStatus | null;
+  blockReason: BlockReason | null;
   onPick: (status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (text: string | null) => void;
 }) {
   return (
     <div className="space-y-1">
@@ -152,6 +310,12 @@ export function StatusControl({
         })}
       </div>
       {statusOverride !== null ? <PinNote /> : null}
+      <BlockReasonControl
+        status={status}
+        statusOverride={statusOverride}
+        blockReason={blockReason}
+        onSet={onSetBlockReason}
+      />
     </div>
   );
 }

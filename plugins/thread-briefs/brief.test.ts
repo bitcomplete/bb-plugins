@@ -310,7 +310,9 @@ describe("status overrides", () => {
       lastActivitySeen: 50,
     });
     const decoration = rowDecoration(rowSignalFor(resolveBrief(pinned)), false);
-    expect(decoration?.icon).toBe("thread-briefs/done");
+    // With the dot: the pin is in force, and the dot is what says so.
+    expect(decoration?.icon).toBe("thread-briefs/done-pinned");
+    expect(decoration?.label).toBe("Implementation — Done · set by hand");
   });
 });
 
@@ -362,8 +364,19 @@ describe("rowDecoration", () => {
       lastActivitySeen: 50,
     });
     expect(rowDecoration(signalFor(overridden), false)?.icon).toBe(
-      "thread-briefs/stage-review",
+      "thread-briefs/stage-review-pinned",
     );
+  });
+
+  it("drops the dot once the pin has retired", () => {
+    const retired = stored({
+      stageOverride: "review",
+      stageOverrideSeq: 50,
+      lastActivitySeen: 51,
+    });
+    const decoration = rowDecoration(signalFor(retired), false);
+    expect(decoration?.icon).toBe("thread-briefs/stage-implementation");
+    expect(decoration?.label).toBe("Implementation — Waiting on you");
   });
 
   it("draws the same ring for waiting-on-me and blocked", () => {

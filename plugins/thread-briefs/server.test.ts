@@ -717,6 +717,7 @@ describe("summarizing", () => {
         status: "waiting-on-me",
         stage: "review",
         label: "Review — Waiting on you",
+        pinned: false,
       },
     ]);
   });
@@ -1165,6 +1166,284 @@ describe("status override", () => {
     })) as BriefState;
     // Nothing to pin a status onto, and briefs are never backfilled.
     expect(state.state).toBe("absent");
+
+    await harness.lifecycle.dispose();
+  });
+});
+
+describe("block reason", () => {
+  const BLOCKED = {
+    ...SUMMARY,
+    blockedOn: "the design review",
+    status: "waiting-on-other",
+  };
+
+  /**
+   * A host whose conversation can grow by user messages, and whose model can
+   * change its mind: the two things the release rule reads.
+   */
+  function talkingHost(initial: unknown) {
+    let reply = initial;
+    const items = [
+      { id: "1", role: "user", preview: "Build it", attachmentSummary: null },
+    ];
+    let maxSeq = 12;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: JSON.stringify(reply) } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    const created = createFakePluginHost({
+      pluginId: "thread-briefs",
+      settings: {
+        apiKey: "test-key",
+        baseUrl: "https://api.test/v1",
+        model: "test-model",
+        jsonMode: true,
+        quietSeconds: 120,
+      },
+      sdk: {
+        threads: {
+          get: async () => thread,
+          list: async () => [thread],
+          output: async () => ({ output: "All set." }),
+          conversationOutline: async () => ({ items: [...items], maxSeq }),
+          interactions: { list: async () => [] },
+        },
+      },
+    });
+    return {
+      ...created,
+      fetchMock,
+      answer: (next: unknown) => {
+        reply = next;
+      },
+      userSays: (preview: string) => {
+        items.push({
+          id: String(items.length + 1),
+          role: "user",
+          preview,
+          attachmentSummary: null,
+        });
+        maxSeq += 1;
+      },
+      agentSays: (preview: string) => {
+        items.push({
+          id: String(items.length + 1),
+          role: "assistant",
+          preview,
+          attachmentSummary: null,
+        });
+        maxSeq += 1;
+      },
+    };
+  }
+
+  const summarize = async (
+    harness: { behavior: { callRpc: (method: string, input: unknown) => Promise<unknown> } },
+    after = 0,
+  ) => {
+    await harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    return waitFor(async () => {
+      const result = (await harness.behavior.callRpc("getBrief", {
+        threadId: "thr_1",
+      })) as BriefState;
+      if (result.state !== "ready") return null;
+      return result.brief.lastSummarizedAt >= after ? result : null;
+    });
+  };
+
+  /** The user prompt of the most recent summarizer call. */
+  const lastPrompt = (fetchMock: ReturnType<typeof vi.fn>) => {
+    const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as {
+      messages: { role: string; content: string }[];
+    };
+    return body.messages.find((message) => message.role === "user")!.content;
+  };
+
+  it("records the reason with a Blocked pin, in one write", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+
+    const pinned = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "  not before the release  ",
+    })) as BriefState;
+    if (pinned.state !== "ready") throw new Error("unreachable");
+    expect(pinned.brief.status).toBe("waiting-on-other");
+    expect(pinned.brief.blockReason?.text).toBe("not before the release");
+    expect(pinned.brief.blockReason?.recordedAt).toBeGreaterThan(0);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("hands the reason to the summarizer in the conversation, with guidance", async () => {
+    const { bb, harness, fetchMock } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "waiting on the design review",
+    });
+    // The pin queues its own re-summary; wait for it so the next call we read
+    // is the one that saw the note.
+    await summarize(harness, first.brief.lastSummarizedAt + 1);
+
+    const prompt = lastPrompt(fetchMock);
+    expect(prompt).toContain("User's note");
+    expect(prompt).toContain('"waiting on the design review"');
+    expect(prompt).toContain("Treat it as true unless");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("outlives the pin: an agent turn retires the pin and keeps the reason", async () => {
+    // Parking a thread whose turn is still running is the common case. The
+    // turn ending advances the cursor and retires the pin like any pin; the
+    // reason has to survive that, or the park is undone by the agent.
+    const { bb, harness, agentSays, answer } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    agentSays("Finished the refactor.");
+    answer(BLOCKED);
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.statusOverride).toBeNull();
+    expect(after.brief.blockReason?.text).toBe("not before the release");
+    expect(after.brief.status).toBe("waiting-on-other");
+    expect(after.brief.blockedOn).toBe("the design review");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the reason when the model reads it as not blocked without a new user message", async () => {
+    // Nothing the user did has changed, so one bad reading by a small model
+    // must not quietly un-park the thread.
+    const { bb, harness, agentSays } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "not before the release",
+    });
+
+    agentSays("Done, want me to push?");
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason?.text).toBe("not before the release");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("releases the reason once the user has written and the model reads it as resolved", async () => {
+    const { bb, harness, userSays } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "waiting on the design review",
+    });
+
+    userSays("Design review is done, carry on.");
+    // SUMMARY answers waiting-on-me: the model read the message as resolving it.
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason).toBeNull();
+    expect(after.brief.status).toBe("waiting-on-me");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the reason across a user message the model still reads as blocked", async () => {
+    const { bb, harness, userSays, answer } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "waiting on the design review",
+    });
+
+    userSays("Where did we leave this?");
+    answer(BLOCKED);
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason?.text).toBe("waiting on the design review");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("clears the reason when another status is pinned, and not when the pin is cleared", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    const unpinned = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: null,
+    })) as BriefState;
+    if (unpinned.state !== "ready") throw new Error("unreachable");
+    expect(unpinned.brief.blockReason?.text).toBe("not before the release");
+
+    const done = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "done",
+    })) as BriefState;
+    if (done.state !== "ready") throw new Error("unreachable");
+    expect(done.brief.blockReason).toBeNull();
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("clears the reason on its own with a blank, leaving the pin", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    const cleared = (await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: null,
+    })) as BriefState;
+    if (cleared.state !== "ready") throw new Error("unreachable");
+    expect(cleared.brief.blockReason).toBeNull();
+    expect(cleared.brief.statusOverride).toBe("waiting-on-other");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("rides along on the board card", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "not before the release",
+    });
+    const { cards } = (await harness.behavior.callRpc("listBriefCards", null)) as {
+      cards: { blockReason: { text: string } | null }[];
+    };
+    expect(cards[0]?.blockReason?.text).toBe("not before the release");
 
     await harness.lifecycle.dispose();
   });

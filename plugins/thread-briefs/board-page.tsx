@@ -368,11 +368,13 @@ function CardDetail({
   now,
   onPickStage,
   onPickStatus,
+  onSetBlockReason,
 }: {
   threadId: string;
   now: number;
   onPickStage: (stage: BriefStage | null) => void;
   onPickStatus: (status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (text: string | null) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const [state, setState] = useState<BriefState | null>(null);
@@ -424,7 +426,9 @@ function CardDetail({
       <StatusControl
         status={brief.status}
         statusOverride={brief.statusOverride}
+        blockReason={brief.blockReason}
         onPick={onPickStatus}
+        onSetBlockReason={onSetBlockReason}
       />
       <StageControl
         stage={brief.stage}
@@ -445,6 +449,7 @@ function Card({
   onDragEnd,
   onPickStage,
   onPickStatus,
+  onSetBlockReason,
   onSummarize,
 }: {
   row: BoardRow;
@@ -456,6 +461,7 @@ function Card({
   onDragEnd: () => void;
   onPickStage: (stage: BriefStage | null) => void;
   onPickStatus: (status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (text: string | null) => void;
   onSummarize: () => void;
 }) {
   const ring = cardRingIcon(row);
@@ -602,6 +608,7 @@ function Card({
           now={now}
           onPickStage={onPickStage}
           onPickStatus={onPickStatus}
+          onSetBlockReason={onSetBlockReason}
         />
       ) : null}
     </article>
@@ -689,6 +696,7 @@ function Column({
   onDrop,
   onPickStage,
   onPickStatus,
+  onSetBlockReason,
   onSummarize,
 }: {
   column: BoardColumn;
@@ -708,6 +716,7 @@ function Column({
   onDrop: () => void;
   onPickStage: (row: BoardRow, stage: BriefStage | null) => void;
   onPickStatus: (row: BoardRow, status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (row: BoardRow, text: string | null) => void;
   onSummarize: (row: BoardRow) => void;
 }) {
   const [showAll, setShowAll] = useState(false);
@@ -790,6 +799,7 @@ function Column({
             onDragEnd={onDragEnd}
             onPickStage={(stage) => onPickStage(row, stage)}
             onPickStatus={(status) => onPickStatus(row, status)}
+            onSetBlockReason={(text) => onSetBlockReason(row, text)}
             onSummarize={() => onSummarize(row)}
           />
         ))}
@@ -862,6 +872,25 @@ export function BoardPage() {
   const columns = useMemo(
     () => layOutColumns({ rows: visible, filters, expanded: view.expanded }),
     [filters, view.expanded, visible],
+  );
+
+  /** Write the user's block reason; realtime redraws the card. */
+  const setBlockReason = useCallback(
+    async (row: BoardRow, text: string | null) => {
+      setPending((previous) => new Set(previous).add(row.threadId));
+      try {
+        await rpc.call("setBlockReason", { threadId: row.threadId, text });
+      } catch {
+        // Same recovery as a drop: the server's state is what gets drawn.
+      } finally {
+        setPending((previous) => {
+          const next = new Set(previous);
+          next.delete(row.threadId);
+          return next;
+        });
+      }
+    },
+    [rpc],
   );
 
   /**
@@ -987,6 +1016,7 @@ export function BoardPage() {
               onPickStatus={(row, status) =>
                 void applyDrops(row, [{ kind: "status", status }])
               }
+              onSetBlockReason={(row, text) => void setBlockReason(row, text)}
               onSummarize={onSummarize}
             />
           ))}

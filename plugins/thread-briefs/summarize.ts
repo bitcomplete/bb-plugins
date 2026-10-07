@@ -11,6 +11,7 @@ import {
   type StoredBriefStatus,
   type SummaryResult,
 } from "./contract.js";
+import { BLOCK_NOTE_MARKER } from "./transcript.js";
 
 export const SYSTEM_PROMPT = `You write one-paragraph-max operating briefs for software engineering threads, so someone returning after a day away knows what the thread is for and what to do next without reading it.
 
@@ -62,11 +63,26 @@ const PINNED_STATUS_GUIDANCE: Record<StoredBriefStatus, string> = {
   done: "the user has marked this thread as finished — the outstanding step was carried out somewhere the transcript cannot see. The refreshers must not hand out a next action; say what it landed and stop.",
 };
 
+/**
+ * What to tell the model about a block reason the user recorded.
+ *
+ * Unlike the pinned-status guidance, this is addressed to the fields. The
+ * reason is a fact the transcript does not contain — the user typed it into
+ * the panel, not the thread — and the honest way to get it into the brief is
+ * to hand it over as a fact and let the model write `blockedOn` and `status`
+ * from it, in its own words, as it would from a message. The note is placed
+ * in the conversation at the point it was made so the model can read what
+ * came after it; that is what "unless resolved since" means.
+ */
+const BLOCK_REASON_GUIDANCE = `The conversation contains a line marked "${BLOCK_NOTE_MARKER}": the user recorded, outside the thread, why this thread is blocked. Treat it as true unless the conversation after that line shows the block resolved or the user resuming the work. While it holds, "blockedOn" names what the note says the thread is waiting on, in your words, and "status" is "waiting-on-other". The refreshers should say the thread was parked and why, and what picking it back up would involve, rather than telling the user to carry on.`;
+
 export function buildUserPrompt(args: {
   transcript: string;
   fixedStage: BriefStage | null;
   /** A status the user pinned by hand, or null for the ordinary derivation. */
   pinnedStatus?: StoredBriefStatus | null;
+  /** Whether the transcript carries a block note to be read as guidance. */
+  hasBlockReason?: boolean;
 }): string {
   const stageLine =
     args.fixedStage === null
@@ -81,7 +97,9 @@ export function buildUserPrompt(args: {
       ? ""
       : `\n\nFor "refresherShort" and "refresherFull" only: ${PINNED_STATUS_GUIDANCE[pinned]} The other fields still describe the work as the transcript leaves it.`;
 
-  return `${stageLine}${statusLine}
+  const reasonLine = args.hasBlockReason ? `\n\n${BLOCK_REASON_GUIDANCE}` : "";
+
+  return `${stageLine}${statusLine}${reasonLine}
 
 Thread transcript follows.
 

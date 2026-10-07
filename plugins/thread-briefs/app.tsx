@@ -39,9 +39,8 @@ import {
 } from "./shared.js";
 import {
   doneRingIcon,
-  DONE_RING_ICON,
   rowDecoration,
-  STALE_DONE_RING_ICON,
+  staleDoneRingIcon,
   stageRingIcon,
   STATUS_LABELS,
   summarizedAgo,
@@ -304,7 +303,7 @@ const RING_QUARTERS = [
 
 /**
  * A ring with `filled` of its four quarters solid and the rest left as a track,
- * optionally with the centre filled in.
+ * optionally closed off as `done` and optionally marked as pinned.
  *
  * The track is what makes the glyph a ratio rather than a count: three quarters
  * against a visible whole reads instantly at 16px, where three marks against
@@ -313,11 +312,19 @@ const RING_QUARTERS = [
  * A `color` of `currentColor` leaves the host's tone class to paint it, which
  * is what the panel and the stage picker want. An explicit colour overrides
  * that class, so the two modes cannot both colour the same ring — which is what
- * lets one glyph carry three facts at 16px: how far round it goes is the stage,
- * whether the centre is filled is `done`, and the hue is the project (or grey,
- * for a done thread nobody has come back to).
+ * lets one glyph carry four facts at 16px: how far round it goes is the stage,
+ * a thin outer ring is `done`, a dot in the centre is a pin, and the hue is the
+ * project (or grey, for a done thread nobody has come back to).
+ *
+ * `done` draws the closed ring smaller inside the outer ring rather than
+ * adding the outer ring around a full-size one, because the arcs already reach
+ * the box's edge. The dot is the smaller of the two marks because it is the
+ * one that also has to read at 12px in the stage picker.
  */
-function ring(filled: number, complete = false, color = "currentColor") {
+function ring(
+  filled: number,
+  { complete = false, pinned = false, color = "currentColor" } = {},
+) {
   return function StageRing({ className }: { className?: string }) {
     return (
       <svg
@@ -326,23 +333,32 @@ function ring(filled: number, complete = false, color = "currentColor") {
         className={className}
         aria-hidden="true"
       >
-        {RING_QUARTERS.map((d, index) => (
-          <path
-            key={d}
-            d={d}
-            stroke={color}
-            strokeWidth={2}
-            opacity={index < filled ? 1 : 0.25}
-          />
-        ))}
-        {complete ? <circle cx={8} cy={8} r={2.75} fill={color} /> : null}
+        {complete ? (
+          <circle cx={8} cy={8} r={7.25} stroke={color} strokeWidth={1} />
+        ) : null}
+        <g
+          transform={
+            complete ? "translate(8 8) scale(0.72) translate(-8 -8)" : undefined
+          }
+        >
+          {RING_QUARTERS.map((d, index) => (
+            <path
+              key={d}
+              d={d}
+              stroke={color}
+              strokeWidth={complete ? 2.5 : 2}
+              opacity={index < filled ? 1 : 0.25}
+            />
+          ))}
+        </g>
+        {pinned ? <circle cx={8} cy={8} r={2.25} fill={color} /> : null}
       </svg>
     );
   };
 }
 
 /**
- * One ring per stage, plus the closed filled ring for `done`.
+ * One ring per stage, plus the done ring, each with and without the pin dot.
  *
  * Mapped over `BRIEF_STAGES` in order, so the artwork and the names cannot
  * drift: `stageRingIcon` is the same function the row decoration calls, and a
@@ -351,16 +367,16 @@ function ring(filled: number, complete = false, color = "currentColor") {
 function ringSet(colorIndex?: number) {
   const color =
     colorIndex === undefined ? "currentColor" : projectRingColor(colorIndex);
-  return [
+  return [false, true].flatMap((pinned) => [
     ...BRIEF_STAGES.map((stage, index) => ({
-      name: stageRingIcon(stage, colorIndex),
-      component: ring(index + 1, false, color),
+      name: stageRingIcon(stage, colorIndex, pinned),
+      component: ring(index + 1, { pinned, color }),
     })),
     {
-      name: doneRingIcon(colorIndex),
-      component: ring(RING_QUARTERS.length, true, color),
+      name: doneRingIcon(colorIndex, pinned),
+      component: ring(RING_QUARTERS.length, { complete: true, pinned, color }),
     },
-  ];
+  ]);
 }
 
 /**
@@ -376,12 +392,16 @@ function ringSet(colorIndex?: number) {
 const RING_ICONS = [
   ...ringSet(),
   ...PROJECT_RING_HUES.flatMap((_hue, colorIndex) => ringSet(colorIndex)),
-  // One, not a set: the grey replaces a project's hue rather than varying with
-  // it. See {@link STALE_DONE_RING_ICON}.
-  {
-    name: STALE_DONE_RING_ICON,
-    component: ring(RING_QUARTERS.length, true, STALE_DONE_RING_COLOR),
-  },
+  // Two, not a set: the grey replaces a project's hue rather than varying with
+  // it, and only the pin still varies. See {@link STALE_DONE_RING_ICON}.
+  ...[false, true].map((pinned) => ({
+    name: staleDoneRingIcon(pinned),
+    component: ring(RING_QUARTERS.length, {
+      complete: true,
+      pinned,
+      color: STALE_DONE_RING_COLOR,
+    }),
+  })),
 ];
 
 // ------------------------------------------------------------------ the panel
@@ -391,12 +411,14 @@ function BriefBody({
   state,
   onPick,
   onPickStatus,
+  onSetBlockReason,
   onRefresh,
 }: {
   now: number;
   state: BriefState | null;
   onPick: (stage: BriefStage | null) => void;
   onPickStatus: (status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (text: string | null) => void;
   onRefresh: () => void;
 }) {
   if (state === null) {
@@ -428,6 +450,7 @@ function BriefBody({
   }
 
   const { brief } = state;
+  const pinned = brief.stageOverride !== null || brief.statusOverride !== null;
   const allEmpty =
     [brief.goal, brief.currentState, brief.nextStep, brief.blockedOn, brief.constraints]
       .every((value) => value.trim() === "");
@@ -446,8 +469,8 @@ function BriefBody({
             <Icon
               name={
                 brief.status === "done"
-                  ? DONE_RING_ICON
-                  : stageRingIcon(brief.stage)
+                  ? doneRingIcon(undefined, pinned)
+                  : stageRingIcon(brief.stage, undefined, pinned)
               }
               className={`h-3.5 w-3.5 shrink-0 ${
                 brief.status === "done"
@@ -509,7 +532,9 @@ function BriefBody({
       <StatusControl
         status={brief.status}
         statusOverride={brief.statusOverride}
+        blockReason={brief.blockReason}
         onPick={onPickStatus}
+        onSetBlockReason={onSetBlockReason}
       />
       <StageControl
         stage={brief.stage}
@@ -566,13 +591,23 @@ function useBrief(threadId: string) {
     [rpc, threadId, load],
   );
 
+  const setBlockReason = useCallback(
+    (text: string | null) => {
+      void rpc
+        .call("setBlockReason", { threadId, text })
+        .then(setState)
+        .catch(() => load());
+    },
+    [rpc, threadId, load],
+  );
+
   const refresh = useCallback(() => {
     void rpc.call("refresh", { threadId }).then(() => {
       setState({ state: "summarizing" });
     });
   }, [rpc, threadId]);
 
-  return { state, setStage, setStatus, refresh };
+  return { state, setStage, setStatus, setBlockReason, refresh };
 }
 
 /**
@@ -585,7 +620,8 @@ function useBrief(threadId: string) {
  * none of that is this component's problem.
  */
 function BriefPanel({ threadId }: { threadId: string }) {
-  const { state, setStage, setStatus, refresh } = useBrief(threadId);
+  const { state, setStage, setStatus, setBlockReason, refresh } =
+    useBrief(threadId);
   const now = useNow(30_000);
   return (
     <BriefBody
@@ -593,6 +629,7 @@ function BriefPanel({ threadId }: { threadId: string }) {
       state={state}
       onPick={setStage}
       onPickStatus={setStatus}
+      onSetBlockReason={setBlockReason}
       onRefresh={refresh}
     />
   );

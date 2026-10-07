@@ -23,6 +23,7 @@ const card = (overrides: Partial<BriefCard> = {}): BriefCard => ({
   status: "waiting-on-me",
   stageOverride: null,
   statusOverride: null,
+  blockReason: null,
   nextStep: "Push the branch",
   blockedOn: "",
   lastSummarizedAt: NOW - 1000,
@@ -59,6 +60,7 @@ const READY: BriefState = {
     status: "waiting-on-me",
     stageOverride: null,
     statusOverride: null,
+    blockReason: null,
     lastSummarizedAt: NOW - 1000,
   },
 };
