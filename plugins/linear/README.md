@@ -39,9 +39,14 @@ API → OAuth applications:
 | Callback URL | `https://<bb host>/api/v1/plugins/linear/http/connect/callback` — for the team, `https://bb.boreray-eel.ts.net/api/v1/plugins/linear/http/connect/callback` |
 | Public | Yes. The plugin uses PKCE and sends no client secret. |
 
-Then set the application's client ID in the plugin's `clientId` setting on
-each server (or bake it into the image's defaults). The scopes requested are
-`read`, `write`, `issues:create`, `comments:create`.
+Then give every server the application's client ID through the
+`LINEAR_CLIENT_ID` environment variable, the way thread-briefs takes
+`THREAD_BRIEFS_BASE_URL` (in bb-gate, a plain value in the backend template).
+The plugin reads it as the `clientId` setting's default, so nobody types it;
+a stored setting still wins for a server that connects through a different
+application. The ID is not a secret: the application is public and PKCE
+protects the exchange. The scopes requested are `read`, `write`,
+`issues:create`, `comments:create`.
 
 Linear access tokens last 24 hours. The plugin refreshes one that is within
 five minutes of expiry before using it, and once more if Linear answers 401;
@@ -52,7 +57,7 @@ Disconnect revokes the token at Linear.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `clientId` | — | The Linear OAuth application's client ID. Required before Connect works. |
+| `clientId` | `LINEAR_CLIENT_ID` from the server's environment | The Linear OAuth application's client ID. Required before Connect works. |
 | `linearUrl` | `https://linear.app` | Where the browser approves. |
 | `apiUrl` | `https://api.linear.app` | Token exchange and GraphQL. |
 | `accessToken` | — | Secret. Set by Connect Linear, refreshed by the plugin. |

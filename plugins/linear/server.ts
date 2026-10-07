@@ -52,6 +52,13 @@ import {
 
 export const CALLBACK_PATH = "/connect/callback";
 export const CONNECTION_CHANGED = "connection-changed";
+/**
+ * The server's environment can carry the deployment's OAuth client ID, so a
+ * fleet of servers behind one hostname shares one Linear application without
+ * anyone typing it. A stored setting wins over it; an empty stored setting
+ * falls back to it.
+ */
+export const ENV_CLIENT_ID = "LINEAR_CLIENT_ID";
 
 /** A token this close to expiry is refreshed before it is used. */
 export const REFRESH_MARGIN_MS = 5 * 60 * 1000;
@@ -81,13 +88,14 @@ export const rpcContract = defineRpcContract({
   },
 });
 
-export const SETTING_DESCRIPTORS = {
-  clientId: {
-    type: "string",
-    label: "OAuth client ID",
-    description: "The Linear OAuth application this server connects through. Its redirect URI must be this server's callback; see the README.",
-    default: "",
-  },
+export function settingDescriptors(env: Record<string, string | undefined>) {
+  return {
+    clientId: {
+      type: "string",
+      label: "OAuth client ID",
+      description: `The Linear OAuth application this server connects through. Its redirect URI must be this server's callback; see the README. Unset, the server's ${ENV_CLIENT_ID} is used when the deployment sets one.`,
+      default: env[ENV_CLIENT_ID]?.trim() ?? "",
+    },
   linearUrl: {
     type: "string",
     label: "Linear address",
@@ -112,11 +120,13 @@ export const SETTING_DESCRIPTORS = {
     label: "Refresh token",
     description: "Filled in by Connect Linear below.",
   },
-} as const;
+  } as const;
+}
 
 export interface LinearPluginDeps {
   fetch: typeof fetch;
   now: () => number;
+  env: Record<string, string | undefined>;
 }
 
 function errorMessage(error: unknown): string {
@@ -154,7 +164,8 @@ const issueKey = z
 
 export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
-    const settings = bb.settings.define(SETTING_DESCRIPTORS);
+    const settings = bb.settings.define(settingDescriptors(deps.env));
+    const clientIdOf = (cfg: { clientId: string }) => (cfg.clientId.trim() === "" ? (deps.env[ENV_CLIENT_ID]?.trim() ?? "") : cfg.clientId.trim());
 
     // ---- the connection ---------------------------------------------------
 
@@ -206,7 +217,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         const cfg = await settings.get();
         const refreshToken = cfg.refreshToken?.trim() ?? "";
         if (refreshToken === "") throw new Error(`The Linear token ${reason} and there is no refresh token. Connect Linear again.`);
-        const tokens = await refreshTokens(cfg.apiUrl, cfg.clientId, refreshToken, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS), deps.now());
+        const tokens = await refreshTokens(cfg.apiUrl, clientIdOf(cfg), refreshToken, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS), deps.now());
         await storeTokens(tokens);
         // The developer is the same; carry the record to the new fingerprint.
         const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
@@ -257,17 +268,17 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             organization = stored.data.organization;
           }
         }
-        return { connected: token !== "", configured: cfg.clientId.trim() !== "", user, organization, linearUrl: cfg.linearUrl };
+        return { connected: token !== "", configured: clientIdOf(cfg) !== "", user, organization, linearUrl: cfg.linearUrl };
       },
       async connect() {
         const cfg = await settings.get();
-        if (cfg.clientId.trim() === "") {
+        if (clientIdOf(cfg) === "") {
           throw new Error("No OAuth client ID is set. Open Settings → Plugins → Linear and enter the Linear OAuth application's client ID.");
         }
         await prunePending();
         const pending = newPendingConnect(redirectUri(), deps.now());
         await bb.storage.kv.set(pendingKey(pending.state), pending);
-        return { url: authorizeUrl(cfg.linearUrl, cfg.clientId.trim(), pending) };
+        return { url: authorizeUrl(cfg.linearUrl, clientIdOf(cfg), pending) };
       },
       async disconnect() {
         const cfg = await settings.get();
@@ -307,7 +318,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         const code = c.req.query("code") ?? "";
         const cfg = await settings.get();
         try {
-          const tokens = await exchangeCode(cfg.apiUrl, cfg.clientId.trim(), pending, code, deps.fetch, AbortSignal.timeout(15_000), deps.now());
+          const tokens = await exchangeCode(cfg.apiUrl, clientIdOf(cfg), pending, code, deps.fetch, AbortSignal.timeout(15_000), deps.now());
           await storeTokens(tokens);
           await bb.storage.kv.delete(CONNECTION_KEY);
           const viewer = await whoIs(tokens.accessToken, cfg.apiUrl, AbortSignal.timeout(15_000));
@@ -458,4 +469,4 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
   };
 }
 
-export default createLinearPlugin({ fetch: (url, init) => fetch(url, init), now: () => Date.now() });
+export default createLinearPlugin({ fetch: (url, init) => fetch(url, init), now: () => Date.now(), env: process.env });

@@ -52,7 +52,7 @@ const issue = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-async function setup(options: { settings?: Record<string, string>; linear?: Parameters<typeof fakeLinear>[0]; expiresAt?: number } = {}) {
+async function setup(options: { settings?: Record<string, string>; env?: Record<string, string>; linear?: Parameters<typeof fakeLinear>[0]; expiresAt?: number } = {}) {
   const { bb, harness } = createFakePluginHost({
     pluginId: "linear",
     appUrl: APP_URL,
@@ -60,7 +60,7 @@ async function setup(options: { settings?: Record<string, string>; linear?: Para
   });
   const linear = fakeLinear(options.linear);
   let now = 1_000_000_000_000;
-  await createLinearPlugin({ fetch: linear.fetchImpl, now: () => now })(bb);
+  await createLinearPlugin({ fetch: linear.fetchImpl, now: () => now, env: options.env ?? {} })(bb);
   if (options.expiresAt !== undefined) await bb.storage.kv.set("expiresAt", options.expiresAt);
   const route = harness.registrations.httpRoutes.find((r) => r.path === "/connect/callback")!;
   const app = new Hono().get("/cb", route.handler);
@@ -87,6 +87,19 @@ describe("connect", () => {
     const { harness } = await setup({ settings: { clientId: "" } });
     await expect(harness.callRpc("connect", null)).rejects.toThrow(/client ID/u);
     expect(await harness.callRpc("status", null)).toMatchObject({ connected: false, configured: false });
+  });
+
+  it("takes the client ID from the server's environment when no setting is stored", async () => {
+    const { harness } = await setup({ settings: { clientId: "" }, env: { LINEAR_CLIENT_ID: " fleet-client " } });
+    expect(await harness.callRpc("status", null)).toMatchObject({ configured: true });
+    const { url } = (await harness.callRpc("connect", null)) as { url: string };
+    expect(new URL(url).searchParams.get("client_id")).toBe("fleet-client");
+  });
+
+  it("lets a stored client ID win over the environment", async () => {
+    const { harness } = await setup({ settings: { clientId: "mine" }, env: { LINEAR_CLIENT_ID: "fleet-client" } });
+    const { url } = (await harness.callRpc("connect", null)) as { url: string };
+    expect(new URL(url).searchParams.get("client_id")).toBe("mine");
   });
 
   it("exchanges the code with the verifier, stores the tokens, and learns who connected", async () => {
