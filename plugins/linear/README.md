@@ -19,6 +19,7 @@ same connect.
 |---|---|
 | `linear_issue` | One issue by key: fields, description, latest comments. |
 | `linear_search` | Issues by free text, team, state, assignee. |
+| `linear_create_issue` | A new issue in a team: title, description, state, assignee, labels, priority, parent. |
 | `linear_comment` | A Markdown comment, signed with the thread id. |
 | `linear_set_state` | Move an issue to a workflow state by name. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
@@ -26,7 +27,8 @@ same connect.
 Writes are deliberately named tools rather than a raw mutation tool, so the
 thread's timeline says what changed. Everything runs as the connected user
 (`actor=user`), so comments and state changes are attributed to the
-developer, like `gh`.
+developer, like `gh`. Issues and comments a thread writes carry the
+thread's id so a reader in Linear can find the conversation.
 
 ## The OAuth application
 

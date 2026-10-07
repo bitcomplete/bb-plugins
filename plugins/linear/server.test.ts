@@ -170,7 +170,7 @@ describe("tools", () => {
   it("are registered with the names the skill documents", async () => {
     const { harness } = await setup();
     const names = harness.registrations.agentTools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["linear_comment", "linear_issue", "linear_query", "linear_search", "linear_set_state"]);
+    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_set_state"]);
   });
 
   it("say how to connect when there is no token", async () => {
@@ -249,6 +249,58 @@ describe("tools", () => {
     const miss = await tool("linear_set_state", { key: "ENG-123", state: "Shipped" });
     expect(miss).toMatchObject({ isError: true });
     expect(text(miss)).toContain("Todo (unstarted), Done (completed)");
+  });
+
+  it("linear_create_issue resolves the team, state, labels, assignee and parent, and signs the description", async () => {
+    const team = {
+      id: "t-eng",
+      key: "ENG",
+      name: "Engineering",
+      states: { nodes: [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }, { id: "s-todo", name: "Todo", type: "unstarted", position: 1 }] },
+      labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
+    };
+    const { tool, text, linear } = await setup({
+      settings: { accessToken: "at-0" },
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($input: IssueCreateInput!)")) return { data: { issueCreate: { success: true, issue: { identifier: "ENG-124", url: "https://linear.app/acme/issue/ENG-124" } } } };
+          if (body.query.startsWith("query($key: String!) { teams")) return { data: { teams: { nodes: body.variables!.key === "ENG" ? [team] : [] }, issueLabels: { nodes: [{ id: "l-infra", name: "Infra" }] } } };
+          if (body.query.startsWith("query($who: String!) { users")) {
+            return { data: { users: { nodes: [{ id: "u-bob", name: "Bob", displayName: "bob", email: "bob@acme.test", active: true }, { id: "u-bobby", name: "Bobby", displayName: "bobby", email: "bobby@acme.test", active: true }] } } };
+          }
+          return { data: { issue: issue() } };
+        },
+      },
+    });
+
+    const out = text(await tool("linear_create_issue", { team: "eng", title: "Add retries", description: "Calls fail once in a while.", state: "todo", labels: ["bug", "infra"], assignee: "me", priority: "high", parent: "ENG-123" }));
+    expect(out).toBe("Filed ENG-124: Add retries\nhttps://linear.app/acme/issue/ENG-124");
+    const mutation = linear.calls.find((c) => c.body?.query.startsWith("mutation($input: IssueCreateInput!)"))!;
+    const input = mutation.body!.variables!.input as Record<string, unknown>;
+    expect(input).toMatchObject({ teamId: "t-eng", title: "Add retries", stateId: "s-todo", labelIds: ["l-bug", "l-infra"], assigneeId: "u1", priority: 2, parentId: "uuid-1" });
+    expect(input.description).toMatch(/^Calls fail once in a while\.\n\n_— from bb thread .+_$/u);
+
+    // Without a description the signature is the description.
+    expect(text(await tool("linear_create_issue", { team: "ENG", title: "Bare" }))).toContain("Filed ENG-124");
+    const bare = linear.calls.at(-1)!.body!.variables!.input as Record<string, unknown>;
+    expect(bare.description).toMatch(/^_— from bb thread .+_$/u);
+    expect(bare).not.toHaveProperty("stateId");
+
+    // A person by email; by an ambiguous name the tool asks for an email.
+    await tool("linear_create_issue", { team: "ENG", title: "For Bob", assignee: "bob@acme.test" });
+    expect((linear.calls.at(-1)!.body!.variables!.input as Record<string, unknown>).assigneeId).toBe("u-bob");
+    const ambiguous = await tool("linear_create_issue", { team: "ENG", title: "For Bob", assignee: "bo" });
+    expect(ambiguous).toMatchObject({ isError: true });
+    expect(text(ambiguous)).toContain("bob <bob@acme.test>, bobby <bobby@acme.test>");
+
+    const noTeam = await tool("linear_create_issue", { team: "NOPE", title: "x" });
+    expect(noTeam).toMatchObject({ isError: true });
+    expect(text(noTeam)).toContain("No Linear team NOPE");
+    const noState = await tool("linear_create_issue", { team: "ENG", title: "x", state: "Shipped" });
+    expect(text(noState)).toContain("Backlog (backlog), Todo (unstarted)");
+    const noLabel = await tool("linear_create_issue", { team: "ENG", title: "x", labels: ["urgent"] });
+    expect(text(noLabel)).toContain('No label named "urgent" for team ENG. Its labels: Bug, Infra.');
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($input: IssueCreateInput!)"))).toHaveLength(3);
   });
 
   it("linear_query runs queries and refuses mutations", async () => {

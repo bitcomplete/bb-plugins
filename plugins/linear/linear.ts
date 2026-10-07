@@ -114,6 +114,13 @@ export const SEARCH_QUERY = `query($term: String!, $filter: IssueFilter, $first:
 export const ISSUE_REF_QUERY = "query($id: String!) { issue(id: $id) { id identifier team { key states { nodes { id name type position } } } } }";
 export const COMMENT_CREATE = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { url } } }";
 export const ISSUE_UPDATE = "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier state { name } } } }";
+export const ISSUE_CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }";
+/** A team by key, with the states and labels an issue in it can take. Workspace labels apply to every team. */
+export const TEAM_QUERY =
+  "query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1) { nodes { id key name states { nodes { id name type position } } labels(first: 250) { nodes { id name } } } } " +
+  "issueLabels(filter: { team: { null: true } }, first: 250) { nodes { id name } } }";
+export const USERS_QUERY =
+  "query($who: String!) { users(filter: { or: [{ displayName: { containsIgnoreCase: $who } }, { name: { containsIgnoreCase: $who } }, { email: { eqIgnoreCase: $who } }] }, first: 10) { nodes { id name displayName email active } } }";
 
 const person = z.object({ name: z.string().nullish(), displayName: z.string().nullish(), email: z.string().nullish() }).nullish();
 const personName = (p: z.infer<typeof person>) => p?.displayName ?? p?.name ?? p?.email ?? null;
@@ -199,6 +206,82 @@ export function parseIssueUpdate(payload: unknown): { identifier: string; state:
   if (!parsed.success || parsed.issue === null || parsed.issue === undefined) throw new Error("Linear did not update the issue");
   return { identifier: parsed.issue.identifier, state: parsed.issue.state?.name ?? null };
 }
+
+export function parseIssueCreate(payload: unknown): { identifier: string; url: string | null } {
+  const data = dataOf(payload);
+  const parsed = z
+    .object({ success: z.boolean(), issue: z.object({ identifier: z.string(), url: z.string().nullish() }).nullish() })
+    .parse(data.issueCreate);
+  if (!parsed.success || parsed.issue === null || parsed.issue === undefined) throw new Error("Linear did not create the issue");
+  return { identifier: parsed.issue.identifier, url: parsed.issue.url ?? null };
+}
+
+export type Team = {
+  id: string;
+  key: string;
+  name: string | null;
+  states: IssueRef["team"]["states"];
+  /** The team's own labels and the workspace's, the team's first. */
+  labels: Array<{ id: string; name: string }>;
+};
+
+const labelNodes = z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string() })) });
+
+export function parseTeam(payload: unknown): Team | null {
+  const data = dataOf(payload);
+  const parsed = z
+    .object({
+      teams: z.object({
+        nodes: z.array(
+          z.object({
+            id: z.string(),
+            key: z.string(),
+            name: z.string().nullish(),
+            states: z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string(), type: z.string(), position: z.number() })) }),
+            labels: labelNodes.nullish(),
+          }),
+        ),
+      }),
+      issueLabels: labelNodes.nullish(),
+    })
+    .parse(data);
+  const team = parsed.teams.nodes[0];
+  if (team === undefined) return null;
+  return {
+    id: team.id,
+    key: team.key,
+    name: team.name ?? null,
+    states: team.states.nodes,
+    labels: [...(team.labels?.nodes ?? []), ...(parsed.issueLabels?.nodes ?? [])],
+  };
+}
+
+/** Each wanted label's id, matched by name ignoring case; the names with no match. */
+export function findLabels(labels: Team["labels"], names: string[]): { ids: string[]; missing: string[] } {
+  const ids: string[] = [];
+  const missing: string[] = [];
+  for (const name of names) {
+    const wanted = name.trim().toLowerCase();
+    const found = labels.find((l) => l.name.toLowerCase() === wanted);
+    if (found === undefined) missing.push(name.trim());
+    else if (!ids.includes(found.id)) ids.push(found.id);
+  }
+  return { ids, missing };
+}
+
+export type User = { id: string; name: string; email: string | null; active: boolean };
+
+export function parseUsers(payload: unknown): User[] {
+  const data = dataOf(payload);
+  const parsed = z
+    .object({ nodes: z.array(z.object({ id: z.string(), name: z.string().nullish(), displayName: z.string().nullish(), email: z.string().nullish(), active: z.boolean().nullish() })) })
+    .parse(data.users);
+  return parsed.nodes.map((u) => ({ id: u.id, name: u.displayName ?? u.name ?? u.email ?? u.id, email: u.email ?? null, active: u.active ?? true }));
+}
+
+/** Linear's priority numbers: 0 is none, 1 urgent, 4 low. */
+export const PRIORITIES = { none: 0, urgent: 1, high: 2, medium: 3, low: 4 } as const;
+export type PriorityName = keyof typeof PRIORITIES;
 
 // ---- search filters --------------------------------------------------------
 

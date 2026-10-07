@@ -9,7 +9,7 @@
   },
   "bb": {
     "name": "Linear",
-    "description": "Connect your Linear account once; threads then read, search, comment on and move issues as you.",
+    "description": "Connect your Linear account once; threads then read, search, file, comment on and move issues as you.",
     "branding": {
       "icon": "ListTodo"
     },

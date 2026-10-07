@@ -1,6 +1,6 @@
 ---
 name: linear
-description: Read, search, comment on, or move Linear issues from a bb thread through the Linear plugin's tools, or diagnose why they say Linear is not connected.
+description: Read, search, file, comment on, or move Linear issues from a bb thread through the Linear plugin's tools, or diagnose why they say Linear is not connected.
 ---
 
 # Linear
@@ -15,6 +15,7 @@ token stays on the server; a thread never sees it and needs no API key.
 |---|---|
 | `linear_issue` | Read one issue by key (`ENG-123`): state, assignee, labels, project, parent, sub-issues, description, latest comments. |
 | `linear_search` | Find issues by free text and/or team key, state name, assignee (`me` for the connected user). Open issues only by default. |
+| `linear_create_issue` | File a new issue in a team by key: title, Markdown description, and optionally a state, assignee (`me`), labels, priority and parent issue. The description is signed with the thread id. |
 | `linear_comment` | Add a Markdown comment. It is signed with the thread id so a reader can find the conversation. |
 | `linear_set_state` | Move an issue to a state by name. On a mismatch the error lists the team's states. |
 | `linear_query` | Any read-only GraphQL query, for projects, cycles, teams, documents and anything the tools above lack. Mutations are refused. |
@@ -29,6 +30,13 @@ Comment when there is something a reader in Linear needs: a PR link, a
 decision, a question for the reporter. Do not narrate progress. Move an
 issue's state only when the user asked for it or the team's convention is
 clear (for example In Review when the PR opens).
+
+File an issue only when the user asks for one. Put the team key, a short
+title and a description with the reproduction or the ask in it; the plugin
+signs the description with the thread id. If the user did not name a team,
+`linear_search` with `assignee: me` shows which teams they work in. A state,
+label or assignee that does not match is an error that lists the choices,
+so retry with one of those rather than inventing a name.
 
 ## Not connected
 

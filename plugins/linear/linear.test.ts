@@ -4,6 +4,7 @@ import {
   DESCRIPTION_CHARS,
   LinearRequestError,
   dataOf,
+  findLabels,
   findState,
   formatIssue,
   formatIssueList,
@@ -12,9 +13,12 @@ import {
   issueFilter,
   parseCommentCreate,
   parseIssue,
+  parseIssueCreate,
   parseIssueList,
   parseIssueRef,
   parseIssueUpdate,
+  parseTeam,
+  parseUsers,
   parseViewer,
   searchLimit,
 } from "./linear.js";
@@ -105,6 +109,38 @@ describe("parsing", () => {
     expect(() => parseCommentCreate({ data: { commentCreate: { success: false } } })).toThrow(/did not create/u);
     expect(parseIssueUpdate({ data: { issueUpdate: { success: true, issue: { identifier: "ENG-1", state: { name: "Done" } } } } })).toEqual({ identifier: "ENG-1", state: "Done" });
     expect(() => parseIssueUpdate({ data: { issueUpdate: { success: false, issue: null } } })).toThrow(/did not update/u);
+  });
+});
+
+describe("creating", () => {
+  const team = {
+    id: "t-eng",
+    key: "ENG",
+    name: "Engineering",
+    states: { nodes: [{ id: "s-todo", name: "Todo", type: "unstarted", position: 0 }] },
+    labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
+  };
+
+  it("reads a team with its own and the workspace's labels, and a missing team", () => {
+    const parsed = parseTeam({ data: { teams: { nodes: [team] }, issueLabels: { nodes: [{ id: "l-infra", name: "Infra" }] } } })!;
+    expect(parsed.id).toBe("t-eng");
+    expect(parsed.states.map((s) => s.name)).toEqual(["Todo"]);
+    expect(parsed.labels.map((l) => l.name)).toEqual(["Bug", "Infra"]);
+    expect(parseTeam({ data: { teams: { nodes: [] }, issueLabels: { nodes: [] } } })).toBeNull();
+  });
+
+  it("matches labels by name ignoring case and names the misses", () => {
+    const labels = [{ id: "l-bug", name: "Bug" }, { id: "l-infra", name: "Infra" }];
+    expect(findLabels(labels, ["bug", "BUG", "Infra", "perf"])).toEqual({ ids: ["l-bug", "l-infra"], missing: ["perf"] });
+  });
+
+  it("reads users with a display name and the create result", () => {
+    expect(parseUsers({ data: { users: { nodes: [{ id: "u1", name: "Jane", displayName: "jane", email: "jane@acme.test", active: true }, { id: "u2", name: "Old" }] } } })).toEqual([
+      { id: "u1", name: "jane", email: "jane@acme.test", active: true },
+      { id: "u2", name: "Old", email: null, active: true },
+    ]);
+    expect(parseIssueCreate({ data: { issueCreate: { success: true, issue: { identifier: "ENG-124", url: "https://linear.app/i/ENG-124" } } } })).toEqual({ identifier: "ENG-124", url: "https://linear.app/i/ENG-124" });
+    expect(() => parseIssueCreate({ data: { issueCreate: { success: false, issue: null } } })).toThrow("did not create");
   });
 });
 
