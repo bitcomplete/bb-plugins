@@ -1,7 +1,8 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { hostContract, hostSignals, rpcContract, type DiffFile } from "./contract";
+import { randomUUID } from "node:crypto";
+import { cliCommand, defineCli, PluginCliError, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { hostContract, hostSignals, rpcContract, type DiffFile, type Report } from "./contract";
 
 // Path installs run server.ts from the plugin root; git and npm installs run the bundled dist/server.js.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -20,7 +21,45 @@ export default async function plugin(bb: BbPluginApi) {
 
   let preview: { baseUrl: string; expiresAtMs: number } | null = null;
 
+  async function getReport(id: string) {
+    const report = await bb.storage.kv.get<Report>(`report/${id}`);
+    if (report === undefined) throw new PluginCliError(`Report ${id} not found`, { code: "report_not_found" });
+    return report;
+  }
+
+  async function reports() {
+    // ponytail: scans report keys; add pagination if this inbox grows large.
+    const keys = (await bb.storage.kv.list("report/")).sort().reverse().slice(0, 20);
+    return Promise.all(keys.map(async (key) => {
+      const { setup, ...summary } = await getReport(key.slice("report/".length));
+      return summary;
+    }));
+  }
+
+  bb.cli.register(defineCli({
+    name: "diff-explorer", summary: "Read saved Diff Explorer issue reports",
+    commands: {
+      reports: cliCommand({
+        summary: "List the latest 20 reports from every thread",
+        async run() { return { exitCode: 0, stdout: JSON.stringify(await reports(), null, 2) }; },
+      }),
+      report: cliCommand({
+        summary: "Read a saved report by ID",
+        positionals: [{ name: "id", description: "Report ID from the inbox", required: true }],
+        async run(input) { return { exitCode: 0, stdout: JSON.stringify(await getReport(input.positionals.id), null, 2) }; },
+      }),
+    },
+  }));
+
   bb.rpc.register(rpcContract, {
+    async report(setup) {
+      const now = Date.now();
+      const summary = { id: `${now}-${randomUUID()}`, createdAt: new Date(now).toISOString(), threadId: setup.threadId };
+      await bb.storage.kv.set(`report/${summary.id}`, { ...summary, setup });
+      return summary;
+    },
+    reports,
+    async getReport({ id }) { return getReport(id); },
     async assets() {
       if (preview === null || preview.expiresAtMs - Date.now() < 5 * 60_000) {
         preview = await bb.sdk.files.createPreview({ rootPath: MONACO_DIR, ttlMs: 60 * 60_000 });
@@ -86,6 +125,11 @@ export default async function plugin(bb: BbPluginApi) {
     async definition({ environmentId, ...position }) {
       const { root, hostId } = await environment(environmentId);
       return host.call("definition", { root, ...position }, { hostId });
+    },
+
+    async fileAction({ environmentId, ...action }) {
+      const { root, hostId } = await environment(environmentId);
+      return host.call("fileAction", { root, ...action }, { hostId });
     },
 
     async write({ environmentId, path: filePath, content, expected }) {

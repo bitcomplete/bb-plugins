@@ -14,7 +14,7 @@ Definitions come from the language server for the file's language. The server ru
 
 ## Requirements
 
-- TypeScript and JavaScript: Node.js with `npx`. The first use downloads `typescript-language-server`.
+- TypeScript and JavaScript: Node.js 20+ with `npx`. The first use downloads pinned TypeScript 5.9.3 and `typescript-language-server` 5.1.3; install scripts are disabled.
 - Go: `gopls`. Rust: `rust-analyzer`. Python: `pyright-langserver`. C and C++: `clangd`. Swift: `sourcekit-lsp`. Each must be on your PATH.
 - Files in other languages show the diff without go to definition.
 - Binary files and files too large to diff are skipped.

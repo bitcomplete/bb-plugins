@@ -1,16 +1,17 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { mkdir, open, readFile, realpath, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract, hostSignals, type Location } from "./contract";
 
-const TS = ["npx", "--yes", "-p", "typescript", "-p", "typescript-language-server", "typescript-language-server", "--stdio"];
+const TS = ["npx", "--yes", "--ignore-scripts", "-p", "typescript@5.9.3", "-p", "typescript-language-server@5.1.3", "typescript-language-server", "--stdio"];
 
 // [command, { extension: LSP languageId }]
 const SERVER_GROUPS: [string[], Record<string, string>][] = [
-  [TS, { ".ts": "typescript", ".mts": "typescript", ".cts": "typescript", ".tsx": "typescriptreact" }],
-  [TS, { ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascriptreact" }],
+  [TS, { ".ts": "typescript", ".mts": "typescript", ".cts": "typescript", ".tsx": "typescriptreact", ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascriptreact" }],
   [["gopls"], { ".go": "go" }],
   [["rust-analyzer"], { ".rs": "rust" }],
   [["pyright-langserver", "--stdio"], { ".py": "python", ".pyi": "python" }],
@@ -172,10 +173,75 @@ const watches = new Map<string, Promise<{ dispose(): Promise<void> }>>();
 // ponytail: serializes this worker's saves only; external writers need a shared locking protocol.
 const writes = new Map<string, Promise<null>>();
 
+async function mutateFile(key: string, mutate: () => Promise<null>) {
+  const saving = (writes.get(key) ?? Promise.resolve(null)).catch(() => null).then(mutate);
+  writes.set(key, saving);
+  try {
+    return await saving;
+  } finally {
+    if (writes.get(key) === saving) writes.delete(key);
+  }
+}
+
+function inside(root: string, file: string) {
+  const relative = path.relative(root, file);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${file} is outside the workspace or is its root`);
+  }
+  return relative;
+}
+
 export default experimental_defineHostEntry({
   contract: hostContract,
   experimental_signals: hostSignals,
   handlers: {
+    async fileAction({ root, path: file, action }) {
+      const relative = inside(path.resolve(root), path.resolve(file));
+      const canonicalRoot = await realpath(root);
+      // Validate the parent: unlink removes a symlink itself, never its target.
+      const key = path.join(await realpath(path.dirname(file)), path.basename(file));
+      inside(canonicalRoot, key);
+      if (action === "delete") return mutateFile(key, async () => {
+        await unlink(key); // Refuses directories; no recursive deletion.
+        return null;
+      });
+      if (/[\r\n]/.test(relative)) throw new Error("Gitignore entries cannot contain newlines");
+      const escape = (value: string) => value.replace(/[\\*?\[\] #!]/g, "\\$&");
+      if (action.endsWith("-directory") && path.dirname(relative) === ".") throw new Error("Cannot ignore the whole workspace");
+      let patternPath = relative;
+      let ignore = path.join(canonicalRoot, ".gitignore");
+      if (action.startsWith("ignore-local")) {
+        const git = (args: string[]) => promisify(execFile)("git", ["-C", canonicalRoot, "rev-parse", ...args]);
+        const [top, exclude] = await Promise.all([git(["--show-toplevel"]), git(["--git-path", "info/exclude"])]);
+        const gitRoot = top.stdout.replace(/\r?\n$/, "");
+        patternPath = inside(gitRoot, path.join(canonicalRoot, relative));
+        // Ask Git for the path: linked worktrees use a .git file, not a directory.
+        ignore = path.resolve(canonicalRoot, exclude.stdout.replace(/\r?\n$/, ""));
+        await mkdir(path.dirname(ignore), { recursive: true });
+      }
+      const directory = path.dirname(patternPath);
+      let pattern = `/${escape(patternPath)}`;
+      if (action.endsWith("-directory")) {
+        pattern = `/${escape(directory)}/`;
+      } else if (action.endsWith("-extension")) {
+        const extension = path.extname(patternPath);
+        if (!extension) throw new Error("This file has no extension to ignore");
+        pattern = `/${directory === "." ? "" : `${escape(directory)}/`}*${escape(extension)}`;
+      }
+      return mutateFile(ignore, async () => {
+        // O_NOFOLLOW prevents an ignore-file symlink from redirecting the write.
+        const handle = await open(ignore, constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o666);
+        try {
+          const content = await handle.readFile("utf8");
+          if (!content.split(/\r?\n/).includes(pattern)) {
+            await handle.writeFile(`${content && !content.endsWith("\n") ? "\n" : ""}${pattern}\n`, "utf8");
+          }
+        } finally {
+          await handle.close();
+        }
+        return null;
+      });
+    },
     async watch({ root }, context) {
       if (!watches.has(root)) {
         const watch = context.experimental_watch(
@@ -212,19 +278,13 @@ export default experimental_defineHostEntry({
     },
     async write({ path: file, content, expected }) {
       const key = await realpath(file);
-      const saving = (writes.get(key) ?? Promise.resolve(null)).catch(() => null).then(async () => {
+      return mutateFile(key, async () => {
         if ((await readFile(key, "utf8")) !== expected) {
           throw new Error(`${path.basename(file)} changed on disk since it was loaded. Refresh to see the new version; this discards your edit.`);
         }
         await writeFile(key, content, "utf8");
         return null;
       });
-      writes.set(key, saving);
-      try {
-        return await saving;
-      } finally {
-        if (writes.get(key) === saving) writes.delete(key);
-      }
     },
   },
   async dispose() {

@@ -24,7 +24,7 @@ bb plugin install git:https://github.com/arashout/bb-plugin-diff-explorer.git
 
 | Language | Server (on your PATH) |
 |---|---|
-| TypeScript, JavaScript | `npx` (downloads `typescript-language-server` on first use) |
+| TypeScript, JavaScript | Node.js 20+ with `npx` (downloads pinned TypeScript 5.9.3 and language server 5.1.3 on first use) |
 | Go | `gopls` |
 | Rust | `rust-analyzer` |
 | Python | `pyright-langserver` |
@@ -33,13 +33,44 @@ bb plugin install git:https://github.com/arashout/bb-plugin-diff-explorer.git
 
 Other languages still show the diff.
 
-## Develop
+## Issue reports
+
+**Report issue** saves diagnostics to the plugin's inbox without sending a
+thread message or starting an agent. **Settings → View reports** opens the latest 20 snapshots
+from all threads. Each snapshot has an ID, timestamp, source thread ID, and
+setup details; it excludes file contents.
+
+Reports use BB's plugin key-value storage in `bb.db`. They survive plugin
+reloads, BB restarts, and source-thread deletion. Older reports remain stored
+and can be retrieved by ID. This is local BB storage, so its durability depends
+on keeping or backing up the BB data directory.
 
 ```sh
-npm install
-npm run build:monaco   # only after changing scripts/multi-diff.js or the Monaco version
+bb diff-explorer reports
+bb diff-explorer report <id>
+```
+
+## Develop
+
+Use pnpm 10.34.6 and Node 22.23.3 from this directory:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
+pnpm run build:monaco   # only after changing scripts/multi-diff.js or the Monaco version
 bb plugin install .
 ```
+
+Dependencies use exact versions and a committed pnpm lock. Install scripts are
+blocked unless their package and version are approved in `pnpm-workspace.yaml`;
+newly published versions must be at least one day old. CI rejects high or
+critical dependency advisories, and its GitHub Actions use pinned commit hashes.
+
+BB's Git plugin installer currently uses npm, so `package-lock.json` remains
+as its compatibility lock. After a dependency update, regenerate that lock with
+`npm install --package-lock-only --ignore-scripts --legacy-peer-deps`, then run
+`node scripts/check-dependencies.mjs` and `pnpm install --frozen-lockfile`.
 
 ## License
 

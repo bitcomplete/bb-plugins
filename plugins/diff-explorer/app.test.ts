@@ -71,3 +71,74 @@ test("refresh keeps the editor data mounted and ignores superseded loads", async
   await setImmediate();
   assert.equal(data, latest);
 });
+
+test("issue reports save bounded diagnostics to the inbox without sending thread messages", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const panel = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "DiffsPanel");
+  const declaration = panel?.body?.statements.filter(ts.isVariableStatement)
+    .flatMap((node) => [...node.declarationList.declarations]).find((node) => node.name.getText(source) === "reportIssue");
+  assert.ok(declaration?.initializer);
+  let saved: Record<string, any> | undefined;
+  let status: string;
+  const context = vm.createContext({
+    reportStatus: "idle", pluginVersion: "test", threadId: "current-thread", target: "all", mode: "dark", name: "test-theme", error: null,
+    data: { root: "/workspace", environmentId: "env", baseBranch: "main", skipped: [], files: Array.from({ length: 45 }, (_, i) => ({
+      path: `file-${i}`, changeKind: "modified", oldText: "PRIVATE_CONTENT", newText: "PRIVATE_CONTENT",
+    })) },
+    root: { current: { clientWidth: 800, clientHeight: 600, querySelectorAll: () => [{ className: "line-insert" }] } },
+    navigator: { userAgent: "test-browser" }, matchMedia: () => ({ matches: false }),
+    window: { location: { origin: "https://example.test" } }, workerStatus: null,
+    document: { querySelectorAll: () => [{ href: "https://example.test/editor.css?token=PRIVATE_TOKEN", sheet: {} }] }, URL,
+    getComputedStyle: () => ({ backgroundColor: "rgba(155, 185, 85, 0.2)", getPropertyValue: () => "color" }),
+    rpc: { call: async (method: string, setup: typeof saved) => {
+      assert.equal(method, "report"); saved = setup;
+      return { id: "saved-report", createdAt: "2026-10-06T00:00:00Z", threadId: "current-thread" };
+    } },
+    sdk: { threads: { send: () => { throw new Error("Reports must not send thread messages"); } } },
+    setReportStatus: (value: string) => { status = value; }, setError: (error: unknown) => { throw error; },
+  });
+  const report = vm.runInContext(ts.transpileModule(`(${declaration.initializer.getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, context);
+  await report();
+  assert.equal(saved?.threadId, "current-thread");
+  const body = JSON.stringify(saved);
+  assert.ok(!body.includes("PRIVATE_CONTENT") && !body.includes("PRIVATE_TOKEN"));
+  const setup = JSON.parse(body);
+  assert.equal(setup.files.length, 40);
+  assert.equal(setup.fileCount, 45);
+  assert.equal(setup.decorations[0].background, "rgba(155, 185, 85, 0.2)");
+  assert.equal(status!, "saved");
+});
+
+test("worker restarts request fresh assets instead of the cached bundle URL", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let getter: ts.PropertyAssignment | undefined;
+  const find = (node: ts.Node) => {
+    if (ts.isPropertyAssignment(node) && node.name.getText(source) === "getWorker") getter = node;
+    ts.forEachChild(node, find);
+  };
+  find(source);
+  assert.ok(getter);
+  let calls = 0;
+  const urls: string[] = [];
+  const context = vm.createContext({
+    baseUrl: "/expired", workerStatus: null, URL, window: { location: { origin: "https://example.test" } },
+    rpc: { call: async (method: string, input: unknown) => {
+      assert.equal(method, "assets"); assert.equal(input, null);
+      return { baseUrl: `/fresh-${++calls}` };
+    } },
+    Worker: class {
+      constructor(url: URL) { urls.push(url.href); }
+      addEventListener() {}
+    },
+  });
+  const getWorker = vm.runInContext(ts.transpileModule(`(${getter.initializer.getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, context);
+  await getWorker();
+  await getWorker();
+  assert.deepEqual(urls, ["https://example.test/fresh-1/editor.worker.js", "https://example.test/fresh-2/editor.worker.js"]);
+});
