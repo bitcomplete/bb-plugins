@@ -7,8 +7,12 @@
 // server with that token; a thread sees results, never the token. Access
 // tokens last a day, so each call refreshes first when one is about to
 // expire, and once more on a 401.
+//
+// The same reads are a `bb linear` command, so a script automation on this
+// server (which has no thread and therefore no tools) can poll Linear
+// without a credential of its own.
 import { createHash } from "node:crypto";
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
 import {
@@ -21,6 +25,7 @@ import {
   LinearRequestError,
   PRIORITIES,
   PRIORITY_NAMES,
+  SEARCH_LIMIT_DEFAULT,
   SEARCH_LIMIT_MAX,
   SEARCH_QUERY,
   TEAM_QUERY,
@@ -44,6 +49,8 @@ import {
   parseUsers,
   parseViewer,
   searchLimit,
+  type Issue,
+  type SearchInput,
   type Viewer,
 } from "./linear.js";
 import {
@@ -264,21 +271,24 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
     }
 
-    bb.rpc.register(rpcContract, {
-      async status() {
-        const cfg = await settings.get();
-        const token = cfg.accessToken?.trim() ?? "";
-        let user: Viewer["user"] | null = null;
-        let organization: Viewer["organization"] | null = null;
-        if (token !== "") {
-          const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
-          if (stored.success && stored.data.tokenFingerprint === tokenFingerprint(token)) {
-            user = stored.data.user;
-            organization = stored.data.organization;
-          }
+    /** The connection as the settings section and `bb linear status` show it. */
+    async function connectionStatus() {
+      const cfg = await settings.get();
+      const token = cfg.accessToken?.trim() ?? "";
+      let user: Viewer["user"] | null = null;
+      let organization: Viewer["organization"] | null = null;
+      if (token !== "") {
+        const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
+        if (stored.success && stored.data.tokenFingerprint === tokenFingerprint(token)) {
+          user = stored.data.user;
+          organization = stored.data.organization;
         }
-        return { connected: token !== "", configured: clientIdOf(cfg) !== "", user, organization, linearUrl: cfg.linearUrl };
-      },
+      }
+      return { connected: token !== "", configured: clientIdOf(cfg) !== "", user, organization, linearUrl: cfg.linearUrl };
+    }
+
+    bb.rpc.register(rpcContract, {
+      status: connectionStatus,
       async connect() {
         const cfg = await settings.get();
         if (clientIdOf(cfg) === "") {
@@ -346,6 +356,39 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       { auth: "none" },
     );
 
+    // ---- the reads the tools and the CLI share -----------------------------
+
+    const notFound = (key: string) => new Error(`No Linear issue ${key}, or it is not visible to the connected user.`);
+
+    async function readIssue(key: string, signal: AbortSignal): Promise<Issue | null> {
+      return parseIssue(await query(ISSUE_QUERY, { id: key }, signal));
+    }
+
+    async function searchIssues(input: SearchInput, signal: AbortSignal): Promise<{ issues: Issue[]; heading: string }> {
+      const openOnly = input.openOnly ?? true;
+      const filter = issueFilter({ ...input, openOnly });
+      const first = searchLimit(input.limit);
+      const term = input.query?.trim() ?? "";
+      const issues =
+        term === ""
+          ? parseIssueList(await query(ISSUES_QUERY, { filter, first }, signal), "issues")
+          : parseIssueList(await query(SEARCH_QUERY, { term, filter, first }, signal), "searchIssues");
+      const what = [term === "" ? null : JSON.stringify(term), input.team ? `team ${input.team}` : null, input.state ? `state ${input.state}` : null, input.assignee ? `assignee ${input.assignee}` : null]
+        .filter((s): s is string => s !== null)
+        .join(", ");
+      return { issues, heading: `Linear issues${what === "" ? "" : ` matching ${what}`}` };
+    }
+
+    /** A read-only document's data, with Linear's GraphQL errors alongside. */
+    async function readOnlyQuery(document: string, variables: Record<string, unknown> | undefined, signal: AbortSignal): Promise<{ data: unknown; errors: string[] }> {
+      if (!isReadOnlyDocument(document)) throw new Error("Only queries are allowed here. Use linear_create_issue, linear_comment or linear_update_issue to change issues.");
+      const payload = await query(document, variables, signal);
+      const errors = graphqlErrors(payload);
+      const data = payload !== null && typeof payload === "object" ? (payload as { data?: unknown }).data : undefined;
+      if (data === undefined || data === null) throw new Error(errors.length > 0 ? `Linear: ${errors.join("; ")}` : "Linear answered without data");
+      return { data, errors };
+    }
+
     // ---- the tools --------------------------------------------------------
 
     const toolError = (error: unknown) => ({ content: [{ type: "text" as const, text: errorMessage(error) }], isError: true });
@@ -383,8 +426,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
       async execute({ key }, { signal }) {
         try {
-          const issue = parseIssue(await query(ISSUE_QUERY, { id: key }, signal));
-          return issue === null ? toolError(new Error(`No Linear issue ${key}, or it is not visible to the connected user.`)) : formatIssue(issue);
+          const issue = await readIssue(key, signal);
+          return issue === null ? toolError(notFound(key)) : formatIssue(issue);
         } catch (error) {
           return toolError(error);
         }
@@ -406,18 +449,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }),
       async execute(input, { signal }) {
         try {
-          const openOnly = input.openOnly ?? true;
-          const filter = issueFilter({ ...input, openOnly });
-          const first = searchLimit(input.limit);
-          const term = input.query?.trim() ?? "";
-          const issues =
-            term === ""
-              ? parseIssueList(await query(ISSUES_QUERY, { filter, first }, signal), "issues")
-              : parseIssueList(await query(SEARCH_QUERY, { term, filter, first }, signal), "searchIssues");
-          const what = [term === "" ? null : JSON.stringify(term), input.team ? `team ${input.team}` : null, input.state ? `state ${input.state}` : null, input.assignee ? `assignee ${input.assignee}` : null]
-            .filter((s): s is string => s !== null)
-            .join(", ");
-          return formatIssueList(issues, `Linear issues${what === "" ? "" : ` matching ${what}`}`);
+          const { issues, heading } = await searchIssues(input, signal);
+          return formatIssueList(issues, heading);
         } catch (error) {
           return toolError(error);
         }
@@ -595,14 +628,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         variables: z.record(z.string(), z.unknown()).optional().describe("Variables for the query."),
       }),
       async execute({ query: document, variables }, { signal }) {
-        if (!isReadOnlyDocument(document)) {
-          return toolError(new Error("linear_query runs queries only. Use linear_create_issue, linear_comment or linear_update_issue to change issues."));
-        }
         try {
-          const payload = await query(document, variables, signal);
-          const errors = graphqlErrors(payload);
-          const data = payload !== null && typeof payload === "object" ? (payload as { data?: unknown }).data : undefined;
-          if (data === undefined || data === null) return toolError(new Error(errors.length > 0 ? `Linear: ${errors.join("; ")}` : "Linear answered without data"));
+          const { data, errors } = await readOnlyQuery(document, variables, signal);
           const text = JSON.stringify(data, null, 1);
           return errors.length > 0 ? `${text}\n\nErrors: ${errors.join("; ")}` : text;
         } catch (error) {
@@ -610,6 +637,118 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         }
       },
     });
+
+    // ---- the CLI ----------------------------------------------------------
+    //
+    // `bb linear …` runs here on the server, as the connected user, with the
+    // same reads as the tools. It exists for script automations: they run on
+    // the server with `bb` on their PATH and no thread, so this is how a
+    // cron script asks "which issues are build-ready?" without a token of
+    // its own. The token never appears in its output.
+
+    const cliSignal = (ctx: { signal?: AbortSignal }) => (ctx.signal === undefined ? AbortSignal.timeout(REQUEST_TIMEOUT_MS) : AbortSignal.any([ctx.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]));
+    const cliError = (error: unknown): never => {
+      const message = errorMessage(error);
+      throw new PluginCliError(message, {
+        code: message.startsWith("Linear is not connected") ? "not_connected" : error instanceof LinearRequestError ? "linear_request_failed" : "linear_error",
+        ...(message.startsWith("Linear is not connected") ? { hint: "Connect Linear in Settings → Plugins → Linear, then run this again." } : {}),
+      });
+    };
+    const parseVariables = (raw: string | undefined): Record<string, unknown> | undefined => {
+      if (raw === undefined || raw.trim() === "") return undefined;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new PluginCliError("--variables must be a JSON object.", { code: "invalid_variables", hint: 'For example --variables \'{"first": 10}\'.' });
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new PluginCliError("--variables must be a JSON object.", { code: "invalid_variables", hint: 'For example --variables \'{"first": 10}\'.' });
+      }
+      return parsed as Record<string, unknown>;
+    };
+    const JSON_OPTION = { type: "boolean", description: "Emit machine-readable JSON" } as const;
+
+    bb.cli.register(
+      defineCli({
+        name: "linear",
+        summary: "Read Linear issues as the connected user, from scripts and automations",
+        description:
+          "Runs on the bb server with the Linear connection made in Settings → Plugins → Linear. Reads only; " +
+          "the token never appears in output. Made for script automations, which have no thread and no tools.",
+        commands: {
+          status: cliCommand({
+            summary: "Who Linear is connected as on this server",
+            options: { json: JSON_OPTION },
+            async run(input) {
+              const status = await connectionStatus();
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(status) };
+              if (!status.connected) return { exitCode: 0, stdout: status.configured ? "Linear is not connected." : "Linear is not connected, and no OAuth client ID is set." };
+              const who = status.user === null ? "an unknown user" : status.user.name;
+              return { exitCode: 0, stdout: `Connected to Linear as ${who}${status.organization === null ? "" : ` in ${status.organization.name}`}.` };
+            },
+          }),
+
+          issue: cliCommand({
+            summary: "Read one issue by key, with its description and latest comments",
+            positionals: [{ name: "key", description: "The issue key, such as ENG-123", required: true }],
+            options: { json: JSON_OPTION },
+            async run(input, ctx) {
+              const key = issueKey.safeParse(input.positionals.key);
+              if (!key.success) throw new PluginCliError(`${JSON.stringify(input.positionals.key)} is not an issue key.`, { code: "invalid_issue_key", hint: "Pass a key such as ENG-123." });
+              const issue = await readIssue(key.data, cliSignal(ctx)).catch(cliError);
+              if (issue === null) throw new PluginCliError(notFound(key.data).message, { code: "issue_not_found" });
+              return { exitCode: 0, stdout: input.options.json ? JSON.stringify(issue) : formatIssue(issue) };
+            },
+          }),
+
+          search: cliCommand({
+            summary: "List issues by free text, team, state, or assignee; newest first",
+            description: "Without --state, completed and canceled issues are left out unless --all is given. With --json the output is a JSON array of issues, one object per issue with id, identifier, title, state, team, assignee, labels, url and timestamps.",
+            options: {
+              query: { type: "string", description: "Free text searched in titles and descriptions (at most 500 characters)", aliases: ["q", "text"] },
+              team: { type: "string", description: "A team key such as ENG" },
+              state: { type: "string", description: "A workflow state name such as Build Ready, matched ignoring case", aliases: ["status"] },
+              assignee: { type: "string", description: "A person's name or email, or 'me' for the connected user" },
+              all: { type: "boolean", description: "Include completed and canceled issues (default when --state is given)", aliases: ["include-closed"] },
+              limit: { type: "integer", min: 1, max: SEARCH_LIMIT_MAX, default: SEARCH_LIMIT_DEFAULT, description: `At most this many issues (1 to ${SEARCH_LIMIT_MAX})` },
+              json: JSON_OPTION,
+            },
+            async run(input, ctx) {
+              const o = input.options;
+              if (o.query !== undefined && o.query.length > 500) throw new PluginCliError("--query is at most 500 characters.", { code: "invalid_query" });
+              const search: SearchInput = {
+                ...(o.query === undefined ? {} : { query: o.query }),
+                ...(o.team === undefined ? {} : { team: o.team }),
+                ...(o.state === undefined ? {} : { state: o.state }),
+                ...(o.assignee === undefined ? {} : { assignee: o.assignee }),
+                openOnly: !o.all,
+                limit: o.limit,
+              };
+              const { issues, heading } = await searchIssues(search, cliSignal(ctx)).catch(cliError);
+              return { exitCode: 0, stdout: o.json ? JSON.stringify(issues) : formatIssueList(issues, heading) };
+            },
+          }),
+
+          query: cliCommand({
+            summary: "Run a read-only GraphQL query and print its data as JSON",
+            description: "Mutations are refused. The output is the query's `data` object; Linear's GraphQL errors, if any, go to stderr.",
+            positionals: [{ name: "document", description: "A GraphQL query document", required: true }],
+            options: {
+              variables: { type: "string", description: "Variables for the query, as a JSON object", aliases: ["vars"] },
+              json: JSON_OPTION,
+            },
+            async run(input, ctx) {
+              const document = input.positionals.document;
+              if (document.trim() === "" || document.length > 20_000) throw new PluginCliError("The document must be 1 to 20000 characters.", { code: "invalid_document" });
+              const variables = parseVariables(input.options.variables);
+              const { data, errors } = await readOnlyQuery(document, variables, cliSignal(ctx)).catch(cliError);
+              return { exitCode: 0, stdout: JSON.stringify(data), ...(errors.length > 0 ? { stderr: `Linear: ${errors.join("; ")}` } : {}) };
+            },
+          }),
+        },
+      }),
+    );
   };
 }
 

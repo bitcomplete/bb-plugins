@@ -396,3 +396,82 @@ describe("refresh", () => {
     expect(linear.calls.filter((c) => c.form !== undefined)).toHaveLength(1);
   });
 });
+
+describe("bb linear", () => {
+  const connected = (answer?: Answer) => setup({ settings: { accessToken: "at-0" }, linear: { answer } });
+
+  it("is registered as `bb linear` and renders help without a connection", async () => {
+    const { harness } = await setup();
+    expect(harness.registrations.cli?.name).toBe("linear");
+    const help = await harness.runCli(["--help"]);
+    expect(help.exitCode).toBe(0);
+    for (const command of ["status", "issue", "search", "query"]) expect(help.stdout).toContain(command);
+  });
+
+  it("status says who is connected, and that nobody is", async () => {
+    const { harness, callback } = await setup();
+    expect((await harness.runCli(["status"])).stdout).toContain("not connected");
+    const { url } = (await harness.callRpc("connect", null)) as { url: string };
+    await callback({ code: "c", state: new URL(url).searchParams.get("state")! });
+    expect((await harness.runCli(["status"])).stdout).toBe("Connected to Linear as jane in Acme.");
+    expect(JSON.parse((await harness.runCli(["status", "--json"])).stdout)).toMatchObject({ connected: true, user: { name: "jane" } });
+  });
+
+  it("fails with a connect hint and a JSON envelope when there is no token", async () => {
+    const { harness } = await setup();
+    const result = await harness.runCli(["search", "--state", "Build Ready", "--json"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "not_connected" } });
+    expect(result.stderr).toContain("Connect Linear");
+  });
+
+  it("search runs the same filter as the tool and prints issues as JSON, without a thread", async () => {
+    const { harness, linear } = await connected(() => ({ data: { issues: { nodes: [issue(), issue({ identifier: "ENG-124", title: "Other" })] } } }));
+    const result = await harness.runCli(["search", "--state", "Build Ready", "--team", "eng", "--limit", "5", "--json"]);
+    expect(result.exitCode).toBe(0);
+    const issues = JSON.parse(result.stdout) as Array<{ identifier: string; state: { name: string } }>;
+    expect(issues.map((i) => i.identifier)).toEqual(["ENG-123", "ENG-124"]);
+    expect(linear.calls.at(-1)!.token).toBe("at-0");
+    expect(linear.calls.at(-1)!.body!.variables).toEqual({ filter: { and: [{ team: { key: { eq: "ENG" } } }, { state: { name: { eqIgnoreCase: "Build Ready" } } }] }, first: 5 });
+    // No token anywhere in what a script sees.
+    expect(result.stdout + result.stderr).not.toContain("at-0");
+  });
+
+  it("search leaves out closed issues by default and includes them with --all", async () => {
+    const { harness, linear } = await connected(() => ({ data: { issues: { nodes: [] } } }));
+    expect((await harness.runCli(["search", "--team", "ENG"])).stdout).toContain("no issues");
+    expect(linear.calls.at(-1)!.body!.variables).toMatchObject({ filter: { and: [{ team: { key: { eq: "ENG" } } }, { state: { type: { nin: ["completed", "canceled"] } } }] } });
+    await harness.runCli(["search", "--team", "ENG", "--all"]);
+    expect(linear.calls.at(-1)!.body!.variables).toEqual({ filter: { team: { key: { eq: "ENG" } } }, first: 20 });
+  });
+
+  it("issue reads one issue, as text or JSON, and rejects a bad key", async () => {
+    const { harness } = await connected((body) => (body.variables?.id === "ENG-123" ? { data: { issue: issue() } } : { data: { issue: null } }));
+    expect((await harness.runCli(["issue", "eng-123"])).stdout).toContain("# ENG-123: Fix login");
+    expect(JSON.parse((await harness.runCli(["issue", "ENG-123", "--json"])).stdout)).toMatchObject({ identifier: "ENG-123", state: { name: "In Progress" } });
+    const missing = await harness.runCli(["issue", "ENG-999", "--json"]);
+    expect(missing.exitCode).not.toBe(0);
+    expect(JSON.parse(missing.stdout)).toMatchObject({ ok: false, error: { code: "issue_not_found" } });
+    const bad = await harness.runCli(["issue", "nope", "--json"]);
+    expect(JSON.parse(bad.stdout)).toMatchObject({ ok: false, error: { code: "invalid_issue_key" } });
+  });
+
+  it("query prints the data for a read-only document and refuses mutations", async () => {
+    const { harness, linear } = await connected((body) => ({ data: { teams: { nodes: [{ key: "ENG" }] } }, errors: body.variables?.first === 0 ? [{ message: "first must be positive" }] : undefined }));
+    const ok = await harness.runCli(["query", "query($first: Int) { teams(first: $first) { nodes { key } } }", "--variables", '{"first": 1}']);
+    expect(ok.exitCode).toBe(0);
+    expect(JSON.parse(ok.stdout)).toEqual({ teams: { nodes: [{ key: "ENG" }] } });
+    expect(linear.calls.at(-1)!.body!.variables).toEqual({ first: 1 });
+
+    const withErrors = await harness.runCli(["query", "{ teams { nodes { key } } }", "--variables", '{"first": 0}']);
+    expect(withErrors.exitCode).toBe(0);
+    expect(withErrors.stderr).toContain("first must be positive");
+
+    const mutation = await harness.runCli(["query", "mutation { issueDelete(id: \"x\") { success } }", "--json"]);
+    expect(mutation.exitCode).not.toBe(0);
+    expect(JSON.parse(mutation.stdout).error.message).toContain("Only queries");
+
+    const badVars = await harness.runCli(["query", "{ viewer { id } }", "--variables", "[1]", "--json"]);
+    expect(JSON.parse(badVars.stdout)).toMatchObject({ ok: false, error: { code: "invalid_variables" } });
+  });
+});

@@ -24,6 +24,15 @@ Ticket keys appear in branch names, PR titles and thread titles
 (`ENG-123`, `eng-123-fix-login`). Read the ticket before starting work on
 one, and prefer these tools over asking the user to paste its contents.
 
+## From a script
+
+The same reads are a `bb linear` command (`status`, `issue <key>`,
+`search`, `query <document>`), each with `--json`. It runs on the server
+inside the plugin, so a script automation can poll Linear with no token of
+its own: `bb linear search --team ENG --state "Build Ready" --json`. Prefer
+the tools inside a thread; reach for the command when writing a script
+automation or a shell pipeline.
+
 ## Writing back
 
 Comment when there is something a reader in Linear needs: a PR link, a

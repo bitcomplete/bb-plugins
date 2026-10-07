@@ -30,6 +30,39 @@ thread's timeline says what changed. Everything runs as the connected user
 developer, like `gh`. Issues and comments a thread writes carry the
 thread's id so a reader in Linear can find the conversation.
 
+## The `bb linear` command
+
+The reads are also a CLI, for code that runs on the server without a thread:
+script automations in particular. A cron script has `bb` on its PATH but no
+tools, and this is how it polls Linear without a token of its own. The
+command runs inside the plugin on the server, so the token never leaves it.
+
+| Command | What it does |
+|---|---|
+| `bb linear status [--json]` | Who Linear is connected as. |
+| `bb linear issue <key> [--json]` | One issue, as the tool shows it, or its JSON. |
+| `bb linear search [--query <text>] [--team <key>] [--state <name>] [--assignee <who>] [--all] [--limit <n>] [--json]` | Issues, newest first. Open ones only unless `--state` or `--all`. `--json` prints an array of issue objects. |
+| `bb linear query <document> [--variables <json>]` | A read-only GraphQL query's `data`, as JSON. Mutations are refused. |
+
+A dispatcher that spawns a thread per issue in a state, as a script
+automation:
+
+```sh
+bb linear search --team ENG --state "Build Ready" --json \
+  | jq -r '.[] | "\(.identifier)\t\(.title)"' \
+  | while IFS=$'\t' read -r key title; do
+      grep -qx "$key" dispatched 2>/dev/null && continue
+      bb thread spawn --project "$BB_PROJECT_ID" --prompt "Build $key: $title" --json >/dev/null && echo "$key" >> dispatched && echo "dispatched $key"
+    done
+```
+
+Create it with `--working-directory automation-storage` so the `dispatched`
+file lives beside the script rather than in a project checkout. A quiet
+tick prints nothing, which the automations plugin records as a silent
+skipped run. There are no write commands: a change to an issue
+should be made by the thread that did the work, through the tools, so it
+is signed and visible in that thread's timeline.
+
 ## The OAuth application
 
 One Linear OAuth application serves every developer, because bb-gate puts
