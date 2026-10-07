@@ -310,8 +310,8 @@ export function stageRingIcon(
  * A pin is a human overriding the summarizer, and it is the one fact on the
  * row the model did not decide — so it gets the one mark the ring has room
  * for in its centre. Before the dot meant this, a filled centre meant `done`;
- * done now closes the ring and adds a thin outer ring instead, so the two
- * cannot be confused and a pinned done thread can show both.
+ * done is now one seamless circle instead, so the two cannot be confused and a
+ * pinned done thread can show both.
  */
 function pinSuffix(pinned: boolean): string {
   return pinned ? "-pinned" : "";
@@ -340,8 +340,7 @@ export function staleDoneRingIcon(pinned = false): string {
 }
 
 /**
- * The closed ring with a thin outer ring, drawn for `done` in place of any
- * stage ring.
+ * The seamless circle drawn for `done` in place of any stage ring.
  *
  * `done` is a status, not a fifth stage: the arc is over, so which stage it
  * ended in stops being the interesting fact about the row. Keeping it off the
@@ -349,8 +348,10 @@ export function staleDoneRingIcon(pinned = false): string {
  * where the fill's endpoint lands on a clock position you can read without
  * counting marks. A fifth segment in a 16px glyph is where that stops working.
  *
- * The outer ring rather than a filled centre, because the centre now means
- * "pinned" — see {@link stageRingIcon}.
+ * A circle rather than a filled centre, because the centre now means "pinned"
+ * — see {@link stageRingIcon}. Seamless rather than four closed quarters
+ * because a done thread draws no stage, so there are no boundaries to mark;
+ * the review ring's gaps are what tell the two apart.
  */
 export const DONE_RING_ICON = `${ICON_PREFIX}done`;
 

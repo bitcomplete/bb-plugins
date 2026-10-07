@@ -141,10 +141,10 @@ describe("registrations", () => {
     return {
       quarters: paths.length,
       solid: paths.filter((path) => path.getAttribute("opacity") === "1").length,
-      // The dot is filled; the outer ring is stroked. Telling them apart is
-      // the point of the test below.
+      // The dot is filled; the done circle is stroked. Telling them apart is
+      // the point of the tests below.
       hasDot: circles.some((circle) => circle.getAttribute("fill") !== null),
-      hasOuterRing: circles.some(
+      isCircle: circles.some(
         (circle) => circle.getAttribute("stroke") !== null,
       ),
     };
@@ -163,37 +163,36 @@ describe("registrations", () => {
     }
   });
 
-  it("rings the done ring, so it is not just the review ring again", async () => {
+  it("draws done as one seamless circle, so it is not just the review ring again", async () => {
     // Both close the ring, because done is not a fifth stage. At 16px the
-    // thin outer ring is the only thing telling them apart — and the centre
-    // stays free for the pin, so a plain done ring has no dot.
+    // review ring's four gaps are the only thing telling them apart — and the
+    // centre stays free for the pin, so a plain done ring has no dot.
     expect(await drawIcon("thread-briefs/done")).toMatchObject({
-      solid: 4,
-      hasOuterRing: true,
+      quarters: 0,
+      isCircle: true,
       hasDot: false,
     });
     expect(await drawIcon("thread-briefs/stage-review")).toMatchObject({
       solid: 4,
-      hasOuterRing: false,
+      isCircle: false,
       hasDot: false,
     });
   });
 
   it("dots the centre of a pinned ring and nothing else about it", async () => {
     // The dot is the one mark on the row the model did not decide. It has to
-    // be additive: a pinned done thread shows both the outer ring and the dot.
+    // be additive: a pinned done thread shows both the circle and the dot.
     expect(await drawIcon("thread-briefs/stage-planning-pinned")).toMatchObject({
       solid: 2,
-      hasOuterRing: false,
+      isCircle: false,
       hasDot: true,
     });
     expect(await drawIcon("thread-briefs/done-pinned")).toMatchObject({
-      solid: 4,
-      hasOuterRing: true,
+      isCircle: true,
       hasDot: true,
     });
     expect(await drawIcon(staleDoneRingIcon(true))).toMatchObject({
-      hasOuterRing: true,
+      isCircle: true,
       hasDot: true,
     });
   });

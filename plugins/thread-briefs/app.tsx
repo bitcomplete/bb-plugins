@@ -303,7 +303,7 @@ const RING_QUARTERS = [
 
 /**
  * A ring with `filled` of its four quarters solid and the rest left as a track,
- * optionally closed off as `done` and optionally marked as pinned.
+ * or — for `complete` — one seamless circle, optionally marked as pinned.
  *
  * The track is what makes the glyph a ratio rather than a count: three quarters
  * against a visible whole reads instantly at 16px, where three marks against
@@ -313,13 +313,14 @@ const RING_QUARTERS = [
  * is what the panel and the stage picker want. An explicit colour overrides
  * that class, so the two modes cannot both colour the same ring — which is what
  * lets one glyph carry four facts at 16px: how far round it goes is the stage,
- * a thin outer ring is `done`, a dot in the centre is a pin, and the hue is the
+ * a seamless circle is `done`, a dot in the centre is a pin, and the hue is the
  * project (or grey, for a done thread nobody has come back to).
  *
- * `done` draws the closed ring smaller inside the outer ring rather than
- * adding the outer ring around a full-size one, because the arcs already reach
- * the box's edge. The dot is the smaller of the two marks because it is the
- * one that also has to read at 12px in the stage picker.
+ * `done` is a circle rather than four closed quarters because a done thread
+ * draws no stage: the arc is over, so there are no boundaries to mark. The
+ * gaps are what tell it from the closed review ring, and the whole glyph stays
+ * at full size. The dot is small because it also has to read at 12px in the
+ * stage picker.
  */
 function ring(
   filled: number,
@@ -334,23 +335,18 @@ function ring(
         aria-hidden="true"
       >
         {complete ? (
-          <circle cx={8} cy={8} r={7.25} stroke={color} strokeWidth={1} />
-        ) : null}
-        <g
-          transform={
-            complete ? "translate(8 8) scale(0.72) translate(-8 -8)" : undefined
-          }
-        >
-          {RING_QUARTERS.map((d, index) => (
+          <circle cx={8} cy={8} r={6} stroke={color} strokeWidth={2} />
+        ) : (
+          RING_QUARTERS.map((d, index) => (
             <path
               key={d}
               d={d}
               stroke={color}
-              strokeWidth={complete ? 2.5 : 2}
+              strokeWidth={2}
               opacity={index < filled ? 1 : 0.25}
             />
-          ))}
-        </g>
+          ))
+        )}
         {pinned ? <circle cx={8} cy={8} r={2.25} fill={color} /> : null}
       </svg>
     );

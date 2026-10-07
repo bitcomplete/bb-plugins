@@ -457,7 +457,7 @@ stage the thread has reached:
 | half (ends at 6) | planning |
 | three quarters (ends at 9) | implementation |
 | closed ring, hollow | review |
-| closed ring with a **thin outer ring** | status `done`, any stage |
+| one **seamless circle**, no gaps | status `done`, any stage |
 | a **dot in the centre** | a stage or status set by hand — see [the pin dot](#the-pin-dot) |
 | the ring's **colour** | which project the thread is in |
 
@@ -478,10 +478,12 @@ gone the moment the pin retires, so a dot means "a human is overriding the
 summarizer right now", never "was overridden once". The hover label says the
 same in words: `Implementation — Blocked · set by hand`.
 
-It is additive. A pinned done thread shows the outer ring *and* the dot; a cold
+It is additive. A pinned done thread shows the circle *and* the dot; a cold
 pinned done thread shows both in grey. The centre is the only mark the ring has
 room for at the 12px the stage picker draws it at, which is why the pin got it
-and `done` moved out to the outer ring.
+and `done` became the seamless circle: a done thread draws no stage, so the
+quarter boundaries had nothing left to mark, and the review ring's four gaps
+are what tell the two apart.
 
 ### The project colour
 
