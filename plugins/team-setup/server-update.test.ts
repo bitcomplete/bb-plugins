@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createUpdateStore, POLL_MS, RESTART_POLL_MS, UPDATE_PATH, type UpdateStoreDeps } from "./server-update.js";
+import { createUpdateStore, POLL_MS, RESTART_POLL_MS, RESTART_TIMEOUT_MS, UPDATE_PATH, type UpdateStoreDeps } from "./server-update.js";
 
 // A router and a clock the test drives. Timers fire only when `advance` is
 // called, so each step is explicit.
@@ -98,14 +98,13 @@ describe("update store", () => {
     expect(store.getState()).toEqual({ status: "pending" });
   });
 
-  it("applies, follows the restart down and up, then reloads", async () => {
+  it("applies, then reloads as soon as the server has gone down", async () => {
     const h = harness([
       { status: 200, body: { pending: true, ready: true } },
       { status: 200, body: { applied: true } },
       { status: 200, body: { pending: false, ready: true } }, // old pod still up
       { status: 503 }, // router briefly away
       { status: 200, body: { pending: false, ready: false } },
-      { status: 200, body: { pending: false, ready: true } },
     ]);
     const store = createUpdateStore(h.deps);
     store.subscribe(() => {});
@@ -115,10 +114,43 @@ describe("update store", () => {
     await h.flush();
     expect(store.getState()).toEqual({ status: "restarting" });
     expect(h.calls[1]).toEqual({ method: "POST" });
-    for (let i = 0; i < 4; i++) await h.advance(RESTART_POLL_MS);
+    for (let i = 0; i < 2; i++) await h.advance(RESTART_POLL_MS);
+    expect(h.reloaded()).toBe(0);
+    await h.advance(RESTART_POLL_MS);
     await applied;
     expect(h.reloaded()).toBe(1);
-    expect(h.calls).toHaveLength(6);
+    expect(h.calls).toHaveLength(5);
+  });
+
+  it("reloads anyway when the server never reports going down", async () => {
+    const answers: Array<{ status: number; body?: unknown }> = [
+      { status: 200, body: { pending: true, ready: true } },
+      { status: 200, body: { applied: true } },
+    ];
+    for (let i = 0; i < 100; i++) answers.push({ status: 200, body: { pending: false, ready: true } });
+    const h = harness(answers);
+    const store = createUpdateStore(h.deps);
+    store.subscribe(() => {});
+    await h.flush();
+    const applied = store.apply();
+    await h.flush();
+    for (let i = 0; i * RESTART_POLL_MS < RESTART_TIMEOUT_MS; i++) await h.advance(RESTART_POLL_MS);
+    await applied;
+    expect(h.reloaded()).toBe(1);
+  });
+
+  it("drops the banner without reloading when there was nothing to apply", async () => {
+    const h = harness([
+      { status: 200, body: { pending: true, ready: true } },
+      { status: 200, body: { applied: false } },
+    ]);
+    const store = createUpdateStore(h.deps);
+    store.subscribe(() => {});
+    await h.flush();
+    await store.apply();
+    expect(store.getState()).toEqual({ status: "current" });
+    expect(h.reloaded()).toBe(0);
+    expect(h.timers).toHaveLength(1); // only the regular poll
   });
 
   it("reports a refused apply instead of waiting forever", async () => {

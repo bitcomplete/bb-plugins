@@ -492,11 +492,11 @@ function ServerUpdateBanner() {
       <div className="flex min-w-0 items-center gap-2">
         <Icon name={restarting ? "LoaderCircle" : "CircleArrowUp"} className={`size-4 shrink-0 ${restarting ? "animate-spin" : "text-primary"}`} />
         {restarting ? (
-          <span>Restarting your server. This page reloads when it is back, in about a minute.</span>
+          <span>Restarting your server. This page reloads in a moment and comes back when it is up.</span>
         ) : (
           <span>
-            A new build of your bb server is ready. Restarting takes about a minute and interrupts any running turn; if you never
-            do, it restarts tonight.
+            A new build of your bb server is ready. Restarting takes under a minute and interrupts any running turn; if you
+            never do, it restarts tonight.
           </span>
         )}
       </div>
