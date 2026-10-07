@@ -1,7 +1,8 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { hostContract, hostSignals, rpcContract, type DiffFile } from "./contract";
+import { randomUUID } from "node:crypto";
+import { cliCommand, defineCli, PluginCliError, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { hostContract, hostSignals, rpcContract, type DiffFile, type Report } from "./contract";
 
 // Path installs run server.ts from the plugin root; git and npm installs run the bundled dist/server.js.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -15,12 +16,50 @@ export default async function plugin(bb: BbPluginApi) {
     const env = await bb.sdk.environments.get({ environmentId });
     if (!env.path) throw new Error("This environment has no workspace path");
     if (!env.hostId) throw new Error("This environment has no host");
-    return { root: env.path, hostId: env.hostId };
+    return { root: env.path, hostId: env.hostId, baseBranch: env.mergeBaseBranch ?? env.baseBranch ?? env.defaultBranch };
   }
 
   let preview: { baseUrl: string; expiresAtMs: number } | null = null;
 
+  async function getReport(id: string) {
+    const report = await bb.storage.kv.get<Report>(`report/${id}`);
+    if (report === undefined) throw new PluginCliError(`Report ${id} not found`, { code: "report_not_found" });
+    return report;
+  }
+
+  async function reports() {
+    // ponytail: scans report keys; add pagination if this inbox grows large.
+    const keys = (await bb.storage.kv.list("report/")).sort().reverse().slice(0, 20);
+    return Promise.all(keys.map(async (key) => {
+      const { setup, ...summary } = await getReport(key.slice("report/".length));
+      return summary;
+    }));
+  }
+
+  bb.cli.register(defineCli({
+    name: "diff-explorer", summary: "Read saved Diff Explorer issue reports",
+    commands: {
+      reports: cliCommand({
+        summary: "List the latest 20 reports from every thread",
+        async run() { return { exitCode: 0, stdout: JSON.stringify(await reports(), null, 2) }; },
+      }),
+      report: cliCommand({
+        summary: "Read a saved report by ID",
+        positionals: [{ name: "id", description: "Report ID from the inbox", required: true }],
+        async run(input) { return { exitCode: 0, stdout: JSON.stringify(await getReport(input.positionals.id), null, 2) }; },
+      }),
+    },
+  }));
+
   bb.rpc.register(rpcContract, {
+    async report(setup) {
+      const now = Date.now();
+      const summary = { id: `${now}-${randomUUID()}`, createdAt: new Date(now).toISOString(), threadId: setup.threadId };
+      await bb.storage.kv.set(`report/${summary.id}`, { ...summary, setup });
+      return summary;
+    },
+    reports,
+    async getReport({ id }) { return getReport(id); },
     async assets() {
       if (preview === null || preview.expiresAtMs - Date.now() < 5 * 60_000) {
         preview = await bb.sdk.files.createPreview({ rootPath: MONACO_DIR, ttlMs: 60 * 60_000 });
@@ -32,11 +71,7 @@ export default async function plugin(bb: BbPluginApi) {
       const thread = await bb.sdk.threads.get({ threadId });
       if (!thread.environmentId) throw new Error("This thread has no environment");
       const environmentId = thread.environmentId;
-      const env = await bb.sdk.environments.get({ environmentId });
-      if (!env.path) throw new Error("This environment has no workspace path");
-      if (!env.hostId) throw new Error("This environment has no host");
-      const root = env.path;
-      const baseBranch = env.mergeBaseBranch ?? env.baseBranch ?? env.defaultBranch;
+      const { root, hostId, baseBranch } = await environment(environmentId);
       if (baseBranch === null) throw new Error("This environment has no base branch");
       // "all" = everything since the merge base with the base branch, committed or not.
       const diff = await bb.sdk.environments.diffFiles(
@@ -79,9 +114,9 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
       const files = [...byPath.values()];
-      host.call("watch", { root }, { hostId: env.hostId }).catch((error) => bb.log.warn(`File watch failed: ${error}`));
+      host.call("watch", { root }, { hostId }).catch((error) => bb.log.warn(`File watch failed: ${error}`));
       host
-        .call("warm", { root, paths: files.filter((f) => f.newText !== "").map((f) => path.join(root, f.path)) }, { hostId: env.hostId })
+        .call("warm", { root, paths: files.filter((f) => f.newText !== "").map((f) => path.join(root, f.path)) }, { hostId })
         .catch((error) => bb.log.warn(`Language server warm-up failed: ${error}`));
       const skipped = diff.files.filter((f) => f.binary || f.loadMode === "too_large").map((f) => f.path);
       return { environmentId, root, baseBranch, files, skipped };
@@ -90,6 +125,17 @@ export default async function plugin(bb: BbPluginApi) {
     async definition({ environmentId, ...position }) {
       const { root, hostId } = await environment(environmentId);
       return host.call("definition", { root, ...position }, { hostId });
+    },
+
+    async fileAction({ environmentId, ...action }) {
+      const { root, hostId } = await environment(environmentId);
+      return host.call("fileAction", { root, ...action }, { hostId });
+    },
+
+    async write({ environmentId, path: filePath, content, expected }) {
+      const { root, hostId } = await environment(environmentId);
+      if (path.relative(root, filePath).startsWith("..")) throw new Error(`${filePath} is outside the workspace`);
+      return host.call("write", { path: filePath, content, expected }, { hostId });
     },
 
     async read({ environmentId, path: filePath }) {

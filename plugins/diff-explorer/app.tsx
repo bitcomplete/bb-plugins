@@ -12,7 +12,8 @@ import {
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { z } from "zod";
-import type { DiffFile, DiffTarget, Location, rpcContract } from "./contract";
+import type { DiffFile, DiffTarget, FileAction, Location, Report, rpcContract } from "./contract";
+import { version as pluginVersion } from "./package.json";
 
 type MonacoApi = typeof Monaco;
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -32,6 +33,7 @@ type PanelContext = {
 const panels = new Map<string, PanelContext>();
 
 type MultiDiffDocument = {
+  path: string;
   original: Monaco.editor.ITextModel;
   modified: Monaco.editor.ITextModel;
   label: string;
@@ -40,22 +42,29 @@ type MultiDiffDocument = {
 };
 type Bundle = {
   monaco: MonacoApi;
-  createMultiDiffEditor(
-    element: HTMLElement,
-    documents: MultiDiffDocument[],
-  ): { update(documents: MultiDiffDocument[]): void; dispose(): void };
+  createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void): { update(documents: MultiDiffDocument[]): void; dispose(): void };
 };
 let bundlePromise: Promise<Bundle> | null = null;
+let workerStatus: { path: string; error: string | null } | null = null;
 
-function loadMonaco(baseUrl: string): Promise<Bundle> {
+function loadMonaco(baseUrl: string, rpc: Rpc): Promise<Bundle> {
+  (globalThis as any).DiffExplorerMonacoEnvironment = {
+    // Workers can restart after the cached bundle's preview URL has expired.
+    getWorker: async () => {
+      const { baseUrl } = await rpc.call("assets", null);
+      const url = new URL(`${baseUrl}/editor.worker.js`, window.location.origin);
+      const status = { path: url.pathname, error: null as string | null };
+      workerStatus = status;
+      const worker = new Worker(url, { type: "module" });
+      worker.addEventListener("error", (event) => { status.error = event.message || "Editor worker failed to load"; });
+      return worker;
+    },
+  };
   return (bundlePromise ??= (async () => {
     const link = document.createElement("link");
     link.rel = "stylesheet";
     link.href = `${baseUrl}/editor.css`;
     document.head.appendChild(link);
-    (globalThis as any).DiffExplorerMonacoEnvironment = {
-      getWorker: () => new Worker(new URL(`${baseUrl}/editor.worker.js`, window.location.origin), { type: "module" }),
-    };
     const bundle: Bundle = await import(/* @vite-ignore */ `${baseUrl}/editor.js`);
     installNavigation(bundle.monaco);
     return bundle;
@@ -124,34 +133,118 @@ const EDITOR_OPTIONS = {
   gotoLocation: { multipleDefinitions: "goto" },
 } satisfies Monaco.editor.IEditorOptions;
 
+// The new side is the file on disk and is editable; the gutter arrows revert a block to the old side.
 const DIFF_OPTIONS = {
   ...EDITOR_OPTIONS,
+  readOnly: false,
+  originalEditable: false,
+  renderMarginRevertIcon: true,
   renderSideBySide: false,
   hideUnchangedRegions: { enabled: true },
 } satisfies Monaco.editor.IDiffEditorOptions;
+const DELETED_DIFF_OPTIONS = { ...DIFF_OPTIONS, readOnly: true } satisfies Monaco.editor.IDiffEditorOptions;
+const SAVE_DELAY_MS = 600;
+
+type FileModels = {
+  original: Monaco.editor.ITextModel;
+  modified: Monaco.editor.ITextModel;
+  // What the file on disk holds as far as we know; a save must find exactly this there.
+  saved: string;
+  saving: Promise<void>;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  listener: Monaco.IDisposable;
+  deleting?: boolean;
+};
+type SaveFile = (path: string, content: string, expected: string) => Promise<unknown>;
 
 const LINE_HEIGHT = 19;
 const HEADER_HEIGHT = 40;
 
-function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: string; root: string; files: DiffFile[] }) {
+function MultiDiff({
+  bundle,
+  panelId,
+  root,
+  files,
+  save,
+  fileAction,
+  onError,
+}: {
+  bundle: Bundle;
+  panelId: string;
+  root: string;
+  files: DiffFile[];
+  save: SaveFile;
+  fileAction(path: string, action: FileAction): Promise<unknown>;
+  onError(message: string | null): void;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const editor = useRef<ReturnType<Bundle["createMultiDiffEditor"]> | null>(null);
   // Models per path, updated in place on refresh so each file keeps its editor and your scroll place.
-  const models = useRef(new Map<string, { original: Monaco.editor.ITextModel; modified: Monaco.editor.ITextModel }>());
+  const models = useRef(new Map<string, FileModels>());
+  const saveRef = useRef({ save, fileAction, onError });
+  saveRef.current = { save, fileAction, onError };
+
+  // Saves run one at a time per file, so each one expects what the previous one wrote.
+  const flush = useCallback((path: string, m: FileModels) => {
+    clearTimeout(m.timer);
+    m.timer = undefined;
+    const content = m.modified.getValue();
+    m.saving = m.saving.then(async () => {
+      if (content === m.saved) return;
+      try {
+        await saveRef.current.save(path, content, m.saved);
+        m.saved = content;
+        saveRef.current.onError(null);
+      } catch (cause) {
+        saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
+      }
+    });
+  }, []);
+
+  const release = useCallback(
+    (path: string, m: FileModels) => {
+      m.listener.dispose();
+      if (m.timer !== undefined) flush(path, m);
+      m.original.dispose();
+      m.modified.dispose();
+    },
+    [flush],
+  );
 
   useEffect(() => {
-    const created = bundle.createMultiDiffEditor(container.current!, []);
+    const created = bundle.createMultiDiffEditor(container.current!, async (path, action) => {
+      const m = models.current.get(path);
+      if (m === undefined || m.deleting) return;
+      if (action === "delete") {
+        if (!window.confirm(`Delete ${path}? This removes the file from disk.`)) return;
+        m.deleting = true;
+        clearTimeout(m.timer);
+        m.timer = undefined;
+        await m.saving;
+      }
+      try {
+        await saveRef.current.fileAction(path, action);
+        if (action === "delete") {
+          m.saved = m.modified.getValue();
+          m.deleting = false;
+        }
+        saveRef.current.onError(null);
+      } catch (cause) {
+        m.deleting = false;
+        saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
+        if (action === "delete" && !m.modified.isDisposed()) {
+          m.timer = setTimeout(() => flush(path, m), SAVE_DELAY_MS);
+        }
+      }
+    });
     editor.current = created;
     const owned = models.current;
     return () => {
       created.dispose();
-      for (const m of owned.values()) {
-        m.original.dispose();
-        m.modified.dispose();
-      }
+      for (const [path, m] of owned) release(path, m);
       owned.clear();
     };
-  }, [bundle]);
+  }, [bundle, flush, release]);
 
   useEffect(() => {
     const { monaco } = bundle;
@@ -161,19 +254,37 @@ function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: 
       let m = current.get(abs);
       if (m === undefined) {
         const language = languageFor(monaco, file.path);
-        m = {
+        const modified = monaco.editor.createModel(file.newText, language, monaco.Uri.from({ scheme: NEW, authority: panelId, path: abs }));
+        const created: FileModels = {
           original: monaco.editor.createModel(file.oldText, language, monaco.Uri.from({ scheme: OLD, authority: panelId, path: abs })),
-          modified: monaco.editor.createModel(file.newText, language, monaco.Uri.from({ scheme: NEW, authority: panelId, path: abs })),
+          modified,
+          saved: file.newText,
+          saving: Promise.resolve(),
+          timer: undefined,
+          listener: modified.onDidChangeContent(() => {
+            if (created.deleting) return;
+            clearTimeout(created.timer);
+            created.timer = setTimeout(() => flush(abs, created), SAVE_DELAY_MS);
+          }),
         };
+        m = created;
         current.set(abs, m);
       } else {
         if (m.original.getValue() !== file.oldText) m.original.setValue(file.oldText);
-        if (m.modified.getValue() !== file.newText) m.modified.setValue(file.newText);
+        const value = m.modified.getValue();
+        if (file.newText === value) m.saved = value;
+        // A file with unsaved edits keeps them; its next save then reports the change on disk.
+        else if (value === m.saved) {
+          m.saved = file.newText;
+          m.modified.setValue(file.newText);
+        }
       }
       return {
-        ...m,
+        path: file.path,
+        original: m.original,
+        modified: m.modified,
         label: `${file.path} · ${file.changeKind}`,
-        options: DIFF_OPTIONS,
+        options: file.changeKind === "deleted" ? DELETED_DIFF_OPTIONS : DIFF_OPTIONS,
         // Placeholder height until the widget renders the file; ~ changed lines plus collapsed-region rows.
         estimatedHeight: HEADER_HEIGHT + (file.additions + file.deletions + 8) * LINE_HEIGHT,
       };
@@ -182,11 +293,10 @@ function MultiDiff({ bundle, panelId, root, files }: { bundle: Bundle; panelId: 
     const kept = new Set(documents.map((d) => d.modified));
     for (const [abs, m] of current) {
       if (kept.has(m.modified)) continue;
-      m.original.dispose();
-      m.modified.dispose();
+      release(abs, m);
       current.delete(abs);
     }
-  }, [bundle, panelId, root, files]);
+  }, [bundle, panelId, root, files, flush, release]);
 
   return <div ref={container} className="h-full" />;
 }
@@ -217,9 +327,55 @@ function FileView({ monaco, panelId, location, onError }: {
   return <div ref={container} className="min-h-0 flex-1" />;
 }
 
+function ReportInbox({ rpc, onClose }: { rpc: Rpc; onClose(): void }) {
+  const [reports, setReports] = useState<Omit<Report, "setup">[] | null>(null);
+  const [id, setId] = useState<string | null>(null);
+  const [report, setReport] = useState<Report | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    rpc.call("reports", null).then((reports) => { if (!cancelled) setReports(reports); },
+      (cause) => { if (!cancelled) setError(String(cause)); });
+    return () => { cancelled = true; };
+  }, [rpc]);
+  useEffect(() => {
+    let cancelled = false;
+    setReport(null);
+    setError(null);
+    if (id !== null) rpc.call("getReport", { id }).then((report) => { if (!cancelled) setReport(report); },
+      (cause) => { if (!cancelled) setError(String(cause)); });
+    return () => { cancelled = true; };
+  }, [rpc, id]);
+  return (
+    <div role="region" aria-label="Diff Explorer reports" onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); onClose(); } }} className="absolute inset-0 z-20 flex min-h-0 flex-col bg-background text-xs">
+      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+        {id === null ? null : <button type="button" className="rounded px-1.5 py-0.5 hover:bg-muted" onClick={() => setId(null)}>← Back</button>}
+        <span className="flex-1">Diff Explorer reports</span>
+        <button type="button" autoFocus className="rounded px-1.5 py-0.5 hover:bg-muted" onClick={onClose}>Close</button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        {error === null ? null : <p className="text-destructive">{error}</p>}
+        {id !== null ? (report === null ? <p>Loading report…</p> : <pre className="whitespace-pre-wrap break-all">{JSON.stringify(report, null, 2)}</pre>) : (
+          reports === null ? <p>Loading reports…</p> : reports.length === 0 ? <p>No reports saved.</p> : (
+            <>
+              <p className="mb-2 text-muted-foreground">Latest 20 reports from all threads. Stored in this BB installation.</p>
+              {reports.map((report) => (
+                <button key={report.id} type="button" className="block w-full rounded p-2 text-left hover:bg-muted" onClick={() => setId(report.id)}>
+                  <span className="block">{new Date(report.createdAt).toLocaleString()} · {report.threadId}</span>
+                  <span className="block break-all font-mono text-muted-foreground">{report.id}</span>
+                </button>
+              ))}
+            </>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
-  const { mode } = experimental_useCodeTheme();
+  const { mode, name } = experimental_useCodeTheme();
   const [panelId] = useState(() => `p${Math.random().toString(36).slice(2)}`);
   const [bundle, setBundle] = useState<Bundle | null>(null);
   const monaco = bundle?.monaco ?? null;
@@ -228,37 +384,68 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const [stack, setStack] = useState<Location[]>([]);
   const [reload, setReload] = useState(0);
   const [target, setTarget] = useState<DiffTarget>("uncommitted");
+  const [reportStatus, setReportStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [showReports, setShowReports] = useState(false);
   const root = useRef<HTMLDivElement>(null);
+  const settingsMenu = useRef<HTMLDivElement>(null);
+  const settingsButton = useRef<HTMLButtonElement>(null);
+
+  const reportIssue = async () => {
+    if (reportStatus === "saving") return;
+    setReportStatus("saving");
+    try {
+      const setup = {
+        pluginVersion, threadId, environmentId: data?.environmentId ?? null, workspace: data?.root ?? null,
+        target, baseBranch: data?.baseBranch ?? null, theme: { mode, name }, error,
+        files: data?.files.slice(0, 40).map((file) => ({ path: file.path, kind: file.changeKind })) ?? [],
+        fileCount: data?.files.length ?? 0, skippedCount: data?.skipped.length ?? 0,
+        browser: navigator.userAgent, forcedColors: matchMedia("(forced-colors: active)").matches,
+        origin: window.location.origin, worker: workerStatus,
+        viewport: { width: root.current?.clientWidth ?? 0, height: root.current?.clientHeight ?? 0 },
+        decorations: Array.from(root.current?.querySelectorAll(".line-insert,.line-delete,.char-insert,.char-delete") ?? []).slice(0, 8).map((element) => {
+          const style = getComputedStyle(element);
+          return {
+            class: element.className, background: style.backgroundColor,
+            inserted: style.getPropertyValue("--vscode-diffEditor-insertedLineBackground"),
+            removed: style.getPropertyValue("--vscode-diffEditor-removedLineBackground"),
+          };
+        }),
+        stylesheets: Array.from(document.querySelectorAll<HTMLLinkElement>("link[rel=stylesheet]"))
+          .filter((link) => link.href.includes("/editor.css")).map((link) => ({ path: new URL(link.href).pathname, loaded: link.sheet !== null })),
+      };
+      await rpc.call("report", setup);
+      setReportStatus("saved");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setReportStatus("idle");
+    }
+  };
+
+  useEffect(() => {
+    setData(null);
+    setStack([]);
+  }, [threadId, target]);
 
   useEffect(() => {
     let cancelled = false;
-    setData(null);
-    setStack([]);
-    Promise.all([rpc.call("assets", null).then(({ baseUrl }) => loadMonaco(baseUrl)), rpc.call("load", { threadId, target })]).then(
+    Promise.all([rpc.call("assets", null).then(({ baseUrl }) => loadMonaco(baseUrl, rpc)), rpc.call("load", { threadId, target })]).then(
       ([b, loaded]) => {
         if (cancelled) return;
         setBundle(b);
-        setData(loaded);
+        setData((prev) => (prev !== null && JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
         setError(null);
       },
-      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+      (cause) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      },
     );
     return () => {
       cancelled = true;
     };
   }, [rpc, threadId, target, reload]);
 
-  const current = useRef({ target, root: data?.root });
-  current.current = { target, root: data?.root };
   useRealtime("changed", (payload) => {
-    if ((payload as { root: string }).root !== current.current.root) return;
-    rpc.call("load", { threadId, target }).then(
-      (loaded) => {
-        if (current.current.target !== target) return;
-        setData((prev) => (prev !== null && JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
-      },
-      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
-    );
+    if ((payload as { root: string }).root === data?.root) setReload((n) => n + 1);
   });
 
   useEffect(() => {
@@ -306,7 +493,7 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const relative = (p: string) => (data !== null && p.startsWith(`${data.root}/`) ? p.slice(data.root.length + 1) : p);
 
   return (
-    <div ref={root} tabIndex={-1} onKeyDownCapture={onKeyDownCapture} className="flex h-full min-h-0 flex-col outline-none">
+    <div ref={root} tabIndex={-1} onKeyDownCapture={onKeyDownCapture} className="relative flex h-full min-h-0 flex-col outline-none">
       <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
         {top === undefined ? (
           <>
@@ -320,7 +507,7 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
               <option value="uncommitted">Uncommitted</option>
             </select>
             <span className="text-muted-foreground">
-              {data === null ? "Loading…" : `${data.files.length} files · ⌘-click a symbol to go to its definition`}
+              {data === null ? "Loading…" : `${data.files.length} files`}
             </span>
           </>
         ) : (
@@ -336,10 +523,34 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
         )}
         <span className="flex-1" />
         {error === null ? null : <span className="truncate text-destructive">{error}</span>}
-        <button type="button" className="rounded px-1.5 py-0.5 hover:bg-muted" onClick={() => setReload((n) => n + 1)}>
-          Refresh
+        <button type="button" aria-label="Report issue" title="Save diagnostics to the Diff Explorer inbox" disabled={reportStatus === "saving"}
+          className="shrink-0 rounded px-1.5 py-0.5 hover:bg-muted disabled:opacity-50" onClick={reportIssue}>
+          {reportStatus === "saving" ? "Saving…" : reportStatus === "saved" ? "Report saved" : "Report issue"}
         </button>
+        <button ref={settingsButton} type="button" aria-label="Diff Explorer settings" title="Settings"
+          popoverTarget={`${panelId}-settings`} className="shrink-0 rounded p-1 hover:bg-muted"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            if (settingsMenu.current === null) return;
+            settingsMenu.current.style.top = `${rect.bottom + 4}px`;
+            settingsMenu.current.style.right = `${window.innerWidth - rect.right}px`;
+          }}>
+          <Icon name="Settings" className="size-4" aria-hidden />
+        </button>
+        <div ref={settingsMenu} id={`${panelId}-settings`} popover="auto" aria-label="Diff Explorer options"
+          className="fixed left-auto m-0 min-w-32 rounded border border-border bg-background p-1 text-xs text-foreground shadow-md">
+          <button type="button" className="w-full rounded px-2 py-1.5 text-left hover:bg-muted" onClick={() => {
+            settingsMenu.current?.hidePopover();
+            setShowReports(true);
+          }}>View reports</button>
+          <button type="button" className="w-full rounded px-2 py-1.5 text-left hover:bg-muted" onClick={() => {
+            settingsMenu.current?.hidePopover();
+            settingsButton.current?.focus();
+            setReload((n) => n + 1);
+          }}>Refresh</button>
+        </div>
       </div>
+      {showReports ? <ReportInbox rpc={rpc} onClose={() => { setShowReports(false); settingsButton.current?.focus(); }} /> : null}
       {bundle === null || monaco === null || data === null ? null : (
         <>
           <div className="flex min-h-0 flex-1 flex-col" hidden={top !== undefined}>
@@ -350,7 +561,18 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
               </p>
             )}
             <div className="min-h-0 flex-1">
-              <MultiDiff bundle={bundle} panelId={panelId} root={data.root} files={data.files} />
+              <MultiDiff
+                bundle={bundle}
+                panelId={panelId}
+                root={data.root}
+                files={data.files}
+                save={(path, content, expected) => rpc.call("write", { environmentId: data.environmentId, path, content, expected })}
+                fileAction={async (path, action) => {
+                  await rpc.call("fileAction", { environmentId: data.environmentId, path, action });
+                  setReload((n) => n + 1);
+                }}
+                onError={setError}
+              />
             </div>
           </div>
           {top === undefined ? null : (
