@@ -30,6 +30,7 @@ import {
 import {
   STALE_DONE_RING_ICON,
   doneRingIcon,
+  staleDoneRingIcon,
   stageRingIcon,
 } from "./brief.js";
 import { projectColorIndex } from "./shared.js";
@@ -57,6 +58,7 @@ const thread = (overrides: Partial<BoardRowThread> = {}): BoardRowThread => ({
   displayTitle: "Thread briefs board",
   href: "/projects/proj_alpha/threads/thr_1",
   status: "idle",
+  isUnread: false,
   isPinned: false,
   isHidden: false,
   latestAttentionAt: NOW - 1000,
@@ -83,6 +85,7 @@ const row = (overrides: Partial<BoardRow> = {}): BoardRow => ({
   href: "/t/1",
   project: { id: "proj_alpha", name: "Alpha" },
   isPinned: false,
+  isUnread: false,
   latestAttentionAt: NOW,
   status: "waiting-on-me",
   card: card(),
@@ -576,11 +579,32 @@ describe("card presentation", () => {
     ).toBe(STALE_DONE_RING_ICON);
   });
 
-  it("still draws the brief's ring for a working card", () => {
-    // Unlike the sidebar row, where bb has a live glyph of its own to put there.
+  it("animates the brief's ring for a working card, as the row does", () => {
     expect(cardRingIcon(row({ status: "working" }))).toBe(
-      stageRingIcon("implementation", projectColorIndex("proj_alpha")),
+      stageRingIcon("implementation", projectColorIndex("proj_alpha"), {
+        unread: false,
+        working: true,
+      }),
     );
+  });
+
+  it("dots the ring of a card with unread output", () => {
+    expect(cardRingIcon(row({ isUnread: true }))).toBe(
+      stageRingIcon("implementation", projectColorIndex("proj_alpha"), {
+        unread: true,
+        working: false,
+      }),
+    );
+    expect(
+      cardRingIcon(
+        row({
+          isUnread: true,
+          status: "done",
+          column: DONE_COLUMN,
+          stale: { idleMs: 2 * DAY, archiving: true },
+        }),
+      ),
+    ).toBe(staleDoneRingIcon({ unread: true, working: false }));
   });
 
   it("draws no ring for a briefless card", () => {

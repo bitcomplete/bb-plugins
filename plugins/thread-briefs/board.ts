@@ -104,6 +104,8 @@ export type BoardRowThread = {
   href: string;
   /** bb's live execution status, for the `working` fold. */
   status: string;
+  /** bb's "output you have not seen", for the ring's centre dot. */
+  isUnread: boolean;
   isPinned: boolean;
   isHidden: boolean;
   latestAttentionAt: number;
@@ -117,6 +119,8 @@ export type BoardRow = {
   /** Null for a thread with no project, which cannot take a project colour. */
   project: { id: string; name: string } | null;
   isPinned: boolean;
+  /** The thread has output nobody has read; drawn as the ring's centre dot. */
+  isUnread: boolean;
   latestAttentionAt: number;
   /**
    * The status the card shows: `working` where bb says the agent is running or
@@ -212,6 +216,7 @@ export function buildRows(args: {
             }
           : null,
       isPinned: thread.isPinned,
+      isUnread: thread.isUnread,
       latestAttentionAt: thread.latestAttentionAt,
       status,
       card,
@@ -663,22 +668,20 @@ export function actorHint(
 /**
  * The ring a card draws, or null for a briefless one.
  *
- * The same three-facts-in-one-glyph as the sidebar row — how far round is the
- * stage, a filled centre is done, the hue is the project, grey is done and cold
- * — so the vocabulary learned in one place reads in the other. It differs from
- * `rowDecoration` in one way: a `working` card still draws its brief's ring here.
- * On a row that decoration is suppressed because bb has a live glyph of its own
- * to put there; a card has room for both and the stage is still the fact that
- * says how close the running thread is to finished.
+ * The same glyph as the sidebar row — how far round is the stage, all four
+ * quarters is done, a dot in the centre is unread, a pulse is the agent
+ * working, the hue is the project, grey is done and cold — so the vocabulary
+ * learned in one place reads in the other. The pin is not on the ring; the
+ * card has its own `pinned` marker for it, where a row has only its label.
  */
 export function cardRingIcon(row: BoardRow): string | null {
   if (row.card === null) return null;
-  const pinned = isPinnedByHand(row.card);
-  if (row.stale !== null) return staleDoneRingIcon(pinned);
+  const marks = { unread: row.isUnread, working: row.status === "working" };
+  if (row.stale !== null) return staleDoneRingIcon(marks);
   const colorIndex =
     row.project === null ? undefined : projectColorIndex(row.project.id);
-  if (row.status === "done") return doneRingIcon(colorIndex, pinned);
-  return stageRingIcon(row.card.stage, colorIndex, pinned);
+  if (row.status === "done") return doneRingIcon(colorIndex, marks);
+  return stageRingIcon(row.card.stage, colorIndex, marks);
 }
 
 /** Whether either pin is in force on this card, for the "pinned" marker. */

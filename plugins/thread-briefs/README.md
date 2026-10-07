@@ -74,8 +74,8 @@ Either can be pinned by hand in the Brief panel, anchored to the thread's
 activity cursor so the pin retires on the next real turn. The status pin is what
 closes a thread whose next step was carried out somewhere the transcript cannot
 see — a go-ahead you gave in another thread, a PR you merged on github.com —
-leaves nothing for a summary to read. A pin in force draws a dot in the centre
-of the row's ring.
+leaves nothing for a summary to read. A pin in force is named in the row's
+hover label (`· set by hand`); the ring itself draws nothing for it.
 
 Pinning **Blocked** is how a thread is parked, and it takes a reason. The reason
 is not written into the brief; it is placed in the conversation the summarizer
@@ -108,8 +108,11 @@ is read as unset too.
 
 **Sidebar row** — a **ring** showing the stage: one of four quarters filled per
 stage reached, so `discovery` is a quarter, `implementation` is three quarters,
-`review` closes the ring, and a `done` thread gets the closed ring with its
-centre filled in.
+`review` closes the ring, and a `done` thread draws the same full ring whatever
+stage it ended in. Two live marks sit on top of it, both bb's own facts read
+off the sidebar row: a **dot in the centre** is bb's activity dot — the thread
+has output you have not read — and a **pulse** in the filled quarters means
+the agent is running or queued.
 
 The glyph draws the stage rather than the status because status is what the
 sidebar's own [status grouping](#sidebar-sections) already puts in the section
@@ -123,12 +126,15 @@ off the ring is what holds the ring at four readable segments.
 
 Two consequences. `waiting-on-me` and `waiting-on-other` draw the **same** ring,
 told apart by the section header or the hover label (`Implementation —
-Blocked`). And a thread whose agent is running or queued keeps bb's own
-indicator: bb hides a plugin row status outright while its own is `runtime`, and
-where it does not — plan mode, a goal, a workflow — a ring would displace a live
-glyph that says more than a stored brief can. bb also paints the status in place
-of its unsent-draft pencil, so decorating a row is never free. The live status is
-folded in per row on the client, off the sidebar view it already holds, so
+Blocked`). And a thread whose agent is running or queued keeps its ring and
+**pulses** it, with the label reading `Working`: the stage is still the stage
+while the agent runs, so the fill stays put and only the filled quarters
+breathe. Where bb hides a plugin row status outright — its own indicator is
+`runtime`, `unread-error` or `waiting-for-input` — bb's glyph shows instead,
+so a failed turn and a thread asking for input still look the way they do
+everywhere else. bb also paints the status in place of its unsent-draft
+pencil, so decorating a row is never free. The live facts — running, unread —
+are folded in per row on the client, off the sidebar view it already holds, so
 `listRowSignals` needs no per-thread lookups.
 
 The same rings label the stage control in the Brief panel, which is where the
@@ -209,8 +215,8 @@ hand makes the next sync build its own alongside yours.
 
 Two things to know. There is **no section for running threads**: `working` is
 live state and never reaches a stored brief, so a thread whose agent is running
-sits in the section its last brief implies and keeps bb's own running indicator —
-the same live-vs-stored split as the panel. And a thread you filed in a section
+sits in the section its last brief implies, with its ring pulsing — the same
+live-vs-stored split as the panel. And a thread you filed in a section
 of your own is left alone until it has a brief, but once it does the grouping
 takes it over; turning grouping off deletes the three sections and restores the
 sidebar preferences it changed, but cannot put a hand-made placement back.

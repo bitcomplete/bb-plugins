@@ -84,7 +84,7 @@ describe("registrations", () => {
     expect(captured.threadLists).toEqual([]);
   });
 
-  it("registers a ring for every stage, plus the closed one for done", async () => {
+  it("registers a ring for every stage, plus the full one for done", async () => {
     // A stage with no artwork would draw bb's Zap fallback on the row, which is
     // why the names are mapped off BRIEF_STAGES rather than listed.
     const captured = await loadApp();
@@ -109,25 +109,33 @@ describe("registrations", () => {
       }
       expect(names).toContain(doneRingIcon(colorIndex));
     }
-    // Every ring in every colour, each with and without the pin dot, plus the
-    // grey done ring — two, because grey replaces a project's hue rather than
-    // varying with it, and only the pin still varies.
+    // Every ring in every colour, in each of the four combinations of live
+    // marks, plus the grey done ring — four, because grey replaces a project's
+    // hue rather than varying with it, and only the marks still vary.
     expect(names).toContain(STALE_DONE_RING_ICON);
-    expect(names).toContain(staleDoneRingIcon(true));
+    expect(names).toContain(staleDoneRingIcon({ unread: true }));
+    expect(names).toContain(staleDoneRingIcon({ working: true }));
+    expect(names).toContain(staleDoneRingIcon({ unread: true, working: true }));
     expect(captured.icons).toHaveLength(
-      (BRIEF_STAGES.length + 1) * 2 * (PROJECT_RING_HUES.length + 1) + 2,
+      (BRIEF_STAGES.length + 1) * 4 * (PROJECT_RING_HUES.length + 1) + 4,
     );
   });
 
-  it("registers a pinned twin of every ring, dot included", async () => {
+  it("registers an unread and a working twin of every ring, and both at once", async () => {
     const captured = await loadApp();
     const names = new Set(captured.icons.map((entry) => entry.name));
-    for (const stage of BRIEF_STAGES) {
-      expect(names).toContain(stageRingIcon(stage, undefined, true));
-      expect(names).toContain(stageRingIcon(stage, 3, true));
+    for (const marks of [
+      { unread: true },
+      { working: true },
+      { unread: true, working: true },
+    ]) {
+      for (const stage of BRIEF_STAGES) {
+        expect(names).toContain(stageRingIcon(stage, undefined, marks));
+        expect(names).toContain(stageRingIcon(stage, 3, marks));
+      }
+      expect(names).toContain(doneRingIcon(undefined, marks));
+      expect(names).toContain(doneRingIcon(3, marks));
     }
-    expect(names).toContain(doneRingIcon(undefined, true));
-    expect(names).toContain(doneRingIcon(3, true));
   });
 
   /** The artwork one registered icon draws, rendered on its own. */
@@ -141,12 +149,10 @@ describe("registrations", () => {
     return {
       quarters: paths.length,
       solid: paths.filter((path) => path.getAttribute("opacity") === "1").length,
-      // The dot is filled; the done circle is stroked. Telling them apart is
-      // the point of the tests below.
       hasDot: circles.some((circle) => circle.getAttribute("fill") !== null),
-      isCircle: circles.some(
-        (circle) => circle.getAttribute("stroke") !== null,
-      ),
+      // The pulse is SMIL inside the filled quarters, so counting the animate
+      // elements says both that it animates and that the track stays still.
+      pulsing: container.querySelectorAll("animate").length,
     };
   };
 
@@ -163,38 +169,54 @@ describe("registrations", () => {
     }
   });
 
-  it("draws done as one seamless circle, so it is not just the review ring again", async () => {
-    // Both close the ring, because done is not a fifth stage. At 16px the
-    // review ring's four gaps are the only thing telling them apart — and the
-    // centre stays free for the pin, so a plain done ring has no dot.
+  it("draws done as all four quarters, gaps kept, with a free centre", async () => {
+    // Done is not a fifth stage, so it closes the ring the way review does
+    // rather than adding a mark of its own; the centre is unread's, not done's.
     expect(await drawIcon("thread-briefs/done")).toMatchObject({
-      quarters: 0,
-      isCircle: true,
-      hasDot: false,
-    });
-    expect(await drawIcon("thread-briefs/stage-review")).toMatchObject({
+      quarters: 4,
       solid: 4,
-      isCircle: false,
+      hasDot: false,
+      pulsing: 0,
+    });
+    expect(await drawIcon(STALE_DONE_RING_ICON)).toMatchObject({
+      quarters: 4,
+      solid: 4,
       hasDot: false,
     });
   });
 
-  it("dots the centre of a pinned ring and nothing else about it", async () => {
-    // The dot is the one mark on the row the model did not decide. It has to
-    // be additive: a pinned done thread shows both the circle and the dot.
-    expect(await drawIcon("thread-briefs/stage-planning-pinned")).toMatchObject({
+  it("dots the centre of an unread ring and nothing else about it", async () => {
+    // bb's own activity dot, where bb drew it. Additive: an unread done thread
+    // shows the full ring and the dot, in grey once cold.
+    expect(await drawIcon("thread-briefs/stage-planning-unread")).toMatchObject({
       solid: 2,
-      isCircle: false,
+      hasDot: true,
+      pulsing: 0,
+    });
+    expect(await drawIcon("thread-briefs/done-unread")).toMatchObject({
+      solid: 4,
       hasDot: true,
     });
-    expect(await drawIcon("thread-briefs/done-pinned")).toMatchObject({
-      isCircle: true,
+    expect(await drawIcon(staleDoneRingIcon({ unread: true }))).toMatchObject({
+      solid: 4,
       hasDot: true,
     });
-    expect(await drawIcon(staleDoneRingIcon(true))).toMatchObject({
-      isCircle: true,
-      hasDot: true,
+  });
+
+  it("pulses the filled quarters of a working ring and leaves the track still", async () => {
+    // The stage has to stay legible while the agent runs, so the fill's
+    // endpoint does not move; only the filled quarters breathe.
+    expect(await drawIcon("thread-briefs/stage-planning-working")).toMatchObject({
+      solid: 2,
+      hasDot: false,
+      pulsing: 2,
     });
+    expect(await drawIcon("thread-briefs/done-working")).toMatchObject({
+      pulsing: 4,
+    });
+    expect(
+      await drawIcon("thread-briefs/stage-discovery-unread-working"),
+    ).toMatchObject({ solid: 1, hasDot: true, pulsing: 1 });
   });
 
   it("labels the tab the same way from the launcher as from the header", async () => {
@@ -709,15 +731,41 @@ describe("sidebar row glyphs", () => {
     await scripts.lifecycle.dispose();
   });
 
-  it("leaves a running thread to bb's own indicator", async () => {
-    // Live working outranks the brief, and working draws no glyph.
+  it("animates the ring of a running thread and says so in the label", async () => {
+    // Live working outranks the brief: the row says Working, not Blocked, and
+    // the ring pulses — but it is still the review ring, because the stage is
+    // the stage while the agent runs.
     const { scripts, slot } = await mountBoth({
       signals: [signal({ status: "waiting-on-other", label: "Review — Blocked" })],
       threads: [sidebarThread({ id: "thr_1", status: "active" })],
     });
 
-    await waitFor(() => expect(slot.inspection.rpcCalls.length).toBeGreaterThan(0));
-    expect(scripts.inspection.getThreadRowStatus("thr_1")).toBeNull();
+    await waitFor(() =>
+      expect(scripts.inspection.getThreadRowStatus("thr_1")).toEqual({
+        icon: stageRingIcon("review", ALPHA, { unread: false, working: true }),
+        label: "Review — Working (Alpha)",
+        tone: "running",
+      }),
+    );
+
+    slot.lifecycle.unmount();
+    await scripts.lifecycle.dispose();
+  });
+
+  it("dots the ring of a thread with output you have not read", async () => {
+    // bb's own activity dot, in the ring's centre, off bb's own `isUnread`.
+    const { scripts, slot } = await mountBoth({
+      signals: [signal({ status: "waiting-on-me", label: "Review — Waiting on you" })],
+      threads: [sidebarThread({ id: "thr_1", status: "idle", isUnread: true })],
+    });
+
+    await waitFor(() =>
+      expect(scripts.inspection.getThreadRowStatus("thr_1")).toEqual({
+        icon: stageRingIcon("review", ALPHA, { unread: true, working: false }),
+        label: "Review — Waiting on you (Alpha)",
+        tone: "default",
+      }),
+    );
 
     slot.lifecycle.unmount();
     await scripts.lifecycle.dispose();

@@ -44,6 +44,7 @@ import {
   stageRingIcon,
   STATUS_LABELS,
   summarizedAgo,
+  type RingMarks,
 } from "./brief.js";
 import { Field, StageControl, StatusControl } from "./controls.js";
 import { useNow } from "./clock.js";
@@ -169,6 +170,17 @@ function BriefSync() {
     return ids;
   }, [threads]);
 
+  // bb's own "new output since you looked", the condition its activity dot
+  // was drawn on before the ring took the row. The ring draws it in its
+  // centre; a `Set` for the same reason as `workingIds`.
+  const unreadIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const thread of threads) {
+      if (thread.isUnread === true) ids.add(thread.id);
+    }
+    return ids;
+  }, [threads]);
+
   /** Every thread this window's sidebar is showing, by id. */
   const sidebarIds = useMemo(
     () => new Set(threads.map((thread) => thread.id)),
@@ -261,7 +273,10 @@ function BriefSync() {
           : null;
       const decoration = rowDecoration(
         signal,
-        workingIds.has(signal.threadId),
+        {
+          working: workingIds.has(signal.threadId),
+          unread: unreadIds.has(signal.threadId),
+        },
         projectByThreadId.get(signal.threadId) ?? null,
         stale,
       );
@@ -275,6 +290,7 @@ function BriefSync() {
     sidebarIds,
     signals,
     thresholds,
+    unreadIds,
     workingIds,
   ]);
 
@@ -303,7 +319,7 @@ const RING_QUARTERS = [
 
 /**
  * A ring with `filled` of its four quarters solid and the rest left as a track,
- * or — for `complete` — one seamless circle, optionally marked as pinned.
+ * optionally dotted for unread and animated for working.
  *
  * The track is what makes the glyph a ratio rather than a count: three quarters
  * against a visible whole reads instantly at 16px, where three marks against
@@ -312,19 +328,27 @@ const RING_QUARTERS = [
  * A `color` of `currentColor` leaves the host's tone class to paint it, which
  * is what the panel and the stage picker want. An explicit colour overrides
  * that class, so the two modes cannot both colour the same ring — which is what
- * lets one glyph carry four facts at 16px: how far round it goes is the stage,
- * a seamless circle is `done`, a dot in the centre is a pin, and the hue is the
- * project (or grey, for a done thread nobody has come back to).
+ * lets one glyph carry four facts at 16px: how far round it goes is the stage
+ * (all four quarters is `done`), a dot in the centre is unread, a pulse is the
+ * agent working, and the hue is the project (or grey, for a done thread
+ * nobody has come back to).
  *
- * `done` is a circle rather than four closed quarters because a done thread
- * draws no stage: the arc is over, so there are no boundaries to mark. The
- * gaps are what tell it from the closed review ring, and the whole glyph stays
- * at full size. The dot is small because it also has to read at 12px in the
- * stage picker.
+ * The dot is bb's own mark, drawn where bb drew it: a filled centre is what the
+ * activity dot was before the ring displaced it, so the vocabulary carries
+ * over. It is small because it also has to read at 12px in the stage picker.
+ *
+ * Working *pulses* the filled quarters rather than spinning the ring. A spin
+ * is the more familiar "busy", but it moves the fill's endpoint, and where the
+ * fill stops is the whole reading of the glyph — a spinning ring says the
+ * thread is busy and nothing else. A pulse keeps the stage legible and still
+ * reads as alive at a glance; the track is left steady so the pulse has
+ * something to beat against. SMIL rather than a stylesheet, because an icon
+ * registered as a component has nowhere to put CSS and this way the motion
+ * travels with the artwork.
  */
 function ring(
   filled: number,
-  { complete = false, pinned = false, color = "currentColor" } = {},
+  { unread = false, working = false, color = "currentColor" } = {},
 ) {
   return function StageRing({ className }: { className?: string }) {
     return (
@@ -334,67 +358,81 @@ function ring(
         className={className}
         aria-hidden="true"
       >
-        {complete ? (
-          <circle cx={8} cy={8} r={6} stroke={color} strokeWidth={2} />
-        ) : (
-          RING_QUARTERS.map((d, index) => (
-            <path
-              key={d}
-              d={d}
-              stroke={color}
-              strokeWidth={2}
-              opacity={index < filled ? 1 : 0.25}
-            />
-          ))
-        )}
-        {pinned ? <circle cx={8} cy={8} r={2.25} fill={color} /> : null}
+        {RING_QUARTERS.map((d, index) => (
+          <path
+            key={d}
+            d={d}
+            stroke={color}
+            strokeWidth={2}
+            opacity={index < filled ? 1 : 0.25}
+          >
+            {working && index < filled ? (
+              <animate
+                attributeName="opacity"
+                values="1;0.35;1"
+                dur="1.6s"
+                repeatCount="indefinite"
+              />
+            ) : null}
+          </path>
+        ))}
+        {unread ? <circle cx={8} cy={8} r={2.25} fill={color} /> : null}
       </svg>
     );
   };
 }
 
 /**
- * One ring per stage, plus the done ring, each with and without the pin dot.
+ * Every combination of live marks a ring can carry, in the order the icons
+ * are registered. Four, because unread and working are independent facts.
+ */
+const RING_MARKS: readonly RingMarks[] = [
+  {},
+  { unread: true },
+  { working: true },
+  { unread: true, working: true },
+];
+
+/**
+ * One ring per stage, plus the done ring, each in every combination of marks.
  *
- * Mapped over `BRIEF_STAGES` in order, so the artwork and the names cannot
- * drift: `stageRingIcon` is the same function the row decoration calls, and a
- * stage added to the list gets its ring here without a second edit.
+ * Mapped off `BRIEF_STAGES` and the same name builders the decoration calls
+ * (`stageRingIcon`, `doneRingIcon`), so the registry and the row cannot
+ * drift: a stage added to the list gets its rings here without a second edit.
  */
 function ringSet(colorIndex?: number) {
   const color =
     colorIndex === undefined ? "currentColor" : projectRingColor(colorIndex);
-  return [false, true].flatMap((pinned) => [
+  return RING_MARKS.flatMap((marks) => [
     ...BRIEF_STAGES.map((stage, index) => ({
-      name: stageRingIcon(stage, colorIndex, pinned),
-      component: ring(index + 1, { pinned, color }),
+      name: stageRingIcon(stage, colorIndex, marks),
+      component: ring(index + 1, { ...marks, color }),
     })),
     {
-      name: doneRingIcon(colorIndex, pinned),
-      component: ring(RING_QUARTERS.length, { complete: true, pinned, color }),
+      name: doneRingIcon(colorIndex, marks),
+      component: ring(RING_QUARTERS.length, { ...marks, color }),
     },
   ]);
 }
 
 /**
- * The neutral set, plus one set per palette slot.
+ * The whole icon registry: every ring neutral, then in each palette colour.
  *
- * Every combination is registered up front because the registry is keyed by
- * name and filled once, at plugin init, where no project list exists yet —
+ * Registered at init, before any project is known, because the sidebar's
  * projects arrive later, per window, through `experimental_useSidebarThreads`.
  * Hashing a project into a fixed palette instead of registering an icon per
- * project is what makes that work: the set of names is knowable without knowing
- * the projects, and a project added later already has its artwork waiting.
+ * project is what makes that possible.
  */
 const RING_ICONS = [
   ...ringSet(),
   ...PROJECT_RING_HUES.flatMap((_hue, colorIndex) => ringSet(colorIndex)),
-  // Two, not a set: the grey replaces a project's hue rather than varying with
-  // it, and only the pin still varies. See {@link STALE_DONE_RING_ICON}.
-  ...[false, true].map((pinned) => ({
-    name: staleDoneRingIcon(pinned),
+  // Four, not a set per colour: the grey replaces a project's hue rather than
+  // varying with it, and only the marks still vary. See
+  // {@link STALE_DONE_RING_ICON}.
+  ...RING_MARKS.map((marks) => ({
+    name: staleDoneRingIcon(marks),
     component: ring(RING_QUARTERS.length, {
-      complete: true,
-      pinned,
+      ...marks,
       color: STALE_DONE_RING_COLOR,
     }),
   })),
@@ -446,7 +484,6 @@ function BriefBody({
   }
 
   const { brief } = state;
-  const pinned = brief.stageOverride !== null || brief.statusOverride !== null;
   const allEmpty =
     [brief.goal, brief.currentState, brief.nextStep, brief.blockedOn, brief.constraints]
       .every((value) => value.trim() === "");
@@ -458,15 +495,16 @@ function BriefBody({
           <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
             {/*
               The glyph this thread's sidebar row draws, beside the words it
-              stands for. A done thread is the case that needs it: its row shows
-              a closed ring and no stage, so the stage control below cannot
-              explain it.
+              stands for — without the live marks, which belong to the row:
+              you are reading this thread, so it is not unread. A done thread
+              is the case that needs it: its row shows a closed ring and no
+              stage, so the stage control below cannot explain it.
             */}
             <Icon
               name={
                 brief.status === "done"
-                  ? doneRingIcon(undefined, pinned)
-                  : stageRingIcon(brief.stage, undefined, pinned)
+                  ? doneRingIcon()
+                  : stageRingIcon(brief.stage)
               }
               className={`h-3.5 w-3.5 shrink-0 ${
                 brief.status === "done"
