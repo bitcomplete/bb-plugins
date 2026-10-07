@@ -2,9 +2,10 @@
 // Settings → Plugins → Team setup. Each row reads one step's state from the
 // server and starts that step's flow; the plugins that own the steps finish
 // them.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { browserDeps, createUpdateStore, type UpdateStore } from "./server-update";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 
@@ -437,13 +438,63 @@ function Checklist({ compact }: { compact: boolean }) {
   );
 }
 
+// bb-gate stages a new build of this server rather than restarting it; the
+// banner is how the developer finds out and picks the moment. One store for
+// the page, made on first use so a bb that is not behind bb-gate never
+// polls for nothing more than once.
+let updateStore: UpdateStore | null = null;
+function useServerUpdate(): UpdateStore {
+  if (updateStore === null) updateStore = createUpdateStore(browserDeps());
+  return updateStore;
+}
+
+function ServerUpdateBanner() {
+  const store = useServerUpdate();
+  const state = useSyncExternalStore(store.subscribe, store.getState);
+  if (state.status !== "pending" && state.status !== "restarting") return null;
+  const restarting = state.status === "restarting";
+  return (
+    <div
+      role="status"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm"
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon name={restarting ? "LoaderCircle" : "CircleArrowUp"} className={`size-4 shrink-0 ${restarting ? "animate-spin" : "text-primary"}`} />
+        {restarting ? (
+          <span>Restarting your server. This page reloads when it is back, in about a minute.</span>
+        ) : (
+          <span>
+            A new build of your bb server is ready. Restarting takes about a minute and interrupts any running turn; if you never
+            do, it restarts tonight.
+          </span>
+        )}
+      </div>
+      {restarting ? null : (
+        <Button size="sm" onClick={() => void store.apply()}>
+          Restart now
+        </Button>
+      )}
+    </div>
+  );
+}
+
 const CHANGED_CHANNEL = "changed";
 
 export default definePluginApp((app) => {
   app.slots.homepageSection({
     id: "checklist",
     title: "Team setup",
-    component: () => <Checklist compact />,
+    component: () => (
+      <div className="flex flex-col gap-3">
+        <ServerUpdateBanner />
+        <Checklist compact />
+      </div>
+    ),
+  });
+  // Above the composer in every thread, where a developer actually is.
+  app.composer.customize({
+    id: "server-update",
+    banners: [{ id: "server-update", chrome: "bare", component: ServerUpdateBanner }],
   });
   app.slots.settingsSection({
     id: "checklist",
