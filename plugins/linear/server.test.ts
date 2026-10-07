@@ -170,7 +170,7 @@ describe("tools", () => {
   it("are registered with the names the skill documents", async () => {
     const { harness } = await setup();
     const names = harness.registrations.agentTools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_set_state"]);
+    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_update_issue"]);
   });
 
   it("say how to connect when there is no token", async () => {
@@ -233,22 +233,58 @@ describe("tools", () => {
     expect(input.body).toMatch(/^PR opened: https:\/\/github\.com\/x\/y\/pull\/1\n\n_— from bb thread .+_$/u);
   });
 
-  it("linear_set_state matches a state by name and lists the team's states otherwise", async () => {
+  it("linear_update_issue applies state, assignee, labels and priority together", async () => {
+    let lastInput: Record<string, unknown> = {};
+    const ref = issue({
+      labels: { nodes: [{ id: "l-bug", name: "Bug" }, { id: "l-ready", name: "build-ready" }] },
+      team: { ...(issue().team as object), labels: { nodes: [{ id: "l-bug", name: "Bug" }, { id: "l-ready", name: "build-ready" }, { id: "l-agent", name: "agent" }] } },
+    });
     const { tool, text, linear } = await setup({
       settings: { accessToken: "at-0" },
       linear: {
-        answer: (body) =>
-          body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")
-            ? { data: { issueUpdate: { success: true, issue: { identifier: "ENG-123", state: { name: "Done" } } } } }
-            : { data: { issue: issue() } },
+        answer: (body) => {
+          if (body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")) {
+            lastInput = body.variables!.input as Record<string, unknown>;
+            const who = lastInput.assigneeId === "u1" ? { displayName: "jane" } : lastInput.assigneeId === "u-bob" ? { name: "Bob" } : null;
+            const labels = Array.isArray(lastInput.labelIds) ? (lastInput.labelIds as string[]).map((id) => ({ name: id.replace(/^l-/u, "") })) : [{ name: "Bug" }, { name: "build-ready" }];
+            return { data: { issueUpdate: { success: true, issue: { identifier: "ENG-123", state: { name: lastInput.stateId === "s-done" ? "Done" : "Todo" }, assignee: who, labels: { nodes: labels }, priority: lastInput.priority ?? 0 } } } };
+          }
+          if (body.query.startsWith("query($who: String!) { users")) {
+            const who = String(body.variables!.who);
+            const all = [{ id: "u-bob", name: "Bob", displayName: "Bob", email: "bob@acme.test", active: true }, { id: "u-bobby", name: "Bobby", displayName: "Bobby", email: "bobby@acme.test", active: true }];
+            return { data: { users: { nodes: all.filter((u) => u.email === who || u.name.toLowerCase().includes(who.toLowerCase())) } } };
+          }
+          return { data: { issue: body.variables!.id === "ENG-999" ? null : ref, issueLabels: { nodes: [{ id: "l-ws", name: "Workspace" }] } } };
+        },
       },
     });
-    expect(text(await tool("linear_set_state", { key: "ENG-123", state: "done" }))).toBe("ENG-123 is now Done.");
-    expect(linear.calls.at(-1)!.body!.variables).toEqual({ id: "uuid-1", input: { stateId: "s-done" } });
 
-    const miss = await tool("linear_set_state", { key: "ENG-123", state: "Shipped" });
-    expect(miss).toMatchObject({ isError: true });
-    expect(text(miss)).toContain("Todo (unstarted), Done (completed)");
+    // Claiming a ticket: state and assignee in one mutation.
+    expect(text(await tool("linear_update_issue", { key: "eng-123", state: "done", assignee: "me" }))).toBe("ENG-123: now Done; assigned to jane.");
+    expect(linear.calls.at(-1)!.body!.variables).toEqual({ id: "uuid-1", input: { stateId: "s-done", assigneeId: "u1" } });
+
+    // Handing it back: unassign, relabel, reprioritize. Labels are the issue's current set, minus removed, plus added.
+    expect(text(await tool("linear_update_issue", { key: "ENG-123", assignee: "Nobody", removeLabels: ["BUILD-READY"], addLabels: ["agent", "workspace"], priority: "high" }))).toBe(
+      "ENG-123: unassigned; labels bug, agent, ws; priority high.",
+    );
+    expect(lastInput).toEqual({ assigneeId: null, labelIds: ["l-bug", "l-agent", "l-ws"], priority: 2 });
+
+    // A person by email.
+    expect(text(await tool("linear_update_issue", { key: "ENG-123", assignee: "bob@acme.test" }))).toBe("ENG-123: assigned to Bob.");
+    expect(lastInput).toEqual({ assigneeId: "u-bob" });
+
+    // Misses list the choices and change nothing.
+    const state = await tool("linear_update_issue", { key: "ENG-123", state: "Shipped" });
+    expect(state).toMatchObject({ isError: true });
+    expect(text(state)).toContain("Todo (unstarted), Done (completed)");
+    const label = await tool("linear_update_issue", { key: "ENG-123", addLabels: ["perf"] });
+    expect(label).toMatchObject({ isError: true });
+    expect(text(label)).toContain("Bug, build-ready, agent, Workspace");
+    const ambiguous = await tool("linear_update_issue", { key: "ENG-123", assignee: "bo" });
+    expect(ambiguous).toMatchObject({ isError: true });
+    expect(text(ambiguous)).toContain("Give an email");
+    expect(await tool("linear_update_issue", { key: "ENG-999", state: "Done" })).toMatchObject({ isError: true });
+    await expect(tool("linear_update_issue", { key: "ENG-123" })).rejects.toThrow(/at least one of/u);
   });
 
   it("linear_create_issue resolves the team, state, labels, assignee and parent, and signs the description", async () => {

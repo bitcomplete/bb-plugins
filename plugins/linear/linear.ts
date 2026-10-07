@@ -111,9 +111,11 @@ const COMMENT_FIELDS = "comments(first: 50) { nodes { body createdAt url user { 
 export const ISSUE_QUERY = `query($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} ${COMMENT_FIELDS} } }`;
 export const ISSUES_QUERY = `query($filter: IssueFilter, $first: Int!) { issues(filter: $filter, first: $first, orderBy: updatedAt) { nodes { ${ISSUE_FIELDS} } } }`;
 export const SEARCH_QUERY = `query($term: String!, $filter: IssueFilter, $first: Int!) { searchIssues(term: $term, filter: $filter, first: $first) { nodes { ${ISSUE_FIELDS} } } }`;
-export const ISSUE_REF_QUERY = "query($id: String!) { issue(id: $id) { id identifier team { key states { nodes { id name type position } } } } }";
+export const ISSUE_REF_QUERY =
+  "query($id: String!) { issue(id: $id) { id identifier labels { nodes { id name } } team { key states { nodes { id name type position } } labels(first: 250) { nodes { id name } } } } " +
+  "issueLabels(filter: { team: { null: true } }, first: 250) { nodes { id name } } }";
 export const COMMENT_CREATE = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { url } } }";
-export const ISSUE_UPDATE = "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier state { name } } } }";
+export const ISSUE_UPDATE = "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier state { name } assignee { name displayName email } labels { nodes { name } } priority } } }";
 export const ISSUE_CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }";
 /** A team by key, with the states and labels an issue in it can take. Workspace labels apply to every team. */
 export const TEAM_QUERY =
@@ -170,19 +172,46 @@ export function parseIssueList(payload: unknown, field: "issues" | "searchIssues
   return list.nodes;
 }
 
-export type IssueRef = { id: string; identifier: string; team: { key: string; states: Array<{ id: string; name: string; type: string; position: number }> } };
+const labelNodes = z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string() })) });
+
+export type IssueRef = {
+  id: string;
+  identifier: string;
+  /** The labels on the issue now. */
+  labels: Array<{ id: string; name: string }>;
+  team: {
+    key: string;
+    states: Array<{ id: string; name: string; type: string; position: number }>;
+    /** The labels the issue may carry: the team's own and the workspace's. */
+    labels: Array<{ id: string; name: string }>;
+  };
+};
 
 export function parseIssueRef(payload: unknown): IssueRef | null {
   const data = dataOf(payload);
   if (data.issue === null || data.issue === undefined) return null;
   const parsed = z
     .object({
-      id: z.string(),
-      identifier: z.string(),
-      team: z.object({ key: z.string(), states: z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string(), type: z.string(), position: z.number() })) }) }),
+      issue: z.object({
+        id: z.string(),
+        identifier: z.string(),
+        labels: labelNodes.nullish(),
+        team: z.object({
+          key: z.string(),
+          states: z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string(), type: z.string(), position: z.number() })) }),
+          labels: labelNodes.nullish(),
+        }),
+      }),
+      issueLabels: labelNodes.nullish(),
     })
-    .parse(data.issue);
-  return { id: parsed.id, identifier: parsed.identifier, team: { key: parsed.team.key, states: parsed.team.states.nodes } };
+    .parse(data);
+  const issue = parsed.issue;
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    labels: issue.labels?.nodes ?? [],
+    team: { key: issue.team.key, states: issue.team.states.nodes, labels: [...(issue.team.labels?.nodes ?? []), ...(parsed.issueLabels?.nodes ?? [])] },
+  };
 }
 
 /** The state whose name matches, ignoring case; null when none does. */
@@ -198,13 +227,27 @@ export function parseCommentCreate(payload: unknown): { url: string | null } {
   return { url: parsed.comment?.url ?? null };
 }
 
-export function parseIssueUpdate(payload: unknown): { identifier: string; state: string | null } {
+export type IssueUpdated = { identifier: string; state: string | null; assignee: string | null; labels: string[]; priority: number | null };
+
+export function parseIssueUpdate(payload: unknown): IssueUpdated {
   const data = dataOf(payload);
   const parsed = z
-    .object({ success: z.boolean(), issue: z.object({ identifier: z.string(), state: z.object({ name: z.string() }).nullish() }).nullish() })
+    .object({
+      success: z.boolean(),
+      issue: z
+        .object({
+          identifier: z.string(),
+          state: z.object({ name: z.string() }).nullish(),
+          assignee: person,
+          labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+          priority: z.number().nullish(),
+        })
+        .nullish(),
+    })
     .parse(data.issueUpdate);
   if (!parsed.success || parsed.issue === null || parsed.issue === undefined) throw new Error("Linear did not update the issue");
-  return { identifier: parsed.issue.identifier, state: parsed.issue.state?.name ?? null };
+  const issue = parsed.issue;
+  return { identifier: issue.identifier, state: issue.state?.name ?? null, assignee: personName(issue.assignee), labels: (issue.labels?.nodes ?? []).map((l) => l.name), priority: issue.priority ?? null };
 }
 
 export function parseIssueCreate(payload: unknown): { identifier: string; url: string | null } {
@@ -224,8 +267,6 @@ export type Team = {
   /** The team's own labels and the workspace's, the team's first. */
   labels: Array<{ id: string; name: string }>;
 };
-
-const labelNodes = z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string() })) });
 
 export function parseTeam(payload: unknown): Team | null {
   const data = dataOf(payload);
@@ -281,6 +322,7 @@ export function parseUsers(payload: unknown): User[] {
 
 /** Linear's priority numbers: 0 is none, 1 urgent, 4 low. */
 export const PRIORITIES = { none: 0, urgent: 1, high: 2, medium: 3, low: 4 } as const;
+export const PRIORITY_NAMES = Object.fromEntries(Object.entries(PRIORITIES).map(([name, n]) => [n, name])) as Record<number, keyof typeof PRIORITIES>;
 export type PriorityName = keyof typeof PRIORITIES;
 
 // ---- search filters --------------------------------------------------------

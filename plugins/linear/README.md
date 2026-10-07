@@ -21,7 +21,7 @@ same connect.
 | `linear_search` | Issues by free text, team, state, assignee. |
 | `linear_create_issue` | A new issue in a team: title, description, state, assignee, labels, priority, parent. |
 | `linear_comment` | A Markdown comment, signed with the thread id. |
-| `linear_set_state` | Move an issue to a workflow state by name. |
+| `linear_update_issue` | Change an issue's state, assignee, labels and priority together. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 
 Writes are deliberately named tools rather than a raw mutation tool, so the
