@@ -20,6 +20,7 @@ import {
   ISSUES_QUERY,
   LinearRequestError,
   PRIORITIES,
+  PRIORITY_NAMES,
   SEARCH_LIMIT_MAX,
   SEARCH_QUERY,
   TEAM_QUERY,
@@ -353,12 +354,31 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // reader in Linear can find the conversation.
     const signature = (threadId: string) => `\n\n_— from bb thread ${threadId}_`;
 
+    // "me" is the connected user. Anyone else is matched by exact name or
+    // email first, then as the only partial match; several matches ask for
+    // an email rather than guessing.
+    async function resolveAssignee(who: string, signal: AbortSignal): Promise<{ id: string } | { error: string }> {
+      if (who.toLowerCase() === "me") return { id: parseViewer(await query(VIEWER_QUERY, undefined, signal)).user.id };
+      const users = parseUsers(await query(USERS_QUERY, { who }, signal)).filter((u) => u.active);
+      const exact = users.filter((u) => u.name.toLowerCase() === who.toLowerCase() || u.email?.toLowerCase() === who.toLowerCase());
+      const chosen = exact.length === 1 ? exact[0] : users.length === 1 ? users[0] : null;
+      if (chosen === null) {
+        return {
+          error:
+            users.length === 0
+              ? `No Linear user matches ${JSON.stringify(who)}.`
+              : `${JSON.stringify(who)} matches several Linear users: ${users.map((u) => (u.email === null ? u.name : `${u.name} <${u.email}>`)).join(", ")}. Give an email.`,
+        };
+      }
+      return { id: chosen.id };
+    }
+
     bb.agents.registerTool({
       name: "linear_issue",
       description:
         "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
       instructions:
-        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket.",
+        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel or reprioritize one.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
       async execute({ key }, { signal }) {
@@ -425,24 +445,71 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     });
 
     bb.agents.registerTool({
-      name: "linear_set_state",
-      description: "Move a Linear issue to a workflow state by name (for example In Progress, In Review, Done). The names a team uses are listed when the name does not match.",
-      presentation: { label: { pending: "Moving a Linear issue", completed: "Moved a Linear issue" } },
-      parameters: z.object({
-        key: issueKey.describe("The issue key, such as ENG-123."),
-        state: z.string().trim().min(1).max(60).describe("The state's name, matched ignoring case."),
-      }),
-      async execute({ key, state }, { signal }) {
+      name: "linear_update_issue",
+      description:
+        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, and priority. Give only the fields to change; they are applied together. A state, label or person that does not match is an error that lists the choices.",
+      presentation: { label: { pending: "Updating a Linear issue", completed: "Updated a Linear issue" } },
+      parameters: z
+        .object({
+          key: issueKey.describe("The issue key, such as ENG-123."),
+          state: z.string().trim().min(1).max(60).optional().describe("A workflow state name, matched ignoring case."),
+          assignee: z.string().trim().min(1).max(100).optional().describe("A person's name or email, 'me' for the connected user, or 'nobody' to unassign."),
+          addLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to add, matched ignoring case."),
+          removeLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to remove, matched ignoring case."),
+          priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
+        })
+        .refine((v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined, {
+          message: "Give at least one of state, assignee, addLabels, removeLabels or priority.",
+        }),
+      async execute(input, { signal }) {
         try {
-          const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: key }, signal));
-          if (ref === null) return toolError(new Error(`No Linear issue ${key}, or it is not visible to the connected user.`));
-          const target = findState(ref.team.states, state);
-          if (target === null) {
-            const names = [...ref.team.states].sort((a, b) => a.position - b.position).map((s) => `${s.name} (${s.type})`);
-            return toolError(new Error(`Team ${ref.team.key} has no state named ${JSON.stringify(state)}. Its states: ${names.join(", ")}.`));
+          const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: input.key }, signal));
+          if (ref === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
+          const update: Record<string, unknown> = {};
+          const changed: string[] = [];
+
+          if (input.state !== undefined) {
+            const target = findState(ref.team.states, input.state);
+            if (target === null) {
+              const names = [...ref.team.states].sort((a, b) => a.position - b.position).map((s) => `${s.name} (${s.type})`);
+              return toolError(new Error(`Team ${ref.team.key} has no state named ${JSON.stringify(input.state)}. Its states: ${names.join(", ")}.`));
+            }
+            update.stateId = target.id;
           }
-          const updated = parseIssueUpdate(await query(ISSUE_UPDATE, { id: ref.id, input: { stateId: target.id } }, signal));
-          return `${updated.identifier} is now ${updated.state ?? target.name}.`;
+
+          if (input.assignee !== undefined) {
+            if (input.assignee.toLowerCase() === "nobody") {
+              update.assigneeId = null;
+            } else {
+              const resolved = await resolveAssignee(input.assignee, signal);
+              if ("error" in resolved) return toolError(new Error(resolved.error));
+              update.assigneeId = resolved.id;
+            }
+          }
+
+          const adding = (input.addLabels ?? []).filter((l) => l !== "");
+          const removing = (input.removeLabels ?? []).filter((l) => l !== "");
+          if (adding.length > 0 || removing.length > 0) {
+            const add = findLabels(ref.team.labels, adding);
+            const remove = findLabels([...ref.labels, ...ref.team.labels], removing);
+            const missing = [...add.missing, ...remove.missing];
+            if (missing.length > 0) {
+              const names = ref.team.labels.map((l) => l.name);
+              return toolError(new Error(`No label named ${missing.map((m) => JSON.stringify(m)).join(", ")} for team ${ref.team.key}. Its labels: ${names.length > 0 ? names.join(", ") : "(none)"}.`));
+            }
+            const ids = ref.labels.map((l) => l.id).filter((id) => !remove.ids.includes(id));
+            for (const id of add.ids) if (!ids.includes(id)) ids.push(id);
+            update.labelIds = ids;
+          }
+
+          if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
+
+          const updated = parseIssueUpdate(await query(ISSUE_UPDATE, { id: ref.id, input: update }, signal));
+          if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
+          if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
+          if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
+          if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+          return `${updated.identifier}: ${changed.join("; ")}.`;
         } catch (error) {
           return toolError(error);
         }
@@ -496,23 +563,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
           const assignee = input.assignee?.trim() ?? "";
           if (assignee !== "") {
-            if (assignee.toLowerCase() === "me") {
-              create.assigneeId = parseViewer(await query(VIEWER_QUERY, undefined, signal)).user.id;
-            } else {
-              const users = parseUsers(await query(USERS_QUERY, { who: assignee }, signal)).filter((u) => u.active);
-              const exact = users.filter((u) => u.name.toLowerCase() === assignee.toLowerCase() || u.email?.toLowerCase() === assignee.toLowerCase());
-              const chosen = exact.length === 1 ? exact[0] : users.length === 1 ? users[0] : null;
-              if (chosen === null) {
-                return toolError(
-                  new Error(
-                    users.length === 0
-                      ? `No Linear user matches ${JSON.stringify(assignee)}.`
-                      : `${JSON.stringify(assignee)} matches several Linear users: ${users.map((u) => (u.email === null ? u.name : `${u.name} <${u.email}>`)).join(", ")}. Give an email.`,
-                  ),
-                );
-              }
-              create.assigneeId = chosen.id;
-            }
+            const resolved = await resolveAssignee(assignee, signal);
+            if ("error" in resolved) return toolError(new Error(resolved.error));
+            create.assigneeId = resolved.id;
           }
 
           if (input.priority !== undefined) create.priority = PRIORITIES[input.priority];
@@ -543,7 +596,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }),
       async execute({ query: document, variables }, { signal }) {
         if (!isReadOnlyDocument(document)) {
-          return toolError(new Error("linear_query runs queries only. Use linear_create_issue, linear_comment or linear_set_state to change issues."));
+          return toolError(new Error("linear_query runs queries only. Use linear_create_issue, linear_comment or linear_update_issue to change issues."));
         }
         try {
           const payload = await query(document, variables, signal);

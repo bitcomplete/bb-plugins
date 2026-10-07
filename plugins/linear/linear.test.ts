@@ -107,7 +107,10 @@ describe("parsing", () => {
   it("reads mutation results and refuses failures", () => {
     expect(parseCommentCreate({ data: { commentCreate: { success: true, comment: { url: "https://x" } } } })).toEqual({ url: "https://x" });
     expect(() => parseCommentCreate({ data: { commentCreate: { success: false } } })).toThrow(/did not create/u);
-    expect(parseIssueUpdate({ data: { issueUpdate: { success: true, issue: { identifier: "ENG-1", state: { name: "Done" } } } } })).toEqual({ identifier: "ENG-1", state: "Done" });
+    expect(parseIssueUpdate({ data: { issueUpdate: { success: true, issue: { identifier: "ENG-1", state: { name: "Done" } } } } })).toEqual({ identifier: "ENG-1", state: "Done", assignee: null, labels: [], priority: null });
+    expect(
+      parseIssueUpdate({ data: { issueUpdate: { success: true, issue: { identifier: "ENG-1", state: { name: "Todo" }, assignee: { name: "Jane Doe", displayName: "jane" }, labels: { nodes: [{ name: "Bug" }] }, priority: 2 } } } }),
+    ).toEqual({ identifier: "ENG-1", state: "Todo", assignee: "jane", labels: ["Bug"], priority: 2 });
     expect(() => parseIssueUpdate({ data: { issueUpdate: { success: false, issue: null } } })).toThrow(/did not update/u);
   });
 });
