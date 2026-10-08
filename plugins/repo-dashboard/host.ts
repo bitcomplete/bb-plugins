@@ -8,7 +8,7 @@ const QUERY = `query($searchQuery: String!, $cursor: String) {
   search(query: $searchQuery, type: ISSUE, first: 100, after: $cursor) {
     issueCount pageInfo { hasNextPage endCursor }
     nodes { __typename ... on PullRequest {
-      number title url createdAt mergedAt closedAt
+      number title url createdAt mergedAt closedAt additions deletions changedFiles
       author { __typename login }
       repository { nameWithOwner }
       reviews(first: 100) { pageInfo { hasNextPage } nodes { id submittedAt state author { __typename login } } }
@@ -19,7 +19,7 @@ const SNAPSHOT_QUERY = `query($searchQuery: String!, $cursor: String) {
   search(query: $searchQuery, type: ISSUE, first: 100, after: $cursor) {
     issueCount pageInfo { hasNextPage endCursor }
     nodes { __typename ... on PullRequest {
-      number title url createdAt mergedAt closedAt isDraft
+      number title url createdAt mergedAt closedAt additions deletions changedFiles isDraft
       author { __typename login }
       repository { nameWithOwner }
     } }

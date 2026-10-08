@@ -4,6 +4,8 @@ import { dailyCounts, etDate, eventsOnEtDay, flowScore, inProgressAgeDays, inPro
 import { type Event, type InProgress, type Result, type SnapshotResult, type rpcContract } from "./contract.js";
 import { ReviewConnections } from "./ConnectionsPanel.js";
 import { Postcard } from "./PostcardPanel.js";
+import { PrSize, SizeTag } from "./SizePanel.js";
+import { formatLines, reviewLoad, type ReviewLoad } from "./size.js";
 
 type Org = "parsleyhealth" | "bitcomplete" | "ira-cscc";
 type Metric = Event["metric"];
@@ -20,6 +22,7 @@ const columns: { id: Metric; label: string; help: string }[] = [
 ];
 const inProgressHelp = "PRs authored by the contributor, created within the 90 days before the snapshot, and open at the end of the selected week, including drafts. The current week shows PRs open when the data was fetched.";
 const flowHelp = "Opened + 2 × merged + 0.5 × distinct PRs reviewed − 0.25 × any increase in 90-day in-progress PRs from the previous week. Requires the previous-week snapshot.";
+const reviewLoadHelp = "Lines changed (additions + deletions) across the distinct PRs the contributor reviewed during the week, at each PR's current size. Each PR counts once per reviewer.";
 const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const CACHE_TTL_MS = 24 * 60 * 60_000;
 const resultCache = new Map<string, { at: number; result: Extract<Result, { ok: true }> }>();
@@ -93,7 +96,13 @@ function AgeStrip({ items, week, fetchedAt, current }: { items: InProgress[]; we
     })}</div>
   </details>;
 }
-function Contributor({ login, events, inProgress, previousInProgress, week, dailyScaleMax, activeDay, selectedDay }: { login: string; events: Event[]; inProgress: InProgress[]; previousInProgress?: number; week: string; dailyScaleMax: number; activeDay: number | null; selectedDay: number | null }) {
+function ReviewLoadCell({ load }: { load?: ReviewLoad }) {
+  if (!load) return <span className="text-center font-mono text-sm text-muted-foreground/50">·</span>;
+  if (load.known === 0) return <span className="text-center font-mono text-sm text-muted-foreground" title="Refresh to load PR sizes.">—</span>;
+  const partial = load.known < load.prs ? ` Size data covers ${load.known} of ${load.prs} PRs; refresh to fill it.` : "";
+  return <span className="text-center font-mono text-sm tabular-nums" title={`${load.lines.toLocaleString("en-US")} lines across ${load.files} files in ${load.prs} reviewed ${load.prs === 1 ? "PR" : "PRs"}.${partial}`}>{formatLines(load.lines)}{partial && "*"}</span>;
+}
+function Contributor({ login, events, inProgress, previousInProgress, load, week, dailyScaleMax, activeDay, selectedDay }: { login: string; events: Event[]; inProgress: InProgress[]; previousInProgress?: number; load?: ReviewLoad; week: string; dailyScaleMax: number; activeDay: number | null; selectedDay: number | null }) {
   const counts = [events.filter((event) => event.metric === "opened").length, inProgress.length,
     ...columns.slice(1).map(({ id }) => events.filter((event) => event.metric === id).length)];
   const [open, setOpen] = useState(false);
@@ -114,21 +123,22 @@ function Contributor({ login, events, inProgress, previousInProgress, week, dail
   }, [detailEvents, inProgress, selectedDay]);
   return (
     <div className="border-b border-border/60 last:border-0">
-      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="grid w-full grid-cols-[minmax(12rem,1fr)_repeat(5,5.5rem)_4.5rem_6rem] items-center gap-2 px-4 py-2.5 text-left hover:bg-foreground/[0.04] focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring">
+      <button type="button" aria-expanded={open} onClick={() => setOpen(!open)} className="grid w-full grid-cols-[minmax(12rem,1fr)_repeat(5,5.5rem)_4.5rem_5.5rem_6rem] items-center gap-2 px-4 py-2.5 text-left hover:bg-foreground/[0.04] focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring">
         <span className="min-w-0 truncate font-medium text-foreground"><span className="mr-2 text-muted-foreground">{open ? "▾" : "▸"}</span>{login}</span>
         {counts.map((count, index) => <span key={index} className={`flex items-center justify-center gap-1 font-mono text-sm tabular-nums ${count ? "text-foreground" : "text-muted-foreground/50"}`}><span>{count || "·"}</span>{index === 1 && previousInProgress !== undefined && <Trend current={count} previous={previousInProgress} label={`${login} 90-day in-progress trend`} />}</span>)}
         <span className="text-center font-mono text-sm tabular-nums" title={previousInProgress === undefined ? "Flow requires the previous-week in-progress snapshot." : flowHelp}>{previousInProgress === undefined ? "—" : flowScore(events, inProgress.length, previousInProgress).toFixed(1)}</span>
+        <ReviewLoadCell load={load} />
         <DayBars counts={dailyCounts(events, week)} label={`${login} daily PR activity`} compact scaleMax={dailyScaleMax} activeDay={activeDay} />
       </button>
       {open && <div className="bg-foreground/[0.025] px-6 pb-3 pt-1">
         {repos.map(([repo, group]) => <details key={repo} className="border-b border-border/50 py-2 last:border-0">
           <summary className="cursor-pointer text-xs text-foreground marker:text-muted-foreground"><span className="ml-1 font-medium">{repo}</span><span className="ml-3 font-mono tabular-nums text-muted-foreground">{[{ label: "In progress", count: group.inProgress.length }, ...columns.map(({ id, label }) => ({ label, count: group.events.filter((event) => event.metric === id).length }))].filter(({ count }) => count > 0).map(({ label, count }) => `${label} ${count}`).join(" · ")}</span></summary>
           <div className="pl-5 pt-2">
-            {group.inProgress.length > 0 && <section className="mb-2"><h3 className="text-[11px] font-medium text-muted-foreground">In progress</h3><ul>{group.inProgress.map((item) => <li key={item.url} className="flex min-w-0 items-baseline gap-2 text-xs leading-5"><span className="w-12 shrink-0 font-mono text-muted-foreground">{etDate(new Date(item.createdAt)).slice(5)}</span><UrlLink href={item.url} className="min-w-0 truncate text-foreground underline-offset-2 hover:underline" title={item.title}>#{item.number} · {item.title}</UrlLink>{item.isDraft && <span className="shrink-0 text-muted-foreground">Draft</span>}</li>)}</ul></section>}
+            {group.inProgress.length > 0 && <section className="mb-2"><h3 className="text-[11px] font-medium text-muted-foreground">In progress</h3><ul>{group.inProgress.map((item) => <li key={item.url} className="flex min-w-0 items-baseline gap-2 text-xs leading-5"><span className="w-12 shrink-0 font-mono text-muted-foreground">{etDate(new Date(item.createdAt)).slice(5)}</span><UrlLink href={item.url} className="min-w-0 truncate text-foreground underline-offset-2 hover:underline" title={item.title}>#{item.number} · {item.title}</UrlLink>{item.isDraft && <span className="shrink-0 text-muted-foreground">Draft</span>}<SizeTag item={item} /></li>)}</ul></section>}
             {columns.map(({ id, label }) => {
             const matches = group.events.filter((event) => event.metric === id);
             if (!matches.length) return null;
-            return <section key={id} className="mb-2"><h3 className="text-[11px] font-medium text-muted-foreground">{label}</h3><ul>{matches.map((event) => <li key={event.id} className="flex min-w-0 items-baseline gap-2 text-xs leading-5"><span className="w-12 shrink-0 font-mono text-muted-foreground">{etDate(new Date(event.at)).slice(5)}</span><UrlLink href={event.url} className="min-w-0 truncate text-foreground underline-offset-2 hover:underline" title={event.title}>#{event.number} · {event.title}</UrlLink></li>)}</ul></section>;
+            return <section key={id} className="mb-2"><h3 className="text-[11px] font-medium text-muted-foreground">{label}</h3><ul>{matches.map((event) => <li key={event.id} className="flex min-w-0 items-baseline gap-2 text-xs leading-5"><span className="w-12 shrink-0 font-mono text-muted-foreground">{etDate(new Date(event.at)).slice(5)}</span><UrlLink href={event.url} className="min-w-0 truncate text-foreground underline-offset-2 hover:underline" title={event.title}>#{event.number} · {event.title}</UrlLink><SizeTag item={event} /></li>)}</ul></section>;
           })}</div>
         </details>)}
       </div>}
@@ -218,6 +228,7 @@ function Dashboard() {
     }
     return [...groups].sort((a, b) => b[1].events.length + b[1].inProgress.length - a[1].events.length - a[1].inProgress.length || a[0].localeCompare(b[0]));
   }, [stateForSelection]);
+  const loads = useMemo(() => stateForSelection?.ok ? reviewLoad(stateForSelection.events) : new Map<string, ReviewLoad>(), [stateForSelection]);
   const dailyScaleMax = useMemo(() => Math.max(1, ...contributors.map(([, group]) => Math.max(...dailyCounts(group.events, week)))), [contributors, week]);
   const activeDay = hoveredDay ?? selectedDay;
   const visibleContributors = selectedDay === null ? contributors : contributors.filter(([, group]) => eventsOnEtDay(group.events, week, selectedDay).length > 0);
@@ -246,14 +257,15 @@ function Dashboard() {
         <section aria-label="Organization activity by day" className="mb-3 flex flex-wrap items-center gap-x-10 gap-y-2 border-y border-border py-3"><div className="min-w-36"><h2 className="text-xs font-medium text-foreground">Activity by day</h2><p className="mt-1 font-mono text-xl tabular-nums text-foreground">{stateForSelection.events.length}<span className="ml-2 text-[11px] font-normal text-muted-foreground">activities</span></p></div><DayBars counts={dailyCounts(stateForSelection.events, week)} label="Organization daily PR activity" activeDay={activeDay} selectedDay={selectedDay} onSelect={(day) => setSelectedDay(selectedDay === day ? null : day)} onHover={setHoveredDay} /><div className="min-w-44"><h2 className="text-xs font-medium text-foreground">90-day in-progress trend</h2><p className="mt-1 flex items-baseline gap-3"><span className="font-mono text-xl tabular-nums">{stateForSelection.inProgress.length}</span>{previous ? <Trend current={stateForSelection.inProgress.length} previous={previous.length} label="Organization 90-day in-progress trend" /> : <span className="text-xs text-muted-foreground" title={priorState?.result.ok === false ? priorState.result.error : "Loading previous-week snapshot"}>—</span>}</p><p className="text-[11px] text-muted-foreground">{isCurrent ? "Fetch-time snapshot" : "Week-end snapshot"} · change from previous week</p></div></section>
         <p className="mb-3 text-xs text-muted-foreground">{weekNote(stateForSelection.events, week, isCurrent, stateForSelection.inProgress.length, previous?.length)}</p>
         <AgeStrip items={stateForSelection.inProgress} week={week} fetchedAt={stateForSelection.fetchedAt} current={isCurrent} />
+        <PrSize events={stateForSelection.events} inProgress={stateForSelection.inProgress} />
         <ReviewConnections events={stateForSelection.events} week={week} />
         {selectedDay !== null && <p className="mb-3 flex items-center gap-3 text-xs"><span className="font-medium">{["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][selectedDay]} details · counts remain weekly</span><button type="button" onClick={() => setSelectedDay(null)} className="rounded border border-border px-2 py-0.5 text-muted-foreground hover:bg-muted hover:text-foreground">Clear day</button></p>}
         {priorState?.key === cacheKey(org, shift(week, -1)) && !priorState.result.ok && <p role="status" className="mb-3 text-xs text-muted-foreground">Previous-week in-progress snapshot unavailable: {priorState.result.error} Flow scores require this snapshot.</p>}
-        <div className="overflow-x-auto border-y border-border"><div className="min-w-[888px]">
-          <div className="grid grid-cols-[minmax(12rem,1fr)_repeat(5,5.5rem)_4.5rem_6rem] gap-2 border-b border-border bg-muted/40 px-4 py-2.5 text-xs font-medium text-muted-foreground"><span>Contributor</span><span className="text-center" title={columns[0].help}>Opened</span><span className="text-center" title={inProgressHelp}>In progress</span>{columns.slice(1).map((column) => <span key={column.id} className="text-center" title={column.help}>{column.label}</span>)}<span className="text-center" title={flowHelp}>Flow</span><span className="text-center" title="Daily PR activity uses the same scale across all contributors.">Mon–Sun</span></div>
-          {visibleContributors.length ? visibleContributors.map(([login, group]) => <Contributor key={login} login={login} events={group.events} inProgress={group.inProgress} previousInProgress={previousByLogin?.get(login) ?? (previousByLogin ? 0 : undefined)} week={week} dailyScaleMax={dailyScaleMax} activeDay={activeDay} selectedDay={selectedDay} />) : <p className="px-4 py-8 text-sm text-muted-foreground">{selectedDay === null ? "No activity found for this week." : "No PR activity on this day."}</p>}
+        <div className="overflow-x-auto border-y border-border"><div className="min-w-[984px]">
+          <div className="grid grid-cols-[minmax(12rem,1fr)_repeat(5,5.5rem)_4.5rem_5.5rem_6rem] gap-2 border-b border-border bg-muted/40 px-4 py-2.5 text-xs font-medium text-muted-foreground"><span>Contributor</span><span className="text-center" title={columns[0].help}>Opened</span><span className="text-center" title={inProgressHelp}>In progress</span>{columns.slice(1).map((column) => <span key={column.id} className="text-center" title={column.help}>{column.label}</span>)}<span className="text-center" title={flowHelp}>Flow</span><span className="text-center" title={reviewLoadHelp}>Lines reviewed</span><span className="text-center" title="Daily PR activity uses the same scale across all contributors.">Mon–Sun</span></div>
+          {visibleContributors.length ? visibleContributors.map(([login, group]) => <Contributor key={login} login={login} events={group.events} inProgress={group.inProgress} previousInProgress={previousByLogin?.get(login) ?? (previousByLogin ? 0 : undefined)} load={loads.get(login)} week={week} dailyScaleMax={dailyScaleMax} activeDay={activeDay} selectedDay={selectedDay} />) : <p className="px-4 py-8 text-sm text-muted-foreground">{selectedDay === null ? "No activity found for this week." : "No PR activity on this day."}</p>}
         </div></div>
-        <div className="mt-4 grid gap-2 text-xs leading-5 text-muted-foreground sm:grid-cols-2"><p><strong className="text-foreground">In progress:</strong> {inProgressHelp} The 90-day in-progress trend compares two rolling snapshots, so PRs can leave the window without being completed.</p>{columns.map((column) => <p key={column.id}><strong className="text-foreground">{column.label}:</strong> {column.help}</p>)}<p><strong className="text-foreground">Flow:</strong> {flowHelp}</p></div>
+        <div className="mt-4 grid gap-2 text-xs leading-5 text-muted-foreground sm:grid-cols-2"><p><strong className="text-foreground">In progress:</strong> {inProgressHelp} The 90-day in-progress trend compares two rolling snapshots, so PRs can leave the window without being completed.</p>{columns.map((column) => <p key={column.id}><strong className="text-foreground">{column.label}:</strong> {column.help}</p>)}<p><strong className="text-foreground">Flow:</strong> {flowHelp}</p><p><strong className="text-foreground">Lines reviewed:</strong> {reviewLoadHelp}</p></div>
         <p className="mt-4 text-[11px] text-muted-foreground">{contributors.length} contributors · {stateForSelection.events.length} activities · Updated {fetchedAtFormatter.format(new Date(stateForSelection.fetchedAt))}</p>
         <Postcard key={key} org={org} orgLabel={orgs.find((choice) => choice.id === org)!.label} week={week} fetchedAt={stateForSelection.fetchedAt} current={isCurrent} events={stateForSelection.events} inProgress={stateForSelection.inProgress.length} previousInProgress={previous?.length} inProgressItems={stateForSelection.inProgress} previousInProgressItems={previous} />
       </> : null}

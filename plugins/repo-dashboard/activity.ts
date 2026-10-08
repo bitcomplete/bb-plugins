@@ -9,6 +9,8 @@ const pr = z.object({
   __typename: z.literal("PullRequest"), number: z.number().int().positive(), title: z.string().max(300),
   url: z.string().url().max(500), createdAt: z.string(), mergedAt: z.string().nullable(), closedAt: z.string().nullable(),
   author: login, repository: z.object({ nameWithOwner: z.string().max(200) }),
+  additions: z.number().int().nonnegative().optional(), deletions: z.number().int().nonnegative().optional(),
+  changedFiles: z.number().int().nonnegative().optional(),
   reviews: z.object({ nodes: z.array(review), pageInfo: z.object({ hasNextPage: z.boolean() }) }),
 });
 export const searchResponse = z.object({
@@ -94,6 +96,10 @@ export function flowScore(events: Event[], currentInProgress: number, previousIn
 export function inProgressChange(current: number, previous: number): { delta: number; percent: number | null } {
   return { delta: current - previous, percent: previous === 0 ? null : (current - previous) / previous * 100 };
 }
+function size(item: { additions?: number; deletions?: number; changedFiles?: number }) {
+  return item.additions === undefined || item.deletions === undefined || item.changedFiles === undefined ? {}
+    : { additions: item.additions, deletions: item.deletions, changedFiles: item.changedFiles };
+}
 function human(author: z.infer<typeof login>): string | null {
   if (!author || author.__typename === "Bot" || /\[bot\]$/iu.test(author.login) || author.login.toLowerCase() === "parsleybot") return null;
   return author.login;
@@ -119,7 +125,7 @@ export function eventsFromSearch(search: Search, metric: Metric, week: string): 
         if (!reviewer || !within(one.submittedAt) || one.state === "PENDING") continue;
         events.push({ id: `review:${reviewer}:${item.url}`, metric, login: reviewer, repo: item.repository.nameWithOwner,
           number: item.number, title: item.title, url: item.url, at: one.submittedAt, firstReviewedAt: one.submittedAt,
-          ...(authorLogin ? { authorLogin } : {}) });
+          ...(authorLogin ? { authorLogin } : {}), ...size(item) });
       }
       continue;
     }
@@ -127,7 +133,7 @@ export function eventsFromSearch(search: Search, metric: Metric, week: string): 
     const at = metric === "opened" ? item.createdAt : metric === "merged" ? item.mergedAt : item.mergedAt === null ? item.closedAt : null;
     if (!author || !within(at)) continue;
     events.push({ id: `${metric}:${item.url}`, metric, login: author, repo: item.repository.nameWithOwner,
-      number: item.number, title: item.title, url: item.url, at });
+      number: item.number, title: item.title, url: item.url, at, ...size(item) });
   }
   return events;
 }
@@ -176,7 +182,7 @@ export function inProgressFromSearch(search: Search, cutoff: Date, openNow = fal
     if (!author || !Number.isFinite(createdAtMs) || createdAtMs < createdAfterMs || createdAtMs >= cutoffMs ||
         (!openNow && item.closedAt !== null && !(Date.parse(item.closedAt) >= cutoffMs))) return [];
     return [{ login: author, repo: item.repository.nameWithOwner, number: item.number,
-      title: item.title, url: item.url, createdAt: item.createdAt, isDraft: item.isDraft }];
+      title: item.title, url: item.url, createdAt: item.createdAt, isDraft: item.isDraft, ...size(item) }];
   });
 }
 

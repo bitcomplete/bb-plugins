@@ -6,19 +6,24 @@ export const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u);
 export const inputSchema = z.object({ org: orgSchema, week: dateSchema, refresh: z.boolean().default(false) }).strict();
 export const cachedInputSchema = z.object({ org: orgSchema, week: dateSchema }).strict();
 export const metricSchema = z.enum(["opened", "merged", "reviewed", "closed"]);
+// Size is the PR's state at fetch time. Older cached entries lack it until a refresh.
+const sizeFields = {
+  additions: z.number().int().nonnegative().optional(), deletions: z.number().int().nonnegative().optional(),
+  changedFiles: z.number().int().nonnegative().optional(),
+};
 export const eventSchema = z.object({
   id: z.string().max(300), metric: metricSchema, login: z.string().max(100),
   repo: z.string().max(200), number: z.number().int().positive(), title: z.string().max(300),
   url: z.string().url().max(500), at: z.string().datetime(),
   // Retain existing cached metadata and record the first review within the selected week.
   createdAt: z.string().datetime().optional(), authorLogin: z.string().max(100).optional(),
-  firstReviewedAt: z.string().datetime().optional(),
+  firstReviewedAt: z.string().datetime().optional(), ...sizeFields,
 }).strict();
 export type Event = z.infer<typeof eventSchema>;
 export const inProgressSchema = z.object({
   login: z.string().max(100), repo: z.string().max(200), number: z.number().int().positive(),
   title: z.string().max(300), url: z.string().url().max(500), createdAt: z.string().datetime(),
-  isDraft: z.boolean(),
+  isDraft: z.boolean(), ...sizeFields,
 }).strict();
 export type InProgress = z.infer<typeof inProgressSchema>;
 export const resultSchema = z.discriminatedUnion("ok", [

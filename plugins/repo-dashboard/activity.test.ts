@@ -94,6 +94,16 @@ describe("event attribution", () => {
     expect(reviewed).not.toHaveProperty("authorLogin");
     expect(eventSchema.parse({ ...reviewed, createdAt: item.createdAt, firstReviewedAt: reviewed?.at })).toMatchObject({ createdAt: item.createdAt, firstReviewedAt: reviewed?.at });
   });
+  it("carries PR size onto activity events and in-progress items, and omits partial size data", () => {
+    const sized = pr({ mergedAt: "2026-09-30T12:00:00Z", additions: 120, deletions: 30, changedFiles: 4,
+      reviews: { pageInfo: { hasNextPage: false }, nodes: [{ id: "r1", submittedAt: "2026-09-30T13:00:00Z", state: "APPROVED", author: { __typename: "User", login: "bob" } }] } });
+    for (const metric of ["opened", "merged", "reviewed"] as const) {
+      expect(eventsFromSearch(search([sized]), metric, week)[0]).toMatchObject({ additions: 120, deletions: 30, changedFiles: 4 });
+    }
+    expect(eventsFromSearch(search([pr({ additions: 120 })]), "opened", week)[0]).not.toHaveProperty("additions");
+    const [item] = inProgressFromSearch(search([snapshot({ additions: 5, deletions: 1, changedFiles: 1 })]), new Date("2026-10-05T04:00:00Z"));
+    expect(item).toMatchObject({ additions: 5, deletions: 1, changedFiles: 1 });
+  });
   it("credits authored opens, merges, and unmerged closes separately", () => {
     const item = pr({ mergedAt: "2026-09-30T12:00:00Z", closedAt: "2026-09-30T12:00:00Z" });
     expect(eventsFromSearch(search([item]), "opened", week)).toHaveLength(1);
