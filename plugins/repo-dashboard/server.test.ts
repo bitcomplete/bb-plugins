@@ -70,6 +70,26 @@ describe("repo dashboard activity cache", () => {
   });
 
 
+  it("runs gh on a connected machine when the server has no primary host", async () => {
+    const hostIds: (string | undefined)[] = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "repo-dashboard",
+      sdk: {
+        system: { config: async () => ({ primaryHostId: null }) as never },
+        hosts: { list: async () => [{ id: "host-offline", status: "disconnected" }, { id: "host-devbox", status: "connected" }] as never },
+      },
+      experimental_callHostRpc: ({ input, hostId }) => {
+        hostIds.push(hostId);
+        const { org, week } = input as { org: string; week: string };
+        return { ok: true, org, week, fetchedAt: new Date().toISOString(), events: [], inProgress: [] };
+      },
+    });
+    await plugin(bb);
+    expect(await harness.callRpc("activity_get", { org: "bitcomplete", week: "2026-09-28", refresh: false })).toMatchObject({ ok: true });
+    expect(hostIds).toEqual(["host-devbox"]);
+    await harness.lifecycle.dispose();
+  });
+
   it("reads only matching, unexpired activity cache entries without calling the host", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-10-06T12:00:00Z"));

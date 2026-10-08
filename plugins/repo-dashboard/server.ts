@@ -17,6 +17,12 @@ export default function plugin(bb: BbPluginApi) {
   const writeCache = db.prepare("INSERT INTO activity_cache_v1 (key, expires_at, result) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET expires_at = excluded.expires_at, result = excluded.result");
   const readSnapshot = db.prepare("SELECT expires_at, result FROM in_progress_cache_v1 WHERE key = ?");
   const writeSnapshot = db.prepare("INSERT INTO in_progress_cache_v1 (key, expires_at, result) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET expires_at = excluded.expires_at, result = excluded.result");
+  // Servers without a primary host (a bb-gate) run gh on a connected machine, which receives the server's GitHub login.
+  const ghHostId = async (): Promise<string | null> => {
+    const { primaryHostId } = await bb.sdk.system.config();
+    if (primaryHostId !== null) return primaryHostId;
+    return (await bb.sdk.hosts.list()).find((machine) => machine.status === "connected")?.id ?? null;
+  };
   const pending = new Map<string, Promise<Result>>();
   const pendingSnapshots = new Map<string, Promise<SnapshotResult>>();
   const readCachedSnapshot = (org: string, week: string): SnapshotResult | null => {
@@ -62,8 +68,8 @@ export default function plugin(bb: BbPluginApi) {
       if (inFlight) return inFlight;
       const work = (async (): Promise<Result> => {
         try {
-          const hostId = (await bb.sdk.system.config()).primaryHostId;
-          if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh." };
+          const hostId = await ghHostId();
+          if (hostId === null) return { ok: false, error: "No connected BB machine is available to run gh." };
           const result = await host.call("activity", { org, week, refresh }, { hostId, timeoutMs: TIMEOUT_MS });
           if (result.ok) {
             const now = Date.now();
@@ -102,8 +108,8 @@ export default function plugin(bb: BbPluginApi) {
       if (inFlight) return inFlight;
       const work = (async (): Promise<SnapshotResult> => {
         try {
-          const hostId = (await bb.sdk.system.config()).primaryHostId;
-          if (hostId === null) return { ok: false, error: "No primary BB host is available to run gh." };
+          const hostId = await ghHostId();
+          if (hostId === null) return { ok: false, error: "No connected BB machine is available to run gh." };
           const result = await host.call("in_progress", { org, week, refresh }, { hostId, timeoutMs: TIMEOUT_MS });
           if (result.ok) {
             const now = Date.now();
