@@ -12,6 +12,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [diff-explorer](plugins/diff-explorer) | Scrollable diff of every changed file, with ⌘-click go to definition and Ctrl+- to go back |
 | [team-setup](plugins/team-setup) | First-run checklist for a bb-gate server: sign in to Claude or Codex, GitHub (headless `gh auth login`), devbox and Linear, make a machine |
 | [linear](plugins/linear) | Connect Linear once with OAuth; threads then read, search, comment on and move issues through native tools, as you |
+| [repo-dashboard](plugins/repo-dashboard) | Shows weekly pull request activity by contributor for Parsley Health, Bit Complete, and Cscc |
 
 Install one:
 
