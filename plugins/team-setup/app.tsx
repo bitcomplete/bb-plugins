@@ -1,7 +1,8 @@
-// The checklist, on the home page until every step is done and always under
-// Settings → Plugins → Team setup. Each row reads one step's state from the
-// server and starts that step's flow; the plugins that own the steps finish
-// them.
+// The checklist, under Settings → Plugins → Team setup. The home page carries
+// only a one-line summary of it: a pointer to the settings page while steps
+// remain, and what is set up once none do. Each row reads one step's state
+// from the server and starts that step's flow; the plugins that own the steps
+// finish them.
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -56,6 +57,28 @@ function StepMark({ state }: { state: StepState }) {
   const name = state === "done" ? "CircleCheck" : "Circle";
   const tone = state === "done" ? "text-success" : state === "todo" ? "text-muted-foreground" : "text-muted-foreground/60";
   return <Icon name={name} className={`mt-0.5 size-4 shrink-0 ${tone}`} aria-label={state} />;
+}
+
+const STEP_TITLES: Record<keyof Status["steps"], string> = {
+  ai: "Claude or Codex",
+  github: "GitHub",
+  devbox: "devbox",
+  linear: "Linear",
+  machine: "a machine",
+};
+
+/** The home-page line while steps remain: an icon to draw the eye, what is left, and the way to the checklist. */
+function Remaining({ steps }: { steps: Status["steps"] }) {
+  const left = (Object.keys(steps) as (keyof Status["steps"])[]).filter((k) => steps[k] === "todo").map((k) => STEP_TITLES[k]);
+  return (
+    <p className="flex items-start gap-2 text-sm">
+      <Icon name="CircleAlert" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="setup incomplete" />
+      <span>
+        {left.length === 1 ? "One step left" : `${left.length} steps left`} before agents can work here: {left.join(", ")}.{" "}
+        <SettingsLink pluginId="team-setup">Finish setup</SettingsLink>
+      </span>
+    </p>
+  );
 }
 
 function Step({
@@ -213,7 +236,9 @@ function Checklist({ compact }: { compact: boolean }) {
 
   const { ai, github, devbox, linear, machines, steps } = status;
 
-  if (compact && complete) {
+  if (compact && !complete) return <Remaining steps={steps} />;
+
+  if (compact) {
     const aiLabel = ai.accounts
       .filter((a) => a.enabled && ai.routing[a.provider])
       .map((a) => a.label)
@@ -419,7 +444,7 @@ function Checklist({ compact }: { compact: boolean }) {
 
         <Step
           state={steps.linear}
-          title="Linear"
+          title="Linear (optional)"
           action={
             linear.available && linear.configured && !linear.connected ? (
               <Button size="sm" disabled={busy !== null} onClick={() => void run("linear", async () => {
@@ -443,7 +468,10 @@ function Checklist({ compact }: { compact: boolean }) {
               Connected{linear.user !== null ? ` as ${linear.user}` : ""}{linear.organization !== null ? ` in ${linear.organization}` : ""}. Threads read and update issues as you.
             </p>
           ) : (
-            <p>Connect your Linear account so threads can read and update issues as you. You approve it on Linear, which sends you back here.</p>
+            <p>
+              Connect your Linear account so threads can read and update issues as you. You approve it on Linear, which sends you back
+              here. Skip it if you do not use Linear.
+            </p>
           )}
         </Step>
 

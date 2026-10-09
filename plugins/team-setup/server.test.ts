@@ -118,7 +118,7 @@ describe("status", () => {
   it("starts with everything to do", async () => {
     const { status } = await setup();
     const s = await status();
-    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "todo", machine: "todo" });
+    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", machine: "todo" });
     expect(s.complete).toBe(false);
     expect(s.github.login).toBeNull();
   });
@@ -161,6 +161,20 @@ describe("status", () => {
     expect(s.devbox.available).toBe(false);
     expect(s.devbox.message).toContain("turned off");
     expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", machine: "done" });
+    expect(s.complete).toBe(true);
+  });
+
+  it("treats Linear as optional: not connecting it does not block completion", async () => {
+    const { status } = await setup({
+      builtInGit: { status: "logged in", statusMessage: "ok" },
+      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
+      devbox: { connected: true, project: "dylan" },
+      hosts: [{ name: "box" }],
+      runs: signedIn,
+    });
+    const s = await status();
+    expect(s.steps.linear).toBe("optional");
+    expect(s.linear).toMatchObject({ available: true, configured: true, connected: false });
     expect(s.complete).toBe(true);
   });
 

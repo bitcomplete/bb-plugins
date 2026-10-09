@@ -1,15 +1,17 @@
 # Team setup
 
 The first-run checklist for a bb server behind
-[bb-gate](https://github.com/bitcomplete/bb-gate). It sits on the home page
-until every step is done, and under Settings → Plugins → Team setup always.
+[bb-gate](https://github.com/bitcomplete/bb-gate). It lives under Settings →
+Plugins → Team setup. The home page carries a one-line summary of it: while
+steps remain, a warning icon, what is left and a link to the checklist; once
+none do, what is set up. The full checklist never renders on the home page.
 
 | Step | Owned by | Done when | What the button does |
 |---|---|---|---|
 | Claude or Codex | Account Pool | An enabled account exists and routing for its provider is on | Starts Account Pool's sign-in: claude.ai with a code to paste back, or ChatGPT's device code, polled from here. |
 | GitHub | gh on the server host, read by bb core | The built-in GitHub row in Environment variables is "logged in" (or overridden by your own `GH_TOKEN`) | Runs `gh auth login --web` on the server, shows the device code, waits for GitHub to approve it. |
 | devbox | devbox-provider | Connected | Starts devbox-provider's connect; its callback finishes it. |
-| Linear | linear | Connected (unavailable until the server has an OAuth client ID) | Starts the linear plugin's connect; its callback finishes it. |
+| Linear | linear | Connected. Optional: a server without it is still complete (unavailable until the server has an OAuth client ID) | Starts the linear plugin's connect; its callback finishes it. |
 | A machine | bb | Any machine exists | Links to Devbox machines. |
 
 The GitHub step is the point. bb core forwards the server host's gh login to

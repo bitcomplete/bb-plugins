@@ -50,7 +50,9 @@ const PROMPT_TIMEOUT_MS = 20_000;
 const GH_TIMEOUT_MS = 15_000;
 const IDENTITY_TTL_MS = 60_000;
 
-const stepStateSchema = z.enum(["done", "todo", "unavailable"]);
+// "optional" is a step the developer may do but does not have to; like
+// "unavailable" it never blocks completion.
+const stepStateSchema = z.enum(["done", "todo", "optional", "unavailable"]);
 export type StepState = z.infer<typeof stepStateSchema>;
 
 const providerSchema = z.enum(["claude", "codex"]);
@@ -444,8 +446,9 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
                 : "todo",
           devbox: !devbox.available ? "unavailable" : devbox.connected ? "done" : "todo",
           // A server whose operator has not set up the OAuth application
-          // cannot connect, and that is not the developer's to-do.
-          linear: !linear.available || !linear.configured ? "unavailable" : linear.connected ? "done" : "todo",
+          // cannot connect, and that is not the developer's to-do. Even when
+          // it can, Linear is optional: not connecting it is not incomplete.
+          linear: !linear.available || !linear.configured ? "unavailable" : linear.connected ? "done" : "optional",
           machine: hosts.length > 0 ? "done" : "todo",
         } as const;
         return {
