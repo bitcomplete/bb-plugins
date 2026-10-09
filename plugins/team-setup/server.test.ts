@@ -1,7 +1,7 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { GhProcess, GhResult, GhRunner } from "./gh.js";
-import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS } from "./server.js";
+import { ACCOUNT_POOL_ID, CHANGED, createTeamSetupPlugin, DEVBOX_ID, LINEAR_ID, LOGIN_TTL_MS, SEEDED_NOTE } from "./server.js";
 
 // A gh whose `auth login` the test drives: print lines, then exit.
 function fakeGh(runs: Record<string, GhResult> = {}) {
@@ -47,6 +47,8 @@ interface World {
   hosts?: Array<{ name: string }>;
   runs?: Record<string, GhResult>;
   settings?: Record<string, string>;
+  env?: Record<string, string | undefined>;
+  setVariable?: (input: { name: string; value: string; note: string | null }) => Promise<unknown>;
 }
 
 async function setup(world: World = {}) {
@@ -60,6 +62,12 @@ async function setup(world: World = {}) {
     variables: [],
   }));
   harness.sdk.stub("hosts.list", async () => world.hosts ?? []);
+  const setVariables: Array<{ name: string; value: string; note: string | null }> = [];
+  harness.sdk.stub("system.setMachineEnvironmentVariable", async (input: { name: string; value: string; note: string | null }) => {
+    setVariables.push(input);
+    if (world.setVariable) await world.setVariable(input);
+    return { builtInGit: { status: "not logged in", statusMessage: "" }, variables: [{ name: input.name, note: input.note, secret: true, value: null }] };
+  });
   const rpcCalls: Array<{ pluginId: string; method: string; input: unknown }> = [];
   harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input: unknown; outputSchema: { parse: (v: unknown) => unknown } }) => {
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input: args.input });
@@ -86,9 +94,9 @@ async function setup(world: World = {}) {
     return args.outputSchema.parse(answers[key]);
   });
   let now = 1_000_000;
-  await createTeamSetupPlugin({ gh: gh.runner, now: () => now })(bb);
+  await createTeamSetupPlugin({ gh: gh.runner, now: () => now, env: world.env ?? {} })(bb);
   const status = async () => (await harness.callRpc("status", null)) as Awaited<ReturnType<typeof statusType>>;
-  return { bb, harness, gh, rpcCalls, status, advance: (ms: number) => (now += ms) };
+  return { bb, harness, gh, rpcCalls, status, setVariables, advance: (ms: number) => (now += ms) };
 }
 // Only for the inferred return type above.
 declare function statusType(): Promise<{
@@ -294,5 +302,29 @@ describe("Account Pool and devbox flows", () => {
     expect(s.ai.message).toContain("boom");
     expect(s.devbox.available).toBe(false);
     expect(s.linear.available).toBe(false);
+  });
+});
+
+describe("machine environment seeding", () => {
+  it("copies FIREWORKS_API_KEY from the server environment to every machine", async () => {
+    const { setVariables } = await setup({ env: { FIREWORKS_API_KEY: "fw-secret" } });
+    expect(setVariables).toEqual([{ name: "FIREWORKS_API_KEY", value: "fw-secret", note: SEEDED_NOTE }]);
+  });
+
+  it("sets nothing when the server has no key", async () => {
+    const { setVariables } = await setup({ env: { FIREWORKS_API_KEY: "  ", OTHER: "x" } });
+    expect(setVariables).toEqual([]);
+  });
+
+  it("still loads when the machine environment cannot be written", async () => {
+    const { status, setVariables } = await setup({
+      env: { FIREWORKS_API_KEY: "fw-secret" },
+      setVariable: async () => {
+        throw new Error("encryption key unavailable");
+      },
+    });
+    expect(setVariables).toHaveLength(1);
+    const s = await status();
+    expect(s.complete).toBe(false);
   });
 });

@@ -11,6 +11,11 @@
 //            callback.
 //   Linear   the linear plugin's connection, the same shape as devbox's.
 //   machine  Any machine at all. Created from devbox-provider's section.
+//
+// It also carries deployment-wide machine variables: a key the operator
+// puts in the server's environment (a Kubernetes Secret in bb-gate) is
+// written into Settings → Environment variables, which bb syncs into every
+// machine's daemon, where the agent CLIs that need it run.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -27,6 +32,15 @@ export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
 export const LINEAR_ID = "linear";
 export const CHANGED = "changed";
+
+// Server environment variables copied into the machine environment on every
+// start. Each is a key an agent CLI on the machine reads: Pi's built-in
+// Fireworks provider turns on when FIREWORKS_API_KEY is set, so a server
+// whose deployment supplies the key gives every developer Fireworks models
+// with nothing to configure. The server's value is the source of truth; a
+// row edited or deleted by hand comes back on the next restart.
+export const SEEDED_VARIABLES = ["FIREWORKS_API_KEY"] as const;
+export const SEEDED_NOTE = "From the server's environment (team setup). Edits are overwritten on restart.";
 
 // GitHub device codes last 15 minutes; gh gives up itself around then.
 export const LOGIN_TTL_MS = 15 * 60 * 1000;
@@ -134,6 +148,7 @@ export const SETTING_DESCRIPTORS = {
 export interface TeamSetupDeps {
   gh: GhRunner;
   now: () => number;
+  env: Record<string, string | undefined>;
 }
 
 function errorMessage(error: unknown): string {
@@ -203,6 +218,19 @@ interface Identity {
 export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
     const settings = bb.settings.define(SETTING_DESCRIPTORS);
+
+    // ---- deployment-wide machine variables ---------------------------------
+
+    for (const name of SEEDED_VARIABLES) {
+      const value = deps.env[name];
+      if (value === undefined || value.trim() === "") continue;
+      try {
+        await bb.sdk.system.setMachineEnvironmentVariable({ name, value, note: SEEDED_NOTE });
+        bb.log.info(`${name} from the server environment is set for every machine`);
+      } catch (error) {
+        bb.log.warn(`could not set ${name} for machines: ${errorMessage(error)}`);
+      }
+    }
 
     // ---- other plugins ----------------------------------------------------
 
@@ -487,4 +515,4 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
   };
 }
 
-export default createTeamSetupPlugin({ gh: createGhRunner(), now: () => Date.now() });
+export default createTeamSetupPlugin({ gh: createGhRunner(), now: () => Date.now(), env: process.env });

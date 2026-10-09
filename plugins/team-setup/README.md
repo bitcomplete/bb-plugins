@@ -27,6 +27,22 @@ Linear tokens to the linear plugin, and the GitHub token to gh's own file.
 The checklist polls only while its page is visible, every ten seconds, or
 every three while a GitHub sign-in is waiting for approval.
 
+## Deployment-wide machine variables
+
+A key an agent CLI needs is only useful on the machine where that CLI runs,
+and behind bb-gate no thread runs on the server. So on every start the
+plugin copies `FIREWORKS_API_KEY` from the server's own environment (a
+Kubernetes Secret in bb-gate's backend template) into Settings →
+Environment variables, the encrypted store bb syncs into every connected
+machine's daemon. Pi has Fireworks built in and turns it on when that
+variable is set, so a developer picks Pi and a Fireworks model and it works,
+with nothing to configure and no secret in the devbox image.
+
+The server's value is the source of truth: the row is rewritten on every
+start, so a hand edit or deletion lasts until the next restart. A server
+without the variable writes nothing. The list of seeded names is
+`SEEDED_VARIABLES` in `server.ts`.
+
 ## Server update banner
 
 bb-gate does not restart a developer's server when a new `bb-server` image
