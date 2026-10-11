@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { Hono } from "hono";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { signature, WATCH_LIMIT } from "./watch.js";
 import { createLinearPlugin, REFRESH_MARGIN_MS } from "./server.js";
 
 const APP_URL = "https://bb.example";
@@ -39,6 +40,48 @@ function fakeLinear(options: { answer?: Answer; tokens?: () => Record<string, un
   return { fetchImpl, calls };
 }
 
+const HOOKS_URL = "http://bb-gate-hooks.test:8081";
+
+// A bb-gate-hooks whose event stream a test writes to and whose subscribe answers it scripts.
+function fakeHooks() {
+  const encoder = new TextEncoder();
+  const streams: Array<{ send(text: string): void; closed: boolean }> = [];
+  const subscribes: Array<{ connection: string; source: string; token: string; watches: Array<{ kind: string; id: string }> }> = [];
+  const state = { answer: (body: (typeof subscribes)[number]): Response => Response.json({ leases: body.watches, rejected: [] }) };
+  const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const u = String(url);
+    if (u === `${HOOKS_URL}/v1/events`) {
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const entry = { closed: false, send: (text: string) => controller.enqueue(encoder.encode(text)) };
+      const body = new ReadableStream<Uint8Array>({ start: (c) => void (controller = c), cancel: () => void (entry.closed = true) });
+      const keepalive = setInterval(() => {
+        if (!entry.closed) entry.send(": keepalive\n\n");
+      }, 20_000);
+      init?.signal?.addEventListener("abort", () => {
+        entry.closed = true;
+        clearInterval(keepalive);
+      });
+      streams.push(entry);
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (u === `${HOOKS_URL}/v1/subscribe`) {
+      const body = JSON.parse(String(init?.body)) as (typeof subscribes)[number];
+      subscribes.push(body);
+      return state.answer(body);
+    }
+    return new Response("not found", { status: 404 });
+  }) as unknown as typeof fetch;
+  return {
+    fetchImpl,
+    streams,
+    subscribes,
+    state,
+    last: () => streams.at(-1)!,
+    hello: (connection: string) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds: 3600 })}\n\n`,
+    doorbell: (id: string) => `event: doorbell\ndata: ${JSON.stringify({ source: "linear", kind: "issue", id, unit: "team-1", action: "update", at: "2026-10-10T17:02:11Z" })}\n\n`,
+  };
+}
+
 const issue = (over: Record<string, unknown> = {}) => ({
   id: "uuid-1",
   identifier: "ENG-123",
@@ -52,20 +95,25 @@ const issue = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-async function setup(options: { settings?: Record<string, string>; env?: Record<string, string>; linear?: Parameters<typeof fakeLinear>[0]; expiresAt?: number } = {}) {
+async function setup(
+  options: { settings?: Record<string, string>; env?: Record<string, string>; linear?: Parameters<typeof fakeLinear>[0]; expiresAt?: number; hooks?: ReturnType<typeof fakeHooks>; sdk?: Parameters<typeof createFakePluginHost>[0] extends { sdk?: infer S } | undefined ? S : never } = {},
+) {
   const { bb, harness } = createFakePluginHost({
     pluginId: "linear",
     appUrl: APP_URL,
     settings: { clientId: "client-1", ...options.settings },
+    ...(options.sdk === undefined ? {} : { sdk: options.sdk }),
   });
   const linear = fakeLinear(options.linear);
   let now = 1_000_000_000_000;
-  await createLinearPlugin({ fetch: linear.fetchImpl, now: () => now, env: options.env ?? {} })(bb);
+  const fetchImpl = (options.hooks === undefined ? linear.fetchImpl : ((url, init) => (String(url).startsWith(HOOKS_URL) ? options.hooks!.fetchImpl(url, init) : linear.fetchImpl(url, init))) as typeof fetch);
+  await createLinearPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {} })(bb);
   if (options.expiresAt !== undefined) await bb.storage.kv.set("expiresAt", options.expiresAt);
   const route = harness.registrations.httpRoutes.find((r) => r.path === "/connect/callback")!;
   const app = new Hono().get("/cb", route.handler);
   const callback = (query: Record<string, string>) => app.request(`/cb?${new URLSearchParams(query)}`);
-  const tool = (name: string, args: Record<string, unknown>) => harness.behavior.callAgentTool(name, args) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
+  const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
+    harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
   return { bb, harness, linear, callback, route, tool, text, advance: (ms: number) => (now += ms), now: () => now };
 }
@@ -170,7 +218,7 @@ describe("tools", () => {
   it("are registered with the names the skill documents", async () => {
     const { harness } = await setup();
     const names = harness.registrations.agentTools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_update_issue"]);
+    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_update_issue", "linear_watch_issue"]);
   });
 
   it("say how to connect when there is no token", async () => {
@@ -473,5 +521,227 @@ describe("bb linear", () => {
 
     const badVars = await harness.runCli(["query", "{ viewer { id } }", "--variables", "[1]", "--json"]);
     expect(JSON.parse(badVars.stdout)).toMatchObject({ ok: false, error: { code: "invalid_variables" } });
+  });
+});
+
+describe("watching an issue", () => {
+  const comment = (body: string, createdAt: string, who = "bob") => ({ body, createdAt, url: `https://linear.app/c/${createdAt}`, user: { displayName: who } });
+
+  // The issue as Linear currently has it; tests change it and ring the doorbell.
+  function liveLinear() {
+    const state = { issue: issue({ updatedAt: "2026-10-09T10:00:00Z", comments: { nodes: [comment("old", "2026-10-09T09:00:00Z")] } }) as Record<string, unknown> | null, fail: false };
+    const answer: Answer = (body) => {
+      if (state.fail) return { errors: [{ message: "Linear is down" }] };
+      return body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier title") ? { data: { issue: state.issue } } : { data: {} };
+    };
+    return { state, answer };
+  }
+
+  async function watching(over: { hooks?: ReturnType<typeof fakeHooks>; send?: (...args: never[]) => unknown } = {}) {
+    const live = liveLinear();
+    const hooks = over.hooks ?? fakeHooks();
+    const send = vi.fn((over.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
+    const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send } } });
+    const rows = () => s.bb.storage.database().prepare("SELECT thread_id, issue_id, issue_key, updated_at, last_comment_at FROM watches ORDER BY thread_id").all() as Array<Record<string, unknown>>;
+    const sent = () => send.mock.calls.map((c) => c[0] as { threadId: string; mode: string; input: Array<{ type: string; text: string }> });
+    return { ...s, live, hooks, send, rows, sent };
+  }
+
+  it("is refused, with a reason, on a server without bb-gate-hooks, and starts no service", async () => {
+    const { tool, text, harness } = await setup({ settings: { accessToken: "at-0" }, linear: { answer: () => ({ data: { issue: issue() } }) } });
+    const result = await tool("linear_watch_issue", { key: "ENG-123" });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("BB_HOOKS_URL");
+    expect(harness.registrations.services.map((s) => s.name)).toEqual([]);
+  });
+
+  it("records a watch for the calling thread, is a no-op the second time, and stops at the limit", async () => {
+    const { tool, text, rows, harness, live } = await watching();
+    expect(harness.registrations.services.map((s) => s.name)).toEqual(["watches"]);
+    expect(text(await tool("linear_watch_issue", { key: "eng-123" }, { threadId: "thr-1", projectId: "prj-1" }))).toBe(
+      "Watching ENG-123: Fix login. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.",
+    );
+    expect(rows()).toEqual([{ thread_id: "thr-1", issue_id: "uuid-1", issue_key: "ENG-123", updated_at: "2026-10-09T10:00:00Z", last_comment_at: "2026-10-09T09:00:00Z" }]);
+    expect(text(await tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" }))).toContain("Already watching ENG-123");
+    expect(rows()).toHaveLength(1);
+
+    for (let i = 2; i <= WATCH_LIMIT; i++) {
+      live.state.issue = issue({ id: `uuid-${i}`, identifier: `ENG-${i}` });
+      expect(await tool("linear_watch_issue", { key: `ENG-${i}` }, { threadId: "thr-1", projectId: "prj-1" })).not.toMatchObject({ isError: true });
+    }
+    live.state.issue = issue({ id: "uuid-extra", identifier: "ENG-999" });
+    const full = await tool("linear_watch_issue", { key: "ENG-999" }, { threadId: "thr-1", projectId: "prj-1" });
+    expect(full).toMatchObject({ isError: true });
+    expect(text(full)).toContain(`already watches ${WATCH_LIMIT} Linear issues`);
+    // Another thread has its own budget.
+    expect(await tool("linear_watch_issue", { key: "ENG-999" }, { threadId: "thr-2", projectId: "prj-1" })).not.toMatchObject({ isError: true });
+    expect(rows()).toHaveLength(WATCH_LIMIT + 1);
+
+    live.state.issue = null;
+    expect(await tool("linear_watch_issue", { key: "ENG-404" }, { threadId: "thr-3", projectId: "prj-1" })).toMatchObject({ isError: true });
+  });
+
+  describe("the service", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+
+    it("leases the watches with the developer's token, checks on hello, and wakes the thread on a doorbell with what changed", async () => {
+      const w = await watching();
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-2", projectId: "prj-1" });
+      const service = w.harness.runService("watches");
+      await tick();
+      expect(w.hooks.streams).toHaveLength(1);
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(w.hooks.subscribes).toEqual([{ connection: "c_1", source: "linear", token: "at-0", watches: [{ kind: "issue", id: "uuid-1" }] }]);
+      // The hello sweep read the issue (by uuid) and found nothing new.
+      expect(w.linear.calls.at(-1)!.body!.variables).toEqual({ id: "uuid-1" });
+      expect(w.send).not.toHaveBeenCalled();
+
+      // Linear moves the issue; one thread comments on it; a human answers. Three doorbells, one check.
+      w.live.state.issue = issue({
+        updatedAt: "2026-10-09T12:00:00Z",
+        state: { name: "Done", type: "completed" },
+        assignee: { displayName: "jane" },
+        comments: { nodes: [comment("old", "2026-10-09T09:00:00Z"), comment(`PR opened${signature("thr-1")}`, "2026-10-09T11:00:00Z", "jane"), comment("Merged, thanks", "2026-10-09T11:30:00Z")] },
+      });
+      const reads = w.linear.calls.length;
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      w.hooks.last().send(w.hooks.doorbell("uuid-other"));
+      await tick(2999);
+      expect(w.send).not.toHaveBeenCalled();
+      await tick(1);
+      await tick();
+      expect(w.linear.calls.length - reads).toBe(1);
+      const sent = w.sent();
+      expect(sent.map((m) => [m.threadId, m.mode, m.input[0]!.type])).toEqual([
+        ["thr-1", "auto", "text"],
+        ["thr-2", "auto", "text"],
+      ]);
+      const toOwner = sent[0]!.input[0]!.text;
+      expect(toOwner).toContain("Linear issue ENG-123 changed: Fix login");
+      expect(toOwner).toContain("- State: In Progress → Done");
+      expect(toOwner).not.toContain("Assignee");
+      expect(toOwner).toContain("**bob** — 2026-10-09T11:30:00Z");
+      expect(toOwner).toContain("> Merged, thanks");
+      // thr-1 wrote the signed comment, so it is not told about it; thr-2 is.
+      expect(toOwner).not.toContain("PR opened");
+      expect(sent[1]!.input[0]!.text).toContain("PR opened");
+      expect(w.rows().map((r) => [r.updated_at, r.last_comment_at])).toEqual([
+        ["2026-10-09T12:00:00Z", "2026-10-09T11:30:00Z"],
+        ["2026-10-09T12:00:00Z", "2026-10-09T11:30:00Z"],
+      ]);
+      // Nothing is reported twice.
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      await tick(3000);
+      expect(w.send).toHaveBeenCalledTimes(2);
+      expect(w.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("at-0");
+
+      service.controller.abort();
+      await service.done;
+      expect(w.hooks.last().closed).toBe(true);
+    });
+
+    it("keeps the cursor when the thread cannot be woken, and drops the watch when the thread is gone", async () => {
+      let mode: "fail" | "gone" | "ok" = "fail";
+      const w = await watching({
+        send: async () => {
+          if (mode === "ok") return { kind: "sent" };
+          throw Object.assign(new Error(mode === "gone" ? "thread not found" : "busy"), mode === "gone" ? { code: "NOT_FOUND", status: 404 } : { status: 500 });
+        },
+      });
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      w.live.state.issue = issue({ updatedAt: "2026-10-09T12:00:00Z", state: { name: "Done", type: "completed" }, comments: { nodes: [] } });
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      await tick(3000);
+      expect(w.send).toHaveBeenCalledTimes(1);
+      expect(w.rows()[0]!.updated_at).toBe("2026-10-09T10:00:00Z");
+      // Still unreported, so the next doorbell says it again.
+      mode = "ok";
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      await tick(3000);
+      expect(w.send).toHaveBeenCalledTimes(2);
+      expect(w.rows()[0]!.updated_at).toBe("2026-10-09T12:00:00Z");
+
+      mode = "gone";
+      w.live.state.issue = issue({ updatedAt: "2026-10-09T13:00:00Z", title: "Renamed", comments: { nodes: [] } });
+      w.hooks.last().send(w.hooks.doorbell("uuid-1"));
+      await tick(3000);
+      expect(w.rows()).toEqual([]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("forgets a thread's watches when it is archived or deleted", async () => {
+      const w = await watching();
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-2", projectId: "prj-1" });
+      await w.harness.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+      expect(w.rows().map((r) => r.thread_id)).toEqual(["thr-2"]);
+      await w.harness.emitThreadEvent("thread.deleted", { thread: { id: "thr-2" } as never });
+      expect(w.rows()).toEqual([]);
+    });
+
+    it("drops a refused watch only when the developer cannot read the issue either, and tells the thread", async () => {
+      const w = await watching();
+      await w.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      // Readable here: the service is wrong or stale; the watch stays.
+      expect(w.rows()).toHaveLength(1);
+      expect(w.send).not.toHaveBeenCalled();
+      expect(w.harness.logEntries.some((l) => l.message.includes("keeping the watch"))).toBe(true);
+
+      // Linear unreachable from here: neither an `unverifiable` nor a `forbidden`
+      // answer can be confirmed, so the watch stays for the next renewal.
+      w.live.state.fail = true;
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "unverifiable" })) });
+      await tick(30 * 60_000);
+      expect(w.hooks.subscribes).toHaveLength(2);
+      expect(w.rows()).toHaveLength(1);
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+      await tick(30 * 60_000);
+      expect(w.hooks.subscribes).toHaveLength(3);
+      expect(w.rows()).toHaveLength(1);
+      expect(w.harness.logEntries.some((l) => l.message.includes("could not confirm a refused lease"))).toBe(true);
+      expect(w.send).not.toHaveBeenCalled();
+
+      // Gone for the developer too: the watch is dropped and the thread told, once.
+      w.live.state.fail = false;
+      w.live.state.issue = null;
+      await tick(30 * 60_000);
+      expect(w.rows()).toEqual([]);
+      expect(w.sent().map((m) => m.input[0]!.text)).toEqual(["Linear issue ENG-123 is no longer visible to the connected user (deleted, moved, or access removed), so this thread has stopped watching it."]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("stops the stream on disconnect and opens it again on connect", async () => {
+      const w = await watching();
+      const service = w.harness.runService("watches");
+      await tick();
+      expect(w.hooks.streams).toHaveLength(1);
+      await w.harness.callRpc("disconnect", null);
+      await tick(5000);
+      expect(w.hooks.last().closed).toBe(true);
+      expect(w.hooks.streams).toHaveLength(1);
+      // A token arriving by any route reconnects: here it is pasted into settings.
+      await w.harness.setSettings({ accessToken: "at-1" });
+      await tick(1000);
+      expect(w.hooks.streams).toHaveLength(2);
+      expect(w.hooks.last().closed).toBe(false);
+      service.controller.abort();
+      await service.done;
+    });
   });
 });

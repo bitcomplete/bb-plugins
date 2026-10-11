@@ -11,6 +11,11 @@
 // The same reads are a `bb linear` command, so a script automation on this
 // server (which has no thread and therefore no tools) can poll Linear
 // without a credential of its own.
+//
+// A thread can also watch an issue (watch.ts, hooks-client.ts): when the
+// deployment runs bb-gate-hooks, Linear's webhooks reach it and it rings
+// this plugin, which re-reads the issue as the developer and messages the
+// thread with what changed. The thread ends its turn instead of polling.
 import { createHash } from "node:crypto";
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
@@ -65,6 +70,8 @@ import {
   type PendingConnect,
   type Tokens,
 } from "./oauth.js";
+import { createHooksLoop, HOOKS_URL_ENV, type Rejection } from "./hooks-client.js";
+import { compare, createCheckQueue, createWatchStore, initialCursors, signature, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export const CALLBACK_PATH = "/connect/callback";
 export const CONNECTION_CHANGED = "connection-changed";
@@ -223,6 +230,21 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return viewer;
     }
 
+    // The settings section and the watch service both want to know when the
+    // connection comes or goes. A pasted or cleared token changes it too, so
+    // settings changes count alongside Connect and Disconnect.
+    const connectionListeners = new Set<() => void>();
+    function announceConnection(connected: boolean): void {
+      bb.realtime.publish(CONNECTION_CHANGED, { connected });
+      for (const listener of connectionListeners) listener();
+    }
+    settings.onChange((next, prev) => {
+      if ((next.accessToken?.trim() ?? "") !== (prev.accessToken?.trim() ?? "")) for (const listener of connectionListeners) listener();
+    });
+    async function isConnected(): Promise<boolean> {
+      return ((await settings.get()).accessToken?.trim() ?? "") !== "";
+    }
+
     // One refresh at a time: two tools on the same expiring token must not
     // both refresh, or the second would hand Linear a refresh token the first
     // may already have rotated.
@@ -312,7 +334,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         await settings.experimental_set({ accessToken: null, refreshToken: null });
         await bb.storage.kv.delete(CONNECTION_KEY);
         await bb.storage.kv.delete(EXPIRY_KEY);
-        bb.realtime.publish(CONNECTION_CHANGED, { connected: false });
+        announceConnection(false);
         return { ok: true };
       },
     });
@@ -341,7 +363,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           await storeTokens(tokens);
           await bb.storage.kv.delete(CONNECTION_KEY);
           const viewer = await whoIs(tokens.accessToken, cfg.apiUrl, AbortSignal.timeout(15_000));
-          bb.realtime.publish(CONNECTION_CHANGED, { connected: true });
+          announceConnection(true);
           bb.log.info(`connected to Linear as ${viewer.user.name} in ${viewer.organization.name}`);
           return resultPage(
             "Linear connected",
@@ -393,9 +415,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     const toolError = (error: unknown) => ({ content: [{ type: "text" as const, text: errorMessage(error) }], isError: true });
 
-    // Comments and state changes name the thread that made them so a
-    // reader in Linear can find the conversation.
-    const signature = (threadId: string) => `\n\n_— from bb thread ${threadId}_`;
+    // Comments and state changes name the thread that made them (watch.ts
+    // `signature`) so a reader in Linear can find the conversation, and so a
+    // watch can tell the thread's own comments from everyone else's.
 
     // "me" is the connected user. Anyone else is matched by exact name or
     // email first, then as the only partial match; several matches ask for
@@ -421,7 +443,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       description:
         "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
       instructions:
-        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel or reprioritize one.",
+        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel or reprioritize one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
       async execute({ key }, { signal }) {
@@ -632,6 +654,198 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           const { data, errors } = await readOnlyQuery(document, variables, signal);
           const text = JSON.stringify(data, null, 1);
           return errors.length > 0 ? `${text}\n\nErrors: ${errors.join("; ")}` : text;
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    });
+
+    // ---- watching an issue -----------------------------------------------
+    //
+    // A watch is a row in the plugin's SQLite plus a lease on bb-gate-hooks.
+    // The row is the truth: it carries what the thread last saw, and every
+    // check compares a fresh read against it. The lease only makes the check
+    // prompt. Without BB_HOOKS_URL there is no service to lease from and the
+    // tool says so; a watch that merely polled would be a different feature.
+
+    const hooksUrl = deps.env[HOOKS_URL_ENV]?.trim() ?? "";
+    const db = bb.storage.database();
+    bb.storage.migrate(db, WATCH_MIGRATIONS);
+    const watches = createWatchStore(db, deps.now);
+    const checkSignal = () => AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+
+    /** Message a thread. "gone" when the thread no longer exists, so the caller drops the watch. */
+    async function wake(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
+      try {
+        await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
+        return "sent";
+      } catch (error) {
+        const e = error as { code?: string; status?: number };
+        if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return "gone";
+        bb.log.warn(`could not wake thread ${threadId} for a Linear change: ${errorMessage(error)}`);
+        return "failed";
+      }
+    }
+
+    /** The issue is gone or no longer readable as the developer: tell the thread once and forget the watch. */
+    async function dropInvisible(watch: WatchRow): Promise<void> {
+      watches.remove(watch.threadId, watch.issueId);
+      await wake(watch.threadId, `Linear issue ${watch.issueKey} is no longer visible to the connected user (deleted, moved, or access removed), so this thread has stopped watching it.`);
+    }
+
+    /** Read the issue once and settle every watch on it against what it remembers. */
+    async function checkIssue(issueId: string): Promise<void> {
+      const watching = watches.forIssue(issueId);
+      if (watching.length === 0) return;
+      let issue: Issue | null;
+      try {
+        issue = await readIssue(issueId, checkSignal());
+      } catch (error) {
+        // Left as it was: the cursors still point at the last thing seen, so
+        // the next doorbell or sweep reports everything since then.
+        bb.log.warn(`could not read Linear issue ${watching[0]!.issueKey} for its watchers: ${errorMessage(error)}`);
+        return;
+      }
+      for (const watch of watching) {
+        if (issue === null) {
+          await dropInvisible(watch);
+          continue;
+        }
+        const outcome = compare(watch, issue);
+        if (outcome.message === null) {
+          watches.advance(watch.threadId, watch.issueId, outcome, false);
+          continue;
+        }
+        const sent = await wake(watch.threadId, outcome.message);
+        if (sent === "gone") watches.remove(watch.threadId, watch.issueId);
+        else if (sent === "sent") watches.advance(watch.threadId, watch.issueId, outcome, true);
+      }
+    }
+
+    const checks = createCheckQueue(checkIssue, { onError: (issueId, error) => bb.log.warn(`Linear watch check of ${issueId} failed: ${errorMessage(error)}`) });
+    bb.onDispose(() => checks.stop());
+
+    async function sweep(reason: string): Promise<void> {
+      const expired = watches.expire();
+      if (expired > 0) bb.log.info(`forgot ${expired} Linear watch${expired === 1 ? "" : "es"} idle for a week`);
+      const ids = watches.issueIds();
+      if (ids.length > 0) bb.log.info(`checking ${ids.length} watched Linear issue${ids.length === 1 ? "" : "s"} (${reason})`);
+      await checks.sweep(ids);
+    }
+
+    // The service refusing a lease is not proof the developer lost access:
+    // with the token expired on the service's side, or Linear briefly down,
+    // every watch would come back `forbidden`. The developer's own read is
+    // the ground truth, so a refused issue is read here before the thread is
+    // told it is gone; one that reads fine keeps its watch and is leased
+    // again at the next renewal.
+    async function onRejected(rejected: Rejection[]): Promise<void> {
+      for (const r of rejected) {
+        if (r.kind !== "issue" || r.reason !== "forbidden") continue;
+        const watching = watches.forIssue(r.id);
+        if (watching.length === 0) continue;
+        try {
+          if ((await readIssue(r.id, checkSignal())) !== null) {
+            bb.log.warn(`bb-gate-hooks refused a lease on ${watching[0]!.issueKey} that the connected user can read; keeping the watch`);
+            continue;
+          }
+        } catch (error) {
+          bb.log.warn(`could not confirm a refused lease on ${watching[0]!.issueKey}: ${errorMessage(error)}`);
+          continue;
+        }
+        for (const watch of watching) await dropInvisible(watch);
+      }
+    }
+
+    const hooks = createHooksLoop({
+      fetch: deps.fetch,
+      baseUrl: hooksUrl,
+      now: deps.now,
+      log: bb.log,
+      token: accessToken,
+      refreshToken: () => refresh("was refused by bb-gate-hooks"),
+      watchIds: () => watches.issueIds(),
+      onDoorbell: (issueId) => checks.ring(issueId),
+      onRejected,
+      sweep,
+    });
+
+    if (hooksUrl !== "") {
+      // Runs the stream only while Linear is connected: a lease is proven
+      // with the token, so without one there is nothing to subscribe with.
+      // Disconnect stops the stream; Connect starts it again.
+      bb.background.service("watches", {
+        async start(signal) {
+          while (!signal.aborted) {
+            // Listen before looking, so a change between the two is not missed.
+            let changed!: () => void;
+            const change = new Promise<void>((resolve) => {
+              changed = () => {
+                connectionListeners.delete(changed);
+                signal.removeEventListener("abort", changed);
+                resolve();
+              };
+              connectionListeners.add(changed);
+              signal.addEventListener("abort", changed, { once: true });
+            });
+            if (!(await isConnected())) {
+              await change;
+              continue;
+            }
+            changed();
+            const session = new AbortController();
+            const stop = () => session.abort();
+            signal.addEventListener("abort", stop, { once: true });
+            const onChange = () => void isConnected().then((connected) => (connected ? undefined : session.abort()));
+            connectionListeners.add(onChange);
+            try {
+              await hooks.run(session.signal);
+            } finally {
+              connectionListeners.delete(onChange);
+              signal.removeEventListener("abort", stop);
+            }
+          }
+        },
+      });
+    }
+
+    const forgetThread = (threadId: string) => {
+      const removed = watches.removeThread(threadId);
+      if (removed > 0) bb.log.info(`thread ${threadId} is gone; forgot its ${removed} Linear watch${removed === 1 ? "" : "es"}`);
+    };
+    bb.events.on("thread.archived", ({ thread }) => forgetThread(thread.id));
+    bb.events.on("thread.deleted", ({ thread }) => forgetThread(thread.id));
+
+    bb.agents.registerTool({
+      name: "linear_watch_issue",
+      description:
+        "Watch a Linear issue from this thread: when its state, assignee, priority, labels, title or other fields change, or someone else comments, this thread is sent a message describing the change (which starts a new turn if the thread is idle). Use it when there is nothing to do until the ticket moves, then end the turn instead of polling. A thread can watch up to 10 issues; a watch nobody has woken in a week is dropped.",
+      presentation: { label: { pending: "Watching a Linear issue", completed: "Watching a Linear issue" } },
+      parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
+      async execute({ key }, { threadId, projectId, signal }) {
+        if (hooksUrl === "") {
+          return toolError(new Error("Watching Linear issues is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set). Read the issue again later instead."));
+        }
+        try {
+          const issue = await readIssue(key, signal);
+          if (issue === null) return toolError(notFound(key));
+          const added = watches.add({
+            threadId,
+            projectId,
+            issueId: issue.id,
+            issueKey: issue.identifier,
+            snapshot: snapshotOf(issue),
+            ...initialCursors(issue, new Date(deps.now()).toISOString()),
+          });
+          const title = issue.title ?? "(untitled)";
+          if (added.outcome === "full") {
+            return toolError(new Error(`This thread already watches ${added.limit} Linear issues, the most it can. It is still watching them; it cannot add ${issue.identifier}.`));
+          }
+          if (added.outcome === "already") return `Already watching ${issue.identifier}: ${title}. This thread will be messaged when it changes; you can end the turn.`;
+          // Not awaited: the lease lands within seconds when the stream is up,
+          // and the next hello covers it when it is not. The tool need not wait.
+          hooks.added(issue.id).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
+          return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
         } catch (error) {
           return toolError(error);
         }

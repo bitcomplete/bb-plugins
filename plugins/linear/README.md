@@ -23,12 +23,61 @@ same connect.
 | `linear_comment` | A Markdown comment, signed with the thread id. |
 | `linear_update_issue` | Change an issue's state, assignee, labels and priority together. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
+| `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
 
 Writes are deliberately named tools rather than a raw mutation tool, so the
 thread's timeline says what changed. Everything runs as the connected user
 (`actor=user`), so comments and state changes are attributed to the
 developer, like `gh`. Issues and comments a thread writes carry the
 thread's id so a reader in Linear can find the conversation.
+
+## Watching an issue
+
+A thread that has nothing to do until a ticket moves (a question asked of
+the reporter, a PR waiting on review in Linear's terms, a parent waiting on
+its sub-issues) calls `linear_watch_issue` with the key and ends its turn.
+When the issue changes, the thread is sent a message describing the change
+and a new turn starts, or the running turn is steered if one is live.
+
+What "changes" means: a different state, assignee, priority, labels, title,
+project, cycle, parent, due date or estimate (each reported as `old → new`),
+an edited description (reported as edited, without a diff), and new comments
+by anyone other than the watching thread itself, with author and body (long
+bodies trimmed). Comments the thread wrote carry its signature, so they are
+left out; comments from other threads count. One message carries everything
+since the thread last looked, however many webhooks it took.
+
+How it wakes: the plugin keeps a durable watch per thread and issue in its
+SQLite (what it last saw, and cursors on `updatedAt` and the newest comment),
+and subscribes to [bb-gate-hooks](../../bb-gate/docs/hooks.md), the one
+public endpoint that receives Linear's webhooks. It proves each watch with
+the developer's own access token, renews the lease every 30 minutes, and
+when the service rings for an issue it re-reads it as the developer,
+compares it with the snapshot, and messages the thread only if something
+is new. A doorbell is a latency optimization, not the source of truth:
+every watch is also re-checked when the stream connects, after a renewal
+that failed or ran late, every ten minutes while leased, and every two
+minutes while the service is unreachable. A stream silent for a minute
+(the service sends a keepalive every 20 seconds) is dropped and reopened.
+If the service reports that Linear refused the token itself, the plugin
+refreshes it and retries once; nothing is dropped for that. Nothing is
+ever reported twice.
+
+Limits and cleanup: ten watches per thread; the eleventh is refused.
+Watching an issue twice is a no-op. A watch expires a week after it last
+woke the thread (or was created). Archiving or deleting the thread drops
+its watches, as does a wake that finds the thread gone. If the issue stops
+being visible to the connected user, the thread is told once and the watch
+is dropped. There is no unwatch tool and no UI. Disconnecting Linear stops
+the subscription; connecting again resumes it.
+
+`BB_HOOKS_URL` is the cluster-internal address of bb-gate-hooks
+(`http://bb-gate-hooks.bb-gate-production.svc:8081` in bb-gate's backend
+template). It is read from the server's environment only; there is no
+setting. Without it, `linear_watch_issue` returns an error saying watching
+is not available on this server, no background service is started, and
+the other tools work as before. There is deliberately no polling fallback:
+re-reading the issue later is what the agent would do anyway.
 
 ## The `bb linear` command
 
@@ -97,6 +146,11 @@ Disconnect revokes the token at Linear.
 | `apiUrl` | `https://api.linear.app` | Token exchange and GraphQL. |
 | `accessToken` | — | Secret. Set by Connect Linear, refreshed by the plugin. |
 | `refreshToken` | — | Secret. Set by Connect Linear. |
+
+| Environment | Meaning |
+|---|---|
+| `LINEAR_CLIENT_ID` | Default for `clientId`. |
+| `BB_HOOKS_URL` | Where bb-gate-hooks listens for subscribers. Enables `linear_watch_issue`. |
 
 ## Development
 

@@ -19,10 +19,29 @@ token stays on the server; a thread never sees it and needs no API key.
 | `linear_comment` | Add a Markdown comment. It is signed with the thread id so a reader can find the conversation. |
 | `linear_update_issue` | Change an issue: state by name, assignee (`me`, a name or email, `nobody`), labels to add or remove, priority. Give only the fields to change; a name that does not match is an error listing the choices. |
 | `linear_query` | Any read-only GraphQL query, for projects, cycles, teams, documents and anything the tools above lack. Mutations are refused. |
+| `linear_watch_issue` | Watch an issue by key. This thread is messaged when its state, assignee, priority, labels, title or other fields change, or when someone else comments; the message starts a new turn. Up to ten per thread. |
 
 Ticket keys appear in branch names, PR titles and thread titles
 (`ENG-123`, `eng-123-fix-login`). Read the ticket before starting work on
 one, and prefer these tools over asking the user to paste its contents.
+
+## Waiting on a ticket
+
+When there is nothing to do until an issue changes, do not poll it with
+`linear_issue` or sleep in a loop. Call `linear_watch_issue` with the key,
+say in your reply what you are waiting for, and end the turn. The plugin
+wakes this thread with one message naming the issue, each changed field as
+`old → new`, and any new comment with its author and body; your own signed
+comments are left out. Typical moments: you asked the reporter a question in
+a comment; you moved the issue to a review state and the next step is
+someone else's; a parent issue is waiting on its sub-issues.
+
+Watching the same issue again is harmless. A thread can watch ten issues; a
+watch that has not fired in a week is forgotten, so watch again if you are
+still waiting. If the tool answers that watching is not available on this
+server (no `BB_HOOKS_URL`), tell the user you cannot be woken and will need
+to be asked again, or check the issue when the user next sends a message;
+do not poll.
 
 ## From a script
 
