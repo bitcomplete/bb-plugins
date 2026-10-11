@@ -1,0 +1,396 @@
+// The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md): one SSE
+// stream for doorbells, a lease per watched issue or pull request proven with the
+// developer's own token, renewed at half-life, and a re-check of every watch
+// whenever coverage cannot be proven. The service promises nothing beyond
+// "something about this entity changed while you were leased", so this
+// module never decides anything about an entity; it only says when to look.
+//
+// Everything that touches the world is injected: fetch, the clock, the
+// token, the watch list, and what to do on a doorbell or a rejected lease.
+// The token goes into one request body and nowhere else: not a log line,
+// not an error message.
+import { z } from "zod";
+
+export const HOOKS_URL_ENV = "BB_HOOKS_URL";
+export const SOURCE = "github";
+/** The service refuses more watches than this in one call (413). */
+export const SUBSCRIBE_BATCH = 100;
+
+// ---- server-sent events ----------------------------------------------------
+
+export type SseEvent = { event: string; data: string; id: string | null };
+
+/**
+ * Incremental parser for text/event-stream: feed it chunks, get the events
+ * that completed. Comment lines (`: keepalive`) are dropped, a field's single
+ * leading space is stripped, several `data:` lines join with newlines, and a
+ * blank line dispatches. `retry:` is ignored; reconnect timing is ours.
+ */
+export class SseParser {
+  private buffer = "";
+  private event = "";
+  private data: string[] = [];
+  private id: string | null = null;
+
+  push(chunk: string): SseEvent[] {
+    this.buffer += chunk;
+    const out: SseEvent[] = [];
+    let newline: number;
+    while ((newline = this.buffer.indexOf("\n")) !== -1) {
+      let line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (line === "") {
+        if (this.data.length > 0 || this.event !== "") out.push({ event: this.event === "" ? "message" : this.event, data: this.data.join("\n"), id: this.id });
+        this.event = "";
+        this.data = [];
+        continue;
+      }
+      if (line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") this.event = value;
+      else if (field === "data") this.data.push(value);
+      else if (field === "id") this.id = value;
+    }
+    return out;
+  }
+}
+
+/** The events of a stream body, until it ends or the signal aborts. */
+export class StreamIdleError extends Error {
+  constructor(idleMs: number) {
+    super(`no bytes from bb-gate-hooks for ${Math.round(idleMs / 1000)} s`);
+    this.name = "StreamIdleError";
+  }
+}
+
+/**
+ * The events of a stream body, until it ends or the signal aborts. A stream
+ * silent for `idleMs` (keepalives included: any bytes count) throws
+ * StreamIdleError, because a half-open connection would otherwise look
+ * leased forever.
+ */
+export async function* readSse(body: ReadableStream<Uint8Array>, signal: AbortSignal, idleMs = STREAM_IDLE_MS): AsyncGenerator<SseEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const parser = new SseParser();
+  const cancel = () => void reader.cancel().catch(() => undefined);
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    while (!signal.aborted) {
+      let idle: ReturnType<typeof setTimeout> | null = null;
+      const timedOut = new Promise<never>((_, reject) => {
+        idle = setTimeout(() => reject(new StreamIdleError(idleMs)), idleMs);
+      });
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await Promise.race([reader.read(), timedOut]);
+      } catch (error) {
+        if (error instanceof StreamIdleError) cancel();
+        throw error;
+      } finally {
+        if (idle !== null) clearTimeout(idle);
+      }
+      if (chunk.done) break;
+      for (const event of parser.push(decoder.decode(chunk.value, { stream: true }))) yield event;
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
+// ---- the wire shapes ---------------------------------------------------------
+
+export const helloSchema = z.object({ connection: z.string().min(1), leaseSeconds: z.number().positive().optional() });
+export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1) }).loose();
+export const subscribeResponseSchema = z.object({
+  leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
+  rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
+});
+export type SubscribeResponse = z.infer<typeof subscribeResponseSchema>;
+export type Rejection = SubscribeResponse["rejected"][number];
+
+export class HooksRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    /** The answer's body, for the one 404 that means something (`{"error":"unknown-connection"}`). Never the request. */
+    readonly body: string = "",
+  ) {
+    super(message);
+    this.name = "HooksRequestError";
+  }
+
+  /** The service forgot the connection the request named; any other 404 is a wrong URL. */
+  get unknownConnection(): boolean {
+    if (this.status !== 404) return false;
+    try {
+      return (JSON.parse(this.body) as { error?: unknown }).error === "unknown-connection";
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** The service guarantees a keepalive every 20 s; this much silence means the stream is dead. */
+export const STREAM_IDLE_MS = 60_000;
+
+type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
+
+/**
+ * POST /v1/subscribe for these issue ids, in batches the service accepts.
+ * A 404 means the connection is gone and is thrown as such so the caller
+ * reconnects; nothing about the request body is ever put in an error.
+ */
+export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, issueIds: string[], signal: AbortSignal): Promise<SubscribeResponse> {
+  const merged: SubscribeResponse = { leases: [], rejected: [] };
+  for (let i = 0; i < issueIds.length; i += SUBSCRIBE_BATCH) {
+    const watches = issueIds.slice(i, i + SUBSCRIBE_BATCH).map((id) => ({ kind: "issue", id }));
+    const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ connection, source: SOURCE, token, watches }),
+      signal,
+    });
+    if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
+    const parsed = subscribeResponseSchema.parse(await response.json());
+    merged.leases.push(...parsed.leases);
+    merged.rejected.push(...parsed.rejected);
+  }
+  return merged;
+}
+
+// ---- the loop ----------------------------------------------------------------
+
+export interface HooksTiming {
+  /** Renew at this fraction of the lease. */
+  renewFraction: number;
+  /** Lease length assumed until the hello says otherwise. */
+  defaultLeaseMs: number;
+  /** Re-check everything this often while leased. */
+  baselineMs: number;
+  /** Re-check everything this often while the stream is down. */
+  downSweepMs: number;
+  /** Reconnect backoff, doubled from the first to the cap. */
+  backoffMinMs: number;
+  backoffMaxMs: number;
+  /** Silence on the stream that counts as a dead connection. */
+  idleMs: number;
+}
+
+export const DEFAULT_TIMING: HooksTiming = {
+  renewFraction: 0.5,
+  defaultLeaseMs: 60 * 60 * 1000,
+  baselineMs: 10 * 60 * 1000,
+  downSweepMs: 2 * 60 * 1000,
+  backoffMinMs: 1000,
+  backoffMaxMs: 60 * 1000,
+  idleMs: STREAM_IDLE_MS,
+};
+
+export interface HooksLoopDeps {
+  fetch: FetchLike;
+  baseUrl: string;
+  now: () => number;
+  log: { info(message: string): void; warn(message: string): void };
+  /** The developer's current access token, refreshed if it is about to expire. */
+  token: () => Promise<string>;
+  /** A new token, whatever the old one's expiry says: the service reported GitHub refused it. */
+  refreshToken: () => Promise<string>;
+  /** The issue ids to hold leases for, right now. */
+  watchIds: () => string[];
+  /** A doorbell for an issue: look at it again. */
+  onDoorbell: (issueId: string) => void;
+  /** Leases the service refused. The caller decides what that means for each watch. */
+  onRejected: (rejected: Rejection[]) => Promise<void>;
+  /** Check every watch against its cursor. */
+  sweep: (reason: string) => Promise<void>;
+  timing?: Partial<HooksTiming>;
+}
+
+export interface HooksLoop {
+  /** Run until the signal aborts. Never throws for a network reason; it retries. */
+  run(signal: AbortSignal): Promise<void>;
+  /** A watch was just added: lease it now if there is a connection. The next hello covers it otherwise. */
+  added(issueId: string): Promise<void>;
+  /** Whether a connection is up and leased; for status lines and tests. */
+  readonly connected: boolean;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
+  const timing: HooksTiming = { ...DEFAULT_TIMING, ...deps.timing };
+  let connection: string | null = null;
+  let leaseMs = timing.defaultLeaseMs;
+  /** When the current leases run out; 0 while there are none. */
+  let leasedUntil = 0;
+  /** Aborting this drops the current stream so the outer loop reconnects. */
+  let stream: AbortController | null = null;
+  let lastSweepAt = 0;
+  let wrongUrlLogged = false;
+
+  function runSweep(reason: string): void {
+    lastSweepAt = deps.now();
+    deps.sweep(reason).catch((error: unknown) => deps.log.warn(`GitHub watch sweep (${reason}) failed: ${errorMessage(error)}`));
+  }
+
+  /**
+   * Lease these ids on the current connection. Returns whether the service
+   * accepted the call; a 404 means the connection is gone and drops the
+   * stream. The token comes from the caller's refresh path, so a lease is
+   * always proven with one GitHub would accept right now.
+   */
+  async function lease(ids: string[], signal: AbortSignal): Promise<boolean> {
+    if (connection === null) return false;
+    const current = connection;
+    const started = deps.now();
+    try {
+      let result: SubscribeResponse;
+      try {
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.token(), ids, signal);
+      } catch (error) {
+        // 401 is about the token, not any entity: GitHub refused it on the
+        // service's side. Refresh regardless of what the expiry says and try
+        // once more; nothing was admitted or dropped.
+        if (!(error instanceof HooksRequestError && error.status === 401)) throw error;
+        deps.log.warn("bb-gate-hooks says GitHub refused the token; refreshing and retrying");
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(), ids, signal);
+      }
+      if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
+      if (result.rejected.length > 0) await deps.onRejected(result.rejected);
+      return true;
+    } catch (error) {
+      if (signal.aborted) return false;
+      if (error instanceof HooksRequestError && error.status === 404) {
+        if (error.unknownConnection) {
+          if (connection === current) {
+            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            stream?.abort();
+          }
+          return false;
+        }
+        // A 404 from the path itself: the URL is wrong. Say so once; the
+        // normal renewal and reconnect cadence keeps trying.
+        if (!wrongUrlLogged) {
+          wrongUrlLogged = true;
+          deps.log.warn(`${HOOKS_URL_ENV} looks wrong: ${deps.baseUrl} answers 404 to /v1/subscribe without naming the connection`);
+        }
+        return false;
+      }
+      deps.log.warn(`GitHub watch lease failed: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  /** Renew every lease; a failed or late renewal means a gap, so everything is checked. Never throws: it runs from timers. */
+  async function renew(reason: "hello" | "renewal", signal: AbortSignal): Promise<void> {
+    try {
+      const ids = deps.watchIds();
+      const late = reason === "renewal" && leasedUntil !== 0 && deps.now() >= leasedUntil;
+      let ok = true;
+      if (ids.length === 0) leasedUntil = deps.now() + leaseMs;
+      else ok = await lease(ids, signal);
+      if (reason === "hello" || !ok || late) runSweep(reason === "hello" ? "connected" : ok ? "late renewal" : "failed renewal");
+    } catch (error) {
+      if (!signal.aborted) deps.log.warn(`GitHub watch renewal failed: ${errorMessage(error)}`);
+    }
+  }
+
+  async function consume(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<void> {
+    let renewTimer: ReturnType<typeof setInterval> | null = null;
+    let baselineTimer: ReturnType<typeof setInterval> | null = null;
+    try {
+      for await (const event of readSse(body, signal, timing.idleMs)) {
+        if (event.event === "hello") {
+          const hello = helloSchema.safeParse(JSON.parse(event.data));
+          if (!hello.success) {
+            deps.log.warn("bb-gate-hooks sent a hello this plugin does not understand; reconnecting");
+            return;
+          }
+          connection = hello.data.connection;
+          leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
+          deps.log.info(`GitHub watches: connected to bb-gate-hooks as ${connection}`);
+          // Not awaited: doorbells behind the hello must not wait for GitHub.
+          void renew("hello", signal);
+          if (renewTimer !== null) clearInterval(renewTimer);
+          if (baselineTimer !== null) clearInterval(baselineTimer);
+          renewTimer = setInterval(() => void renew("renewal", signal), Math.max(1000, leaseMs * timing.renewFraction));
+          baselineTimer = setInterval(() => runSweep("baseline"), timing.baselineMs);
+        } else if (event.event === "doorbell") {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(event.data);
+          } catch {
+            continue;
+          }
+          const doorbell = doorbellSchema.safeParse(parsed);
+          // `action` and `at` are for the service's logs; the reaction to any
+          // doorbell is the same check.
+          if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") deps.onDoorbell(doorbell.data.id);
+        }
+      }
+    } finally {
+      if (renewTimer !== null) clearInterval(renewTimer);
+      if (baselineTimer !== null) clearInterval(baselineTimer);
+      connection = null;
+      leasedUntil = 0;
+    }
+  }
+
+  return {
+    get connected() {
+      return connection !== null && leasedUntil > deps.now();
+    },
+
+    async added(issueId) {
+      if (connection === null || stream === null) return;
+      await lease([issueId], stream.signal);
+    },
+
+    async run(signal) {
+      let backoff = timing.backoffMinMs;
+      while (!signal.aborted) {
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        signal.addEventListener("abort", onAbort, { once: true });
+        stream = controller;
+        try {
+          const response = await deps.fetch(new URL("/v1/events", deps.baseUrl), { headers: { accept: "text/event-stream" }, signal: controller.signal });
+          if (!response.ok || response.body === null) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to the event stream`, response.status);
+          backoff = timing.backoffMinMs;
+          await consume(response.body, controller.signal);
+          if (!signal.aborted) deps.log.warn("bb-gate-hooks event stream ended; reconnecting");
+        } catch (error) {
+          if (!signal.aborted && !controller.signal.aborted) deps.log.warn(`bb-gate-hooks event stream: ${errorMessage(error)}`);
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+          controller.abort();
+          stream = null;
+        }
+        if (signal.aborted) break;
+        // Down: nobody is ringing, so look for ourselves, slowly.
+        if (deps.now() - lastSweepAt >= timing.downSweepMs) runSweep("stream down");
+        await sleep(backoff, signal);
+        backoff = Math.min(backoff * 2, timing.backoffMaxMs);
+      }
+    },
+  };
+}

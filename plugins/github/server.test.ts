@@ -1,0 +1,337 @@
+import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NotSignedInError } from "./gh.js";
+import { createGitHubPlugin, TOKEN_CACHE_MS } from "./server.js";
+import { signature, WATCH_LIMIT } from "./watch.js";
+
+const API_URL = "https://api.github.test";
+const HOOKS_URL = "http://bb-gate-hooks.test:8081";
+
+// A pull request as GitHub currently has it; tests change it and ring the doorbell.
+const pullNode = (over: Record<string, unknown> = {}) => ({
+  __typename: "PullRequest",
+  number: 12,
+  title: "Add widgets",
+  url: "https://github.com/Acme/Widgets/pull/12",
+  createdAt: "2026-10-01T00:00:00Z",
+  updatedAt: "2026-10-09T10:00:00Z",
+  author: { login: "jane" },
+  assignees: { nodes: [] },
+  labels: { nodes: [] },
+  milestone: null,
+  comments: { nodes: [{ author: { login: "bob" }, body: "old", createdAt: "2026-10-09T09:00:00Z", url: "https://github.com/c/old" }] },
+  state: "OPEN",
+  isDraft: false,
+  merged: false,
+  reviewDecision: "REVIEW_REQUIRED",
+  headRefName: "feature",
+  headRefOid: "0123456789abcdef",
+  baseRefName: "main",
+  reviewRequests: { nodes: [] },
+  latestReviews: { nodes: [] },
+  reviews: { nodes: [] },
+  commits: { nodes: [{ commit: { oid: "0123456789abcdef", statusCheckRollup: { state: "PENDING", contexts: { nodes: [] } } } }] },
+  ...over,
+});
+const comment = (body: string, createdAt: string, who = "bob") => ({ author: { login: who }, body, createdAt, url: `https://github.com/c/${createdAt}` });
+
+// A GitHub whose GraphQL endpoint a test scripts: one repository with one pull request.
+function fakeGitHub() {
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_") };
+  const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
+  const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+    if (String(url) !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
+    const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
+    const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+    calls.push({ token, variables: body.variables });
+    if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+    if (state.fail) return Response.json({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] });
+    const v = body.variables as { owner: string; name: string; number: number };
+    if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
+    if (v.number !== 12 || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
+    return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: state.node } } });
+  }) as unknown as typeof fetch;
+  return { fetchImpl, calls, state };
+}
+
+// A bb-gate-hooks whose event stream a test writes to and whose subscribe answers it scripts.
+function fakeHooks() {
+  const encoder = new TextEncoder();
+  const streams: Array<{ send(text: string): void; closed: boolean }> = [];
+  const subscribes: Array<{ connection: string; source: string; token: string; watches: Array<{ kind: string; id: string }> }> = [];
+  const state = { answer: (body: (typeof subscribes)[number]): Response => Response.json({ leases: body.watches, rejected: [] }) };
+  const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const u = String(url);
+    if (u === `${HOOKS_URL}/v1/events`) {
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const entry = { closed: false, send: (text: string) => controller.enqueue(encoder.encode(text)) };
+      const body = new ReadableStream<Uint8Array>({ start: (c) => void (controller = c), cancel: () => void (entry.closed = true) });
+      const keepalive = setInterval(() => {
+        if (!entry.closed) entry.send(": keepalive\n\n");
+      }, 20_000);
+      init?.signal?.addEventListener("abort", () => {
+        entry.closed = true;
+        clearInterval(keepalive);
+      });
+      streams.push(entry);
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    if (u === `${HOOKS_URL}/v1/subscribe`) {
+      const body = JSON.parse(String(init?.body)) as (typeof subscribes)[number];
+      subscribes.push(body);
+      return state.answer(body);
+    }
+    return new Response("not found", { status: 404 });
+  }) as unknown as typeof fetch;
+  return {
+    fetchImpl,
+    streams,
+    subscribes,
+    state,
+    last: () => streams.at(-1)!,
+    hello: (connection: string) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds: 3600 })}\n\n`,
+    doorbell: (id: string) => `event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "issue", id, unit: "Acme/Widgets", action: "pull_request_review.submitted", at: "2026-10-10T17:02:11Z" })}\n\n`,
+  };
+}
+
+async function setup(options: { env?: Record<string, string>; send?: (...args: never[]) => unknown; token?: () => Promise<string> } = {}) {
+  const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
+  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send } } });
+  const github = fakeGitHub();
+  const hooks = fakeHooks();
+  let now = 1_000_000_000_000;
+  const token = vi.fn(options.token ?? (async () => "gho_dev"));
+  const fetchImpl = ((url, init) => (String(url).startsWith(HOOKS_URL) ? hooks.fetchImpl(url, init) : github.fetchImpl(url, init))) as typeof fetch;
+  await createGitHubPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {}, token, apiUrl: API_URL })(bb);
+  const tool = (args: Record<string, unknown>, ctx: { threadId: string; projectId: string } = { threadId: "thr-1", projectId: "prj-1" }) =>
+    harness.behavior.callAgentTool("github_watch", args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
+  const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
+  const rows = () => bb.storage.database().prepare("SELECT thread_id, key, kind, updated_at, last_comment_at FROM watches ORDER BY thread_id").all() as Array<Record<string, unknown>>;
+  const sent = () => send.mock.calls.map((c) => c[0] as { threadId: string; mode: string; input: Array<{ type: string; text: string }> });
+  return { bb, harness, github, hooks, token, send, tool, text, rows, sent, advance: (ms: number) => (now += ms) };
+}
+
+const WITH_HOOKS = { env: { BB_HOOKS_URL: HOOKS_URL } };
+
+describe("the tool", () => {
+  it("is the one tool, and is refused with a reason on a server without bb-gate-hooks, starting no service", async () => {
+    const { harness, tool, text } = await setup();
+    expect(harness.registrations.agentTools.map((t: { name: string }) => t.name)).toEqual(["github_watch"]);
+    const result = await tool({ ref: "Acme/Widgets#12" });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("BB_HOOKS_URL");
+    expect(harness.registrations.services.map((s) => s.name)).toEqual([]);
+  });
+
+  it("records a watch under the name GitHub uses, is a no-op the second time, and stops at the limit", async () => {
+    const { bb, harness, tool, text, rows, github } = await setup(WITH_HOOKS);
+    expect(harness.registrations.services.map((s) => s.name)).toEqual(["watches"]);
+    expect(text(await tool({ ref: "https://github.com/acme/widgets/pull/12/files" }))).toBe("Watching pull request Acme/Widgets#12: Add widgets. This thread will be messaged when it changes or someone else comments; end the turn rather than polling.");
+    expect(rows()).toEqual([{ thread_id: "thr-1", key: "Acme/Widgets#12", kind: "pull", updated_at: "2026-10-09T10:00:00Z", last_comment_at: "2026-10-09T09:00:00Z" }]);
+    expect(github.calls.at(-1)).toEqual({ token: "gho_dev", variables: { owner: "acme", name: "widgets", number: 12 } });
+    expect(text(await tool({ ref: "Acme/Widgets#12" }))).toContain("Already watching pull request Acme/Widgets#12");
+    expect(rows()).toHaveLength(1);
+
+    expect(text(await tool({ ref: "Acme/Other#12" }))).toContain("No Acme/Other#12 on GitHub, or it is not visible");
+    expect(text(await tool({ ref: "Acme/Widgets#13" }))).toContain("No Acme/Widgets#13 on GitHub");
+    expect(text(await tool({ ref: "nonsense" }))).toContain("does not name a pull request or issue");
+
+    // The fake has one pull request, so fill the rest of the thread by hand.
+    const db = bb.storage.database();
+    for (let i = 0; i < WATCH_LIMIT; i++) db.prepare("INSERT INTO watches VALUES ('thr-1', 'prj-1', ?, 'pull', '{}', 'u', 'c', 0, 0)").run(`Acme/Widgets#${100 + i}`);
+    db.prepare("DELETE FROM watches WHERE key = 'Acme/Widgets#12'").run();
+    const full = await tool({ ref: "Acme/Widgets#12" });
+    expect(full).toMatchObject({ isError: true });
+    expect(text(full)).toContain(`already watches ${WATCH_LIMIT} GitHub pull requests or issues`);
+    // The limit is per thread.
+    expect(await tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-2", projectId: "prj-1" })).not.toMatchObject({ isError: true });
+  });
+
+  it("says so when gh is not signed in, and when the target is not there", async () => {
+    const { tool, text, rows } = await setup({ ...WITH_HOOKS, token: async () => { throw new NotSignedInError("no oauth token"); } });
+    const result = await tool({ ref: "Acme/Widgets#12" });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("GitHub is not signed in on this bb server (no oauth token)");
+    expect(rows()).toEqual([]);
+  });
+
+  it("re-reads the token from gh once when GitHub refuses it, and otherwise reuses it for five minutes", async () => {
+    const tokens = ["gho_old", "gho_new"];
+    const { tool, token, github, advance } = await setup({ ...WITH_HOOKS, token: async () => tokens.shift() ?? "gho_new" });
+    github.state.valid = (t) => t === "gho_new";
+    expect(await tool({ ref: "Acme/Widgets#12" })).not.toMatchObject({ isError: true });
+    expect(github.calls.map((c) => c.token)).toEqual(["gho_old", "gho_new"]);
+    expect(token).toHaveBeenCalledTimes(2);
+    await tool({ ref: "Acme/Widgets#12" });
+    expect(token).toHaveBeenCalledTimes(2);
+    advance(TOKEN_CACHE_MS + 1);
+    await tool({ ref: "Acme/Widgets#12" });
+    expect(token).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("the service", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+
+  it("leases the watches with the developer's token, checks on hello, and wakes the thread on a doorbell with what changed", async () => {
+    const w = await setup(WITH_HOOKS);
+    await w.tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-1", projectId: "prj-1" });
+    await w.tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-2", projectId: "prj-1" });
+    const service = w.harness.runService("watches");
+    await tick();
+    expect(w.hooks.streams).toHaveLength(1);
+    w.hooks.last().send(w.hooks.hello("c_1"));
+    await tick();
+    expect(w.hooks.subscribes).toEqual([{ connection: "c_1", source: "github", token: "gho_dev", watches: [{ kind: "issue", id: "Acme/Widgets#12" }] }]);
+    // The hello sweep read the pull request and found nothing new.
+    expect(w.github.calls.at(-1)!.variables).toEqual({ owner: "Acme", name: "Widgets", number: 12 });
+    expect(w.send).not.toHaveBeenCalled();
+
+    // A review lands, checks finish, one thread comments through gh with its signature, a human answers.
+    w.github.state.node = pullNode({
+      updatedAt: "2026-10-09T12:00:00Z",
+      reviewDecision: "APPROVED",
+      latestReviews: { nodes: [{ author: { login: "carol" }, state: "APPROVED" }] },
+      reviews: { nodes: [{ author: { login: "carol" }, state: "APPROVED", body: "LGTM", createdAt: "2026-10-09T11:00:00Z", submittedAt: "2026-10-09T11:00:00Z", url: "https://github.com/r/1", comments: { nodes: [] } }] },
+      comments: { nodes: [comment("old", "2026-10-09T09:00:00Z"), comment(`Addressed\n\n${signature("thr-1")}`, "2026-10-09T11:10:00Z", "jane"), comment("Merging", "2026-10-09T11:30:00Z")] },
+      commits: { nodes: [{ commit: { oid: "0123456789abcdef", statusCheckRollup: { state: "SUCCESS", contexts: { nodes: [{ __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://ci/1" }] } } } }] },
+    });
+    const reads = w.github.calls.length;
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#99"));
+    await tick(2999);
+    expect(w.send).not.toHaveBeenCalled();
+    await tick(1);
+    await tick();
+    expect(w.github.calls.length - reads).toBe(1);
+    const sent = w.sent();
+    expect(sent.map((m) => [m.threadId, m.mode, m.input[0]!.type])).toEqual([
+      ["thr-1", "auto", "text"],
+      ["thr-2", "auto", "text"],
+    ]);
+    const toOwner = sent[0]!.input[0]!.text;
+    expect(toOwner).toContain("GitHub pull request Acme/Widgets#12 changed: Add widgets");
+    expect(toOwner).toContain("- Review decision: review required → approved");
+    expect(toOwner).toContain("- Reviews: (none) → carol: approved");
+    expect(toOwner).toContain("- Checks: pending → success");
+    expect(toOwner).not.toContain("Head:");
+    expect(toOwner).toContain("**carol** approved — 2026-10-09T11:00:00Z");
+    expect(toOwner).toContain("> LGTM");
+    expect(toOwner).toContain("**bob** commented — 2026-10-09T11:30:00Z");
+    // thr-1 wrote the signed comment, so it is not told about it; thr-2 is.
+    expect(toOwner).not.toContain("Addressed");
+    expect(sent[1]!.input[0]!.text).toContain("Addressed");
+    expect(w.rows().map((r) => [r.updated_at, r.last_comment_at])).toEqual([
+      ["2026-10-09T12:00:00Z", "2026-10-09T11:30:00Z"],
+      ["2026-10-09T12:00:00Z", "2026-10-09T11:30:00Z"],
+    ]);
+    // Nothing is reported twice.
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(2);
+    expect(w.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("gho_dev");
+
+    service.controller.abort();
+    await service.done;
+    expect(w.hooks.last().closed).toBe(true);
+  });
+
+  it("keeps the cursor when the thread cannot be woken, and drops the watch when the thread is gone", async () => {
+    let mode: "fail" | "gone" | "ok" = "fail";
+    const w = await setup({
+      ...WITH_HOOKS,
+      send: async () => {
+        if (mode === "ok") return { kind: "sent" };
+        throw Object.assign(new Error(mode === "gone" ? "thread not found" : "busy"), mode === "gone" ? { code: "NOT_FOUND", status: 404 } : { status: 500 });
+      },
+    });
+    await w.tool({ ref: "Acme/Widgets#12" });
+    const service = w.harness.runService("watches");
+    await tick();
+    w.hooks.last().send(w.hooks.hello("c_1"));
+    await tick();
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T12:00:00Z", state: "MERGED", merged: true });
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(w.rows()[0]!.updated_at).toBe("2026-10-09T10:00:00Z");
+    // Still unreported, so the next doorbell says it again.
+    mode = "ok";
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(2);
+    expect(w.rows()[0]!.updated_at).toBe("2026-10-09T12:00:00Z");
+
+    mode = "gone";
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T13:00:00Z", title: "Renamed" });
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    await tick(3000);
+    expect(w.rows()).toEqual([]);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("forgets a thread's watches when it is archived or deleted", async () => {
+    const w = await setup(WITH_HOOKS);
+    await w.tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-1", projectId: "prj-1" });
+    await w.tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-2", projectId: "prj-1" });
+    await w.harness.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    expect(w.rows().map((r) => r.thread_id)).toEqual(["thr-2"]);
+    await w.harness.emitThreadEvent("thread.deleted", { thread: { id: "thr-2" } as never });
+    expect(w.rows()).toEqual([]);
+  });
+
+  it("drops a refused watch only when the developer cannot read the target either, and tells the thread", async () => {
+    const w = await setup(WITH_HOOKS);
+    await w.tool({ ref: "Acme/Widgets#12" });
+    w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+    const service = w.harness.runService("watches");
+    await tick();
+    w.hooks.last().send(w.hooks.hello("c_1"));
+    await tick();
+    // Readable here: the service is wrong or stale; the watch stays.
+    expect(w.rows()).toHaveLength(1);
+    expect(w.send).not.toHaveBeenCalled();
+    expect(w.harness.logEntries.some((l) => l.message.includes("keeping the watch"))).toBe(true);
+
+    // GitHub unreachable from here: neither answer can be confirmed, so the watch stays for the next renewal.
+    w.github.state.fail = true;
+    w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "unverifiable" })) });
+    await tick(30 * 60_000);
+    expect(w.hooks.subscribes).toHaveLength(2);
+    expect(w.rows()).toHaveLength(1);
+    w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+    await tick(30 * 60_000);
+    expect(w.hooks.subscribes).toHaveLength(3);
+    expect(w.rows()).toHaveLength(1);
+    expect(w.harness.logEntries.some((l) => l.message.includes("could not confirm a refused lease"))).toBe(true);
+    expect(w.send).not.toHaveBeenCalled();
+
+    // Gone for the developer too: the watch is dropped and the thread told, once.
+    w.github.state.fail = false;
+    w.github.state.node = null;
+    await tick(30 * 60_000);
+    expect(w.rows()).toEqual([]);
+    expect(w.sent().map((m) => m.input[0]!.text)).toEqual(["GitHub pull request Acme/Widgets#12 is no longer visible to the signed-in GitHub user (deleted, transferred, or access removed), so this thread has stopped watching it."]);
+    service.controller.abort();
+    await service.done;
+  });
+
+  it("re-reads the token from gh and retries once when the service says GitHub refused it", async () => {
+    const tokens = ["gho_old", "gho_new"];
+    const w = await setup({ ...WITH_HOOKS, token: async () => tokens.shift() ?? "gho_new" });
+    await w.tool({ ref: "Acme/Widgets#12" });
+    w.hooks.state.answer = (body) => (body.token === "gho_new" ? Response.json({ leases: body.watches, rejected: [] }) : new Response("token refused", { status: 401 }));
+    const service = w.harness.runService("watches");
+    await tick();
+    w.hooks.last().send(w.hooks.hello("c_1"));
+    await tick();
+    expect(w.hooks.subscribes.map((s) => s.token)).toEqual(["gho_old", "gho_new"]);
+    expect(w.token).toHaveBeenCalledTimes(2);
+    service.controller.abort();
+    await service.done;
+  });
+});
