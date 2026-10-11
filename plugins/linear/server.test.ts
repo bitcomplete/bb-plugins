@@ -453,7 +453,7 @@ describe("bb linear", () => {
     expect(harness.registrations.cli?.name).toBe("linear");
     const help = await harness.runCli(["--help"]);
     expect(help.exitCode).toBe(0);
-    for (const command of ["status", "issue", "search", "query"]) expect(help.stdout).toContain(command);
+    for (const command of ["status", "issue", "search", "query", "watches"]) expect(help.stdout).toContain(command);
   });
 
   it("status says who is connected, and that nobody is", async () => {
@@ -677,6 +677,81 @@ describe("watching an issue", () => {
       expect(w.rows()).toEqual([]);
       service.controller.abort();
       await service.done;
+    });
+
+    it("shows every watch with its counters, flags and thread title, lets one be stopped, and signals the settings section", async () => {
+      const get = vi.fn(async ({ threadId }: { threadId: string }) => {
+        if (threadId === "thr-1") return { id: threadId, title: "Fix login" };
+        throw Object.assign(new Error("not found"), { code: "NOT_FOUND" });
+      });
+      const live = liveLinear();
+      const hooks = fakeHooks();
+      const send = vi.fn(async () => ({ kind: "sent" }));
+      const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send, get } } });
+      const signals = () => s.harness.realtimeSignals.filter((x) => x.channel === "watches-changed").length;
+
+      // Before the service runs: no stream, nothing watched.
+      type View = { watches: Array<Record<string, unknown>>; threads: unknown; hooks: Record<string, unknown> };
+      let view = (await s.harness.callRpc("watches", null)) as View;
+      expect(view).toMatchObject({ now: s.now(), limit: WATCH_LIMIT, hooks: { configured: true, state: "stopped" }, threads: [], watches: [] });
+      expect(get).not.toHaveBeenCalled();
+
+      await s.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      expect(signals()).toBe(1);
+      const service = s.harness.runService("watches");
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      await tick();
+      // The hello sweep checked once without waking.
+      view = (await s.harness.callRpc("watches", null)) as View;
+      expect(view).toMatchObject({ hooks: { state: "connected", leased: true, sweeps: 1, lastSweepReason: "connected" } });
+      expect(view.watches).toEqual([
+        expect.objectContaining({
+          threadId: "thr-1",
+          threadTitle: "Fix login",
+          // A pasted token has no connection record, so no organization to build a URL from.
+          target: { id: "uuid-1", key: "ENG-123", kind: "issue", title: "Fix login", url: null },
+          state: "In Progress",
+          checks: 1,
+          wakes: 0,
+          lastCheckedAt: s.now(),
+          lastWokeAt: 0,
+          flags: [],
+        }),
+      ]);
+
+      live.state.issue = issue({ updatedAt: "2026-10-09T12:00:00Z", state: { name: "Done", type: "completed" }, comments: { nodes: [] } });
+      hooks.last().send(hooks.doorbell("uuid-1"));
+      await tick(3000);
+      expect(send).toHaveBeenCalledTimes(1);
+      view = (await s.harness.callRpc("watches", null)) as View;
+      expect(view.watches[0]).toMatchObject({ state: "Done", checks: 2, wakes: 1, wakesInWindow: 1, lastWokeAt: s.now() });
+      expect(view.hooks).toMatchObject({ doorbells: 1, lastDoorbellAt: s.now() });
+      expect(view.threads).toEqual([{ threadId: "thr-1", title: "Fix login", count: 1, wakes: 1, nearLimit: false }]);
+      const afterWake = signals();
+      expect(afterWake).toBeGreaterThan(1);
+
+      // A thread bb cannot read shows its id. The CLI prints the same view.
+      live.state.issue = issue({ id: "uuid-2", identifier: "ENG-2" });
+      await s.tool("linear_watch_issue", { key: "ENG-2" }, { threadId: "thr-gone", projectId: "prj-1" });
+      const cli = await s.harness.runCli(["watches"]);
+      expect(cli.exitCode).toBe(0);
+      expect(cli.stdout).toContain("Doorbells: connected and leased");
+      expect(cli.stdout).toContain("2 watches across 2 threads");
+      expect(cli.stdout).toMatch(/ENG-123 +Fix login +/u);
+      expect(cli.stdout).toMatch(/ENG-2 +thr-gone +/u);
+      expect(JSON.parse((await s.harness.runCli(["watches", "--json"])).stdout)).toMatchObject({ watches: [{ target: { key: "ENG-123" } }, { target: { key: "ENG-2" }, threadTitle: null }] });
+
+      // Stop one from settings: gone from the store, the thread is not told.
+      expect(await s.harness.callRpc("unwatch", { threadId: "thr-1", targetId: "uuid-1" })).toEqual({ removed: true });
+      expect(await s.harness.callRpc("unwatch", { threadId: "thr-1", targetId: "uuid-1" })).toEqual({ removed: false });
+      expect(s.bb.storage.database().prepare("SELECT issue_key FROM watches").all()).toEqual([{ issue_key: "ENG-2" }]);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(signals()).toBe(afterWake + 2);
+
+      service.controller.abort();
+      await service.done;
+      expect(((await s.harness.callRpc("watches", null)) as { hooks: { state: string } }).hooks.state).toBe("stopped");
     });
 
     it("forgets a thread's watches when it is archived or deleted", async () => {

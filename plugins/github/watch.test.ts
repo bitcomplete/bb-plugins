@@ -1,7 +1,30 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Target } from "./github.js";
-import { compare, createCheckQueue, createWatchStore, diffSnapshots, formatWake, initialCursors, newComments, signature, snapshotOf, WAKE_COMMENT_CHARS, WATCH_LIMIT, WATCH_MIGRATIONS, WATCH_TTL_MS, type WatchRow } from "./watch.js";
+import {
+  compare,
+  createCheckQueue,
+  createWatchStore,
+  diffSnapshots,
+  expiresAt,
+  flagsFor,
+  formatWake,
+  IDLE_AFTER_MS,
+  initialCursors,
+  newComments,
+  NOISY_WAKES_PER_WINDOW,
+  RATE_WINDOW_MS,
+  RECENT_WAKES_KEPT,
+  signature,
+  snapshotOf,
+  WAKE_COMMENT_CHARS,
+  wakesInWindow,
+  WATCH_LIMIT,
+  WATCH_MIGRATIONS,
+  WATCH_TTL_MS,
+  type Usage,
+  type WatchRow,
+} from "./watch.js";
 
 const pull = (over: Partial<Target> = {}, pullOver: Partial<NonNullable<Target["pull"]>> = {}): Target => ({
   kind: "pull",
@@ -24,7 +47,7 @@ const pull = (over: Partial<Target> = {}, pullOver: Partial<NonNullable<Target["
 
 const comment = (body: string, createdAt: string, who = "bob", did = "commented") => ({ author: who, did, body, createdAt, url: `https://github.com/c/${createdAt}` });
 
-const watchOf = (t: Target, threadId = "thr-1"): WatchRow => ({ threadId, projectId: "prj-1", key: t.key, kind: t.kind, snapshot: snapshotOf(t), ...initialCursors(t, "2026-10-09T12:00:00Z"), createdAt: 0, lastActivityAt: 0 });
+const watchOf = (t: Target, threadId = "thr-1"): WatchRow => ({ threadId, projectId: "prj-1", key: t.key, kind: t.kind, snapshot: snapshotOf(t), ...initialCursors(t, "2026-10-09T12:00:00Z"), createdAt: 0, lastActivityAt: 0, checks: 0, wakes: 0, lastCheckedAt: 0, lastWokeAt: 0, recentWakes: [] });
 
 describe("snapshots", () => {
   it("report each changed field with both values, in a fixed order", () => {
@@ -161,6 +184,68 @@ describe("the store", () => {
     const w = store.get("thr-1", "a/b#1")!;
     expect(w.snapshot.state).toBeNull();
     expect(compare(w, pull()).message).toContain("- State: (none) → open");
+  });
+});
+
+describe("usage", () => {
+  let db: Database.Database;
+  let now = 1_000_000;
+  beforeEach(() => {
+    db = new Database(":memory:");
+    for (const statement of WATCH_MIGRATIONS) db.exec(statement);
+    now = 1_000_000;
+  });
+  afterEach(() => db.close());
+
+  it("counts checks and wakes, remembers when each last happened, and keeps the newest wake times", () => {
+    const store = createWatchStore(db, () => now);
+    store.add({ threadId: "thr-1", projectId: "prj", key: "a/b#1", kind: "pull", snapshot: snapshotOf(pull()), updatedAt: "u", lastCommentAt: "c" });
+    const fresh = store.get("thr-1", "a/b#1")!;
+    expect([fresh.checks, fresh.wakes, fresh.lastCheckedAt, fresh.lastWokeAt, fresh.recentWakes]).toEqual([0, 0, 0, 0, []]);
+
+    now += 1000;
+    store.advance("thr-1", "a/b#1", compare(fresh, pull({ updatedAt: "later" })), false);
+    let w = store.get("thr-1", "a/b#1")!;
+    expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.recentWakes]).toEqual([1, 0, now, 0, []]);
+    expect(w.lastActivityAt).toBe(1_000_000);
+
+    for (let i = 0; i < RECENT_WAKES_KEPT + 3; i++) {
+      now += 1000;
+      store.advance("thr-1", "a/b#1", compare(w, pull({ title: `T${i}` })), true);
+      w = store.get("thr-1", "a/b#1")!;
+    }
+    expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.lastActivityAt]).toEqual([RECENT_WAKES_KEPT + 4, RECENT_WAKES_KEPT + 3, now, now, now]);
+    expect(w.recentWakes).toHaveLength(RECENT_WAKES_KEPT);
+    expect(w.recentWakes.at(-1)).toBe(now);
+    expect(w.recentWakes[0]).toBe(now - (RECENT_WAKES_KEPT - 1) * 1000);
+    expect(wakesInWindow(w, now, 10_500)).toBe(11);
+  });
+
+  const DAY = 86_400_000;
+  const usage = (over: Partial<Usage> = {}): Usage => ({ checks: 0, wakes: 0, lastCheckedAt: 0, lastWokeAt: 0, recentWakes: [], createdAt: 0, lastActivityAt: 0, ...over });
+
+  it("calls a watch idle once it is old and has not woken in as long", () => {
+    const at = 10 * DAY;
+    expect(flagsFor(usage({ createdAt: at - IDLE_AFTER_MS + 1, lastActivityAt: at }), at)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: at - IDLE_AFTER_MS, lastActivityAt: at }), at)).toEqual(["idle"]);
+    expect(flagsFor(usage({ createdAt: 0, lastWokeAt: at - DAY, lastActivityAt: at - DAY }), at)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: 0, lastWokeAt: at - IDLE_AFTER_MS, lastActivityAt: at }), at)).toEqual(["idle"]);
+  });
+
+  it("calls a watch noisy at the wake rate, counting only the last hour", () => {
+    const at = 10 * DAY;
+    const recent = (n: number, spread: number) => Array.from({ length: n }, (_, i) => at - i * spread);
+    const woke = (recentWakes: number[]) => usage({ recentWakes, lastWokeAt: at, lastActivityAt: at });
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW - 1, 1000)), at)).toEqual([]);
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW, 1000)), at)).toEqual(["noisy"]);
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW, RATE_WINDOW_MS / 2)), at)).toEqual([]);
+  });
+
+  it("says when a watch is about to be forgotten", () => {
+    const at = 10 * DAY;
+    expect(flagsFor(usage({ createdAt: at, lastActivityAt: at - WATCH_TTL_MS + DAY }), at)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: at, lastActivityAt: at - WATCH_TTL_MS + DAY - 1 }), at)).toEqual(["expiring"]);
+    expect(expiresAt(usage({ lastActivityAt: 5 }))).toBe(5 + WATCH_TTL_MS);
   });
 });
 

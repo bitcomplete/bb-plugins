@@ -71,10 +71,12 @@ import {
   type Tokens,
 } from "./oauth.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Rejection } from "./hooks-client.js";
+import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
+import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signature, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export const CALLBACK_PATH = "/connect/callback";
-export const CONNECTION_CHANGED = "connection-changed";
+export { CONNECTION_CHANGED, WATCHES_CHANGED };
 /**
  * The server's environment can carry the deployment's OAuth client ID, so a
  * fleet of servers behind one hostname shares one Linear application without
@@ -108,6 +110,16 @@ export const rpcContract = defineRpcContract({
   disconnect: {
     input: z.null(),
     output: z.object({ ok: z.boolean() }),
+  },
+  /** Every watch on this server and what the doorbell stream is doing. */
+  watches: {
+    input: z.null(),
+    output: usageViewSchema,
+  },
+  /** Forget one watch; the thread is not told. */
+  unwatch: {
+    input: z.object({ threadId: z.string().min(1), targetId: z.string().min(1) }),
+    output: z.object({ removed: z.boolean() }),
   },
 });
 
@@ -336,6 +348,16 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         await bb.storage.kv.delete(EXPIRY_KEY);
         announceConnection(false);
         return { ok: true };
+      },
+      watches: () => usage(),
+      async unwatch({ threadId, targetId }) {
+        const removed = watches.get(threadId, targetId) !== null;
+        if (removed) {
+          watches.remove(threadId, targetId);
+          bb.log.info(`watch on ${targetId} by thread ${threadId} removed from settings`);
+          announceWatches();
+        }
+        return { removed };
       },
     });
 
@@ -674,6 +696,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     const watches = createWatchStore(db, deps.now);
     const checkSignal = () => AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 
+    /** The settings section re-reads the usage view on this. */
+    const announceWatches = () => bb.realtime.publish(WATCHES_CHANGED, {});
+
     /** Message a thread. "gone" when the thread no longer exists, so the caller drops the watch. */
     async function wake(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
       try {
@@ -690,6 +715,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     /** The issue is gone or no longer readable as the developer: tell the thread once and forget the watch. */
     async function dropInvisible(watch: WatchRow): Promise<void> {
       watches.remove(watch.threadId, watch.issueId);
+      announceWatches();
       await wake(watch.threadId, `Linear issue ${watch.issueKey} is no longer visible to the connected user (deleted, moved, or access removed), so this thread has stopped watching it.`);
     }
 
@@ -719,6 +745,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         const sent = await wake(watch.threadId, outcome.message);
         if (sent === "gone") watches.remove(watch.threadId, watch.issueId);
         else if (sent === "sent") watches.advance(watch.threadId, watch.issueId, outcome, true);
+        if (sent !== "failed") announceWatches();
       }
     }
 
@@ -727,7 +754,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     async function sweep(reason: string): Promise<void> {
       const expired = watches.expire();
-      if (expired > 0) bb.log.info(`forgot ${expired} Linear watch${expired === 1 ? "" : "es"} idle for a week`);
+      if (expired > 0) {
+        bb.log.info(`forgot ${expired} Linear watch${expired === 1 ? "" : "es"} idle for a week`);
+        announceWatches();
+      }
       const ids = watches.issueIds();
       if (ids.length > 0) bb.log.info(`checking ${ids.length} watched Linear issue${ids.length === 1 ? "" : "s"} (${reason})`);
       await checks.sweep(ids);
@@ -769,6 +799,37 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       onRejected,
       sweep,
     });
+    hooks.onStateChange(announceWatches);
+
+    /**
+     * The usage view: every watch with its counters, flags and thread title,
+     * and the doorbell stream's state. Titles come from bb per thread; a
+     * thread that cannot be read shows its id.
+     */
+    async function usage() {
+      const rows = watches.all();
+      const status = await connectionStatus();
+      const base = status.organization === null ? null : `${status.linearUrl.replace(/\/$/u, "")}/${status.organization.urlKey}/issue/`;
+      const titles = new Map<string, string | null>();
+      await Promise.all(
+        [...new Set(rows.map((r) => r.threadId))].map(async (threadId) => {
+          try {
+            const thread = (await bb.sdk.threads.get({ threadId })) as { title?: string | null; titleFallback?: string | null };
+            titles.set(threadId, thread.title ?? thread.titleFallback ?? null);
+          } catch {
+            titles.set(threadId, null);
+          }
+        }),
+      );
+      return buildUsage({
+        rows,
+        hooks: hooks.status(),
+        configured: hooksUrl !== "",
+        now: deps.now(),
+        titles,
+        target: (row) => ({ id: row.issueId, key: row.issueKey, kind: "issue", title: row.snapshot.title, url: base === null ? null : `${base}${row.issueKey}` }),
+      });
+    }
 
     if (hooksUrl !== "") {
       // Runs the stream only while Linear is connected: a lease is proven
@@ -811,7 +872,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     const forgetThread = (threadId: string) => {
       const removed = watches.removeThread(threadId);
-      if (removed > 0) bb.log.info(`thread ${threadId} is gone; forgot its ${removed} Linear watch${removed === 1 ? "" : "es"}`);
+      if (removed > 0) {
+        bb.log.info(`thread ${threadId} is gone; forgot its ${removed} Linear watch${removed === 1 ? "" : "es"}`);
+        announceWatches();
+      }
     };
     bb.events.on("thread.archived", ({ thread }) => forgetThread(thread.id));
     bb.events.on("thread.deleted", ({ thread }) => forgetThread(thread.id));
@@ -845,6 +909,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
           hooks.added(issue.id).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
+          announceWatches();
           return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
         } catch (error) {
           return toolError(error);
@@ -900,6 +965,17 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
               if (!status.connected) return { exitCode: 0, stdout: status.configured ? "Linear is not connected." : "Linear is not connected, and no OAuth client ID is set." };
               const who = status.user === null ? "an unknown user" : status.user.name;
               return { exitCode: 0, stdout: `Connected to Linear as ${who}${status.organization === null ? "" : ` in ${status.organization.name}`}.` };
+            },
+          }),
+
+          watches: cliCommand({
+            summary: "Every watch on this server, how busy each has been, and the doorbell stream's state",
+            description:
+              "The same view as Settings → Plugins → Linear → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
+            options: { json: JSON_OPTION },
+            async run(input) {
+              const view = await usage();
+              return { exitCode: 0, stdout: input.options.json ? JSON.stringify(view) : formatUsage(view) };
             },
           }),
 

@@ -44,7 +44,54 @@ export const WATCH_MIGRATIONS = [
      PRIMARY KEY (thread_id, issue_id)
    )`,
   `CREATE INDEX IF NOT EXISTS watches_issue ON watches (issue_id)`,
+  // Usage: how often a watch has been checked and woken, and when last. 0 is
+  // never. recent_wakes is a JSON list of the newest wake times, so a wake
+  // rate can be read without a history table.
+  `ALTER TABLE watches ADD COLUMN checks INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE watches ADD COLUMN wakes INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE watches ADD COLUMN last_checked_at INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE watches ADD COLUMN last_woke_at INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE watches ADD COLUMN recent_wakes TEXT NOT NULL DEFAULT '[]'`,
 ];
+
+// ---- usage ---------------------------------------------------------------------
+
+/** How many wake times a watch keeps; enough to judge a rate over the last hour. */
+export const RECENT_WAKES_KEPT = 50;
+/** A watch this old that has not woken in this long is flagged idle: a wait somebody forgot. */
+export const IDLE_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+/** The window a wake rate is judged over. */
+export const RATE_WINDOW_MS = 60 * 60 * 1000;
+/** This many wakes in the window flags a watch noisy: the ticket is restarting the thread's turn too often. */
+export const NOISY_WAKES_PER_WINDOW = 5;
+/** A thread with this many watches is flagged as near its limit. */
+export const NEAR_LIMIT_AT = 8;
+
+export type WatchFlag = "idle" | "noisy" | "expiring";
+
+export type Usage = { checks: number; wakes: number; lastCheckedAt: number; lastWokeAt: number; recentWakes: number[]; createdAt: number; lastActivityAt: number };
+
+/** How many of the remembered wakes fall in the window ending now. */
+export function wakesInWindow(usage: Pick<Usage, "recentWakes">, now: number, windowMs = RATE_WINDOW_MS): number {
+  return usage.recentWakes.filter((at) => at > now - windowMs).length;
+}
+
+/** When the watch is forgotten unless something wakes it or asks for it again. */
+export const expiresAt = (usage: Pick<Usage, "lastActivityAt">) => usage.lastActivityAt + WATCH_TTL_MS;
+
+/**
+ * What stands out about one watch, for a usage view. `idle`: old and never
+ * or long since woken. `noisy`: woken often in the last hour. `expiring`:
+ * forgotten within a day unless something happens.
+ */
+export function flagsFor(usage: Usage, now: number): WatchFlag[] {
+  const flags: WatchFlag[] = [];
+  const lastWoke = usage.lastWokeAt === 0 ? usage.createdAt : usage.lastWokeAt;
+  if (now - usage.createdAt >= IDLE_AFTER_MS && now - lastWoke >= IDLE_AFTER_MS) flags.push("idle");
+  if (wakesInWindow(usage, now) >= NOISY_WAKES_PER_WINDOW) flags.push("noisy");
+  if (expiresAt(usage) - now < 24 * 60 * 60 * 1000) flags.push("expiring");
+  return flags;
+}
 
 // ---- what a watch remembers ---------------------------------------------------
 
@@ -179,6 +226,14 @@ export type WatchRow = {
   lastCommentAt: string;
   createdAt: number;
   lastActivityAt: number;
+  checks: number;
+  wakes: number;
+  /** 0 when never. */
+  lastCheckedAt: number;
+  /** 0 when never. */
+  lastWokeAt: number;
+  /** The newest wake times, oldest first; at most RECENT_WAKES_KEPT. */
+  recentWakes: number[];
 };
 
 export type CheckOutcome = {
@@ -217,7 +272,21 @@ type Row = {
   last_comment_at: string;
   created_at: number;
   last_activity_at: number;
+  checks: number;
+  wakes: number;
+  last_checked_at: number;
+  last_woke_at: number;
+  recent_wakes: string;
 };
+
+function parseRecentWakes(raw: string): number[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is number => typeof v === "number") : [];
+  } catch {
+    return [];
+  }
+}
 
 function rowToWatch(row: Row): WatchRow {
   const parsed = snapshotSchema.safeParse(JSON.parse(row.snapshot));
@@ -233,19 +302,27 @@ function rowToWatch(row: Row): WatchRow {
     lastCommentAt: row.last_comment_at,
     createdAt: row.created_at,
     lastActivityAt: row.last_activity_at,
+    checks: row.checks,
+    wakes: row.wakes,
+    lastCheckedAt: row.last_checked_at,
+    lastWokeAt: row.last_woke_at,
+    recentWakes: parseRecentWakes(row.recent_wakes),
   };
 }
+
+/** What a caller supplies; the store fills in the timestamps and counters. */
+export type NewWatch = Omit<WatchRow, "createdAt" | "lastActivityAt" | "checks" | "wakes" | "lastCheckedAt" | "lastWokeAt" | "recentWakes">;
 
 export type AddResult = { outcome: "added" } | { outcome: "already" } | { outcome: "full"; limit: number };
 
 export interface WatchStore {
-  add(watch: Omit<WatchRow, "createdAt" | "lastActivityAt">): AddResult;
+  add(watch: NewWatch): AddResult;
   all(): WatchRow[];
   forIssue(issueId: string): WatchRow[];
   get(threadId: string, issueId: string): WatchRow | null;
   /** Every distinct issue id with at least one watch: what to lease. */
   issueIds(): string[];
-  /** After a check: the new memory, and whether the thread was woken (activity). */
+  /** After a check: the new memory, the check counted, and whether the thread was woken (activity, and counted too). */
   advance(threadId: string, issueId: string, outcome: CheckOutcome, woke: boolean): void;
   remove(threadId: string, issueId: string): void;
   removeThread(threadId: string): number;
@@ -264,13 +341,16 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
   const selectIssue = db.prepare<[string], Row>("SELECT * FROM watches WHERE issue_id = ? ORDER BY created_at");
   const selectIds = db.prepare<[], { issue_id: string }>("SELECT DISTINCT issue_id FROM watches ORDER BY issue_id");
   const touch = db.prepare("UPDATE watches SET last_activity_at = ? WHERE thread_id = ? AND issue_id = ?");
-  const update = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, issue_key = ? WHERE thread_id = ? AND issue_id = ?");
-  const updateWoke = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, issue_key = ?, last_activity_at = ? WHERE thread_id = ? AND issue_id = ?");
+  const update = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, issue_key = ?, checks = checks + 1, last_checked_at = ? WHERE thread_id = ? AND issue_id = ?");
+  const updateWoke = db.prepare(
+    "UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, issue_key = ?, checks = checks + 1, last_checked_at = ?, wakes = wakes + 1, last_woke_at = ?, recent_wakes = ?, last_activity_at = ? WHERE thread_id = ? AND issue_id = ?",
+  );
+  const selectRecent = db.prepare<[string, string], { recent_wakes: string }>("SELECT recent_wakes FROM watches WHERE thread_id = ? AND issue_id = ?");
   const deleteOne = db.prepare("DELETE FROM watches WHERE thread_id = ? AND issue_id = ?");
   const deleteThread = db.prepare("DELETE FROM watches WHERE thread_id = ?");
   const deleteExpired = db.prepare("DELETE FROM watches WHERE last_activity_at < ?");
 
-  const add = db.transaction((watch: Omit<WatchRow, "createdAt" | "lastActivityAt">): AddResult => {
+  const add = db.transaction((watch: NewWatch): AddResult => {
     if (selectOne.get(watch.threadId, watch.issueId) !== undefined) {
       // Asking again is a sign the thread still cares; that is activity.
       touch.run(now(), watch.threadId, watch.issueId);
@@ -302,8 +382,13 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
     issueIds: () => selectIds.all().map((r) => r.issue_id),
     advance: (threadId, issueId, outcome, woke) => {
       const snapshot = JSON.stringify(outcome.snapshot);
-      if (woke) updateWoke.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.issueKey, now(), threadId, issueId);
-      else update.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.issueKey, threadId, issueId);
+      const at = now();
+      if (!woke) {
+        update.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.issueKey, at, threadId, issueId);
+        return;
+      }
+      const recent = [...parseRecentWakes(selectRecent.get(threadId, issueId)?.recent_wakes ?? "[]"), at].slice(-RECENT_WAKES_KEPT);
+      updateWoke.run(snapshot, outcome.updatedAt, outcome.lastCommentAt, outcome.issueKey, at, at, JSON.stringify(recent), at, threadId, issueId);
     },
     remove: (threadId, issueId) => {
       deleteOne.run(threadId, issueId);

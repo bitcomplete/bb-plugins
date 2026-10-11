@@ -302,6 +302,43 @@ describe("the loop", () => {
     await s.done;
   });
 
+  it("reports its state and how busy it has been, and says when the state changes", async () => {
+    const hooks = fakeHooks();
+    hooks.state.eventsStatus = 503;
+    const s = start(hooks);
+    const changes: string[] = [];
+    s.loop.onStateChange(() => changes.push(s.loop.status().state));
+    await tick();
+    expect(s.loop.status()).toMatchObject({ state: "connecting", since: now, leased: false, leasedUntil: 0, doorbells: 0, sweeps: 1, lastSweepAt: now, lastSweepReason: "stream down" });
+
+    hooks.state.eventsStatus = 200;
+    await tick(1000);
+    const connectedAt = now;
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    expect(changes).toEqual(["connected"]);
+    expect(s.loop.status()).toMatchObject({ state: "connected", since: connectedAt, leased: true, leasedUntil: connectedAt + 60 * MINUTE, sweeps: 2, lastSweepReason: "connected" });
+
+    hooks.last().send(hooks.doorbell("i-1"));
+    hooks.last().send(hooks.doorbell("i-2"));
+    hooks.last().send(hooks.doorbell("team-1", { kind: "team" }));
+    await tick();
+    expect(s.loop.status()).toMatchObject({ doorbells: 2, lastDoorbellAt: now });
+    // Counts are over the last hour; the last time is kept.
+    const lastDoorbellAt = now;
+    await tick(61 * MINUTE);
+    expect(s.loop.status()).toMatchObject({ doorbells: 0, lastDoorbellAt });
+
+    hooks.last().end();
+    await tick();
+    expect(changes).toEqual(["connected", "connecting"]);
+    expect(s.loop.status().state).toBe("connecting");
+    s.controller.abort();
+    await s.done;
+    expect(changes).toEqual(["connected", "connecting", "stopped"]);
+    expect(s.loop.status()).toMatchObject({ state: "stopped", leased: false });
+  });
+
   it("leases a newly added watch right away when connected, and leaves it to the next hello otherwise", async () => {
     const hooks = fakeHooks();
     const s = start(hooks, { watchIds: () => [] });

@@ -12,14 +12,31 @@
 // of this plugin: a watch (watch.ts) is a row in the plugin's SQLite plus a
 // lease on bb-gate-hooks (hooks-client.ts); when GitHub's webhook rings, the
 // target is re-read here and the thread is messaged with what changed.
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { WATCHES_CHANGED } from "./channels.js";
 import { createGhTokenReader, type TokenReader } from "./gh.js";
 import { GITHUB_API_URL, GitHubRequestError, TARGET_QUERY, graphql, kindName, parseRef, parseRefKey, parseTarget, type Target } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Rejection } from "./hooks-client.js";
+import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
+export { WATCHES_CHANGED };
+
 const REQUEST_TIMEOUT_MS = 30_000;
+
+export const rpcContract = defineRpcContract({
+  /** Every watch on this server and what the doorbell stream is doing. */
+  watches: {
+    input: z.null(),
+    output: usageViewSchema,
+  },
+  /** Forget one watch; the thread is not told. */
+  unwatch: {
+    input: z.object({ threadId: z.string().min(1), targetId: z.string().min(1) }),
+    output: z.object({ removed: z.boolean() }),
+  },
+});
 /** How long a token read from gh is reused before gh is asked again. */
 export const TOKEN_CACHE_MS = 5 * 60 * 1000;
 
@@ -95,6 +112,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     const watches = createWatchStore(db, deps.now);
     const checkSignal = () => AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 
+    /** The settings section re-reads the usage view on this. */
+    const announceWatches = () => bb.realtime.publish(WATCHES_CHANGED, {});
+
     /** Message a thread. "gone" when the thread no longer exists, so the caller drops the watch. */
     async function wake(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
       try {
@@ -111,6 +131,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     /** The target is gone or no longer readable as the developer: tell the thread once and forget the watch. */
     async function dropInvisible(watch: WatchRow): Promise<void> {
       watches.remove(watch.threadId, watch.key);
+      announceWatches();
       await wake(watch.threadId, `GitHub ${kindName(watch.kind)} ${watch.key} is no longer visible to the signed-in GitHub user (deleted, transferred, or access removed), so this thread has stopped watching it.`);
     }
 
@@ -141,6 +162,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const sent = await wake(watch.threadId, outcome.message);
         if (sent === "gone") watches.remove(watch.threadId, watch.key);
         else if (sent === "sent") watches.advance(watch.threadId, watch.key, outcome, true);
+        if (sent !== "failed") announceWatches();
       }
     }
 
@@ -149,7 +171,10 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
     async function sweep(reason: string): Promise<void> {
       const expired = watches.expire();
-      if (expired > 0) bb.log.info(`forgot ${expired} GitHub watch${expired === 1 ? "" : "es"} idle for a week`);
+      if (expired > 0) {
+        bb.log.info(`forgot ${expired} GitHub watch${expired === 1 ? "" : "es"} idle for a week`);
+        announceWatches();
+      }
       const keys = watches.keys();
       if (keys.length > 0) bb.log.info(`checking ${keys.length} watched GitHub pull request${keys.length === 1 ? "" : "s"} or issue${keys.length === 1 ? "" : "s"} (${reason})`);
       await checks.sweep(keys);
@@ -192,6 +217,74 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       onRejected,
       sweep,
     });
+    hooks.onStateChange(announceWatches);
+
+    /**
+     * The usage view: every watch with its counters, flags and thread title,
+     * and the doorbell stream's state. Titles come from bb per thread; a
+     * thread that cannot be read shows its id.
+     */
+    async function usage() {
+      const rows = watches.all();
+      const titles = new Map<string, string | null>();
+      await Promise.all(
+        [...new Set(rows.map((r) => r.threadId))].map(async (threadId) => {
+          try {
+            const thread = (await bb.sdk.threads.get({ threadId })) as { title?: string | null; titleFallback?: string | null };
+            titles.set(threadId, thread.title ?? thread.titleFallback ?? null);
+          } catch {
+            titles.set(threadId, null);
+          }
+        }),
+      );
+      return buildUsage({
+        rows,
+        hooks: hooks.status(),
+        configured: hooksUrl !== "",
+        now: deps.now(),
+        titles,
+        target: (row) => {
+          const ref = parseRefKey(row.key);
+          const url = ref === null ? null : `https://github.com/${ref.repo}/${row.kind === "pull" ? "pull" : "issues"}/${ref.number}`;
+          return { id: row.key, key: row.key, kind: row.kind, title: row.snapshot.title, url };
+        },
+      });
+    }
+
+    bb.rpc.register(rpcContract, {
+      watches: () => usage(),
+      async unwatch({ threadId, targetId }) {
+        const removed = watches.get(threadId, targetId) !== null;
+        if (removed) {
+          watches.remove(threadId, targetId);
+          bb.log.info(`watch on ${targetId} by thread ${threadId} removed from settings`);
+          announceWatches();
+        }
+        return { removed };
+      },
+    });
+
+    // `bb github watches` is the same view for a shell: a colleague's server,
+    // or a script that wants to know what is being waited on.
+    bb.cli.register(
+      defineCli({
+        name: "github",
+        summary: "What this server's threads are watching on GitHub",
+        description: "Runs on the bb server. Reads the plugin's own watch list; GitHub itself is read with gh.",
+        commands: {
+          watches: cliCommand({
+            summary: "Every watch on this server, how busy each has been, and the doorbell stream's state",
+            description:
+              "The same view as Settings → Plugins → GitHub → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
+            options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
+            async run(input) {
+              const view = await usage();
+              return { exitCode: 0, stdout: input.options.json ? JSON.stringify(view) : formatUsage(view) };
+            },
+          }),
+        },
+      }),
+    );
 
     if (hooksUrl !== "") {
       // The stream is held whether or not gh is signed in: a lease is only
@@ -206,7 +299,10 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
     const forgetThread = (threadId: string) => {
       const removed = watches.removeThread(threadId);
-      if (removed > 0) bb.log.info(`thread ${threadId} is gone; forgot its ${removed} GitHub watch${removed === 1 ? "" : "es"}`);
+      if (removed > 0) {
+        bb.log.info(`thread ${threadId} is gone; forgot its ${removed} GitHub watch${removed === 1 ? "" : "es"}`);
+        announceWatches();
+      }
     };
     bb.events.on("thread.archived", ({ thread }) => forgetThread(thread.id));
     bb.events.on("thread.deleted", ({ thread }) => forgetThread(thread.id));
@@ -246,6 +342,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
           hooks.added(target.key).catch((error: unknown) => bb.log.warn(`could not lease ${target.key} right away: ${errorMessage(error)}`));
+          announceWatches();
           return `Watching ${what}. This thread will be messaged when it changes or someone else comments; end the turn rather than polling.`;
         } catch (error) {
           return toolError(error);

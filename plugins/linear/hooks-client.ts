@@ -212,6 +212,31 @@ export interface HooksLoopDeps {
   timing?: Partial<HooksTiming>;
 }
 
+/**
+ * The loop as a usage view sees it. `stopped`: `run` is not running (no
+ * service, or nothing to prove a lease with). `connecting`: running, no
+ * stream with a hello on it yet, so checks fall back to the slow down-sweep.
+ * `connected`: a stream is up; `leased` says whether the leases on it are
+ * current. Counts are over the last `windowMs`.
+ */
+export type HooksStatus = {
+  state: "stopped" | "connecting" | "connected";
+  /** When the state last changed. */
+  since: number;
+  leased: boolean;
+  /** When the current leases run out; 0 while there are none. */
+  leasedUntil: number;
+  windowMs: number;
+  doorbells: number;
+  lastDoorbellAt: number;
+  sweeps: number;
+  lastSweepAt: number;
+  lastSweepReason: string | null;
+};
+
+/** The window the status counts doorbells and sweeps over. */
+export const STATUS_WINDOW_MS = 60 * 60 * 1000;
+
 export interface HooksLoop {
   /** Run until the signal aborts. Never throws for a network reason; it retries. */
   run(signal: AbortSignal): Promise<void>;
@@ -219,6 +244,29 @@ export interface HooksLoop {
   added(issueId: string): Promise<void>;
   /** Whether a connection is up and leased; for status lines and tests. */
   readonly connected: boolean;
+  /** What the loop is doing and how busy it has been; for the usage view. */
+  status(): HooksStatus;
+  /** Called whenever `status().state` changes. */
+  onStateChange(listener: () => void): void;
+}
+
+/** How many events fell in the window ending now, and when the last one was (however long ago). */
+function createWindowCounter(windowMs: number, now: () => number) {
+  let stamps: number[] = [];
+  let lastAt = 0;
+  return {
+    push() {
+      lastAt = now();
+      stamps.push(lastAt);
+      stamps = stamps.filter((t) => t > lastAt - windowMs);
+    },
+    count: () => {
+      const at = now();
+      stamps = stamps.filter((t) => t > at - windowMs);
+      return stamps.length;
+    },
+    last: () => lastAt,
+  };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -245,10 +293,25 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   /** Aborting this drops the current stream so the outer loop reconnects. */
   let stream: AbortController | null = null;
   let lastSweepAt = 0;
+  let lastSweepReason: string | null = null;
   let wrongUrlLogged = false;
+
+  const doorbells = createWindowCounter(STATUS_WINDOW_MS, deps.now);
+  const sweeps = createWindowCounter(STATUS_WINDOW_MS, deps.now);
+  let state: HooksStatus["state"] = "stopped";
+  let stateSince = deps.now();
+  const stateListeners = new Set<() => void>();
+  function setState(next: HooksStatus["state"]): void {
+    if (next === state) return;
+    state = next;
+    stateSince = deps.now();
+    for (const listener of stateListeners) listener();
+  }
 
   function runSweep(reason: string): void {
     lastSweepAt = deps.now();
+    lastSweepReason = reason;
+    sweeps.push();
     deps.sweep(reason).catch((error: unknown) => deps.log.warn(`Linear watch sweep (${reason}) failed: ${errorMessage(error)}`));
   }
 
@@ -326,6 +389,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
             return;
           }
           connection = hello.data.connection;
+          setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
           deps.log.info(`Linear watches: connected to bb-gate-hooks as ${connection}`);
           // Not awaited: doorbells behind the hello must not wait for Linear.
@@ -344,7 +408,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           const doorbell = doorbellSchema.safeParse(parsed);
           // `action` and `at` are for the service's logs; the reaction to any
           // doorbell is the same check.
-          if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") deps.onDoorbell(doorbell.data.id);
+          if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") {
+            doorbells.push();
+            deps.onDoorbell(doorbell.data.id);
+          }
         }
       }
     } finally {
@@ -360,6 +427,25 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       return connection !== null && leasedUntil > deps.now();
     },
 
+    status() {
+      return {
+        state,
+        since: stateSince,
+        leased: connection !== null && leasedUntil > deps.now(),
+        leasedUntil: connection === null ? 0 : leasedUntil,
+        windowMs: STATUS_WINDOW_MS,
+        doorbells: doorbells.count(),
+        lastDoorbellAt: doorbells.last(),
+        sweeps: sweeps.count(),
+        lastSweepAt,
+        lastSweepReason,
+      };
+    },
+
+    onStateChange(listener) {
+      stateListeners.add(listener);
+    },
+
     async added(issueId) {
       if (connection === null || stream === null) return;
       await lease([issueId], stream.signal);
@@ -367,6 +453,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async run(signal) {
       let backoff = timing.backoffMinMs;
+      setState("connecting");
       while (!signal.aborted) {
         const controller = new AbortController();
         const onAbort = () => controller.abort();
@@ -384,6 +471,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           signal.removeEventListener("abort", onAbort);
           controller.abort();
           stream = null;
+          setState(signal.aborted ? "stopped" : "connecting");
         }
         if (signal.aborted) break;
         // Down: nobody is ringing, so look for ourselves, slowly.
@@ -391,6 +479,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         await sleep(backoff, signal);
         backoff = Math.min(backoff * 2, timing.backoffMaxMs);
       }
+      setState("stopped");
     },
   };
 }

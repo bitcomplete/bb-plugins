@@ -48,7 +48,8 @@ function fakeGitHub() {
     if (state.fail) return Response.json({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] });
     const v = body.variables as { owner: string; name: string; number: number };
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
-    if (v.number !== 12 || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
+    const number = typeof state.node?.number === "number" ? state.node.number : 12;
+    if (v.number !== number || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
     return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: state.node } } });
   }) as unknown as typeof fetch;
   return { fetchImpl, calls, state };
@@ -94,9 +95,9 @@ function fakeHooks() {
   };
 }
 
-async function setup(options: { env?: Record<string, string>; send?: (...args: never[]) => unknown; token?: () => Promise<string> } = {}) {
+async function setup(options: { env?: Record<string, string>; send?: (...args: never[]) => unknown; get?: (args: { threadId: string }) => Promise<unknown>; token?: () => Promise<string> } = {}) {
   const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
-  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send } } });
+  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) } } });
   const github = fakeGitHub();
   const hooks = fakeHooks();
   let now = 1_000_000_000_000;
@@ -110,6 +111,23 @@ async function setup(options: { env?: Record<string, string>; send?: (...args: n
   const sent = () => send.mock.calls.map((c) => c[0] as { threadId: string; mode: string; input: Array<{ type: string; text: string }> });
   return { bb, harness, github, hooks, token, send, tool, text, rows, sent, advance: (ms: number) => (now += ms) };
 }
+
+const issueNode = (over: Record<string, unknown> = {}) => ({
+  __typename: "Issue",
+  number: 7,
+  title: "Bug",
+  url: "https://github.com/Acme/Widgets/issues/7",
+  createdAt: "2026-10-01T00:00:00Z",
+  updatedAt: "2026-10-02T00:00:00Z",
+  author: { login: "bob" },
+  assignees: { nodes: [] },
+  labels: { nodes: [] },
+  milestone: null,
+  comments: { nodes: [] },
+  state: "OPEN",
+  stateReason: null,
+  ...over,
+});
 
 const WITH_HOOKS = { env: { BB_HOOKS_URL: HOOKS_URL } };
 
@@ -138,7 +156,7 @@ describe("the tool", () => {
 
     // The fake has one pull request, so fill the rest of the thread by hand.
     const db = bb.storage.database();
-    for (let i = 0; i < WATCH_LIMIT; i++) db.prepare("INSERT INTO watches VALUES ('thr-1', 'prj-1', ?, 'pull', '{}', 'u', 'c', 0, 0)").run(`Acme/Widgets#${100 + i}`);
+    for (let i = 0; i < WATCH_LIMIT; i++) db.prepare("INSERT INTO watches (thread_id, project_id, key, kind, snapshot, updated_at, last_comment_at, created_at, last_activity_at) VALUES ('thr-1', 'prj-1', ?, 'pull', '{}', 'u', 'c', 0, 0)").run(`Acme/Widgets#${100 + i}`);
     db.prepare("DELETE FROM watches WHERE key = 'Acme/Widgets#12'").run();
     const full = await tool({ ref: "Acme/Widgets#12" });
     expect(full).toMatchObject({ isError: true });
@@ -272,6 +290,76 @@ describe("the service", () => {
     expect(w.rows()).toEqual([]);
     service.controller.abort();
     await service.done;
+  });
+
+  it("shows every watch with its counters, flags and thread title, lets one be stopped, and signals the settings section", async () => {
+    const get = vi.fn(async ({ threadId }: { threadId: string }) => {
+      if (threadId === "thr-1") return { id: threadId, title: "Ship widgets" };
+      throw Object.assign(new Error("not found"), { code: "NOT_FOUND" });
+    });
+    const w = await setup({ ...WITH_HOOKS, get });
+    const signals = () => w.harness.realtimeSignals.filter((x) => x.channel === "watches-changed").length;
+    type View = { watches: Array<Record<string, unknown>>; threads: unknown; hooks: Record<string, unknown> };
+
+    let view = (await w.harness.callRpc("watches", null)) as View;
+    expect(view).toMatchObject({ limit: WATCH_LIMIT, hooks: { configured: true, state: "stopped" }, threads: [], watches: [] });
+
+    await w.tool({ ref: "Acme/Widgets#12" }, { threadId: "thr-1", projectId: "prj-1" });
+    expect(signals()).toBe(1);
+    const service = w.harness.runService("watches");
+    await tick();
+    w.hooks.last().send(w.hooks.hello("c_1"));
+    await tick();
+    view = (await w.harness.callRpc("watches", null)) as View;
+    expect(view).toMatchObject({ hooks: { state: "connected", leased: true, sweeps: 1, lastSweepReason: "connected" } });
+    expect(view.watches).toEqual([
+      expect.objectContaining({
+        threadId: "thr-1",
+        threadTitle: "Ship widgets",
+        target: { id: "Acme/Widgets#12", key: "Acme/Widgets#12", kind: "pull", title: "Add widgets", url: "https://github.com/Acme/Widgets/pull/12" },
+        checks: 1,
+        wakes: 0,
+        lastWokeAt: 0,
+        flags: [],
+      }),
+    ]);
+
+    w.github.state.node = pullNode({ updatedAt: "2026-10-09T12:00:00Z", reviewDecision: "APPROVED", comments: { nodes: [] } });
+    w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+    await tick(3000);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    view = (await w.harness.callRpc("watches", null)) as View;
+    expect(view.watches[0]).toMatchObject({ checks: 2, wakes: 1, wakesInWindow: 1 });
+    expect(view.hooks).toMatchObject({ doorbells: 1 });
+    expect(view.threads).toEqual([{ threadId: "thr-1", title: "Ship widgets", count: 1, wakes: 1, nearLimit: false }]);
+    const afterWake = signals();
+    expect(afterWake).toBeGreaterThan(1);
+
+    // A thread bb cannot read shows its id; an issue links to /issues. The CLI prints the same view.
+    w.github.state.node = issueNode();
+    await w.tool({ ref: "Acme/Widgets#7" }, { threadId: "thr-gone", projectId: "prj-1" });
+    expect(w.harness.registrations.cli?.name).toBe("github");
+    const cli = await w.harness.runCli(["watches"]);
+    expect(cli.exitCode).toBe(0);
+    expect(cli.stdout).toContain("Doorbells: connected and leased");
+    expect(cli.stdout).toContain("2 watches across 2 threads");
+    expect(cli.stdout).toMatch(/Acme\/Widgets#12 +Ship widgets +/u);
+    expect(cli.stdout).toMatch(/Acme\/Widgets#7 +thr-gone +/u);
+    const json = JSON.parse((await w.harness.runCli(["watches", "--json"])).stdout) as View;
+    expect(json.watches.map((x) => x.target)).toEqual([
+      expect.objectContaining({ key: "Acme/Widgets#12" }),
+      { id: "Acme/Widgets#7", key: "Acme/Widgets#7", kind: "issue", title: expect.any(String), url: "https://github.com/Acme/Widgets/issues/7" },
+    ]);
+
+    expect(await w.harness.callRpc("unwatch", { threadId: "thr-1", targetId: "Acme/Widgets#12" })).toEqual({ removed: true });
+    expect(await w.harness.callRpc("unwatch", { threadId: "thr-1", targetId: "Acme/Widgets#12" })).toEqual({ removed: false });
+    expect(w.rows().map((r) => r.key)).toEqual(["Acme/Widgets#7"]);
+    expect(w.send).toHaveBeenCalledTimes(1);
+    expect(signals()).toBe(afterWake + 2);
+
+    service.controller.abort();
+    await service.done;
+    expect(((await w.harness.callRpc("watches", null)) as View).hooks.state).toBe("stopped");
   });
 
   it("forgets a thread's watches when it is archived or deleted", async () => {

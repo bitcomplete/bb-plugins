@@ -5,6 +5,14 @@ import {
   compare,
   createCheckQueue,
   createWatchStore,
+  expiresAt,
+  flagsFor,
+  IDLE_AFTER_MS,
+  NOISY_WAKES_PER_WINDOW,
+  RATE_WINDOW_MS,
+  RECENT_WAKES_KEPT,
+  wakesInWindow,
+  type Usage,
   diffSnapshots,
   formatWake,
   initialCursors,
@@ -47,6 +55,11 @@ const watchOf = (i: Issue, threadId = "thr-1"): WatchRow => ({
   ...initialCursors(i, "2026-10-09T12:00:00.000Z"),
   createdAt: 0,
   lastActivityAt: 0,
+  checks: 0,
+  wakes: 0,
+  lastCheckedAt: 0,
+  lastWokeAt: 0,
+  recentWakes: [],
 });
 
 describe("snapshots", () => {
@@ -188,6 +201,61 @@ describe("the store", () => {
     const kept = store.get("thr-1", "i-b")!;
     expect(kept.snapshot.state).toBe("Done");
     expect(store.get("thr-1", "i-a")).toBeNull();
+  });
+
+  it("counts checks and wakes, remembers when each last happened, and keeps the newest wake times", () => {
+    const store = createWatchStore(db, () => now);
+    store.add(row("thr-1", "i-a"));
+    const fresh = store.get("thr-1", "i-a")!;
+    expect([fresh.checks, fresh.wakes, fresh.lastCheckedAt, fresh.lastWokeAt, fresh.recentWakes]).toEqual([0, 0, 0, 0, []]);
+
+    now += 1000;
+    store.advance("thr-1", "i-a", compare(fresh, issue({ updatedAt: "later" })), false);
+    let w = store.get("thr-1", "i-a")!;
+    expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.recentWakes]).toEqual([1, 0, now, 0, []]);
+    expect(w.lastActivityAt).toBe(1_000_000);
+
+    for (let i = 0; i < RECENT_WAKES_KEPT + 3; i++) {
+      now += 1000;
+      store.advance("thr-1", "i-a", compare(w, issue({ state: { name: `S${i}`, type: "started" } })), true);
+      w = store.get("thr-1", "i-a")!;
+    }
+    expect([w.checks, w.wakes, w.lastCheckedAt, w.lastWokeAt, w.lastActivityAt]).toEqual([RECENT_WAKES_KEPT + 4, RECENT_WAKES_KEPT + 3, now, now, now]);
+    expect(w.recentWakes).toHaveLength(RECENT_WAKES_KEPT);
+    expect(w.recentWakes.at(-1)).toBe(now);
+    expect(w.recentWakes[0]).toBe(now - (RECENT_WAKES_KEPT - 1) * 1000);
+    expect(wakesInWindow(w, now, 10_500)).toBe(11);
+  });
+});
+
+describe("flags", () => {
+  const DAY = 86_400_000;
+  const usage = (over: Partial<Usage> = {}): Usage => ({ checks: 0, wakes: 0, lastCheckedAt: 0, lastWokeAt: 0, recentWakes: [], createdAt: 0, lastActivityAt: 0, ...over });
+
+  it("calls a watch idle once it is old and has not woken in as long", () => {
+    const now = 10 * DAY;
+    expect(flagsFor(usage({ createdAt: now - IDLE_AFTER_MS + 1, lastActivityAt: now }), now)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: now - IDLE_AFTER_MS, lastActivityAt: now }), now)).toEqual(["idle"]);
+    // A recent wake clears it.
+    expect(flagsFor(usage({ createdAt: 0, lastWokeAt: now - DAY, lastActivityAt: now - DAY }), now)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: 0, lastWokeAt: now - IDLE_AFTER_MS, lastActivityAt: now }), now)).toEqual(["idle"]);
+  });
+
+  it("calls a watch noisy at the wake rate, counting only the last hour", () => {
+    const now = 10 * DAY;
+    const recent = (n: number, spread: number) => Array.from({ length: n }, (_, i) => now - i * spread);
+    const woke = (recentWakes: number[]) => usage({ recentWakes, lastWokeAt: now, lastActivityAt: now });
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW - 1, 1000)), now)).toEqual([]);
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW, 1000)), now)).toEqual(["noisy"]);
+    // Only the last hour counts.
+    expect(flagsFor(woke(recent(NOISY_WAKES_PER_WINDOW, RATE_WINDOW_MS / 2)), now)).toEqual([]);
+  });
+
+  it("says when a watch is about to be forgotten", () => {
+    const now = 10 * DAY;
+    expect(flagsFor(usage({ createdAt: now, lastActivityAt: now - WATCH_TTL_MS + DAY }), now)).toEqual([]);
+    expect(flagsFor(usage({ createdAt: now, lastActivityAt: now - WATCH_TTL_MS + DAY - 1 }), now)).toEqual(["expiring"]);
+    expect(expiresAt(usage({ lastActivityAt: 5 }))).toBe(5 + WATCH_TTL_MS);
   });
 });
 

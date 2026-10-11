@@ -68,8 +68,37 @@ Watching an issue twice is a no-op. A watch expires a week after it last
 woke the thread (or was created). Archiving or deleting the thread drops
 its watches, as does a wake that finds the thread gone. If the issue stops
 being visible to the connected user, the thread is told once and the watch
-is dropped. There is no unwatch tool and no UI. Disconnecting Linear stops
-the subscription; connecting again resumes it.
+is dropped. There is no unwatch tool; a watch can be stopped from the
+Watches settings section. Disconnecting Linear stops the subscription;
+connecting again resumes it.
+
+### Seeing what is watched
+
+Settings → Plugins → Linear → Watches lists every watch on this server, and
+`bb linear watches` prints the same view. It is a debugging view, made to
+answer "why did my thread never wake" and "what is re-reading Linear every
+ten minutes" at a glance:
+
+- A status line for the doorbell stream: connected and leased, reconnecting
+  (checks fall back to a sweep every two minutes, so reads go up), or
+  stopped, how long it has been so, and how many doorbells and sweeps the
+  last hour saw.
+- One row per watch: the issue (linking to Linear, with the state the watch
+  last saw), the thread (linking to it), age, how many times it has been
+  checked and woken, wakes in the last hour, when it last woke, when it
+  expires, and flags. A Stop button forgets the watch without telling the
+  thread.
+- Flags, which sort to the top: `noisy` (five or more wakes in the last
+  hour: the ticket is restarting the thread's turn again and again), `idle`
+  (three days old and not woken in three days: a wait somebody forgot, still
+  read every ten minutes), `expiring` (forgotten within a day unless it
+  wakes). A thread watching eight or more of its ten is called out above
+  the table.
+
+Checks and wakes are counted in the watch's row (`checks`, `wakes`,
+`last_checked_at`, `last_woke_at`, and the newest fifty wake times for the
+rate); doorbell and sweep counts are in memory and start over when the
+server does.
 
 `BB_HOOKS_URL` is the cluster-internal address of bb-gate-hooks
 (`http://bb-gate-hooks.bb-gate-production.svc:8081` in bb-gate's backend
@@ -92,6 +121,7 @@ command runs inside the plugin on the server, so the token never leaves it.
 | `bb linear issue <key> [--json]` | One issue, as the tool shows it, or its JSON. |
 | `bb linear search [--query <text>] [--team <key>] [--state <name>] [--assignee <who>] [--all] [--limit <n>] [--json]` | Issues, newest first. Open ones only unless `--state` or `--all`. `--json` prints an array of issue objects. |
 | `bb linear query <document> [--variables <json>]` | A read-only GraphQL query's `data`, as JSON. Mutations are refused. |
+| `bb linear watches [--json]` | Every watch on this server with its counters and flags, and the doorbell stream's state; see "Seeing what is watched". |
 
 A dispatcher that spawns a thread per issue in a state, as a script
 automation:
