@@ -8,14 +8,41 @@ checklist signs `gh` in on the server host, bb core forwards that login to
 every machine as `GH_TOKEN`, and this plugin reads the same token with
 `gh auth token` whenever it needs one. Everything else a thread wants from
 GitHub it already does with `gh` on its machine: reading a PR, commenting,
-requesting review, merging. What `gh` cannot do is wake a thread later.
-That is the whole of this plugin.
+reviewing, requesting review, merging. What `gh` cannot do is wake a thread
+later. That is the heart of this plugin; it also serves the
+[stewards](../stewards/DESIGN.md) plugin's view of GitHub (below).
 
 ## Tool
 
 | Tool | What it does |
 |---|---|
 | `github_watch` | Watch a pull request or issue by URL, `owner/repo#12` or `owner/repo/pull/12`: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
+
+## Stewards
+
+[stewards](../stewards/DESIGN.md) reads GitHub through this plugin, over
+cross-plugin RPC, with the contract in `source-contract.ts` (a byte-for-byte
+copy shared with stewards and linear; edit all three or none):
+
+- `sourceSnapshot`: one pull request or issue as an `EntitySnapshot`
+  (state `open`, `draft`, `merged` or `closed`; the description; the newest
+  comments, reviews and inline comments with ids and the thread whose
+  signature each carries; every submitted review with its commit; checks;
+  the viewer). The same GraphQL read as a watch.
+- `sourceValidate`: each `owner/repo` is visible and carries the label.
+  A `gh` that is not signed in is reported in `error`, not thrown.
+- `sourceAdoptable`: every open pull request in the repositories, oldest
+  first, up to the limit.
+- `sourceSetInterest`: the repositories and entities stewards wants to hear
+  about. Only stewards may call it. Kept in kv, leased on bb-gate-hooks
+  beside the watches (`repo` leases for repositories, `issue` leases for
+  entities), and every doorbell for one of them is debounced and rung over
+  to stewards as `stewardsRing` (`ringStewards`, quiet when stewards is not
+installed). A refused lease is logged.
+
+There are no write tools: a steward comments and reviews with `gh` like
+any thread, and signs what it posts as the skill asks, which is how
+`signedBy` in the snapshot tells its words from the developer's.
 
 ## Watching a pull request or issue
 
@@ -120,9 +147,11 @@ npm run typecheck
 npm test
 ```
 
-`github.ts` is the GraphQL document and its parsing; `watch.ts` the
+`github.ts` is the GraphQL documents and their parsing (including
+stewards' snapshot); `watch.ts` the
 snapshot, the diff, the wake message and the SQLite store;
 `hooks-client.ts` the subscriber side of bb-gate-hooks, the same as the
-linear plugin's with the source changed; `gh.ts` reads the token;
+linear plugin's with the source and lease kinds changed;
+`source-contract.ts` the shared contract with stewards; `gh.ts` reads the token;
 `usage.ts` the watches view; `server.ts` wires them to bb, and `app.tsx`
 is the settings section.

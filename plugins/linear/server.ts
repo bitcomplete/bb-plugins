@@ -16,26 +16,36 @@
 // deployment runs bb-gate-hooks, Linear's webhooks reach it and it rings
 // this plugin, which re-reads the issue as the developer and messages the
 // thread with what changed. The thread ends its turn instead of polling.
+//
+// The stewards plugin reads Linear through this one too (source-contract.ts):
+// snapshots, validation, adoption, and doorbells for the issues and teams it
+// manages, forwarded as rings.
 import { createHash } from "node:crypto";
-import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type JsonValue } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
 import {
+  ADOPTABLE_QUERY,
   COMMENT_CREATE,
   ISSUE_CREATE,
+  ISSUE_ID_QUERY,
   ISSUE_QUERY,
   ISSUE_REF_QUERY,
   ISSUE_UPDATE,
   ISSUES_QUERY,
   LinearRequestError,
+  MY_TEAMS_QUERY,
   PRIORITIES,
   PRIORITY_NAMES,
   SEARCH_LIMIT_DEFAULT,
   SEARCH_LIMIT_MAX,
   SEARCH_QUERY,
+  SNAPSHOT_QUERY,
   TEAM_QUERY,
+  TEAMS_QUERY,
   USERS_QUERY,
   VIEWER_QUERY,
+  adoptableFilter,
   findLabels,
   findState,
   formatIssue,
@@ -44,16 +54,21 @@ import {
   graphqlErrors,
   isReadOnlyDocument,
   issueFilter,
+  parseAdoptablePage,
   parseCommentCreate,
   parseIssue,
   parseIssueCreate,
+  parseIssueId,
   parseIssueList,
   parseIssueRef,
   parseIssueUpdate,
+  parseSnapshotIssue,
   parseTeam,
+  parseTeams,
   parseUsers,
   parseViewer,
   searchLimit,
+  snapshotOfIssue,
   type Issue,
   type SearchInput,
   type Viewer,
@@ -70,7 +85,8 @@ import {
   type PendingConnect,
   type Tokens,
 } from "./oauth.js";
-import { createHooksLoop, HOOKS_URL_ENV, type Rejection } from "./hooks-client.js";
+import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
+import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signature, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -121,6 +137,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().min(1), targetId: z.string().min(1) }),
     output: z.object({ removed: z.boolean() }),
   },
+  // sourceSnapshot, sourceValidate, sourceAdoptable, sourceSetInterest: what
+  // stewards calls. The shapes are the shared file's, so they cannot drift
+  // from what stewards and github expect.
+  ...sourceContract,
 });
 
 export function settingDescriptors(env: Record<string, string | undefined>) {
@@ -359,6 +379,16 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         }
         return { removed };
       },
+      sourceSnapshot: ({ id }) => sourceSnapshot(id),
+      sourceValidate: (input) => sourceValidate(input),
+      sourceAdoptable: (input) => sourceAdoptable(input),
+      async sourceSetInterest({ units, entities }, { experimental_caller: caller }) {
+        // The interest decides what this server leases and whom it rings, so
+        // only stewards itself may set it; the app and the CLI are clients.
+        if (caller.kind !== "plugin" || caller.pluginId !== STEWARDS_PLUGIN_ID) throw new Error(`sourceSetInterest is for the ${STEWARDS_PLUGIN_ID} plugin only.`);
+        await setInterest(units, entities);
+        return { ok: true };
+      },
     });
 
     // Linear sends the browser here after approval. "none" because the
@@ -465,7 +495,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       description:
         "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
       instructions:
-        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel or reprioritize one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes.",
+        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
       async execute({ key }, { signal }) {
@@ -524,7 +554,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_update_issue",
       description:
-        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, and priority. Give only the fields to change; they are applied together. A state, label or person that does not match is an error that lists the choices.",
+        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id; read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
       presentation: { label: { pending: "Updating a Linear issue", completed: "Updated a Linear issue" } },
       parameters: z
         .object({
@@ -534,11 +564,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           addLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to add, matched ignoring case."),
           removeLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to remove, matched ignoring case."),
           priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
+          description: z.string().trim().min(1).max(50_000).optional().describe("The whole new description, in Markdown. Replaces the old one."),
         })
-        .refine((v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined, {
-          message: "Give at least one of state, assignee, addLabels, removeLabels or priority.",
-        }),
-      async execute(input, { signal }) {
+        .refine(
+          (v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined || v.description !== undefined,
+          { message: "Give at least one of state, assignee, addLabels, removeLabels, priority or description." },
+        ),
+      async execute(input, { threadId, signal }) {
         try {
           const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: input.key }, signal));
           if (ref === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
@@ -580,12 +612,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
 
           if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
+          if (input.description !== undefined) update.description = input.description + signature(threadId);
 
           const updated = parseIssueUpdate(await query(ISSUE_UPDATE, { id: ref.id, input: update }, signal));
           if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
           if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
           if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
           if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+          if (input.description !== undefined) changed.push("description replaced");
           return `${updated.identifier}: ${changed.join("; ")}.`;
         } catch (error) {
           return toolError(error);
@@ -763,14 +797,235 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       await checks.sweep(ids);
     }
 
+    // ---- stewards --------------------------------------------------------
+    //
+    // stewards (source-contract.ts) reads issues through the snapshot RPC and
+    // says which teams and issues it manages through sourceSetInterest. The
+    // interest is stored in kv so a restart leases it again without waiting
+    // for stewards to repeat itself. Teams come as keys and are leased by
+    // UUID, which is also what a doorbell's unit names; issues come as UUIDs
+    // or keys, and keys are resolved with a read. Anything that cannot be
+    // resolved yet (Linear not connected, or down) stays as given and is
+    // tried again when the stream next connects or the interest next changes.
+
+    const INTEREST_KEY = "stewards/interest";
+    const TEAM_IDS_KEY = "stewards/teamIds";
+    const interestRecord = z.object({ units: z.array(z.string()), entities: z.array(z.string()) });
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+    /** Team keys, and issues as UUIDs or keys not yet resolved. */
+    let interest = interestRecord.catch({ units: [], entities: [] }).parse(await bb.storage.kv.get(INTEREST_KEY));
+    /** Team key to UUID, for every team the connected user could see when last asked. */
+    let teamIds = z.record(z.string(), z.string()).catch({}).parse(await bb.storage.kv.get(TEAM_IDS_KEY));
+    /** What a doorbell is matched against: issue UUIDs, and team UUIDs as a doorbell's unit names them. */
+    let ringFor = { issues: new Set<string>(), teams: new Set<string>() };
+    function recomputeRings(): void {
+      ringFor = {
+        issues: new Set(interest.entities.filter((e) => UUID.test(e))),
+        teams: new Set(interest.units.map((key) => teamIds[key]).filter((id): id is string => id !== undefined)),
+      };
+    }
+    recomputeRings();
+
+    /** Every lease the stream holds: watched issues, stewards' issues, stewards' teams. */
+    function leases(): Lease[] {
+      const issues = new Set([...watches.issueIds(), ...ringFor.issues]);
+      return [...[...issues].map((id) => ({ kind: "issue" as const, id })), ...[...ringFor.teams].map((id) => ({ kind: "team" as const, id }))];
+    }
+
+    // The SDK's callRpc takes JSON input; ringStewards hands it the
+    // contract's own input object, which is JSON by construction.
+    const callRpc = <T>(args: { pluginId: string; method: string; input: unknown; outputSchema: z.ZodType<T> }) =>
+      bb.sdk.plugins.callRpc<T>({ ...args, input: args.input as JsonValue });
+    const warn = (message: string) => bb.log.warn(message);
+
+    // Rings are debounced per issue like watch checks: Linear sends several
+    // webhooks per edit, and stewards would only compare the same snapshot.
+    const stewardRings = createCheckQueue((issueId) => ringStewards(callRpc, { source: "linear", id: issueId }, warn), {
+      onError: (issueId, error) => bb.log.warn(`ringing stewards for Linear issue ${issueId} failed: ${errorMessage(error)}`),
+    });
+    bb.onDispose(() => stewardRings.stop());
+
+    /** Linear says "Entity not found" for an id that names nothing, rather than a null issue. */
+    const isNotFound = (error: unknown) => /entity not found|could not find/iu.test(errorMessage(error));
+
+    async function refreshTeamIds(): Promise<Record<string, string>> {
+      teamIds = Object.fromEntries(parseTeams(await query(TEAMS_QUERY, undefined, checkSignal())).map((t) => [t.key.toUpperCase(), t.id]));
+      await bb.storage.kv.set(TEAM_IDS_KEY, teamIds);
+      return teamIds;
+    }
+
+    /** The team map, asked of Linear again when one of these keys is missing from it: the team may be new. */
+    async function teamIdsFor(keys: string[]): Promise<Record<string, string>> {
+      return keys.some((k) => teamIds[k] === undefined) ? refreshTeamIds() : teamIds;
+    }
+
+    // One change to the interest at a time: a resolution finishing after a
+    // newer set would otherwise write the older set back.
+    let interestChain: Promise<void> = Promise.resolve();
+    function serially(task: () => Promise<void>): Promise<void> {
+      const next = interestChain.then(task, task);
+      interestChain = next.catch(() => undefined);
+      return next;
+    }
+
+    /** Resolve what can be resolved, store the result, and lease whatever is new right away. */
+    async function resolveAndLease(why: string): Promise<void> {
+      const before = ringFor;
+      if (await isConnected()) {
+        try {
+          if (interest.units.length > 0) await teamIdsFor(interest.units);
+        } catch (error) {
+          bb.log.warn(`could not list Linear teams for stewards (${why}): ${errorMessage(error)}`);
+        }
+        const entities: string[] = [];
+        for (const entity of interest.entities) {
+          if (UUID.test(entity)) {
+            entities.push(entity);
+            continue;
+          }
+          try {
+            const found = parseIssueId(await query(ISSUE_ID_QUERY, { id: entity }, checkSignal()));
+            if (found === null) bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
+            else entities.push(found.id.toLowerCase());
+          } catch (error) {
+            if (isNotFound(error)) {
+              bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
+              continue;
+            }
+            bb.log.warn(`could not resolve Linear issue ${entity} for stewards (${why}): ${errorMessage(error)}`);
+            entities.push(entity);
+          }
+        }
+        interest = { units: interest.units, entities: [...new Set(entities)] };
+        await bb.storage.kv.set(INTEREST_KEY, interest);
+      }
+      recomputeRings();
+      const issues = [...ringFor.issues].filter((id) => !before.issues.has(id));
+      const teams = [...ringFor.teams].filter((id) => !before.teams.has(id));
+      await Promise.all([
+        hooks.added("issue", ...issues).catch((error: unknown) => bb.log.warn(`could not lease stewards' issues right away: ${errorMessage(error)}`)),
+        hooks.added("team", ...teams).catch((error: unknown) => bb.log.warn(`could not lease stewards' teams right away: ${errorMessage(error)}`)),
+      ]);
+    }
+
+    const resolveInterest = (why: string) =>
+      serially(() => resolveAndLease(why)).catch((error: unknown) => bb.log.warn(`could not resolve stewards' interest (${why}): ${errorMessage(error)}`));
+
+    /** Replace the interest. Leases for what it drops simply stop being renewed and lapse within the hour. */
+    function setInterest(units: string[], entities: string[]): Promise<void> {
+      return serially(async () => {
+        interest = {
+          units: [...new Set(units.map((u) => u.trim().toUpperCase()))],
+          entities: [...new Set(entities.map((e) => e.trim()).map((e) => (UUID.test(e) ? e.toLowerCase() : e.toUpperCase())))],
+        };
+        await bb.storage.kv.set(INTEREST_KEY, interest);
+        await resolveAndLease("interest changed");
+      });
+    }
+
+    /** The connected user's name, for a snapshot's `viewer`; null when it cannot be learned. */
+    async function viewerName(): Promise<string | null> {
+      try {
+        return (await whoIs(await accessToken(), (await settings.get()).apiUrl, checkSignal())).user.name;
+      } catch (error) {
+        bb.log.warn(`could not learn who Linear is connected as: ${errorMessage(error)}`);
+        return null;
+      }
+    }
+
+    async function sourceSnapshot(id: string) {
+      let issue;
+      try {
+        issue = parseSnapshotIssue(await query(SNAPSHOT_QUERY, { id: id.trim() }, checkSignal()));
+      } catch (error) {
+        if (isNotFound(error)) return { snapshot: null };
+        throw error;
+      }
+      return { snapshot: issue === null ? null : snapshotOfIssue(issue, await viewerName()) };
+    }
+
+    // Validation answers rather than throws: `bb stewards check` reports a
+    // disconnected Linear as one line, beside whatever github says.
+    async function sourceValidate(input: { units: string[]; label: string; states: string[] }) {
+      if (!(await isConnected())) return { viewer: null, units: [], mine: [], error: NOT_CONNECTED };
+      try {
+        const viewer = await viewerName();
+        const mine = parseTeams(await query(MY_TEAMS_QUERY, undefined, checkSignal())).map((t) => ({ unit: t.key, name: t.name }));
+        const units = [];
+        for (const unit of input.units) {
+          const team = parseTeam(await query(TEAM_QUERY, { key: unit.trim().toUpperCase() }, checkSignal()));
+          units.push(
+            team === null
+              ? { unit, found: false, labelFound: false, missingStates: [] }
+              : { unit, found: true, labelFound: findLabels(team.labels, [input.label]).missing.length === 0, missingStates: input.states.filter((s) => findState(team.states, s) === null) },
+          );
+        }
+        return { viewer, units, mine, error: null };
+      } catch (error) {
+        return { viewer: null, units: [], mine: [], error: errorMessage(error) };
+      }
+    }
+
+    /** At most this many labelled open issues are read per team, a page at a time. */
+    const ADOPTABLE_PAGE = 250;
+    const ADOPTABLE_PAGES_MAX = 4;
+
+    // Each team is asked on its own so one failing team costs only its own
+    // issues. Linear's order is not the one wanted, so the pages are sorted
+    // here: oldest first, which is the order a capped nightly pass adopts in.
+    async function sourceAdoptable(input: { units: string[]; label: string; limit: number }) {
+      if (!(await isConnected())) return { viewer: null, entities: [], errors: [NOT_CONNECTED] };
+      const viewer = await viewerName();
+      const keys = [...new Set(input.units.map((u) => u.trim().toUpperCase()))];
+      const entities: AdoptableEntity[] = [];
+      const errors: string[] = [];
+      let known: Record<string, string> | null = null;
+      try {
+        known = await teamIdsFor(keys);
+      } catch (error) {
+        errors.push(`Linear teams: ${errorMessage(error)}`);
+      }
+      for (const key of keys) {
+        if (known !== null && known[key] === undefined) {
+          errors.push(`${key}: no such Linear team, or it is not visible to the connected user`);
+          continue;
+        }
+        try {
+          let after: string | null = null;
+          let pages = 0;
+          do {
+            const page = parseAdoptablePage(await query(ADOPTABLE_QUERY, { filter: adoptableFilter(key, input.label), first: ADOPTABLE_PAGE, after }, checkSignal()));
+            entities.push(...page.entities);
+            after = page.next;
+          } while (after !== null && ++pages < ADOPTABLE_PAGES_MAX);
+          if (after !== null) errors.push(`${key}: more than ${ADOPTABLE_PAGE * ADOPTABLE_PAGES_MAX} open issues carry ${input.label}; only those were read`);
+        } catch (error) {
+          errors.push(`${key}: ${errorMessage(error)}`);
+        }
+      }
+      entities.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+      return { viewer, entities: entities.slice(0, input.limit), errors };
+    }
+
+    // ---- the doorbell stream ---------------------------------------------
+    //
     // The service refusing a lease is not proof the developer lost access:
     // with the token expired on the service's side, or Linear briefly down,
     // every watch would come back `forbidden`. The developer's own read is
     // the ground truth, so a refused issue is read here before the thread is
     // told it is gone; one that reads fine keeps its watch and is leased
     // again at the next renewal.
+    //
+    // A refused team lease only costs stewards its early rings for that
+    // team's issues: each bound issue holds its own lease, and the nightly
+    // pass re-lists the rest. It is logged and left to the next renewal.
     async function onRejected(rejected: Rejection[]): Promise<void> {
       for (const r of rejected) {
+        if (r.kind === "team") {
+          const key = Object.entries(teamIds).find(([, id]) => id === r.id)?.[0] ?? r.id;
+          bb.log.warn(`bb-gate-hooks refused a lease on Linear team ${key} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
+          continue;
+        }
         if (r.kind !== "issue" || r.reason !== "forbidden") continue;
         const watching = watches.forIssue(r.id);
         if (watching.length === 0) continue;
@@ -794,8 +1049,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       log: bb.log,
       token: accessToken,
       refreshToken: () => refresh("was refused by bb-gate-hooks"),
-      watchIds: () => watches.issueIds(),
-      onDoorbell: (issueId) => checks.ring(issueId),
+      leases,
+      // A watch check reads the issue only when a thread watches it, so every
+      // doorbell goes to it; stewards hears of the ones it asked about.
+      onDoorbell: (issueId, unit) => {
+        checks.ring(issueId);
+        if (ringFor.issues.has(issueId) || (unit !== null && ringFor.teams.has(unit))) stewardRings.ring(issueId);
+      },
       onRejected,
       sweep,
     });
@@ -859,6 +1119,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             signal.addEventListener("abort", stop, { once: true });
             const onChange = () => void isConnected().then((connected) => (connected ? undefined : session.abort()));
             connectionListeners.add(onChange);
+            // Interest stored while Linear was disconnected, or before a
+            // restart, may still name keys; resolve them now there is a token.
+            void resolveInterest("connected");
             try {
               await hooks.run(session.signal);
             } finally {
@@ -908,7 +1171,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (added.outcome === "already") return `Already watching ${issue.identifier}: ${title}. This thread will be messaged when it changes; you can end the turn.`;
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
-          hooks.added(issue.id).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
+          hooks.added("issue", issue.id).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
           announceWatches();
           return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
         } catch (error) {

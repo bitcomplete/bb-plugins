@@ -84,3 +84,29 @@ export function slugify(name: string): string {
     .slice(0, 60);
   return slug.length > 0 ? slug : "project";
 }
+
+/** The longest repo-relative path `readProjectFiles` accepts. */
+export const PROJECT_FILE_PATH_MAX = 300;
+
+/**
+ * Why a path is not a file inside the `.bb` repo, or null when it is one.
+ *
+ * Checked in the RPC schema and again host-side, because the host is the side
+ * that hands the path to git. A relative POSIX path with no `..`, no `.` and
+ * no empty segment names exactly one entry in a commit's tree; anything else
+ * either escapes the repo or means something to git beyond a path.
+ */
+export function projectFilePathProblem(value: string): string | null {
+  if (value.length === 0) return "A path is required.";
+  if (value.length > PROJECT_FILE_PATH_MAX) return `A path may be at most ${PROJECT_FILE_PATH_MAX} characters.`;
+  if (value.startsWith("/")) return `${JSON.stringify(value)} is absolute; paths are relative to the repo.`;
+  if (value.includes("\\")) return `${JSON.stringify(value)} contains a backslash; paths use \`/\`.`;
+  if (value.includes("\0")) return `${JSON.stringify(value)} contains NUL.`;
+  for (const segment of value.split("/")) {
+    if (segment === "..") return `${JSON.stringify(value)} has a \`..\` segment.`;
+    if (segment === "." || segment.length === 0) {
+      return `${JSON.stringify(value)} has an empty or \`.\` segment.`;
+    }
+  }
+  return null;
+}

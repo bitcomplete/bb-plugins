@@ -6,9 +6,9 @@ description: Wait for a GitHub pull request or issue to change (a review, checks
 # GitHub
 
 This bb server is signed in to GitHub as the user, and `gh` on the
-machine carries the same login. Read, comment, request review, open and
-merge with `gh` as usual. The `github` plugin adds one thing `gh` cannot
-do: wake this thread when a pull request or issue changes.
+machine carries the same login. Read, comment, review, request review,
+open and merge with `gh` as usual. The `github` plugin adds one thing
+`gh` cannot do: wake this thread when a pull request or issue changes.
 
 ## Waiting on a pull request or issue
 
@@ -35,8 +35,8 @@ will check when they next send a message; do not poll.
 ## Sign your comments
 
 `gh` comments as the user, so the plugin cannot tell your comment from
-theirs by author. End every comment you post on a watched PR or issue
-with a line naming this thread, on its own line after a blank line:
+theirs by author. End every comment or review you post with a line
+naming this thread, on its own line after a blank line:
 
 ```
 _— from bb thread <this thread's id>_

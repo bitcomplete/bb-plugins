@@ -1,12 +1,12 @@
 // The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md): one SSE
-// stream for doorbells, a lease per watched issue proven with the
-// developer's own token, renewed at half-life, and a re-check of every watch
-// whenever coverage cannot be proven. The service promises nothing beyond
+// stream for doorbells, a lease per watched issue (and per team stewards
+// asked about) proven with the developer's own token, renewed at half-life,
+// and a re-check of every watch whenever coverage cannot be proven. The service promises nothing beyond
 // "something about this entity changed while you were leased", so this
 // module never decides anything about an issue; it only says when to look.
 //
 // Everything that touches the world is injected: fetch, the clock, the
-// token, the watch list, and what to do on a doorbell or a rejected lease.
+// token, the lease set, and what to do on a doorbell or a rejected lease.
 // The token goes into one request body and nowhere else: not a log line,
 // not an error message.
 import { z } from "zod";
@@ -106,13 +106,22 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal: AbortSi
 // ---- the wire shapes ---------------------------------------------------------
 
 export const helloSchema = z.object({ connection: z.string().min(1), leaseSeconds: z.number().positive().optional() });
-export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1) }).loose();
+/** `unit` is the issue's team UUID, or empty when the delivery did not say (some comments). */
+export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional() }).loose();
 export const subscribeResponseSchema = z.object({
   leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
   rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
 });
 export type SubscribeResponse = z.infer<typeof subscribeResponseSchema>;
 export type Rejection = SubscribeResponse["rejected"][number];
+
+/**
+ * One thing to lease. `issue` rings for that issue; `team` (a team UUID)
+ * rings for every issue doorbell whose unit is that team. Teams are leased
+ * for stewards only: a watch is always on an issue.
+ */
+export type LeaseKind = "issue" | "team";
+export type Lease = { kind: LeaseKind; id: string };
 
 export class HooksRequestError extends Error {
   constructor(
@@ -142,14 +151,14 @@ export const STREAM_IDLE_MS = 60_000;
 type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
 
 /**
- * POST /v1/subscribe for these issue ids, in batches the service accepts.
+ * POST /v1/subscribe for these leases, in batches the service accepts.
  * A 404 means the connection is gone and is thrown as such so the caller
  * reconnects; nothing about the request body is ever put in an error.
  */
-export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, issueIds: string[], signal: AbortSignal): Promise<SubscribeResponse> {
+export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, leases: Lease[], signal: AbortSignal): Promise<SubscribeResponse> {
   const merged: SubscribeResponse = { leases: [], rejected: [] };
-  for (let i = 0; i < issueIds.length; i += SUBSCRIBE_BATCH) {
-    const watches = issueIds.slice(i, i + SUBSCRIBE_BATCH).map((id) => ({ kind: "issue", id }));
+  for (let i = 0; i < leases.length; i += SUBSCRIBE_BATCH) {
+    const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id }) => ({ kind, id }));
     const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
@@ -201,11 +210,11 @@ export interface HooksLoopDeps {
   token: () => Promise<string>;
   /** A new token, whatever the old one's expiry says: the service reported Linear refused it. */
   refreshToken: () => Promise<string>;
-  /** The issue ids to hold leases for, right now. */
-  watchIds: () => string[];
-  /** A doorbell for an issue: look at it again. */
-  onDoorbell: (issueId: string) => void;
-  /** Leases the service refused. The caller decides what that means for each watch. */
+  /** Everything to hold leases for, right now: watched issues, and stewards' issues and teams. */
+  leases: () => Lease[];
+  /** A doorbell for an issue: look at it again. `unit` is its team's UUID, or null when the doorbell did not name one. */
+  onDoorbell: (issueId: string, unit: string | null) => void;
+  /** Leases the service refused. The caller decides what that means for each watch or team. */
   onRejected: (rejected: Rejection[]) => Promise<void>;
   /** Check every watch against its cursor. */
   sweep: (reason: string) => Promise<void>;
@@ -240,8 +249,8 @@ export const STATUS_WINDOW_MS = 60 * 60 * 1000;
 export interface HooksLoop {
   /** Run until the signal aborts. Never throws for a network reason; it retries. */
   run(signal: AbortSignal): Promise<void>;
-  /** A watch was just added: lease it now if there is a connection. The next hello covers it otherwise. */
-  added(issueId: string): Promise<void>;
+  /** Leases were just added (a watch, or stewards' interest): lease them now if there is a connection. The next hello covers them otherwise. */
+  added(kind: LeaseKind, ...ids: string[]): Promise<void>;
   /** Whether a connection is up and leased; for status lines and tests. */
   readonly connected: boolean;
   /** What the loop is doing and how busy it has been; for the usage view. */
@@ -316,26 +325,26 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   }
 
   /**
-   * Lease these ids on the current connection. Returns whether the service
+   * Lease these on the current connection. Returns whether the service
    * accepted the call; a 404 means the connection is gone and drops the
    * stream. The token comes from the caller's refresh path, so a lease is
    * always proven with one Linear would accept right now.
    */
-  async function lease(ids: string[], signal: AbortSignal): Promise<boolean> {
+  async function lease(leases: Lease[], signal: AbortSignal): Promise<boolean> {
     if (connection === null) return false;
     const current = connection;
     const started = deps.now();
     try {
       let result: SubscribeResponse;
       try {
-        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.token(), ids, signal);
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.token(), leases, signal);
       } catch (error) {
         // 401 is about the token, not any entity: Linear refused it on the
         // service's side. Refresh regardless of what the expiry says and try
         // once more; nothing was admitted or dropped.
         if (!(error instanceof HooksRequestError && error.status === 401)) throw error;
         deps.log.warn("bb-gate-hooks says Linear refused the token; refreshing and retrying");
-        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(), ids, signal);
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(), leases, signal);
       }
       if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
       if (result.rejected.length > 0) await deps.onRejected(result.rejected);
@@ -366,11 +375,11 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   /** Renew every lease; a failed or late renewal means a gap, so everything is checked. Never throws: it runs from timers. */
   async function renew(reason: "hello" | "renewal", signal: AbortSignal): Promise<void> {
     try {
-      const ids = deps.watchIds();
+      const leases = deps.leases();
       const late = reason === "renewal" && leasedUntil !== 0 && deps.now() >= leasedUntil;
       let ok = true;
-      if (ids.length === 0) leasedUntil = deps.now() + leaseMs;
-      else ok = await lease(ids, signal);
+      if (leases.length === 0) leasedUntil = deps.now() + leaseMs;
+      else ok = await lease(leases, signal);
       if (reason === "hello" || !ok || late) runSweep(reason === "hello" ? "connected" : ok ? "late renewal" : "failed renewal");
     } catch (error) {
       if (!signal.aborted) deps.log.warn(`Linear watch renewal failed: ${errorMessage(error)}`);
@@ -407,10 +416,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           }
           const doorbell = doorbellSchema.safeParse(parsed);
           // `action` and `at` are for the service's logs; the reaction to any
-          // doorbell is the same check.
+          // doorbell is the same check. Every Linear doorbell is an issue,
+          // including those a team lease brought; `unit` says which team.
           if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") {
             doorbells.push();
-            deps.onDoorbell(doorbell.data.id);
+            const unit = doorbell.data.unit ?? "";
+            deps.onDoorbell(doorbell.data.id, unit === "" ? null : unit);
           }
         }
       }
@@ -446,9 +457,9 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       stateListeners.add(listener);
     },
 
-    async added(issueId) {
-      if (connection === null || stream === null) return;
-      await lease([issueId], stream.signal);
+    async added(kind, ...ids) {
+      if (connection === null || stream === null || ids.length === 0) return;
+      await lease(ids.map((id) => ({ kind, id })), stream.signal);
     },
 
     async run(signal) {

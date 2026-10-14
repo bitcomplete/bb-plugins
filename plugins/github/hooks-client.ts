@@ -1,7 +1,8 @@
 // The subscriber side of bb-gate-hooks (bb-gate/docs/hooks.md): one SSE
-// stream for doorbells, a lease per watched issue or pull request proven with the
-// developer's own token, renewed at half-life, and a re-check of every watch
-// whenever coverage cannot be proven. The service promises nothing beyond
+// stream for doorbells, a lease per watched issue or pull request (and per
+// repository stewards asks about) proven with the developer's own token,
+// renewed at half-life, and a re-check of every watch whenever coverage
+// cannot be proven. The service promises nothing beyond
 // "something about this entity changed while you were leased", so this
 // module never decides anything about an entity; it only says when to look.
 //
@@ -15,6 +16,14 @@ export const HOOKS_URL_ENV = "BB_HOOKS_URL";
 export const SOURCE = "github";
 /** The service refuses more watches than this in one call (413). */
 export const SUBSCRIBE_BATCH = 100;
+
+/**
+ * What a lease hangs off. `issue` is one issue or pull request,
+ * "owner/repo#12"; `repo` is a whole repository, "owner/repo", and receives
+ * every doorbell whose unit it is. Doorbells themselves are always `issue`.
+ */
+export type LeaseKind = "issue" | "repo";
+export type Lease = { kind: LeaseKind; id: string };
 
 // ---- server-sent events ----------------------------------------------------
 
@@ -106,7 +115,7 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal: AbortSi
 // ---- the wire shapes ---------------------------------------------------------
 
 export const helloSchema = z.object({ connection: z.string().min(1), leaseSeconds: z.number().positive().optional() });
-export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1) }).loose();
+export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional() }).loose();
 export const subscribeResponseSchema = z.object({
   leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
   rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
@@ -142,14 +151,14 @@ export const STREAM_IDLE_MS = 60_000;
 type FetchLike = (url: string | URL, init: RequestInit) => Promise<Response>;
 
 /**
- * POST /v1/subscribe for these issue ids, in batches the service accepts.
+ * POST /v1/subscribe for these leases, in batches the service accepts.
  * A 404 means the connection is gone and is thrown as such so the caller
  * reconnects; nothing about the request body is ever put in an error.
  */
-export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, issueIds: string[], signal: AbortSignal): Promise<SubscribeResponse> {
+export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, leases: Lease[], signal: AbortSignal): Promise<SubscribeResponse> {
   const merged: SubscribeResponse = { leases: [], rejected: [] };
-  for (let i = 0; i < issueIds.length; i += SUBSCRIBE_BATCH) {
-    const watches = issueIds.slice(i, i + SUBSCRIBE_BATCH).map((id) => ({ kind: "issue", id }));
+  for (let i = 0; i < leases.length; i += SUBSCRIBE_BATCH) {
+    const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id }) => ({ kind, id }));
     const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
@@ -201,10 +210,10 @@ export interface HooksLoopDeps {
   token: () => Promise<string>;
   /** A new token, whatever the old one's expiry says: the service reported GitHub refused it. */
   refreshToken: () => Promise<string>;
-  /** The issue ids to hold leases for, right now. */
-  watchIds: () => string[];
-  /** A doorbell for an issue: look at it again. */
-  onDoorbell: (issueId: string) => void;
+  /** Every lease to hold, right now: watched issues, and whatever stewards asked for. */
+  watchIds: () => Lease[];
+  /** A doorbell for an issue, with the unit (the repository) it fell in when the service named one: look at it again. */
+  onDoorbell: (issueId: string, unit: string | null) => void;
   /** Leases the service refused. The caller decides what that means for each watch. */
   onRejected: (rejected: Rejection[]) => Promise<void>;
   /** Check every watch against its cursor. */
@@ -240,8 +249,8 @@ export const STATUS_WINDOW_MS = 60 * 60 * 1000;
 export interface HooksLoop {
   /** Run until the signal aborts. Never throws for a network reason; it retries. */
   run(signal: AbortSignal): Promise<void>;
-  /** A watch was just added: lease it now if there is a connection. The next hello covers it otherwise. */
-  added(issueId: string): Promise<void>;
+  /** A watch or an interest was just added: lease it now if there is a connection. The next hello covers it otherwise. */
+  added(kind: LeaseKind, ...ids: string[]): Promise<void>;
   /** Whether a connection is up and leased; for status lines and tests. */
   readonly connected: boolean;
   /** What the loop is doing and how busy it has been; for the usage view. */
@@ -316,12 +325,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   }
 
   /**
-   * Lease these ids on the current connection. Returns whether the service
+   * Lease these on the current connection. Returns whether the service
    * accepted the call; a 404 means the connection is gone and drops the
    * stream. The token comes from the caller's refresh path, so a lease is
    * always proven with one GitHub would accept right now.
    */
-  async function lease(ids: string[], signal: AbortSignal): Promise<boolean> {
+  async function lease(ids: Lease[], signal: AbortSignal): Promise<boolean> {
     if (connection === null) return false;
     const current = connection;
     const started = deps.now();
@@ -407,10 +416,12 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           }
           const doorbell = doorbellSchema.safeParse(parsed);
           // `action` and `at` are for the service's logs; the reaction to any
-          // doorbell is the same check.
+          // doorbell is the same check. The unit is passed on so a repository
+          // lease can tell which of its doorbells it was rung for.
           if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") {
             doorbells.push();
-            deps.onDoorbell(doorbell.data.id);
+            const unit = doorbell.data.unit?.trim() ?? "";
+            deps.onDoorbell(doorbell.data.id, unit === "" ? null : unit);
           }
         }
       }
@@ -446,9 +457,9 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       stateListeners.add(listener);
     },
 
-    async added(issueId) {
-      if (connection === null || stream === null) return;
-      await lease([issueId], stream.signal);
+    async added(kind, ...ids) {
+      if (connection === null || stream === null || ids.length === 0) return;
+      await lease(ids.map((id) => ({ kind, id })), stream.signal);
     },
 
     async run(signal) {

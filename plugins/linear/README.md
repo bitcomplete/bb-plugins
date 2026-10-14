@@ -21,15 +21,38 @@ same connect.
 | `linear_search` | Issues by free text, team, state, assignee. |
 | `linear_create_issue` | A new issue in a team: title, description, state, assignee, labels, priority, parent. |
 | `linear_comment` | A Markdown comment, signed with the thread id. |
-| `linear_update_issue` | Change an issue's state, assignee, labels and priority together. |
+| `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
 
 Writes are deliberately named tools rather than a raw mutation tool, so the
 thread's timeline says what changed. Everything runs as the connected user
 (`actor=user`), so comments and state changes are attributed to the
-developer, like `gh`. Issues and comments a thread writes carry the
-thread's id so a reader in Linear can find the conversation.
+developer, like `gh`. Issues, descriptions and comments a thread writes
+carry the thread's id so a reader in Linear can find the conversation.
+
+## Stewards
+
+The [stewards](../stewards) plugin gives a labelled ticket a long-lived
+thread, and reads Linear through this plugin. The contract is
+`source-contract.ts`, copied byte for byte into linear, github and stewards:
+
+- `sourceSnapshot` — one issue, by key or UUID, as stewards' snapshot:
+  fields, sub-issues, the newest fifty comments with the thread each is
+  signed by, and the GitHub pull requests attached to it.
+- `sourceValidate` — whether a project's teams exist, carry its label and
+  have the states its playbooks name; and the teams the connected user is
+  in, for `bb stewards init`.
+- `sourceAdoptable` — open issues carrying the label in those teams, oldest
+  first, for the nightly pass.
+- `sourceSetInterest` — the teams and issues stewards manages. Only
+  stewards may call it. The set is kept in kv, leased on bb-gate-hooks (a
+  `team` lease per team, an `issue` lease per issue, beside the watches'),
+  and every doorbell for one of those issues, or for any issue in one of
+  those teams, is passed on to stewards as a ring, debounced per issue.
+  Without stewards installed the ring is dropped quietly.
+
+A steward writes through the same tools as any thread, signed the same way.
 
 ## Watching an issue
 

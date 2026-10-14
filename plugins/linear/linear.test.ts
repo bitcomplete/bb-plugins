@@ -3,6 +3,7 @@ import {
   COMMENTS_SHOWN,
   DESCRIPTION_CHARS,
   LinearRequestError,
+  adoptableFilter,
   dataOf,
   findLabels,
   findState,
@@ -11,17 +12,23 @@ import {
   graphql,
   isReadOnlyDocument,
   issueFilter,
+  parseAdoptablePage,
   parseCommentCreate,
   parseIssue,
   parseIssueCreate,
   parseIssueList,
   parseIssueRef,
   parseIssueUpdate,
+  parseSnapshotIssue,
   parseTeam,
+  parseTeams,
   parseUsers,
   parseViewer,
+  pullKey,
   searchLimit,
+  snapshotOfIssue,
 } from "./linear.js";
+import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 const issue = {
   id: "uuid-1",
@@ -224,5 +231,129 @@ describe("formatting", () => {
     const list = formatIssueList([parseIssue({ data: { issue } })!], "Linear issues");
     expect(list).toBe("Linear issues (1):\n- ENG-123 Fix login [In Progress, @jane, High]");
     expect(formatIssueList([], "Linear issues")).toBe("Linear issues: no issues.");
+  });
+});
+
+describe("what stewards reads", () => {
+  const raw = {
+    id: "uuid-1",
+    identifier: "ENG-123",
+    title: "Fix login",
+    description: "Users cannot log in.",
+    url: "https://linear.app/acme/issue/ENG-123",
+    priority: 2,
+    priorityLabel: "High",
+    estimate: 3,
+    createdAt: "2026-10-01T00:00:00.000Z",
+    updatedAt: "2026-10-02T00:00:00.000Z",
+    state: { name: "In Progress", type: "started" },
+    team: { id: "team-uuid", key: "ENG" },
+    assignee: { name: "Jane Doe", displayName: "jane" },
+    creator: { name: "Bob" },
+    labels: { nodes: [{ name: "bb-managed" }, { name: "bug" }] },
+    parent: { id: "uuid-100", identifier: "ENG-100" },
+    children: { nodes: [{ id: "uuid-124", identifier: "ENG-124", title: "Add test", state: { name: "Todo", type: "unstarted" }, labels: { nodes: [{ name: "bb-managed" }] } }] },
+    comments: {
+      nodes: [
+        { id: "c-2", body: "On it.\n\n_— from bb thread thr_abc_", createdAt: "2026-10-01T02:00:00Z", url: "https://linear.app/c/2", user: { displayName: "jane" } },
+        { id: "c-1", body: "Repro?", createdAt: "2026-10-01T01:00:00Z", url: null, user: null },
+      ],
+    },
+    attachments: {
+      nodes: [
+        { url: "https://github.com/Acme/web/pull/42", sourceType: "github" },
+        { url: "https://github.com/Acme/web/pull/42", sourceType: "github" },
+        { url: "https://github.com/acme/web/issues/7", sourceType: "github" },
+        { url: "https://sentry.io/x", sourceType: "sentry" },
+      ],
+    },
+  };
+
+  it("maps an issue to the contract's snapshot", () => {
+    const snapshot = snapshotOfIssue(parseSnapshotIssue({ data: { issue: raw } })!, "jane");
+    expect(entitySnapshotSchema.parse(snapshot)).toEqual(snapshot);
+    expect(snapshot).toEqual({
+      source: "linear",
+      kind: "issue",
+      id: "uuid-1",
+      key: "ENG-123",
+      url: "https://linear.app/acme/issue/ENG-123",
+      title: "Fix login",
+      state: "In Progress",
+      stateType: "started",
+      unit: "ENG",
+      labels: ["bb-managed", "bug"],
+      author: "Bob",
+      assignees: ["jane"],
+      priority: "High",
+      estimate: 3,
+      description: "Users cannot log in.",
+      createdAt: "2026-10-01T00:00:00.000Z",
+      updatedAt: "2026-10-02T00:00:00.000Z",
+      comments: [
+        { id: "c-1", author: "someone", did: "commented", body: "Repro?", createdAt: "2026-10-01T01:00:00Z", url: null, signedBy: null },
+        { id: "c-2", author: "jane", did: "commented", body: "On it.\n\n_— from bb thread thr_abc_", createdAt: "2026-10-01T02:00:00Z", url: "https://linear.app/c/2", signedBy: "thr_abc" },
+      ],
+      parent: { id: "uuid-100", key: "ENG-100" },
+      children: [{ id: "uuid-124", key: "ENG-124", title: "Add test", state: "Todo", stateType: "unstarted", labels: ["bb-managed"] }],
+      linkedPulls: [{ url: "https://github.com/Acme/web/pull/42", key: "Acme/web#42" }],
+      pull: null,
+      viewer: "jane",
+    });
+    expect(parseSnapshotIssue({ data: { issue: null } })).toBeNull();
+  });
+
+  it("clips long bodies after reading their signature, and keeps the newest comments", () => {
+    const long = {
+      ...raw,
+      description: "d".repeat(SNAPSHOT_DESCRIPTION_CHARS + 5),
+      assignee: null,
+      comments: {
+        nodes: Array.from({ length: SNAPSHOT_COMMENTS_MAX + 5 }, (_, i) => ({
+          id: `c-${i}`,
+          body: i === SNAPSHOT_COMMENTS_MAX + 4 ? `${"x".repeat(SNAPSHOT_COMMENT_CHARS + 10)}\n\n_— from bb thread thr_long_` : `c${i}`,
+          createdAt: `2026-10-01T00:${String(i).padStart(2, "0")}:00Z`,
+          url: null,
+          user: null,
+        })),
+      },
+    };
+    const snapshot = snapshotOfIssue(parseSnapshotIssue({ data: { issue: long } })!, null);
+    expect(snapshot.assignees).toEqual([]);
+    expect(snapshot.description).toContain("… (5 more characters)");
+    expect(snapshot.comments).toHaveLength(SNAPSHOT_COMMENTS_MAX);
+    expect(snapshot.comments[0]!.id).toBe("c-5");
+    const last = snapshot.comments.at(-1)!;
+    expect(last.body).not.toContain("thr_long");
+    expect(last.signedBy).toBe("thr_long");
+  });
+
+  it("names GitHub pull requests by owner/repo#n and nothing else", () => {
+    expect(pullKey("https://github.com/acme/web/pull/42")).toBe("acme/web#42");
+    expect(pullKey("https://github.com/acme/web.js/pull/42/files")).toBe("acme/web.js#42");
+    expect(pullKey("https://github.com/acme/web/pull/42#discussion")).toBe("acme/web#42");
+    expect(pullKey("https://github.com/acme/web/pulls")).toBeNull();
+    expect(pullKey("https://gitlab.com/acme/web/pull/42")).toBeNull();
+  });
+
+  it("reads team lists from teams and from the viewer", () => {
+    const nodes = { nodes: [{ id: "t1", key: "ENG", name: "Engineering" }, { id: "t2", key: "OPS", name: null }] };
+    const expected = [{ id: "t1", key: "ENG", name: "Engineering" }, { id: "t2", key: "OPS", name: "OPS" }];
+    expect(parseTeams({ data: { teams: nodes } })).toEqual(expected);
+    expect(parseTeams({ data: { viewer: { teams: nodes } } })).toEqual(expected);
+  });
+
+  it("filters adoptable issues by team, label and open state, and reads them a page at a time", () => {
+    expect(adoptableFilter("ENG", "bb-managed")).toEqual({
+      team: { key: { eq: "ENG" } },
+      labels: { some: { name: { eqIgnoreCase: "bb-managed" } } },
+      state: { type: { nin: ["completed", "canceled"] } },
+    });
+    const node = { id: "uuid-1", identifier: "ENG-1", createdAt: "2026-10-01T00:00:00Z", state: { name: "Todo" }, team: { key: "ENG" }, creator: { displayName: "bob" }, labels: { nodes: [{ name: "bb-managed" }] } };
+    expect(parseAdoptablePage({ data: { issues: { nodes: [node], pageInfo: { hasNextPage: true, endCursor: "cur" } } } })).toEqual({
+      entities: [{ id: "uuid-1", key: "ENG-1", unit: "ENG", kind: "issue", state: "Todo", labels: ["bb-managed"], author: "bob", draft: false, createdAt: "2026-10-01T00:00:00Z" }],
+      next: "cur",
+    });
+    expect(parseAdoptablePage({ data: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } }).next).toBeNull();
   });
 });

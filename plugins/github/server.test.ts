@@ -35,18 +35,23 @@ const pullNode = (over: Record<string, unknown> = {}) => ({
 });
 const comment = (body: string, createdAt: string, who = "bob") => ({ author: { login: who }, body, createdAt, url: `https://github.com/c/${createdAt}` });
 
-// A GitHub whose GraphQL endpoint a test scripts: one repository with one pull request.
+// A GitHub whose GraphQL endpoint a test scripts: one repository with one
+// pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_") };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
-    if (String(url) !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
+    if (String(url) !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
     const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
     calls.push({ token, variables: body.variables });
     if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
     if (state.fail) return Response.json({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] });
-    const v = body.variables as { owner: string; name: string; number: number };
+    const v = body.variables as { owner: string; name: string; number: number; label?: string };
+    if (!body.query.includes("repository(")) return Response.json({ data: { viewer: { login: "dev" } } });
+    if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
+    if (body.query.includes("label(name:")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: v.label === "bb-managed" ? { name: "bb-managed" } : null } } });
+    if (body.query.includes("pullRequests(")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openPulls } } } });
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
     const number = typeof state.node?.number === "number" ? state.node.number : 12;
     if (v.number !== number || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
@@ -95,9 +100,24 @@ function fakeHooks() {
   };
 }
 
-async function setup(options: { env?: Record<string, string>; send?: (...args: never[]) => unknown; get?: (args: { threadId: string }) => Promise<unknown>; token?: () => Promise<string> } = {}) {
+type RpcCall = { pluginId: string; method: string; input: Record<string, unknown> };
+
+async function setup(
+  options: {
+    env?: Record<string, string>;
+    send?: (...args: never[]) => unknown;
+    get?: (args: { threadId: string }) => Promise<unknown>;
+    token?: () => Promise<string>;
+    /** Stands in for stewards answering cross-plugin calls. */
+    callRpc?: (args: RpcCall) => Promise<unknown>;
+    /** What kv held before this load: a restart. */
+    kv?: Record<string, unknown>;
+  } = {},
+) {
   const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
-  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) } } });
+  const callRpc = vi.fn((options.callRpc ?? (async () => ({ ok: true }))) as (args: unknown) => Promise<unknown>);
+  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) }, plugins: { callRpc } } });
+  for (const [key, value] of Object.entries(options.kv ?? {})) await bb.storage.kv.set(key, value);
   const github = fakeGitHub();
   const hooks = fakeHooks();
   let now = 1_000_000_000_000;
@@ -109,7 +129,8 @@ async function setup(options: { env?: Record<string, string>; send?: (...args: n
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
   const rows = () => bb.storage.database().prepare("SELECT thread_id, key, kind, updated_at, last_comment_at FROM watches ORDER BY thread_id").all() as Array<Record<string, unknown>>;
   const sent = () => send.mock.calls.map((c) => c[0] as { threadId: string; mode: string; input: Array<{ type: string; text: string }> });
-  return { bb, harness, github, hooks, token, send, tool, text, rows, sent, advance: (ms: number) => (now += ms) };
+  const rpcs = () => callRpc.mock.calls.map((c) => c[0] as RpcCall).map(({ pluginId, method, input }) => ({ pluginId, method, input }));
+  return { bb, harness, github, hooks, token, send, tool, text, rows, sent, callRpc, rpcs, advance: (ms: number) => (now += ms) };
 }
 
 const issueNode = (over: Record<string, unknown> = {}) => ({
@@ -423,3 +444,118 @@ describe("the service", () => {
     await service.done;
   });
 });
+
+describe("stewards' source contract", () => {
+  const STEWARDS = { experimental_caller: { kind: "plugin" as const, pluginId: "stewards" } };
+
+  it("snapshots a pull request as the contract names it, and answers null for one that is not there", async () => {
+    const w = await setup();
+    w.github.state.node = pullNode({
+      body: "Adds widgets.",
+      isDraft: true,
+      comments: { nodes: [{ id: "IC_1", ...comment(`Done\n\n_— from bb thread thr-9_`, "2026-10-09T09:00:00Z") }] },
+      reviews: { nodes: [{ id: "PRR_1", author: { login: "carol" }, state: "CHANGES_REQUESTED", body: "No", createdAt: "2026-10-09T08:00:00Z", submittedAt: "2026-10-09T08:00:01Z", url: "https://github.com/r/1", commit: { oid: "aaaa" }, comments: { nodes: [] } }] },
+    });
+    const { snapshot } = (await w.harness.callRpc("sourceSnapshot", { id: "https://github.com/acme/widgets/pull/12" }, STEWARDS)) as { snapshot: Record<string, unknown> };
+    expect(snapshot).toMatchObject({ source: "github", kind: "pull", id: "Acme/Widgets#12", key: "Acme/Widgets#12", unit: "Acme/Widgets", state: "draft", description: "Adds widgets.", stateType: null });
+    expect(snapshot.comments).toEqual([
+      { id: "PRR_1", author: "carol", did: "requested changes", body: "No", createdAt: "2026-10-09T08:00:01Z", url: "https://github.com/r/1", signedBy: null },
+      { id: "IC_1", author: "bob", did: "commented", body: "Done\n\n_— from bb thread thr-9_", createdAt: "2026-10-09T09:00:00Z", url: "https://github.com/c/2026-10-09T09:00:00Z", signedBy: "thr-9" },
+    ]);
+    expect(snapshot.pull).toMatchObject({ draft: true, merged: false, headSha: "0123456789abcdef", reviews: [{ author: "carol", state: "changes requested", submittedAt: "2026-10-09T08:00:01Z", commit: "aaaa" }] });
+    expect(await w.harness.callRpc("sourceSnapshot", { id: "Acme/Widgets#13" }, STEWARDS)).toEqual({ snapshot: null });
+    expect(await w.harness.callRpc("sourceSnapshot", { id: "nonsense" }, STEWARDS)).toEqual({ snapshot: null });
+  });
+
+  it("validates repositories and their label, and says so when gh is not signed in rather than failing", async () => {
+    const w = await setup();
+    expect(await w.harness.callRpc("sourceValidate", { units: ["acme/widgets", "Acme/Nope", "not-a-repo"], label: "bb-managed", states: ["In Review"] }, STEWARDS)).toEqual({
+      viewer: "dev",
+      units: [
+        { unit: "acme/widgets", found: true, labelFound: true, missingStates: [] },
+        { unit: "Acme/Nope", found: false, labelFound: false, missingStates: [] },
+        { unit: "not-a-repo", found: false, labelFound: false, missingStates: [] },
+      ],
+      mine: [],
+      error: null,
+    });
+    expect(((await w.harness.callRpc("sourceValidate", { units: ["acme/widgets"], label: "other", states: [] }, STEWARDS)) as { units: unknown[] }).units).toEqual([{ unit: "acme/widgets", found: true, labelFound: false, missingStates: [] }]);
+
+    const out = await setup({ token: async () => { throw new NotSignedInError("no oauth token"); } });
+    expect(await out.harness.callRpc("sourceValidate", { units: ["acme/widgets"], label: "bb-managed", states: [] }, STEWARDS)).toEqual({ viewer: null, units: [], mine: [], error: expect.stringContaining("not signed in") });
+  });
+
+  it("lists open pull requests oldest first up to the limit, with per-repository errors", async () => {
+    const w = await setup();
+    w.github.state.openPulls = [
+      { number: 3, isDraft: false, createdAt: "2026-10-01T00:00:00Z", author: { login: "jane" }, labels: { nodes: [{ name: "bb-managed" }] } },
+      { number: 5, isDraft: true, createdAt: "2026-10-02T00:00:00Z", author: null, labels: { nodes: [] } },
+    ];
+    const result = (await w.harness.callRpc("sourceAdoptable", { units: ["Acme/Widgets", "acme/gone"], label: "bb-managed", limit: 1 }, STEWARDS)) as { viewer: string; entities: unknown[]; errors: string[] };
+    expect(result.viewer).toBe("dev");
+    expect(result.entities).toEqual([{ id: "Acme/Widgets#3", key: "Acme/Widgets#3", unit: "Acme/Widgets", kind: "pull", state: "open", labels: ["bb-managed"], author: "jane", draft: false, createdAt: "2026-10-01T00:00:00Z" }]);
+    expect(result.errors).toEqual(["acme/gone: no such repository, or it is not visible to the signed-in GitHub user"]);
+    expect(w.github.calls.find((c) => c.variables.first !== undefined)!.variables).toMatchObject({ owner: "Acme", name: "Widgets", first: 1, after: null });
+  });
+
+  describe("interest", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+
+    it("is only for stewards, is kept in kv, is leased at once, and rings stewards for doorbells in it", async () => {
+      const w = await setup(WITH_HOOKS);
+      await expect(w.harness.callRpc("sourceSetInterest", { units: ["acme/widgets"], entities: [] })).rejects.toThrow(/stewards plugin only/u);
+      await expect(w.harness.callRpc("sourceSetInterest", { units: [], entities: [] }, { experimental_caller: { kind: "plugin", pluginId: "linear" } })).rejects.toThrow(/stewards plugin only/u);
+      await expect(w.harness.callRpc("sourceSetInterest", { units: ["widgets"], entities: [] }, STEWARDS)).rejects.toThrow(/want owner\/repo/u);
+
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(w.hooks.subscribes).toEqual([]);
+
+      expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/gadgets"], entities: ["https://github.com/Acme/Widgets/pull/12"] }, STEWARDS)).toEqual({ ok: true });
+      expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"] });
+      await tick();
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "repo", id: "acme/gadgets" }], [{ kind: "issue", id: "Acme/Widgets#12" }]]);
+      // Setting the same again leases nothing new.
+      await w.harness.callRpc("sourceSetInterest", { units: ["Acme/Gadgets"], entities: ["Acme/Widgets#12"] }, STEWARDS);
+      await tick();
+      expect(w.hooks.subscribes).toHaveLength(2);
+
+      // A doorbell for the entity, and one in the repository (spelled as GitHub does), ring stewards once each after the debounce; others do not.
+      w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+      w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#12"));
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "issue", id: "Acme/Gadgets#4", unit: "Acme/Gadgets" })}\n\n`);
+      w.hooks.last().send(w.hooks.doorbell("Acme/Widgets#99"));
+      await tick(3000);
+      expect(w.rpcs()).toEqual([
+        { pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/Widgets#12" } },
+        { pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/Gadgets#4" } },
+      ]);
+
+      // A refused repository lease is logged and otherwise ignored.
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+      await tick(30 * 60_000);
+      expect(w.harness.logEntries.some((l) => l.message.includes("refused a lease on repository Acme/Gadgets for stewards (forbidden)"))).toBe(true);
+      expect(w.send).not.toHaveBeenCalled();
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("leases what stewards asked for after a restart, beside the watches", async () => {
+      const w = await setup({ ...WITH_HOOKS, kv: { "stewards/interest": { units: ["acme/gadgets"], entities: ["acme/widgets#12"] } } });
+      await w.tool({ ref: "Acme/Widgets#12" });
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      // The watch and the entity are one lease, whatever the casing.
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "issue", id: "Acme/Widgets#12" }, { kind: "repo", id: "acme/gadgets" }]]);
+      service.controller.abort();
+      await service.done;
+    });
+  });
+});
+

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseRef, parseRefKey, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
   it("reads a URL, owner/repo#n and owner/repo/pull/n, keeping the casing", () => {
@@ -23,6 +24,8 @@ describe("refs", () => {
       expect(parseRef(input), input).toBeNull();
     }
     expect(parseRefKey("nope")).toBeNull();
+    expect(parseRepo(" Acme/Widgets ")).toEqual({ owner: "Acme", name: "Widgets" });
+    for (const input of ["Acme", "Acme/Widgets#1", "a/b/c", ""]) expect(parseRepo(input), input).toBeNull();
   });
 });
 
@@ -143,5 +146,119 @@ describe("parseTarget", () => {
     expect(() => parseTarget({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] })).toThrow(/rate limit/u);
     expect(() => parseTarget({ errors: [{ message: "Bad credentials" }] })).toThrow(/Bad credentials/u);
     expect(() => parseTarget(null)).toThrow(/without data/u);
+  });
+});
+
+describe("parseSnapshot", () => {
+  it("maps a pull request onto the contract: state words, every review with its commit, ids, signatures, the head's author and the viewer", () => {
+    const payload = pull({
+      body: "Adds widgets.",
+      comments: { nodes: [{ id: "IC_1", author: { login: "bob" }, body: "Looks fine\n\n_— from bb thread thr-7_", createdAt: "2026-10-09T09:00:00Z", url: "https://github.com/c/1" }] },
+      reviews: {
+        nodes: [
+          { id: "PRR_1", author: { login: "bob" }, state: "COMMENTED", body: "", createdAt: "2026-10-09T08:00:00Z", submittedAt: "2026-10-09T08:30:00Z", url: "https://github.com/r/1", commit: { oid: "aaaa" }, comments: { nodes: [{ id: "RC_1", author: { login: "bob" }, body: "nit", createdAt: "2026-10-09T08:10:00Z", url: "https://github.com/rc/1", path: "src/a.ts" }] } },
+          { id: "PRR_2", author: { login: "carol" }, state: "APPROVED", body: "", createdAt: "2026-10-09T10:00:00Z", submittedAt: "2026-10-09T10:00:00Z", url: "https://github.com/r/2", commit: { oid: "bbbb" }, comments: { nodes: [] } },
+          { id: "PRR_3", author: { login: "jane" }, state: "PENDING", body: "draft", createdAt: "2026-10-09T11:00:00Z", submittedAt: null, url: null, commit: null, comments: { nodes: [] } },
+        ],
+      },
+    });
+    (payload.data.repository.issueOrPullRequest.commits.nodes[0]!.commit as Record<string, unknown>).author = { user: { login: "jane" } };
+    const s = parseSnapshot({ data: { viewer: { login: "dev" }, ...payload.data } })!;
+    expect(entitySnapshotSchema.parse(s)).toEqual(s);
+    expect(s).toMatchObject({
+      source: "github",
+      kind: "pull",
+      id: "Acme/Widgets#12",
+      key: "Acme/Widgets#12",
+      unit: "Acme/Widgets",
+      state: "open",
+      stateType: null,
+      labels: ["backend", "feature"],
+      author: "jane",
+      assignees: ["jane"],
+      priority: null,
+      estimate: null,
+      description: "Adds widgets.",
+      parent: null,
+      children: [],
+      linkedPulls: [],
+      viewer: "dev",
+    });
+    expect(s.comments).toEqual([
+      { id: "RC_1", author: "bob", did: "commented on src/a.ts", body: "nit", createdAt: "2026-10-09T08:10:00Z", url: "https://github.com/rc/1", signedBy: null },
+      { id: "IC_1", author: "bob", did: "commented", body: "Looks fine\n\n_— from bb thread thr-7_", createdAt: "2026-10-09T09:00:00Z", url: "https://github.com/c/1", signedBy: "thr-7" },
+      { id: "PRR_2", author: "carol", did: "approved", body: "", createdAt: "2026-10-09T10:00:00Z", url: "https://github.com/r/2", signedBy: null },
+    ]);
+    expect(s.pull).toEqual({
+      draft: false,
+      merged: false,
+      base: "main",
+      head: "feature/widgets",
+      headSha: "0123456789abcdef",
+      headAuthor: "jane",
+      reviewDecision: "review required",
+      requestedReviewers: ["backend", "carol"],
+      reviews: [
+        { author: "bob", state: "commented", submittedAt: "2026-10-09T08:30:00Z", commit: "aaaa" },
+        { author: "carol", state: "approved", submittedAt: "2026-10-09T10:00:00Z", commit: "bbbb" },
+      ],
+      checks: { state: "failure", failing: ["ci/deploy (https://ci/deploy)", "test (https://ci/test)"] },
+    });
+    expect(TARGET_QUERY).toContain("viewer { login }");
+  });
+
+  it("words the state as a playbook keys on it: draft, merged, closed; an issue is open or closed", () => {
+    expect(parseSnapshot(pull({ isDraft: true }))!.state).toBe("draft");
+    expect(parseSnapshot(pull({ isDraft: true }))!.pull!.draft).toBe(true);
+    expect(parseSnapshot(pull({ state: "MERGED", merged: true }))!).toMatchObject({ state: "merged", pull: { merged: true } });
+    expect(parseSnapshot(pull({ state: "CLOSED", isDraft: true }))!.state).toBe("closed");
+    const changes = parseSnapshot(pull({ reviews: { nodes: [{ author: { login: "carol" }, state: "CHANGES_REQUESTED", body: "no", createdAt: "2026-10-09T12:00:00Z", submittedAt: null, url: null, comments: { nodes: [] } }] } }))!;
+    // Without a node id or URL a comment is still named, by who and when.
+    expect(changes.comments.at(-1)!.id).toBe("carol@2026-10-09T12:00:00Z");
+    expect(changes.pull!.reviews).toEqual([{ author: "carol", state: "changes requested", submittedAt: "2026-10-09T12:00:00Z", commit: null }]);
+    const issue = parseSnapshot({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: { __typename: "Issue", number: 3, title: "Bug", body: null, state: "CLOSED", stateReason: "COMPLETED", comments: { nodes: [] } } } } })!;
+    expect(issue).toMatchObject({ kind: "issue", key: "Acme/Widgets#3", state: "closed", description: null, pull: null, viewer: null });
+    expect(parseSnapshot({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] })).toBeNull();
+  });
+
+  it("bounds what crosses: the newest comments, clipped bodies (signed before clipping), a clipped description", () => {
+    const many = Array.from({ length: 60 }, (_, i) => ({ id: `IC_${i}`, author: { login: "bob" }, body: i === 59 ? `${"x".repeat(SNAPSHOT_COMMENT_CHARS + 10)}\n\n_— from bb thread thr-1_` : `c${i}`, createdAt: `2026-10-09T09:${String(i).padStart(2, "0")}:00Z`, url: null }));
+    const s = parseSnapshot(pull({ body: "d".repeat(SNAPSHOT_DESCRIPTION_CHARS + 5), comments: { nodes: many }, reviews: { nodes: [] } }))!;
+    expect(s.comments).toHaveLength(SNAPSHOT_COMMENTS_MAX);
+    expect(s.comments[0]!.id).toBe("IC_10");
+    const last = s.comments.at(-1)!;
+    expect(last.signedBy).toBe("thr-1");
+    expect(last.body.startsWith("x".repeat(SNAPSHOT_COMMENT_CHARS))).toBe(true);
+    expect(last.body).toContain("more characters");
+    expect(s.description!.length).toBeLessThan(SNAPSHOT_DESCRIPTION_CHARS + 40);
+    expect(s.description).toContain("(5 more characters)");
+  });
+});
+
+describe("repositories", () => {
+  it("checks a repository and its label; not there is found false, anything else throws", () => {
+    expect(parseRepoCheck({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: { name: "bb-managed" } } } })).toEqual({ viewer: "dev", found: true, labelFound: true });
+    expect(parseRepoCheck({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: null } } })).toEqual({ viewer: "dev", found: true, labelFound: false });
+    expect(parseRepoCheck({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toEqual({ viewer: "dev", found: false, labelFound: false });
+    expect(() => parseRepoCheck({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] })).toThrow(/rate limit/u);
+  });
+
+  it("reads a page of open pull requests named as doorbells name them, with the next cursor", () => {
+    const page = (hasNextPage: boolean) => ({
+      data: {
+        viewer: { login: "dev" },
+        repository: {
+          nameWithOwner: "Acme/Widgets",
+          pullRequests: { pageInfo: { hasNextPage, endCursor: "Y3Vy" }, nodes: [{ number: 4, isDraft: true, createdAt: "2026-10-01T00:00:00Z", author: { login: "jane" }, labels: { nodes: [{ name: "b" }, { name: "a" }] } }] },
+        },
+      },
+    });
+    expect(parseOpenPulls(page(true))).toEqual({
+      viewer: "dev",
+      entities: [{ id: "Acme/Widgets#4", key: "Acme/Widgets#4", unit: "Acme/Widgets", kind: "pull", state: "draft", labels: ["a", "b"], author: "jane", draft: true, createdAt: "2026-10-01T00:00:00Z" }],
+      next: "Y3Vy",
+    });
+    expect(parseOpenPulls(page(false))!.next).toBeNull();
+    expect(parseOpenPulls({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toBeNull();
   });
 });

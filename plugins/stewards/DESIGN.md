@@ -5,7 +5,8 @@ thread that manages it until it is done**. The thread, a **steward**, acts on
 the entity as you, according to a playbook the project keeps in `.bb`, and you
 steer it only from bb.
 
-Status: design. Nothing here is built yet.
+Status: built (steps 1–4 of the build order; the board is not). See
+[README.md](README.md) for how it runs and where it goes beyond this design.
 
 ## Scope
 
@@ -94,6 +95,17 @@ These were settled while designing; each changes what gets built.
 - **Models are a playbook field per role**, and whichever thread spawned a
   binding may override them.
 - **Configuration lives in the project's `.bb`**, read through multi-repo.
+- **People make only the big decisions.** Stewards and the project steward
+  decide everything the project's own guidance (AGENTS.md, architecture and
+  design docs, the playbooks) settles. Only what the project file lists as a
+  big decision reaches you, through the project steward.
+- **Few tools.** Stewards get two: `steward_report` and `steward_update`.
+  Everything else uses what every thread has: the `linear_*` tools, `gh`,
+  and `bb thread` for workers. The github plugin adds no write tools.
+- **Thread lifetime and the sidebar belong to thread-briefs and the user.**
+  Stewards archive nothing, pin nothing and create no sidebar sections. A
+  finished steward says so in its last turn and thread-briefs archives it; a
+  later wake brings it back.
 
 ## 3. Configuration
 
@@ -116,7 +128,11 @@ These were settled while designing; each changes what gets built.
   "linear": { "teams": ["ENG", "OPS"] },
   "label": "bb-managed",
   "nightly": { "at": "01:00", "timezone": "America/New_York" },
-  "projectSteward": { "model": "claude/claude-opus-5-5/high" }
+  "projectSteward": { "model": "claude/claude-opus-5-5/high" },
+  "bigDecisions": [
+    "A public API, data contract or schema change other teams depend on",
+    "New vendors, services or spending"
+  ]
 }
 ```
 
@@ -152,8 +168,9 @@ committed `master` is read, so a playbook edit published from a thread lands as
 a `guidance-<threadId>` branch and takes effect when it is merged. That is the
 review step, and it is deliberate.
 
-Whether multi-repo's host-side read fast-forwards the canonical checkout from
-its remote, or only fetches, needs checking before this is built.
+multi-repo's host-side read fetches and fast-forwards (`--ff-only`) the
+canonical checkout at most once every ten minutes, then reads committed
+HEAD; a checkout with local commits is left as it is and read as it is.
 
 ## 4. Bindings and adoption
 
@@ -166,8 +183,8 @@ its remote, or only fetches, needs checking before this is built.
 - The plugin hears triggers through bb-gate-hooks `team` and `repo` leases,
   which already exist. The nightly pass re-lists labelled tickets and open
   pull requests as the correctness backstop.
-- A new steward is spawned in the **Managed** section with its display parent
-  set to its nearest managed ancestor, or the project steward when it has none.
+- A new steward is spawned as a child thread of its nearest managed
+  ancestor's steward, or of the project steward when it has none.
 - `--lifecycle-owner-thread` is used only between a steward and its workers.
   Stewards end on their own entity's terms.
 - Your own pull requests get no review steward. They belong to the ticket
@@ -184,12 +201,11 @@ its remote, or only fetches, needs checking before this is built.
 | kind, playbook, playbook version | What governs it. |
 | thread id, parent binding | The steward, and its nearest managed ancestor. |
 | phase, stage | From the entity's state, through the playbook. |
-| standing guidance | Your instructions, appended through `steward_guidance`. |
+| standing guidance | Instructions and decisions, appended through `steward_update`. |
 | ready gate | Checklist state, substantial or not, approval and the spec hash it was given against. |
 | priority, holds | Written by the project steward or a parent steward. |
 | model overrides | Steward and worker models, when overridden. |
 | status record | The latest one (§6). |
-| action log | Actions with idempotency keys (§6). |
 | requeue at, last snapshot, last judgment | Timers and the mechanical tier's memory. |
 | created, ended, end reason | Lifecycle. |
 
@@ -199,14 +215,17 @@ plugins.
 ## 5. Lifecycle
 
 - **Terminal.** The entity reaches a state the playbook declares terminal
-  (Linear Done or Canceled; GitHub merged or closed). The steward gets one
-  wrap-up turn — a final comment, closing workers — and is archived with its
-  workers.
-- **Reopen.** The entity leaves a terminal state. The same thread is
-  unarchived and the binding resumes. No second thread.
-- **Detach.** The label is removed. The steward gets one turn to stop: no new
-  actions, workers told to wind down. Then it is archived. Re-adding the label
-  unarchives it.
+  (Linear Done or Canceled; GitHub merged or closed). Its workers are
+  stopped and the steward gets one wrap-up turn — a final comment, saying
+  the work is done — and the binding ends. The thread is not archived here:
+  thread-briefs archives finished threads, and workers follow their
+  lifecycle owner.
+- **Reopen.** The entity leaves a terminal state. The binding resumes and
+  the same thread is woken, brought back from the archive if thread-briefs
+  had archived it. No second thread.
+- **Detach.** The label is removed. Workers are stopped and the steward gets
+  one turn to stop. Re-adding the label resumes it the same way. Deleting
+  the steward thread detaches it until the label is removed and re-added.
 - **Review stewards** end when the pull request is merged or closed.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
@@ -270,9 +289,8 @@ A turn that ends without a report is noted; repeated misses raise `stuck`.
 
 Comments and spawns are not idempotent. Before acting, a steward looks for
 evidence in the world that it already did it — a signed comment, a linked
-worker, an open pull request, a submitted review. Actions that leave no
-visible trace go in the binding's action log with an idempotency key, and the
-log is part of the snapshot.
+worker, an open pull request, a submitted review. Everything a steward writes
+is signed with its thread, which is what makes that evidence findable.
 
 ### The nightly pass
 
@@ -280,8 +298,8 @@ At the project file's time, 01:00 US Eastern by default:
 
 1. Every open binding gets one judgment turn whether or not anything changed,
    staggered and capped per night.
-2. The project steward's pass follows, over the fresh status records, and
-   writes the morning digest.
+2. The project steward's pass follows, over the fresh status records; its
+   reply is kept as the morning digest.
 
 All of it must finish before 03:00, when bb-gate's quiet window restarts
 servers to apply staged updates and would kill a running turn.
@@ -303,7 +321,7 @@ ready:
     - schema or data migration
     - public API or contract change
     - estimate >= 3
-  approval: me            # or { linear-state: Approved }
+  approval: project       # or me, or { linear-state: Approved }
 ```
 
 - **Specifying is done in comments.** In a `spec` stage the steward checks the
@@ -311,15 +329,17 @@ ready:
   affected repos, a plan — it posts as signed **spec comments**. What it
   cannot, it asks through a `decision` escalation. It does not rewrite the
   description.
-- **Approval.** A substantial ticket waits. With `approval: me` you approve in
-  bb, recorded by `steward_approve`. With a Linear signal, the steward waits
-  for it.
+- **Approval.** A substantial ticket waits. By default the project steward
+  approves it, judging the spec against the project's guidance, through
+  `steward_update`. With `approval: me` you approve in the steward's thread,
+  and the steward records it quoting your words. With a Linear signal, the
+  steward waits for it.
 - **The approval is pinned to the spec.** It is stored with a hash of the
   description and the spec comments it was given against. The mechanical tier
   flags any change after approval; the steward judges whether it is material,
   and if so voids the approval and asks again.
 - **Scope changes edit the description.** When the scope changes, the steward
-  raises a `scope` escalation. Once it is resolved, the steward updates the
+  raises a `scope` escalation. Once it is decided, the steward updates the
   description to the new scope, signed, and posts a comment saying what changed
   and why. A description edit always voids the approval.
 - **Out-of-order moves.** If someone moves the ticket into a `build` stage
@@ -351,21 +371,23 @@ gets a review steward.
   The worker returns findings; the steward posts them as your review, signed.
 - **Later rounds** — new pushes after your review, or a re-request — cover only
   what changed since your last review.
-- **Comments and change requests post without asking. Approvals go to you**
-  (`gate: me` on approve). An approval is the branch-protection safeguard
-  against unreviewed merges; if an agent can give it as you, the safeguard is
-  an agent too.
+- **Reviews post without asking, approvals included.** The review steward
+  requests changes for blocking findings, comments otherwise, and approves
+  when nothing blocking is left — unless the change is one of the project's
+  big decisions, which it escalates. It posts with `gh pr review`, signed.
+  This makes an approval as you an agent's call; a project that wants branch
+  protection to mean a person looked removes `approve` from the review
+  playbook's `may` list and has the steward escalate instead.
 - **Authors to skip**, such as dependency bots, are a playbook field.
 - **Cost.** Review stewards default to a small model. The work is in the
   workers, one per round.
-- The morning digest lists reviews waiting on your approval.
 
 ## 10. Steering and escalation
 
 ### Steering
 
 - **One binding:** say it in its steward's thread. The steward saves it with
-  `steward_guidance`, and every later wake carries it.
+  `steward_update`, and every later wake carries it.
 - **The project:** say it to the project steward — "focus on auth this week",
   "hold everything touching billing", "use a stronger model on ENG-57". It
   turns that into priority, holds and model overrides on bindings.
@@ -373,7 +395,7 @@ gets a review steward.
 
 ### Escalation
 
-`steward_escalate` takes:
+An escalation is raised with the turn's `steward_report` and takes:
 
 - a **kind** — `blocked`, `decision`, `scope`, `conflict`, `stuck`;
 - **what it needs** — one answerable question;
@@ -383,42 +405,45 @@ gets a review steward.
 An escalation is a condition on the status record, not a message, and stays
 until it is resolved.
 
-- **Routing:** nearest managed ancestor, then the project steward, then you.
-  Each level resolves it by writing guidance onto the binding — which clears
-  the condition and wakes the steward — or forwards it with a recommendation.
-- **Straight to you:** kinds listed in the playbook's `escalate-to-me`, and
-  every gate — `gate: me`, ready-gate approval, review approval. The steward
-  then shows as waiting-on-me.
+- **Routing:** nearest managed ancestor, then the project steward. Each level
+  decides it from the project's guidance by writing guidance onto the binding
+  (`steward_update` with `resolve`) — which clears the condition and wakes the
+  steward — or forwards it up with a recommendation.
+- **To you only for big decisions.** The project file's `bigDecisions` list
+  says what they are: by default scope changes beyond clarification, shared
+  API and schema changes, irreversible production changes, new spending, and
+  conflicts between people. The project steward forwards such an escalation
+  and asks you in its own thread, which thread-briefs then shows as waiting
+  on you. Nothing else reaches you.
 - **Your answer**, in any of the threads involved, becomes standing guidance.
 - **Backstop:** a status record that has not advanced within the playbook's
   `stuck` limit gets a `stuck` escalation raised for it.
 
 ## 11. Enforcement
 
-`may` lists what a playbook allows a steward to do. It is checked by the
-source plugins' write tools: a tool called from a bound thread refuses an
-action its playbook does not allow, and a description edit is refused unless
-the binding has a resolved `scope` escalation newer than the last edit.
-
-That check sits on the normal path only. A steward with a shell can run `gh`
-or call an API directly. Irreversible actions rely on the platforms: branch
-protection that requires someone else's approval, and review approvals that go
-through you. Every action is signed and recorded against its binding, so what
-a steward did is always visible afterwards.
+`may` lists what a playbook allows a steward to do, and every wake states it.
+It is policy, not a wall: nothing checks it. A steward acts with your
+credentials and a shell, GitHub writes go through `gh`, and adding checking
+write tools would duplicate `gh` for little gain. Irreversible actions rely
+on the platforms, such as branch protection. Everything a steward writes is
+signed with its thread, so what it did is always visible afterwards. The one
+hard stop is the runaway guard (§12).
 
 ## 12. The project steward
 
-- **Reads** status records and your focus guidance. Never transcripts; that is
-  what keeps it small however many bindings are open.
-- **Writes** priority, holds and model overrides onto bindings
-  (`steward_prioritize`, `steward_set_model`), resolutions to escalations,
-  forwarded escalations with its recommendation, and the morning digest.
+- **Reads** status records (`bb stewards list`, `bb stewards show`) and your
+  focus guidance. Never transcripts; that is what keeps it small however many
+  bindings are open.
+- **Decides** what stewards escalate, from the project's guidance, and
+  approves substantial specs. Writes priority, holds, model overrides and
+  decisions onto bindings with `steward_update`, forwards big decisions to
+  you, and writes the morning digest as its reply to the nightly wake.
 - **Woken** at the end of the nightly pass, by escalations that reach it, and
   by your messages.
 - **Budget is advisory.** Status records report what each binding uses; the
   project steward keeps the total sensible through priority and holds.
-- **Runaway guard.** A hard cap on worker spawns per binding per hour, to stop
-  a looping thread. Not a budget.
+- **Runaway guard.** A hard cap on worker spawns per binding per hour: a
+  worker past it is stopped and the steward told. Not a budget.
 
 ## 13. Models
 
@@ -430,9 +455,9 @@ models:
 
 - A playbook names the models for its stewards and their workers. The project
   file names the project steward's.
-- Whichever thread spawned a binding can override its models with
-  `steward_set_model`: the project steward for any binding, a parent steward
-  for its children and workers. The override is applied with the thread's
+- The project steward (any binding) and a parent steward (its children) can
+  override a binding's models with `steward_update`; a steward can override
+  its own workers' model. The override is applied with the thread's
   sticky model (`bb thread update --model`), takes effect from the next turn,
   and is stored on the binding so it survives restarts.
 
@@ -446,14 +471,13 @@ name: linear-tickets
 kind: ticket
 source: linear
 phases:
-  Triage:      { stage: spec }
+  Backlog:     { stage: spec }
   Todo:        { stage: spec }
   In Progress: { stage: build }
   In Review:   { stage: review, stuck: { days: 3 } }
 terminal: [Done, Canceled]
 ready: { ... }                    # §7
 promote: "A sub-issue that needs more than one pull request or its own approval."
-escalate-to-me: [scope]
 may: [comment, edit-description, set-state, set-labels, create-sub-issue, open-pr, request-review, spawn-worker]
 models: { ... }                   # §13
 requeue-default: 2d
@@ -470,12 +494,15 @@ requeue-default: 2d
 
 ## 15. Organization
 
-- A **Managed** section holds the pinned project steward and every ticket and
-  review steward, nested under their display parents.
-- Workers are hidden children of their steward.
-- A steward waiting on someone else stays quiet. Only gates and escalations
-  that reach you make it waiting-on-me.
-- Terminal bindings are archived.
+- Stewards are child threads of their nearest managed ancestor's steward, or
+  of the project steward. The plugin creates no sidebar sections and pins
+  nothing; how the sidebar is organized is the user's and thread-briefs'.
+- Workers are hidden children of their steward, started by the steward with
+  `bb thread spawn --parent-self --lifecycle-owner-thread … --visibility
+  hidden` and recognized by the plugin as children of a steward thread.
+- Whether a steward is waiting on you, waiting on someone else, or done is
+  thread-briefs' judgment from its transcript. Ended bindings are archived
+  by thread-briefs once finished, not by this plugin.
 
 ## 16. Architecture
 
@@ -483,31 +510,27 @@ requeue-default: 2d
 
 - **Configuration:** the project file and playbooks through multi-repo, and
   validation.
-- **Store:** bindings, action log, status records.
+- **Store:** bindings, status records, escalations, workers.
 - **Reconciler:** mechanical tier, debounce, nightly pass, `requeueAfter`
   timers, escalation routing.
-- **Threads:** spawning stewards and workers, building wake messages.
-- **Agent tools:** `steward_report`, `steward_guidance`, `steward_escalate`,
-  `steward_spawn_worker`, `steward_set_model`, `steward_approve`, and for the
-  project steward `steward_prioritize`.
-- **CLI:** `bb stewards init | check | list | show | detach | pass`.
+- **Threads:** spawning stewards, recognizing workers, building wake messages.
+- **Agent tools:** `steward_report` and `steward_update`.
+- **CLI:** `bb stewards init | check | list | show | detach | pass | digest`.
 - **UI:** a board of status records, later.
 
 ### Changes to linear and github
 
 - **A source contract**, in a contract file the three plugins share:
   `snapshot`, `validate`, `adoptable` (labelled tickets and open pull requests,
-  for the nightly backstop).
+  for the nightly backstop), `setInterest`, and stewards' `ring`.
 - **Leases and rings.** The hooks clients hold `team` and `repo` leases for
   the units stewards asks for, plus an issue lease for every bound entity, and
   forward rings to stewards over cross-plugin RPC. Existing `linear_watch_issue` and
   `github_watch` are unchanged.
 - **linear:** description editing on `linear_update_issue`, which today changes
-  state, assignee, labels and priority only. The `may` check on write tools.
-- **github:** write tools it does not have yet — comment, and submit a review
-  (comment, request changes, approve) — signed like linear's, with the `may`
-  check. Without them every GitHub write goes through `gh` and nothing is
-  checked.
+  state, assignee, labels and priority only.
+- **github:** no new tools. Every GitHub write goes through `gh`, signed by
+  the steward.
 
 ### Change to multi-repo
 
@@ -531,15 +554,13 @@ plugins' contract before stewards uses them, bb-plugins before bb-gate.
 
 1. **Linear ticket stewards.** Project file and playbooks through multi-repo,
    label adoption, bindings, mechanical tier, snapshot, status records,
-   standing guidance, the ready gate, terminal, reopen and detach, escalation
-   straight to you.
+   standing guidance, the ready gate, terminal, reopen and detach.
 2. **Pull requests, workers, sub-issues.** Linked pull requests in snapshots,
-   workers, model overrides, the `may` check, the runaway guard, promotion and
+   workers, model overrides, the runaway guard, promotion and
    parent routing, labelled pull requests.
-3. **Project steward.** Escalation routing, priority and holds, the nightly
-   pass, the morning digest.
-4. **Reviews.** Review bindings, review workers, the approval gate, github's
-   review tool.
+3. **Project steward.** Escalation routing and decisions, big decisions to
+   you, priority and holds, the nightly pass, the morning digest.
+4. **Reviews.** Review bindings, review workers.
 5. **Board.**
 
 ## Known limits

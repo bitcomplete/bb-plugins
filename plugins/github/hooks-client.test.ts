@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createHooksLoop, HooksRequestError, readSse, SseParser, StreamIdleError, subscribe, type Rejection } from "./hooks-client.js";
+import { createHooksLoop, HooksRequestError, readSse, SseParser, StreamIdleError, subscribe, type Lease, type Rejection } from "./hooks-client.js";
 
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
@@ -119,24 +119,24 @@ describe("SSE parsing", () => {
 });
 
 describe("subscribe", () => {
-  it("posts the connection, source, token and watches, in batches of 100, and merges the answers", async () => {
+  it("posts the connection, source, token and watches of either kind, in batches of 100, and merges the answers", async () => {
     const hooks = fakeHooks();
-    const ids = Array.from({ length: 150 }, (_, i) => `i-${i}`);
+    const ids: Lease[] = [{ kind: "repo", id: "acme/widgets" }, ...Array.from({ length: 149 }, (_, i) => ({ kind: "issue" as const, id: `i-${i + 1}` }))];
     hooks.state.answer = (body) => Response.json({ leases: body.watches.slice(1), rejected: [{ ...body.watches[0], reason: "forbidden" }] });
     const result = await subscribe(hooks.fetchImpl, BASE, "c_1", "tok-1", ids, new AbortController().signal);
     expect(hooks.subscribes).toHaveLength(2);
     expect(hooks.subscribes[0]).toMatchObject({ connection: "c_1", source: "github", token: "tok-1" });
     expect(hooks.subscribes[0]!.watches).toHaveLength(100);
-    expect(hooks.subscribes[0]!.watches[0]).toEqual({ kind: "issue", id: "i-0" });
+    expect(hooks.subscribes[0]!.watches.slice(0, 2)).toEqual([{ kind: "repo", id: "acme/widgets" }, { kind: "issue", id: "i-1" }]);
     expect(hooks.subscribes[1]!.watches).toHaveLength(50);
     expect(result.leases).toHaveLength(148);
-    expect(result.rejected.map((r) => r.id)).toEqual(["i-0", "i-100"]);
+    expect(result.rejected.map((r) => r.id)).toEqual(["acme/widgets", "i-100"]);
   });
 
   it("throws with the status and body when the connection is unknown, without the token in the message", async () => {
     const hooks = fakeHooks();
     hooks.state.answer = () => Response.json({ error: "unknown-connection" }, { status: 404 });
-    const error = await subscribe(hooks.fetchImpl, BASE, "c_gone", "tok-secret", ["i"], new AbortController().signal).catch((e: unknown) => e);
+    const error = await subscribe(hooks.fetchImpl, BASE, "c_gone", "tok-secret", [{ kind: "issue", id: "i" }], new AbortController().signal).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(HooksRequestError);
     expect((error as HooksRequestError).status).toBe(404);
     expect((error as HooksRequestError).unknownConnection).toBe(true);
@@ -159,10 +159,11 @@ describe("the loop", () => {
     await vi.advanceTimersByTimeAsync(ms);
   };
 
-  function start(hooks: ReturnType<typeof fakeHooks>, over: { watchIds?: () => string[]; token?: () => Promise<string>; idleMs?: number } = {}) {
+  function start(hooks: ReturnType<typeof fakeHooks>, over: { watchIds?: () => Lease[]; token?: () => Promise<string>; idleMs?: number } = {}) {
     const logs: string[] = [];
     const sweeps: string[] = [];
     const doorbells: string[] = [];
+    const units: Array<string | null> = [];
     const rejected: Rejection[][] = [];
     let token = "tok-1";
     let refreshes = 0;
@@ -177,8 +178,11 @@ describe("the loop", () => {
         token = `tok-fresh-${refreshes}`;
         return token;
       },
-      watchIds: over.watchIds ?? (() => ["i-1", "i-2"]),
-      onDoorbell: (id) => doorbells.push(id),
+      watchIds: over.watchIds ?? (() => [{ kind: "issue", id: "i-1" }, { kind: "issue", id: "i-2" }]),
+      onDoorbell: (id, unit) => {
+        doorbells.push(id);
+        units.push(unit);
+      },
       onRejected: async (r) => {
         rejected.push(r);
       },
@@ -189,7 +193,7 @@ describe("the loop", () => {
     });
     const controller = new AbortController();
     const done = loop.run(controller.signal);
-    return { loop, logs, sweeps, doorbells, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
+    return { loop, logs, sweeps, doorbells, units, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
   }
 
   it("subscribes every watch on hello with the current token, sweeps, then rings on doorbells for issues only", async () => {
@@ -209,9 +213,11 @@ describe("the loop", () => {
     hooks.last().send(hooks.doorbell("acme/widgets", { kind: "repo" }));
     hooks.last().send(hooks.doorbell("i-9", { source: "linear" }));
     hooks.last().send("event: doorbell\ndata: not json\n\n");
-    hooks.last().send(hooks.doorbell("i-2", { action: "remove" }));
+    hooks.last().send(hooks.doorbell("i-2", { action: "remove", unit: "" }));
     await tick();
     expect(s.doorbells).toEqual(["i-1", "i-2"]);
+    // The unit comes along when the service names one.
+    expect(s.units).toEqual(["acme/widgets", null]);
     expect(s.logs.join("\n")).not.toContain("tok-1");
 
     s.controller.abort();
@@ -339,10 +345,10 @@ describe("the loop", () => {
     expect(s.loop.status()).toMatchObject({ state: "stopped", leased: false });
   });
 
-  it("leases a newly added watch right away when connected, and leaves it to the next hello otherwise", async () => {
+  it("leases a newly added watch or repository right away when connected, and leaves it to the next hello otherwise", async () => {
     const hooks = fakeHooks();
     const s = start(hooks, { watchIds: () => [] });
-    await s.loop.added("i-new");
+    await s.loop.added("issue", "i-new");
     await tick();
     expect(hooks.subscribes).toEqual([]);
     hooks.last().send(hooks.hello("c_1"));
@@ -351,8 +357,12 @@ describe("the loop", () => {
     expect(hooks.subscribes).toEqual([]);
     expect(s.sweeps).toEqual(["connected"]);
     expect(s.loop.connected).toBe(true);
-    await s.loop.added("i-new");
+    await s.loop.added("issue", "i-new");
     expect(hooks.subscribes).toEqual([{ connection: "c_1", source: "github", token: "tok-1", watches: [{ kind: "issue", id: "i-new" }] }]);
+    // Several at once are one call; none is no call.
+    await s.loop.added("repo", "acme/widgets", "acme/gadgets");
+    await s.loop.added("repo");
+    expect(hooks.subscribes.slice(1)).toEqual([{ connection: "c_1", source: "github", token: "tok-1", watches: [{ kind: "repo", id: "acme/widgets" }, { kind: "repo", id: "acme/gadgets" }] }]);
     s.controller.abort();
     await s.done;
   });

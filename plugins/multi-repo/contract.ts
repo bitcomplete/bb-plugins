@@ -11,8 +11,37 @@
  */
 import { defineRpcContract, type ExperimentalHostSignals } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { PROJECT_FILE_PATH_MAX, projectFilePathProblem } from "./names.js";
 
 const absolutePath = z.string().min(1).max(4096);
+
+/**
+ * The most text one file in `readProjectFiles` may carry.
+ *
+ * A file over it is not truncated: half a playbook reads as a whole one. It
+ * comes back with `content: null` and the response's `error` names it, so a
+ * caller can tell it from a file that is not in the commit at all.
+ */
+export const PROJECT_FILE_MAX_CHARS = 200_000;
+export const PROJECT_FILES_MAX = 50;
+
+/** A file inside the `.bb` repo, as a relative POSIX path. */
+export const projectFilePathSchema = z
+  .string()
+  .min(1)
+  .max(PROJECT_FILE_PATH_MAX)
+  .superRefine((value, context) => {
+    const problem = projectFilePathProblem(value);
+    if (problem !== null) context.addIssue({ code: "custom", message: problem });
+  });
+
+export const projectFileSchema = z
+  .object({
+    path: z.string().max(PROJECT_FILE_PATH_MAX),
+    /** Null when the commit has no regular file at this path, or it is too large. */
+    content: z.string().max(PROJECT_FILE_MAX_CHARS).nullable(),
+  })
+  .strict();
 
 export const repoStatusSchema = z.enum(["ready", "failed"]);
 
@@ -209,6 +238,32 @@ export const hostContract = defineRpcContract({
         reposJson: z.string().max(200_000).nullable(),
         remote: z.string().max(2000).nullable(),
         defaultBranch: z.string().max(300).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
+      })
+      .strict(),
+  },
+
+  /**
+   * Read files from the canonical checkout's committed `HEAD`.
+   *
+   * Refreshes first — fetch and fast-forward, at most once per TTL, exactly
+   * as `prepareProjectSource` does — then reads each path out of the commit
+   * rather than off disk, so an uncommitted edit in the checkout is never
+   * served. `head` is the commit read.
+   */
+  readProjectSourceFiles: {
+    input: z
+      .object({
+        path: absolutePath,
+        fetchTtlMs: z.number().int().nonnegative(),
+        files: z.array(projectFilePathSchema).min(1).max(PROJECT_FILES_MAX),
+      })
+      .strict(),
+    output: z
+      .object({
+        head: z.string().max(64).nullable(),
+        files: z.array(projectFileSchema).max(PROJECT_FILES_MAX),
+        error: z.string().max(2000).nullable(),
         warnings: z.array(z.string().max(600)).max(20),
       })
       .strict(),
@@ -541,6 +596,31 @@ export const rpcContract = defineRpcContract({
   repoSet: {
     input: z.object({ projectId: z.string().min(1).max(100) }).strict(),
     output: repoSetViewSchema,
+  },
+  /**
+   * Files from the project's `.bb` repo, read from the canonical checkout's
+   * committed `HEAD` after a fast-forward-only refresh.
+   *
+   * The cross-plugin half of this contract, with `repoSet`: stewards reads its
+   * playbooks and settings through it. `head` is the commit read; a file the
+   * commit does not have comes back with `content: null`.
+   */
+  readProjectFiles: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        paths: z.array(projectFilePathSchema).min(1).max(PROJECT_FILES_MAX),
+      })
+      .strict(),
+    output: z
+      .object({
+        /** Null when this project has no `.bb` checkout on a reachable machine. */
+        projectSourcePath: absolutePath.nullable(),
+        head: z.string().max(64).nullable(),
+        files: z.array(projectFileSchema).max(PROJECT_FILES_MAX),
+        error: z.string().max(2000).nullable(),
+      })
+      .strict(),
   },
   saveRepoSet: {
     input: z

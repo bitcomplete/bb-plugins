@@ -8,16 +8,41 @@
 // bb-gate-hooks. A thread sees results, never the token.
 //
 // Everything else a thread wants from GitHub it does with `gh` on its
-// machine. What `gh` cannot do is wake a thread later, and that is the whole
+// machine. What `gh` cannot do is wake a thread later, and that is the heart
 // of this plugin: a watch (watch.ts) is a row in the plugin's SQLite plus a
 // lease on bb-gate-hooks (hooks-client.ts); when GitHub's webhook rings, the
 // target is re-read here and the thread is messaged with what changed.
-import { cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+//
+// The stewards plugin (../stewards/DESIGN.md) reads GitHub through this
+// plugin's half of source-contract.ts, and hears about its repositories and
+// bound pull requests through the same doorbell stream, rung over to it as
+// `stewardsRing`.
+import { cliCommand, defineCli, defineRpcContract, type BbPluginApi, type JsonValue } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { WATCHES_CHANGED } from "./channels.js";
 import { createGhTokenReader, type TokenReader } from "./gh.js";
-import { GITHUB_API_URL, GitHubRequestError, TARGET_QUERY, graphql, kindName, parseRef, parseRefKey, parseTarget, type Target } from "./github.js";
-import { createHooksLoop, HOOKS_URL_ENV, type Rejection } from "./hooks-client.js";
+import {
+  GITHUB_API_URL,
+  GitHubRequestError,
+  OPEN_PULLS_QUERY,
+  REPO_CHECK_QUERY,
+  TARGET_QUERY,
+  VIEWER_QUERY,
+  graphql,
+  kindName,
+  parseOpenPulls,
+  parseRef,
+  parseRefKey,
+  parseRepo,
+  parseRepoCheck,
+  parseSnapshot,
+  parseTarget,
+  parseViewer,
+  refKey,
+  type Target,
+} from "./github.js";
+import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
+import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
 import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -36,7 +61,16 @@ export const rpcContract = defineRpcContract({
     input: z.object({ threadId: z.string().min(1), targetId: z.string().min(1) }),
     output: z.object({ removed: z.boolean() }),
   },
+  // What stewards reads GitHub through: sourceSnapshot, sourceValidate,
+  // sourceAdoptable and sourceSetInterest (source-contract.ts).
+  ...sourceContract,
 });
+
+/** Where the units and entities stewards wants to hear about are kept, so a restart keeps leasing them. */
+export const INTEREST_KEY = "stewards/interest";
+const interestSchema = z.object({ units: z.array(z.string()), entities: z.array(z.string()) });
+type Interest = z.infer<typeof interestSchema>;
+
 /** How long a token read from gh is reused before gh is asked again. */
 export const TOKEN_CACHE_MS = 5 * 60 * 1000;
 
@@ -83,20 +117,32 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       return token;
     }
 
-    // ---- reading a target ---------------------------------------------------
+    // ---- talking to GitHub as the developer -----------------------------------
 
-    /** The target as the developer, or null when it does not exist or is not visible. A 401 re-reads the token once. */
-    async function readTarget(ref: { repo: string; number: number }, signal: AbortSignal): Promise<Target | null> {
-      const [owner, name] = ref.repo.split("/") as [string, string];
-      const variables = { owner, name, number: ref.number };
-      let payload: unknown;
+    /**
+     * One call with the token. A 401 means GitHub refused the token, not the
+     * request, so it is re-read from gh and the call made once more.
+     */
+    async function asDeveloper<T>(call: (token: string) => Promise<T>): Promise<T> {
       try {
-        payload = await graphql(apiUrl, await accessToken(), TARGET_QUERY, variables, deps.fetch, signal);
+        return await call(await accessToken());
       } catch (error) {
         if (!(error instanceof GitHubRequestError && error.status === 401)) throw error;
-        payload = await graphql(apiUrl, await refreshToken("GitHub answered 401"), TARGET_QUERY, variables, deps.fetch, signal);
+        return await call(await refreshToken("GitHub answered 401"));
       }
-      return parseTarget(payload);
+    }
+
+    const query = (document: string, variables: Record<string, unknown>, signal: AbortSignal) => asDeveloper((token) => graphql(apiUrl, token, document, variables, deps.fetch, signal));
+
+    /** The target's one read, unparsed: a watch and stewards' snapshot read the same answer two ways. */
+    function readTargetPayload(ref: { repo: string; number: number }, signal: AbortSignal): Promise<unknown> {
+      const [owner, name] = ref.repo.split("/") as [string, string];
+      return query(TARGET_QUERY, { owner, name, number: ref.number }, signal);
+    }
+
+    /** The target as the developer, or null when it does not exist or is not visible. */
+    async function readTarget(ref: { repo: string; number: number }, signal: AbortSignal): Promise<Target | null> {
+      return parseTarget(await readTargetPayload(ref, signal));
     }
 
     // ---- watching -----------------------------------------------------------
@@ -180,16 +226,68 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       await checks.sweep(keys);
     }
 
+    // ---- what stewards wants to hear about ------------------------------------
+    //
+    // Stewards names repositories (to hear of new pull requests) and the pull
+    // requests and issues it has bound. They are leased beside the watches,
+    // and a doorbell for one of them is passed on as `stewardsRing`; whether
+    // anything changed is stewards' question, as a watch's is watch.ts's.
+    // Kept in kv so a restart leases them again before stewards next says.
+
+    const storedInterest = interestSchema.safeParse(await bb.storage.kv.get(INTEREST_KEY));
+    let interest: Interest = storedInterest.success ? storedInterest.data : { units: [], entities: [] };
+    // GitHub's names are case-insensitive, and a doorbell spells them as
+    // GitHub does, which need not be how a project file does.
+    let interestRepos = new Set(interest.units.map((u) => u.toLowerCase()));
+    let interestEntities = new Set(interest.entities.map((e) => e.toLowerCase()));
+
+    /** Every lease to hold: the watches, then stewards' entities and repositories, each once. */
+    function leases(): Lease[] {
+      const seen = new Set<string>();
+      const out: Lease[] = [];
+      const add = (kind: Lease["kind"], id: string) => {
+        const k = `${kind} ${id.toLowerCase()}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({ kind, id });
+      };
+      for (const key of watches.keys()) add("issue", key);
+      for (const key of interest.entities) add("issue", key);
+      for (const repo of interest.units) add("repo", repo);
+      return out;
+    }
+
+    /** Whether stewards cares about a doorbell for this key, in this repository. */
+    function interesting(key: string, unit: string | null): boolean {
+      if (interestEntities.has(key.toLowerCase())) return true;
+      const repo = unit ?? parseRefKey(key)?.repo ?? null;
+      return repo !== null && interestRepos.has(repo.toLowerCase());
+    }
+
+    // Debounced per key like a watch's check, so a push and its three check
+    // runs are one ring. stewardsRing never throws; a missing stewards is quiet.
+    const callStewards = <T>(args: { pluginId: string; method: string; input: unknown; outputSchema: z.ZodType<T> }) => bb.sdk.plugins.callRpc<T>({ ...args, input: args.input as JsonValue });
+    const warn = (message: string) => bb.log.warn(message);
+    const rings = createCheckQueue((key) => ringStewards(callStewards, { source: "github", id: key }, warn), { onError: (key, error) => warn(`ringing stewards for ${key} failed: ${errorMessage(error)}`) });
+    bb.onDispose(() => rings.stop());
+
     // The service refusing a lease is not proof the developer lost access:
     // with GitHub rate-limiting the service, or briefly down, every watch
     // would come back `forbidden`. The developer's own read is the ground
     // truth, so a refused target is read here before the thread is told it
     // is gone; one that reads fine keeps its watch and is leased again at
     // the next renewal.
+    //
+    // Leases stewards asked for are only logged: stewards still reads the
+    // entity itself on its nightly pass, and says what it wants again.
     async function onRejected(rejected: Rejection[]): Promise<void> {
       for (const r of rejected) {
+        const watching = r.kind === "issue" ? watches.forKey(r.id) : [];
+        if (r.kind === "repo" || (watching.length === 0 && interestEntities.has(r.id.toLowerCase()))) {
+          bb.log.warn(`bb-gate-hooks refused a lease on ${r.kind === "repo" ? `repository ${r.id}` : r.id} for stewards (${r.reason}); stewards will not be rung for it`);
+          continue;
+        }
         if (r.kind !== "issue" || r.reason !== "forbidden") continue;
-        const watching = watches.forKey(r.id);
         if (watching.length === 0) continue;
         const ref = parseRefKey(r.id);
         try {
@@ -212,8 +310,11 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       log: bb.log,
       token: accessToken,
       refreshToken: () => refreshToken("was refused by bb-gate-hooks"),
-      watchIds: () => watches.keys(),
-      onDoorbell: (key) => checks.ring(key),
+      watchIds: leases,
+      onDoorbell: (key, unit) => {
+        checks.ring(key);
+        if (interesting(key, unit)) rings.ring(key);
+      },
       onRejected,
       sweep,
     });
@@ -261,6 +362,101 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           announceWatches();
         }
         return { removed };
+      },
+
+      async sourceSnapshot({ id }) {
+        const ref = parseRef(id);
+        if (ref === null) return { snapshot: null };
+        return { snapshot: parseSnapshot(await readTargetPayload(ref, checkSignal())) };
+      },
+
+      // States are Linear's; GitHub has none to check. A gh that is not
+      // signed in is an answer here (`error`), not a failure: it is the
+      // first thing `bb stewards check` should say.
+      async sourceValidate({ units, label }) {
+        let viewer: string;
+        try {
+          viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
+        } catch (error) {
+          return { viewer: null, units: [], mine: [], error: errorMessage(error) };
+        }
+        const checked: Array<{ unit: string; found: boolean; labelFound: boolean; missingStates: string[] }> = [];
+        try {
+          for (const unit of units) {
+            const repo = parseRepo(unit);
+            const found = repo === null ? { found: false, labelFound: false } : parseRepoCheck(await query(REPO_CHECK_QUERY, { ...repo, label }, checkSignal()));
+            checked.push({ unit, found: found.found, labelFound: found.labelFound, missingStates: [] });
+          }
+        } catch (error) {
+          return { viewer, units: [], mine: [], error: errorMessage(error) };
+        }
+        return { viewer, units: checked, mine: [], error: null };
+      },
+
+      // Each repository is read oldest first up to the limit, so the oldest
+      // `limit` across all of them are among what was read.
+      async sourceAdoptable({ units, limit }) {
+        let viewer: string;
+        try {
+          viewer = parseViewer(await query(VIEWER_QUERY, {}, checkSignal()));
+        } catch (error) {
+          return { viewer: null, entities: [], errors: [errorMessage(error)] };
+        }
+        const entities: AdoptableEntity[] = [];
+        const errors: string[] = [];
+        for (const unit of units) {
+          const repo = parseRepo(unit);
+          if (repo === null) {
+            errors.push(`${unit}: not owner/repo`);
+            continue;
+          }
+          try {
+            let after: string | null = null;
+            let read = 0;
+            do {
+              const page = parseOpenPulls(await query(OPEN_PULLS_QUERY, { ...repo, first: Math.min(100, limit - read), after }, checkSignal()));
+              if (page === null) {
+                errors.push(`${unit}: no such repository, or it is not visible to the signed-in GitHub user`);
+                break;
+              }
+              entities.push(...page.entities);
+              read += page.entities.length;
+              after = page.next;
+            } while (after !== null && read < limit);
+          } catch (error) {
+            errors.push(`${unit}: ${errorMessage(error)}`);
+          }
+        }
+        entities.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
+        return { viewer, entities: entities.slice(0, limit), errors };
+      },
+
+      // Replaces the previous set. Anything new is leased right away; what
+      // was dropped is simply not renewed and lapses within the hour.
+      async sourceSetInterest({ units, entities }, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== STEWARDS_PLUGIN_ID) throw new Error(`sourceSetInterest is for the ${STEWARDS_PLUGIN_ID} plugin only`);
+        const badUnits = units.filter((u) => parseRepo(u) === null);
+        const badEntities = entities.filter((e) => parseRef(e) === null);
+        if (badUnits.length > 0 || badEntities.length > 0) {
+          throw new Error(`not GitHub names: ${[...badUnits.map((u) => `${JSON.stringify(u)} (want owner/repo)`), ...badEntities.map((e) => `${JSON.stringify(e)} (want owner/repo#12)`)].slice(0, 10).join(", ")}`);
+        }
+        const before = new Set(leases().map((l) => `${l.kind} ${l.id.toLowerCase()}`));
+        const next: Interest = {
+          units: [...new Set(units.map((u) => u.trim()))],
+          entities: [...new Set(entities.map((e) => refKey(parseRef(e)!)))],
+        };
+        await bb.storage.kv.set(INTEREST_KEY, next);
+        interest = next;
+        interestRepos = new Set(next.units.map((u) => u.toLowerCase()));
+        interestEntities = new Set(next.entities.map((e) => e.toLowerCase()));
+        const fresh = leases().filter((l) => !before.has(`${l.kind} ${l.id.toLowerCase()}`));
+        const lease = (kind: Lease["kind"]) => {
+          const ids = fresh.filter((l) => l.kind === kind).map((l) => l.id);
+          if (ids.length > 0) hooks.added(kind, ...ids).catch((error: unknown) => bb.log.warn(`could not lease what stewards asked for right away: ${errorMessage(error)}`));
+        };
+        lease("repo");
+        lease("issue");
+        return { ok: true };
       },
     });
 
@@ -341,7 +537,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           if (added.outcome === "already") return `Already watching ${what}. This thread will be messaged when it changes; you can end the turn.`;
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
-          hooks.added(target.key).catch((error: unknown) => bb.log.warn(`could not lease ${target.key} right away: ${errorMessage(error)}`));
+          hooks.added("issue", target.key).catch((error: unknown) => bb.log.warn(`could not lease ${target.key} right away: ${errorMessage(error)}`));
           announceWatches();
           return `Watching ${what}. This thread will be messaged when it changes or someone else comments; end the turn rather than polling.`;
         } catch (error) {
@@ -349,6 +545,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         }
       },
     });
+
   };
 }
 

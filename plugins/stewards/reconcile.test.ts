@@ -1,0 +1,109 @@
+import { describe, expect, it } from "vitest";
+import { parsePlaybook } from "./config.js";
+import { comment, issue, pull } from "./fixtures.js";
+import { diffObserved, gateState, lifecycle, specHash, stuckDue } from "./reconcile.js";
+import { readyStateSchema } from "./store.js";
+import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
+
+const tickets = (() => {
+  const p = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+  if (!p.ok) throw new Error(p.error);
+  return p.value;
+})();
+const reviews = (() => {
+  const p = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+  if (!p.ok) throw new Error(p.error);
+  return p.value;
+})();
+
+const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z" };
+const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
+
+describe("what changed", () => {
+  it("wakes for others' comments and not for the steward's own", () => {
+    const before = { entity: issue(), pulls: [] };
+    const own = { entity: issue({ comments: [comment({ id: "c0", body: "Plan…", signedBy: "thr_s" }), comment({ id: "c9", signedBy: "thr_w" })] }), pulls: [] };
+    expect(actionable(diffObserved(before, own, ctx))).toEqual([]);
+    const other = { entity: issue({ comments: [comment()] }), pulls: [] };
+    expect(actionable(diffObserved(before, other, ctx))).toEqual(["1 new comment from Sam"]);
+    const stale = { entity: issue({ comments: [comment({ createdAt: "2026-09-30T00:00:00Z" })] }), pulls: [] };
+    expect(actionable(diffObserved(before, stale, ctx))).toEqual([]);
+  });
+
+  it("treats state and description as actionable and label churn as not", () => {
+    const before = { entity: issue(), pulls: [] };
+    const after = { entity: issue({ state: "In Progress", labels: ["bb-managed", "auth"], description: "Users cannot log in with SSO." }), pulls: [] };
+    expect(actionable(diffObserved(before, after, ctx))).toEqual(["State: Todo → In Progress", "Description edited"]);
+  });
+
+  it("counts a spec comment only once an approval is pinned", () => {
+    const before = { entity: issue(), pulls: [] };
+    const after = { entity: issue({ comments: [comment({ id: "s1", body: "**Spec:** acceptance criteria…", signedBy: "thr_s" })] }), pulls: [] };
+    expect(actionable(diffObserved(before, after, ctx))).toEqual([]);
+    expect(actionable(diffObserved(before, after, { ...ctx, approved: true }))).toEqual(["Spec comment added"]);
+  });
+
+  it("on a pull request: checks finishing, others' pushes and reviews, re-requests", () => {
+    const before = { entity: pull(), pulls: [] };
+    const ownPush = { entity: pull({}, { headSha: "bbbbbbb2", headAuthor: "jane" }), pulls: [] };
+    expect(actionable(diffObserved(before, ownPush, ctx))).toEqual([]);
+    const theirs = { entity: pull({}, { headSha: "bbbbbbb2", headAuthor: "sam", checks: { state: "failure", failing: ["ci"] }, requestedReviewers: ["jane"], reviews: [{ author: "lee", state: "approved", submittedAt: "2026-10-02T00:00:00Z", commit: null }] }), pulls: [] };
+    expect(actionable(diffObserved(before, theirs, ctx))).toEqual(["Pushed bbbbbbb by sam", "Checks finished: failure (failing: ci)", "Review: lee approved", "Your review was requested"]);
+  });
+
+  it("follows a ticket's linked pull requests", () => {
+    const before = { entity: issue(), pulls: [pull()] };
+    const after = { entity: issue(), pulls: [pull({ state: "merged" })] };
+    expect(actionable(diffObserved(before, after, ctx))).toEqual(["acme/web#7: State: open → merged"]);
+  });
+});
+
+describe("the ready gate", () => {
+  const ready = (over: object) => readyStateSchema.parse(over);
+  const allMet = tickets.ready!.checklist.map((item) => ({ item, met: true }));
+
+  it("needs the whole checklist, and approval unless judged not substantial", () => {
+    const hash = specHash(issue(), "thr_s");
+    expect(gateState(tickets, ready({}), hash)).toMatchObject({ passed: false, unmet: tickets.ready!.checklist });
+    expect(gateState(tickets, ready({ checklist: allMet }), hash)).toMatchObject({ passed: false, approvalNeeded: true });
+    expect(gateState(tickets, ready({ checklist: allMet, substantial: false }), hash).passed).toBe(true);
+    expect(gateState(tickets, ready({ checklist: allMet, approval: { at: 1, specHash: hash, by: "thr_s" } }), hash).passed).toBe(true);
+  });
+
+  it("pins approval to the description and spec comments", () => {
+    const hash = specHash(issue(), "thr_s");
+    const r = ready({ checklist: allMet, approval: { at: 1, specHash: hash, by: "thr_s" } });
+    const edited = specHash(issue({ description: "Users cannot log in. Also SSO." }), "thr_s");
+    expect(gateState(tickets, r, edited)).toMatchObject({ passed: false, approvalStale: true });
+    // Others' comments are not spec; the steward's signature on its own edit does not change the hash.
+    expect(specHash(issue({ comments: [comment({ body: "Spec: mine" })] }), "thr_s")).toBe(hash);
+    expect(specHash(issue({ description: "Users cannot log in.\n\n_— from bb thread thr_s_" }), "thr_s")).toBe(hash);
+  });
+});
+
+describe("lifecycle", () => {
+  const open = { kind: "ticket" as const, endedAt: null, endReason: null, manualDetach: false };
+  it("ends on a terminal state or a removed label, and comes back", () => {
+    expect(lifecycle(open, tickets, issue(), "bb-managed").kind).toBe("continue");
+    expect(lifecycle(open, tickets, issue({ state: "Done" }), "bb-managed").kind).toBe("terminal");
+    expect(lifecycle(open, tickets, issue({ labels: [] }), "bb-managed").kind).toBe("detach");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, tickets, issue({ state: "Todo" }), "bb-managed").kind).toBe("reopen");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "detach" }, tickets, issue(), "bb-managed").kind).toBe("reopen");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "detach", manualDetach: true }, tickets, issue(), "bb-managed").kind).toBe("stay-ended");
+  });
+
+  it("does not detach a review binding, which has no label", () => {
+    expect(lifecycle({ ...open, kind: "review" }, reviews, pull(), "bb-managed").kind).toBe("continue");
+    expect(lifecycle({ ...open, kind: "review" }, reviews, pull({ state: "merged" }), "bb-managed").kind).toBe("terminal");
+  });
+});
+
+describe("the stuck backstop", () => {
+  it("fires after the phase's limit without progress, once", () => {
+    const b = { advancedAt: 0, createdAt: 0, phase: "In Progress" };
+    expect(stuckDue(b, tickets, [], 86_400_000)).toBeNull();
+    expect(stuckDue(b, tickets, [], 3 * 86_400_000)).toBe(2 * 86_400_000);
+    expect(stuckDue({ ...b, phase: "Todo" }, tickets, [], 30 * 86_400_000)).toBeNull();
+    expect(stuckDue(b, tickets, [{ kind: "stuck" } as never], 3 * 86_400_000)).toBeNull();
+  });
+});

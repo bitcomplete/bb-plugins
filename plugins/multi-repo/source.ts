@@ -18,8 +18,8 @@
 import { access, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { slugify } from "./names.js";
-import { git, gitIn, gitInOrThrow, gitLine, firstProblemLine } from "./git.js";
+import { projectFilePathProblem, slugify } from "./names.js";
+import { git, gitIn, gitInOrThrow, gitLine, firstProblemLine, splitNul } from "./git.js";
 import { REPOS_FILE, serializeReposFile, type ReposFile } from "./repos.js";
 
 const FETCH_MARKER = ".git/bb-multi-repo-fetched-at";
@@ -273,6 +273,88 @@ export async function readReposJson(dir: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+export interface CommittedFiles {
+  /** The commit read, or null when there is none to read. */
+  head: string | null;
+  files: Array<{ path: string; content: string | null }>;
+  error: string | null;
+}
+
+/** Git modes of a regular file. A symlink (`120000`) or a submodule is not one. */
+const REGULAR_FILE_MODES = new Set(["100644", "100755"]);
+
+/**
+ * Read files out of the project source's committed `HEAD`, never its working
+ * tree.
+ *
+ * The canonical checkout is a person's directory as well as the plugin's: an
+ * edit someone is halfway through there is not yet the project's, any more
+ * than one in a thread's workspace is. So the read is pinned to one commit,
+ * resolved once, and every file comes from that commit's tree — a `HEAD` that
+ * moves mid-read cannot hand back a mix of two.
+ *
+ * A path the commit does not hold as a regular file comes back as null, and
+ * so does one over `maxChars`, with `error` naming it: a truncated playbook
+ * would read as a complete one. A path that fails {@link projectFilePathProblem}
+ * is refused outright, whatever the schema in front of this already checked.
+ */
+export async function readCommittedFiles(
+  dir: string,
+  paths: readonly string[],
+  maxChars: number,
+  signal?: AbortSignal,
+): Promise<CommittedFiles> {
+  for (const file of paths) {
+    const problem = projectFilePathProblem(file);
+    if (problem !== null) return { head: null, files: [], error: problem };
+  }
+  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
+  const head = await gitLine(dir, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], options);
+  if (head === null || head.length === 0) {
+    return { head: null, files: [], error: `${dir} is not a git repo with a commit to read.` };
+  }
+
+  // One `ls-tree` for every path: which of them the commit holds, and as what.
+  // Literal pathspecs, so a name with `*` or a leading `:(` is only a name.
+  const listed = await gitIn(
+    dir,
+    ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", head, "--", ...paths],
+    options,
+  );
+  if (listed.code !== 0) return { head, files: [], error: firstProblemLine(listed) };
+  const blobs = new Map<string, string>();
+  for (const entry of splitNul(listed.stdout)) {
+    const match = /^(\d+) (\w+) ([0-9a-f]+)\t(.*)$/su.exec(entry);
+    if (match === null || match[2] !== "blob" || !REGULAR_FILE_MODES.has(match[1])) continue;
+    blobs.set(match[4], match[3]);
+  }
+
+  const files: CommittedFiles["files"] = [];
+  const tooLarge: string[] = [];
+  for (const file of paths) {
+    const object = blobs.get(file);
+    if (object === undefined) {
+      files.push({ path: file, content: null });
+      continue;
+    }
+    // Room for the limit in the widest UTF-8, plus one byte to tell "exactly
+    // at the limit" from "over it".
+    const read = await gitIn(dir, ["cat-file", "blob", object], { ...options, maxBytes: maxChars * 3 + 1 });
+    if (read.code !== 0) return { head, files: [], error: firstProblemLine(read) };
+    if (read.truncated || read.stdout.length > maxChars) {
+      tooLarge.push(file);
+      files.push({ path: file, content: null });
+      continue;
+    }
+    files.push({ path: file, content: read.stdout });
+  }
+  const error =
+    tooLarge.length === 0
+      ? null
+      : `Larger than ${maxChars} characters, so not read: ${tooLarge.join(", ")}`.slice(0, 2000);
+  return { head, files, error };
 }
 
 /**

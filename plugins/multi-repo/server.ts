@@ -1290,6 +1290,34 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       }
     },
 
+    /**
+     * Files from the project's `.bb`, for another plugin — stewards reads its
+     * playbooks through this. Open to any caller like `repoSet` beside it:
+     * everything it can return is already in a repo whose `repos.json` that
+     * RPC hands to every client.
+     */
+    async readProjectFiles({ projectId, paths }) {
+      let location: SourceLocation | null;
+      try {
+        location = await projectSource(projectId);
+      } catch (error) {
+        return { projectSourcePath: null, head: null, files: [], error: errorMessage(error) };
+      }
+      if (location === null) return { projectSourcePath: null, head: null, files: [], error: null };
+      try {
+        const read = await host.call(
+          "readProjectSourceFiles",
+          { path: location.path, fetchTtlMs: CACHE_FRESH_MS, files: paths },
+          { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
+        );
+        // A failed refresh still leaves a commit to read; it is only stale.
+        for (const warning of read.warnings) bb.log.debug(`readProjectFiles(${projectId}): ${warning}`);
+        return { projectSourcePath: location.path, head: read.head, files: read.files, error: read.error };
+      } catch (error) {
+        return { projectSourcePath: location.path, head: null, files: [], error: errorMessage(error) };
+      }
+    },
+
     async saveRepoSet({ projectId, reposJson }) {
       const location = await projectSource(projectId);
       if (location === null) return { ok: false, error: "This project has no checkout on any machine." };

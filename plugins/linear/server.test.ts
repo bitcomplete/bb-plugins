@@ -78,8 +78,19 @@ function fakeHooks() {
     state,
     last: () => streams.at(-1)!,
     hello: (connection: string) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds: 3600 })}\n\n`,
-    doorbell: (id: string) => `event: doorbell\ndata: ${JSON.stringify({ source: "linear", kind: "issue", id, unit: "team-1", action: "update", at: "2026-10-10T17:02:11Z" })}\n\n`,
+    doorbell: (id: string, unit = "team-1") => `event: doorbell\ndata: ${JSON.stringify({ source: "linear", kind: "issue", id, unit, action: "update", at: "2026-10-10T17:02:11Z" })}\n\n`,
   };
+}
+
+// A stewards plugin that records every call made to it.
+function fakeStewards() {
+  const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
+  const callRpc = vi.fn(async (args: { pluginId: string; method: string; input?: unknown }) => {
+    if (args.pluginId !== "stewards") throw new Error(`unexpected plugin ${args.pluginId}`);
+    calls.push({ method: args.method, input: args.input as Record<string, unknown> });
+    return { ok: true };
+  });
+  return { callRpc, calls, to: (method: string) => calls.filter((c) => c.method === method).map((c) => c.input) };
 }
 
 const issue = (over: Record<string, unknown> = {}) => ({
@@ -96,7 +107,16 @@ const issue = (over: Record<string, unknown> = {}) => ({
 });
 
 async function setup(
-  options: { settings?: Record<string, string>; env?: Record<string, string>; linear?: Parameters<typeof fakeLinear>[0]; expiresAt?: number; hooks?: ReturnType<typeof fakeHooks>; sdk?: Parameters<typeof createFakePluginHost>[0] extends { sdk?: infer S } | undefined ? S : never } = {},
+  options: {
+    settings?: Record<string, string>;
+    env?: Record<string, string>;
+    linear?: Parameters<typeof fakeLinear>[0];
+    expiresAt?: number;
+    hooks?: ReturnType<typeof fakeHooks>;
+    sdk?: Parameters<typeof createFakePluginHost>[0] extends { sdk?: infer S } | undefined ? S : never;
+    /** kv the plugin finds when it starts, as after a restart. */
+    kv?: Record<string, unknown>;
+  } = {},
 ) {
   const { bb, harness } = createFakePluginHost({
     pluginId: "linear",
@@ -106,6 +126,7 @@ async function setup(
   });
   const linear = fakeLinear(options.linear);
   let now = 1_000_000_000_000;
+  for (const [key, value] of Object.entries(options.kv ?? {})) await bb.storage.kv.set(key, value);
   const fetchImpl = (options.hooks === undefined ? linear.fetchImpl : ((url, init) => (String(url).startsWith(HOOKS_URL) ? options.hooks!.fetchImpl(url, init) : linear.fetchImpl(url, init))) as typeof fetch);
   await createLinearPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {} })(bb);
   if (options.expiresAt !== undefined) await bb.storage.kv.set("expiresAt", options.expiresAt);
@@ -815,6 +836,230 @@ describe("watching an issue", () => {
       await tick(1000);
       expect(w.hooks.streams).toHaveLength(2);
       expect(w.hooks.last().closed).toBe(false);
+      service.controller.abort();
+      await service.done;
+    });
+  });
+});
+
+describe("editing a description", () => {
+  it("replaces the description, signed with the thread, alongside other changes", async () => {
+    const { tool, text, linear } = await setup({
+      settings: { accessToken: "at-0" },
+      linear: {
+        answer: (body) =>
+          body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")
+            ? { data: { issueUpdate: { success: true, issue: { identifier: "ENG-123", state: { name: "Done" }, assignee: null, labels: { nodes: [] }, priority: 2 } } } }
+            : { data: { issue: issue(), issueLabels: { nodes: [] } } },
+      },
+    });
+    expect(text(await tool("linear_update_issue", { key: "ENG-123", state: "done", priority: "high", description: "Scope: login only." }, { threadId: "thr-1" }))).toBe(
+      "ENG-123: now Done; priority high; description replaced.",
+    );
+    const input = linear.calls.find((c) => c.body?.query.startsWith("mutation"))!.body!.variables!.input as Record<string, unknown>;
+    expect(input).toMatchObject({ stateId: "s-done", priority: 2 });
+    expect(input.description).toMatch(/^Scope: login only\.\n\n_— from bb thread thr-1_$/u);
+    expect(text(await tool("linear_update_issue", { key: "ENG-123", description: "Only this." }, { threadId: "thr-1" }))).toBe("ENG-123: description replaced.");
+  });
+});
+
+describe("the source contract", () => {
+  const snapshotIssue = (over: Record<string, unknown> = {}) => ({
+    ...issue(),
+    priority: 2,
+    priorityLabel: "High",
+    estimate: null,
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-02T00:00:00Z",
+    team: { id: "t-eng", key: "ENG" },
+    creator: { name: "Bob" },
+    labels: { nodes: [{ name: "bb-managed" }] },
+    parent: null,
+    children: { nodes: [] },
+    comments: { nodes: [{ id: "c-1", body: `On it${signature("thr-9")}`, createdAt: "2026-10-01T01:00:00Z", url: null, user: { displayName: "jane" } }] },
+    attachments: { nodes: [{ url: "https://github.com/acme/web/pull/7", sourceType: "github" }] },
+    ...over,
+  });
+  const STEWARDS = { kind: "plugin", pluginId: "stewards" } as const;
+
+  it("sourceSnapshot reads an issue by key or id as the connected user, and is null for one that is not there", async () => {
+    const { harness, linear } = await setup({
+      settings: { accessToken: "at-0" },
+      linear: {
+        answer: (body) =>
+          body.variables?.id === "ENG-404" ? { data: null, errors: [{ message: "Entity not found: Issue" }] } : body.query.includes("attachments") ? { data: { issue: snapshotIssue() } } : { data: {} },
+      },
+    });
+    const { snapshot } = (await harness.callRpc("sourceSnapshot", { id: "ENG-123" })) as { snapshot: Record<string, unknown> };
+    expect(snapshot).toMatchObject({
+      source: "linear",
+      id: "uuid-1",
+      key: "ENG-123",
+      state: "In Progress",
+      stateType: "started",
+      unit: "ENG",
+      author: "Bob",
+      assignees: ["jane"],
+      priority: "High",
+      linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }],
+      viewer: "jane",
+    });
+    expect(snapshot.comments).toEqual([{ id: "c-1", author: "jane", did: "commented", body: `On it${signature("thr-9")}`, createdAt: "2026-10-01T01:00:00Z", url: null, signedBy: "thr-9" }]);
+    expect(linear.calls.find((c) => c.body?.query.includes("attachments"))!.token).toBe("at-0");
+    expect(await harness.callRpc("sourceSnapshot", { id: "ENG-404" })).toEqual({ snapshot: null });
+  });
+
+  it("sourceValidate checks each team's label and states, lists the viewer's teams, and answers when not connected", async () => {
+    const disconnected = await setup();
+    expect(await disconnected.harness.callRpc("sourceValidate", { units: ["ENG"], label: "bb-managed", states: [] })).toEqual({
+      viewer: null,
+      units: [],
+      mine: [],
+      error: expect.stringContaining("Linear is not connected"),
+    });
+
+    const team = {
+      id: "t-eng",
+      key: "ENG",
+      name: "Engineering",
+      states: { nodes: [{ id: "s-todo", name: "Todo", type: "unstarted", position: 0 }, { id: "s-review", name: "In Review", type: "started", position: 1 }] },
+      labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
+    };
+    const { harness } = await setup({
+      settings: { accessToken: "at-0" },
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query MyTeams")) return { data: { viewer: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } } };
+          if (body.query.startsWith("query($key: String!) { teams")) {
+            return { data: { teams: { nodes: body.variables!.key === "ENG" ? [team] : [] }, issueLabels: { nodes: [{ id: "l-bb", name: "BB-Managed" }] } } };
+          }
+          return { data: {} };
+        },
+      },
+    });
+    expect(await harness.callRpc("sourceValidate", { units: ["eng", "NOPE"], label: "bb-managed", states: ["todo", "In Review", "Approved"] })).toEqual({
+      viewer: "jane",
+      units: [
+        { unit: "eng", found: true, labelFound: true, missingStates: ["Approved"] },
+        { unit: "NOPE", found: false, labelFound: false, missingStates: [] },
+      ],
+      mine: [{ unit: "ENG", name: "Engineering" }],
+      error: null,
+    });
+  });
+
+  it("sourceAdoptable lists labelled open issues per team, oldest first, with each team's failure on its own", async () => {
+    const node = (id: string, team: string, createdAt: string) => ({ id, identifier: `${team}-${id}`, createdAt, state: { name: "Todo" }, team: { key: team }, creator: { name: "Bob" }, labels: { nodes: [{ name: "bb-managed" }] } });
+    const { harness, linear } = await setup({
+      settings: { accessToken: "at-0" },
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }, { id: "t-ops", key: "OPS", name: "Ops" }] } } };
+          const filter = body.variables!.filter as { team: { key: { eq: string } } };
+          if (filter.team.key.eq === "OPS") return { errors: [{ message: "rate limited" }] };
+          return body.variables!.after === null
+            ? { data: { issues: { nodes: [node("3", "ENG", "2026-10-03T00:00:00Z")], pageInfo: { hasNextPage: true, endCursor: "p2" } } } }
+            : { data: { issues: { nodes: [node("1", "ENG", "2026-10-01T00:00:00Z"), node("2", "ENG", "2026-10-02T00:00:00Z")], pageInfo: { hasNextPage: false, endCursor: null } } } };
+        },
+      },
+    });
+    const result = (await harness.callRpc("sourceAdoptable", { units: ["eng", "OPS", "GONE"], label: "bb-managed", limit: 2 })) as { viewer: string; entities: Array<{ key: string }>; errors: string[] };
+    expect(result.viewer).toBe("jane");
+    expect(result.entities.map((e) => e.key)).toEqual(["ENG-1", "ENG-2"]);
+    expect(result.errors).toEqual(["OPS: Linear: rate limited", "GONE: no such Linear team, or it is not visible to the connected user"]);
+    expect(linear.calls.find((c) => c.body?.query.startsWith("query($filter: IssueFilter"))!.body!.variables).toEqual({
+      filter: { team: { key: { eq: "ENG" } }, labels: { some: { name: { eqIgnoreCase: "bb-managed" } } }, state: { type: { nin: ["completed", "canceled"] } } },
+      first: 250,
+      after: null,
+    });
+  });
+
+  it("sourceSetInterest is for stewards only", async () => {
+    const { harness, bb } = await setup({ settings: { accessToken: "at-0" } });
+    await expect(harness.callRpc("sourceSetInterest", { units: [], entities: [] })).rejects.toThrow(/stewards plugin only/u);
+    await expect(harness.callRpc("sourceSetInterest", { units: [], entities: [] }, { experimental_caller: { kind: "plugin", pluginId: "workstreams" } })).rejects.toThrow(/stewards plugin only/u);
+    expect(await bb.storage.kv.get("stewards/interest")).toBeUndefined();
+  });
+
+  describe("leases and rings", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+    const UUID_1 = "11111111-1111-4111-8111-111111111111";
+    const UUID_2 = "22222222-2222-4222-8222-222222222222";
+    const UUID_3 = "33333333-3333-4333-8333-333333333333";
+    const answer: Answer = (body) => {
+      if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }, { id: "t-ops", key: "OPS", name: "Ops" }] } } };
+      if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) {
+        return body.variables!.id === "ENG-5" ? { data: { issue: { id: UUID_2, identifier: "ENG-5" } } } : { data: null, errors: [{ message: "Entity not found: Issue" }] };
+      }
+      return { data: { issue: null } };
+    };
+
+    it("stores the interest, leases its issues and teams, and rings stewards for their doorbells", async () => {
+      const hooks = fakeHooks();
+      const stewards = fakeStewards();
+      const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc: stewards.callRpc } } });
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["eng"], entities: [UUID_1, "eng-5", "ENG-404"] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      // Keys resolved; one the user cannot see is left out.
+      expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG"], entities: [UUID_1, UUID_2] });
+      expect(s.harness.logEntries.some((l) => l.message.includes("ENG-404, which the connected user cannot see"))).toBe(true);
+
+      const service = s.harness.runService("watches");
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      await tick();
+      expect(hooks.subscribes.at(-1)!.watches).toEqual([
+        { kind: "issue", id: UUID_1 },
+        { kind: "issue", id: UUID_2 },
+        { kind: "team", id: "t-eng" },
+      ]);
+
+      // Its own issue, twice: one ring after the debounce. Another issue in its team: a ring. Elsewhere: none.
+      hooks.last().send(hooks.doorbell(UUID_1, "t-other"));
+      hooks.last().send(hooks.doorbell(UUID_1, "t-other"));
+      hooks.last().send(hooks.doorbell("uuid-in-eng", "t-eng"));
+      hooks.last().send(hooks.doorbell("uuid-elsewhere", "t-ops"));
+      hooks.last().send(hooks.doorbell("uuid-no-unit", ""));
+      await tick(2999);
+      expect(stewards.to("stewardsRing")).toEqual([]);
+      await tick(1);
+      expect(stewards.to("stewardsRing")).toEqual([
+        { source: "linear", id: UUID_1 },
+        { source: "linear", id: "uuid-in-eng" },
+      ]);
+
+      // A change while connected is leased right away, only what is new.
+      await s.harness.callRpc("sourceSetInterest", { units: ["ENG", "OPS"], entities: [UUID_1, UUID_3] }, { experimental_caller: STEWARDS });
+      expect(hooks.subscribes.slice(-2).map((b) => b.watches)).toEqual([[{ kind: "issue", id: UUID_3 }], [{ kind: "team", id: "t-ops" }]]);
+      hooks.last().send(hooks.doorbell("uuid-elsewhere", "t-ops"));
+      await tick(3000);
+      expect(stewards.to("stewardsRing").at(-1)).toEqual({ source: "linear", id: "uuid-elsewhere" });
+
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("leases a stored interest after a restart, and logs a refused team lease", async () => {
+      const hooks = fakeHooks();
+      hooks.state.answer = (body) => Response.json({ leases: body.watches.filter((w) => w.kind === "issue"), rejected: body.watches.filter((w) => w.kind === "team").map((w) => ({ ...w, reason: "forbidden" })) });
+      const s = await setup({
+        settings: { accessToken: "at-0" },
+        env: { BB_HOOKS_URL: HOOKS_URL },
+        linear: { answer },
+        hooks,
+        sdk: { plugins: { callRpc: fakeStewards().callRpc } },
+        kv: { "stewards/interest": { units: ["ENG"], entities: [UUID_1, "ENG-5"] }, "stewards/teamIds": { ENG: "t-eng" } },
+      });
+      const service = s.harness.runService("watches");
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      await tick();
+      // The stored key is resolved once the stream is up; whichever lands first, everything ends up leased.
+      const leased = hooks.subscribes.flatMap((b) => b.watches);
+      expect(leased).toEqual(expect.arrayContaining([{ kind: "issue", id: UUID_1 }, { kind: "issue", id: UUID_2 }, { kind: "team", id: "t-eng" }]));
+      expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG"], entities: [UUID_1, UUID_2] });
+      expect(s.harness.logEntries.some((l) => l.level === "warn" && l.message.includes("refused a lease on Linear team ENG (forbidden)"))).toBe(true);
       service.controller.abort();
       await service.done;
     });
