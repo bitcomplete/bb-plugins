@@ -31,10 +31,20 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
   children of a steward thread.
 - **Lifecycle.** A terminal state gets one wrap-up turn and the binding
-  ends; removing the label gets one stop turn. Nothing is archived here:
-  thread-briefs archives finished threads (and workers go with their
-  lifecycle owner). Reopening, or re-adding the label, wakes the same
-  thread, bringing it back from the archive if need be.
+  ends; removing the label gets one stop turn. When the binding ends, the
+  steward's thread is archived, and its workers go with their lifecycle
+  owner. Reopening, or re-adding the label, wakes the same thread,
+  bringing it back from the archive.
+- **thread-briefs.** Every steward is spawned with
+  `threadBriefs: { rename: false, archive: false }` in this plugin's
+  metadata namespace, and the project steward also with `group: false`
+  (see thread-briefs' "Threads a plugin runs"). thread-briefs then never
+  renames a steward, whose title carries its entity key, or auto-archives
+  one, which between wakes reads done while its entity is still open. The
+  project steward is kept out of the status sections and is titled
+  "<project name> project steward". The sweep tags threads spawned before
+  this, and renames an older project steward once. After that, a project
+  steward renamed by hand keeps its name.
 - **Workers** are hidden child threads with their own checkout, one per
   bounded task, owned by their steward. A runaway guard stops a steward's
   workers past a per-hour limit.

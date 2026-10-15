@@ -20,7 +20,8 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
   const rpcCalls: Call[] = [];
-  const threads = new Map<string, { status: string; archivedAt: number | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null }>();
+  const metadata = new Map<string, Record<string, unknown>>();
   const spawns: Array<Record<string, unknown> & { id: string }> = [];
   const sends: Array<{ threadId: string; text: string }> = [];
   const userTurns: Array<{ threadId: string; text: string }> = [];
@@ -67,7 +68,8 @@ function world() {
     threads: {
       spawn: async (args: Record<string, unknown>) => {
         const id = `thr_${++n}`;
-        threads.set(id, { status: "idle", archivedAt: null });
+        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null });
+        metadata.set(id, { ...((args.pluginMetadata as Record<string, unknown> | undefined) ?? {}) });
         spawns.push({ ...args, id });
         return makeThreadResponse({ id });
       },
@@ -78,7 +80,7 @@ function world() {
       get: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
-        return makeThreadResponse({ id: threadId, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code" });
+        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code" });
       },
       archive: async ({ threadId }: { threadId: string }) => {
         threads.get(threadId)!.archivedAt = 1;
@@ -89,7 +91,16 @@ function world() {
         return {};
       },
       stop: async () => ({}),
-      update: async () => ({}),
+      update: async (args: { threadId: string; title?: string }) => {
+        const t = threads.get(args.threadId);
+        if (t !== undefined && args.title !== undefined) t.title = args.title;
+        return {};
+      },
+      updatePluginMetadata: async (args: { threadId: string; set?: Record<string, unknown> }) => {
+        const next = { ...(metadata.get(args.threadId) ?? {}), ...(args.set ?? {}) };
+        metadata.set(args.threadId, next);
+        return next;
+      },
       events: {
         list: async ({ threadId }: { threadId: string }) =>
           userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
@@ -97,7 +108,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, repos, entities, rpcCalls, threads, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, repos, entities, rpcCalls, threads, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup() {
@@ -141,13 +152,15 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "uuid-12");
 
     const [project, steward] = t.spawns;
-    expect(project).toMatchObject({ title: "Project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
+    expect(project).toMatchObject({ title: "Acme project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
+    // thread-briefs keeps its hands off: no renames or auto-archiving for any steward, and no grouping for the project steward.
+    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false } } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
     // No sidebar sections or pins: the sidebar is the user's.
     expect(project).not.toHaveProperty("pinned");
     expect(steward).not.toHaveProperty("sectionId");
-    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward" } });
+    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } } });
     const prompt = String(steward!.prompt);
     expect(prompt).toMatch(/# Steward wake: ENG-12 — Fix login/u);
     expect(prompt).toMatch(/You have just been bound/u);
@@ -265,7 +278,7 @@ describe("a Linear ticket steward", () => {
     expect(t.sends.at(-1)!.text).toMatch(/Runaway guard/u);
   });
 
-  it("ends without archiving anything, and resumes the same thread when the label comes back", async () => {
+  it("archives its thread when it ends, and resumes the same thread when the label comes back", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -276,16 +289,43 @@ describe("a Linear ticket steward", () => {
     expect(t.sends.at(-1)!.text).toMatch(/this binding is detached/u);
     await t.idle(steward);
     expect((await t.list())[0]).toMatchObject({ ended: true });
-    expect(t.harness.sdk.callsTo("threads.archive")).toEqual([]);
+    expect(t.harness.sdk.callsTo("threads.archive").map(([args]) => args)).toEqual([{ threadId: steward }]);
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
 
-    // thread-briefs archived it meanwhile; the next wake brings it back.
-    t.threads.get(steward)!.archivedAt = 1;
+    // The next wake brings it back.
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     expect(t.threads.get(steward)!.archivedAt).toBeNull();
     expect((await t.list())[0]).toMatchObject({ ended: false, threadId: steward });
     expect(t.sends.at(-1)!.text).toMatch(/came back from a terminal or detached state/u);
     expect(t.spawns).toHaveLength(2);
+  });
+});
+
+describe("the project steward", () => {
+  it("is renamed to its project and tagged for thread-briefs when it predates both", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns;
+    // As a server that ran an earlier stewards left it: the old title, since
+    // rewritten by a summarizer, and no word to thread-briefs on either thread.
+    t.hooks.store.patchProject("p1", { title: null });
+    t.threads.get(project!.id)!.title = "Project steward triaging steward reports";
+    t.metadata.set(project!.id, { role: "project" });
+    t.metadata.set(steward!.id, { role: "steward" });
+
+    // A restart's first sweep: nothing tagged yet in this process.
+    t.hooks.forgetTags();
+    await t.hooks.sweep();
+    expect(t.threads.get(project!.id)!.title).toBe("Acme project steward");
+    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, archive: false } });
+
+    // A name given by hand afterwards sticks.
+    t.threads.get(project!.id)!.title = "Acme overseer";
+    await t.hooks.sweep();
+    expect(t.threads.get(project!.id)!.title).toBe("Acme overseer");
   });
 });
 
