@@ -111,6 +111,11 @@ GitHub every ten minutes" at a glance:
   (checks fall back to a sweep every two minutes, so reads go up), or
   stopped, how long it has been so, and how many doorbells and sweeps the
   last hour saw.
+- A line for what stewards asked to have leased beside the watches: its
+  repositories by name, and its pull requests counted, listed only when
+  opened. A lease bb-gate-hooks refused in the last hour is called out under
+  it with the reason. The CLI names at most twenty pull requests; `--json`
+  has them all.
 - One row per watch: the pull request or issue (linking to GitHub, with the
   state the watch last saw), the thread (linking to it), age, how many times
   it has been checked and woken, wakes in the last hour, when it last woke,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HooksStatus } from "./hooks-client.js";
-import { buildUsage, describeHooks, formatUsage, orderWatches, type WatchView } from "./usage.js";
+import { buildUsage, createRefusals, describeHooks, describeInterest, formatUsage, orderWatches, type InterestView, type WatchView } from "./usage.js";
 import { IDLE_AFTER_MS, NEAR_LIMIT_AT, WATCH_LIMIT, WATCH_TTL_MS, type WatchRow } from "./watch.js";
 
 const DAY = 86_400_000;
@@ -41,6 +41,8 @@ const row = (threadId: string, key: string, over: Partial<WatchRow> = {}): Watch
 
 const target = (r: WatchRow) => ({ id: r.key, key: r.key, kind: r.kind, title: r.snapshot.title, url: `https://github.test/acme/pull/${r.key}` });
 
+const none: InterestView = { nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] }, units: [], entities: [], unleased: [] };
+
 describe("buildUsage", () => {
   it("puts flagged watches first, noisy before idle before expiring, then the busiest, and sums per thread", () => {
     const rows = [
@@ -50,7 +52,7 @@ describe("buildUsage", () => {
       row("thr-2", "ENG-4", { recentWakes: [NOW - 1000, NOW - 2000, NOW - 3000, NOW - 4000, NOW - 5000], wakes: 5 }),
       row("thr-3", "ENG-5", { createdAt: NOW, lastActivityAt: NOW - WATCH_TTL_MS + 3600_000 }),
     ];
-    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"], ["thr-2", null]]), target });
+    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"], ["thr-2", null]]), target, interest: none });
     expect(view.watches.map((w) => [w.target.key, w.flags])).toEqual([
       ["ENG-4", ["noisy"]],
       ["ENG-3", ["idle"]],
@@ -70,7 +72,7 @@ describe("buildUsage", () => {
 
   it("marks a thread near its limit", () => {
     const rows = Array.from({ length: NEAR_LIMIT_AT }, (_, i) => row("thr-1", `ENG-${i}`));
-    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map(), target });
+    const view = buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map(), target, interest: none });
     expect(view.threads).toEqual([{ threadId: "thr-1", title: null, count: NEAR_LIMIT_AT, wakes: NEAR_LIMIT_AT, nearLimit: true }]);
   });
 
@@ -97,14 +99,14 @@ describe("text", () => {
   });
 
   it("formats the view as a table with the stream line first, and says when there is nothing", () => {
-    const empty = buildUsage({ rows: [], hooks: hooks(), configured: true, now: NOW, titles: new Map(), target });
-    expect(formatUsage(empty).split("\n")).toEqual([describeHooks(empty.hooks, NOW), "No watches."]);
+    const empty = buildUsage({ rows: [], hooks: hooks(), configured: true, now: NOW, titles: new Map(), target, interest: none });
+    expect(formatUsage(empty).split("\n")).toEqual([describeHooks(empty.hooks, NOW), "Stewards: nothing asked for.", "No thread watches anything."]);
 
     const rows = [row("thr-1", "ENG-1", { recentWakes: [NOW - 1000] }), row("thr-2", "ENG-22", { createdAt: NOW - IDLE_AFTER_MS, lastWokeAt: 0, lastActivityAt: NOW - IDLE_AFTER_MS })];
-    const text = formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"]]), target }));
+    const text = formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Fix login"]]), target, interest: none }));
     const lines = text.split("\n");
-    expect(lines[1]).toBe("2 watches across 2 threads (limit 10 per thread; a watch idle for 7 days is forgotten).");
-    expect(lines.slice(3)).toEqual([
+    expect(lines[2]).toBe("2 watches across 2 threads (limit 10 per thread; a watch idle for 7 days is forgotten).");
+    expect(lines.slice(4)).toEqual([
       "TARGET  THREAD     AGE  CHECKS  WAKES    LAST WOKE  EXPIRES  FLAGS",
       "ENG-22  thr-2      3d   10      1        never      in 4d    idle",
       "ENG-1   Fix login  24h  10      1 (1/h)  24h        in 6d",
@@ -113,6 +115,35 @@ describe("text", () => {
 
   it("names threads near the limit", () => {
     const rows = Array.from({ length: NEAR_LIMIT_AT }, (_, i) => row("thr-1", `ENG-${i}`));
-    expect(formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Epic"]]), target }))).toContain(`Near limit: thread Epic watches ${NEAR_LIMIT_AT} of ${WATCH_LIMIT}.`);
+    expect(formatUsage(buildUsage({ rows, hooks: hooks(), configured: true, now: NOW, titles: new Map([["thr-1", "Epic"]]), target, interest: none }))).toContain(`Near limit: thread Epic watches ${NEAR_LIMIT_AT} of ${WATCH_LIMIT}.`);
+  });
+
+  it("names what stewards leased, at most twenty entities, and what is not leased", () => {
+    const entities = Array.from({ length: 22 }, (_, i) => ({ key: `ENG-${i + 1}`, url: null }));
+    expect(describeInterest({ ...none, units: ["ENG"], entities: entities.slice(0, 2) })).toEqual(["Stewards: team ENG; 2 issues (ENG-1, ENG-2)."]);
+    expect(describeInterest({ ...none, units: ["ENG", "OPS"], entities, unleased: [{ key: "OPS", reason: "refused by bb-gate-hooks (forbidden)" }] })).toEqual([
+      `Stewards: teams ENG, OPS; 22 issues (${entities
+        .slice(0, 20)
+        .map((e) => e.key)
+        .join(", ")}, and 2 more).`,
+      "Not leased for stewards: OPS: refused by bb-gate-hooks (forbidden).",
+    ]);
+    expect(describeInterest({ ...none, unleased: [{ key: "ENG-9", reason: "not visible to the connected Linear user" }] })).toEqual(["Stewards: nothing leased.", "Not leased for stewards: ENG-9: not visible to the connected Linear user."]);
+  });
+});
+
+describe("createRefusals", () => {
+  it("keeps a refusal until a renewal has had the window to repeat it", () => {
+    let now = NOW;
+    const refusals = createRefusals(() => now, 60_000);
+    refusals.add("team:t1", "forbidden");
+    now += 30_000;
+    refusals.add("team:t2", "unknown");
+    expect([...refusals.current()]).toEqual([["team:t1", "forbidden"], ["team:t2", "unknown"]]);
+    now += 30_000;
+    expect([...refusals.current()]).toEqual([["team:t2", "unknown"]]);
+    refusals.add("team:t2", "forbidden");
+    now += 59_000;
+    expect([...refusals.current()]).toEqual([["team:t2", "forbidden"]]);
   });
 });

@@ -29,6 +29,7 @@ import {
   COMMENT_CREATE,
   ISSUE_CREATE,
   ISSUE_ID_QUERY,
+  ISSUE_KEYS_QUERY,
   ISSUE_QUERY,
   ISSUE_REF_QUERY,
   ISSUE_UPDATE,
@@ -59,6 +60,7 @@ import {
   parseIssue,
   parseIssueCreate,
   parseIssueId,
+  parseIssueKeys,
   parseIssueList,
   parseIssueRef,
   parseIssueUpdate,
@@ -88,7 +90,7 @@ import {
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
 import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
-import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
+import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signature, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export const CALLBACK_PATH = "/connect/callback";
@@ -825,6 +827,12 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       };
     }
     recomputeRings();
+    /** Issue UUID to key, for naming stewards' issues in the usage view; learned on resolution, asked for when missing. */
+    const issueKeys = new Map<string, string>();
+    /** Issue keys stewards asked about that the connected user cannot see, as of the last resolution. */
+    let invisible: string[] = [];
+    /** Stewards' leases bb-gate-hooks refused: `team:<uuid>` or an issue UUID. */
+    const refusals = createRefusals(deps.now);
 
     /** Every lease the stream holds: watched issues, stewards' issues, stewards' teams. */
     function leases(): Lease[] {
@@ -878,6 +886,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           bb.log.warn(`could not list Linear teams for stewards (${why}): ${errorMessage(error)}`);
         }
         const entities: string[] = [];
+        invisible = [];
         for (const entity of interest.entities) {
           if (UUID.test(entity)) {
             entities.push(entity);
@@ -885,11 +894,17 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
           try {
             const found = parseIssueId(await query(ISSUE_ID_QUERY, { id: entity }, checkSignal()));
-            if (found === null) bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
-            else entities.push(found.id.toLowerCase());
+            if (found === null) {
+              bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
+              invisible.push(entity);
+            } else {
+              entities.push(found.id.toLowerCase());
+              issueKeys.set(found.id.toLowerCase(), found.identifier);
+            }
           } catch (error) {
             if (isNotFound(error)) {
               bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
+              invisible.push(entity);
               continue;
             }
             bb.log.warn(`could not resolve Linear issue ${entity} for stewards (${why}): ${errorMessage(error)}`);
@@ -900,6 +915,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         await bb.storage.kv.set(INTEREST_KEY, interest);
       }
       recomputeRings();
+      announceWatches();
       const issues = [...ringFor.issues].filter((id) => !before.issues.has(id));
       const teams = [...ringFor.teams].filter((id) => !before.teams.has(id));
       await Promise.all([
@@ -1022,10 +1038,12 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     async function onRejected(rejected: Rejection[]): Promise<void> {
       for (const r of rejected) {
         if (r.kind === "team") {
+          refusals.add(`team:${r.id}`, r.reason);
           const key = Object.entries(teamIds).find(([, id]) => id === r.id)?.[0] ?? r.id;
           bb.log.warn(`bb-gate-hooks refused a lease on Linear team ${key} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
           continue;
         }
+        if (r.kind === "issue" && ringFor.issues.has(r.id)) refusals.add(r.id, r.reason);
         if (r.kind !== "issue" || r.reason !== "forbidden") continue;
         const watching = watches.forIssue(r.id);
         if (watching.length === 0) continue;
@@ -1088,7 +1106,45 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         now: deps.now(),
         titles,
         target: (row) => ({ id: row.issueId, key: row.issueKey, kind: "issue", title: row.snapshot.title, url: base === null ? null : `${base}${row.issueKey}` }),
+        interest: await interestView(status.connected, base),
       });
+    }
+
+    /**
+     * Stewards' interest as a person reads it: team keys, issue keys, and
+     * what is asked for but not leased. Keys missing from the cache are
+     * asked of Linear in one query; an issue Linear cannot name shows its UUID.
+     */
+    async function interestView(connected: boolean, base: string | null): Promise<InterestView> {
+      for (const row of watches.all()) issueKeys.set(row.issueId, row.issueKey);
+      const uuids = interest.entities.filter((e) => UUID.test(e));
+      const missing = uuids.filter((id) => !issueKeys.has(id));
+      if (connected && missing.length > 0) {
+        try {
+          for (let i = 0; i < missing.length; i += 250) {
+            for (const found of parseIssueKeys(await query(ISSUE_KEYS_QUERY, { ids: missing.slice(i, i + 250) }, checkSignal()))) issueKeys.set(found.id.toLowerCase(), found.identifier);
+          }
+        } catch (error) {
+          bb.log.warn(`could not name stewards' Linear issues: ${errorMessage(error)}`);
+        }
+      }
+      const keyOf = (id: string) => issueKeys.get(id) ?? id;
+      const teamKeyOf = (id: string) => Object.entries(teamIds).find(([, t]) => t === id)?.[0] ?? id;
+      const unleased: InterestView["unleased"] = [];
+      for (const unit of interest.units) if (teamIds[unit] === undefined) unleased.push({ key: unit, reason: "no such team, or not visible to the connected Linear user" });
+      for (const entity of interest.entities) if (!UUID.test(entity)) unleased.push({ key: entity, reason: "not resolved to a Linear issue yet" });
+      for (const key of invisible) unleased.push({ key, reason: "not visible to the connected Linear user" });
+      for (const [id, reason] of refusals.current()) {
+        if (id.startsWith("team:")) {
+          if (ringFor.teams.has(id.slice(5))) unleased.push({ key: teamKeyOf(id.slice(5)), reason: `refused by bb-gate-hooks (${reason})` });
+        } else if (ringFor.issues.has(id)) unleased.push({ key: keyOf(id), reason: `refused by bb-gate-hooks (${reason})` });
+      }
+      return {
+        nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] },
+        units: interest.units,
+        entities: uuids.map((id) => ({ key: keyOf(id), url: base === null || !issueKeys.has(id) ? null : `${base}${keyOf(id)}` })).sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true })),
+        unleased,
+      };
     }
 
     if (hooksUrl !== "") {
@@ -1232,7 +1288,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }),
 
           watches: cliCommand({
-            summary: "Every watch on this server, how busy each has been, and the doorbell stream's state",
+            summary: "Every watch on this server, how busy each has been, what stewards has leased, and the doorbell stream's state",
             description:
               "The same view as Settings → Plugins → Linear → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
             options: { json: JSON_OPTION },

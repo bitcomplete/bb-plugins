@@ -1,14 +1,15 @@
 // The Watches settings section: every watch on this server, the busiest and
-// the ones that stand out first, and what the doorbell stream is doing. A
-// debugging view: it answers "why did my thread never wake" and "what is
-// re-reading GitHub every ten minutes" at a glance. The linear plugin has
+// the ones that stand out first, what stewards has leased beside them, and
+// what the doorbell stream is doing. A debugging view: it answers "why did
+// my thread (or steward) never wake" and "what is re-reading GitHub every
+// ten minutes" at a glance. The linear plugin has
 // the same component over the same view shape; a change here belongs there.
 import { useCallback, useEffect, useState } from "react";
 import { useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ago, until } from "../format-time";
-import type { UsageView, WatchView } from "../usage";
+import type { InterestView, UsageView, WatchView } from "../usage";
 
 /** The view is re-read this often so ages and the stream's silence stay honest between signals. */
 const REFRESH_MS = 30_000;
@@ -64,6 +65,7 @@ export function WatchesSection(props: { changedChannel: string; targetLabel: str
   return (
     <div className="flex flex-col gap-3 text-sm">
       <HooksLine view={view} />
+      <InterestLine interest={view.interest} open={open} />
       {view.watches.length === 0 ? (
         <p className="text-muted-foreground">No thread is watching anything. A thread watches with the agent tool when it has nothing to do until a ticket moves.</p>
       ) : (
@@ -173,6 +175,70 @@ function Flag({ flag }: { flag: WatchView["flags"][number] }) {
     >
       {flag}
     </span>
+  );
+}
+
+/** Units are listed inline up to this many; the rest are counted. */
+const UNITS_SHOWN = 6;
+
+const count = (n: number, [one, many]: [string, string]) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What stewards has leased beside the watches, in a line: its teams or
+ * repositories by name, its entities counted and listed only when opened,
+ * and anything it asked for that is not leased called out under it. The
+ * stewards' own settings page has the detail per entity.
+ */
+function InterestLine({ interest, open }: { interest: InterestView; open: (url: string) => void }) {
+  const { nouns, units, entities, unleased } = interest;
+  if (units.length === 0 && entities.length === 0 && unleased.length === 0) {
+    return <p className="text-muted-foreground">Stewards has not asked to hear about anything here.</p>;
+  }
+  const shown = units.slice(0, UNITS_SHOWN);
+  const hidden = units.slice(UNITS_SHOWN);
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap items-baseline gap-x-1.5">
+        <span>Leased for stewards:</span>
+        {units.length > 0 ? (
+          <span>
+            {units.length === 1 ? nouns.unit[0] : nouns.unit[1]} <span className="font-mono">{shown.join(", ")}</span>
+            {hidden.length > 0 ? <span title={hidden.join(", ")}> and {hidden.length} more</span> : null}
+          </span>
+        ) : null}
+        {units.length > 0 && entities.length > 0 ? <span className="text-muted-foreground">·</span> : null}
+        {entities.length > 0 ? (
+          <details className="group">
+            <summary className="cursor-pointer list-none text-muted-foreground underline-offset-2 hover:underline">
+              {count(entities.length, nouns.entity)}
+              <span className="ml-0.5 inline-block transition-transform group-open:rotate-90">›</span>
+            </summary>
+            <div className="mt-1 flex max-h-32 flex-wrap gap-1 overflow-y-auto">
+              {entities.map((e) =>
+                e.url !== null ? (
+                  <button key={e.key} type="button" className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs hover:underline" onClick={() => open(e.url!)}>
+                    {e.key}
+                  </button>
+                ) : (
+                  <span key={e.key} className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                    {e.key}
+                  </span>
+                ),
+              )}
+            </div>
+          </details>
+        ) : null}
+      </div>
+      {unleased.length > 0 ? (
+        <ul className="flex max-h-24 flex-col gap-0.5 overflow-y-auto text-amber-600 dark:text-amber-400">
+          {unleased.map((u) => (
+            <li key={`${u.key} ${u.reason}`}>
+              <span className="font-mono">{u.key}</span> not leased: {u.reason}.
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
   );
 }
 

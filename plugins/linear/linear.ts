@@ -385,6 +385,8 @@ const SNAPSHOT_FIELDS =
 export const SNAPSHOT_QUERY = `query($id: String!) { issue(id: $id) { ${SNAPSHOT_FIELDS} } }`;
 /** An issue's UUID from its key; stewards may name an entity either way. */
 export const ISSUE_ID_QUERY = "query($id: String!) { issue(id: $id) { id identifier } }";
+/** Many issues' keys by UUID at once, for naming what stewards leased. */
+export const ISSUE_KEYS_QUERY = "query($ids: [ID!]!) { issues(filter: { id: { in: $ids } }, first: 250) { nodes { id identifier } } }";
 /** Every team the connected user can see, for resolving the keys a project lists to the UUIDs leases and doorbells use. */
 export const TEAMS_QUERY = "query { teams(first: 250) { nodes { id key name } } }";
 /** The teams the connected user belongs to, which `bb stewards init` offers. */
@@ -504,6 +506,11 @@ export function parseIssueId(payload: unknown): { id: string; identifier: string
   const data = dataOf(payload);
   if (data.issue === null || data.issue === undefined) return null;
   return z.object({ id: z.string(), identifier: z.string() }).parse(data.issue);
+}
+
+/** The issues of ISSUE_KEYS_QUERY, as UUID and key. */
+export function parseIssueKeys(payload: unknown): Array<{ id: string; identifier: string }> {
+  return z.object({ nodes: z.array(z.object({ id: z.string(), identifier: z.string() })) }).parse(dataOf(payload).issues).nodes;
 }
 
 export type TeamSummary = { id: string; key: string; name: string };

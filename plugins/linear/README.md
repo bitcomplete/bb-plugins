@@ -106,6 +106,12 @@ ten minutes" at a glance:
   (checks fall back to a sweep every two minutes, so reads go up), or
   stopped, how long it has been so, and how many doorbells and sweeps the
   last hour saw.
+- A line for what stewards asked to have leased beside the watches (see
+  "Stewards"): its teams by key, and its issues counted, listed by key only
+  when opened. Anything it asked for that is not leased is called out under
+  it with the reason: a team the connected user cannot see, an issue key not
+  resolved yet or not visible, or a lease bb-gate-hooks refused in the last
+  hour. The CLI names at most twenty issues; `--json` has them all.
 - One row per watch: the issue (linking to Linear, with the state the watch
   last saw), the thread (linking to it), age, how many times it has been
   checked and woken, wakes in the last hour, when it last woke, when it
@@ -144,7 +150,7 @@ command runs inside the plugin on the server, so the token never leaves it.
 | `bb linear issue <key> [--json]` | One issue, as the tool shows it, or its JSON. |
 | `bb linear search [--query <text>] [--team <key>] [--state <name>] [--assignee <who>] [--all] [--limit <n>] [--json]` | Issues, newest first. Open ones only unless `--state` or `--all`. `--json` prints an array of issue objects. |
 | `bb linear query <document> [--variables <json>]` | A read-only GraphQL query's `data`, as JSON. Mutations are refused. |
-| `bb linear watches [--json]` | Every watch on this server with its counters and flags, and the doorbell stream's state; see "Seeing what is watched". |
+| `bb linear watches [--json]` | Every watch on this server with its counters and flags, what stewards has leased, and the doorbell stream's state; see "Seeing what is watched". |
 
 A dispatcher that spawns a thread per issue in a state, as a script
 automation:

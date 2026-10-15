@@ -115,7 +115,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "watches",
     title: "Watches",
-    description: "What this server's threads are waiting on in Linear, how often each watch has fired, and the doorbell stream's state.",
+    description: "What this server's threads are waiting on in Linear, how often each watch has fired, what stewards has leased, and the doorbell stream's state.",
     component: () => <WatchesSection changedChannel={WATCHES_CHANGED} targetLabel="issue" />,
   });
 });

@@ -993,17 +993,32 @@ describe("the source contract", () => {
       if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) {
         return body.variables!.id === "ENG-5" ? { data: { issue: { id: UUID_2, identifier: "ENG-5" } } } : { data: null, errors: [{ message: "Entity not found: Issue" }] };
       }
+      if (body.query.startsWith("query($ids: [ID!]!) { issues(")) {
+        const known: Record<string, string> = { [UUID_1]: "ENG-1", [UUID_3]: "ENG-3" };
+        return { data: { issues: { nodes: (body.variables!.ids as string[]).filter((id) => known[id] !== undefined).map((id) => ({ id, identifier: known[id] })) } } };
+      }
       return { data: { issue: null } };
     };
+    type InterestView = { units: string[]; entities: Array<{ key: string }>; unleased: Array<{ key: string; reason: string }> };
+    const interestOf = async (s: { harness: { callRpc(method: string, input: unknown): Promise<unknown> } }) => ((await s.harness.callRpc("watches", null)) as { interest: InterestView }).interest;
 
     it("stores the interest, leases its issues and teams, and rings stewards for their doorbells", async () => {
       const hooks = fakeHooks();
       const stewards = fakeStewards();
       const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc: stewards.callRpc } } });
-      expect(await s.harness.callRpc("sourceSetInterest", { units: ["eng"], entities: [UUID_1, "eng-5", "ENG-404"] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
+      expect(await s.harness.callRpc("sourceSetInterest", { units: ["eng", "nope"], entities: [UUID_1, "eng-5", "ENG-404"] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
       // Keys resolved; one the user cannot see is left out.
-      expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG"], entities: [UUID_1, UUID_2] });
+      expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG", "NOPE"], entities: [UUID_1, UUID_2] });
       expect(s.harness.logEntries.some((l) => l.message.includes("ENG-404, which the connected user cannot see"))).toBe(true);
+      // The usage view names them by key, and says what is not leased and why.
+      expect(await interestOf(s)).toMatchObject({
+        units: ["ENG", "NOPE"],
+        entities: [{ key: "ENG-1" }, { key: "ENG-5" }],
+        unleased: [
+          { key: "NOPE", reason: "no such team, or not visible to the connected Linear user" },
+          { key: "ENG-404", reason: "not visible to the connected Linear user" },
+        ],
+      });
 
       const service = s.harness.runService("watches");
       await tick();
@@ -1060,6 +1075,7 @@ describe("the source contract", () => {
       expect(leased).toEqual(expect.arrayContaining([{ kind: "issue", id: UUID_1 }, { kind: "issue", id: UUID_2 }, { kind: "team", id: "t-eng" }]));
       expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG"], entities: [UUID_1, UUID_2] });
       expect(s.harness.logEntries.some((l) => l.level === "warn" && l.message.includes("refused a lease on Linear team ENG (forbidden)"))).toBe(true);
+      expect((await interestOf(s)).unleased).toEqual([{ key: "ENG", reason: "refused by bb-gate-hooks (forbidden)" }]);
       service.controller.abort();
       await service.done;
     });

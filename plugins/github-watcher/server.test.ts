@@ -517,6 +517,9 @@ describe("stewards' source contract", () => {
 
       expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/gadgets"], entities: ["https://github.com/Acme/Widgets/pull/12"] }, STEWARDS)).toEqual({ ok: true });
       expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"] });
+      type Interest = { units: string[]; entities: Array<{ key: string; url: string | null }>; unleased: Array<{ key: string; reason: string }> };
+      const interestOf = async () => ((await w.harness.callRpc("watches", null)) as { interest: Interest }).interest;
+      expect(await interestOf()).toMatchObject({ units: ["acme/gadgets"], entities: [{ key: "Acme/Widgets#12", url: "https://github.com/Acme/Widgets/issues/12" }], unleased: [] });
       await tick();
       expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "repo", id: "acme/gadgets" }], [{ kind: "issue", id: "Acme/Widgets#12" }]]);
       // Setting the same again leases nothing new.
@@ -539,6 +542,11 @@ describe("stewards' source contract", () => {
       w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
       await tick(30 * 60_000);
       expect(w.harness.logEntries.some((l) => l.message.includes("refused a lease on repository Acme/Gadgets for stewards (forbidden)"))).toBe(true);
+      // The usage view says so too, under the name stewards asked for.
+      expect((await interestOf()).unleased).toEqual([
+        { key: "Acme/Gadgets", reason: "refused by bb-gate-hooks (forbidden)" },
+        { key: "Acme/Widgets#12", reason: "refused by bb-gate-hooks (forbidden)" },
+      ]);
       expect(w.send).not.toHaveBeenCalled();
       service.controller.abort();
       await service.done;

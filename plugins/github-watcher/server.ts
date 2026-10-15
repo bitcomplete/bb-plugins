@@ -43,7 +43,7 @@ import {
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
 import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
-import { buildUsage, formatUsage, usageViewSchema } from "./usage.js";
+import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export { WATCHES_CHANGED };
@@ -240,6 +240,8 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     // GitHub does, which need not be how a project file does.
     let interestRepos = new Set(interest.units.map((u) => u.toLowerCase()));
     let interestEntities = new Set(interest.entities.map((e) => e.toLowerCase()));
+    /** Stewards' leases bb-gate-hooks refused, by `<kind> <lowercased id>`. */
+    const refusals = createRefusals(deps.now);
 
     /** Every lease to hold: the watches, then stewards' entities and repositories, each once. */
     function leases(): Lease[] {
@@ -283,6 +285,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     async function onRejected(rejected: Rejection[]): Promise<void> {
       for (const r of rejected) {
         const watching = r.kind === "issue" ? watches.forKey(r.id) : [];
+        if (r.kind === "repo" ? interestRepos.has(r.id.toLowerCase()) : interestEntities.has(r.id.toLowerCase())) refusals.add(`${r.kind} ${r.id.toLowerCase()}`, r.reason);
         if (r.kind === "repo" || (watching.length === 0 && interestEntities.has(r.id.toLowerCase()))) {
           bb.log.warn(`bb-gate-hooks refused a lease on ${r.kind === "repo" ? `repository ${r.id}` : r.id} for stewards (${r.reason}); stewards will not be rung for it`);
           continue;
@@ -349,7 +352,32 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           const url = ref === null ? null : `https://github.com/${ref.repo}/${row.kind === "pull" ? "pull" : "issues"}/${ref.number}`;
           return { id: row.key, key: row.key, kind: row.kind, title: row.snapshot.title, url };
         },
+        interest: interestView(),
       });
+    }
+
+    /** Stewards' interest as a person reads it, with whatever bb-gate-hooks refused of it. */
+    function interestView(): InterestView {
+      const refused = refusals.current();
+      const unleased: InterestView["unleased"] = [];
+      for (const repo of interest.units) {
+        const reason = refused.get(`repo ${repo.toLowerCase()}`);
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason})` });
+      }
+      for (const key of interest.entities) {
+        const reason = refused.get(`issue ${key.toLowerCase()}`);
+        if (reason !== undefined) unleased.push({ key, reason: `refused by bb-gate-hooks (${reason})` });
+      }
+      return {
+        nouns: { unit: ["repository", "repositories"], entity: ["pull request", "pull requests"] },
+        units: interest.units,
+        entities: [...interest.entities].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).map((key) => {
+          const ref = parseRefKey(key);
+          // GitHub sends /issues/N on to the pull request when it is one.
+          return { key, url: ref === null ? null : `https://github.com/${ref.repo}/issues/${ref.number}` };
+        }),
+        unleased,
+      };
     }
 
     bb.rpc.register(rpcContract, {
@@ -449,6 +477,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         interest = next;
         interestRepos = new Set(next.units.map((u) => u.toLowerCase()));
         interestEntities = new Set(next.entities.map((e) => e.toLowerCase()));
+        announceWatches();
         const fresh = leases().filter((l) => !before.has(`${l.kind} ${l.id.toLowerCase()}`));
         const lease = (kind: Lease["kind"]) => {
           const ids = fresh.filter((l) => l.kind === kind).map((l) => l.id);
@@ -469,7 +498,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         description: "Runs on the bb server. Reads the plugin's own watch list; GitHub itself is read with gh.",
         commands: {
           watches: cliCommand({
-            summary: "Every watch on this server, how busy each has been, and the doorbell stream's state",
+            summary: "Every watch on this server, how busy each has been, what stewards has leased, and the doorbell stream's state",
             description:
               "The same view as Settings → Plugins → GitHub watcher → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
             options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
