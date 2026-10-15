@@ -287,6 +287,7 @@ export function rowSignalFor(stored: StoredBrief): RowSignal {
     stageOverride: brief.stageOverride,
     statusOverride: brief.statusOverride,
     autoArchive: autoArchives(stored),
+    ring: !(stored.optOut?.ring ?? false),
   };
 }
 

@@ -4,12 +4,16 @@ import { NO_OPT_OUT, readOptOut } from "./optout.js";
 describe("readOptOut", () => {
   it("reads each false as an opt-out", () => {
     expect(
-      readOptOut({ role: "project", threadBriefs: { rename: false, group: false, archive: false } }),
-    ).toEqual({ rename: true, group: true, archive: true });
+      readOptOut({
+        role: "project",
+        threadBriefs: { rename: false, group: false, archive: false, ring: false },
+      }),
+    ).toEqual({ rename: true, group: true, archive: true, ring: true });
     expect(readOptOut({ threadBriefs: { archive: false } })).toEqual({
       rename: false,
       group: false,
       archive: true,
+      ring: false,
     });
   });
 

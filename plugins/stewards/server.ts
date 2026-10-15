@@ -59,12 +59,14 @@ export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
  * metadata namespace on each thread it spawns (thread-briefs' README, "Threads
  * a plugin runs"). Every steward keeps the title it was given, which carries
  * the entity key, and is archived by this plugin when its binding ends rather
- * than whenever its brief reads done between wakes. The project steward also
+ * than whenever its brief reads done between wakes, and its sidebar row
+ * draws no stage ring, which for a thread that idles between wakes mostly
+ * says done about work that is not. The project steward also
  * stays out of the status sections: it is never finished, and it is the one
  * thread you always want where you left it.
  */
-export const STEWARD_BRIEFS = { rename: false, archive: false } as const;
-export const PROJECT_BRIEFS = { rename: false, group: false, archive: false } as const;
+export const STEWARD_BRIEFS = { rename: false, archive: false, ring: false } as const;
+export const PROJECT_BRIEFS = { rename: false, group: false, archive: false, ring: false } as const;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */

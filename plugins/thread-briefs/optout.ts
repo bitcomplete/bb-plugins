@@ -8,7 +8,7 @@
  * the one thread you always want where you left it. So it seeds
  *
  * ```ts
- * pluginMetadata: { threadBriefs: { rename: false, group: false, archive: false } }
+ * pluginMetadata: { threadBriefs: { rename: false, group: false, archive: false, ring: false } }
  * ```
  *
  * in its own metadata namespace when it spawns the thread, and this plugin
@@ -19,8 +19,10 @@
  *
  * Each key is an opt-out: `false` turns that behaviour off for the thread,
  * and anything else — absent, `true`, a typo — leaves it on. The brief itself
- * is still written; only the three things that change the thread or the
- * sidebar without being asked are covered.
+ * is still written: the panel and the board show it. What is covered is the
+ * three things that change the thread or the sidebar without being asked,
+ * and the row's ring, which for a thread that idles between wakes mostly
+ * says "done" about work that is not.
  */
 
 /** The key a spawning plugin sets in its own metadata namespace. */
@@ -34,9 +36,11 @@ export interface OptOut {
   group: boolean;
   /** Never auto-archive the thread. */
   archive: boolean;
+  /** Draw no ring on the thread's sidebar row; bb's own indicators show. */
+  ring: boolean;
 }
 
-export const NO_OPT_OUT: OptOut = { rename: false, group: false, archive: false };
+export const NO_OPT_OUT: OptOut = { rename: false, group: false, archive: false, ring: false };
 
 /**
  * Used when the origin plugin's namespace could not be read. Every behaviour
@@ -44,7 +48,7 @@ export const NO_OPT_OUT: OptOut = { rename: false, group: false, archive: false 
  * back: a thread left unrenamed or in the sidebar costs nothing, one archived
  * against its plugin's wishes is the case this exists to prevent.
  */
-export const FULL_OPT_OUT: OptOut = { rename: true, group: true, archive: true };
+export const FULL_OPT_OUT: OptOut = { rename: true, group: true, archive: true, ring: true };
 
 /** The opt-out a plugin's metadata namespace asks for. */
 export function readOptOut(metadata: unknown): OptOut {
@@ -56,5 +60,11 @@ export function readOptOut(metadata: unknown): OptOut {
     rename: entry.rename === false,
     group: entry.group === false,
     archive: entry.archive === false,
+    ring: entry.ring === false,
   };
+}
+
+/** Whether an opt-out turns anything off at all. */
+export function optsOutOfAnything(optOut: OptOut): boolean {
+  return optOut.rename || optOut.group || optOut.archive || optOut.ring;
 }

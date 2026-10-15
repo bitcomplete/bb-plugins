@@ -736,6 +736,7 @@ describe("summarizing", () => {
         stageOverride: null,
         statusOverride: null,
         autoArchive: true,
+        ring: true,
       },
     ]);
   });
@@ -1984,6 +1985,9 @@ describe("renaming threads", () => {
     });
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
 
+    // Mutable, so a test can change what the plugin asks for between passes.
+    const metadata: Record<string, Record<string, unknown>> =
+      options.originMetadata === undefined ? {} : { thr_1: options.originMetadata };
     // Advanced per summary so a test can wait for *that* summary's write,
     // rather than seeing the previous one's brief and racing ahead.
     let seq = 12;
@@ -2013,13 +2017,11 @@ describe("renaming threads", () => {
             maxSeq: seq,
           }),
           interactions: { list: async () => [] },
-          experimental_listPluginMetadata: metadataFrom(
-            options.originMetadata === undefined ? {} : { thr_1: options.originMetadata },
-          ),
+          experimental_listPluginMetadata: metadataFrom(metadata),
         },
       },
     });
-    return { ...created, live, fetchMock, nextSeq: () => (seq += 1) };
+    return { ...created, live, fetchMock, metadata, nextSeq: () => (seq += 1) };
   }
 
   /** Summarize once, and wait for that summary's brief to be stored. */
@@ -2125,11 +2127,39 @@ describe("renaming threads", () => {
     expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
     // Stored, so the sidebar knows not to promise an archiving.
     const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
-    expect(stored?.optOut).toEqual({ rename: true, group: false, archive: true });
+    expect(stored?.optOut).toEqual({ rename: true, group: false, archive: true, ring: false });
     const { signals } = (await current.harness.behavior.callRpc("listRowSignals", null)) as {
       signals: { autoArchive: boolean }[];
     };
     expect(signals[0]?.autoArchive).toBe(false);
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("brings a stored opt-out up to date in the sweep, without a summary", async () => {
+    // A steward idle since before its plugin asked for no ring: the sidebar
+    // draws from the stored copy, so the sweep has to refresh it.
+    const current = renameHost({
+      originMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
+    });
+    await plugin(current.bb);
+    await summarize(current);
+    const before = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+    expect(before?.optOut?.ring).toBe(false);
+
+    current.metadata.thr_1 = {
+      role: "steward",
+      threadBriefs: { rename: false, archive: false, ring: false },
+    };
+    await current.harness.behavior.runSchedule("brief-sweep");
+
+    const after = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+    expect(after?.optOut).toEqual({ rename: true, group: false, archive: true, ring: true });
+    // Nothing else on the row moved.
+    expect(after?.lastSummarizedAt).toBe(before?.lastSummarizedAt);
+    const { signals } = (await current.harness.behavior.callRpc("listRowSignals", null)) as {
+      signals: { ring: boolean }[];
+    };
+    expect(signals[0]?.ring).toBe(false);
     await current.harness.lifecycle.dispose();
   });
 

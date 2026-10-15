@@ -45,7 +45,13 @@ import {
   settingDefaults,
 } from "./config.js";
 import { endsWithQuestion, renderTranscript, type OutlineItem } from "./transcript.js";
-import { FULL_OPT_OUT, NO_OPT_OUT, readOptOut, type OptOut } from "./optout.js";
+import {
+  FULL_OPT_OUT,
+  NO_OPT_OUT,
+  optsOutOfAnything,
+  readOptOut,
+  type OptOut,
+} from "./optout.js";
 import {
   mergeSectionOrder,
   planAssignments,
@@ -728,11 +734,37 @@ export default async function plugin(bb: BbPluginApi) {
     optOut: OptOut | null,
     stored: StoredBrief | null,
   ): { optOut?: OptOut } => {
-    const kept = optOut ?? stored?.optOut ?? null;
-    return kept !== null && (kept.rename || kept.group || kept.archive)
-      ? { optOut: kept }
-      : {};
+    const kept = optOut ?? (stored?.optOut ? { ring: false, ...stored.optOut } : null);
+    return kept !== null && optsOutOfAnything(kept) ? { optOut: kept } : {};
   };
+
+  /**
+   * Bring the `optOut` stored on briefs up to date with each thread's plugin.
+   *
+   * A summary refreshes it, but a steward can sit idle for days, and a plugin
+   * can ask for something new of threads it spawned long ago. The sidebar
+   * draws from the stored copy alone, so without this a ring a plugin turned
+   * off would stay until the thread's next turn. Only rows that change are
+   * written, and the sidebar is told once.
+   */
+  async function syncStoredOptOuts(
+    threads: readonly { id: string; originPluginId: string | null }[],
+  ): Promise<void> {
+    const fromPlugins = threads.filter((thread) => thread.originPluginId !== null);
+    if (fromPlugins.length === 0) return;
+    let changed = 0;
+    for (const [threadId, optOut] of await optOutsFor(fromPlugins)) {
+      if (optOut === null) continue;
+      const stored = await readBrief(threadId);
+      if (stored === null) continue;
+      const next = exemptionsToStore(optOut, stored).optOut;
+      if (JSON.stringify(next) === JSON.stringify(stored.optOut)) continue;
+      const { optOut: _old, ...rest } = stored;
+      await writeBrief(next === undefined ? rest : { ...rest, optOut: next });
+      changed += 1;
+    }
+    if (changed > 0) announce();
+  }
 
   // -------------------------------------------------------------- reading
 
@@ -1284,10 +1316,14 @@ export default async function plugin(bb: BbPluginApi) {
    * threads that actually moved.
    */
   bb.background.schedule("brief-sweep", SWEEP_CRON, async () => {
+    const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
+    // Reads no summarizer, so it runs with or without a key.
+    await syncStoredOptOuts(
+      threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
+    );
+
     const values = await settings.get();
     if (!hasApiKey(values)) return;
-
-    const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;

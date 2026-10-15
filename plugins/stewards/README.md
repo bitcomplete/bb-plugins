@@ -36,11 +36,13 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   owner. Reopening, or re-adding the label, wakes the same thread,
   bringing it back from the archive.
 - **thread-briefs.** Every steward is spawned with
-  `threadBriefs: { rename: false, archive: false }` in this plugin's
+  `threadBriefs: { rename: false, archive: false, ring: false }` in this plugin's
   metadata namespace, and the project steward also with `group: false`
   (see thread-briefs' "Threads a plugin runs"). thread-briefs then never
   renames a steward, whose title carries its entity key, or auto-archives
-  one, which between wakes reads done while its entity is still open. The
+  one, which between wakes reads done while its entity is still open, and
+  draws no stage ring on its row, leaving bb's own indicators. Its brief
+  is still written, for the Brief panel and the board. The
   project steward is kept out of the status sections and is titled
   "<project name> project steward". The sweep tags threads spawned before
   this, and renames an older project steward once. After that, a project

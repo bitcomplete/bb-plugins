@@ -503,7 +503,7 @@ metadata namespace on the thread:
 ```ts
 await bb.sdk.threads.spawn({
   // ...
-  pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false } },
+  pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } },
 });
 ```
 
@@ -518,14 +518,18 @@ key to threads it spawned before, with `updatePluginMetadata`.
 | `rename` | the title is never replaced with the brief's |
 | `group` | the thread stays out of the status sections, in bb's Threads group (or pinned, if you pin it) |
 | `archive` | the thread is never auto-archived, and its grey ring does not say "archiving soon" |
+| `ring` | the sidebar row draws no ring, so bb's own running, unread and error indicators are all it shows |
 
-The brief is still written, and the ring, the panel, the board and the
-refresher work as for any other thread. The rename, the grouping and the
+The brief is still written, and the panel, the board, the refresher and the
+Stage and Status actions work as for any other thread. The rename, the grouping and the
 archive sweep read the namespace live, one request per spawning plugin per
 pass. When that read fails, the thread is not renamed or archived and is not
 moved between sections, because each of those is something nobody asked for.
 The sidebar and the board read a copy stored on the brief at each summary
-(`optOut`), and use it only to leave "archiving soon" off the label.
+(`optOut`) to decide whether to draw the ring and whether to say "archiving
+soon". A summary refreshes that copy, and so does the ten-minute sweep, so a
+plugin that asks for something new of an idle thread is heard within ten
+minutes.
 
 ## How it is built
 

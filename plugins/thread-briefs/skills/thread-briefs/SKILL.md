@@ -824,16 +824,19 @@ no preference writes.
 ## Threads a plugin exempted
 
 A plugin that spawns a thread can exempt it from three things by setting
-`threadBriefs: { rename: false, group: false, archive: false }` (any subset)
+`threadBriefs: { rename: false, group: false, archive: false, ring: false }` (any subset)
 in its own metadata namespace on that thread. thread-briefs reads it through
 the thread's `originPluginId`. Stewards does this: no steward is renamed or
-auto-archived, and the project steward is kept out of the status sections.
+auto-archived or given a row ring, and the project steward is kept out of the
+status sections.
 
 - A thread kept out of the sections sits in bb's **Threads** group. Pin it to
   keep it at the top.
-- An exempt thread still gets a brief, a ring and a board card. It still goes
-  grey when it has been done and idle for a while, but its label does not say
-  "archiving soon".
+- An exempt thread still gets a brief and a board card. With `ring: false`
+  its row shows only bb's own indicators; otherwise it still goes grey when
+  done and idle, but with `archive: false` its label does not say "archiving
+  soon". The stored copy the sidebar reads is refreshed by the ten-minute
+  sweep, so a newly asked-for opt-out shows within ten minutes.
 - If the origin plugin's namespace cannot be read (the plugin is gone, or the
   request fails), the thread is not renamed or archived and is not moved
   between sections. The logs show `could not read <plugin>'s metadata`.
