@@ -14,7 +14,7 @@ import {
 import type { z } from "zod";
 import type { DiffFile, DiffTarget, FileAction, Location, Report, rpcContract } from "./contract";
 import { version as pluginVersion } from "./package.json";
-import { flushFile, reconcileFile, reloadFile, releaseFile, type FileModels, type SaveFile } from "./file-models";
+import { flushFile, flushFiles, reconcileFile, reloadFile, releaseFile, type FileModels, type SaveFile } from "./file-models";
 
 type MonacoApi = typeof Monaco;
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -43,7 +43,7 @@ type MultiDiffDocument = {
 };
 type Bundle = {
   monaco: MonacoApi;
-  createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void): { update(documents: MultiDiffDocument[]): void; dispose(): void };
+  createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void): { update(documents: MultiDiffDocument[]): void; openSearch(): void; dispose(): void };
 };
 let bundlePromise: Promise<Bundle> | null = null;
 let bundleAttempt = 0;
@@ -92,14 +92,15 @@ function installNavigation(monaco: MonacoApi) {
           path: model.uri.path,
           line: position.lineNumber,
           column: position.column,
+          content: model.getValue(),
         });
         panel.setError(null);
         // Monaco only navigates to models that exist.
         const models = await Promise.all(locations.map((l) => fileModel(monaco, model.uri.authority, panel, l.path)));
-        return locations.map((l, i) => ({
-          uri: models[i].uri,
+        return locations.flatMap((l, i) => models[i] === null ? [] : [{
+          uri: models[i]!.uri,
           range: new monaco.Range(l.line, l.column, l.line, l.column),
-        }));
+        }]);
       } catch (cause) {
         panel.setError(cause instanceof Error ? cause.message : String(cause));
         return null;
@@ -124,10 +125,12 @@ function installNavigation(monaco: MonacoApi) {
 
 async function fileModel(monaco: MonacoApi, panelId: string, panel: PanelContext, path: string) {
   const uri = monaco.Uri.from({ scheme: FILE, authority: panelId, path });
-  const existing = monaco.editor.getModel(uri);
-  if (existing !== null) return existing;
   const { content } = await panel.rpc.call("read", { environmentId: panel.environmentId, path });
-  return monaco.editor.getModel(uri) ?? monaco.editor.createModel(content, languageFor(monaco, path), uri);
+  if (panels.get(panelId) !== panel) return null;
+  const existing = monaco.editor.getModel(uri);
+  if (existing === null) return monaco.editor.createModel(content, languageFor(monaco, path), uri);
+  if (existing.getValue() !== content) existing.setValue(content);
+  return existing;
 }
 
 function languageFor(monaco: MonacoApi, filePath: string) {
@@ -167,6 +170,8 @@ function MultiDiff({
   read,
   fileAction,
   onError,
+  editor,
+  flush,
 }: {
   bundle: Bundle;
   panelId: string;
@@ -176,9 +181,10 @@ function MultiDiff({
   read(path: string): Promise<string>;
   fileAction(path: string, action: FileAction): Promise<unknown>;
   onError(message: string | null): void;
+  editor: { current: ReturnType<Bundle["createMultiDiffEditor"]> | null };
+  flush: { current: (() => Promise<void>) | null };
 }) {
   const container = useRef<HTMLDivElement>(null);
-  const editor = useRef<ReturnType<Bundle["createMultiDiffEditor"]> | null>(null);
   // Models per path, updated in place on refresh so each file keeps its editor and your scroll place.
   const models = useRef(new Map<string, FileModels>());
   const [conflicts, setConflicts] = useState<string[]>([]);
@@ -217,13 +223,15 @@ function MultiDiff({
     });
     editor.current = created;
     const owned = models.current;
+    flush.current = () => flushFiles(owned, saveRef);
     return () => {
+      flush.current = null;
       editor.current = null;
       created.dispose();
       for (const [path, m] of owned) releaseFile(path, m, saveRef);
       owned.clear();
     };
-  }, [bundle]);
+  }, [bundle, editor, flush]);
 
   useEffect(() => {
     const { monaco } = bundle;
@@ -307,13 +315,13 @@ function FileView({ monaco, panelId, location, onError }: {
     let cancelled = false;
     let editor: Monaco.editor.IStandaloneCodeEditor | undefined;
     fileModel(monaco, panelId, panels.get(panelId)!, location.path).then((model) => {
-      if (cancelled) return;
+      if (cancelled || model === null) return;
       editor = monaco.editor.create(container.current!, { ...EDITOR_OPTIONS, automaticLayout: true, model });
       const position = { lineNumber: location.line, column: location.column };
       editor.setPosition(position);
       editor.revealPositionInCenter(position);
       editor.focus();
-    }, (cause) => onError(cause instanceof Error ? cause.message : String(cause)));
+    }, (cause) => { if (!cancelled) onError(cause instanceof Error ? cause.message : String(cause)); });
     return () => {
       cancelled = true;
       editor?.dispose();
@@ -381,9 +389,32 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const [target, setTarget] = useState<DiffTarget>("uncommitted");
   const [reportStatus, setReportStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [showReports, setShowReports] = useState(false);
+  const [committing, setCommitting] = useState(false);
+  const [commitThread, setCommitThread] = useState<string | null>(null);
+  const commitPending = useRef(false);
+  const flushEdits = useRef<(() => Promise<void>) | null>(null);
+  const navigate = useBbNavigate();
   const root = useRef<HTMLDivElement>(null);
   const settingsMenu = useRef<HTMLDivElement>(null);
   const settingsButton = useRef<HTMLButtonElement>(null);
+  const diffEditor = useRef<ReturnType<Bundle["createMultiDiffEditor"]> | null>(null);
+
+  const commit = async (push: boolean) => {
+    if (commitPending.current || data === null) return;
+    commitPending.current = true;
+    setCommitting(true);
+    setError(null);
+    try {
+      await flushEdits.current?.();
+      const agent = await rpc.call("commit", { threadId, push });
+      setCommitThread(agent.threadId);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      commitPending.current = false;
+      setCommitting(false);
+    }
+  };
 
   const reportIssue = async () => {
     if (reportStatus === "saving") return;
@@ -443,6 +474,8 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
     if ((payload as { root: string }).root === data?.root) setReload((n) => n + 1);
   });
 
+  useEffect(() => { setCommitThread(null); }, [threadId]);
+
   useEffect(() => {
     monaco?.editor.setTheme(mode === "dark" ? "vs-dark" : "vs");
   }, [monaco, mode]);
@@ -477,6 +510,11 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   }, []);
 
   const onKeyDownCapture = (event: KeyboardEvent) => {
+    if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "f" && !showReports && stack.length === 0 && diffEditor.current !== null) {
+      event.preventDefault();
+      event.stopPropagation();
+      diffEditor.current.openSearch();
+    }
     if (event.ctrlKey && !event.metaKey && event.key === "-" && stack.length > 0) {
       event.preventDefault();
       event.stopPropagation();
@@ -504,6 +542,21 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
             <span className="text-muted-foreground">
               {data === null ? "Loading…" : `${data.files.length} files`}
             </span>
+            <button type="button" aria-label="Commit changes" title="Review and commit uncommitted changes with Claude Haiku"
+              disabled={data === null || committing || (target === "uncommitted" && data.files.length === 0 && data.skipped.length === 0)}
+              className="shrink-0 rounded p-1 hover:bg-muted disabled:opacity-50" onClick={() => commit(false)}>
+              <Icon name="Check" className="size-4" aria-hidden />
+            </button>
+            <button type="button" aria-label="Commit and push changes" title="Review, commit and push uncommitted changes with Claude Haiku"
+              disabled={data === null || committing || (target === "uncommitted" && data.files.length === 0 && data.skipped.length === 0)}
+              className="shrink-0 rounded p-1 hover:bg-muted disabled:opacity-50" onClick={() => commit(true)}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="size-4" aria-hidden>
+                <path d="M18 6 7 17l-5-5m20-2-7.5 7.5L13 16" />
+              </svg>
+            </button>
+            {committing ? <span role="status" className="text-muted-foreground">Starting Haiku…</span> : null}
+            {commitThread === null ? null : <button type="button" className="shrink-0 rounded px-1.5 py-0.5 hover:bg-muted"
+              onClick={() => navigate.toThread(commitThread)}>View commit agent</button>}
           </>
         ) : (
           <>
@@ -518,6 +571,8 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
         )}
         <span className="flex-1" />
         {error === null ? null : <span className="truncate text-destructive">{error}</span>}
+        {top === undefined ? <button type="button" title="Find in all diffs (⌘F)" aria-label="Find in all diffs" disabled={bundle === null || data === null}
+          className="shrink-0 rounded px-1.5 py-0.5 hover:bg-muted disabled:opacity-50" onClick={() => diffEditor.current?.openSearch()}>Find</button> : null}
         <button type="button" aria-label="Report issue" title="Save diagnostics to the Diff Explorer inbox" disabled={reportStatus === "saving"}
           className="shrink-0 rounded px-1.5 py-0.5 hover:bg-muted disabled:opacity-50" onClick={reportIssue}>
           {reportStatus === "saving" ? "Saving…" : reportStatus === "saved" ? "Report saved" : "Report issue"}
@@ -552,11 +607,13 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
             {data.files.length === 0 ? <p className="p-4 text-sm text-muted-foreground">No changes.</p> : null}
             {data.skipped.length === 0 ? null : (
               <p className="border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
-                Skipped (binary or too large): {data.skipped.join(", ")}
+                Skipped (binary, too large, or outside the read root): {data.skipped.join(", ")}
               </p>
             )}
             <div className="min-h-0 flex-1">
               <MultiDiff
+                flush={flushEdits}
+                editor={diffEditor}
                 bundle={bundle}
                 panelId={panelId}
                 root={data.root}

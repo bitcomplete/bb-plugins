@@ -12,6 +12,7 @@ import { RefCounted } from "../node_modules/monaco-editor/esm/vs/editor/browser/
 import { observableValue } from "../node_modules/monaco-editor/esm/vs/base/common/observableInternal/observables/observableValue.js";
 import { constObservable } from "../node_modules/monaco-editor/esm/vs/base/common/observableInternal/observables/constObservable.js";
 import { derived } from "../node_modules/monaco-editor/esm/vs/base/common/observableInternal/observables/derived.js";
+import { createDiffSearch } from "./diff-search.js";
 
 class DocumentItem {
   constructor(documentDiffItem, editorViewModel, instantiationService) {
@@ -74,6 +75,10 @@ class EditorViewModel {
  * documents: { path: string, original: ITextModel, modified: ITextModel, label: string, options: IDiffEditorOptions, estimatedHeight: number }[]
  */
 export function createMultiDiffEditor(element, onFileAction) {
+  element.style.cssText = "height:100%;display:flex;flex-direction:column";
+  const editorElement = document.createElement("div");
+  editorElement.style.cssText = "flex:1;min-height:0";
+  element.appendChild(editorElement);
   const instantiationService = StandaloneServices.get(IInstantiationService);
   // monaco.editor.create does this; without it the theme stylesheet (token and diff colors) is never injected.
   const theme = StandaloneServices.get(IStandaloneThemeService).registerEditorContainer(element);
@@ -83,7 +88,7 @@ export function createMultiDiffEditor(element, onFileAction) {
   const viewModelSource = observableValue("viewModel", undefined);
   const widget = instantiationService.createInstance(
     MultiDiffEditorWidgetImpl,
-    element,
+    editorElement,
     dimension,
     viewModelSource,
     {
@@ -167,20 +172,50 @@ export function createMultiDiffEditor(element, onFileAction) {
       },
     },
   );
-  const resize = new ResizeObserver(() => dimension.set({ width: element.clientWidth, height: element.clientHeight }, undefined));
-  resize.observe(element);
+  let searchEditor;
+  function restoreSearchLayout() {
+    if (searchEditor) {
+      searchEditor.updateOptions({ renderSideBySide: false });
+      searchEditor = undefined;
+    }
+  }
+  const search = createDiffSearch(element, (match) => {
+    restoreSearchLayout();
+    if (!match) return;
+    const item = viewModel.items.get().find((item) => item.documentDiffItem.modified === match.document.modified);
+    item.collapsed.set(false, undefined);
+    widget.reveal({ original: item.originalUri, modified: item.modifiedUri });
+    const diff = widget.activeControl.get();
+    if (!diff) return;
+    // Inline deleted lines are view zones, not a selectable original editor.
+    if (match.side === "original") {
+      diff.updateOptions({ renderSideBySide: true, useInlineViewWhenSpaceIsLimited: false });
+      searchEditor = diff;
+    }
+    const editor = match.side === "original" ? diff.getOriginalEditor() : diff.getModifiedEditor();
+    editor.setSelection(match.range);
+    editor.revealRangeInCenter(match.range);
+  }, () => widget.activeControl.get()?.getModifiedEditor().focus());
+  const resize = new ResizeObserver(() => dimension.set({ width: editorElement.clientWidth, height: editorElement.clientHeight }, undefined));
+  resize.observe(editorElement);
   // Like VS Code: create the widget empty, then attach the view model.
   viewModelSource.set(viewModel, undefined);
   return {
+    openSearch() { search.open(); },
     update(documents) {
+      restoreSearchLayout();
       documentsByUri = new Map(documents.map((d) => [d.modified.uri.toString(), d]));
       viewModel.setDocuments(documents);
+      search.update(documents);
     },
     dispose() {
+      restoreSearchLayout();
+      search.dispose();
       resize.disconnect();
       widget.dispose();
       theme.dispose();
       viewModel.dispose();
+      editorElement.remove();
     },
   };
 }

@@ -22,19 +22,20 @@
     ]
   },
   "dependencies": {
+    "esbuild": "0.28.2",
+    "monaco-editor": "0.56.0",
     "zod": "4.6.5"
   },
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.5.29",
     "@types/node": "22.20.5",
     "@types/react": "19.3.0",
-    "esbuild": "0.28.2",
-    "monaco-editor": "0.56.0",
     "typescript": "5.9.3"
   },
   "scripts": {
-    "build:monaco": "scripts/build-monaco.sh",
-    "test": "esbuild host.test.ts app.test.ts server.test.ts file-models.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js dist/server.test.js dist/file-models.test.js",
+    "postinstall": "node scripts/build-monaco.mjs",
+    "build:monaco": "node scripts/build-monaco.mjs",
+    "test": "esbuild host.test.ts app.test.ts server.test.ts file-models.test.ts commit.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js dist/server.test.js dist/file-models.test.js dist/commit.test.js",
     "typecheck": "tsc --noEmit"
   },
   "packageManager": "pnpm@10.34.6",

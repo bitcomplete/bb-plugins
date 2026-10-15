@@ -20,13 +20,31 @@ const fileAction = z.object({
 });
 export type FileAction = z.infer<typeof fileAction>["action"];
 
+const commitPaths = z.array(z.string().min(1).max(4096)).min(1).max(1000);
+const objectId = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+export const commitSnapshot = z.object({ head: objectId.nullable(), branch: z.string().startsWith("refs/heads/"), tree: objectId, index: z.string().regex(/^[0-9a-f]{64}$/) });
+export type CommitSnapshot = z.infer<typeof commitSnapshot>;
+export const commitJob = z.object({
+  root: z.string().startsWith("/"), hostId: z.string(), environmentId: z.string(), paths: commitPaths, push: z.boolean(),
+  status: z.enum(["pending", "reviewed", "finishing", "done", "failed"]), snapshot: commitSnapshot.optional(),
+});
+const commitResult = z.object({ commit: objectId.nullable(), pushed: z.boolean(), error: z.string().nullable() });
+
 export const hostContract = defineRpcContract({
+  reviewCommit: {
+    input: z.object({ root: z.string().startsWith("/"), paths: commitPaths, snapshot: commitSnapshot.optional() }),
+    output: z.object({ snapshot: commitSnapshot, diff: z.string() }),
+  },
+  finishCommit: {
+    input: z.object({ root: z.string().startsWith("/"), paths: commitPaths, snapshot: commitSnapshot, messageFile: z.string().startsWith("/"), push: z.boolean() }),
+    output: commitResult,
+  },
   fileAction: {
     input: fileAction.extend({ root: z.string().startsWith("/") }),
     output: z.null(),
   },
   definition: {
-    input: position.extend({ root: z.string().startsWith("/") }),
+    input: position.extend({ root: z.string().startsWith("/"), content: z.string() }),
     output: z.object({ locations: z.array(location) }),
   },
   read: {
@@ -73,6 +91,10 @@ export type Report = z.infer<typeof report>;
 const reportSummary = report.omit({ setup: true });
 
 export const rpcContract = defineRpcContract({
+  commit: {
+    input: z.object({ threadId: z.string().min(1), push: z.boolean(), paths: commitPaths.optional() }),
+    output: z.object({ threadId: z.string() }),
+  },
   report: { input: reportSetup, output: reportSummary },
   reports: { input: z.null(), output: z.array(reportSummary).max(20) },
   getReport: { input: z.object({ id: z.string().min(1).max(80) }), output: report },
@@ -95,7 +117,7 @@ export const rpcContract = defineRpcContract({
     }),
   },
   definition: {
-    input: position.extend({ environmentId: z.string() }),
+    input: position.extend({ environmentId: z.string(), content: z.string() }),
     output: z.object({ locations: z.array(location) }),
   },
   read: {

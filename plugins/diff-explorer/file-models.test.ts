@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { flushFile, reconcileFile, reloadFile, releaseFile, type FileModels } from "./file-models";
+import { flushFile, flushFiles, reconcileFile, reloadFile, releaseFile, type FileModels } from "./file-models";
 
 function model(text: string) {
   let disposed = false;
@@ -69,6 +69,25 @@ test("discard waits for an in-flight save and retains the edit if reading fails"
   assert.equal(m.modified.getValue(), "local edit");
   assert.equal(m.saved, "base");
   assert.equal(m.reloading, false);
+});
+
+test("commit flush waits for saves and rejects unsaved or deleting files", async () => {
+  const m = file();
+  m.modified.setValue("pending");
+  let finish!: () => void;
+  const pending = new Promise<void>((resolve) => { finish = resolve; });
+  const callbacks = { current: { save: async () => { await pending; }, onError() {} } };
+  const models = new Map([["file.ts", m]]);
+  const flushed = flushFiles(models, callbacks);
+  assert.equal(m.saved, "base");
+  finish();
+  await flushed;
+  assert.equal(m.saved, "pending");
+  m.modified.setValue("conflict");
+  callbacks.current.save = async () => { throw new Error("Changed on disk"); };
+  await assert.rejects(flushFiles(models, callbacks), /Save all editor changes/);
+  m.deleting = true;
+  await assert.rejects(flushFiles(models, callbacks), /file action/);
 });
 
 test("queued saves use the preceding saved value and recover after a conflict", async () => {

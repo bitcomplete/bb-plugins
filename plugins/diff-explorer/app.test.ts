@@ -4,6 +4,7 @@ import { setImmediate } from "node:timers/promises";
 import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
+import { findDiffMatches } from "./scripts/diff-search.js";
 
 test("Monaco initialization cleans up a failed attempt and retries a fresh URL while sharing success", async () => {
   const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
@@ -42,6 +43,106 @@ test("Monaco initialization cleans up a failed attempt and retries a fresh URL w
   assert.equal(installed, 1);
 });
 
+test("find searches both sides of every diff using literal case-insensitive model search", () => {
+  const range = { startLineNumber: 7, startColumn: 2, endLineNumber: 7, endColumn: 8 };
+  const calls: unknown[][] = [];
+  const model = (found: boolean) => ({ findMatches: (...args: unknown[]) => {
+    calls.push(args);
+    return found ? [{ range }] : [];
+  } });
+  const documents = [
+    { path: "first.ts", original: model(true), modified: model(false) },
+    { path: "offscreen.ts", original: model(false), modified: model(true) },
+  ];
+  assert.deepEqual(findDiffMatches(documents, "a.b"), [
+    { document: documents[0], side: "original", range },
+    { document: documents[1], side: "modified", range },
+  ]);
+  assert.deepEqual(calls, Array.from({ length: 4 }, () => ["a.b", false, false, false, null, false]));
+  assert.deepEqual(findDiffMatches(documents, ""), []);
+  assert.equal(calls.length, 4);
+});
+
+test("Cmd+F opens panel search before Monaco handles the shortcut, while Ctrl+F is untouched", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const panel = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "DiffsPanel");
+  const declaration = panel?.body?.statements.filter(ts.isVariableStatement)
+    .flatMap((node) => [...node.declarationList.declarations]).find((node) => node.name.getText(source) === "onKeyDownCapture");
+  assert.ok(declaration?.initializer);
+  let opened = 0;
+  const context = vm.createContext({ showReports: false, stack: [], diffEditor: { current: { openSearch: () => opened++ } } });
+  const handler = vm.runInContext(ts.transpileModule(`(${declaration.initializer.getText(source)})`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, context);
+  const events: string[] = [];
+  const event = { key: "f", metaKey: true, ctrlKey: false, altKey: false, shiftKey: false,
+    preventDefault: () => events.push("prevent"), stopPropagation: () => events.push("stop") };
+  handler(event);
+  assert.equal(opened, 1);
+  assert.deepEqual(events, ["prevent", "stop"]);
+  handler({ ...event, metaKey: false, ctrlKey: true });
+  context.showReports = true;
+  handler(event);
+  context.showReports = false;
+  context.stack = [{}];
+  handler(event);
+  assert.equal(opened, 1);
+  assert.equal(events.length, 2);
+});
+
+test("definition models re-read disk, retain identity, and ignore reads after panel disposal", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const fn = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "fileModel");
+  assert.ok(fn);
+  let disk = "before";
+  let reads = 0;
+  let existing: any = null;
+  const panel = { environmentId: "env", rpc: { call: async () => { reads++; return { content: disk }; } } };
+  const panels = new Map([["panel", panel]]);
+  const monaco = {
+    Uri: { from: (uri: unknown) => uri },
+    editor: {
+      getModel: () => existing,
+      createModel(content: string) {
+        existing = { getValue: () => content, setValue: (value: string) => { content = value; } };
+        return existing;
+      },
+    },
+  };
+  const context = vm.createContext({ FILE: "bbfile", panels, languageFor: () => "typescript" });
+  vm.runInContext(ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  const first = await context.fileModel(monaco, "panel", panel, "/file.ts");
+  disk = "after";
+  assert.equal(await context.fileModel(monaco, "panel", panel, "/file.ts"), first);
+  assert.equal(first.getValue(), "after");
+  assert.equal(reads, 2);
+  existing = null;
+  const pending = context.fileModel(monaco, "panel", panel, "/file.ts");
+  panels.delete("panel");
+  assert.equal(await pending, null);
+  assert.equal(existing, null);
+});
+
+test("definition provider sends the visible model text with its cursor position", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const fn = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "installNavigation");
+  assert.ok(fn);
+  let provider: any;
+  let sent: any;
+  const panel = { environmentId: "env", setError() {}, rpc: { call: async (method: string, input: unknown) => {
+    assert.equal(method, "definition"); sent = input; return { locations: [] };
+  } } };
+  const monaco = { languages: { registerDefinitionProvider: (_language: string, value: unknown) => { provider = value; } }, editor: { registerEditorOpener() {} } };
+  const context = vm.createContext({ panels: new Map([["panel", panel]]), OLD: "bbold" });
+  vm.runInContext(ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  context.installNavigation(monaco);
+  await provider.provideDefinition({ uri: { authority: "panel", scheme: "bbnew", path: "/file.ts" }, getValue: () => "\nunsaved content" }, { lineNumber: 2, column: 3 });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), { environmentId: "env", path: "/file.ts", line: 2, column: 3, content: "\nunsaved content" });
+});
+
 test("refresh keeps the editor data mounted and ignores superseded loads", async () => {
   // Exercise the panel's actual loading callbacks without a DOM or another test framework.
   const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
@@ -68,6 +169,7 @@ test("refresh keeps the editor data mounted and ignores superseded loads", async
     setData: (value: unknown) => { data = typeof value === "function" ? value(data) : value; context.data = data; },
     setError: (value: unknown) => { error = value; },
     setStack: (value: unknown) => { stack = value; },
+    setCommitThread: () => {},
     setReload: (update: (value: number) => number) => { reload = update(reload); },
   });
   vm.runInContext(ts.transpileModule(callbacks.map((node) => node.getText(source)).join("\n"), {

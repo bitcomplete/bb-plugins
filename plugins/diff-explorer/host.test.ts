@@ -108,10 +108,11 @@ test("overlapping stale saves conflict and a failed save does not block the queu
   }
 });
 
-test("warm opens one file per server and shares the TypeScript server with JavaScript", async () => {
+test("warm shares servers and definitions synchronize the requesting editor text", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "diff-explorer-warm-"));
   const opened: string[] = [];
   const commands: string[][] = [];
+  const messages: any[] = [];
   const spawn = mock.method(childProcess, "spawn", (command: string, args: string[]) => {
     commands.push([command, ...args]);
     const stdout = new EventEmitter();
@@ -120,7 +121,13 @@ test("warm opens one file per server and shares the TypeScript server with JavaS
       stdin: { write(body: string | Buffer) {
         if (!Buffer.isBuffer(body)) return;
         const message = JSON.parse(body.toString());
+        messages.push(message);
         if (message.method === "textDocument/didOpen") opened.push(message.params.textDocument.languageId);
+        if (message.method === "textDocument/definition") setImmediate(() => {
+          const result = { uri: message.params.textDocument.uri, range: { start: { line: 0, character: 0 } } };
+          const response = JSON.stringify({ jsonrpc: "2.0", id: message.id, result });
+          stdout.emit("data", Buffer.from(`Content-Length: ${Buffer.byteLength(response)}\r\n\r\n${response}`));
+        });
       } },
       kill() { child.emit("exit", 0); },
     });
@@ -141,6 +148,19 @@ test("warm opens one file per server and shares the TypeScript server with JavaS
       ["gopls"],
     ]);
     assert.deepEqual(opened.sort(), ["go", "typescript"]);
+    messages.length = 0;
+    const definition = (content: string) => host.experimental_call("definition", {
+      root: dir, path: paths[0], line: 3, column: 2, content,
+    });
+    const results = await Promise.all([definition("\nfirst unsaved edit"), definition("")]);
+    assert.deepEqual(messages.map((message) => [message.method, message.params.contentChanges?.[0].text ?? message.params.position]), [
+      ["textDocument/didChange", "\nfirst unsaved edit"],
+      ["textDocument/definition", { line: 2, character: 1 }],
+      ["textDocument/didChange", ""],
+      ["textDocument/definition", { line: 2, character: 1 }],
+    ]);
+    assert.deepEqual(results[0].locations, [{ path: paths[0], line: 1, column: 1 }]);
+    assert.equal(await readFile(paths[0], "utf8"), "text");
   } finally {
     await host.experimental_dispose();
     spawn.mock.restore();

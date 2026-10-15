@@ -34,6 +34,17 @@ export function flushFile(path: string, m: FileModels, callbacks: SaveCallbacks)
   });
 }
 
+export async function flushFiles(models: Map<string, FileModels>, callbacks: SaveCallbacks) {
+  for (const [path, m] of models) {
+    if (m.deleting || m.reloading) throw new Error("Wait for the file action to finish before committing");
+    flushFile(path, m, callbacks);
+  }
+  await Promise.all(Array.from(models.values(), (m) => m.saving));
+  if (Array.from(models.values()).some((m) => m.saved !== m.modified.getValue())) {
+    throw new Error("Save all editor changes successfully before committing");
+  }
+}
+
 export function reconcileFile(m: FileModels, oldText: string, newText: string) {
   if (m.reloading) return;
   if (m.original.getValue() !== oldText) m.original.setValue(oldText);

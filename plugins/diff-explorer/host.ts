@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import { hostContract, hostSignals, type Location } from "./contract";
+import { reviewCommit, finishCommit } from "./commit";
 
 const TS = ["npx", "--yes", "--ignore-scripts", "-p", "typescript@5.9.3", "-p", "typescript-language-server@5.1.3", "typescript-language-server", "--stdio"];
 
@@ -56,8 +57,11 @@ class LanguageServer {
 
   async open(file: string, languageId: string) {
     await this.ready;
+    return this.synchronize(file, languageId, await readFile(file, "utf8"));
+  }
+
+  private synchronize(file: string, languageId: string, text: string) {
     const uri = pathToFileURL(file).href;
-    const text = await readFile(file, "utf8");
     const open = this.documents.get(uri);
     if (open === undefined) {
       this.documents.set(uri, { version: 1, text });
@@ -73,8 +77,10 @@ class LanguageServer {
     return uri;
   }
 
-  async definition(file: string, line: number, column: number, languageId: string): Promise<Location[]> {
-    const uri = await this.open(file, languageId);
+  async definition(file: string, line: number, column: number, languageId: string, content: string): Promise<Location[]> {
+    await this.ready;
+    // Keep synchronization and the request together so concurrent panels query their own text.
+    const uri = this.synchronize(file, languageId, content);
     const result = await this.request("textDocument/definition", {
       textDocument: { uri },
       position: { line: line - 1, character: column - 1 },
@@ -195,6 +201,8 @@ export default experimental_defineHostEntry({
   contract: hostContract,
   experimental_signals: hostSignals,
   handlers: {
+    async reviewCommit({ root, paths, snapshot }) { return reviewCommit(root, paths, snapshot); },
+    async finishCommit({ root, paths, snapshot, messageFile, push }) { return finishCommit(root, paths, snapshot, messageFile, push); },
     async fileAction({ root, path: file, action }) {
       const relative = inside(path.resolve(root), path.resolve(file));
       const canonicalRoot = await realpath(root);
@@ -254,10 +262,10 @@ export default experimental_defineHostEntry({
       await watches.get(root);
       return null;
     },
-    async definition({ root, path: file, line, column }) {
+    async definition({ root, path: file, line, column, content }) {
       const spec = SERVERS[path.extname(file).toLowerCase()];
       if (spec === undefined) return { locations: [] };
-      const locations = await serverFor(root, spec.cmd).definition(file, line, column, spec.languageId);
+      const locations = await serverFor(root, spec.cmd).definition(file, line, column, spec.languageId, content);
       return { locations };
     },
     // Opens one file per language server so it indexes the project before the first click.
