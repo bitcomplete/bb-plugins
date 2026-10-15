@@ -33,7 +33,7 @@
  * to take an empty directory made by hand, a project pointed at it, and a
  * visit here. The form folds the three into one step.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   experimental_Icon as Icon,
   experimental_usePluginId,
@@ -273,7 +273,14 @@ export function ReposPanel() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // Only the latest request may land. Loads overlap whenever the project
+  // changes under a realtime refresh — creating a project publishes the change
+  // before the RPC returns, so a load for the old project is still in flight
+  // when the new one is chosen, and arriving last it would show the old
+  // project's repo set under the new project's name.
+  const latestLoad = useRef(0);
   const load = useCallback(() => {
+    const request = ++latestLoad.current;
     if (projectId === null) {
       setView(null);
       return;
@@ -281,11 +288,23 @@ export function ReposPanel() {
     void rpc
       .call("repoSet", { projectId })
       .then((next) => {
+        if (request !== latestLoad.current) return;
         setView(next);
         setLoadError(null);
       })
-      .catch((error: unknown) => setLoadError(error instanceof Error ? error.message : "Could not load the repo set."));
+      .catch((error: unknown) => {
+        if (request !== latestLoad.current) return;
+        setLoadError(error instanceof Error ? error.message : "Could not load the repo set.");
+      });
   }, [rpc, projectId]);
+
+  // Another project's repo set, or a draft of it, must not outlive the switch.
+  useEffect(() => {
+    setView(null);
+    setLoadError(null);
+    setDraft(null);
+    setSaveError(null);
+  }, [projectId]);
 
   useEffect(load, [load]);
   useRealtime(REPOS_CHANGED_CHANNEL, load);
