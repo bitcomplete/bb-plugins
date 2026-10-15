@@ -14,6 +14,7 @@ import {
 import type { z } from "zod";
 import type { DiffFile, DiffTarget, FileAction, Location, Report, rpcContract } from "./contract";
 import { version as pluginVersion } from "./package.json";
+import { flushFile, reconcileFile, reloadFile, releaseFile, type FileModels, type SaveFile } from "./file-models";
 
 type MonacoApi = typeof Monaco;
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -45,6 +46,7 @@ type Bundle = {
   createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void): { update(documents: MultiDiffDocument[]): void; dispose(): void };
 };
 let bundlePromise: Promise<Bundle> | null = null;
+let bundleAttempt = 0;
 let workerStatus: { path: string; error: string | null } | null = null;
 
 function loadMonaco(baseUrl: string, rpc: Rpc): Promise<Bundle> {
@@ -65,9 +67,17 @@ function loadMonaco(baseUrl: string, rpc: Rpc): Promise<Bundle> {
     link.rel = "stylesheet";
     link.href = `${baseUrl}/editor.css`;
     document.head.appendChild(link);
-    const bundle: Bundle = await import(/* @vite-ignore */ `${baseUrl}/editor.js`);
-    installNavigation(bundle.monaco);
-    return bundle;
+    try {
+      // Browsers cache failed module URLs, so a retry needs a different URL too.
+      const attempt = bundleAttempt++;
+      const bundle: Bundle = await import(/* @vite-ignore */ `${baseUrl}/editor.js${attempt === 0 ? "" : `?retry=${attempt}`}`);
+      installNavigation(bundle.monaco);
+      return bundle;
+    } catch (cause) {
+      link.remove();
+      bundlePromise = null;
+      throw cause;
+    }
   })());
 }
 
@@ -145,18 +155,6 @@ const DIFF_OPTIONS = {
 const DELETED_DIFF_OPTIONS = { ...DIFF_OPTIONS, readOnly: true } satisfies Monaco.editor.IDiffEditorOptions;
 const SAVE_DELAY_MS = 600;
 
-type FileModels = {
-  original: Monaco.editor.ITextModel;
-  modified: Monaco.editor.ITextModel;
-  // What the file on disk holds as far as we know; a save must find exactly this there.
-  saved: string;
-  saving: Promise<void>;
-  timer: ReturnType<typeof setTimeout> | undefined;
-  listener: Monaco.IDisposable;
-  deleting?: boolean;
-};
-type SaveFile = (path: string, content: string, expected: string) => Promise<unknown>;
-
 const LINE_HEIGHT = 19;
 const HEADER_HEIGHT = 40;
 
@@ -166,6 +164,7 @@ function MultiDiff({
   root,
   files,
   save,
+  read,
   fileAction,
   onError,
 }: {
@@ -174,6 +173,7 @@ function MultiDiff({
   root: string;
   files: DiffFile[];
   save: SaveFile;
+  read(path: string): Promise<string>;
   fileAction(path: string, action: FileAction): Promise<unknown>;
   onError(message: string | null): void;
 }) {
@@ -181,35 +181,13 @@ function MultiDiff({
   const editor = useRef<ReturnType<Bundle["createMultiDiffEditor"]> | null>(null);
   // Models per path, updated in place on refresh so each file keeps its editor and your scroll place.
   const models = useRef(new Map<string, FileModels>());
-  const saveRef = useRef({ save, fileAction, onError });
-  saveRef.current = { save, fileAction, onError };
-
-  // Saves run one at a time per file, so each one expects what the previous one wrote.
-  const flush = useCallback((path: string, m: FileModels) => {
-    clearTimeout(m.timer);
-    m.timer = undefined;
-    const content = m.modified.getValue();
-    m.saving = m.saving.then(async () => {
-      if (content === m.saved) return;
-      try {
-        await saveRef.current.save(path, content, m.saved);
-        m.saved = content;
-        saveRef.current.onError(null);
-      } catch (cause) {
-        saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
-      }
-    });
-  }, []);
-
-  const release = useCallback(
-    (path: string, m: FileModels) => {
-      m.listener.dispose();
-      if (m.timer !== undefined) flush(path, m);
-      m.original.dispose();
-      m.modified.dispose();
-    },
-    [flush],
-  );
+  const [conflicts, setConflicts] = useState<string[]>([]);
+  const [reloading, setReloading] = useState<string | null>(null);
+  const onConflict = (path: string, conflicted: boolean) => {
+    setConflicts((paths) => conflicted ? (paths.includes(path) ? paths : [...paths, path]) : paths.filter((p) => p !== path));
+  };
+  const saveRef = useRef({ save, fileAction, onError, onConflict });
+  saveRef.current = { save, fileAction, onError, onConflict };
 
   useEffect(() => {
     const created = bundle.createMultiDiffEditor(container.current!, async (path, action) => {
@@ -233,18 +211,19 @@ function MultiDiff({
         m.deleting = false;
         saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
         if (action === "delete" && !m.modified.isDisposed()) {
-          m.timer = setTimeout(() => flush(path, m), SAVE_DELAY_MS);
+          m.timer = setTimeout(() => flushFile(path, m, saveRef), SAVE_DELAY_MS);
         }
       }
     });
     editor.current = created;
     const owned = models.current;
     return () => {
+      editor.current = null;
       created.dispose();
-      for (const [path, m] of owned) release(path, m);
+      for (const [path, m] of owned) releaseFile(path, m, saveRef);
       owned.clear();
     };
-  }, [bundle, flush, release]);
+  }, [bundle]);
 
   useEffect(() => {
     const { monaco } = bundle;
@@ -262,22 +241,15 @@ function MultiDiff({
           saving: Promise.resolve(),
           timer: undefined,
           listener: modified.onDidChangeContent(() => {
-            if (created.deleting) return;
+            if (created.deleting || created.reloading) return;
             clearTimeout(created.timer);
-            created.timer = setTimeout(() => flush(abs, created), SAVE_DELAY_MS);
+            created.timer = setTimeout(() => flushFile(abs, created, saveRef), SAVE_DELAY_MS);
           }),
         };
         m = created;
         current.set(abs, m);
       } else {
-        if (m.original.getValue() !== file.oldText) m.original.setValue(file.oldText);
-        const value = m.modified.getValue();
-        if (file.newText === value) m.saved = value;
-        // A file with unsaved edits keeps them; its next save then reports the change on disk.
-        else if (value === m.saved) {
-          m.saved = file.newText;
-          m.modified.setValue(file.newText);
-        }
+        reconcileFile(m, file.oldText, file.newText);
       }
       return {
         path: file.path,
@@ -293,12 +265,35 @@ function MultiDiff({
     const kept = new Set(documents.map((d) => d.modified));
     for (const [abs, m] of current) {
       if (kept.has(m.modified)) continue;
-      release(abs, m);
+      releaseFile(abs, m, saveRef);
       current.delete(abs);
     }
-  }, [bundle, panelId, root, files, flush, release]);
+    setConflicts((paths) => paths.filter((path) => current.has(path)));
+  }, [bundle, panelId, root, files]);
 
-  return <div ref={container} className="h-full" />;
+  const discard = async (path: string) => {
+    const m = models.current.get(path);
+    if (!m || m.reloading) return;
+    setReloading(path);
+    try {
+      await reloadFile(m, () => read(path));
+      setConflicts((paths) => paths.filter((p) => p !== path));
+      saveRef.current.onError(null);
+    } catch (cause) {
+      saveRef.current.onError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setReloading(null);
+    }
+  };
+
+  return <div className="flex h-full min-h-0 flex-col">
+    {conflicts.map((path) => <div key={path} role="alert" className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs">
+      <span className="min-w-0 flex-1 truncate text-destructive" title={path}>{path.slice(root.length + 1)} changed on disk. Your edit is preserved.</span>
+      <button type="button" className="shrink-0 rounded px-1.5 py-0.5 hover:bg-muted disabled:opacity-50" disabled={reloading !== null}
+        onClick={() => discard(path)}>{reloading === path ? "Reloading…" : "Discard edit and reload"}</button>
+    </div>)}
+    <div ref={container} inert={reloading !== null} aria-busy={reloading !== null} className="min-h-0 flex-1" />
+  </div>;
 }
 
 function FileView({ monaco, panelId, location, onError }: {
@@ -567,6 +562,7 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
                 root={data.root}
                 files={data.files}
                 save={(path, content, expected) => rpc.call("write", { environmentId: data.environmentId, path, content, expected })}
+                read={async (path) => (await rpc.call("read", { environmentId: data.environmentId, path })).content}
                 fileAction={async (path, action) => {
                   await rpc.call("fileAction", { environmentId: data.environmentId, path, action });
                   setReload((n) => n + 1);

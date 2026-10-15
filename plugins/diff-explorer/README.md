@@ -11,6 +11,7 @@ A [BB](https://getbb.app) plugin. Review a thread's changes, and jump into the c
 - ⌘-click a symbol (or press F12) to open its definition.
 - Jump again to go deeper. Press **Ctrl+-** to go back one level.
 - Opens from the thread header button, or with **⌘⇧D**.
+- If autosave detects a disk conflict, the file's **Discard edit and reload** action replaces only that editor's unsaved text with the current disk version. Ordinary refreshes preserve unsaved edits.
 
 ![Go to definition](screenshots/go-to-definition.png)
 
@@ -58,7 +59,7 @@ Use pnpm 10.34.6 and Node 22.23.3 from this directory:
 pnpm install --frozen-lockfile
 pnpm run typecheck
 pnpm test
-pnpm run build:monaco   # only after changing scripts/multi-diff.js or the Monaco version
+pnpm run build:monaco   # after changing scripts/multi-diff.js, scripts/diff-search.js, or Monaco
 bb plugin install .
 ```
 

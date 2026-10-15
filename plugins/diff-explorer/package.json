@@ -34,7 +34,7 @@
   },
   "scripts": {
     "build:monaco": "scripts/build-monaco.sh",
-    "test": "esbuild host.test.ts app.test.ts server.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js dist/server.test.js",
+    "test": "esbuild host.test.ts app.test.ts server.test.ts file-models.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js dist/server.test.js dist/file-models.test.js",
     "typecheck": "tsc --noEmit"
   },
   "packageManager": "pnpm@10.34.6",

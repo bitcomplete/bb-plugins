@@ -5,6 +5,43 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+test("Monaco initialization cleans up a failed attempt and retries a fresh URL while sharing success", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const fn = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "loadMonaco");
+  assert.ok(fn);
+  const links: { remove(): void }[] = [];
+  const urls: string[] = [];
+  let installed = 0;
+  const bundle = {};
+  const context = vm.createContext({
+    bundlePromise: null, bundleAttempt: 0,
+    document: {
+      createElement: () => { const link = { remove() { links.splice(links.indexOf(link), 1); } }; return link; },
+      head: { appendChild: (link: typeof links[number]) => links.push(link) },
+    },
+    installNavigation: () => installed++,
+    importBundle: async (url: string) => {
+      urls.push(url);
+      if (urls.length === 1) throw new Error("Temporary network outage");
+      return bundle;
+    },
+  });
+  vm.runInContext(ts.transpileModule(fn.getText(source).replace("import(/* @vite-ignore */ ", "importBundle("), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, context);
+  const failed = context.loadMonaco("/assets", {});
+  assert.equal(context.loadMonaco("/assets", {}), failed);
+  await assert.rejects(failed, /Temporary network outage/);
+  assert.equal(context.bundlePromise, null);
+  assert.equal(links.length, 0);
+  assert.equal(await context.loadMonaco("/assets", {}), bundle);
+  assert.equal(await context.loadMonaco("/assets", {}), bundle);
+  assert.deepEqual(urls, ["/assets/editor.js", "/assets/editor.js?retry=1"]);
+  assert.equal(links.length, 1);
+  assert.equal(installed, 1);
+});
+
 test("refresh keeps the editor data mounted and ignores superseded loads", async () => {
   // Exercise the panel's actual loading callbacks without a DOM or another test framework.
   const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");

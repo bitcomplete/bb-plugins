@@ -11,6 +11,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [multi-repo](plugins/multi-repo) | Gives a project a set of git repos and every thread a workspace holding a checkout of each |
 | [diff-explorer](plugins/diff-explorer) | Scrollable diff of every changed file, with ⌘-click go to definition and Ctrl+- to go back |
 | [team-setup](plugins/team-setup) | First-run checklist for a bb-gate server: sign in to Claude or Codex, GitHub (headless `gh auth login`), devbox and Linear, make a machine |
+| [image-copy](plugins/image-copy) | Copy linked images beside their link icons in chat |
 | [linear](plugins/linear) | Connect Linear once with OAuth; threads then read, search, comment on and move issues through native tools, as you |
 
 Install one:

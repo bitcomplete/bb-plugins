@@ -280,7 +280,7 @@ export default experimental_defineHostEntry({
       const key = await realpath(file);
       return mutateFile(key, async () => {
         if ((await readFile(key, "utf8")) !== expected) {
-          throw new Error(`${path.basename(file)} changed on disk since it was loaded. Refresh to see the new version; this discards your edit.`);
+          throw new Error(`${path.basename(file)} changed on disk since it was loaded. Use “Discard edit and reload” to replace your edit with the disk version.`);
         }
         await writeFile(key, content, "utf8");
         return null;

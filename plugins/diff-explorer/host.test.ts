@@ -94,6 +94,7 @@ test("overlapping stale saves conflict and a failed save does not block the queu
     const conflict = results.find((result) => result.status === "rejected");
     assert.ok(conflict?.status === "rejected");
     assert.match(conflict.reason.message, /changed on disk/);
+    assert.match(conflict.reason.message, /Discard edit and reload/);
     const winner = results[0].status === "fulfilled" ? "first" : "second";
     assert.equal(await readFile(file, "utf8"), winner);
 

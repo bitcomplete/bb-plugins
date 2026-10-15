@@ -1,0 +1,30 @@
+{
+  "name": "bb-plugin-image-copy",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.44",
+    "bbPluginSdk": ">=0.5.29"
+  },
+  "bb": {
+    "name": "Image Copy",
+    "description": "Copy linked images from inside chat messages.",
+    "branding": {
+      "icon": "Copy"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.5.29",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "jsdom": "30.1.2",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "bb plugin build",
+    "test": "node --test image-copy.test.mjs"
+  }
+}
