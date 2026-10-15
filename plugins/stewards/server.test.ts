@@ -50,7 +50,19 @@ function world() {
 
   const sdk = {
     plugins: { callRpc },
-    projects: { list: async () => [{ id: "p1", name: "Acme" }] },
+    projects: {
+      list: async () => [{ id: "p1", name: "Acme" }],
+      // A checkout on a machine that is off (the default source) and one on a machine that is on.
+      get: async () => ({
+        id: "p1",
+        name: "Acme",
+        sources: [
+          { id: "src_off", projectId: "p1", type: "local_path", hostId: "host_off", path: "/p/.bb", isDefault: true },
+          { id: "src_on", projectId: "p1", type: "local_path", hostId: "host_on", path: "/p/.bb", isDefault: false },
+        ],
+      }),
+    },
+    hosts: { list: async () => [{ id: "host_off", status: "disconnected" }, { id: "host_on", status: "connected" }] },
     threadSections: { list: async () => [], create: async () => ({ id: "sec1", name: "Managed" }) },
     threads: {
       spawn: async (args: Record<string, unknown>) => {
@@ -130,6 +142,8 @@ describe("a Linear ticket steward", () => {
 
     const [project, steward] = t.spawns;
     expect(project).toMatchObject({ title: "Project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
+    // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
+    expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
     // No sidebar sections or pins: the sidebar is the user's.
     expect(project).not.toHaveProperty("pinned");
     expect(steward).not.toHaveProperty("sectionId");
@@ -140,7 +154,7 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/Specify the ticket against the ready checklist/u);
     expect(prompt).toMatch(/\[ \] Acceptance criteria are testable/u);
     expect(prompt).toMatch(/given by the project steward/u);
-    expect(prompt).toMatch(/bb thread spawn --parent-self --lifecycle-owner-thread "\$BB_THREAD_ID" --visibility hidden --provider claude-code --model claude-opus-5-5 --reasoning-level high/u);
+    expect(prompt).toMatch(/bb thread spawn --parent-self --lifecycle-owner-thread "\$BB_THREAD_ID" --visibility hidden --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high/u);
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");

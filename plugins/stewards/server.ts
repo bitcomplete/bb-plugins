@@ -51,6 +51,8 @@ import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type WakeReason } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
+/** multi-repo's environment provider: where every thread of a stewards project works. */
+export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */
@@ -492,6 +494,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const stewardModel = (b: Binding, playbook: Playbook) => parseModel(b.modelSteward) ?? playbook.models.steward;
     const workerModel = (b: Binding, playbook: Playbook) => parseModel(b.modelWorker) ?? playbook.models.worker;
 
+    /**
+     * The machine a project's threads run on: the host of its checkout.
+     *
+     * `{ type: "project-default" }` would leave it to core, which picks the
+     * server's own machine; a server with no host daemon of its own (bb-gate's)
+     * then fails every spawn with "Local host daemon is not initialized".
+     * A connected machine is preferred, then the default source. Null when the
+     * project has no checkout bb knows of, and core's default is all there is.
+     */
+    async function projectHost(projectId: string): Promise<string | null> {
+      try {
+        const [project, hosts] = await Promise.all([bb.sdk.projects.get({ projectId }), bb.sdk.hosts.list().catch(() => [])]);
+        const sources = project.sources.filter((source) => source.type === "local_path");
+        const connected = new Set(hosts.filter((host) => host.status === "connected").map((host) => host.id));
+        const pick =
+          sources.find((source) => source.isDefault && connected.has(source.hostId)) ??
+          sources.find((source) => connected.has(source.hostId)) ??
+          sources.find((source) => source.isDefault) ??
+          sources[0];
+        return pick?.hostId ?? null;
+      } catch (error) {
+        bb.log.warn(`stewards: could not find the machine for ${projectId} (${errorMessage(error)}); leaving it to bb's default`);
+        return null;
+      }
+    }
+
+    /** A fresh environment for a project's thread: a multi-repo workspace on its machine. */
+    const freshEnvironment = (hostId: string | null) =>
+      hostId === null
+        ? ({ type: "project-default" } as const)
+        : ({ type: "provider", environmentProviderId: MULTI_REPO_ENVIRONMENT_PROVIDER_ID, inputs: null, machine: { type: "existing", hostId } } as const);
+
+    /** The same, as `bb thread spawn` flags, for the worker command a wake shows. */
+    const environmentFlags = (hostId: string | null) => (hostId === null ? "" : `--environment-provider ${MULTI_REPO_ENVIRONMENT_PROVIDER_ID} --machine ${hostId}`);
+
     async function ensureProjectSteward(config: ProjectConfig): Promise<string | null> {
       let threadId: string | null = null;
       await serial(`project:${config.projectId}`, async () => {
@@ -505,7 +542,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         const thread = await bb.sdk.threads.spawn({
           projectId: config.projectId,
-          environment: { type: "project-default" },
+          environment: freshEnvironment(await projectHost(config.projectId)),
           prompt: PROJECT_STEWARD_INTRO,
           title: "Project steward",
           ...modelArgs(config.file.projectSteward.model ?? null),
@@ -535,11 +572,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       let thread: { id: string };
       try {
-        thread = await bb.sdk.threads.spawn({ ...base, environment: env === null ? { type: "project-default" } : { type: "reuse", environmentId: env } });
+        thread = await bb.sdk.threads.spawn({ ...base, environment: env === null ? freshEnvironment(await projectHost(b.projectId)) : { type: "reuse", environmentId: env } });
       } catch (error) {
         if (env === null) throw error;
         bb.log.warn(`stewards: could not share the project steward's environment for ${b.entityKey} (${errorMessage(error)}); giving it its own`);
-        thread = await bb.sdk.threads.spawn({ ...base, environment: { type: "project-default" } });
+        thread = await bb.sdk.threads.spawn({ ...base, environment: freshEnvironment(await projectHost(b.projectId)) });
       }
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
@@ -567,7 +604,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         routedToMe: routedTo(b),
         workers: store.workers(b.id),
         children: store.children(b.id).map((c) => ({ binding: c, openEscalations: store.openEscalations(c.id) })),
-        workerFlags: workerFlags(workerModel(b, playbook)),
+        workerFlags: [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
         changes,
         own: ownThreads(b),
         label: config.file.label,
