@@ -560,6 +560,7 @@ describe("sidebar row glyphs", () => {
     pinned: false,
     stageOverride: null,
     statusOverride: null,
+    autoArchive: true,
     ...overrides,
   });
 
@@ -915,6 +916,7 @@ describe("the Stage and Status thread actions", () => {
     pinned: false,
     stageOverride: null,
     statusOverride: null,
+    autoArchive: true,
     ...overrides,
   });
 

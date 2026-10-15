@@ -323,6 +323,21 @@ export const storedBriefSchema = z
      * get from their sequence anchors.
      */
     autoArchivedAt: z.number().nullable().optional(),
+    /**
+     * What the plugin that spawned this thread exempted it from, as of the
+     * last summary: see `optout.ts`. Absent means nothing, which is every
+     * thread a person started.
+     *
+     * Stored for the sidebar and the board, which draw from stored briefs
+     * alone and need `archive` to know whether "archiving soon" is true. The
+     * rename, the grouping and the archive sweep read the live namespace
+     * instead, so a brief written before this field existed is still exempt
+     * where it matters.
+     */
+    optOut: z
+      .object({ rename: z.boolean(), group: z.boolean(), archive: z.boolean() })
+      .strict()
+      .optional(),
     lastSummarizedAt: z.number(),
     /** The thread's `conversationOutline().maxSeq` at summarize time. */
     lastActivitySeen: z.number(),
@@ -429,6 +444,8 @@ export const briefCardSchema = z
     nextStepActor: nextStepActorSchema.optional(),
     blockedOn: z.string(),
     lastSummarizedAt: z.number(),
+    /** False when the thread's plugin exempted it from auto-archiving. */
+    autoArchive: z.boolean(),
   })
   .strict();
 export type BriefCard = z.infer<typeof briefCardSchema>;
@@ -460,6 +477,11 @@ export const rowSignalSchema = z
      */
     stageOverride: briefStageSchema.nullable(),
     statusOverride: storedBriefStatusSchema.nullable(),
+    /**
+     * False when the thread's plugin exempted it from auto-archiving, so a
+     * grey ring does not promise an archiving the sweep will never do.
+     */
+    autoArchive: z.boolean(),
   })
   .strict();
 export type RowSignal = z.infer<typeof rowSignalSchema>;

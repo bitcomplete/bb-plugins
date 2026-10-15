@@ -19,6 +19,7 @@ const thread = (
   deletedAt: null,
   visibility: "visible",
   status: "idle",
+  optedOut: false,
   ...overrides,
 });
 
@@ -107,6 +108,12 @@ describe("planning the auto-archive", () => {
     // A pin is a deliberate "keep this in front of me" and outranks anything
     // inferred. It still greys — it just never leaves.
     expect(plan({ threads: [thread({ pinnedAt: NOW - 10 * DAY })] })).toEqual([]);
+  });
+
+  it("never archives a thread its plugin exempted", () => {
+    // A long-lived plugin thread reads "done" between wakes; the plugin that
+    // runs it decides when it is finished.
+    expect(plan({ threads: [thread({ optedOut: true })] })).toEqual([]);
   });
 
   it("never archives a thread we archived once and the user pulled back", () => {

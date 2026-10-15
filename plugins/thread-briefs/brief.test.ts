@@ -309,7 +309,7 @@ describe("status overrides", () => {
       statusOverrideSeq: 50,
       lastActivitySeen: 50,
     });
-    const decoration = rowDecoration(rowSignalFor(resolveBrief(pinned)), IDLE);
+    const decoration = rowDecoration(rowSignalFor(pinned), IDLE);
     // The ring draws nothing for the pin; the label is what says so.
     expect(decoration?.icon).toBe("thread-briefs/done");
     expect(decoration?.label).toBe("Implementation — Done · set by hand");
@@ -324,7 +324,7 @@ const RUNNING = { working: true, unread: false };
 const UNREAD = { working: false, unread: true };
 
 describe("rowDecoration", () => {
-  const signalFor = (brief: StoredBrief) => rowSignalFor(resolveBrief(brief));
+  const signalFor = (brief: StoredBrief) => rowSignalFor(brief);
 
   const blocked = stored({
     fields: { ...stored().fields, blockedOn: "Waiting on CI" },

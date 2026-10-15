@@ -119,6 +119,21 @@ function storedBrief(
   };
 }
 
+/**
+ * A stub for `threads.experimental_listPluginMetadata` answering from one
+ * plugin's namespace per thread, the way bb answers a thread with nothing in
+ * it: no row.
+ */
+function metadataFrom(byThreadId: Record<string, Record<string, unknown>>) {
+  return async ({ threadIds }: { pluginId?: string; threadIds: readonly string[] }) => ({
+    threads: threadIds.flatMap((threadId) =>
+      byThreadId[threadId] === undefined
+        ? []
+        : [{ threadId, metadata: byThreadId[threadId] as never }],
+    ),
+  });
+}
+
 /** The summarizer queue drains off the rpc call, so tests wait on its effect. */
 async function waitFor<T>(read: () => Promise<T | null | undefined>): Promise<T> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -720,6 +735,7 @@ describe("summarizing", () => {
         pinned: false,
         stageOverride: null,
         statusOverride: null,
+        autoArchive: true,
       },
     ]);
   });
@@ -793,6 +809,7 @@ describe("the auto-archive sweep", () => {
   function archiveHost(options: {
     threads: ReturnType<typeof makeThreadResponse>[];
     doneArchiveHours?: number;
+    listPluginMetadata?: ReturnType<typeof metadataFrom>;
   }) {
     globalThis.fetch = fakeCompletion(SUMMARY) as unknown as typeof globalThis.fetch;
     const archived: string[] = [];
@@ -813,6 +830,9 @@ describe("the auto-archive sweep", () => {
             archived.push(threadId);
             return { id: threadId, archivedAt: Date.now() };
           },
+          ...(options.listPluginMetadata === undefined
+            ? {}
+            : { experimental_listPluginMetadata: options.listPluginMetadata }),
         },
       },
     });
@@ -891,6 +911,50 @@ describe("the auto-archive sweep", () => {
 
     await harness.behavior.runSchedule("archive-done");
     expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("leaves a thread its plugin exempted from archiving", async () => {
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_steward", 9, { originPluginId: "stewards" }),
+        coldThread("thr_worker", 9, { originPluginId: "stewards" }),
+      ],
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: { archive: false } },
+        // Spawned by the same plugin, but it asked for nothing.
+        thr_worker: { role: "worker" },
+      }),
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_steward");
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual(["thr_worker"]);
+    // One request for the plugin, not one per thread.
+    expect(harness.sdk.callsTo("threads.experimental_listPluginMetadata")).toHaveLength(1);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("leaves a plugin's thread alone when its metadata cannot be read", async () => {
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_plugin", 9, { originPluginId: "stewards" }),
+        coldThread("thr_mine", 9),
+      ],
+      listPluginMetadata: async () => {
+        throw new Error("503");
+      },
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_plugin");
+    await seedDoneBrief(bb, "thr_mine");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual(["thr_mine"]);
 
     await harness.lifecycle.dispose();
   });
@@ -1464,6 +1528,7 @@ describe("sidebar grouping by status", () => {
     threads: ReturnType<typeof makeThreadResponse>[];
     sections?: { id: string; name: string }[];
     grouping?: string;
+    listPluginMetadata?: ReturnType<typeof metadataFrom>;
   }) {
     const sections = options.sections ?? [];
     const prefs: Record<string, unknown> = {
@@ -1499,6 +1564,9 @@ describe("sidebar grouping by status", () => {
           output: async () => ({ output: "All set." }),
           conversationOutline: async () => ({ items: [], maxSeq: 0 }),
           interactions: { list: async () => [] },
+          ...(options.listPluginMetadata === undefined
+            ? {}
+            : { experimental_listPluginMetadata: options.listPluginMetadata }),
         },
         threadSections: {
           list: async () => [...sections],
@@ -1614,6 +1682,30 @@ describe("sidebar grouping by status", () => {
     await harness.lifecycle.dispose();
     // Two reconciles, each behind the debounce, so this one needs the room.
   }, 15_000);
+
+  it("takes a thread its plugin exempted out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_plain", sectionId: null }),
+      // Filed before its plugin asked to be left out, as the project steward
+      // was on servers that ran stewards before this.
+      groupedThread({ id: "thr_steward", sectionId: "sec_3", originPluginId: "stewards" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: { group: false } },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_plain", storedBrief("thr_plain", done));
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await plugin(bb);
+
+    await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
 
   it("files each thread by its brief's status and leaves briefless ones alone", async () => {
     const threads = [
@@ -1862,12 +1954,15 @@ describe("renaming threads", () => {
     /** Runs when the summarizer is called, to move the world mid-flight. */
     onRequest?: () => void;
     update?: (args: { threadId: string; title?: string | null }) => void;
+    /** The spawning plugin's namespace on the thread, when a plugin spawned it. */
+    originMetadata?: Record<string, unknown>;
   }) {
     const live = makeThreadResponse({
       id: "thr_1",
       title: options.title === undefined ? "Build me a thing that does..." : options.title,
       visibility: "visible",
       status: "idle",
+      originPluginId: options.originMetadata === undefined ? null : "stewards",
     });
     const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => {
       options.onRequest?.();
@@ -1918,6 +2013,9 @@ describe("renaming threads", () => {
             maxSeq: seq,
           }),
           interactions: { list: async () => [] },
+          experimental_listPluginMetadata: metadataFrom(
+            options.originMetadata === undefined ? {} : { thr_1: options.originMetadata },
+          ),
         },
       },
     });
@@ -2012,6 +2110,37 @@ describe("renaming threads", () => {
     const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
     expect(stored?.appliedTitle).toBe("Sidebar grouping by status");
     expect(stored?.fields.title).toBe("Sidebar grouping by status");
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("keeps the title of a thread its plugin asked to keep", async () => {
+    const current = renameHost({
+      title: "ENG-42: Fix the flaky test",
+      originMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
+    });
+    await plugin(current.bb);
+    await summarize(current);
+
+    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
+    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
+    // Stored, so the sidebar knows not to promise an archiving.
+    const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+    expect(stored?.optOut).toEqual({ rename: true, group: false, archive: true });
+    const { signals } = (await current.harness.behavior.callRpc("listRowSignals", null)) as {
+      signals: { autoArchive: boolean }[];
+    };
+    expect(signals[0]?.autoArchive).toBe(false);
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("renames a plugin's thread that asked for nothing", async () => {
+    const current = renameHost({ originMetadata: { role: "worker" } });
+    await plugin(current.bb);
+    await summarize(current);
+
+    expect(current.live.title).toBe("Sidebar grouping by status");
+    const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+    expect(stored?.optOut).toBeUndefined();
     await current.harness.lifecycle.dispose();
   });
 

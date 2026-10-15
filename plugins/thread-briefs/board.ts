@@ -198,7 +198,7 @@ export function buildRows(args: {
       })
         ? {
             idleMs: idleMsSince(thread.latestAttentionAt, args.now),
-            archiving: args.archiveAfterMs > 0,
+            archiving: args.archiveAfterMs > 0 && (card?.autoArchive ?? true),
           }
         : null;
 

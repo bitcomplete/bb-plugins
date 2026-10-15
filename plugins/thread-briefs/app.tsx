@@ -252,7 +252,7 @@ function BriefSync() {
         })
           ? {
               idleMs: idleMsSince(latestAttentionAt, now),
-              archiving: thresholds.archiveAfterMs > 0,
+              archiving: thresholds.archiveAfterMs > 0 && signal.autoArchive,
             }
           : null;
       const decoration = rowDecoration(

@@ -27,6 +27,7 @@ const card = (overrides: Partial<BriefCard> = {}): BriefCard => ({
   nextStep: "Push the branch",
   blockedOn: "",
   lastSummarizedAt: NOW - 1000,
+  autoArchive: true,
   ...overrides,
 });
 
