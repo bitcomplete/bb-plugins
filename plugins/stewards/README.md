@@ -49,6 +49,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
+- **The settings page** (Settings → Plugins → Stewards, [app.tsx](app.tsx))
+  shows each stewarded project's configuration, problems, project steward
+  and nightly pass, runs `bb stewards check` on a button, and lists every
+  open steward with its latest status record and open escalations. It is
+  read-only; steering stays with the project steward and `steward_update`.
 
 ## Configuration
 

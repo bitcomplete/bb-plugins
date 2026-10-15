@@ -127,6 +127,56 @@ export const rpcContract = defineRpcContract({
       ),
     }),
   },
+  // The settings page: what is stewarded, per project, and whether it is healthy.
+  stewardsOverview: {
+    input: z.null(),
+    output: z.object({
+      paused: z.boolean(),
+      lastSweepAt: z.number().nullable(),
+      projects: z.array(
+        z.object({
+          projectId: z.string(),
+          name: z.string(),
+          configured: z.boolean(),
+          label: z.string().nullable(),
+          linearTeams: z.array(z.string()),
+          repos: z.array(z.string()),
+          playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable() })),
+          problems: z.array(z.string()),
+          nightly: z.object({ at: z.string(), timezone: z.string() }).nullable(),
+          lastNight: z.string().nullable(),
+          projectStewardThreadId: z.string().nullable(),
+          digestAt: z.number().nullable(),
+          endedCount: z.number(),
+          stewards: z.array(
+            z.object({
+              key: z.string(),
+              url: z.string().nullable(),
+              title: z.string().nullable(),
+              kind: z.string(),
+              phase: z.string().nullable(),
+              threadId: z.string().nullable(),
+              summary: z.string().nullable(),
+              nextAction: z.string().nullable(),
+              actor: z.string().nullable(),
+              blockedOn: z.string().nullable(),
+              priority: z.string().nullable(),
+              hold: z.string().nullable(),
+              ending: z.string().nullable(),
+              statusAt: z.number().nullable(),
+              createdAt: z.number(),
+              workers: z.number(),
+              escalations: z.array(z.object({ kind: z.string(), route: z.string(), question: z.string() })),
+            }),
+          ),
+        }),
+      ),
+    }),
+  },
+  stewardsCheck: {
+    input: z.object({ projectId: z.string().min(1).max(100) }),
+    output: z.object({ ok: z.boolean(), lines: z.array(z.string()) }),
+  },
 });
 
 type ProjectConfig = {
@@ -968,6 +1018,60 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           })),
         };
       },
+      async stewardsOverview() {
+        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
+        const configsById = new Map((await stewardedProjects()).map((c) => [c.projectId, c] as const));
+        // A project whose configuration went away still shows the stewards it has.
+        const ids = [...new Set([...configsById.keys(), ...store.all().map((b) => b.projectId)])];
+        const projects = ids.map((projectId) => {
+          const config = configsById.get(projectId) ?? null;
+          const row = store.project(projectId);
+          const bindings = store.all(projectId);
+          const open = bindings.filter((b) => b.endedAt === null);
+          return {
+            projectId,
+            name: named.get(projectId) ?? projectId,
+            configured: config !== null,
+            label: config?.file.label ?? null,
+            linearTeams: config?.file.linear.teams ?? [],
+            repos: config?.repos ?? [],
+            playbooks:
+              config === null
+                ? []
+                : KINDS.filter((k) => k !== "review" || config.file.reviews.enabled).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
+            problems: config?.problems ?? [],
+            nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
+            lastNight: row.nightlyDate,
+            projectStewardThreadId: row.threadId,
+            digestAt: row.digestAt,
+            endedCount: bindings.length - open.length,
+            stewards: open.map((b) => ({
+              key: b.entityKey,
+              url: b.url,
+              title: b.title,
+              kind: b.kind,
+              phase: b.phase,
+              threadId: b.threadId,
+              summary: b.status?.summary ?? null,
+              nextAction: b.status?.nextAction ?? null,
+              actor: b.status?.actor ?? null,
+              blockedOn: b.status?.blockedOn ?? null,
+              priority: b.priority,
+              hold: b.hold,
+              ending: b.ending,
+              statusAt: b.statusAt,
+              createdAt: b.createdAt,
+              workers: store.workers(b.id).filter((w) => w.status === "running").length,
+              escalations: store.openEscalations(b.id).map((x) => ({ kind: x.kind, route: x.route, question: x.question })),
+            })),
+          };
+        });
+        projects.sort((a, b) => a.name.localeCompare(b.name));
+        return { paused: (await settings.get()).paused, lastSweepAt, projects };
+      },
+      async stewardsCheck({ projectId }) {
+        return check(projectId);
+      },
     });
 
     // ---- the agent surface ---------------------------------------------------------------------------
@@ -1266,7 +1370,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** The mechanical backstop: adoption, stuck, overdue endings, and a look at every binding. */
+    let lastSweepAt: number | null = null;
     async function sweep(): Promise<void> {
+      lastSweepAt = now();
       const projects = await stewardedProjects(true);
       pushInterest();
       for (const config of projects) {

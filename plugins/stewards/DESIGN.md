@@ -5,7 +5,7 @@ thread that manages it until it is done**. The thread, a **steward**, acts on
 the entity as you, according to a playbook the project keeps in `.bb`, and you
 steer it only from bb.
 
-Status: built (steps 1–4 of the build order; the board is not). See
+Status: built (steps 1–4 of the build order; the board is not, but the settings page lists every steward and its status). See
 [README.md](README.md) for how it runs and where it goes beyond this design.
 
 ## Scope

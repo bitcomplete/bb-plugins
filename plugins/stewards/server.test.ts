@@ -328,3 +328,33 @@ describe("passes", () => {
     expect(check.stdout).toMatch(/ticket: linear-tickets@/u);
   });
 });
+
+describe("the settings page", () => {
+  type Overview = { paused: boolean; projects: Array<{ name: string; configured: boolean; repos: string[]; playbooks: Array<{ kind: string; version: string | null }>; problems: string[]; projectStewardThreadId: string | null; stewards: Array<{ key: string; summary: string | null; actor: string | null; escalations: Array<{ route: string; question: string }> }> }> };
+
+  it("shows each stewarded project's configuration and its open stewards with their status", async () => {
+    const t = await setup();
+    const empty = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
+    expect(empty.projects).toMatchObject([{ name: "Acme", configured: true, repos: ["acme/web"], problems: [], projectStewardThreadId: null, stewards: [] }]);
+    expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "pr", "review"]);
+
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward!);
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
+    expect(overview.paused).toBe(false);
+    expect(overview.projects[0]).toMatchObject({ projectStewardThreadId: project, stewards: [{ key: "ENG-12", summary: "Spec drafted.", actor: "other", escalations: [{ route: "project", question: "Include SSO?" }] }] });
+  });
+
+  it("reports a broken playbook as a problem and the check runs from the page", async () => {
+    const t = await setup();
+    t.files[playbookPath("github-prs")] = "broken";
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
+    expect(overview.projects[0]!.problems.join("\n")).toMatch(/github-prs\.md has no YAML front matter/u);
+    expect(overview.projects[0]!.playbooks.find((p) => p.kind === "pr")!.version).toBeNull();
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.ok).toBe(false);
+  });
+});
