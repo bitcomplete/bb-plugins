@@ -9,6 +9,7 @@ import {
 import {
   definePluginApp,
   experimental_Icon as Icon,
+  experimental_THREAD_ACTION_GROUPS,
   experimental_useSidebarThreads,
   useBbNavigate,
   useComposer,
@@ -47,6 +48,7 @@ import {
   type RingMarks,
 } from "./brief.js";
 import { Field, StageControl, StatusControl } from "./controls.js";
+import { stageAction, statusAction, type PinWrites } from "./actions.js";
 import { useNow } from "./clock.js";
 import { BoardPage, BOARD_PANEL_ID, BOARD_PATH } from "./board-page.js";
 
@@ -81,27 +83,26 @@ const STALE_TICK_MS = 60_000;
 const store = {
   decorations: new Map<string, Decoration>(),
   /**
-   * How many threads are waiting on you right now, for the board's sidebar
-   * accessory.
+   * Every stored brief's row signal by thread id, for the Stage and Status
+   * thread actions.
    *
-   * Published from here rather than fetched again because the count needs
-   * exactly what {@link BriefSync} has already assembled — the briefs off the
-   * wire and the live `working` fold — and the accessory is mounted in every
-   * sidebar, in every window. A second `listRowSignals` per window on every
-   * `briefs-changed` to draw one number would be the most expensive badge in
-   * bb. Before the first load it is null, which renders nothing; so does zero,
-   * so there is no state where the reading is wrong, only one where it is late.
+   * Published from here rather than fetched again because {@link BriefSync}
+   * already holds exactly this, kept current off `briefs-changed`; a second
+   * `listRowSignals` per window on every change, to fill a menu that is
+   * usually closed, would double the plugin's steady traffic for nothing.
+   * Replaced only when the signals are, so the minute tick that re-tests
+   * staleness does not re-evaluate every thread's menu.
    */
-  waitingOnMe: null as number | null,
+  signals: new Map<string, RowSignal>(),
   listeners: new Set<() => void>(),
 };
 
 function publish(next: {
   decorations: Map<string, Decoration>;
-  waitingOnMe: number;
+  signals: Map<string, RowSignal>;
 }) {
   store.decorations = next.decorations;
-  store.waitingOnMe = next.waitingOnMe;
+  store.signals = next.signals;
   for (const listener of store.listeners) listener();
 }
 
@@ -181,10 +182,9 @@ function BriefSync() {
     return ids;
   }, [threads]);
 
-  /** Every thread this window's sidebar is showing, by id. */
-  const sidebarIds = useMemo(
-    () => new Set(threads.map((thread) => thread.id)),
-    [threads],
+  const signalsById = useMemo(
+    () => new Map(signals.map((signal) => [signal.threadId, signal] as const)),
+    [signals],
   );
 
   /**
@@ -238,23 +238,7 @@ function BriefSync() {
 
   useEffect(() => {
     const next = new Map<string, Decoration>();
-    let waitingOnMe = 0;
     for (const signal of signals) {
-      // A brief with no row beside it belongs to a thread this window is not
-      // showing — archived, most often, since archiving keeps the brief. The
-      // board is driven by the sidebar's threads and never draws such a card,
-      // so the badge must not count it either: a "2" over a board of nothing
-      // but Done is a badge that cannot be trusted.
-      const inSidebar = sidebarIds.has(signal.threadId);
-      // The same live fold the decoration below makes, counted before it: a
-      // thread whose agent is running is `working`, and is not waiting on you.
-      if (
-        inSidebar &&
-        !workingIds.has(signal.threadId) &&
-        signal.status === "waiting-on-me"
-      ) {
-        waitingOnMe += 1;
-      }
       // A thread with no row in the sidebar has no cursor to age, so it simply
       // never greys, and has no glyph to draw either.
       const latestAttentionAt = attentionByThreadId.get(signal.threadId);
@@ -282,13 +266,13 @@ function BriefSync() {
       );
       if (decoration !== null) next.set(signal.threadId, decoration);
     }
-    publish({ decorations: next, waitingOnMe });
+    publish({ decorations: next, signals: signalsById });
   }, [
     attentionByThreadId,
     now,
     projectByThreadId,
-    sidebarIds,
     signals,
+    signalsById,
     thresholds,
     unreadIds,
     workingIds,
@@ -706,41 +690,42 @@ function BriefHeaderAction({
   );
 }
 
-// ------------------------------------------------------ the sidebar accessory
+// ------------------------------------------------------ the thread actions
+
+/** What the Stage and Status actions' `item` reads; see `actions.ts`. */
+interface PinActionData {
+  signals: Map<string, RowSignal>;
+  writes: PinWrites;
+}
 
 /**
- * How many threads are waiting on you, at the trailing edge of the board's own
- * sidebar row.
+ * The data side of the Stage and Status thread actions.
  *
- * The reason to open the board, on the thing you click to open it. It costs no
- * request: {@link BriefSync} has already folded the briefs against the live
- * thread list to draw the row glyphs, so the count is read out of the same store
- * the content script reads. `useSyncExternalStore` rather than an effect because
- * the store is written outside React and this must not lag a frame behind the
- * glyphs beside it.
- *
- * Nothing is drawn at zero. An accessory is clipped to about 4rem by 1.25rem and
- * shares the row's trailing column with the host's own options button, so the
- * only badge worth that space is one that means "there is something here".
+ * bb calls this once for the whole app, not per thread or per menu, so it reads
+ * the signals {@link BriefSync} has already published rather than loading the
+ * `threadIds` the host offers: those are a subset of a list this window already
+ * holds in full. The writes resolve without the reply — `briefs-changed` brings
+ * the new pin back through `BriefSync` to the row glyph and the menu alike.
  */
-function WaitingBadge() {
-  const waitingOnMe = useSyncExternalStore(
+function usePinActionData(): PinActionData {
+  const rpc = useRpc<typeof rpcContract>();
+  const signals = useSyncExternalStore(
     subscribe,
-    () => store.waitingOnMe,
-    () => null,
+    () => store.signals,
+    () => store.signals,
   );
-  if (waitingOnMe === null || waitingOnMe === 0) return null;
-  const label = `${waitingOnMe} thread${waitingOnMe === 1 ? "" : "s"} waiting on you`;
-  return (
-    <span
-      role="status"
-      aria-label={label}
-      title={label}
-      className="rounded-full bg-amber-500/15 px-1.5 font-mono text-[10.5px] leading-4 tabular-nums text-amber-700 dark:text-amber-300"
-    >
-      {waitingOnMe}
-    </span>
+  const writes = useMemo<PinWrites>(
+    () => ({
+      setStage: async (threadId, stage) => {
+        await rpc.call("setStageOverride", { threadId, stage });
+      },
+      setStatus: async (threadId, status) => {
+        await rpc.call("setStatusOverride", { threadId, status });
+      },
+    }),
+    [rpc],
   );
+  return useMemo(() => ({ signals, writes }), [signals, writes]);
 }
 
 // -------------------------------------------------------- the re-entry card
@@ -895,7 +880,6 @@ export default definePluginApp((app) => {
     icon: "Columns3",
     path: BOARD_PATH,
     component: BoardPage,
-    experimental_sidebarAccessory: WaitingBadge,
   });
 
   app.slots.threadPanelAction({
@@ -913,6 +897,36 @@ export default definePluginApp((app) => {
     id: "brief",
     title: "Thread brief",
     component: BriefHeaderAction,
+  });
+
+  // Stage and Status in every thread menu, beside bb's own Pin and Rename and
+  // after them, so bb's actions keep their places. Two registrations rather
+  // than one with a nested list: each is a choice list of its own, and a user
+  // can pin either one to the sidebar rows as a quick-action button.
+  app.slots.experimental_threadAction<PinActionData>({
+    id: "stage",
+    title: "Brief stage",
+    icon: "Columns3",
+    group: experimental_THREAD_ACTION_GROUPS.organize,
+    order: 70,
+    useData: usePinActionData,
+    item: ({ thread, data }) =>
+      stageAction(data.signals.get(thread.id), data.writes),
+  });
+
+  app.slots.experimental_threadAction<PinActionData>({
+    id: "status",
+    title: "Brief status",
+    icon: "CircleDot",
+    group: experimental_THREAD_ACTION_GROUPS.organize,
+    order: 71,
+    useData: usePinActionData,
+    item: ({ thread, data }) =>
+      statusAction(
+        data.signals.get(thread.id),
+        isLiveWorking(thread.status),
+        data.writes,
+      ),
   });
 
   app.composer.customize({

@@ -70,8 +70,10 @@ and without the previous brief fed back. Point `--src` at a `git worktree` of
 `main` to score the old prompt against the same set. Fixtures are real
 transcripts and bb-plugins is public, so they live outside the repository.
 
-Either can be pinned by hand in the Brief panel, anchored to the thread's
-activity cursor so the pin retires on the next real turn. The status pin is what
+Either can be pinned by hand in the Brief panel, or from **Stage** and **Status**
+in any thread actions menu — the header's, the sidebar row's and its right-click
+menu, the compact drawer — or a row's quick-action button, if you pick one. The
+pin is anchored to the thread's activity cursor, so it retires on the next real turn. The status pin is what
 closes a thread whose next step was carried out somewhere the transcript cannot
 see — a go-ahead you gave in another thread, a PR you merged on github.com —
 leaves nothing for a summary to read. A pin in force is named in the row's
@@ -432,14 +434,10 @@ the built-in sidebar does. The two are folded together by pure functions in
 `board.ts`, so which column a thread lands in and what a drop writes are tested
 without mounting anything.
 
-The **count on the sidebar row** — bb calls it a panel accessory — is threads
-waiting on you, among the threads the sidebar is showing: the badge and the
-board it opens are read off the same list, so an archived thread whose last
-brief said "waiting on you" counts on neither. It costs nothing: the overlay that draws the row glyphs has
-already folded the briefs against the live thread list, so the badge reads that
-same store rather than making a second request per window. Nothing is drawn at
-zero; the accessory shares the row's trailing column with bb's own options
-button, so the only badge worth the space is one that means "look here".
+There is no count beside **Briefs** any more. Up to bb 0.45 the board's sidebar
+row carried the number of threads waiting on you, as a panel accessory; bb 0.46
+replaced that sidebar with the navigation rail, which mounts no accessory, so
+the plugin no longer registers one.
 
 ## Auto-archiving finished threads
 
@@ -497,7 +495,8 @@ so a sweep running up to an hour late is invisible.
 | Ring artwork | `app.experimental_icons.register`, one inline SVG per stage plus the done ring, in every palette colour, plus one grey done ring — since a row status takes an icon *name* and not a component, every combination has to be registered at init, before any project is known |
 | Auto-archive | a `17 * * * *` `bb.background.schedule` over `threads.list`, `planArchives` deciding purely, `threads.archive` doing it, and `autoArchivedAt` on the brief row remembering it |
 | Brief UI | a `threadPanelAction` tab, opened by an `experimental_threadHeaderAction` button through `useBbNavigate().openThreadPanel` |
-| Board | a `navPanel` with an `experimental_sidebarAccessory`, one `listBriefCards` call joined on the client to `experimental_useSidebarThreads`, the view in component state and mirrored to local storage (*not* the panel's `subPath` — see above), and every rule — columns, order, drops, view parsing — pure in `board.ts` |
+| Stage and Status menus | two `experimental_threadAction` choice lists in bb's `organize` group, after Rename; their `useData` reads the row signals the overlay already holds, so a menu costs no request. Pure builders in `actions.ts` |
+| Board | a `navPanel`, one `listBriefCards` call joined on the client to `experimental_useSidebarThreads`, the view in component state and mirrored to local storage (*not* the panel's `subPath` — see above), and every rule — columns, order, drops, view parsing — pure in `board.ts` |
 | Re-entry refresher | an `app.composer.customize({banners})` card scoped to `thread`, `chrome: "bare"`, deciding nothing itself: one `getRefresher` call on mount, `onSubmitted` for the send that retires it |
 | Sidebar sections | `bb.sdk.threadSections` + `threads.update({sectionId})`, with `thread-list`'s own `organizationMode` / `manualSectionOrder` preferences set through `bb.sdk.plugins.callRpc` |
 | Thread titles | `threads.update({title})`, gated on `planRename` comparing the thread's title against the one this plugin last wrote |

@@ -1,6 +1,6 @@
 ---
 name: thread-briefs
-description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page and its sidebar count, the re-entry refresher above the composer, the manual stage and status overrides, and renaming threads to the brief's title.
+description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page, the re-entry refresher above the composer, the manual stage and status overrides (Brief panel and the Stage and Status thread menu entries), and renaming threads to the brief's title.
 ---
 
 # Thread briefs
@@ -160,8 +160,8 @@ offer rather than a spinner. A failed summary drops back to `absent`.
 
 `stage` is a semantic judgement from the transcript: discovery, planning,
 implementation, review. It is what the sidebar row's ring draws — see
-[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel to
-override it; the override is anchored to the thread's activity cursor and retires
+[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel, or from **Stage** in any thread
+actions menu, to override it; the override is anchored to the thread's activity cursor and retires
 itself on the next real turn. Clicking the active manual stage clears it. The
 override moves the row's ring too, immediately.
 
@@ -215,7 +215,8 @@ Done. Both are re-read from the transcript every time.
 
 ### Overriding the status by hand
 
-Pick a status in the Brief panel to pin it, exactly as with the stage: the pin
+Pick a status in the Brief panel, or from **Status** in any thread actions
+menu, to pin it, exactly as with the stage: the pin
 is anchored to the thread's activity cursor, retires on the next real turn, and
 clears if you click the one that is already pinned. It moves the sidebar
 section as well as the row, because sections are keyed on this status.
@@ -751,12 +752,11 @@ view could move back into the URL and become linkable again.
 The project chips only list projects that have a thread on the board, and appear
 only when there is more than one.
 
-### The count on the sidebar row
+### No count beside Briefs
 
-The number beside **Briefs** is threads `waiting-on-me`, with running threads
-excluded (they are `working`). It costs no request: the overlay that draws the row
-glyphs has already folded the briefs against the live thread list, and the badge
-reads that store. Nothing is drawn at zero.
+Up to bb 0.45 the board's sidebar entry showed how many threads were waiting
+on you. bb 0.46's navigation rail mounts no panel accessory, so the plugin
+dropped it; a missing number there is expected, not a fault.
 
 ### Cost
 

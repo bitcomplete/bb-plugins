@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "type": "module",
   "engines": {
-    "bb": ">=0.45",
-    "bbPluginSdk": ">=0.6.15"
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
   },
   "bb": {
     "name": "Thread briefs",
@@ -22,7 +22,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.6.15",
+    "@get-bb/plugin-sdk": "0.6.37",
     "@pierre/diffs": "^1.2.9",
     "@radix-ui/react-alert-dialog": "^1.1.19",
     "@radix-ui/react-context-menu": "^2.3.3",

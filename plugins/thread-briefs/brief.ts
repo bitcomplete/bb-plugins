@@ -279,6 +279,8 @@ export function rowSignalFor(brief: ResolvedBrief): RowSignal {
     stage: brief.stage,
     label: rowLabelFor(brief.stage, brief.status, pinned),
     pinned,
+    stageOverride: brief.stageOverride,
+    statusOverride: brief.statusOverride,
   };
 }
 

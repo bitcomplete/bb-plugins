@@ -558,6 +558,8 @@ describe("sidebar row glyphs", () => {
     stage: "review",
     label: "Review — Done",
     pinned: false,
+    stageOverride: null,
+    statusOverride: null,
     ...overrides,
   });
 
@@ -900,102 +902,115 @@ describe("sidebar row glyphs", () => {
 });
 
 /**
- * The count on the board's own sidebar row. It is the reason to open the board,
- * and it costs no request: the overlay has already folded the briefs against the
- * live thread list to draw the row glyphs, so the badge reads the same store the
- * content script does.
+ * Stage and Status in bb's thread menus. The choice semantics are pure and
+ * tested in `actions.test.ts`; here, that the registrations read the signals
+ * the overlay already published, and that a pick reaches the server.
  */
-describe("the board's sidebar badge", () => {
-  const mountBoth = async (options: {
-    signals: RowSignal[];
-    threads?: PluginSidebarThread[];
-  }) => {
+describe("the Stage and Status thread actions", () => {
+  const signal = (overrides: Partial<RowSignal> = {}): RowSignal => ({
+    threadId: "thr_1",
+    status: "waiting-on-me",
+    stage: "planning",
+    label: "Planning — Waiting on you",
+    pinned: false,
+    stageOverride: null,
+    statusOverride: null,
+    ...overrides,
+  });
+
+  const target = (status = "idle") =>
+    ({ id: "thr_1", status }) as Parameters<
+      CapturedPluginApp["threadActions"][number]["item"]
+    >[0]["thread"];
+
+  /**
+   * Mounts the overlay to publish the signals, then reads one registration's
+   * data through its own `useData`, as bb's collector would.
+   */
+  const mount = async (index: number, signals: RowSignal[]) => {
     const captured = await loadApp();
+    const registration = captured.threadActions[index]!;
     const overlay = renderSlot(
       captured.appOverlays[0]!,
       {},
       {
         rpc: {
-          listRowSignals: () => ({
-            signals: options.signals,
-            staleAfterMs: 0,
-            archiveAfterMs: 0,
-          }),
+          listRowSignals: () => ({ signals, staleAfterMs: 0, archiveAfterMs: 0 }),
         },
         sidebarThreads: {
-          threads: options.threads ?? [sidebarThread({ id: "thr_1" })],
+          threads: [sidebarThread({ id: "thr_1" })],
           projects: [{ id: "proj_alpha", name: "Alpha" }] as never,
         },
       },
     );
-    const Accessory = captured.navPanels[0]!.experimental_sidebarAccessory!;
-    const badge = renderSlot({ component: Accessory }, {});
-    return { overlay, badge };
+    let data: unknown;
+    const Probe = () => {
+      data = registration.useData?.({ threadIds: ["thr_1"] });
+      return null;
+    };
+    const probe = renderSlot(
+      { component: Probe },
+      {},
+      {
+        rpc: {
+          setStageOverride: () => READY,
+          setStatusOverride: () => READY,
+        },
+      },
+    );
+    const item = (status?: string) =>
+      registration.item({
+        thread: target(status),
+        data,
+        sdk: undefined as never,
+        navigate: undefined as never,
+      });
+    const unmount = () => {
+      probe.lifecycle.unmount();
+      overlay.lifecycle.unmount();
+    };
+    return { item, probe, unmount };
   };
 
-  const waiting = (threadId: string): RowSignal => ({
-    threadId,
-    status: "waiting-on-me",
-    stage: "planning",
-    label: "Planning — Waiting on you",
-    pinned: false,
+  it("registers Stage and Status in bb's organize group, after its own", async () => {
+    const captured = await loadApp();
+    expect(
+      captured.threadActions.map(({ id, group, order }) => ({ id, group, order })),
+    ).toEqual([
+      { id: "stage", group: "2_organize", order: 70 },
+      { id: "status", group: "2_organize", order: 71 },
+    ]);
   });
 
-  it("counts the threads waiting on you", async () => {
-    const { overlay, badge } = await mountBoth({
-      signals: [waiting("thr_1"), waiting("thr_2")],
-      threads: [
-        sidebarThread({ id: "thr_1" }),
-        sidebarThread({ id: "thr_2" }),
-      ],
+  it("shows the published stage and writes a pick", async () => {
+    const { item, probe, unmount } = await mount(0, [signal()]);
+    await waitFor(() => expect(item()?.detail).toBe("Planning"));
+
+    await item()!.run({ value: "review", requestRename: () => {} });
+    expect(probe.inspection.rpcCalls).toContainEqual({
+      method: "setStageOverride",
+      input: { threadId: "thr_1", stage: "review" },
     });
-    await waitFor(() =>
-      expect(
-        badge.getByRole("status", { name: "2 threads waiting on you" }),
-      ).toBeTruthy(),
-    );
-    badge.lifecycle.unmount();
-    overlay.lifecycle.unmount();
+    unmount();
   });
 
-  it("does not count a thread the sidebar is not showing", async () => {
-    // Archiving a thread keeps its brief, so the kv scan still returns the
-    // signal. The board draws only the sidebar's threads, and the badge on the
-    // way to it must agree with what it opens onto.
-    const { overlay, badge } = await mountBoth({
-      signals: [waiting("thr_1"), waiting("thr_archived")],
-      threads: [sidebarThread({ id: "thr_1" })],
+  it("folds a running agent into the status, as the row glyph does", async () => {
+    const { item, probe, unmount } = await mount(1, [signal()]);
+    await waitFor(() => expect(item("idle")?.detail).toBe("Waiting on you"));
+    expect(item("active")?.detail).toBe("Working");
+
+    await item()!.run({ value: "done", requestRename: () => {} });
+    expect(probe.inspection.rpcCalls).toContainEqual({
+      method: "setStatusOverride",
+      input: { threadId: "thr_1", status: "done" },
     });
-    await waitFor(() =>
-      expect(
-        badge.getByRole("status", { name: "1 thread waiting on you" }),
-      ).toBeTruthy(),
-    );
-    badge.lifecycle.unmount();
-    overlay.lifecycle.unmount();
+    unmount();
   });
 
-  it("does not count a thread whose agent is running", async () => {
-    // The same live fold the row glyph makes: the agent has it, so it is not
-    // waiting on you.
-    const { overlay, badge } = await mountBoth({
-      signals: [waiting("thr_1")],
-      threads: [sidebarThread({ id: "thr_1", status: "active" })],
-    });
-    await waitFor(() => expect(badge.queryByRole("status")).toBeNull());
-    badge.lifecycle.unmount();
-    overlay.lifecycle.unmount();
-  });
-
-  it("draws nothing when nothing is waiting", async () => {
-    // An accessory shares the row's trailing column with the host's own options
-    // button, so the only badge worth the space is one that means "look here".
-    const { overlay, badge } = await mountBoth({
-      signals: [{ ...waiting("thr_1"), status: "done" }],
-    });
-    await waitFor(() => expect(badge.queryByRole("status")).toBeNull());
-    badge.lifecycle.unmount();
-    overlay.lifecycle.unmount();
+  it("hides both on a thread with no brief", async () => {
+    const stage = await mount(0, [signal({ threadId: "thr_other" })]);
+    await waitFor(() => expect(stage.item()).toBeNull());
+    stage.unmount();
   });
 });
 
