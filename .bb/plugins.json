@@ -7,6 +7,7 @@
     { "name": "kubernetes-provider", "source": "./plugins/kubernetes-provider" },
     { "name": "devbox-provider", "source": "./plugins/devbox-provider" },
     { "name": "diff-explorer", "source": "./plugins/diff-explorer" },
+    { "name": "html-preview", "source": "./plugins/html-preview" },
     { "name": "image-copy", "source": "./plugins/image-copy" }
   ]
 }
