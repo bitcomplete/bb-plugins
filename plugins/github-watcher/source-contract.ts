@@ -1,0 +1,253 @@
+// The contract between stewards and the plugins it reads the world through
+// (linear and github-watcher). One file, copied byte for byte into each of the three
+// plugins: they are separate packages and none may import another's files.
+// stewards' contract.test.ts fails when the copies drift.
+//
+// Two directions:
+//
+// - `sourceContract` is served by a source plugin and called by stewards: a
+//   snapshot of one entity, validation of a project's configuration against
+//   the source, the entities a nightly pass may adopt, and the set of units
+//   and entities the source should lease on bb-gate-hooks and ring stewards
+//   about.
+// - `stewardsContract` is served by stewards and called by a source plugin:
+//   a ring when something stewards cares about may have changed.
+//
+// Pure: zod schemas, constants and a small helper. Nothing here talks to
+// the network or to bb beyond the `callRpc` a caller hands in.
+import { z } from "zod";
+
+export const STEWARDS_PLUGIN_ID = "stewards";
+
+export const sourceSchema = z.enum(["linear", "github"]);
+export type Source = z.infer<typeof sourceSchema>;
+
+/**
+ * The plugin that serves each source. github is served by github-watcher:
+ * bb reserves the id `github` for its bundled plugin and refuses a path
+ * install under it.
+ */
+export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher" };
+
+/** How much of a comment or description crosses the contract. */
+export const SNAPSHOT_COMMENT_CHARS = 4000;
+export const SNAPSHOT_DESCRIPTION_CHARS = 20_000;
+export const SNAPSHOT_COMMENTS_MAX = 50;
+
+/**
+ * A bb thread signs what it writes with this line (linear's tools add it,
+ * github's tools add it, and a thread using `gh` is asked to). `signedBy`
+ * below is the thread id it names.
+ */
+export const signatureLine = (threadId: string) => `_— from bb thread ${threadId}_`;
+const SIGNED = /_— from bb thread ([A-Za-z0-9_-]+)_/u;
+
+/** The thread whose signature a body carries, or null. The last one wins: a quoted signature comes first. */
+export function signedBy(body: string): string | null {
+  let found: string | null = null;
+  const all = new RegExp(SIGNED.source, "gu");
+  for (const m of body.matchAll(all)) found = m[1] ?? null;
+  return found;
+}
+
+// ---- the snapshot ------------------------------------------------------------
+
+export const snapshotCommentSchema = z.object({
+  /** Stable per comment: Linear's comment id, GitHub's node id or URL. */
+  id: z.string(),
+  author: z.string(),
+  /** What the author did: "commented", "approved", "requested changes", "reviewed", "commented on path". */
+  did: z.string(),
+  body: z.string(),
+  createdAt: z.string(),
+  url: z.string().nullable(),
+  /** The bb thread whose signature the body carries, or null. */
+  signedBy: z.string().nullable(),
+});
+export type SnapshotComment = z.infer<typeof snapshotCommentSchema>;
+
+export const snapshotChildSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  title: z.string().nullable(),
+  state: z.string().nullable(),
+  stateType: z.string().nullable(),
+  labels: z.array(z.string()),
+});
+export type SnapshotChild = z.infer<typeof snapshotChildSchema>;
+
+export const snapshotReviewSchema = z.object({
+  author: z.string(),
+  /** approved, changes requested, commented, dismissed. */
+  state: z.string(),
+  submittedAt: z.string().nullable(),
+  /** The head commit the review was given against, when known. */
+  commit: z.string().nullable(),
+});
+
+export const snapshotPullSchema = z.object({
+  draft: z.boolean(),
+  merged: z.boolean(),
+  base: z.string().nullable(),
+  head: z.string().nullable(),
+  headSha: z.string().nullable(),
+  /** Login of the head commit's author, to tell a teammate's push from the viewer's own. */
+  headAuthor: z.string().nullable(),
+  reviewDecision: z.string().nullable(),
+  requestedReviewers: z.array(z.string()),
+  /** Every submitted review, oldest first. */
+  reviews: z.array(snapshotReviewSchema),
+  /** The rollup on the head commit: success, failure, pending, error, expected. Null when there are no checks. */
+  checks: z.object({ state: z.string(), failing: z.array(z.string()) }).nullable(),
+});
+export type SnapshotPull = z.infer<typeof snapshotPullSchema>;
+
+export const entitySnapshotSchema = z.object({
+  source: sourceSchema,
+  kind: z.enum(["issue", "pull"]),
+  /** Linear: the issue's UUID. GitHub: "owner/repo#12", as doorbells name it. */
+  id: z.string(),
+  /** Linear: ENG-12. GitHub: "owner/repo#12". */
+  key: z.string(),
+  url: z.string().nullable(),
+  title: z.string().nullable(),
+  /**
+   * The name a playbook keys its phases on. Linear: the workflow state's name.
+   * GitHub: open, draft, merged or closed.
+   */
+  state: z.string(),
+  /** Linear's state type (triage, backlog, unstarted, started, completed, canceled); null on GitHub. */
+  stateType: z.string().nullable(),
+  /** Linear: the team key. GitHub: "owner/repo". What a project lists and a lease hangs off. */
+  unit: z.string(),
+  labels: z.array(z.string()),
+  author: z.string().nullable(),
+  assignees: z.array(z.string()),
+  priority: z.string().nullable(),
+  estimate: z.number().nullable(),
+  description: z.string().nullable(),
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+  /** The newest comments (and, on a pull request, reviews and review comments), oldest first. */
+  comments: z.array(snapshotCommentSchema),
+  parent: z.object({ id: z.string(), key: z.string() }).nullable(),
+  /** Sub-issues. Empty on GitHub. */
+  children: z.array(snapshotChildSchema),
+  /** Pull requests linked to a Linear issue, by URL; "owner/repo#12" when it parses. Empty on GitHub. */
+  linkedPulls: z.array(z.object({ url: z.string(), key: z.string().nullable() })),
+  pull: snapshotPullSchema.nullable(),
+  /** Who the source acts as: the connected Linear user's name, or the gh login. */
+  viewer: z.string().nullable(),
+});
+export type EntitySnapshot = z.infer<typeof entitySnapshotSchema>;
+
+export const adoptableEntitySchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  unit: z.string(),
+  kind: z.enum(["issue", "pull"]),
+  state: z.string(),
+  labels: z.array(z.string()),
+  author: z.string().nullable(),
+  draft: z.boolean(),
+  createdAt: z.string().nullable(),
+});
+export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
+
+/** Served by linear and by github; stewards is the only caller. */
+export const sourceContract = {
+  /** One entity, by Linear key or UUID, or by GitHub "owner/repo#12". Null when it does not exist or is not visible. */
+  sourceSnapshot: {
+    input: z.object({ id: z.string().min(1).max(300) }),
+    output: z.object({ snapshot: entitySnapshotSchema.nullable() }),
+  },
+  /**
+   * Whether a project's configuration makes sense to this source: each unit
+   * (team key, or owner/repo) exists and is visible, carries the label, and
+   * has every named state (Linear workflow states; ignored by GitHub).
+   */
+  sourceValidate: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      label: z.string().min(1).max(100),
+      states: z.array(z.string().min(1).max(100)).max(200),
+    }),
+    output: z.object({
+      viewer: z.string().nullable(),
+      units: z.array(
+        z.object({
+          unit: z.string(),
+          found: z.boolean(),
+          labelFound: z.boolean(),
+          missingStates: z.array(z.string()),
+        }),
+      ),
+      /** Units the viewer belongs to (Linear teams), for `bb stewards init`. Empty on GitHub. */
+      mine: z.array(z.object({ unit: z.string(), name: z.string() })),
+      /** Set when the source could not be asked at all (not connected, signed out). */
+      error: z.string().nullable(),
+    }),
+  },
+  /**
+   * What a nightly pass may adopt. Linear: open issues in these teams carrying
+   * the label. GitHub: every open pull request in these repos, oldest first;
+   * stewards decides which are labelled and which want a review.
+   */
+  sourceAdoptable: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      label: z.string().min(1).max(100),
+      limit: z.number().int().min(1).max(500),
+    }),
+    output: z.object({
+      viewer: z.string().nullable(),
+      entities: z.array(adoptableEntitySchema),
+      errors: z.array(z.string()),
+    }),
+  },
+  /**
+   * The units and entities stewards wants to hear about. Replaces the
+   * previous set. The source leases them on bb-gate-hooks and rings stewards
+   * for every doorbell that names one of the entities or falls in one of the
+   * units. Only stewards may call it.
+   */
+  sourceSetInterest: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(200),
+      entities: z.array(z.string().min(1).max(300)).max(2000),
+    }),
+    output: z.object({ ok: z.boolean() }),
+  },
+} as const;
+
+// ---- what stewards serves ---------------------------------------------------
+
+/** Served by stewards; linear and github are the callers. */
+export const stewardsContract = {
+  /** Something about this entity may have changed. Cheap: debounced, then compared with the last snapshot. */
+  stewardsRing: {
+    input: z.object({ source: sourceSchema, id: z.string().min(1).max(300) }),
+    output: z.object({ ok: z.boolean() }),
+  },
+} as const;
+
+/** Ring stewards. Never throws. */
+export async function ringStewards(
+  callRpc: (args: { pluginId: string; method: string; input: unknown; outputSchema: z.ZodType<{ ok: boolean }> }) => Promise<{ ok: boolean }>,
+  input: z.input<(typeof stewardsContract)["stewardsRing"]["input"]>,
+  warn: (message: string) => void,
+): Promise<void> {
+  try {
+    await callRpc({ pluginId: STEWARDS_PLUGIN_ID, method: "stewardsRing", input, outputSchema: stewardsContract.stewardsRing.output });
+  } catch (error) {
+    if (!isMissingPlugin(error)) warn(`could not ring stewards for ${input.source} ${input.id}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** A callRpc failure that means stewards is not installed or not loaded, as distinct from stewards failing. */
+export function isMissingPlugin(error: unknown): boolean {
+  const e = error as { code?: unknown; status?: unknown; message?: unknown };
+  if (e?.status === 404) return true;
+  if (typeof e?.code === "string" && /not[_-]?found|unknown[_-]?plugin|plugin[_-]?not[_-]?(found|loaded)|not[_-]?loaded/iu.test(e.code)) return true;
+  return typeof e?.message === "string" && /plugin .*(not found|not loaded|is not installed|is disabled)|unknown plugin/iu.test(e.message);
+}

@@ -453,6 +453,13 @@ export const rowSignalSchema = z
      * once a pin retires and the model agrees, there is nothing to mark.
      */
     pinned: z.boolean(),
+    /**
+     * The pins themselves, for the Stage and Status thread actions: picking the
+     * value already pinned clears it, as in the panel, and the menu can only
+     * know which one that is from here. `pinned` is these two, or'd.
+     */
+    stageOverride: briefStageSchema.nullable(),
+    statusOverride: storedBriefStatusSchema.nullable(),
   })
   .strict();
 export type RowSignal = z.infer<typeof rowSignalSchema>;

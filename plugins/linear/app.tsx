@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
+import { WatchesSection } from "@/components/watches-section";
+import { WATCHES_CHANGED } from "./channels";
 
 interface Status {
   connected: boolean;
@@ -109,5 +111,11 @@ export default definePluginApp((app) => {
     title: "Linear",
     description: "The Linear account this server's threads act as.",
     component: LinearSection,
+  });
+  app.slots.settingsSection({
+    id: "watches",
+    title: "Watches",
+    description: "What this server's threads are waiting on in Linear, how often each watch has fired, what stewards has leased, and the doorbell stream's state.",
+    component: () => <WatchesSection changedChannel={WATCHES_CHANGED} targetLabel="issue" />,
   });
 });

@@ -1,7 +1,9 @@
-// The checklist, on the home page until every step is done and always under
-// Settings → Plugins → Team setup. Each row reads one step's state from the
-// server and starts that step's flow; the plugins that own the steps finish
-// them.
+// The checklist and the server update notice, under Settings → Plugins →
+// Team setup. The home page carries only a line for each: a pointer to the
+// settings page while steps remain or a build is staged, and what is set up
+// once none do. Each row reads one step's state
+// from the server and starts that step's flow; the plugins that own the steps
+// finish them.
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -56,6 +58,28 @@ function StepMark({ state }: { state: StepState }) {
   const name = state === "done" ? "CircleCheck" : "Circle";
   const tone = state === "done" ? "text-success" : state === "todo" ? "text-muted-foreground" : "text-muted-foreground/60";
   return <Icon name={name} className={`mt-0.5 size-4 shrink-0 ${tone}`} aria-label={state} />;
+}
+
+const STEP_TITLES: Record<keyof Status["steps"], string> = {
+  ai: "Claude or Codex",
+  github: "GitHub",
+  devbox: "devbox",
+  linear: "Linear",
+  machine: "a machine",
+};
+
+/** The home-page line while steps remain: an icon to draw the eye, what is left, and the way to the checklist. */
+function Remaining({ steps }: { steps: Status["steps"] }) {
+  const left = (Object.keys(steps) as (keyof Status["steps"])[]).filter((k) => steps[k] === "todo").map((k) => STEP_TITLES[k]);
+  return (
+    <p className="flex items-start gap-2 text-sm">
+      <Icon name="CircleAlert" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="setup incomplete" />
+      <span>
+        {left.length === 1 ? "One step left" : `${left.length} steps left`} before agents can work here: {left.join(", ")}.{" "}
+        <SettingsLink pluginId="team-setup">Finish setup</SettingsLink>
+      </span>
+    </p>
+  );
 }
 
 function Step({
@@ -213,7 +237,9 @@ function Checklist({ compact }: { compact: boolean }) {
 
   const { ai, github, devbox, linear, machines, steps } = status;
 
-  if (compact && complete) {
+  if (compact && !complete) return <Remaining steps={steps} />;
+
+  if (compact) {
     const aiLabel = ai.accounts
       .filter((a) => a.enabled && ai.routing[a.provider])
       .map((a) => a.label)
@@ -419,7 +445,7 @@ function Checklist({ compact }: { compact: boolean }) {
 
         <Step
           state={steps.linear}
-          title="Linear"
+          title="Linear (optional)"
           action={
             linear.available && linear.configured && !linear.connected ? (
               <Button size="sm" disabled={busy !== null} onClick={() => void run("linear", async () => {
@@ -443,7 +469,10 @@ function Checklist({ compact }: { compact: boolean }) {
               Connected{linear.user !== null ? ` as ${linear.user}` : ""}{linear.organization !== null ? ` in ${linear.organization}` : ""}. Threads read and update issues as you.
             </p>
           ) : (
-            <p>Connect your Linear account so threads can read and update issues as you. You approve it on Linear, which sends you back here.</p>
+            <p>
+              Connect your Linear account so threads can read and update issues as you. You approve it on Linear, which sends you back
+              here. Skip it if you do not use Linear.
+            </p>
           )}
         </Step>
 
@@ -469,41 +498,94 @@ function Checklist({ compact }: { compact: boolean }) {
   );
 }
 
-// bb-gate stages a new build of this server rather than restarting it; the
-// banner is how the developer finds out and picks the moment. One store for
-// the page, made on first use so a bb that is not behind bb-gate never
-// polls for nothing more than once.
+// bb-gate stages a new build of this server rather than restarting it. The
+// developer finds out here, on the home page and in this plugin's settings
+// page, and picks the moment; nothing is shown in a thread, where it would
+// only be a distraction. One store for the page, made on first use so a bb
+// that is not behind bb-gate never polls for nothing more than once.
 let updateStore: UpdateStore | null = null;
 function useServerUpdate(): UpdateStore {
   if (updateStore === null) updateStore = createUpdateStore(browserDeps());
   return updateStore;
 }
 
-function ServerUpdateBanner() {
+/** The home-page line while a build is staged: one sentence and the way to the restart. */
+function ServerUpdateLine() {
   const store = useServerUpdate();
   const state = useSyncExternalStore(store.subscribe, store.getState);
   if (state.status !== "pending" && state.status !== "restarting") return null;
   const restarting = state.status === "restarting";
   return (
-    <div
-      role="status"
-      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm"
-    >
-      <div className="flex min-w-0 items-center gap-2">
-        <Icon name={restarting ? "LoaderCircle" : "CircleArrowUp"} className={`size-4 shrink-0 ${restarting ? "animate-spin" : "text-primary"}`} />
+    <p role="status" className="flex items-start gap-2 text-sm">
+      <Icon name={restarting ? "LoaderCircle" : "CircleArrowUp"} className={`mt-0.5 size-4 shrink-0 ${restarting ? "animate-spin" : "text-primary"}`} />
+      <span>
+        {restarting ? (
+          "Restarting your server. This page reloads in a moment."
+        ) : (
+          <>
+            A new build of your bb server is ready. <SettingsLink pluginId="team-setup">Restart it</SettingsLink> when no thread
+            you need is running; left alone, it restarts tonight.
+          </>
+        )}
+      </span>
+    </p>
+  );
+}
+
+/** The settings section: always present behind bb-gate, so the developer can see the server is current too. */
+function ServerUpdateSection() {
+  const store = useServerUpdate();
+  const state = useSyncExternalStore(store.subscribe, store.getState);
+  if (state.status === "unavailable") {
+    return <p className="text-sm text-muted-foreground">This server is not behind bb-gate, so it is not updated from here.</p>;
+  }
+  if (state.status === "unknown") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (state.status === "error") {
+    return (
+      <div className="flex flex-col gap-2 text-sm">
+        <p className="text-destructive">Could not ask bb-gate about updates: {state.message}</p>
+        <div>
+          <Button size="sm" variant="outline" onClick={() => void store.refresh()}>
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
+  if (state.status === "current") {
+    return (
+      <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+        <p>Your server is on the latest build. When a new one lands, it is staged here; nothing restarts until you ask, or overnight.</p>
+        <div>
+          <Button size="sm" variant="outline" onClick={() => void store.refresh()}>
+            Check now
+          </Button>
+        </div>
+      </div>
+    );
+  }
+  const restarting = state.status === "restarting";
+  return (
+    <div role="status" className="flex flex-col gap-3 text-sm">
+      <p className="flex items-start gap-2">
+        <Icon name={restarting ? "LoaderCircle" : "CircleArrowUp"} className={`mt-0.5 size-4 shrink-0 ${restarting ? "animate-spin" : "text-primary"}`} />
         {restarting ? (
           <span>Restarting your server. This page reloads in a moment and comes back when it is up.</span>
         ) : (
           <span>
             A new build of your bb server is ready. Restarting takes under a minute and interrupts any running turn; if you
-            never do, it restarts tonight.
+            never do, it restarts tonight between 03:00 and 05:00 US Eastern.
           </span>
         )}
-      </div>
+      </p>
       {restarting ? null : (
-        <Button size="sm" onClick={() => void store.apply()}>
-          Restart now
-        </Button>
+        <div>
+          <Button size="sm" onClick={() => void store.apply()}>
+            Restart now
+          </Button>
+        </div>
       )}
     </div>
   );
@@ -517,15 +599,16 @@ export default definePluginApp((app) => {
     title: "Team setup",
     component: () => (
       <div className="flex flex-col gap-3">
-        <ServerUpdateBanner />
+        <ServerUpdateLine />
         <Checklist compact />
       </div>
     ),
   });
-  // Above the composer in every thread, where a developer actually is.
-  app.composer.customize({
+  app.slots.settingsSection({
     id: "server-update",
-    banners: [{ id: "server-update", chrome: "bare", component: ServerUpdateBanner }],
+    title: "Server update",
+    description: "New builds of your bb server are staged by bb-gate; restart here when it suits you.",
+    component: ServerUpdateSection,
   });
   app.slots.settingsSection({
     id: "checklist",

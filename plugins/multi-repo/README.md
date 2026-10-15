@@ -186,6 +186,23 @@ named branch to review and merge. `workspace_publish_guidance` is the agent's
 entry point; `repos.json` edits from the tools, the CLI and the panel take the
 same host-side route, which is why they work under `accept-edits`.
 
+### Reading `.bb` from another plugin
+
+Two RPCs are a contract with other plugins, written with stewards in mind:
+`repoSet({ projectId })` returns the parsed repo set, and
+`readProjectFiles({ projectId, paths })` returns up to 50 files from the
+project's `.bb`. Both read the canonical checkout, after the same refresh
+provisioning uses — fetch, then `merge --ff-only` from the upstream, at most
+once per TTL, and left alone when it would not fast-forward.
+`readProjectFiles` reads from the committed `HEAD`, never from the working
+tree, so an edit someone has not committed in the canonical checkout is not
+served, and a playbook published from a thread takes effect when its
+`guidance-<threadId>` branch is merged. It returns the commit it read as
+`head`, `content: null` for a path that commit does not hold as a regular
+file, and refuses absolute paths and `..`. A file over 200,000 characters is
+not truncated: it comes back `null` and `error` names it. multi-repo depends
+on no other plugin.
+
 ### Diff and pull requests
 
 The root is not a git repo, so bb's native diff tab and PR state are
@@ -284,7 +301,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 167 tests, including end-to-end provisioning against real git repos
+npm test          # 173 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

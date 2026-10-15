@@ -13,7 +13,7 @@
  * guesses at one.
  */
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
-import { hostContract, hostSignals, type RepoTarget } from "./contract.js";
+import { PROJECT_FILE_MAX_CHARS, hostContract, hostSignals, type RepoTarget } from "./contract.js";
 import { cacheStatus, refreshCaches, type CacheProgress } from "./cache.js";
 import { discoverCheckouts } from "./discovery.js";
 import { filePatch, repoChanges, repoLiveStatus } from "./diff.js";
@@ -27,6 +27,7 @@ import {
   projectSourceBranch,
   projectSourceRemote,
   pushGuidance,
+  readCommittedFiles,
   readReposJson,
   refreshProjectSource,
   writeReposJson,
@@ -100,6 +101,13 @@ export function createMultiRepoHostEntry() {
           defaultBranch: await projectSourceBranch(input.path, context.signal),
           warnings: warnings.slice(0, 20),
         };
+      },
+
+      async readProjectSourceFiles(input, context) {
+        // Never bootstraps: a read must not `git init` anyone's directory.
+        const warnings = await refreshProjectSource(input.path, input.fetchTtlMs, context.signal);
+        const read = await readCommittedFiles(input.path, input.files, PROJECT_FILE_MAX_CHARS, context.signal);
+        return { ...read, warnings: warnings.slice(0, 20) };
       },
 
       async cloneProjectSource(input, context) {

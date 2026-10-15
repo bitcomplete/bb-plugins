@@ -1,6 +1,6 @@
 ---
 name: thread-briefs
-description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page and its sidebar count, the re-entry refresher above the composer, the manual stage and status overrides, and renaming threads to the brief's title.
+description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page, the re-entry refresher above the composer, the manual stage and status overrides (Brief panel and the Stage and Status thread menu entries), and renaming threads to the brief's title.
 ---
 
 # Thread briefs
@@ -160,8 +160,8 @@ offer rather than a spinner. A failed summary drops back to `absent`.
 
 `stage` is a semantic judgement from the transcript: discovery, planning,
 implementation, review. It is what the sidebar row's ring draws — see
-[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel to
-override it; the override is anchored to the thread's activity cursor and retires
+[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel, or from **Stage** in any thread
+actions menu, to override it; the override is anchored to the thread's activity cursor and retires
 itself on the next real turn. Clicking the active manual stage clears it. The
 override moves the row's ring too, immediately.
 
@@ -215,7 +215,8 @@ Done. Both are re-read from the transcript every time.
 
 ### Overriding the status by hand
 
-Pick a status in the Brief panel to pin it, exactly as with the stage: the pin
+Pick a status in the Brief panel, or from **Status** in any thread actions
+menu, to pin it, exactly as with the stage: the pin
 is anchored to the thread's activity cursor, retires on the next real turn, and
 clears if you click the one that is already pinned. It moves the sidebar
 section as well as the row, because sections are keyed on this status.
@@ -457,33 +458,39 @@ stage the thread has reached:
 | half (ends at 6) | planning |
 | three quarters (ends at 9) | implementation |
 | closed ring, hollow | review |
-| one **seamless circle**, no gaps | status `done`, any stage |
-| a **dot in the centre** | a stage or status set by hand — see [the pin dot](#the-pin-dot) |
+| closed ring, hollow | status `done`, any stage — same ring as review; the section heading and the hover label say which, and the grey a day later says it louder |
+| a **dot in the centre** | bb's `isUnread`: output you have not read — see [the unread dot](#the-unread-dot) |
+| the filled quarters **pulse** | bb's thread status is running or queued — see [`working`](#working) |
 | the ring's **colour** | which project the thread is in |
 
 Names are registered by the app through `app.experimental_icons.register` as
-`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in a
-`-pinned` variant and a `-c<n>` variant per palette slot (in that order:
-`stage-review-pinned-c3`), plus `thread-briefs/done-stale` and
-`done-stale-pinned`; a row status takes an icon *name*, not a component, so the
-artwork has to go in the registry first. They are mapped off `BRIEF_STAGES` and
+`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in
+`-unread`, `-working` and `-unread-working` variants and a `-c<n>` variant per
+palette slot (in that order: `stage-review-unread-working-c3`), plus
+`thread-briefs/done-stale` with the same three mark variants; a row status
+takes an icon *name*, not a component, so the artwork has to go in the registry
+first. They are mapped off `BRIEF_STAGES`, `RING_MARKS` and
 `PROJECT_RING_HUES`, so adding a stage or a hue adds its rings. `done-stale` has
 no `-c<n>` variants — see [Stale done threads](#stale-done-threads).
 
-### The pin dot
+### The unread dot
 
-The dot marks the one fact on the row the model did not decide: a stage or
-status pinned by hand is in force. It is drawn exactly while the pin holds and
-gone the moment the pin retires, so a dot means "a human is overriding the
-summarizer right now", never "was overridden once". The hover label says the
-same in words: `Implementation — Blocked · set by hand`.
+The dot is bb's own activity dot, drawn where bb drew it before the ring took
+the row: a filled centre means the thread has output you have not seen. The
+condition is bb's `isUnread` off `experimental_useSidebarThreads()`, so it
+clears exactly when bb's would — on opening the thread — and the label does
+not repeat it, because the dot is the whole message. It is additive: an unread
+done thread shows the full ring and the dot, in grey once cold.
 
-It is additive. A pinned done thread shows the circle *and* the dot; a cold
-pinned done thread shows both in grey. The centre is the only mark the ring has
-room for at the 12px the stage picker draws it at, which is why the pin got it
-and `done` became the seamless circle: a done thread draws no stage, so the
-quarter boundaries had nothing left to mark, and the review ring's four gaps
-are what tell the two apart.
+bb hides a plugin row status outright while its own indicator is
+`unread-error`, so a turn that ended in an error keeps bb's red dot rather than
+getting this one. Only the success case is drawn here.
+
+**The pin draws nothing on the ring.** A stage or status set by hand is named
+in the hover label (`Implementation — Blocked · set by hand`) and, on the
+board, by the card's `pinned` marker. The centre was the pin's for a while;
+it went to unread because that reading was already bb's and is worth more on
+a row at a glance.
 
 ### The project colour
 
@@ -501,8 +508,8 @@ change without any thread having changed.
 
 `done` therefore has **no green**: the success tone is gone from the row
 entirely, rather than surviving on the rows that reach the decoration without a
-project. `done` keeps the two marks that never needed the colour channel — the
-filled centre, and its section heading. A thread the host reports with no
+project. `done` keeps the mark that never needed the colour channel — its
+section heading — and the grey it turns once cold. A thread the host reports with no
 project id keeps the plain `currentColor` ring and is skipped rather than
 throwing, so one bad entry cannot cost the other rows their glyphs.
 
@@ -586,31 +593,39 @@ counting marks.
 
 **What this costs.** A `waiting-on-me` and a model-read `waiting-on-other` draw
 the **same** ring. Grouping tells them apart; with grouping off, only the hover
-label does (`Implementation — Blocked`). A thread *you* blocked is the
-exception: the pin dot marks it for as long as the pin holds — see
+label does (`Implementation — Blocked`). A thread *you* blocked is named as
+such in the label (`· set by hand`) for as long as the pin holds — see
 [Parking a thread](#parking-a-thread-the-block-reason).
 
-`working` still draws **nothing**, so the live override reads as a
-**suppression**: a running thread shows no brief glyph, and its stored ring comes
-back the moment it goes idle. Three reasons, and the first is not the plugin's
-choice:
+### `working`
+
+`working` is a **mark**, not a suppression: a running or queued thread keeps
+its stage ring and the filled quarters **pulse**, with `tone: "running"` and a
+label that reads `Working` in place of the stored status. The fill's endpoint
+does not move — a spinning ring would say "busy" and nothing else, and where
+the fill stops is the whole reading of the glyph. The pulse is SMIL inside the
+artwork, so it needs no stylesheet. A working thread is never drawn grey:
+grey means nobody came back, and a running turn is the proof they did.
+
+Three things bb does with it, and the first is not the plugin's choice:
 
 - bb hides a plugin row status outright when its own indicator is `runtime`,
-  `unread-error` or `waiting-for-input`, so a decoration on a plain running
-  thread is ignored anyway.
+  `unread-error` or `waiting-for-input`. A plain running thread's row is
+  `runtime`, so whether the pulsing ring or bb's spinner shows there is the
+  host's call; the ring is set either way, and shows wherever the host lets a
+  plugin status through on a running row.
 - It is *not* hidden for `plan-mode`, `goal`, `workflow` or `background-agent`,
-  where a ring would displace a shimmering live glyph that says something a
-  stored brief cannot.
+  where the ring displaces that live glyph.
 - bb paints the status in place of the unsent-draft pencil, so any decorated row
   loses its pencil.
 
-The live half is computed in the client from `experimental_useSidebarThreads()`,
-which is why no row needs a server round trip to stay current, and why
-`listRowSignals` does no per-thread lookups.
+The live half — running, unread — is computed in the client from
+`experimental_useSidebarThreads()`, which is why no row needs a server round
+trip to stay current, and why `listRowSignals` does no per-thread lookups.
 
 One consequence worth knowing: the Brief panel shows the **stored** status, so
 a running thread whose brief says "Waiting on you" will say that in the panel
-while its row shows no glyph. The row is live; the panel is the brief.
+while its row pulses and says Working. The row is live; the panel is the brief.
 
 The panel is also where the ring is learned — the stage control draws each option
 beside its own ring, and the status line at the top draws the ring that thread's
@@ -737,12 +752,11 @@ view could move back into the URL and become linkable again.
 The project chips only list projects that have a thread on the board, and appear
 only when there is more than one.
 
-### The count on the sidebar row
+### No count beside Briefs
 
-The number beside **Briefs** is threads `waiting-on-me`, with running threads
-excluded (they are `working`). It costs no request: the overlay that draws the row
-glyphs has already folded the briefs against the live thread list, and the badge
-reads that store. Nothing is drawn at zero.
+Up to bb 0.45 the board's sidebar entry showed how many threads were waiting
+on you. bb 0.46's navigation rail mounts no panel accessory, so the plugin
+dropped it; a missing number there is expected, not a fault.
 
 ### Cost
 

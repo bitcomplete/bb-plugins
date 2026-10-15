@@ -348,7 +348,7 @@ export async function removeWorkspace(args: {
   const present = await exists(root);
   if (present) {
     args.report?.step("Stopping processes in the workspace");
-    await killProcessesUnder({ directory: root }).catch(() => []);
+    await killProcessesUnder({ directories: [root] }).catch(() => []);
     args.report?.step("Removing the workspace");
     let entries: string[] = [];
     try {

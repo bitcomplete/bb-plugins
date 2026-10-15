@@ -1,0 +1,47 @@
+{
+  "name": "bb-plugin-stewards",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Long-lived threads that manage a labelled Linear ticket or GitHub pull request, or review a teammate's pull request, until it is done",
+  "engines": {
+    "bb": ">=0.45",
+    "bbPluginSdk": ">=0.6.15"
+  },
+  "bb": {
+    "name": "Stewards",
+    "description": "Give each labelled Linear ticket or GitHub pull request, and each teammate's pull request, a long-lived thread that manages it as you, by a playbook kept in the project's .bb.",
+    "branding": {
+      "icon": "ShieldCheck"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.15",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.10.2",
+    "hono": "^4.11.9",
+    "react": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  },
+  "license": "MIT"
+}

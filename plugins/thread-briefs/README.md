@@ -70,12 +70,14 @@ and without the previous brief fed back. Point `--src` at a `git worktree` of
 `main` to score the old prompt against the same set. Fixtures are real
 transcripts and bb-plugins is public, so they live outside the repository.
 
-Either can be pinned by hand in the Brief panel, anchored to the thread's
-activity cursor so the pin retires on the next real turn. The status pin is what
+Either can be pinned by hand in the Brief panel, or from **Stage** and **Status**
+in any thread actions menu — the header's, the sidebar row's and its right-click
+menu, the compact drawer — or a row's quick-action button, if you pick one. The
+pin is anchored to the thread's activity cursor, so it retires on the next real turn. The status pin is what
 closes a thread whose next step was carried out somewhere the transcript cannot
 see — a go-ahead you gave in another thread, a PR you merged on github.com —
-leaves nothing for a summary to read. A pin in force draws a dot in the centre
-of the row's ring.
+leaves nothing for a summary to read. A pin in force is named in the row's
+hover label (`· set by hand`); the ring itself draws nothing for it.
 
 Pinning **Blocked** is how a thread is parked, and it takes a reason. The reason
 is not written into the brief; it is placed in the conversation the summarizer
@@ -108,8 +110,11 @@ is read as unset too.
 
 **Sidebar row** — a **ring** showing the stage: one of four quarters filled per
 stage reached, so `discovery` is a quarter, `implementation` is three quarters,
-`review` closes the ring, and a `done` thread gets the closed ring with its
-centre filled in.
+`review` closes the ring, and a `done` thread draws the same full ring whatever
+stage it ended in. Two live marks sit on top of it, both bb's own facts read
+off the sidebar row: a **dot in the centre** is bb's activity dot — the thread
+has output you have not read — and a **pulse** in the filled quarters means
+the agent is running or queued.
 
 The glyph draws the stage rather than the status because status is what the
 sidebar's own [status grouping](#sidebar-sections) already puts in the section
@@ -123,12 +128,15 @@ off the ring is what holds the ring at four readable segments.
 
 Two consequences. `waiting-on-me` and `waiting-on-other` draw the **same** ring,
 told apart by the section header or the hover label (`Implementation —
-Blocked`). And a thread whose agent is running or queued keeps bb's own
-indicator: bb hides a plugin row status outright while its own is `runtime`, and
-where it does not — plan mode, a goal, a workflow — a ring would displace a live
-glyph that says more than a stored brief can. bb also paints the status in place
-of its unsent-draft pencil, so decorating a row is never free. The live status is
-folded in per row on the client, off the sidebar view it already holds, so
+Blocked`). And a thread whose agent is running or queued keeps its ring and
+**pulses** it, with the label reading `Working`: the stage is still the stage
+while the agent runs, so the fill stays put and only the filled quarters
+breathe. Where bb hides a plugin row status outright — its own indicator is
+`runtime`, `unread-error` or `waiting-for-input` — bb's glyph shows instead,
+so a failed turn and a thread asking for input still look the way they do
+everywhere else. bb also paints the status in place of its unsent-draft
+pencil, so decorating a row is never free. The live facts — running, unread —
+are folded in per row on the client, off the sidebar view it already holds, so
 `listRowSignals` needs no per-thread lookups.
 
 The same rings label the stage control in the Brief panel, which is where the
@@ -209,8 +217,8 @@ hand makes the next sync build its own alongside yours.
 
 Two things to know. There is **no section for running threads**: `working` is
 live state and never reaches a stored brief, so a thread whose agent is running
-sits in the section its last brief implies and keeps bb's own running indicator —
-the same live-vs-stored split as the panel. And a thread you filed in a section
+sits in the section its last brief implies, with its ring pulsing — the same
+live-vs-stored split as the panel. And a thread you filed in a section
 of your own is left alone until it has a brief, but once it does the grouping
 takes it over; turning grouping off deletes the three sections and restores the
 sidebar preferences it changed, but cannot put a hand-made placement back.
@@ -426,14 +434,10 @@ the built-in sidebar does. The two are folded together by pure functions in
 `board.ts`, so which column a thread lands in and what a drop writes are tested
 without mounting anything.
 
-The **count on the sidebar row** — bb calls it a panel accessory — is threads
-waiting on you, among the threads the sidebar is showing: the badge and the
-board it opens are read off the same list, so an archived thread whose last
-brief said "waiting on you" counts on neither. It costs nothing: the overlay that draws the row glyphs has
-already folded the briefs against the live thread list, so the badge reads that
-same store rather than making a second request per window. Nothing is drawn at
-zero; the accessory shares the row's trailing column with bb's own options
-button, so the only badge worth the space is one that means "look here".
+There is no count beside **Briefs** any more. Up to bb 0.45 the board's sidebar
+row carried the number of threads waiting on you, as a panel accessory; bb 0.46
+replaced that sidebar with the navigation rail, which mounts no accessory, so
+the plugin no longer registers one.
 
 ## Auto-archiving finished threads
 
@@ -491,7 +495,8 @@ so a sweep running up to an hour late is invisible.
 | Ring artwork | `app.experimental_icons.register`, one inline SVG per stage plus the done ring, in every palette colour, plus one grey done ring — since a row status takes an icon *name* and not a component, every combination has to be registered at init, before any project is known |
 | Auto-archive | a `17 * * * *` `bb.background.schedule` over `threads.list`, `planArchives` deciding purely, `threads.archive` doing it, and `autoArchivedAt` on the brief row remembering it |
 | Brief UI | a `threadPanelAction` tab, opened by an `experimental_threadHeaderAction` button through `useBbNavigate().openThreadPanel` |
-| Board | a `navPanel` with an `experimental_sidebarAccessory`, one `listBriefCards` call joined on the client to `experimental_useSidebarThreads`, the view in component state and mirrored to local storage (*not* the panel's `subPath` — see above), and every rule — columns, order, drops, view parsing — pure in `board.ts` |
+| Stage and Status menus | two `experimental_threadAction` choice lists in bb's `organize` group, after Rename; their `useData` reads the row signals the overlay already holds, so a menu costs no request. Pure builders in `actions.ts` |
+| Board | a `navPanel`, one `listBriefCards` call joined on the client to `experimental_useSidebarThreads`, the view in component state and mirrored to local storage (*not* the panel's `subPath` — see above), and every rule — columns, order, drops, view parsing — pure in `board.ts` |
 | Re-entry refresher | an `app.composer.customize({banners})` card scoped to `thread`, `chrome: "bare"`, deciding nothing itself: one `getRefresher` call on mount, `onSubmitted` for the send that retires it |
 | Sidebar sections | `bb.sdk.threadSections` + `threads.update({sectionId})`, with `thread-list`'s own `organizationMode` / `manualSectionOrder` preferences set through `bb.sdk.plugins.callRpc` |
 | Thread titles | `threads.update({title})`, gated on `planRename` comparing the thread's title against the one this plugin last wrote |

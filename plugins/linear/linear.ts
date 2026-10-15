@@ -3,6 +3,14 @@
 // talks to the network takes its fetch as an argument, and no token appears
 // in anything this module returns or throws.
 import { z } from "zod";
+import {
+  SNAPSHOT_COMMENT_CHARS,
+  SNAPSHOT_COMMENTS_MAX,
+  SNAPSHOT_DESCRIPTION_CHARS,
+  signedBy,
+  type AdoptableEntity,
+  type EntitySnapshot,
+} from "./source-contract.js";
 
 export const GRAPHQL_PATH = "/graphql";
 
@@ -357,6 +365,206 @@ export function issueFilter(input: SearchInput): Record<string, unknown> | undef
 export function searchLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) return SEARCH_LIMIT_DEFAULT;
   return Math.max(1, Math.min(SEARCH_LIMIT_MAX, Math.floor(limit)));
+}
+
+// ---- what stewards reads (source-contract.ts) ------------------------------
+//
+// The snapshot is its own document rather than ISSUE_QUERY grown larger: it
+// wants ids the tools never show (comment ids, child ids, the team UUID a
+// doorbell names) and the attachments that link pull requests, and the
+// tools' output should not change because stewards needs more.
+
+const SNAPSHOT_FIELDS =
+  "id identifier title description url priority priorityLabel estimate createdAt updatedAt " +
+  "state { name type } team { id key } assignee { name displayName email } creator { name displayName email } " +
+  "labels { nodes { name } } parent { id identifier } " +
+  "children { nodes { id identifier title state { name type } labels { nodes { name } } } } " +
+  `comments(last: ${SNAPSHOT_COMMENTS_MAX}) { nodes { id body createdAt url user { name displayName email } } } ` +
+  "attachments { nodes { url sourceType } }";
+
+export const SNAPSHOT_QUERY = `query($id: String!) { issue(id: $id) { ${SNAPSHOT_FIELDS} } }`;
+/** An issue's UUID from its key; stewards may name an entity either way. */
+export const ISSUE_ID_QUERY = "query($id: String!) { issue(id: $id) { id identifier } }";
+/** Many issues' keys by UUID at once, for naming what stewards leased. */
+export const ISSUE_KEYS_QUERY = "query($ids: [ID!]!) { issues(filter: { id: { in: $ids } }, first: 250) { nodes { id identifier } } }";
+/** Every team the connected user can see, for resolving the keys a project lists to the UUIDs leases and doorbells use. */
+export const TEAMS_QUERY = "query { teams(first: 250) { nodes { id key name } } }";
+/** The teams the connected user belongs to, which `bb stewards init` offers. */
+export const MY_TEAMS_QUERY = "query MyTeams { viewer { teams(first: 250) { nodes { id key name } } } }";
+/** Labelled open issues in one team, a page at a time. */
+export const ADOPTABLE_QUERY =
+  "query($filter: IssueFilter, $first: Int!, $after: String) { issues(filter: $filter, first: $first, after: $after) { " +
+  "nodes { id identifier createdAt state { name type } team { key } creator { name displayName email } labels { nodes { name } } } " +
+  "pageInfo { hasNextPage endCursor } } }";
+
+const snapshotIssueSchema = z.object({
+  id: z.string(),
+  identifier: z.string(),
+  title: z.string().nullish(),
+  description: z.string().nullish(),
+  url: z.string().nullish(),
+  priority: z.number().nullish(),
+  priorityLabel: z.string().nullish(),
+  estimate: z.number().nullish(),
+  createdAt: z.string().nullish(),
+  updatedAt: z.string().nullish(),
+  state: z.object({ name: z.string(), type: z.string().nullish() }).nullish(),
+  team: z.object({ id: z.string(), key: z.string() }),
+  assignee: person,
+  creator: person,
+  labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+  parent: z.object({ id: z.string(), identifier: z.string() }).nullish(),
+  children: z
+    .object({
+      nodes: z.array(
+        z.object({
+          id: z.string(),
+          identifier: z.string(),
+          title: z.string().nullish(),
+          state: z.object({ name: z.string(), type: z.string().nullish() }).nullish(),
+          labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+        }),
+      ),
+    })
+    .nullish(),
+  comments: z.object({ nodes: z.array(commentSchema.extend({ id: z.string() })) }).nullish(),
+  attachments: z.object({ nodes: z.array(z.object({ url: z.string().nullish(), sourceType: z.string().nullish() })) }).nullish(),
+});
+export type SnapshotIssue = z.infer<typeof snapshotIssueSchema>;
+
+export function parseSnapshotIssue(payload: unknown): SnapshotIssue | null {
+  const data = dataOf(payload);
+  if (data.issue === null || data.issue === undefined) return null;
+  return snapshotIssueSchema.parse(data.issue);
+}
+
+const PULL_URL = /^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:[/?#]|$)/u;
+
+/** "owner/repo#12" for a GitHub pull request URL, or null for anything else. Casing is the URL's; stewards compares. */
+export function pullKey(url: string): string | null {
+  const m = PULL_URL.exec(url.trim());
+  return m === null ? null : `${m[1]}/${m[2]}#${m[3]}`;
+}
+
+/**
+ * The issue as stewards sees it. Comments are the newest fifty, oldest
+ * first; each body is clipped after its signature is read, so a long
+ * comment still says which thread wrote it. Only attachments that are
+ * GitHub pull requests count as linked pulls, once each.
+ */
+export function snapshotOfIssue(issue: SnapshotIssue, viewer: string | null): EntitySnapshot {
+  const comments = [...(issue.comments?.nodes ?? [])].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? "")).slice(-SNAPSHOT_COMMENTS_MAX);
+  const pulls = new Map<string, string>();
+  for (const a of issue.attachments?.nodes ?? []) {
+    const key = a.url === null || a.url === undefined ? null : pullKey(a.url);
+    if (key !== null && !pulls.has(a.url!)) pulls.set(a.url!, key);
+  }
+  const assignee = personName(issue.assignee);
+  return {
+    source: "linear",
+    kind: "issue",
+    id: issue.id,
+    key: issue.identifier,
+    url: issue.url ?? null,
+    title: issue.title ?? null,
+    state: issue.state?.name ?? "",
+    stateType: issue.state?.type ?? null,
+    unit: issue.team.key,
+    labels: (issue.labels?.nodes ?? []).map((l) => l.name),
+    author: personName(issue.creator),
+    assignees: assignee === null ? [] : [assignee],
+    priority: issue.priorityLabel ?? null,
+    estimate: issue.estimate ?? null,
+    description: issue.description === null || issue.description === undefined ? null : clip(issue.description, SNAPSHOT_DESCRIPTION_CHARS),
+    createdAt: issue.createdAt ?? null,
+    updatedAt: issue.updatedAt ?? null,
+    comments: comments.map((c) => ({
+      id: c.id,
+      author: personName(c.user) ?? "someone",
+      did: "commented",
+      body: clip(c.body ?? "", SNAPSHOT_COMMENT_CHARS),
+      createdAt: c.createdAt ?? "",
+      url: c.url ?? null,
+      signedBy: signedBy(c.body ?? ""),
+    })),
+    parent: issue.parent ? { id: issue.parent.id, key: issue.parent.identifier } : null,
+    children: (issue.children?.nodes ?? []).map((c) => ({
+      id: c.id,
+      key: c.identifier,
+      title: c.title ?? null,
+      state: c.state?.name ?? null,
+      stateType: c.state?.type ?? null,
+      labels: (c.labels?.nodes ?? []).map((l) => l.name),
+    })),
+    linkedPulls: [...pulls].map(([url, key]) => ({ url, key })),
+    pull: null,
+    viewer,
+  };
+}
+
+export function parseIssueId(payload: unknown): { id: string; identifier: string } | null {
+  const data = dataOf(payload);
+  if (data.issue === null || data.issue === undefined) return null;
+  return z.object({ id: z.string(), identifier: z.string() }).parse(data.issue);
+}
+
+/** The issues of ISSUE_KEYS_QUERY, as UUID and key. */
+export function parseIssueKeys(payload: unknown): Array<{ id: string; identifier: string }> {
+  return z.object({ nodes: z.array(z.object({ id: z.string(), identifier: z.string() })) }).parse(dataOf(payload).issues).nodes;
+}
+
+export type TeamSummary = { id: string; key: string; name: string };
+
+const teamNodes = z.object({ nodes: z.array(z.object({ id: z.string(), key: z.string(), name: z.string().nullish() })) });
+
+/** The teams of TEAMS_QUERY or MY_TEAMS_QUERY. */
+export function parseTeams(payload: unknown): TeamSummary[] {
+  const data = dataOf(payload);
+  const nodes = data.teams !== undefined ? teamNodes.parse(data.teams) : z.object({ teams: teamNodes }).parse(data.viewer).teams;
+  return nodes.nodes.map((t) => ({ id: t.id, key: t.key, name: t.name ?? t.key }));
+}
+
+/** Open issues in one team carrying the label (ignoring case). */
+export function adoptableFilter(teamKey: string, label: string): Record<string, unknown> {
+  return {
+    team: { key: { eq: teamKey } },
+    labels: { some: { name: { eqIgnoreCase: label } } },
+    state: { type: { nin: ["completed", "canceled"] } },
+  };
+}
+
+export function parseAdoptablePage(payload: unknown): { entities: AdoptableEntity[]; next: string | null } {
+  const data = dataOf(payload);
+  const parsed = z
+    .object({
+      nodes: z.array(
+        z.object({
+          id: z.string(),
+          identifier: z.string(),
+          createdAt: z.string().nullish(),
+          state: z.object({ name: z.string() }).nullish(),
+          team: z.object({ key: z.string() }),
+          creator: person,
+          labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+        }),
+      ),
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }).nullish(),
+    })
+    .parse(data.issues);
+  return {
+    entities: parsed.nodes.map((i) => ({
+      id: i.id,
+      key: i.identifier,
+      unit: i.team.key,
+      kind: "issue",
+      state: i.state?.name ?? "",
+      labels: (i.labels?.nodes ?? []).map((l) => l.name),
+      author: personName(i.creator),
+      draft: false,
+      createdAt: i.createdAt ?? null,
+    })),
+    next: parsed.pageInfo?.hasNextPage === true ? (parsed.pageInfo.endCursor ?? null) : null,
+  };
 }
 
 // ---- the read-only escape hatch --------------------------------------------

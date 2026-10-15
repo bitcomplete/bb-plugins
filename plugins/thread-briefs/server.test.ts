@@ -718,6 +718,8 @@ describe("summarizing", () => {
         stage: "review",
         label: "Review — Waiting on you",
         pinned: false,
+        stageOverride: null,
+        statusOverride: null,
       },
     ]);
   });
