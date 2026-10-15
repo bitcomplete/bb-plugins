@@ -1,5 +1,5 @@
 ---
-name: github
+name: github-watcher
 description: Wait for a GitHub pull request or issue to change (a review, checks, a merge, a comment) from a bb thread with github_watch instead of polling with gh, and sign comments so the watch can tell your own apart.
 ---
 
@@ -7,7 +7,7 @@ description: Wait for a GitHub pull request or issue to change (a review, checks
 
 This bb server is signed in to GitHub as the user, and `gh` on the
 machine carries the same login. Read, comment, review, request review,
-open and merge with `gh` as usual. The `github` plugin adds one thing
+open and merge with `gh` as usual. The `github-watcher` plugin adds one thing
 `gh` cannot do: wake this thread when a pull request or issue changes.
 
 ## Waiting on a pull request or issue

@@ -1,4 +1,4 @@
-# GitHub
+# GitHub watcher
 
 Let a thread watch a pull request or issue and be woken when it changes,
 as the developer.
@@ -11,6 +11,9 @@ GitHub it already does with `gh` on its machine: reading a PR, commenting,
 reviewing, requesting review, merging. What `gh` cannot do is wake a thread
 later. That is the heart of this plugin; it also serves the
 [stewards](../stewards/DESIGN.md) plugin's view of GitHub (below).
+
+It is not called `github` because bb reserves that id for its own bundled
+GitHub plugin and refuses a path install under it.
 
 ## Tool
 
@@ -99,7 +102,7 @@ from the Watches settings section.
 
 ### Seeing what is watched
 
-Settings → Plugins → GitHub → Watches lists every watch on this server, and
+Settings → Plugins → GitHub watcher → Watches lists every watch on this server, and
 `bb github watches [--json]` prints the same view. It is a debugging view,
 made to answer "why did my thread never wake" and "what is re-reading
 GitHub every ten minutes" at a glance:

@@ -116,7 +116,7 @@ async function setup(
 ) {
   const send = vi.fn((options.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
   const callRpc = vi.fn((options.callRpc ?? (async () => ({ ok: true }))) as (args: unknown) => Promise<unknown>);
-  const { bb, harness } = createFakePluginHost({ pluginId: "github", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) }, plugins: { callRpc } } });
+  const { bb, harness } = createFakePluginHost({ pluginId: "github-watcher", sdk: { threads: { send, ...(options.get === undefined ? {} : { get: options.get }) }, plugins: { callRpc } } });
   for (const [key, value] of Object.entries(options.kv ?? {})) await bb.storage.kv.set(key, value);
   const github = fakeGitHub();
   const hooks = fakeHooks();
@@ -359,7 +359,7 @@ describe("the service", () => {
     // A thread bb cannot read shows its id; an issue links to /issues. The CLI prints the same view.
     w.github.state.node = issueNode();
     await w.tool({ ref: "Acme/Widgets#7" }, { threadId: "thr-gone", projectId: "prj-1" });
-    expect(w.harness.registrations.cli?.name).toBe("github");
+    expect(w.harness.registrations.cli?.name).toBe("github-watcher");
     const cli = await w.harness.runCli(["watches"]);
     expect(cli.exitCode).toBe(0);
     expect(cli.stdout).toContain("Doorbells: connected and leased");

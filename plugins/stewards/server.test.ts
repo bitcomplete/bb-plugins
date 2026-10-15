@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { createStewardsPlugin, testHooks } from "./server.js";
-import type { EntitySnapshot } from "./source-contract.js";
+import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -36,9 +36,9 @@ function world() {
     else if (args.method === "sourceAdoptable") {
       const units = input.units as string[];
       out = {
-        viewer: args.pluginId === "github" ? "jane" : "Jane",
+        viewer: args.pluginId === SOURCE_PLUGIN_IDS.github ? "jane" : "Jane",
         entities: [...entities.values()]
-          .filter((e) => e.source === args.pluginId && units.some((u) => u.toLowerCase() === e.unit.toLowerCase()))
+          .filter((e) => SOURCE_PLUGIN_IDS[e.source] === args.pluginId && units.some((u) => u.toLowerCase() === e.unit.toLowerCase()))
           .map((e) => ({ id: e.id, key: e.key, unit: e.unit, kind: e.kind, state: e.state, labels: e.labels, author: e.author, draft: e.pull?.draft ?? false, createdAt: e.createdAt })),
         errors: [],
       };
@@ -100,7 +100,7 @@ async function setup() {
     }
   };
   const ring = async (source: "linear" | "github", id: string) => {
-    await harness.callRpc("stewardsRing", { source, id }, { experimental_caller: { kind: "plugin", pluginId: source } });
+    await harness.callRpc("stewardsRing", { source, id }, { experimental_caller: { kind: "plugin", pluginId: SOURCE_PLUGIN_IDS[source] } });
     await flush();
   };
   const tool = async (name: string, args: Record<string, unknown>, threadId: string) => {
@@ -144,7 +144,7 @@ describe("a Linear ticket steward", () => {
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
     expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"] });
-    expect(interest.find((c) => c.pluginId === "github")?.input).toEqual({ units: ["acme/web"], entities: [] });
+    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [] });
   });
 
   it("ignores unlabelled tickets, other teams, and rings from anyone but a source plugin", async () => {
@@ -154,7 +154,8 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "u1");
     await t.ring("linear", "u2");
     expect(t.spawns).toEqual([]);
-    await expect(t.harness.callRpc("stewardsRing", { source: "linear", id: "u1" })).rejects.toThrow(/only the linear and github plugins/u);
+    await expect(t.harness.callRpc("stewardsRing", { source: "linear", id: "u1" })).rejects.toThrow(/only the linear and github-watcher plugins/u);
+    await expect(t.harness.callRpc("stewardsRing", { source: "linear", id: "u1" }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } })).rejects.toThrow(/each for its own source/u);
   });
 
   it("wakes only for actionable changes, and gives two tools to stewards only", async () => {

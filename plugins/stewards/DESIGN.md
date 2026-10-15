@@ -101,7 +101,7 @@ These were settled while designing; each changes what gets built.
   big decision reaches you, through the project steward.
 - **Few tools.** Stewards get two: `steward_report` and `steward_update`.
   Everything else uses what every thread has: the `linear_*` tools, `gh`,
-  and `bb thread` for workers. The github plugin adds no write tools.
+  and `bb thread` for workers. The github-watcher plugin adds no write tools.
 - **Thread lifetime and the sidebar belong to thread-briefs and the user.**
   Stewards archive nothing, pin nothing and create no sidebar sections. A
   finished steward says so in its last turn and thread-briefs archives it; a

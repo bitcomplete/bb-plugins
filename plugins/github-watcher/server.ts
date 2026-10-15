@@ -460,18 +460,18 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       },
     });
 
-    // `bb github watches` is the same view for a shell: a colleague's server,
+    // `bb github-watcher watches` is the same view for a shell: a colleague's server,
     // or a script that wants to know what is being waited on.
     bb.cli.register(
       defineCli({
-        name: "github",
+        name: "github-watcher",
         summary: "What this server's threads are watching on GitHub",
         description: "Runs on the bb server. Reads the plugin's own watch list; GitHub itself is read with gh.",
         commands: {
           watches: cliCommand({
             summary: "Every watch on this server, how busy each has been, and the doorbell stream's state",
             description:
-              "The same view as Settings → Plugins → GitHub → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
+              "The same view as Settings → Plugins → GitHub watcher → Watches. Flags: idle (old and not woken in days), noisy (woken often in the last hour), expiring (forgotten within a day unless something happens). With --json the output is the full view object.",
             options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
             async run(input) {
               const view = await usage();

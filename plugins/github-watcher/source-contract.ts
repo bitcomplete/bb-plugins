@@ -1,5 +1,5 @@
 // The contract between stewards and the plugins it reads the world through
-// (linear and github). One file, copied byte for byte into each of the three
+// (linear and github-watcher). One file, copied byte for byte into each of the three
 // plugins: they are separate packages and none may import another's files.
 // stewards' contract.test.ts fails when the copies drift.
 //
@@ -21,6 +21,13 @@ export const STEWARDS_PLUGIN_ID = "stewards";
 
 export const sourceSchema = z.enum(["linear", "github"]);
 export type Source = z.infer<typeof sourceSchema>;
+
+/**
+ * The plugin that serves each source. github is served by github-watcher:
+ * bb reserves the id `github` for its bundled plugin and refuses a path
+ * install under it.
+ */
+export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher" };
 
 /** How much of a comment or description crosses the contract. */
 export const SNAPSHOT_COMMENT_CHARS = 4000;

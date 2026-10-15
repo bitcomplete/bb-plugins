@@ -1,5 +1,5 @@
 {
-  "name": "bb-plugin-github",
+  "name": "bb-plugin-github-watcher",
   "version": "0.1.0",
   "type": "module",
   "description": "Let a thread watch a GitHub pull request or issue and be woken when it changes",
@@ -8,7 +8,7 @@
     "bbPluginSdk": ">=0.6.15"
   },
   "bb": {
-    "name": "GitHub",
+    "name": "GitHub watcher",
     "description": "Threads watch a pull request or issue with the gh login on this server and are messaged when reviews, comments, checks or state change.",
     "branding": {
       "icon": "GitPullRequest"

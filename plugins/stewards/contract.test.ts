@@ -1,4 +1,4 @@
-// The contract is copied into linear and github; the copies must not drift.
+// The contract is copied into linear and github-watcher; the copies must not drift.
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -7,7 +7,7 @@ import { isMissingPlugin, signatureLine, signedBy } from "./source-contract.js";
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 describe("source-contract.ts", () => {
-  for (const sibling of ["linear", "github"]) {
+  for (const sibling of ["linear", "github-watcher"]) {
     const path = here(`../${sibling}/source-contract.ts`);
     it.skipIf(!existsSync(path))(`is byte-identical in ${sibling}`, () => {
       expect(readFileSync(path, "utf8")).toBe(readFileSync(here("./source-contract.ts"), "utf8"));

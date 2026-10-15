@@ -1,7 +1,7 @@
 // The Watches settings section: every watch on this server, the busiest and
 // the ones that stand out first, and what the doorbell stream is doing. A
 // debugging view: it answers "why did my thread never wake" and "what is
-// re-reading Linear every ten minutes" at a glance. The github plugin has
+// re-reading Linear every ten minutes" at a glance. The github-watcher plugin has
 // the same component over the same view shape; a change here belongs there.
 import { useCallback, useEffect, useState } from "react";
 import { useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";

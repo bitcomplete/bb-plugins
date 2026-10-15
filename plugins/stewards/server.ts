@@ -4,7 +4,7 @@
 //
 // The model is a controller. The spec (the playbook, the entity's own
 // description and spec comments, standing guidance) is the desired state; a
-// snapshot read through the linear and github plugins is the observed state;
+// snapshot read through the linear and github-watcher plugins is the observed state;
 // a steward's turn is one reconcile. Rings from those plugins (bb-gate-hooks
 // doorbells, forwarded) and timers only say "look again". The mechanical tier
 // below looks, compares with the last observation, and wakes the steward only
@@ -37,6 +37,7 @@ import {
 import { nightlyDue, stillNight } from "./nightly.js";
 import { advanced, diffObserved, gateState, hasLabel, lifecycle, newestCommentAt, phaseAndStage, specHash, stuckDue } from "./reconcile.js";
 import {
+  SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
   entitySnapshotSchema,
   signatureLine,
@@ -166,6 +167,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
+    const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
+      rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
 
     // ---- serial work and debounce ----------------------------------------------------
     //
@@ -308,7 +311,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- the sources ---------------------------------------------------------------------
 
     async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
-      const out = await rpc(source, "sourceSnapshot", { id }, sourceContract.sourceSnapshot.output);
+      const out = await sourceRpc(source, "sourceSnapshot", { id }, sourceContract.sourceSnapshot.output);
       return out.snapshot === null ? null : entitySnapshotSchema.parse(out.snapshot);
     }
 
@@ -355,7 +358,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const body = JSON.stringify(sets[source]);
         if (lastInterest.get(source) === body) continue;
         try {
-          await rpc(source, "sourceSetInterest", sets[source], sourceContract.sourceSetInterest.output);
+          await sourceRpc(source, "sourceSetInterest", sets[source], sourceContract.sourceSetInterest.output);
           lastInterest.set(source, body);
         } catch (error) {
           bb.log.warn(`stewards: could not tell ${source} what to watch: ${errorMessage(error)}`);
@@ -784,7 +787,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ask = async (source: Source, units: string[]) => {
         if (units.length === 0) return;
         try {
-          const out = await rpc(source, "sourceAdoptable", { units, label: config.file.label, limit: 300 }, sourceContract.sourceAdoptable.output);
+          const out = await sourceRpc(source, "sourceAdoptable", { units, label: config.file.label, limit: 300 }, sourceContract.sourceAdoptable.output);
           for (const e of out.errors) bb.log.warn(`stewards: ${source} adoption list: ${e}`);
           for (const e of out.entities) {
             if (store.byEntity(source, e.id) !== null) continue;
@@ -943,7 +946,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     bb.rpc.register(rpcContract, {
       async stewardsRing({ source, id }, { experimental_caller: caller }) {
-        if (caller.kind !== "plugin" || (caller.pluginId !== "linear" && caller.pluginId !== "github")) throw new Error("only the linear and github plugins ring stewards");
+        if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
         return { ok: true };
       },
@@ -1372,7 +1375,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
-          const out = await rpc(source, "sourceValidate", { units, label: config.file.label, states }, sourceContract.sourceValidate.output);
+          const out = await sourceRpc(source, "sourceValidate", { units, label: config.file.label, states }, sourceContract.sourceValidate.output);
           if (out.error !== null) lines.push(`problem: ${source}: ${out.error}`);
           for (const u of out.units) {
             if (!u.found) lines.push(`problem: ${source}: ${u.unit} is not visible`);

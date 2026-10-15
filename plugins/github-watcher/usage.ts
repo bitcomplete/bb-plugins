@@ -1,7 +1,7 @@
 // The usage view: every watch on this server with how busy it has been,
 // what stands out about it, and what the doorbell stream is doing. Pure:
 // the server hands it rows, the hooks status and thread titles; the
-// settings section and `bb github watches` render the result. The linear
+// settings section and `bb github-watcher watches` render the result. The linear
 // plugin carries the same module; a change here belongs there too.
 import { z } from "zod";
 import { ago, until } from "./format-time.js";

@@ -14,7 +14,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   steward is a child thread of its nearest managed ancestor, or of the
   project's **project steward**. Stewards make no sidebar sections and pin
   nothing; the sidebar stays the user's.
-- **The reconcile loop.** linear and github hold bb-gate-hooks leases for the
+- **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
   the last observation, and the steward is woken only for an actionable
@@ -87,10 +87,10 @@ everything it writes is signed with its thread, so what it did is visible
 afterwards. The runaway guard is the one hard stop. GitHub writes go through
 `gh`; there are no write tools to check.
 
-## The contract with linear and github
+## The contract with linear and github-watcher
 
 [source-contract.ts](source-contract.ts) is copied byte for byte into
-`plugins/linear` and `plugins/github`; `contract.test.ts` fails when the
+`plugins/linear` and `plugins/github-watcher`; `contract.test.ts` fails when the
 copies drift. Sources serve `sourceSnapshot`, `sourceValidate`,
 `sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`.
 
@@ -105,5 +105,5 @@ bb plugin build
 
 Deployment needs this directory added to bb-gate's
 `docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
-`BB_PLUGIN_DIRS`), and multi-repo, linear and github at versions that serve
+`BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve
 the contract.
