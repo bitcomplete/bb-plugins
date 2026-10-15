@@ -21,8 +21,8 @@ async function repo() {
   await git("config", "user.name", "Test");
   await git("config", "user.email", "test@example.invalid");
   await git("config", "commit.gpgsign", "false");
-  for (const name of ["a.txt", "b.txt", "deleted.txt"]) await writeFile(path.join(root, name), "base\n");
-  await git("add", "--", "a.txt", "b.txt", "deleted.txt");
+  for (const name of ["a.txt", "b.txt", "deleted.txt", " leading.txt"]) await writeFile(path.join(root, name), "base\n");
+  await git("add", "--", "a.txt", "b.txt", "deleted.txt", " leading.txt");
   await git("commit", "-m", "Initial fixture");
   const message = path.join(root, "message.txt");
   await writeFile(message, MESSAGE);
@@ -37,8 +37,9 @@ test("review leaves staging untouched; finish commits literal paths, renames, de
     await r.git("add", "--", "b.txt");
     await writeFile(path.join(r.root, "b.txt"), "unstaged unrelated\n");
     await r.git("mv", "deleted.txt", "renamed.txt");
+    await rm(path.join(r.root, " leading.txt"));
     await writeFile(path.join(r.root, "literal[1].txt"), "new\n");
-    const paths = ["a.txt", "deleted.txt", "renamed.txt", "literal[1].txt"];
+    const paths = ["a.txt", "deleted.txt", "renamed.txt", "literal[1].txt", " leading.txt"];
     const staged = await r.git("diff", "--cached", "--binary");
     const beforeHead = await r.git("rev-parse", "HEAD");
     const reviewed = await reviewCommit(r.root, paths);
@@ -108,6 +109,60 @@ test("repository hooks run, and failed hooks or hook edits stop before committin
       assert.equal(await r.git("diff", "--cached", "--binary"), staged);
     } finally { await r.close(); }
   }
+});
+
+test("repository hooks retain Git glob and exclusion pathspecs", async () => {
+  const r = await repo();
+  try {
+    await writeFile(path.join(r.root, "a.txt"), "reviewed\n");
+    await writeFile(path.join(r.root, ".git/hooks/pre-commit"), `#!/bin/sh
+set -eu
+test -z "$(git diff --cached --name-only -- . ':(exclude)a.txt')"
+test "$(git diff --cached --name-only -- '*.txt')" = a.txt
+`, { mode: 0o700 });
+    const { snapshot } = await reviewCommit(r.root, ["a.txt"]);
+    const result = await finishCommit(r.root, ["a.txt"], snapshot, r.message, false);
+    assert.equal(result.error, null, result.error ?? undefined);
+    assert.ok(result.commit);
+  } finally { await r.close(); }
+});
+
+test("finish ignores a staged addition removed from disk when another selected file changed", async () => {
+  const r = await repo();
+  try {
+    await writeFile(path.join(r.root, "gone.txt"), "temporary\n");
+    await r.git("add", "--", "gone.txt");
+    await rm(path.join(r.root, "gone.txt"));
+    await writeFile(path.join(r.root, "a.txt"), "reviewed\n");
+    const paths = ["a.txt", "gone.txt"];
+    const { snapshot } = await reviewCommit(r.root, paths);
+    const result = await finishCommit(r.root, paths, snapshot, r.message, false);
+    assert.equal(result.error, null, result.error ?? undefined);
+    assert.equal(await r.git("show", "HEAD:a.txt"), "reviewed\n");
+    assert.equal(await r.git("ls-files", "--", "gone.txt"), "");
+    assert.equal(await r.git("diff", "--cached"), "");
+  } finally { await r.close(); }
+});
+
+test("a failed post-commit hook reports the local commit and prevents pushing", async () => {
+  const remote = await mkdtemp(path.join(os.tmpdir(), "bb-commit-remote-"));
+  const r = await repo();
+  try {
+    await run("git", ["init", "--bare", remote]);
+    await r.git("remote", "add", "origin", remote);
+    await r.git("push", "origin", "HEAD:refs/heads/feature");
+    const before = await r.git("rev-parse", "HEAD");
+    await writeFile(path.join(r.root, "a.txt"), "reviewed\n");
+    await writeFile(path.join(r.root, ".git/hooks/post-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    const { snapshot } = await reviewCommit(r.root, ["a.txt"]);
+    const result = await finishCommit(r.root, ["a.txt"], snapshot, r.message, true);
+    assert.match(result.error!, /post-commit.*failed/);
+    assert.ok(result.commit);
+    assert.equal(result.pushed, false);
+    assert.equal(await r.git("rev-parse", "HEAD"), result.commit + "\n");
+    assert.equal(await r.git("diff", "--cached"), "");
+    assert.equal((await run("git", ["--git-dir", remote, "rev-parse", "refs/heads/feature"])).stdout, before);
+  } finally { await r.close(); await rm(remote, { recursive: true, force: true }); }
 });
 
 test("push targets the current branch even with a differently named upstream; rejected pushes keep the local commit", async () => {

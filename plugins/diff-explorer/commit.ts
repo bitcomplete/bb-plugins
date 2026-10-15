@@ -10,7 +10,7 @@ const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
 function git(root: string, args: string[], index?: string, input = "") {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_LITERAL_PATHSPECS: "1", GIT_TERMINAL_PROMPT: "0" };
-  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete env[name];
+  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"]) delete env[name];
   if (index) env.GIT_INDEX_FILE = index;
   return new Promise<string>((resolve, reject) => {
     const child = execFile("git", ["-C", root, ...args], { env, maxBuffer: args[0] === "diff" ? LIMIT : 16 * 1024 * 1024, timeout: 120_000 }, (error, stdout, stderr) => {
@@ -117,7 +117,7 @@ async function guardedHooks(root: string, directory: string, snapshot: CommitSna
   const original = (await git(root, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"])).trim();
   const hooks = path.join(directory, "hooks");
   await mkdir(hooks);
-  const config = { root, original, snapshot, paths, message };
+  const config = { root, original, snapshot, paths, message, failureFile: path.join(directory, "hook-failure") };
   await writeFile(path.join(directory, "guard.cjs"), `const config = ${JSON.stringify(config)};\n` + HOOK_GUARD);
   const names = new Set(["pre-commit", "prepare-commit-msg", "commit-msg", ...await readdir(original).catch((error: NodeJS.ErrnoException) => {
     if (!["ENOENT", "ENOTDIR"].includes(error.code ?? "")) throw error;
@@ -140,7 +140,7 @@ const [name, ...args] = process.argv.slice(2);
 function git(args, index) {
   const result = spawnSync('git', ['-C', config.root, ...args], {encoding:'utf8', env:{...process.env, ...(index ? {GIT_INDEX_FILE:index} : {}), GIT_LITERAL_PATHSPECS:'1'}, maxBuffer:800000});
   if (result.status !== 0) throw new Error('Cannot verify reviewed state: ' + (result.stderr || result.error || 'git failed'));
-  return result.stdout.trim();
+  return args.includes('-z') ? result.stdout : result.stdout.trim();
 }
 function verify() {
   const branch = git(['symbolic-ref','--quiet','HEAD']);
@@ -151,7 +151,9 @@ function verify() {
   try {
     const index = path.join(dir,'index');
     git(config.snapshot.head ? ['read-tree',config.snapshot.head] : ['read-tree','--empty'],index);
-    git(['add','-A','--',...config.paths],index);
+    const tracked = new Set(git(['ls-files','-z','--',...config.paths],index).split('\0'));
+    const selected = config.paths.filter(file => tracked.has(file) || fs.lstatSync(path.join(config.root,file),{throwIfNoEntry:false}));
+    if (selected.length) git(['add','-A','--',...selected],index);
     if (git(['write-tree'],index) !== config.snapshot.tree) throw new Error('Selected files changed since review');
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 }
@@ -162,14 +164,20 @@ try {
   let executable = false;
   try { fs.accessSync(original,fs.constants.X_OK); executable = fs.statSync(original).isFile(); } catch(error) { if (!['ENOENT','ENOTDIR','EACCES'].includes(error.code)) throw error; }
   if (executable) {
-    const child = spawnSync(original,args,{stdio:'inherit'});
-    if (child.status !== 0) process.exit(child.status || 1);
+    const env = {...process.env};
+    delete env.GIT_LITERAL_PATHSPECS;
+    const child = spawnSync(original,args,{stdio:'inherit',env});
+    if (child.status !== 0) throw new Error(name + ' hook failed: ' + (child.error?.message || child.signal || 'exit ' + child.status));
   }
   if (guarded) {
     verify();
     if (name !== 'pre-commit' && fs.readFileSync(args[0],'utf8').trim() !== config.message.trim()) throw new Error('A hook changed the commit message; review it in a new job');
   }
-} catch(error) { console.error(error.message); process.exit(1); }
+} catch(error) {
+  fs.writeFileSync(config.failureFile,error.message);
+  console.error(error.message);
+  process.exit(1);
+}
 `;
 
 export async function finishCommit(root: string, paths: string[], snapshot: CommitSnapshot, messageFile: string, push: boolean) {
@@ -227,6 +235,12 @@ export async function finishCommit(root: string, paths: string[], snapshot: Comm
     await rename(lockPath, indexPath);
     ownsLock = false;
     publishedIndex = true;
+    // Git ignores post-commit exit codes, so the wrapper records failures separately.
+    const hookFailure = await readFile(path.join(directory, "hook-failure"), "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return null;
+    });
+    if (hookFailure) throw new Error(`${hookFailure}; the commit is local and was not pushed`);
     // Post-commit hooks can edit files, but their edits must never be pushed as reviewed work.
     if (await tree(root, paths, committed, directory) !== snapshot.tree) throw new Error("A post-commit hook changed selected files; the commit is local and was not pushed");
     if (push) {

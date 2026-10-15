@@ -30,7 +30,7 @@ test("commit launches Haiku in the source environment, scopes the prompt, and pr
     hosts: { experimental_client: () => ({ experimental_onSignal() {}, async call(method: string, input: any, options: any) {
       hostCalls.push({ method, input, options });
       if (method === "reviewCommit") return { snapshot, diff: "reviewed diff" };
-      if (method === "finishCommit") return finishError ? { commit: null, pushed: false, error: "stale snapshot" } : { commit: "d".repeat(40), pushed: input.push, error: null };
+      if (method === "finishCommit") return { commit: "d".repeat(40), pushed: finishError ? false : input.push, error: finishError ? "post-commit hook failed" : null };
     } }) },
     cli: { register(value: typeof cli) { cli = value; } },
     rpc: { register: (_contract: unknown, registered: typeof handlers) => { handlers = registered; } },
