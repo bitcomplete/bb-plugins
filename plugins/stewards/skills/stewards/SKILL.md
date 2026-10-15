@@ -102,6 +102,9 @@ and the runaway guard (worker spawns per binding per hour).
   ticket, its team in `linear.teams`, and the linear plugin connected. Rings
   need bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
+- **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,
+  unless `project.json` lists it in `github.exclude` (`owner/repo`). Bindings
+  already running there end with `bb stewards detach`.
 - **A playbook edit has no effect.** It is not merged to `.bb`'s HEAD yet, or
   it fails validation and bindings run under the last good version; `check`
   says which.

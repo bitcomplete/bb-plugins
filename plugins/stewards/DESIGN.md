@@ -42,7 +42,7 @@ existing bb-gate-hooks pipeline; workers for bounded tasks.
 | **Project steward** | One per bb project. Reads every binding's status record, sets priorities and holds, routes escalations, writes the morning digest. |
 | **Worker** | A short-lived child thread a steward starts for one bounded task: implement, fix CI, review a round. Archived with its steward. |
 | **Playbook** | A file in `.bb/stewards/playbooks/`: adoption, phases keyed by entity state, the ready gate, allowed actions, models, terminal states. |
-| **Project file** | `.bb/stewards/project.json`: Linear teams, adoption label, nightly schedule, the project steward's model. |
+| **Project file** | `.bb/stewards/project.json`: Linear teams, excluded repos, adoption label, nightly schedule, the project steward's model. |
 | **Spec** | What the entity should become: the playbook's terminal state, the ticket's description and acceptance criteria, its spec comments, and standing guidance. |
 | **Snapshot** | The observed state, built by plugin code. |
 | **Status record** | What a steward writes at the end of every judgment turn. |
@@ -113,7 +113,8 @@ These were settled while designing; each changes what gets built.
 .bb/
   repos.json                   owned by multi-repo; the GitHub repos
   stewards/
-    project.json               Linear teams, label, nightly, project steward
+    project.json               Linear teams, excluded repos, label, nightly,
+                               project steward
     playbooks/
       linear-tickets.md
       github-prs.md
@@ -126,6 +127,7 @@ These were settled while designing; each changes what gets built.
 {
   "version": 1,
   "linear": { "teams": ["ENG", "OPS"] },
+  "github": { "exclude": ["acme/docs"] },
   "label": "bb-managed",
   "nightly": { "at": "01:00", "timezone": "America/New_York" },
   "projectSteward": { "model": "claude/claude-opus-5-5/high" },
@@ -142,6 +144,13 @@ These were settled while designing; each changes what gets built.
 - **GitHub repos are not listed.** They are the project's `repos.json`, read
   through multi-repo, so a repo added to the workspace is stewarded without a
   second edit.
+- **`github.exclude` takes repos back out**, as `owner/repo`, for repos that
+  are in the workspace for reference but should not be stewarded. An excluded
+  repo gets no lease, no adoption and no review stewards; its checkout still
+  lands in every thread, so a ticket steward can still work in it. Exclusion
+  only stops new bindings: one already running ends with
+  `bb stewards detach`. An entry not in `repos.json` is a problem in
+  `bb stewards check`, since a typo would leave the repo stewarded.
 - `bb stewards init` writes the file, offering the Linear teams the connected
   user belongs to.
 - `bb stewards check` validates the file and every playbook against Linear and
@@ -177,8 +186,8 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 | Kind | Trigger | Default playbook |
 |---|---|---|
 | `ticket` | `bb-managed` added to an issue in a listed Linear team | `linear-tickets` |
-| `pr` | `bb-managed` added to a pull request in a repo from `repos.json` | `github-prs` |
-| `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` | `github-reviews` |
+| `pr` | `bb-managed` added to a pull request in a repo from `repos.json` not in `github.exclude` | `github-prs` |
+| `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` not in `github.exclude` | `github-reviews` |
 
 - The plugin hears triggers through bb-gate-hooks `team` and `repo` leases,
   which already exist. The nightly pass re-lists labelled tickets and open

@@ -101,6 +101,11 @@ export const projectFileSchema = z
   .object({
     version: z.literal(1),
     linear: z.object({ teams: z.array(z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase())).max(50).default([]) }).strict().default({ teams: [] }),
+    /**
+     * GitHub repos are the project's repos.json; these are left out of it,
+     * for repos in the workspace that stewards should not manage.
+     */
+    github: z.object({ exclude: z.array(z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as acme/web")).max(64).default([]) }).strict().default({ exclude: [] }),
     label: z.string().trim().min(1).max(100).default(DEFAULT_LABEL),
     nightly: z
       .object({

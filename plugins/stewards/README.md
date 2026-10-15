@@ -62,7 +62,7 @@ HEAD through multi-repo's `readProjectFiles` and `repoSet`:
 
 ```
 stewards/
-  project.json          Linear teams, label, nightly, project steward model
+  project.json          Linear teams, excluded repos, label, nightly, project steward model
   playbooks/
     linear-tickets.md   front matter + one ## section per phase
     github-prs.md

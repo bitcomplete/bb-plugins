@@ -141,6 +141,7 @@ export const rpcContract = defineRpcContract({
           label: z.string().nullable(),
           linearTeams: z.array(z.string()),
           repos: z.array(z.string()),
+          excludedRepos: z.array(z.string()),
           playbooks: z.array(z.object({ kind: z.string(), name: z.string(), version: z.string().nullable() })),
           problems: z.array(z.string()),
           nightly: z.object({ at: z.string(), timezone: z.string() }).nullable(),
@@ -183,7 +184,7 @@ type ProjectConfig = {
   projectId: string;
   file: ProjectFile;
   playbooks: Partial<Record<BindingKind, Playbook>>;
-  /** GitHub repos from the project's repos.json, as owner/repo. */
+  /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
   repos: string[];
   /** What is wrong with the configuration, in sentences; bindings keep running under the last good playbook. */
   problems: string[];
@@ -338,7 +339,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
         if (set.error !== null) problems.push(`repos.json: ${set.error}`);
-        repos = set.repos.map((r) => githubRepoOf(r.url)).filter((r): r is string => r !== null);
+        const all = set.repos.map((r) => githubRepoOf(r.url)).filter((r): r is string => r !== null);
+        repos = all.filter((r) => !file.github.exclude.some((x) => lc(x) === lc(r)));
+        if (set.error === null) {
+          const stray = file.github.exclude.filter((x) => !all.some((r) => lc(r) === lc(x)));
+          if (stray.length > 0) problems.push(`github.exclude names ${stray.join(", ")}, not in repos.json`);
+        }
       } catch (error) {
         problems.push(`could not read the repo set: ${errorMessage(error)}`);
       }
@@ -1035,6 +1041,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             label: config?.file.label ?? null,
             linearTeams: config?.file.linear.teams ?? [],
             repos: config?.repos ?? [],
+            excludedRepos: config?.file.github.exclude ?? [],
             playbooks:
               config === null
                 ? []
@@ -1473,7 +1480,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
       const ticket = config.playbooks.ticket;
-      lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}; label ${config.file.label}`);
+      lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       for (const kind of KINDS) {
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);

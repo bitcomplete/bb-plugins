@@ -17,6 +17,7 @@ function world() {
     [playbookPath("github-prs")]: GITHUB_PRS,
     [playbookPath("github-reviews")]: GITHUB_REVIEWS,
   };
+  const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
   const rpcCalls: Call[] = [];
   const threads = new Map<string, { status: string; archivedAt: number | null }>();
@@ -30,7 +31,7 @@ function world() {
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
     let out: unknown;
     if (args.method === "readProjectFiles") out = { projectSourcePath: "/p/.bb", head: "abc", files: (input.paths as string[]).map((path) => ({ path, content: files[path] ?? null })), error: null };
-    else if (args.method === "repoSet") out = { repos: [{ dir: "web", url: "https://github.com/acme/web.git" }], error: null };
+    else if (args.method === "repoSet") out = { repos, error: null };
     else if (args.method === "sourceSnapshot") out = { snapshot: entities.get(String(input.id)) ?? null };
     else if (args.method === "sourceSetInterest") out = { ok: true };
     else if (args.method === "sourceAdoptable") {
@@ -84,7 +85,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, entities, rpcCalls, threads, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, repos, entities, rpcCalls, threads, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup() {
@@ -290,6 +291,32 @@ describe("pull requests", () => {
     t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
     await t.ring("github", "acme/web#7");
     expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "pr" }]);
+  });
+
+  it("leaves out repos the project file excludes, and says so in check", async () => {
+    const t = await setup();
+    t.repos.push({ dir: "docs", url: "git@github.com:acme/docs.git" });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["Acme/Docs"] } });
+    t.entities.set("acme/docs#3", pull({ id: "acme/docs#3", key: "acme/docs#3", unit: "acme/docs" }));
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/docs#3");
+    await t.ring("github", "acme/web#7");
+    expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "review" }]);
+    expect(t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input).toMatchObject({ units: ["acme/web"] });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toMatch(/repos: acme\/web \(excluded: Acme\/Docs\)/u);
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ repos: string[]; excludedRepos: string[] }> };
+    expect(overview.projects).toMatchObject([{ repos: ["acme/web"], excludedRepos: ["Acme/Docs"] }]);
+  });
+
+  it("reports an exclusion that names no repo in repos.json", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/wbe"] } });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout).toMatch(/problem: github\.exclude names acme\/wbe, not in repos\.json/u);
+    expect(check.stdout).toMatch(/repos: acme\/web/u);
   });
 });
 

@@ -12,6 +12,7 @@ describe("the project file", () => {
     expect(parsed.value.nightly).toMatchObject({ at: "01:00", timezone: "America/New_York", until: "02:45" });
     expect(parsed.value.projectSteward.model).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
     expect(parsed.value.reviews.enabled).toBe(true);
+    expect(parsed.value.github.exclude).toEqual([]);
   });
 
   it("names the file and the field in errors", () => {
@@ -20,6 +21,9 @@ describe("the project file", () => {
     if (!bad.ok) expect(bad.error).toMatch(/stewards\/project\.json: nightly\.timezone/u);
     expect(parseProjectFile("{")).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 2 }))).toMatchObject({ ok: false });
+    const repo = parseProjectFile(JSON.stringify({ version: 1, github: { exclude: ["https://github.com/acme/web"] } }));
+    if (!repo.ok) expect(repo.error).toMatch(/github\.exclude\.0: a repo such as acme\/web/u);
+    else expect.fail("a URL is not owner/repo");
   });
 });
 

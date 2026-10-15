@@ -153,6 +153,7 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
         <dl className="flex flex-col gap-1">
           <Row label="Linear teams">{p.linearTeams.join(", ") || "none"}</Row>
           <Row label="Repos">{p.repos.join(", ") || "none"}</Row>
+          {p.excludedRepos.length > 0 && <Row label="Excluded">{p.excludedRepos.join(", ")}</Row>}
           <Row label="Label">
             <code>{p.label}</code>
           </Row>
