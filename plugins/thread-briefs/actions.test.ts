@@ -11,6 +11,8 @@ const signal = (overrides: Partial<RowSignal> = {}): RowSignal => ({
   pinned: false,
   stageOverride: null,
   statusOverride: null,
+  autoArchive: true,
+  ring: true,
   ...overrides,
 });
 

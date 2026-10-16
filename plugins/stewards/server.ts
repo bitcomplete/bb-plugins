@@ -46,13 +46,27 @@ import {
   type EntitySnapshot,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed } from "./store.js";
+import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Store } from "./store.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type WakeReason } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
 export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
+
+/**
+ * What thread-briefs is asked to leave alone, seeded into this plugin's
+ * metadata namespace on each thread it spawns (thread-briefs' README, "Threads
+ * a plugin runs"). Every steward keeps the title it was given, which carries
+ * the entity key, and is archived by this plugin when its binding ends rather
+ * than whenever its brief reads done between wakes, and its sidebar row
+ * draws no stage ring, which for a thread that idles between wakes mostly
+ * says done about work that is not. The project steward also
+ * stays out of the status sections: it is never finished, and it is the one
+ * thread you always want where you left it.
+ */
+export const STEWARD_BRIEFS = { rename: false, archive: false, ring: false } as const;
+export const PROJECT_BRIEFS = { rename: false, group: false, archive: false, ring: false } as const;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */
@@ -426,13 +440,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
         const t = (await bb.sdk.threads.get({ threadId })) as unknown as Partial<ThreadInfo>;
         return {
           id: threadId,
+          title: t.title ?? null,
           status: String(t.status ?? "idle"),
           archivedAt: t.archivedAt ?? null,
           deletedAt: t.deletedAt ?? null,
@@ -462,7 +477,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** Message a thread, bringing it back first if thread-briefs archived it while it waited. */
+    /** Message a thread, bringing it back first if it was archived while it waited. */
     async function sendTo(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return "gone";
@@ -529,6 +544,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The same, as `bb thread spawn` flags, for the worker command a wake shows. */
     const environmentFlags = (hostId: string | null) => (hostId === null ? "" : `--environment-provider ${MULTI_REPO_ENVIRONMENT_PROVIDER_ID} --machine ${hostId}`);
 
+    /** "<project name> project steward", or the bare role when bb cannot name the project. */
+    async function projectStewardTitle(projectId: string): Promise<string> {
+      const name = await bb.sdk.projects
+        .get({ projectId })
+        .then((p) => p.name.trim())
+        .catch(() => "");
+      return name === "" ? "Project steward" : `${name} project steward`;
+    }
+
+    /**
+     * Ask thread-briefs to leave a steward thread alone, once per thread per
+     * process. A spawn seeds it; this covers threads spawned before it was.
+     */
+    const tagged = new Set<string>();
+    async function tagThread(threadId: string, briefs: typeof STEWARD_BRIEFS | typeof PROJECT_BRIEFS): Promise<void> {
+      if (tagged.has(threadId)) return;
+      try {
+        await bb.sdk.threads.updatePluginMetadata({ threadId, set: { threadBriefs: briefs } });
+        tagged.add(threadId);
+      } catch (error) {
+        bb.log.warn(`stewards: could not tag thread ${threadId} for thread-briefs: ${errorMessage(error)}`);
+      }
+    }
+
+    /**
+     * Keep the project steward's title on its project's name, and tag it. A
+     * title someone else put there is left alone: only one still showing what
+     * this plugin last wrote is updated, or one this plugin never titled (the
+     * old "Project steward", or whatever a summarizer renamed it to).
+     */
+    async function keepProjectSteward(projectId: string): Promise<void> {
+      const row = store.project(projectId);
+      if (row.threadId === null) return;
+      const info = await threadInfo(row.threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null) return;
+      await tagThread(row.threadId, PROJECT_BRIEFS);
+      if (row.title !== null && info.title !== row.title) return;
+      const title = await projectStewardTitle(projectId);
+      if (info.title !== title) await quietly(`retitle the project steward ${row.threadId}`, () => bb.sdk.threads.update({ threadId: row.threadId!, title }));
+      if (row.title !== title) store.patchProject(projectId, { title });
+    }
+
     async function ensureProjectSteward(config: ProjectConfig): Promise<string | null> {
       let threadId: string | null = null;
       await serial(`project:${config.projectId}`, async () => {
@@ -540,15 +597,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return;
           }
         }
+        const title = await projectStewardTitle(config.projectId);
         const thread = await bb.sdk.threads.spawn({
           projectId: config.projectId,
           environment: freshEnvironment(await projectHost(config.projectId)),
           prompt: PROJECT_STEWARD_INTRO,
-          title: "Project steward",
+          title,
           ...modelArgs(config.file.projectSteward.model ?? null),
-          pluginMetadata: { role: "project" },
+          pluginMetadata: { role: "project", threadBriefs: PROJECT_BRIEFS },
         });
-        store.patchProject(config.projectId, { threadId: thread.id });
+        tagged.add(thread.id);
+        store.patchProject(config.projectId, { threadId: thread.id, title });
         bb.log.info(`stewards: started the project steward for ${config.projectId} (${thread.id})`);
         threadId = thread.id;
       });
@@ -568,7 +627,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...(parentThread === null ? {} : { parentThreadId: parentThread }),
         ...modelArgs(stewardModel(b, playbook)),
-        pluginMetadata: { role: "steward", bindingId: b.id },
+        pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: STEWARD_BRIEFS },
       };
       let thread: { id: string };
       try {
@@ -578,6 +637,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.warn(`stewards: could not share the project steward's environment for ${b.entityKey} (${errorMessage(error)}); giving it its own`);
         thread = await bb.sdk.threads.spawn({ ...base, environment: freshEnvironment(await projectHost(b.projectId)) });
       }
+      tagged.add(thread.id);
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
@@ -747,14 +807,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * End the binding and hand its children to the next ancestor. The thread
-     * is left alone: its last turn says the work is done, and thread-briefs
-     * archives finished threads (workers go with it, as their lifecycle owner).
+     * End the binding, archive its thread, and hand its children to the next
+     * ancestor. Its last turn said the work is done; workers are archived with
+     * it, as their lifecycle owner. thread-briefs is asked not to archive
+     * stewards, because between wakes a steward reads done while its entity
+     * is still open. A thread still running (an ending that timed out) is left
+     * in the sidebar rather than archived mid-turn.
      */
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.");
       await stopWorkers(b);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
+      if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
+        await quietly(`archive ${b.entityKey}'s steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+      }
       // Parent ends first: promoted children still open move up a level.
       const up = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
       const next = up !== null && up.endedAt === null ? up : null;
@@ -1016,8 +1083,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       scheduleReconcile(worker.bindingId);
     });
 
-    // Archiving is thread-briefs' business (it archives finished threads), and
-    // a wake brings an archived steward back. Only a deleted steward thread
+    // An archived steward is still bound: a wake brings it back, whoever
+    // archived it. Only a deleted steward thread
     // ends its binding: someone meant it, and the label staying on does not
     // bring it back until it is removed and re-added.
     bb.events.on("thread.archived", ({ thread }) => {
@@ -1421,8 +1488,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pushInterest();
       for (const config of projects) {
         if (!(await settings.get()).paused) await adoptionPass(config);
+        await keepProjectSteward(config.projectId);
         const playbooks = config.playbooks;
         for (const b of store.open(config.projectId)) {
+          if (b.threadId !== null) await tagThread(b.threadId, STEWARD_BRIEFS);
           if (b.ending !== null && b.endingAt !== null && now() - b.endingAt > timing.endingTimeoutMs) {
             await serial(`b:${b.id}`, () => finishEnding(store.binding(b.id)!, b.ending!));
             continue;
@@ -1666,12 +1735,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     );
 
     // Exposed for tests: drive the loop without timers.
-    testHooks.set(bb.pluginId, { sweep, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
+    testHooks.set(bb.pluginId, { sweep, store, forgetTags: () => tagged.clear(), nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

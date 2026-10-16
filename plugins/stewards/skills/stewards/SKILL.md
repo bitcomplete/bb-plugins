@@ -55,8 +55,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
 - **Ending.** When the entity is done or detached you get one last turn: say
-  the work is done. thread-briefs archives finished threads; a later wake
-  brings the thread back.
+  the work is done. The plugin archives your thread when the binding ends;
+  a later wake brings it back.
 
 ## If you are the project steward
 

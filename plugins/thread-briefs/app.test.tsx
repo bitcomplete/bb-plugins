@@ -560,6 +560,8 @@ describe("sidebar row glyphs", () => {
     pinned: false,
     stageOverride: null,
     statusOverride: null,
+    autoArchive: true,
+    ring: true,
     ...overrides,
   });
 
@@ -614,6 +616,22 @@ describe("sidebar row glyphs", () => {
         tone: "default",
       }),
     );
+
+    slot.lifecycle.unmount();
+    await scripts.lifecycle.dispose();
+  });
+
+  it("draws nothing on a row whose plugin asked for no ring", async () => {
+    const { scripts, slot } = await mountBoth({
+      signals: [signal({ threadId: "thr_1", ring: false }), signal({ threadId: "thr_2" })],
+      threads: [sidebarThread({ id: "thr_1" }), sidebarThread({ id: "thr_2" })],
+    });
+
+    // The other row is painted, so the pass has run.
+    await waitFor(() =>
+      expect(scripts.inspection.getThreadRowStatus("thr_2")).not.toBeNull(),
+    );
+    expect(scripts.inspection.getThreadRowStatus("thr_1")).toBeNull();
 
     slot.lifecycle.unmount();
     await scripts.lifecycle.dispose();
@@ -915,6 +933,8 @@ describe("the Stage and Status thread actions", () => {
     pinned: false,
     stageOverride: null,
     statusOverride: null,
+    autoArchive: true,
+    ring: true,
     ...overrides,
   });
 

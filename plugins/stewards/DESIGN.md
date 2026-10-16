@@ -102,10 +102,15 @@ These were settled while designing; each changes what gets built.
 - **Few tools.** Stewards get two: `steward_report` and `steward_update`.
   Everything else uses what every thread has: the `linear_*` tools, `gh`,
   and `bb thread` for workers. The github-watcher plugin adds no write tools.
-- **Thread lifetime and the sidebar belong to thread-briefs and the user.**
-  Stewards archive nothing, pin nothing and create no sidebar sections. A
-  finished steward says so in its last turn and thread-briefs archives it; a
-  later wake brings it back.
+- **Stewards end their own threads; the rest of the sidebar is the user's.**
+  Stewards pin nothing and create no sidebar sections. A finished steward
+  says so in its last turn and the plugin archives it when the binding ends;
+  a later wake brings it back. thread-briefs is asked, through each
+  thread's metadata, not to archive or rename stewards and not to group the
+  project steward: between wakes a steward reads done while its entity is
+  still open, and its title carries the entity key. (This first left
+  archiving to thread-briefs. In use, review stewards for open pull requests
+  were archived and unarchived on every wake.)
 
 ## 3. Configuration
 
@@ -226,12 +231,11 @@ plugins.
 - **Terminal.** The entity reaches a state the playbook declares terminal
   (Linear Done or Canceled; GitHub merged or closed). Its workers are
   stopped and the steward gets one wrap-up turn — a final comment, saying
-  the work is done — and the binding ends. The thread is not archived here:
-  thread-briefs archives finished threads, and workers follow their
-  lifecycle owner.
+  the work is done — and the binding ends. The thread is archived then,
+  unless it is still running, and workers follow their lifecycle owner.
 - **Reopen.** The entity leaves a terminal state. The binding resumes and
-  the same thread is woken, brought back from the archive if thread-briefs
-  had archived it. No second thread.
+  the same thread is woken, brought back from the archive. No second
+  thread.
 - **Detach.** The label is removed. Workers are stopped and the steward gets
   one turn to stop. Re-adding the label resumes it the same way. Deleting
   the steward thread detaches it until the label is removed and re-added.
@@ -506,12 +510,14 @@ requeue-default: 2d
 - Stewards are child threads of their nearest managed ancestor's steward, or
   of the project steward. The plugin creates no sidebar sections and pins
   nothing; how the sidebar is organized is the user's and thread-briefs'.
+  The project steward is titled "<project name> project steward" and kept
+  out of thread-briefs' status sections, so it stays where you put it.
 - Workers are hidden children of their steward, started by the steward with
   `bb thread spawn --parent-self --lifecycle-owner-thread … --visibility
   hidden` and recognized by the plugin as children of a steward thread.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. Ended bindings are archived
-  by thread-briefs once finished, not by this plugin.
+  by this plugin, not by thread-briefs.
 
 ## 16. Architecture
 

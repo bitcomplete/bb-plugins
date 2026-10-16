@@ -268,10 +268,15 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
       : { nextStepActor: resolved.nextStepActor }),
     blockedOn: resolved.blockedOn,
     lastSummarizedAt: resolved.lastSummarizedAt,
+    autoArchive: autoArchives(stored),
   };
 }
 
-export function rowSignalFor(brief: ResolvedBrief): RowSignal {
+/** Whether the archive sweep may take this thread, as far as its brief knows. */
+const autoArchives = (stored: StoredBrief): boolean => !(stored.optOut?.archive ?? false);
+
+export function rowSignalFor(stored: StoredBrief): RowSignal {
+  const brief = resolveBrief(stored);
   const pinned = brief.stageOverride !== null || brief.statusOverride !== null;
   return {
     threadId: brief.threadId,
@@ -281,6 +286,8 @@ export function rowSignalFor(brief: ResolvedBrief): RowSignal {
     pinned,
     stageOverride: brief.stageOverride,
     statusOverride: brief.statusOverride,
+    autoArchive: autoArchives(stored),
+    ring: !(stored.optOut?.ring ?? false),
   };
 }
 

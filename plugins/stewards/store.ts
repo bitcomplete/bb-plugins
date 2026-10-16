@@ -88,6 +88,8 @@ export const MIGRATIONS = [
      nightly_date TEXT,
      digest_pending INTEGER NOT NULL DEFAULT 0
    )`,
+  // The title this plugin last put on the project steward, so a rename by hand sticks.
+  `ALTER TABLE project_stewards ADD COLUMN title TEXT`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -303,7 +305,7 @@ export type Escalation = {
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
-export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean };
+export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null };
 
 export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("base64url")}`;
 
@@ -372,6 +374,7 @@ export function createStore(db: Database.Database, now: () => number) {
     digestAt: r.digest_at === null ? null : Number(r.digest_at),
     nightlyDate: r.nightly_date === null ? null : String(r.nightly_date),
     digestPending: Number(r.digest_pending) === 1,
+    title: r.title === null || r.title === undefined ? null : String(r.title),
   });
 
   function patch(id: string, fields: BindingPatch): Binding {
@@ -501,7 +504,7 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     patchProject(projectId: string, fields: Partial<Omit<ProjectStewardRow, "projectId">>): ProjectStewardRow {
       upsertProject.run(projectId);
-      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending" };
+      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending", title: "title" };
       const entries = Object.entries(fields).filter(([, v]) => v !== undefined);
       if (entries.length > 0) db.prepare(`UPDATE project_stewards SET ${entries.map(([k]) => `${map[k]} = ?`).join(", ")} WHERE project_id = ?`).run(...entries.map(([, v]) => toColumn(v)), projectId);
       return toProject(getProject.get(projectId)!);

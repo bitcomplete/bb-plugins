@@ -239,6 +239,9 @@ function BriefSync() {
   useEffect(() => {
     const next = new Map<string, Decoration>();
     for (const signal of signals) {
+      // Its plugin asked for bb's own indicators only: no decoration, so the
+      // content script clears the row.
+      if (!signal.ring) continue;
       // A thread with no row in the sidebar has no cursor to age, so it simply
       // never greys, and has no glyph to draw either.
       const latestAttentionAt = attentionByThreadId.get(signal.threadId);
@@ -252,7 +255,7 @@ function BriefSync() {
         })
           ? {
               idleMs: idleMsSince(latestAttentionAt, now),
-              archiving: thresholds.archiveAfterMs > 0,
+              archiving: thresholds.archiveAfterMs > 0 && signal.autoArchive,
             }
           : null;
       const decoration = rowDecoration(

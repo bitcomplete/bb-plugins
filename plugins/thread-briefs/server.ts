@@ -46,6 +46,13 @@ import {
 } from "./config.js";
 import { endsWithQuestion, renderTranscript, type OutlineItem } from "./transcript.js";
 import {
+  FULL_OPT_OUT,
+  NO_OPT_OUT,
+  optsOutOfAnything,
+  readOptOut,
+  type OptOut,
+} from "./optout.js";
+import {
   mergeSectionOrder,
   planAssignments,
   planSections,
@@ -80,6 +87,8 @@ const ARCHIVE_CRON = "17 * * * *";
  * is still eligible in an hour.
  */
 const ARCHIVE_LIMIT = 500;
+/** Threads per plugin-metadata list request: bb's own cap. */
+const METADATA_PAGE_SIZE = 200;
 /** The plugin that owns the sidebar list, and so its layout preferences. */
 const THREAD_LIST_PLUGIN_ID = "thread-list";
 /** Where the grouping records what it changed, so `off` can put it back. */
@@ -389,6 +398,55 @@ export default async function plugin(bb: BbPluginApi) {
     return config;
   };
 
+  // ------------------------------------------------------------- opt-outs
+
+  /**
+   * Each thread's opt-out, read from the namespace of the plugin that spawned
+   * it: see `optout.ts`.
+   *
+   * A thread no plugin spawned costs nothing. The rest are batched per
+   * spawning plugin, so a pass over the whole sidebar is one request per
+   * plugin rather than one per thread. null means that namespace could not be
+   * read, and each caller decides what not knowing means for it.
+   */
+  async function optOutsFor(
+    threads: readonly { id: string; originPluginId: string | null }[],
+  ): Promise<Map<string, OptOut | null>> {
+    const result = new Map<string, OptOut | null>();
+    const byPlugin = new Map<string, string[]>();
+    for (const thread of threads) {
+      if (thread.originPluginId === null) {
+        result.set(thread.id, NO_OPT_OUT);
+        continue;
+      }
+      const ids = byPlugin.get(thread.originPluginId) ?? [];
+      ids.push(thread.id);
+      byPlugin.set(thread.originPluginId, ids);
+    }
+    for (const [pluginId, ids] of byPlugin) {
+      for (let start = 0; start < ids.length; start += METADATA_PAGE_SIZE) {
+        const chunk = ids.slice(start, start + METADATA_PAGE_SIZE);
+        try {
+          const { threads: rows } = await bb.sdk.threads.experimental_listPluginMetadata({
+            pluginId,
+            threadIds: chunk,
+          });
+          // A thread with nothing in the namespace has no row at all.
+          const metadata = new Map(rows.map((row) => [row.threadId, row.metadata]));
+          for (const id of chunk) result.set(id, readOptOut(metadata.get(id)));
+        } catch (error) {
+          bb.log.warn(
+            `could not read ${pluginId}'s metadata on ${chunk.length} thread(s): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          for (const id of chunk) result.set(id, null);
+        }
+      }
+    }
+    return result;
+  }
+
   /**
    * Put the brief's title on the thread, and report the title we are now on
    * record as having written.
@@ -543,6 +601,7 @@ export default async function plugin(bb: BbPluginApi) {
 
     const config = await completionConfig();
     const { output } = await bb.sdk.threads.output({ threadId });
+    const optOut = (await optOutsFor([thread])).get(threadId) ?? null;
 
     // A stage override in force is passed to the model as fixed; one the thread
     // has moved past is dropped here, which is what "sticks until real thread
@@ -611,8 +670,10 @@ export default async function plugin(bb: BbPluginApi) {
 
     // A thread bb has already named waits for its first turn to end before this
     // plugin renames it; one showing nothing but its own opening prompt does
-    // not. See {@link summarizeThread}.
-    const appliedTitle = beforeFirstTurn && thread.title !== null
+    // not. See {@link summarizeThread}. A thread whose plugin keeps its title,
+    // or whose plugin we could not ask, is never renamed.
+    const appliedTitle = (beforeFirstTurn && thread.title !== null) ||
+        (optOut ?? FULL_OPT_OUT).rename
       ? (stored?.appliedTitle ?? null)
       : await applyTitle({
           threadId,
@@ -657,10 +718,52 @@ export default async function plugin(bb: BbPluginApi) {
       endedWithQuestion: endsWithQuestion(output),
       appliedTitle,
       refresher,
+      ...exemptionsToStore(optOut, stored),
       lastSummarizedAt: Date.now(),
       lastActivitySeen: outline.maxSeq,
     });
     return true;
+  }
+
+  /**
+   * The `optOut` a fresh brief row carries: this summary's reading, or the
+   * last one when the namespace could not be read. Left off entirely for a
+   * thread exempt from nothing, which is nearly every thread.
+   */
+  const exemptionsToStore = (
+    optOut: OptOut | null,
+    stored: StoredBrief | null,
+  ): { optOut?: OptOut } => {
+    const kept = optOut ?? (stored?.optOut ? { ring: false, ...stored.optOut } : null);
+    return kept !== null && optsOutOfAnything(kept) ? { optOut: kept } : {};
+  };
+
+  /**
+   * Bring the `optOut` stored on briefs up to date with each thread's plugin.
+   *
+   * A summary refreshes it, but a steward can sit idle for days, and a plugin
+   * can ask for something new of threads it spawned long ago. The sidebar
+   * draws from the stored copy alone, so without this a ring a plugin turned
+   * off would stay until the thread's next turn. Only rows that change are
+   * written, and the sidebar is told once.
+   */
+  async function syncStoredOptOuts(
+    threads: readonly { id: string; originPluginId: string | null }[],
+  ): Promise<void> {
+    const fromPlugins = threads.filter((thread) => thread.originPluginId !== null);
+    if (fromPlugins.length === 0) return;
+    let changed = 0;
+    for (const [threadId, optOut] of await optOutsFor(fromPlugins)) {
+      if (optOut === null) continue;
+      const stored = await readBrief(threadId);
+      if (stored === null) continue;
+      const next = exemptionsToStore(optOut, stored).optOut;
+      if (JSON.stringify(next) === JSON.stringify(stored.optOut)) continue;
+      const { optOut: _old, ...rest } = stored;
+      await writeBrief(next === undefined ? rest : { ...rest, optOut: next });
+      changed += 1;
+    }
+    if (changed > 0) announce();
   }
 
   // -------------------------------------------------------------- reading
@@ -771,9 +874,7 @@ export default async function plugin(bb: BbPluginApi) {
       // No live thread lookups here: the client folds the running/queued
       // override and the staleness in per row, off the sidebar view it
       // already has.
-      signals: await mapStoredBriefs((stored) =>
-        rowSignalFor(resolveBrief(stored)),
-      ),
+      signals: await mapStoredBriefs(rowSignalFor),
       ...(await ringThresholds()),
     }),
 
@@ -962,8 +1063,10 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /** Visible, live threads, in pages, capped. */
-  const listGroupableThreads = async (): Promise<SectionedThread[]> => {
-    const threads: SectionedThread[] = [];
+  const listGroupableThreads = async (): Promise<
+    (SectionedThread & { originPluginId: string | null })[]
+  > => {
+    const threads: (SectionedThread & { originPluginId: string | null })[] = [];
     for (let offset = 0; offset < SECTION_THREAD_LIMIT; offset += SECTION_PAGE_SIZE) {
       const page = await bb.sdk.threads.list({
         limit: SECTION_PAGE_SIZE,
@@ -974,7 +1077,11 @@ export default async function plugin(bb: BbPluginApi) {
         // Archived threads are out regardless of status: the grouping is for
         // work still in front of you.
         if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
-        threads.push({ id: thread.id, sectionId: thread.sectionId ?? null });
+        threads.push({
+          id: thread.id,
+          sectionId: thread.sectionId ?? null,
+          originPluginId: thread.originPluginId,
+        });
       }
       if (page.length < SECTION_PAGE_SIZE) break;
     }
@@ -1075,9 +1182,19 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
+    const threads = await listGroupableThreads();
+    const optOuts = await optOutsFor(threads);
+    const targets = await sectionIdByThreadId(sectionIds);
+    // A thread its plugin keeps out of the grouping is planned as briefless,
+    // which takes it out of our sections and back to bb's Threads group. One
+    // whose plugin we could not ask is left exactly where it is: a failed
+    // read should not shuffle the sidebar for one pass.
+    for (const [threadId, optOut] of optOuts) {
+      if (optOut === null || optOut.group) targets.delete(threadId);
+    }
     const moves = planAssignments({
-      threads: await listGroupableThreads(),
-      sectionIdByThreadId: await sectionIdByThreadId(sectionIds),
+      threads: threads.filter((thread) => optOuts.get(thread.id) !== null),
+      sectionIdByThreadId: targets,
       ownedSectionIds: new Set(sectionIds.values()),
     });
     for (const move of moves) {
@@ -1199,10 +1316,14 @@ export default async function plugin(bb: BbPluginApi) {
    * threads that actually moved.
    */
   bb.background.schedule("brief-sweep", SWEEP_CRON, async () => {
+    const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
+    // Reads no summarizer, so it runs with or without a key.
+    await syncStoredOptOuts(
+      threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
+    );
+
     const values = await settings.get();
     if (!hasApiKey(values)) return;
-
-    const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;
@@ -1252,6 +1373,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (archiveAfterMs <= 0) return;
 
     const threads = await bb.sdk.threads.list({ limit: ARCHIVE_LIMIT });
+    const optOuts = await optOutsFor(
+      threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
+    );
     const candidates: ArchiveCandidate[] = threads.map((thread) => ({
       id: thread.id,
       latestAttentionAt: thread.latestAttentionAt,
@@ -1260,6 +1384,8 @@ export default async function plugin(bb: BbPluginApi) {
       deletedAt: thread.deletedAt,
       visibility: thread.visibility,
       status: thread.status,
+      // Not knowing is a reason to keep it: see `FULL_OPT_OUT`.
+      optedOut: (optOuts.get(thread.id) ?? FULL_OPT_OUT).archive,
     }));
 
     // Briefs read per candidate rather than by scanning the kv prefix: the

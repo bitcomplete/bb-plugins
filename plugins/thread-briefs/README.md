@@ -478,11 +478,58 @@ screen:
   a fresh brief row without the stamp, so working in the thread again puts it
   back in the normal cycle.
 - **Nothing busy, hidden, deleted or already archived** is touched.
+- **A thread its plugin exempted is never archived**, and neither is one
+  whose plugin's metadata could not be read. See
+  [Threads a plugin runs](#threads-a-plugin-runs).
 
 The sweep runs hourly on its own schedule rather than inside the brief sweep,
 which returns early with no API key — archiving a finished thread has nothing to
 do with whether a summarizer is configured. Its thresholds are compared in days,
 so a sweep running up to an hour late is invisible.
+
+## Threads a plugin runs
+
+Some threads are not a person's work but a plugin's: a long-lived thread that
+plugin wakes and re-wakes, such as a steward. Three things this plugin does
+without being asked are wrong for those. Its plugin chose the title, often
+around a key people search for, so a 4–6 word rename loses it. Between wakes
+it reads done, so it greys, files under Done and is archived, only to be
+brought back on its next wake. And a thread you always want where you left it,
+like a project's steward, gets moved between status sections.
+
+So the plugin that spawns a thread can turn each one off, in its own
+metadata namespace on the thread:
+
+```ts
+await bb.sdk.threads.spawn({
+  // ...
+  pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } },
+});
+```
+
+thread-briefs reads that namespace back through the thread's
+`originPluginId`, which bb sets to whichever plugin seeded the metadata, so it
+never has to know which plugins exist. Each key is an opt-out: only `false`
+turns its behaviour off, and an absent key leaves it on. A plugin can add the
+key to threads it spawned before, with `updatePluginMetadata`.
+
+| Key | Off means |
+| --- | --- |
+| `rename` | the title is never replaced with the brief's |
+| `group` | the thread stays out of the status sections, in bb's Threads group (or pinned, if you pin it) |
+| `archive` | the thread is never auto-archived, and its grey ring does not say "archiving soon" |
+| `ring` | the sidebar row draws no ring, so bb's own running, unread and error indicators are all it shows |
+
+The brief is still written, and the panel, the board, the refresher and the
+Stage and Status actions work as for any other thread. The rename, the grouping and the
+archive sweep read the namespace live, one request per spawning plugin per
+pass. When that read fails, the thread is not renamed or archived and is not
+moved between sections, because each of those is something nobody asked for.
+The sidebar and the board read a copy stored on the brief at each summary
+(`optOut`) to decide whether to draw the ring and whether to say "archiving
+soon". A summary refreshes that copy, and so does the ten-minute sweep, so a
+plugin that asks for something new of an idle thread is heard within ten
+minutes.
 
 ## How it is built
 
