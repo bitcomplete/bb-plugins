@@ -51,11 +51,20 @@ const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.des
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
 /**
+ * Whose pull request events are the steward's own work in progress. While one
+ * of its workers is running, the worker pushes, edits the description, posts
+ * as the viewer (every thread acts as the developer, signed or not) and waits
+ * for checks; none of that is news to the steward, which hears from the
+ * worker when it finishes. People and terminal states still wake it.
+ */
+type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerRunning: boolean };
+
+/**
  * The changes between two observations of one entity, each marked whether it
  * is actionable on its own. `prefix` names the entity when it is not the
  * binding's own (a linked pull request).
  */
-export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null }): Change[] {
+export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContext): Change[] {
   const changes: Change[] = [];
   const p = ctx.prefix;
   if (before.state !== after.state) changes.push({ text: `${p}State: ${before.state} → ${after.state}`, actionable: true });
@@ -64,7 +73,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: {
   if (!same(before.assignees, after.assignees)) changes.push({ text: `${p}Assignees: ${after.assignees.join(", ") || "(none)"}`, actionable: false });
   if ((before.priority ?? "") !== (after.priority ?? "")) changes.push({ text: `${p}Priority: ${after.priority ?? "(none)"}`, actionable: false });
   if (before.estimate !== after.estimate) changes.push({ text: `${p}Estimate: ${after.estimate ?? "(none)"}`, actionable: false });
-  if (descriptionHash(before) !== descriptionHash(after)) changes.push({ text: `${p}Description edited`, actionable: true });
+  if (descriptionHash(before) !== descriptionHash(after)) changes.push({ text: `${p}Description edited`, actionable: !(ctx.workerRunning && after.pull !== null) });
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
@@ -87,7 +96,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: {
 
 const SETTLED = new Set(["success", "failure", "error"]);
 
-function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: { prefix: string; viewer: string | null }): Change[] {
+function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContext): Change[] {
   const b = before.pull!;
   const a = after.pull!;
   const p = ctx.prefix;
@@ -102,7 +111,7 @@ function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: { prefix: 
   const bChecks = b.checks?.state ?? null;
   const aChecks = a.checks?.state ?? null;
   if (aChecks !== null && SETTLED.has(aChecks) && (bChecks !== aChecks || !same(b.checks?.failing ?? [], a.checks?.failing ?? []))) {
-    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: true });
+    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerRunning });
   }
   const seen = new Set(b.reviews.map((r) => `${r.author}|${r.submittedAt}|${r.state}`));
   for (const r of a.reviews) {
@@ -121,8 +130,12 @@ const commentNews = (prefix: string, fresh: SnapshotComment[]) =>
 /** Whether a line of "what changed" is diffObserved's comment count. */
 export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comments? from /u.test(text);
 
-/** Every change between two observations: the entity, then each linked pull request. */
-export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string }): Change[] {
+/**
+ * Every change between two observations: the entity, then each linked pull
+ * request. `workerRunning` quiets the steward's own work on pull requests
+ * (see DiffContext).
+ */
+export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerRunning: boolean }): Change[] {
   const viewer = after.entity.viewer;
   const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer });
   const beforePulls = new Map(before.pulls.map((p) => [p.key.toLowerCase(), p]));
@@ -137,7 +150,11 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
   // news at the next turn.
   for (const e of [after.entity, ...after.pulls]) {
     const fresh = newHumanComments(e, ctx.cursor, ctx.own);
-    if (fresh.length > 0) changes.push({ text: commentNews(e === after.entity ? "" : `${e.key}: `, fresh), actionable: true });
+    // On a pull request a running worker owns, the viewer's comments are the
+    // worker's and its reviewers': they post as the developer, often unsigned.
+    const ownWork = ctx.workerRunning && e.pull !== null;
+    const people = ownWork ? fresh.filter((c) => lc(c.author) !== lc(e.viewer)) : fresh;
+    if (fresh.length > 0) changes.push({ text: commentNews(e === after.entity ? "" : `${e.key}: `, fresh), actionable: people.length > 0 });
   }
   return changes;
 }

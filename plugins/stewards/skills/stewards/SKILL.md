@@ -44,6 +44,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   bounded task with the `bb thread spawn --parent-self …` command the wake
   shows; write the task so the worker needs nothing else. Follow up with
   `bb thread tell`. You are woken when it finishes, with its final message.
+  While it runs you are not woken for its own work on its pull request
+  (checks, pushes, its comments and its reviewer's, posted as the user);
+  that shows under "What changed" at your next turn. Other people's
+  comments and reviews, and a merge or close, still wake you.
   More than the runaway guard allows in an hour are stopped.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
@@ -86,8 +90,9 @@ The project must be a multi-repo project: configuration is read from its
    Edits take effect only once merged.
 3. `bb stewards check` validates the project file and playbooks against
    Linear (teams, states, label) and GitHub (repos, label).
-4. Label a ticket `bb-managed`. Its steward appears as a child of the
-   project steward thread.
+4. Label a ticket `bb-managed`. Its steward thread appears beside the
+   project steward's, not under it: a parent thread is woken whenever a
+   child finishes a turn, and stewards report through their bindings.
 
 | Command | Does |
 |---|---|
@@ -97,8 +102,9 @@ The project must be a multi-repo project: configuration is read from its
 | `bb stewards pass [--nightly]` | The mechanical sweep now, or the full nightly pass |
 | `bb stewards digest` | The latest morning digest |
 
-Settings → Plugins → Stewards has **Pause stewards** (no wakes, no adoption)
-and the runaway guard (worker spawns per binding per hour).
+Settings → Plugins → Stewards has **Pause stewards** (no wakes, no adoption),
+the runaway guard (worker spawns per binding per hour), and the context size
+above which a steward is compacted after its turn.
 
 ## When something is wrong
 

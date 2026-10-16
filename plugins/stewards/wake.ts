@@ -9,7 +9,7 @@ import { newHumanComments, reportedItem, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Observed, Worker } from "./store.js";
 
-/** A wake longer than this is cut, oldest comments first in effect: they come first and are clipped. */
+/** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
@@ -18,6 +18,20 @@ const RESULT_CHARS = 1500;
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
+
+/**
+ * Join a message's three parts within WAKE_MAX_CHARS, cutting the middle
+ * (the snapshot, the list of bindings) and keeping the head and the tail: the
+ * tail says what changed and what to do, which a cut wake must not lose.
+ */
+function fit(head: string[], middle: string[], tail: string[]): string {
+  const h = head.join("\n");
+  const t = tail.join("\n");
+  const room = WAKE_MAX_CHARS - h.length - t.length - 200;
+  const m = middle.join("\n");
+  if (room <= 0) return clip([h, t].join("\n"), WAKE_MAX_CHARS);
+  return [h, clip(m, room), t].join("\n");
+}
 
 /** Why this wake: an ordinary reconcile, or a lifecycle turn with its own instructions. */
 export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "detach" | "reopen";
@@ -150,6 +164,7 @@ export function formatWake(input: WakeInput): string {
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — take no new actions and start no workers until it is lifted.`);
 
+  const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
   out.push(...entityLines(e, binding.commentCursor, input.own, "The entity"));
   for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`));
@@ -177,6 +192,7 @@ export function formatWake(input: WakeInput): string {
     }
   }
 
+  const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
   if (input.changes.length === 0) out.push("Nothing actionable; this is a scheduled look.");
   for (const c of input.changes) out.push(`- ${c}`);
@@ -186,7 +202,7 @@ export function formatWake(input: WakeInput): string {
     "---",
     `Before acting, look for evidence that you already did it (a signed comment, a worker, an open pull request, a review). End your turn with steward_report; requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
-  return clip(out.join("\n"), WAKE_MAX_CHARS);
+  return fit(head, snapshot, out);
 }
 
 /** What the project steward is woken with, at the end of a nightly pass or when an escalation reaches it. */
@@ -215,19 +231,21 @@ export function formatProjectWake(input: {
       "",
     );
   }
+  const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
     const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
+  const bindings = out.splice(0);
   if (input.digestDue) {
     out.push(
       "",
       "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck, and today's priorities. Your reply is saved as the digest.",
     );
   }
-  return clip(out.join("\n"), WAKE_MAX_CHARS);
+  return fit(head, bindings, out);
 }
 
 export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Linear ticket and GitHub pull request in this project that is being managed has its own steward thread; you sit above them all.

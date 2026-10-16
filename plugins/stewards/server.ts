@@ -35,7 +35,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, diffObserved, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
+import { advanced, diffObserved, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -61,12 +61,12 @@ export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
  * the entity key, and is archived by this plugin when its binding ends rather
  * than whenever its brief reads done between wakes, and its sidebar row
  * draws no stage ring, which for a thread that idles between wakes mostly
- * says done about work that is not. The project steward also
- * stays out of the status sections: it is never finished, and it is the one
- * thread you always want where you left it.
+ * says done about work that is not. Stewards also stay out of the status
+ * sections, where one idle between wakes would read done: the project
+ * steward is never finished, and a steward is finished when its binding ends.
  */
-export const STEWARD_BRIEFS = { rename: false, archive: false, ring: false } as const;
-export const PROJECT_BRIEFS = { rename: false, group: false, archive: false, ring: false } as const;
+export const STEWARD_BRIEFS = { rename: false, group: false, archive: false, ring: false } as const;
+export const PROJECT_BRIEFS = STEWARD_BRIEFS;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */
@@ -225,6 +225,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         label: "Worker spawns per binding per hour",
         description: "The runaway guard: a steward that tries to start more workers than this in an hour is refused. Not a budget.",
         default: 6,
+      },
+      compactAboveTokens: {
+        type: "number",
+        label: "Compact a steward above this many context tokens",
+        description: "After a steward's or the project steward's turn, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
+        default: 120_000,
       },
     });
 
@@ -440,7 +446,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
@@ -454,6 +460,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           environmentId: t.environmentId ?? null,
           environmentHostId: t.environmentHostId ?? null,
           providerId: String(t.providerId ?? ""),
+          parentThreadId: t.parentThreadId ?? null,
         };
       } catch (error) {
         const e = error as { code?: string; status?: number };
@@ -614,10 +621,34 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return threadId;
     }
 
+    /**
+     * A steward is no thread's child. bb tells a parent every time a child
+     * finishes a turn, and a steward's parent — the project steward, or the
+     * parent ticket's steward — hears what it needs from the plugin instead:
+     * escalations, and a child's status when it moves. The hierarchy lives in
+     * the bindings. Stewards spawned before this were children; they are let
+     * go here, once per run.
+     */
+    const kept = new Set<string>();
+    async function keepSteward(threadId: string): Promise<void> {
+      if (kept.has(threadId)) return;
+      await tagThread(threadId, STEWARD_BRIEFS);
+      const info = await threadInfo(threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null) return;
+      const parent = info.parentThreadId;
+      if (parent !== null && (store.byThread(parent) !== null || store.projectByThread(parent) !== null)) {
+        try {
+          await bb.sdk.threads.update({ threadId, parentThreadId: null });
+        } catch (error) {
+          bb.log.warn(`stewards: could not un-parent steward ${threadId}: ${errorMessage(error)}`);
+          return;
+        }
+      }
+      kept.add(threadId);
+    }
+
     async function spawnSteward(b: Binding, config: ProjectConfig, playbook: Playbook, prompt: string): Promise<string | null> {
       const projectThread = await ensureProjectSteward(config);
-      const parent = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
-      const parentThread = parent?.threadId ?? projectThread;
       // Stewards decide and delegate; they need no checkout of their own. They
       // share the project steward's environment, and workers get fresh ones.
       const env = projectThread === null ? null : (await threadInfo(projectThread))?.environmentId ?? null;
@@ -625,7 +656,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         projectId: b.projectId,
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : `${b.entityKey}: ${b.title ?? ""}`.trim(),
-        ...(parentThread === null ? {} : { parentThreadId: parentThread }),
         ...modelArgs(stewardModel(b, playbook)),
         pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: STEWARD_BRIEFS },
       };
@@ -638,6 +668,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         thread = await bb.sdk.threads.spawn({ ...base, environment: freshEnvironment(await projectHost(b.projectId)) });
       }
       tagged.add(thread.id);
+      kept.add(thread.id);
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
@@ -744,46 +775,65 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       const currentSpec = specHash(entity, b.threadId);
-      const changes: Array<{ text: string; actionable: boolean }> = [];
+      const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
       if (typeof approval === "object" && lc(entity.state) === lc(approval["linear-state"]) && ready.approval === null) {
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
         changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
       }
-      if (prev !== null) changes.push(...diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor }));
+      const workerRunning = store.workers(b.id).some((w) => w.status === "running");
+      if (prev !== null) changes.push(...diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning }));
       const gate = gateState(playbook, ready, currentSpec);
       if (stage === "build" && b.stage !== "build" && !gate.passed && prev !== null) {
         changes.push({ text: `Moved into a build stage (${entity.state}) before the ready gate passed`, actionable: true });
       }
       if (b.requeueAt !== null && b.requeueAt <= now()) changes.push({ text: "Requeue time came", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
-      // A note queued while the steward was busy can say what this comparison
-      // says again. Comment news is counted from the cursor, which only a wake
-      // moves, so the comparison's count is the current one and a queued count
-      // is stale; anything else is kept once.
-      for (const n of b.pending) {
-        if (isCommentNews(n.text) || changes.some((c) => c.text === n.text)) continue;
-        changes.push({ text: n.text, actionable: true });
+      // A note queued while the steward was busy, or kept quiet, can say what
+      // this comparison says again. Comment news is counted from the cursor,
+      // which only a wake moves, so the comparison's count is the current one
+      // and a queued count is stale; anything else is kept once, and is
+      // actionable if either says so.
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        if (isCommentNews(n.text)) continue;
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
       }
 
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      /**
+       * Keep news for the next turn: what is actionable as a reason for it, the
+       * rest as quiet notes. A quiet comment count is not kept: the next wake
+       * counts from the cursor again.
+       */
+      const keep = (which: Change[]) => {
+        for (const c of which) {
+          if (!c.actionable && isCommentNews(c.text)) continue;
+          if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+        }
+      };
       const due = reason !== null || changes.some((c) => c.actionable);
-      if (!due) return;
-      const lines = changes.map((c) => c.text);
+      if (!due) {
+        // Nothing for a turn now; the steward hears it with the next one.
+        keep(changes);
+        return;
+      }
+      const lines = [...new Set(changes.map((c) => c.text))];
 
       // Not now: keep the news as notes, delivered at the next turn. A held
       // binding still hears from its people (guidance, approvals, lifecycle).
-      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && b.pending.length === 0);
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
       const info = b.threadId === null ? null : await threadInfo(b.threadId);
       if (deferred || (info !== null && busy(info.status))) {
-        const queued = b.pending;
-        const fresh = changes.filter((c) => c.actionable && !queued.some((n) => n.text === c.text));
-        for (const c of fresh) store.note(b.id, c.text);
+        keep(changes);
         if (reason !== null && reason !== "changed") store.note(b.id, `Due: ${reason}`);
         return;
       }
-      await wake(b, config, playbook, observed, lines, reason ?? (b.requeueAt !== null && b.requeueAt <= now() && b.pending.length === 0 ? "requeue" : "changed"));
+      await wake(b, config, playbook, observed, lines, reason ?? (b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"));
     }
 
     // ---- lifecycle -------------------------------------------------------------------------------
@@ -832,11 +882,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Parent ends first: promoted children still open move up a level.
       const up = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
       const next = up !== null && up.endedAt === null ? up : null;
-      const projectThread = store.project(b.projectId).threadId;
       for (const child of store.children(b.id)) {
         store.patch(child.id, { parentBindingId: next?.id ?? null });
-        const parentThreadId = next?.threadId ?? projectThread;
-        if (child.threadId !== null && parentThreadId !== null) await quietly(`re-parent ${child.entityKey}`, () => bb.sdk.threads.update({ threadId: child.threadId!, parentThreadId }));
         store.note(child.id, `Your parent ${b.entityKey} ended (${reason}); you now report to ${next === null ? "the project steward" : next.entityKey}.`);
       }
       bb.log.info(`stewards: ${b.entityKey} ended (${reason})`);
@@ -1063,6 +1110,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (project.digestPending && lastAssistantText !== null && lastAssistantText.trim() !== "") {
           store.patchProject(project.projectId, { digest: clip(lastAssistantText.trim(), 20_000), digestAt: now(), digestPending: false });
         }
+        await compactIfLarge(thread.id);
         return;
       }
       const b = store.byThread(thread.id);
@@ -1079,7 +1127,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await raise(b, "stuck", `The steward ended ${missed} turns in a row without a status report. Look at the thread and say how to continue.`, "Waiting.");
         }
       }
-      if (store.binding(b.id)!.pending.length > 0) scheduleReconcile(b.id);
+      // Compaction makes the thread busy; a wake that finds it so waits as notes for the next idle.
+      await compactIfLarge(thread.id);
+      if (store.binding(b.id)!.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
+    });
+
+    /**
+     * Compact a steward's context once it has grown past the setting, while it
+     * is idle. Every wake carries what the steward needs (DESIGN.md §6), so
+     * its transcript can go; without this a steward's context only grows, and
+     * every later turn reads all of it. A reading already compacted on is not
+     * acted on twice, should the provider not report a new one.
+     */
+    const compactedOn = new Map<string, number>();
+    async function compactIfLarge(threadId: string): Promise<void> {
+      const limit = (await settings.get()).compactAboveTokens;
+      if (!(limit > 0)) return;
+      try {
+        const [usage] = await bb.sdk.threads.events.list({ threadId, types: ["thread/contextWindowUsage/updated"], order: "desc", limit: "1" });
+        const used = (usage?.data as { contextWindowUsage?: { usedTokens?: number | null } } | undefined)?.contextWindowUsage?.usedTokens ?? null;
+        if (used === null || used <= limit || compactedOn.get(threadId) === used) return;
+        compactedOn.set(threadId, used);
+        await bb.sdk.threads.compact({ threadId });
+        bb.log.info(`stewards: compacted ${threadId} at ${used} context tokens`);
+      } catch (error) {
+        bb.log.warn(`stewards: could not compact ${threadId}: ${errorMessage(error)}`);
+      }
+    }
+
+    // A worker that ended its turn to wait (on a watch, a reviewer) is
+    // running again when that wakes it; it is working its pull request.
+    bb.events.on("thread.active", ({ thread }) => {
+      const worker = store.worker(thread.id);
+      if (worker !== null && worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
     });
 
     bb.events.on("thread.failed", ({ thread, error }) => {
@@ -1527,7 +1607,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await keepProjectSteward(config.projectId);
         const playbooks = config.playbooks;
         for (const b of store.open(config.projectId)) {
-          if (b.threadId !== null) await tagThread(b.threadId, STEWARD_BRIEFS);
+          if (b.threadId !== null) await keepSteward(b.threadId);
           if (b.ending !== null && b.endingAt !== null && now() - b.endingAt > timing.endingTimeoutMs) {
             await serial(`b:${b.id}`, () => finishEnding(store.binding(b.id)!, b.ending!));
             continue;
@@ -1771,7 +1851,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     );
 
     // Exposed for tests: drive the loop without timers.
-    testHooks.set(bb.pluginId, { sweep, store, forgetTags: () => tagged.clear(), nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
+    const forgetTags = () => {
+      tagged.clear();
+      kept.clear();
+    };
+    testHooks.set(bb.pluginId, { sweep, store, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
   };
 }
 

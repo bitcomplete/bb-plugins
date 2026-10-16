@@ -11,19 +11,31 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   (`bb-managed` by default) gets a `ticket` steward. A labelled pull request
   in one of the project's repos gets a `pr` steward. Every non-draft pull
   request a teammate opens in those repos gets a `review` steward. Each
-  steward is a child thread of its nearest managed ancestor, or of the
-  project's **project steward**. Stewards make no sidebar sections and pin
-  nothing; the sidebar stays the user's.
+  steward reports to its nearest managed ancestor's steward, or to the
+  project's **project steward**, through its binding — not as a child
+  thread: bb wakes a parent thread every time a child finishes a turn, and
+  on bithub that was 88 of the project steward's 96 turns. Stewards make no
+  sidebar sections and pin nothing; the sidebar stays the user's.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
   the last observation, and the steward is woken only for an actionable
   change: a phase change, a human comment, a review, checks finishing,
   someone else's push, a worker finishing, guidance, an approval, a spec
-  change, or its requeue time. Everything else is recorded and ends there.
+  change, or its requeue time. While one of its workers is running, the
+  worker's own work on a pull request — checks finishing, description
+  edits, pushes and comments from your account, which every thread posts
+  as — is not a reason to wake. Everything not actionable is kept as a
+  quiet note and shown in "What changed" at the next turn something else
+  makes due.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
-  woken turn ends with `steward_report`, the status record.
+  woken turn ends with `steward_report`, the status record. A wake past
+  30,000 characters is cut in its snapshot, never in what changed. Because
+  a wake carries what the steward needs, its transcript can go: after a
+  steward's or the project steward's turn, the plugin compacts its context
+  once it holds more than **Compact a steward above this many context
+  tokens** (120,000 by default; 0 leaves it to the provider).
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a
@@ -35,18 +47,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   steward's thread is archived, and its workers go with their lifecycle
   owner. Reopening, or re-adding the label, wakes the same thread,
   bringing it back from the archive.
-- **thread-briefs.** Every steward is spawned with
-  `threadBriefs: { rename: false, archive: false, ring: false }` in this plugin's
-  metadata namespace, and the project steward also with `group: false`
-  (see thread-briefs' "Threads a plugin runs"). thread-briefs then never
-  renames a steward, whose title carries its entity key, or auto-archives
-  one, which between wakes reads done while its entity is still open, and
+- **thread-briefs.** Every steward, the project steward included, is
+  spawned with `threadBriefs: { rename: false, group: false, archive: false, ring: false }`
+  in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
+  runs"). thread-briefs then never renames a steward, whose title carries
+  its entity key, never moves one into a status section or auto-archives
+  it, since between wakes it reads done while its entity is still open, and
   draws no stage ring on its row, leaving bb's own indicators. Its brief
-  is still written, for the Brief panel and the board. The
-  project steward is kept out of the status sections and is titled
-  "<project name> project steward". The sweep tags threads spawned before
-  this, and renames an older project steward once. After that, a project
-  steward renamed by hand keeps its name.
+  is still written, for the Brief panel and the board. The project steward
+  is titled "<project name> project steward". The sweep tags threads
+  spawned before this, lets go of stewards an earlier version made children
+  of another steward, and renames an older project steward once. After
+  that, a project steward renamed by hand keeps its name.
 - **Workers** are hidden child threads with their own checkout, one per
   bounded task, owned by their steward. A runaway guard stops a steward's
   workers past a per-hour limit.

@@ -16,7 +16,7 @@ const reviews = (() => {
   return p.value;
 })();
 
-const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z" };
+const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerRunning: false };
 const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
 
 describe("what changed", () => {
@@ -58,6 +58,46 @@ describe("what changed", () => {
     expect(lines.every(isCommentNews)).toBe(true);
     expect(isCommentNews("acme/web#7: State: open → merged")).toBe(false);
     expect(isCommentNews('Worker "ENG-12: 1 new comment from Sam" finished its turn.')).toBe(false);
+  });
+
+  it("while a worker runs, its own work on a pull request is not news, and people still are", () => {
+    // HUB-183 on bithub: the worker pushes, edits the description, posts as
+    // the viewer (unsigned, and its reviewer too) and waits for checks.
+    const running = { ...ctx, workerRunning: true };
+    const before = { entity: issue(), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
+    const busy = {
+      entity: issue(),
+      pulls: [
+        pull(
+          { author: "jane", description: "Retries login, with a test.", comments: [comment({ id: "r1", author: "jane", body: "Independent review running in bb thread thr_r." }), comment({ id: "r2", author: "jane", body: "Round 2: all three suggestions taken." })] },
+          { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } },
+        ),
+      ],
+    };
+    const changes = diffObserved(before, busy, running);
+    expect(actionable(changes)).toEqual([]);
+    // Still reported, for the next turn something else makes due.
+    expect(changes.map((c) => c.text)).toEqual(["acme/web#7: Description edited", "acme/web#7: Pushed bbbbbbb by jane", "acme/web#7: Checks finished: success", "acme/web#7: 2 new comments from jane"]);
+    // With no worker running the same checks and edit are news, as before.
+    expect(actionable(diffObserved(before, busy, ctx))).toEqual(["acme/web#7: Description edited", "acme/web#7: Checks finished: success", "acme/web#7: 2 new comments from jane"]);
+
+    const people = {
+      entity: issue({ comments: [comment({ id: "l1", author: "Jane", body: "Please also cover SSO." })] }),
+      pulls: [
+        pull(
+          { author: "jane", state: "merged", comments: [comment({ id: "g1", author: "lee", body: "Why a retry and not a timeout?" })] },
+          { headSha: "ccccccc3", headAuthor: "lee", reviews: [{ author: "lee", state: "changes_requested", submittedAt: "2026-10-02T00:00:00Z", commit: null }] },
+        ),
+      ],
+    };
+    // The ticket's own comments, a teammate's push, review and comment, and the merge all still wake it.
+    expect(actionable(diffObserved(before, people, running))).toEqual([
+      "acme/web#7: State: open → merged",
+      "acme/web#7: Pushed ccccccc by lee",
+      "acme/web#7: Review: lee changes_requested",
+      "1 new comment from Jane",
+      "acme/web#7: 1 new comment from lee",
+    ]);
   });
 
   it("follows a ticket's linked pull requests", () => {

@@ -131,7 +131,8 @@ export const observedSchema = z.object({ entity: entitySnapshotSchema, pulls: z.
 export type Observed = z.infer<typeof observedSchema>;
 
 /** Why a binding is due a judgment turn, queued until the next wake. */
-export const noteSchema = z.object({ at: z.number(), text: z.string() });
+/** A reason for the next judgment turn. A quiet one is news for that turn but does not make it due. */
+export const noteSchema = z.object({ at: z.number(), text: z.string(), quiet: z.boolean().optional() });
 export type Note = z.infer<typeof noteSchema>;
 
 
@@ -439,10 +440,16 @@ export function createStore(db: Database.Database, now: () => number) {
       return rowToBinding(getBinding.get(id)!);
     },
     patch,
-    /** Queue a reason for the next judgment turn. */
-    note(id: string, text: string): Binding {
+    /** Queue a reason for the next judgment turn; a quiet one waits for a turn something else makes due. */
+    note(id: string, text: string, quiet = false): Binding {
       const b = rowToBinding(getBinding.get(id)!);
-      return patch(id, { pending: [...b.pending, { at: now(), text }].slice(-30) });
+      const pending = [...b.pending, quiet ? { at: now(), text, quiet } : { at: now(), text }];
+      // Past thirty, the oldest quiet note goes first, then the oldest of any.
+      while (pending.length > 30) {
+        const i = pending.findIndex((n) => n.quiet === true);
+        pending.splice(i === -1 ? 0 : i, 1);
+      }
+      return patch(id, { pending });
     },
     addGuidance(id: string, text: string, by: string): Binding {
       const b = rowToBinding(getBinding.get(id)!);

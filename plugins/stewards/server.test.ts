@@ -20,7 +20,9 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
   const rpcCalls: Call[] = [];
-  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null }>();
+  /** Each thread's latest context window reading, as bb reports it. */
+  const usage = new Map<string, number>();
   const metadata = new Map<string, Record<string, unknown>>();
   const spawns: Array<Record<string, unknown> & { id: string }> = [];
   const sends: Array<{ threadId: string; text: string }> = [];
@@ -80,7 +82,7 @@ function world() {
       get: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
-        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code" });
+        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null });
       },
       archive: async ({ threadId }: { threadId: string }) => {
         threads.get(threadId)!.archivedAt = 1;
@@ -91,24 +93,30 @@ function world() {
         return {};
       },
       stop: async () => ({}),
-      update: async (args: { threadId: string; title?: string }) => {
+      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null }) => {
         const t = threads.get(args.threadId);
         if (t !== undefined && args.title !== undefined) t.title = args.title;
+        if (t !== undefined && args.parentThreadId !== undefined) t.parentThreadId = args.parentThreadId;
         return {};
       },
+      compact: async () => ({ ok: true }),
       updatePluginMetadata: async (args: { threadId: string; set?: Record<string, unknown> }) => {
         const next = { ...(metadata.get(args.threadId) ?? {}), ...(args.set ?? {}) };
         metadata.set(args.threadId, next);
         return next;
       },
       events: {
-        list: async ({ threadId }: { threadId: string }) =>
-          userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
+        list: async ({ threadId, types }: { threadId: string; types?: string[] }) =>
+          types?.includes("thread/contextWindowUsage/updated")
+            ? usage.has(threadId)
+              ? [{ id: "u", seq: 1, threadId, createdAt: now, scope: "thread", type: "thread/contextWindowUsage/updated", data: { contextWindowUsage: { usedTokens: usage.get(threadId), modelContextWindow: 1_000_000, estimated: true } } }]
+              : []
+            : userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
       },
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, repos, entities, rpcCalls, threads, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, repos, entities, rpcCalls, threads, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup() {
@@ -146,7 +154,7 @@ async function setup() {
 }
 
 describe("a Linear ticket steward", () => {
-  it("is adopted from a ring, under the project steward, with a self-contained wake", async () => {
+  it("is adopted from a ring, beside the project steward rather than under it, with a self-contained wake", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -160,7 +168,9 @@ describe("a Linear ticket steward", () => {
     // No sidebar sections or pins: the sidebar is the user's.
     expect(project).not.toHaveProperty("pinned");
     expect(steward).not.toHaveProperty("sectionId");
-    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, archive: false, ring: false } } });
+    expect(steward).toMatchObject({ title: "ENG-12: Fix login", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false, ring: false } } });
+    // No parent: bb would wake a parent every time a steward finishes a turn.
+    expect(steward).not.toHaveProperty("parentThreadId");
     const prompt = String(steward!.prompt);
     expect(prompt).toMatch(/# Steward wake: ENG-12 — Fix login/u);
     expect(prompt).toMatch(/You have just been bound/u);
@@ -333,6 +343,71 @@ describe("a Linear ticket steward", () => {
     expect(wake).toMatch(/Opened acme\/web#7\./u);
   });
 
+  it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const sent = t.sends.length;
+
+    // The worker's checks finish and it posts (as the viewer, unsigned) about its review round.
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "w1", author: "jane", body: "Round 2: suggestions taken.", createdAt: "2026-10-14T16:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.sends).toHaveLength(sent);
+
+    // A teammate's comment is news, and the wake carries what was kept.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked, comments: [comment({ createdAt: "2026-10-14T16:30:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends).toHaveLength(sent + 1);
+    const wake = t.sends.at(-1)!.text;
+    const changed = wake.slice(wake.indexOf("## 5. What changed"));
+    expect(changed).toMatch(/acme\/web#7: Checks finished: success/u);
+    expect(changed).toMatch(/acme\/web#7: 1 new comment from jane/u);
+    expect(changed).toMatch(/- 1 new comment from Sam/u);
+    // Delivered once: the next turn starts from nothing kept.
+    expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
+  });
+
+  it("counts a worker woken again (by a watch, a reviewer) as running", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Watching acme/web#7 for the review.");
+    const binding = t.hooks.store.open("p1")[0]!.id;
+    expect(t.hooks.store.workers(binding)[0]).toMatchObject({ status: "finished" });
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.workers(binding)[0]).toMatchObject({ status: "running", result: "Watching acme/web#7 for the review." });
+  });
+
+  it("compacts a steward whose context has grown past the setting, once per reading", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const compacted = () => t.harness.sdk.callsTo("threads.compact").map(([args]) => (args as { threadId: string }).threadId);
+
+    t.usage.set(steward!, 90_000);
+    await t.idle(steward!);
+    expect(compacted()).toEqual([]);
+
+    t.usage.set(steward!, 130_000);
+    await t.idle(steward!);
+    expect(compacted()).toEqual([steward]);
+    // The same reading again (the provider has not reported since): not twice.
+    await t.idle(steward!);
+    expect(compacted()).toEqual([steward]);
+
+    t.usage.set(project!, 200_000);
+    await t.idle(project!);
+    expect(compacted()).toEqual([steward, project]);
+  });
+
   it("stops a looping steward's workers past the runaway guard", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
@@ -385,12 +460,44 @@ describe("the project steward", () => {
     await t.hooks.sweep();
     expect(t.threads.get(project!.id)!.title).toBe("Acme project steward");
     expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
-    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, archive: false, ring: false } });
+    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
 
     // A name given by hand afterwards sticks.
     t.threads.get(project!.id)!.title = "Acme overseer";
     await t.hooks.sweep();
     expect(t.threads.get(project!.id)!.title).toBe("Acme overseer");
+  });
+});
+
+describe("stewards and the sidebar", () => {
+  it("lets go of stewards an earlier version spawned as the project steward's children", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    t.threads.get(steward!)!.parentThreadId = project!;
+    t.threads.set("thr_mine", { status: "idle", archivedAt: null, parentThreadId: steward! });
+
+    t.hooks.forgetTags();
+    await t.hooks.sweep();
+    expect(t.threads.get(steward!)!.parentThreadId).toBeNull();
+    expect(t.harness.sdk.callsTo("threads.update").map(([args]) => args)).toContainEqual({ threadId: steward, parentThreadId: null });
+    // Only once per run.
+    const updates = t.harness.sdk.callsTo("threads.update").length;
+    await t.hooks.sweep();
+    expect(t.harness.sdk.callsTo("threads.update")).toHaveLength(updates);
+  });
+
+  it("cuts a long wake in its snapshot, never in what changed", async () => {
+    const t = await setup();
+    const long = Array.from({ length: 40 }, (_, i) => comment({ id: `c${i}`, body: `${"x".repeat(1400)} ${i}`, createdAt: `2026-10-02T00:${String(i).padStart(2, "0")}:00Z` }));
+    t.entities.set("uuid-12", issue({ comments: long }));
+    await t.ring("linear", "uuid-12");
+    const wake = String(t.spawns[1]!.prompt);
+    expect(wake.length).toBeLessThanOrEqual(30_000);
+    expect(wake).toMatch(/more characters\)/u);
+    expect(wake).toMatch(/## 5\. What changed since your last turn/u);
+    expect(wake).toMatch(/End your turn with steward_report/u);
   });
 });
 

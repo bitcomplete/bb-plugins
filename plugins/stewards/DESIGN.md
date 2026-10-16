@@ -197,8 +197,11 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 - The plugin hears triggers through bb-gate-hooks `team` and `repo` leases,
   which already exist. The nightly pass re-lists labelled tickets and open
   pull requests as the correctness backstop.
-- A new steward is spawned as a child thread of its nearest managed
-  ancestor's steward, or of the project steward when it has none.
+- A new steward reports to its nearest managed ancestor's steward, or to the
+  project steward when it has none. That is the binding's parent, not the
+  thread's: bb wakes a parent thread every time a child finishes a turn,
+  which made the project steward a reader of every steward's every turn
+  (on bithub, 88 of its first 96 turns). Stewards are threads of their own.
 - `--lifecycle-owner-thread` is used only between a steward and its workers.
   Stewards end on their own entity's terms.
 - Your own pull requests get no review steward. They belong to the ticket
@@ -270,9 +273,15 @@ Plugin code. No model turn.
    - guidance changed, an escalation resolved, an approval given or voided;
    - the spec changed (description edited, spec comment added);
    - `requeueAfter` came due.
+   While one of the steward's workers is running, its own work on a pull
+   request is not actionable: checks finishing, description edits, and
+   pushes and comments from the developer's account, which the worker and
+   the reviewers it starts post as, often unsigned. People, merges and
+   closes still are.
 4. Otherwise the snapshot is recorded and the ring ends. Most rings end here:
-   the steward's own comments, label churn, pushes by its own workers while
-   checks run.
+   the steward's own comments, label churn, its workers at work. What
+   changed is kept as a quiet note and shown with the next turn something
+   else makes due.
 
 ### Judgment tier
 
@@ -284,8 +293,13 @@ The steward is woken with one message in a fixed form:
 4. The snapshot.
 5. What changed since its last turn.
 
-Each wake is self-contained, so compaction can be aggressive. The steward acts
-and must end its turn with `steward_report`, which writes the status record:
+Each wake is self-contained, so compaction can be aggressive, and it is: after
+a steward's or the project steward's turn the plugin compacts its context once
+it holds more than a setting (120,000 tokens by default). Left to the provider,
+compaction comes near the window's end, and every turn before then reads the
+whole transcript. A wake too long to send is cut in its snapshot, never in
+what changed. The steward acts and must end its turn with `steward_report`,
+which writes the status record:
 
 | Field | Holds |
 |---|---|
@@ -507,11 +521,12 @@ requeue-default: 2d
 
 ## 15. Organization
 
-- Stewards are child threads of their nearest managed ancestor's steward, or
-  of the project steward. The plugin creates no sidebar sections and pins
-  nothing; how the sidebar is organized is the user's and thread-briefs'.
-  The project steward is titled "<project name> project steward" and kept
-  out of thread-briefs' status sections, so it stays where you put it.
+- Stewards are no thread's children (§4): who reports to whom is in the
+  bindings. The plugin creates no sidebar sections and pins nothing; how the
+  sidebar is organized is the user's. Stewards, the project steward
+  included, are kept out of thread-briefs' status sections, where one idle
+  between wakes would read done, so they stay where you put them. The
+  project steward is titled "<project name> project steward".
 - Workers are hidden children of their steward, started by the steward with
   `bb thread spawn --project … --parent-self --lifecycle-owner-thread …
   --visibility hidden` and recognized by the plugin as children of a steward thread.
