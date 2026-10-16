@@ -113,7 +113,8 @@ export const subscribeResponseSchema = z.object({
   rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
 });
 export type SubscribeResponse = z.infer<typeof subscribeResponseSchema>;
-export type Rejection = SubscribeResponse["rejected"][number];
+/** A refused lease, with the workspace it was asked for under. */
+export type Rejection = SubscribeResponse["rejected"][number] & { account?: string };
 
 /**
  * One thing to lease. `issue` rings for that issue; `team` (a team UUID)
@@ -121,7 +122,12 @@ export type Rejection = SubscribeResponse["rejected"][number];
  * for stewards only: a watch is always on an issue.
  */
 export type LeaseKind = "issue" | "team";
-export type Lease = { kind: LeaseKind; id: string };
+/**
+ * `account` names the Linear workspace whose token proves the lease; leases
+ * for different workspaces go in separate calls on the same connection.
+ * Absent is the caller's only account.
+ */
+export type Lease = { kind: LeaseKind; id: string; account?: string };
 
 export class HooksRequestError extends Error {
   constructor(
@@ -206,10 +212,10 @@ export interface HooksLoopDeps {
   baseUrl: string;
   now: () => number;
   log: { info(message: string): void; warn(message: string): void };
-  /** The developer's current access token, refreshed if it is about to expire. */
-  token: () => Promise<string>;
-  /** A new token, whatever the old one's expiry says: the service reported Linear refused it. */
-  refreshToken: () => Promise<string>;
+  /** The developer's current access token for a workspace, refreshed if it is about to expire. */
+  token: (account?: string) => Promise<string>;
+  /** A new token for a workspace, whatever the old one's expiry says: the service reported Linear refused it. */
+  refreshToken: (account?: string) => Promise<string>;
   /** Everything to hold leases for, right now: watched issues, and stewards' issues and teams. */
   leases: () => Lease[];
   /** A doorbell for an issue: look at it again. `unit` is its team's UUID, or null when the doorbell did not name one. */
@@ -251,6 +257,8 @@ export interface HooksLoop {
   run(signal: AbortSignal): Promise<void>;
   /** Leases were just added (a watch, or stewards' interest): lease them now if there is a connection. The next hello covers them otherwise. */
   added(kind: LeaseKind, ...ids: string[]): Promise<void>;
+  /** The same, for leases that name their workspace. */
+  addedLeases(leases: Lease[]): Promise<void>;
   /** Whether a connection is up and leased; for status lines and tests. */
   readonly connected: boolean;
   /** What the loop is doing and how busy it has been; for the usage view. */
@@ -334,20 +342,36 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     if (connection === null) return false;
     const current = connection;
     const started = deps.now();
+    // One workspace's token proves only its own issues and teams, so each
+    // workspace's leases are a call of their own. Every group must succeed
+    // for the renewal to count; a failed one fails the renewal and triggers
+    // the sweep.
+    const groups = new Map<string | undefined, Lease[]>();
+    for (const l of leases) groups.set(l.account, [...(groups.get(l.account) ?? []), l]);
+    let ok = true;
+    for (const [account, group] of groups) {
+      if (!(await leaseGroup(current, account, group, signal))) ok = false;
+      if (connection !== current) return false;
+    }
+    if (ok && connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
+    return ok;
+  }
+
+  async function leaseGroup(current: string, account: string | undefined, leases: Lease[], signal: AbortSignal): Promise<boolean> {
+    const named = account === undefined ? "" : ` for ${account}`;
     try {
       let result: SubscribeResponse;
       try {
-        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.token(), leases, signal);
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.token(account), leases, signal);
       } catch (error) {
         // 401 is about the token, not any entity: Linear refused it on the
         // service's side. Refresh regardless of what the expiry says and try
         // once more; nothing was admitted or dropped.
         if (!(error instanceof HooksRequestError && error.status === 401)) throw error;
-        deps.log.warn("bb-gate-hooks says Linear refused the token; refreshing and retrying");
-        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(), leases, signal);
+        deps.log.warn(`bb-gate-hooks says Linear refused the token${named}; refreshing and retrying`);
+        result = await subscribe(deps.fetch, deps.baseUrl, current, await deps.refreshToken(account), leases, signal);
       }
-      if (connection === current) leasedUntil = Math.max(leasedUntil, started + leaseMs);
-      if (result.rejected.length > 0) await deps.onRejected(result.rejected);
+      if (result.rejected.length > 0) await deps.onRejected(result.rejected.map((r) => (account === undefined ? r : { ...r, account })));
       return true;
     } catch (error) {
       if (signal.aborted) return false;
@@ -367,7 +391,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         }
         return false;
       }
-      deps.log.warn(`Linear watch lease failed: ${errorMessage(error)}`);
+      deps.log.warn(`Linear watch lease${named} failed: ${errorMessage(error)}`);
       return false;
     }
   }
@@ -460,6 +484,11 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     async added(kind, ...ids) {
       if (connection === null || stream === null || ids.length === 0) return;
       await lease(ids.map((id) => ({ kind, id })), stream.signal);
+    },
+
+    async addedLeases(leases) {
+      if (connection === null || stream === null || leases.length === 0) return;
+      await lease(leases, stream.signal);
     },
 
     async run(signal) {

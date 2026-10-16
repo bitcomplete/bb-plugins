@@ -66,6 +66,10 @@ export const WATCH_MIGRATIONS = [
   `ALTER TABLE watches ADD COLUMN last_checked_at INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE watches ADD COLUMN last_woke_at INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE watches ADD COLUMN recent_wakes TEXT NOT NULL DEFAULT '[]'`,
+  // The Linear workspace (organization urlKey) the issue was read in. NULL
+  // on watches made before several workspaces could be connected: those
+  // are read in the default one.
+  `ALTER TABLE watches ADD COLUMN account TEXT`,
 ];
 
 // ---- usage ---------------------------------------------------------------------
@@ -235,6 +239,8 @@ export type WatchRow = {
   projectId: string;
   issueId: string;
   issueKey: string;
+  /** The workspace the issue lives in; null (or absent) means the default one. */
+  account?: string | null;
   snapshot: Snapshot;
   updatedAt: string;
   lastCommentAt: string;
@@ -291,6 +297,7 @@ type Row = {
   last_checked_at: number;
   last_woke_at: number;
   recent_wakes: string;
+  account: string | null;
 };
 
 function parseRecentWakes(raw: string): number[] {
@@ -309,6 +316,7 @@ function rowToWatch(row: Row): WatchRow {
     projectId: row.project_id,
     issueId: row.issue_id,
     issueKey: row.issue_key,
+    account: row.account,
     // A snapshot an older build wrote is treated as empty: every field then
     // reads as changed once, which beats refusing to watch at all.
     snapshot: parsed.success ? parsed.data : { title: null, state: null, assignee: null, priority: null, labels: [], project: null, cycle: null, parent: null, dueDate: null, estimate: null, descriptionHash: null },
@@ -336,6 +344,8 @@ export interface WatchStore {
   get(threadId: string, issueId: string): WatchRow | null;
   /** Every distinct issue id with at least one watch: what to lease. */
   issueIds(): string[];
+  /** The same, each with the workspace it was read in (null: the default). */
+  issues(): Array<{ issueId: string; account: string | null }>;
   /** After a check: the new memory, the check counted, and whether the thread was woken (activity, and counted too). */
   advance(threadId: string, issueId: string, outcome: CheckOutcome, woke: boolean): void;
   remove(threadId: string, issueId: string): void;
@@ -346,14 +356,17 @@ export interface WatchStore {
 
 export function createWatchStore(db: Database.Database, now: () => number): WatchStore {
   const insert = db.prepare(
-    `INSERT INTO watches (thread_id, project_id, issue_id, issue_key, snapshot, updated_at, last_comment_at, created_at, last_activity_at)
-     VALUES (@thread_id, @project_id, @issue_id, @issue_key, @snapshot, @updated_at, @last_comment_at, @created_at, @last_activity_at)`,
+    `INSERT INTO watches (thread_id, project_id, issue_id, issue_key, account, snapshot, updated_at, last_comment_at, created_at, last_activity_at)
+     VALUES (@thread_id, @project_id, @issue_id, @issue_key, @account, @snapshot, @updated_at, @last_comment_at, @created_at, @last_activity_at)`,
   );
   const countForThread = db.prepare<[string], { n: number }>("SELECT COUNT(*) AS n FROM watches WHERE thread_id = ?");
   const selectOne = db.prepare<[string, string], Row>("SELECT * FROM watches WHERE thread_id = ? AND issue_id = ?");
   const selectAll = db.prepare<[], Row>("SELECT * FROM watches ORDER BY created_at");
   const selectIssue = db.prepare<[string], Row>("SELECT * FROM watches WHERE issue_id = ? ORDER BY created_at");
   const selectIds = db.prepare<[], { issue_id: string }>("SELECT DISTINCT issue_id FROM watches ORDER BY issue_id");
+  // An issue lives in one workspace, so its watches agree; MAX prefers a
+  // named workspace over a NULL left by an older build.
+  const selectIssues = db.prepare<[], { issue_id: string; account: string | null }>("SELECT issue_id, MAX(account) AS account FROM watches GROUP BY issue_id ORDER BY issue_id");
   const touch = db.prepare("UPDATE watches SET last_activity_at = ? WHERE thread_id = ? AND issue_id = ?");
   const update = db.prepare("UPDATE watches SET snapshot = ?, updated_at = ?, last_comment_at = ?, issue_key = ?, checks = checks + 1, last_checked_at = ? WHERE thread_id = ? AND issue_id = ?");
   const updateWoke = db.prepare(
@@ -376,6 +389,7 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
       project_id: watch.projectId,
       issue_id: watch.issueId,
       issue_key: watch.issueKey,
+      account: watch.account ?? null,
       snapshot: JSON.stringify(watch.snapshot),
       updated_at: watch.updatedAt,
       last_comment_at: watch.lastCommentAt,
@@ -394,6 +408,7 @@ export function createWatchStore(db: Database.Database, now: () => number): Watc
       return row === undefined ? null : rowToWatch(row);
     },
     issueIds: () => selectIds.all().map((r) => r.issue_id),
+    issues: () => selectIssues.all().map((r) => ({ issueId: r.issue_id, account: r.account })),
     advance: (threadId, issueId, outcome, woke) => {
       const snapshot = JSON.stringify(outcome.snapshot);
       const at = now();

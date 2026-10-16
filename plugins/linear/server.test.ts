@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { signature, WATCH_LIMIT } from "./watch.js";
 import { createLinearPlugin, REFRESH_MARGIN_MS } from "./server.js";
+import { parseAccounts, serializeAccounts, type Account } from "./accounts.js";
 
 const APP_URL = "https://bb.example";
 const CALLBACK = "https://bb.example/api/v1/plugins/linear/http/connect/callback";
@@ -12,7 +13,7 @@ const DAY_MS = 86_400_000;
 type Answer = (body: { query: string; variables?: Record<string, unknown> }, token: string) => unknown;
 
 // A Linear whose token endpoint and GraphQL endpoint a test scripts.
-function fakeLinear(options: { answer?: Answer; tokens?: () => Record<string, unknown>; valid?: (token: string) => boolean } = {}) {
+function fakeLinear(options: { answer?: Answer; tokens?: () => Record<string, unknown>; valid?: (token: string) => boolean; organization?: (token: string) => { name: string; urlKey: string } } = {}) {
   const calls: Array<{ url: string; form?: URLSearchParams; token?: string; body?: { query: string; variables?: Record<string, unknown> } }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
@@ -31,7 +32,7 @@ function fakeLinear(options: { answer?: Answer; tokens?: () => Record<string, un
       calls.push({ url: u, token, body });
       if (options.valid !== undefined && !options.valid(token)) return Response.json({ errors: [{ message: "unauthorized" }] }, { status: 401 });
       if (body.query.startsWith("query { viewer")) {
-        return Response.json({ data: { viewer: { id: "u1", name: "Jane", displayName: "jane", email: "jane@acme.test" }, organization: { name: "Acme", urlKey: "acme" } } });
+        return Response.json({ data: { viewer: { id: "u1", name: "Jane", displayName: "jane", email: "jane@acme.test" }, organization: options.organization?.(token) ?? { name: "Acme", urlKey: "acme" } } });
       }
       return Response.json(options.answer?.(body, token) ?? { data: {} });
     }
@@ -116,28 +117,62 @@ async function setup(
     sdk?: Parameters<typeof createFakePluginHost>[0] extends { sdk?: infer S } | undefined ? S : never;
     /** kv the plugin finds when it starts, as after a restart. */
     kv?: Record<string, unknown>;
+    /** Connected to the acme workspace with this access token. */
+    token?: string;
+    refreshToken?: string;
+    /** More connected workspaces, beside acme's. */
+    accounts?: Account[];
   } = {},
 ) {
+  const seeded: Account[] = [
+    ...(options.token === undefined ? [] : [account("acme", options.token, { refreshToken: options.refreshToken ?? null, expiresAt: options.expiresAt ?? null })]),
+    ...(options.accounts ?? []),
+  ];
   const { bb, harness } = createFakePluginHost({
     pluginId: "linear",
     appUrl: APP_URL,
-    settings: { clientId: "client-1", ...options.settings },
+    settings: { clientId: "client-1", ...(seeded.length === 0 ? {} : { accounts: serializeAccounts(seeded) }), ...options.settings },
     ...(options.sdk === undefined ? {} : { sdk: options.sdk }),
   });
   const linear = fakeLinear(options.linear);
   let now = 1_000_000_000_000;
   for (const [key, value] of Object.entries(options.kv ?? {})) await bb.storage.kv.set(key, value);
+  // The plugin's own settings handle, so a test can read what it stored (the fake host has no getter).
+  let handle!: { get(): Promise<Record<string, unknown>> };
+  const define = bb.settings.define.bind(bb.settings);
+  bb.settings.define = ((descriptors: Parameters<typeof define>[0]) => (handle = define(descriptors))) as typeof define;
   const fetchImpl = (options.hooks === undefined ? linear.fetchImpl : ((url, init) => (String(url).startsWith(HOOKS_URL) ? options.hooks!.fetchImpl(url, init) : linear.fetchImpl(url, init))) as typeof fetch);
   await createLinearPlugin({ fetch: fetchImpl, now: () => now, env: options.env ?? {} })(bb);
-  if (options.expiresAt !== undefined) await bb.storage.kv.set("expiresAt", options.expiresAt);
+  if (options.expiresAt !== undefined && options.token === undefined) await bb.storage.kv.set("expiresAt", options.expiresAt);
   const route = harness.registrations.httpRoutes.find((r) => r.path === "/connect/callback")!;
   const app = new Hono().get("/cb", route.handler);
   const callback = (query: Record<string, string>) => app.request(`/cb?${new URLSearchParams(query)}`);
   const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
-  return { bb, harness, linear, callback, route, tool, text, advance: (ms: number) => (now += ms), now: () => now };
+  const stored = async () => parseAccounts((await handle.get()).accounts as string | undefined);
+  /** Move one workspace's token expiry, as time passing would. */
+  const setExpiry = async (key: string, expiresAt: number | null) =>
+    void (await harness.setSettings({ accounts: serializeAccounts((await stored()).map((a) => (a.key === key ? { ...a, expiresAt } : a))) }));
+  return { bb, harness, linear, callback, route, tool, text, stored, setExpiry, advance: (ms: number) => (now += ms), now: () => now };
 }
+
+/** A connected workspace as the accounts setting stores it. */
+function account(key: string, accessToken: string, over: Partial<Account> = {}): Account {
+  return {
+    key,
+    accessToken,
+    refreshToken: null,
+    expiresAt: null,
+    user: { id: key === "acme" ? "u1" : `u-${key}`, name: "jane", email: "jane@acme.test" },
+    organization: { name: key === "acme" ? "Acme" : key[0]!.toUpperCase() + key.slice(1), urlKey: key },
+    connectedAt: key === "acme" ? 1 : 2,
+    ...over,
+  };
+}
+
+/** GraphQL calls other than the viewer query a connect or a pasted token makes. */
+const reads = (calls: ReturnType<typeof fakeLinear>["calls"]) => calls.filter((c) => c.body !== undefined && !c.body.query.startsWith("query { viewer"));
 
 describe("connect", () => {
   it("sends the browser to Linear with PKCE and this server's callback", async () => {
@@ -172,7 +207,7 @@ describe("connect", () => {
   });
 
   it("exchanges the code with the verifier, stores the tokens, and learns who connected", async () => {
-    const { bb, harness, callback, linear, now } = await setup();
+    const { harness, callback, linear, now, stored } = await setup();
     const { url } = (await harness.callRpc("connect", null)) as { url: string };
     const sent = new URL(url).searchParams;
 
@@ -194,8 +229,9 @@ describe("connect", () => {
       user: { id: "u1", name: "jane", email: "jane@acme.test" },
       organization: { name: "Acme", urlKey: "acme" },
       linearUrl: "https://linear.app",
+      accounts: [{ key: "acme", user: { id: "u1", name: "jane", email: "jane@acme.test" }, organization: { name: "Acme", urlKey: "acme" }, isDefault: true }],
     });
-    expect(await bb.storage.kv.get("expiresAt")).toBe(now() + DAY_MS);
+    expect(await stored()).toEqual([expect.objectContaining({ key: "acme", accessToken: "at-authorization_code", refreshToken: "rt-1", expiresAt: now() + DAY_MS })]);
     expect(harness.realtimeSignals.some((s) => s.channel === "connection-changed")).toBe(true);
 
     // The state is single-use.
@@ -225,13 +261,13 @@ describe("connect", () => {
   });
 
   it("disconnect revokes the token and forgets the connection", async () => {
-    const { bb, harness, callback, linear } = await setup();
+    const { harness, callback, linear, stored } = await setup();
     const { url } = (await harness.callRpc("connect", null)) as { url: string };
     await callback({ code: "c", state: new URL(url).searchParams.get("state")! });
     expect(await harness.callRpc("disconnect", null)).toEqual({ ok: true });
     expect(linear.calls.find((c) => c.url.endsWith("/oauth/revoke"))?.token).toBe("Bearer at-authorization_code");
-    expect(await harness.callRpc("status", null)).toMatchObject({ connected: false, user: null });
-    expect(await bb.storage.kv.get("expiresAt")).toBeUndefined();
+    expect(await harness.callRpc("status", null)).toMatchObject({ connected: false, user: null, accounts: [] });
+    expect(await stored()).toEqual([]);
   });
 });
 
@@ -251,7 +287,7 @@ describe("tools", () => {
 
   it("linear_issue reads an issue as the connected user", async () => {
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: { answer: (body) => (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier title") ? { data: { issue: issue() } } : { data: {} }) },
     });
     const out = text(await tool("linear_issue", { key: "eng-123" }));
@@ -263,13 +299,13 @@ describe("tools", () => {
   });
 
   it("linear_issue reports a missing issue as an error", async () => {
-    const { tool } = await setup({ settings: { accessToken: "at-0" }, linear: { answer: () => ({ data: { issue: null } }) } });
+    const { tool } = await setup({ token: "at-0", linear: { answer: () => ({ data: { issue: null } }) } });
     expect(await tool("linear_issue", { key: "ENG-999" })).toMatchObject({ isError: true });
   });
 
   it("linear_search lists issues, filtering open ones by default", async () => {
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: { answer: (body) => ({ data: body.query.includes("searchIssues") ? { searchIssues: { nodes: [issue()] } } : { issues: { nodes: [issue(), issue({ identifier: "ENG-124", title: "Other" })] } } }) },
     });
     const listed = text(await tool("linear_search", { team: "eng", assignee: "me" }));
@@ -287,7 +323,7 @@ describe("tools", () => {
 
   it("linear_comment signs the comment with the thread and reports the URL", async () => {
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) =>
           body.query.startsWith("mutation($input: CommentCreateInput!)")
@@ -314,7 +350,7 @@ describe("tools", () => {
       team: { ...(issue().team as object), labels: { nodes: [{ id: "l-bug", name: "Bug" }, { id: "l-ready", name: "build-ready" }, { id: "l-agent", name: "agent" }] } },
     });
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) => {
           if (body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")) {
@@ -370,7 +406,7 @@ describe("tools", () => {
       labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
     };
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) => {
           if (body.query.startsWith("mutation($input: IssueCreateInput!)")) return { data: { issueCreate: { success: true, issue: { identifier: "ENG-124", url: "https://linear.app/acme/issue/ENG-124" } } } };
@@ -414,7 +450,7 @@ describe("tools", () => {
   });
 
   it("linear_query runs queries and refuses mutations", async () => {
-    const { tool, text, linear } = await setup({ settings: { accessToken: "at-0" }, linear: { answer: () => ({ data: { teams: { nodes: [{ key: "ENG" }] } } }) } });
+    const { tool, text, linear } = await setup({ token: "at-0", linear: { answer: () => ({ data: { teams: { nodes: [{ key: "ENG" }] } } }) } });
     expect(JSON.parse(text(await tool("linear_query", { query: "{ teams { nodes { key } } }" })))).toEqual({ teams: { nodes: [{ key: "ENG" }] } });
     const refused = await tool("linear_query", { query: "mutation { issueDelete(id: \"x\") { success } }" });
     expect(refused).toMatchObject({ isError: true });
@@ -424,18 +460,18 @@ describe("tools", () => {
 
 describe("refresh", () => {
   it("refreshes a token about to expire before using it", async () => {
-    const { bb, tool, text, linear, now } = await setup({
-      settings: { accessToken: "at-old", refreshToken: "rt-old" },
+    const { tool, text, linear, now, stored, setExpiry } = await setup({
+      token: "at-old", refreshToken: "rt-old",
       expiresAt: 0,
       linear: { answer: () => ({ data: { issue: issue() } }), tokens: () => ({ access_token: "at-new", refresh_token: "rt-new", expires_in: 3600 }) },
     });
-    await bb.storage.kv.set("expiresAt", now() + REFRESH_MARGIN_MS - 1);
+    await setExpiry("acme", now() + REFRESH_MARGIN_MS - 1);
     expect(text(await tool("linear_issue", { key: "ENG-123" }))).toContain("ENG-123");
     const refreshed = linear.calls.find((c) => c.form !== undefined)!.form!;
     expect(refreshed.get("grant_type")).toBe("refresh_token");
     expect(refreshed.get("refresh_token")).toBe("rt-old");
     expect(linear.calls.find((c) => c.body !== undefined)!.token).toBe("at-new");
-    expect(await bb.storage.kv.get("expiresAt")).toBe(now() + 3600 * 1000);
+    expect(await stored()).toEqual([expect.objectContaining({ accessToken: "at-new", refreshToken: "rt-new", expiresAt: now() + 3600 * 1000 })]);
     // Next call uses the new token without refreshing again.
     await tool("linear_issue", { key: "ENG-123" });
     expect(linear.calls.filter((c) => c.form !== undefined)).toHaveLength(1);
@@ -444,7 +480,7 @@ describe("refresh", () => {
 
   it("refreshes once when Linear refuses the token, then retries", async () => {
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-dead", refreshToken: "rt-1" },
+      token: "at-dead", refreshToken: "rt-1",
       linear: { answer: () => ({ data: { issue: issue() } }), valid: (t) => t !== "at-dead", tokens: () => ({ access_token: "at-live", expires_in: 3600 }) },
     });
     expect(text(await tool("linear_issue", { key: "ENG-123" }))).toContain("ENG-123");
@@ -454,25 +490,25 @@ describe("refresh", () => {
   });
 
   it("tells the agent to reconnect when there is no refresh token to try", async () => {
-    const { tool, text } = await setup({ settings: { accessToken: "at-dead" }, linear: { valid: () => false } });
+    const { tool, text } = await setup({ token: "at-dead", linear: { valid: () => false } });
     const result = await tool("linear_issue", { key: "ENG-123" });
     expect(result).toMatchObject({ isError: true });
     expect(text(result)).toContain("Connect Linear again");
   });
 
   it("refreshes once for two concurrent calls", async () => {
-    const { bb, tool, linear, now } = await setup({
-      settings: { accessToken: "at-old", refreshToken: "rt-old" },
+    const { tool, linear, now, setExpiry } = await setup({
+      token: "at-old", refreshToken: "rt-old",
       linear: { answer: () => ({ data: { issue: issue() } }), tokens: () => ({ access_token: "at-new", refresh_token: "rt-new", expires_in: 3600 }) },
     });
-    await bb.storage.kv.set("expiresAt", now());
+    await setExpiry("acme", now());
     await Promise.all([tool("linear_issue", { key: "ENG-1" }), tool("linear_issue", { key: "ENG-2" })]);
     expect(linear.calls.filter((c) => c.form !== undefined)).toHaveLength(1);
   });
 });
 
 describe("bb linear", () => {
-  const connected = (answer?: Answer) => setup({ settings: { accessToken: "at-0" }, linear: { answer } });
+  const connected = (answer?: Answer) => setup({ token: "at-0", linear: { answer } });
 
   it("is registered as `bb linear` and renders help without a connection", async () => {
     const { harness } = await setup();
@@ -567,14 +603,14 @@ describe("watching an issue", () => {
     const live = liveLinear();
     const hooks = over.hooks ?? fakeHooks();
     const send = vi.fn((over.send ?? (async () => ({ kind: "sent" }))) as (args: unknown) => unknown);
-    const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send } } });
+    const s = await setup({ token: "at-0", env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send } } });
     const rows = () => s.bb.storage.database().prepare("SELECT thread_id, issue_id, issue_key, updated_at, last_comment_at FROM watches ORDER BY thread_id").all() as Array<Record<string, unknown>>;
     const sent = () => send.mock.calls.map((c) => c[0] as { threadId: string; mode: string; input: Array<{ type: string; text: string }> });
     return { ...s, live, hooks, send, rows, sent };
   }
 
   it("is refused, with a reason, on a server without bb-gate-hooks, and starts no service", async () => {
-    const { tool, text, harness } = await setup({ settings: { accessToken: "at-0" }, linear: { answer: () => ({ data: { issue: issue() } }) } });
+    const { tool, text, harness } = await setup({ token: "at-0", linear: { answer: () => ({ data: { issue: issue() } }) } });
     const result = await tool("linear_watch_issue", { key: "ENG-123" });
     expect(result).toMatchObject({ isError: true });
     expect(text(result)).toContain("BB_HOOKS_URL");
@@ -713,7 +749,7 @@ describe("watching an issue", () => {
       const live = liveLinear();
       const hooks = fakeHooks();
       const send = vi.fn(async () => ({ kind: "sent" }));
-      const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send, get } } });
+      const s = await setup({ token: "at-0", env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer: live.answer }, hooks, sdk: { threads: { send, get } } });
       const signals = () => s.harness.realtimeSignals.filter((x) => x.channel === "watches-changed").length;
 
       // Before the service runs: no stream, nothing watched.
@@ -735,8 +771,7 @@ describe("watching an issue", () => {
         expect.objectContaining({
           threadId: "thr-1",
           threadTitle: "Fix login",
-          // A pasted token has no connection record, so no organization to build a URL from.
-          target: { id: "uuid-1", key: "ENG-123", kind: "issue", title: "Fix login", url: null },
+          target: { id: "uuid-1", key: "ENG-123", kind: "issue", title: "Fix login", url: "https://linear.app/acme/issue/ENG-123" },
           state: "In Progress",
           checks: 1,
           wakes: 0,
@@ -850,7 +885,7 @@ describe("watching an issue", () => {
 describe("editing a description", () => {
   it("replaces the description, signed with the thread, alongside other changes", async () => {
     const { tool, text, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) =>
           body.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)")
@@ -871,28 +906,29 @@ describe("editing a description", () => {
   });
 });
 
+const snapshotIssue = (over: Record<string, unknown> = {}) => ({
+  ...issue(),
+  priority: 2,
+  priorityLabel: "High",
+  estimate: null,
+  createdAt: "2026-10-01T00:00:00Z",
+  updatedAt: "2026-10-02T00:00:00Z",
+  team: { id: "t-eng", key: "ENG" },
+  creator: { name: "Bob" },
+  labels: { nodes: [{ name: "bb-managed" }] },
+  parent: null,
+  children: { nodes: [] },
+  comments: { nodes: [{ id: "c-1", body: `On it${signature("thr-9")}`, createdAt: "2026-10-01T01:00:00Z", url: null, user: { displayName: "jane" } }] },
+  attachments: { nodes: [{ url: "https://github.com/acme/web/pull/7", sourceType: "github" }] },
+  ...over,
+});
+
 describe("the source contract", () => {
-  const snapshotIssue = (over: Record<string, unknown> = {}) => ({
-    ...issue(),
-    priority: 2,
-    priorityLabel: "High",
-    estimate: null,
-    createdAt: "2026-10-01T00:00:00Z",
-    updatedAt: "2026-10-02T00:00:00Z",
-    team: { id: "t-eng", key: "ENG" },
-    creator: { name: "Bob" },
-    labels: { nodes: [{ name: "bb-managed" }] },
-    parent: null,
-    children: { nodes: [] },
-    comments: { nodes: [{ id: "c-1", body: `On it${signature("thr-9")}`, createdAt: "2026-10-01T01:00:00Z", url: null, user: { displayName: "jane" } }] },
-    attachments: { nodes: [{ url: "https://github.com/acme/web/pull/7", sourceType: "github" }] },
-    ...over,
-  });
   const STEWARDS = { kind: "plugin", pluginId: "stewards" } as const;
 
   it("sourceSnapshot reads an issue by key or id as the connected user, and is null for one that is not there", async () => {
     const { harness, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) =>
           body.variables?.id === "ENG-404" ? { data: null, errors: [{ message: "Entity not found: Issue" }] } : body.query.includes("attachments") ? { data: { issue: snapshotIssue() } } : { data: {} },
@@ -934,7 +970,7 @@ describe("the source contract", () => {
       labels: { nodes: [{ id: "l-bug", name: "Bug" }] },
     };
     const { harness } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) => {
           if (body.query.startsWith("query MyTeams")) return { data: { viewer: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } } };
@@ -959,7 +995,7 @@ describe("the source contract", () => {
   it("sourceAdoptable lists labelled open issues per team, oldest first, with each team's failure on its own", async () => {
     const node = (id: string, team: string, createdAt: string) => ({ id, identifier: `${team}-${id}`, createdAt, state: { name: "Todo" }, team: { key: team }, creator: { name: "Bob" }, labels: { nodes: [{ name: "bb-managed" }] } });
     const { harness, linear } = await setup({
-      settings: { accessToken: "at-0" },
+      token: "at-0",
       linear: {
         answer: (body) => {
           if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }, { id: "t-ops", key: "OPS", name: "Ops" }] } } };
@@ -983,7 +1019,7 @@ describe("the source contract", () => {
   });
 
   it("sourceSetInterest is for stewards only", async () => {
-    const { harness, bb } = await setup({ settings: { accessToken: "at-0" } });
+    const { harness, bb } = await setup({ token: "at-0" });
     await expect(harness.callRpc("sourceSetInterest", { units: [], entities: [] })).rejects.toThrow(/stewards plugin only/u);
     await expect(harness.callRpc("sourceSetInterest", { units: [], entities: [] }, { experimental_caller: { kind: "plugin", pluginId: "workstreams" } })).rejects.toThrow(/stewards plugin only/u);
     expect(await bb.storage.kv.get("stewards/interest")).toBeUndefined();
@@ -1013,7 +1049,7 @@ describe("the source contract", () => {
     it("stores the interest, leases its issues and teams, and rings stewards for their doorbells", async () => {
       const hooks = fakeHooks();
       const stewards = fakeStewards();
-      const s = await setup({ settings: { accessToken: "at-0" }, env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc: stewards.callRpc } } });
+      const s = await setup({ token: "at-0", env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc: stewards.callRpc } } });
       expect(await s.harness.callRpc("sourceSetInterest", { units: ["eng", "nope"], entities: [UUID_1, "eng-5", "ENG-404"] }, { experimental_caller: STEWARDS })).toEqual({ ok: true });
       // Keys resolved; one the user cannot see is left out.
       expect(await s.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["ENG", "NOPE"], entities: [UUID_1, UUID_2] });
@@ -1054,7 +1090,10 @@ describe("the source contract", () => {
 
       // A change while connected is leased right away, only what is new.
       await s.harness.callRpc("sourceSetInterest", { units: ["ENG", "OPS"], entities: [UUID_1, UUID_3] }, { experimental_caller: STEWARDS });
-      expect(hooks.subscribes.slice(-2).map((b) => b.watches)).toEqual([[{ kind: "issue", id: UUID_3 }], [{ kind: "team", id: "t-ops" }]]);
+      expect(hooks.subscribes.at(-1)!.watches).toEqual([
+        { kind: "issue", id: UUID_3 },
+        { kind: "team", id: "t-ops" },
+      ]);
       hooks.last().send(hooks.doorbell("uuid-elsewhere", "t-ops"));
       await tick(3000);
       expect(stewards.to("stewardsRing").at(-1)).toEqual({ source: "linear", id: "uuid-elsewhere" });
@@ -1067,7 +1106,7 @@ describe("the source contract", () => {
       const hooks = fakeHooks();
       hooks.state.answer = (body) => Response.json({ leases: body.watches.filter((w) => w.kind === "issue"), rejected: body.watches.filter((w) => w.kind === "team").map((w) => ({ ...w, reason: "forbidden" })) });
       const s = await setup({
-        settings: { accessToken: "at-0" },
+        token: "at-0",
         env: { BB_HOOKS_URL: HOOKS_URL },
         linear: { answer },
         hooks,
@@ -1087,5 +1126,167 @@ describe("the source contract", () => {
       service.controller.abort();
       await service.done;
     });
+  });
+});
+
+describe("several workspaces", () => {
+  const teamsOf: Record<string, Array<{ id: string; key: string; name: string }>> = {
+    "at-acme": [{ id: "t-eng", key: "ENG", name: "Engineering" }, { id: "t-web-a", key: "WEB", name: "Web" }],
+    "at-globex": [{ id: "t-ops", key: "OPS", name: "Ops" }, { id: "t-web-g", key: "WEB", name: "Web" }],
+  };
+  // Each token sees its own workspace's teams, and an issue in it named by the key asked for.
+  const answer: Answer = (body, token) => {
+    if (body.query.startsWith("query { teams")) return { data: { teams: { nodes: teamsOf[token] ?? [] } } };
+    if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier title")) {
+      const id = String(body.variables!.id);
+      return { data: { issue: issue({ id: token === "at-globex" ? "uuid-g" : "uuid-1", identifier: id.startsWith("uuid") ? (token === "at-globex" ? "OPS-7" : "ENG-123") : id }) } };
+    }
+    if (body.query.includes("issues(") || body.query.includes("searchIssues(")) return { data: { issues: { nodes: [] }, searchIssues: { nodes: [] } } };
+    return { data: { ok: token } };
+  };
+  const two = (over: Parameters<typeof setup>[0] = {}) =>
+    setup({ accounts: [account("acme", "at-acme"), account("globex", "at-globex")], linear: { answer }, ...over });
+  const lastRead = (calls: ReturnType<typeof fakeLinear>["calls"]) => reads(calls).filter((c) => !c.body!.query.startsWith("query { teams")).at(-1)!;
+
+  it("moves a token from the single-workspace build into the workspaces without asking Linear again", async () => {
+    const { harness, linear, stored, bb, now } = await setup({
+      settings: { accessToken: "at-legacy", refreshToken: "rt-legacy" },
+      kv: {
+        connection: { tokenFingerprint: createHash("sha256").update("at-legacy").digest("hex"), user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
+        expiresAt: 1_000_000_000_000 + DAY_MS,
+      },
+    });
+    expect(await harness.callRpc("status", null)).toMatchObject({ connected: true, accounts: [{ key: "acme", isDefault: true }] });
+    expect(linear.calls).toEqual([]);
+    expect(await stored()).toEqual([expect.objectContaining({ key: "acme", accessToken: "at-legacy", refreshToken: "rt-legacy", expiresAt: now() + DAY_MS })]);
+    expect(await bb.storage.kv.get("connection")).toBeUndefined();
+    expect(await bb.storage.kv.get("expiresAt")).toBeUndefined();
+  });
+
+  it("asks whose a pasted token is, refreshing it first when Linear refuses it", async () => {
+    const { tool, text, linear, stored } = await setup({
+      settings: { accessToken: "at-dead", refreshToken: "rt-1" },
+      linear: { answer: () => ({ data: { issue: issue() } }), valid: (t) => t !== "at-dead", tokens: () => ({ access_token: "at-live", expires_in: 3600 }) },
+    });
+    expect(text(await tool("linear_issue", { key: "ENG-123" }))).toContain("# ENG-123");
+    expect(linear.calls.filter((c) => c.form !== undefined)).toHaveLength(1);
+    expect(await stored()).toEqual([expect.objectContaining({ key: "acme", accessToken: "at-live", refreshToken: "rt-1" })]);
+  });
+
+  it("connects a second workspace beside the first, picks a default, and disconnects one", async () => {
+    let n = 0;
+    const tokens = ["at-acme", "at-globex"];
+    const { harness, callback, linear, stored } = await setup({
+      linear: {
+        tokens: () => ({ access_token: tokens[n++], refresh_token: "rt", expires_in: 3600 }),
+        organization: (token) => (token === "at-globex" ? { name: "Globex", urlKey: "globex" } : { name: "Acme", urlKey: "acme" }),
+      },
+    });
+    for (let i = 0; i < 2; i++) {
+      const { url } = (await harness.callRpc("connect", null)) as { url: string };
+      const res = await callback({ code: `c${i}`, state: new URL(url).searchParams.get("state")! });
+      expect(res.status).toBe(200);
+      if (i === 1) expect(await res.text()).toContain("Also connected: Acme");
+    }
+    type Status = { organization: { urlKey: string }; accounts: Array<{ key: string; isDefault: boolean }> };
+    let status = (await harness.callRpc("status", null)) as Status;
+    expect(status.accounts.map((a) => [a.key, a.isDefault])).toEqual([["acme", true], ["globex", false]]);
+
+    await harness.callRpc("setDefault", { account: "Globex" });
+    status = (await harness.callRpc("status", null)) as Status;
+    expect(status.organization.urlKey).toBe("globex");
+    expect(status.accounts.map((a) => [a.key, a.isDefault])).toEqual([["acme", false], ["globex", true]]);
+    await expect(harness.callRpc("setDefault", { account: "initech" })).rejects.toThrow(/No Linear workspace "initech"/u);
+
+    await harness.callRpc("disconnect", { account: "globex" });
+    expect(linear.calls.filter((c) => c.url.endsWith("/oauth/revoke")).map((c) => c.token)).toEqual(["Bearer at-globex"]);
+    expect((await stored()).map((a) => a.key)).toEqual(["acme"]);
+    status = (await harness.callRpc("status", null)) as Status;
+    expect(status.accounts).toEqual([expect.objectContaining({ key: "acme", isDefault: true })]);
+  });
+
+  it("routes each call to the workspace that has the issue's team, and asks for the account when that is not enough", async () => {
+    const { tool, text, linear } = await two();
+    expect(text(await tool("linear_issue", { key: "ENG-1" }))).toContain("# ENG-1");
+    expect(lastRead(linear.calls).token).toBe("at-acme");
+    expect(text(await tool("linear_issue", { key: "ops-7" }))).toContain("# OPS-7");
+    expect(lastRead(linear.calls).token).toBe("at-globex");
+    // Each workspace's teams were asked once, and are remembered.
+    await tool("linear_issue", { key: "OPS-8" });
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("query { teams")).map((c) => c.token).sort()).toEqual(["at-acme", "at-globex"]);
+
+    // Search: by team, by account, else the default; and the heading says where.
+    expect(text(await tool("linear_search", { team: "OPS" }))).toContain("in globex");
+    expect(lastRead(linear.calls).token).toBe("at-globex");
+    await tool("linear_search", { query: "login" });
+    expect(lastRead(linear.calls).token).toBe("at-acme");
+    await tool("linear_search", { query: "login", account: "GLOBEX" });
+    expect(lastRead(linear.calls).token).toBe("at-globex");
+    expect(text(await tool("linear_query", { query: "query { organization { name } }", account: "Globex" }))).toContain("at-globex");
+
+    // Two workspaces with a WEB team: say which rather than guess.
+    const ambiguous = await tool("linear_issue", { key: "WEB-1" });
+    expect(ambiguous).toMatchObject({ isError: true });
+    expect(text(ambiguous)).toContain("Team WEB exists in more than one connected Linear workspace: acme, globex. Pass account");
+    await tool("linear_issue", { key: "WEB-1", account: "globex" });
+    expect(lastRead(linear.calls).token).toBe("at-globex");
+    const unknown = await tool("linear_issue", { key: "ENG-1", account: "initech" });
+    expect(text(unknown)).toBe('No Linear workspace "initech" is connected. Connected: acme, globex.');
+  });
+
+  it("watches issues in two workspaces on one stream, each lease proven with its own workspace's token", async () => {
+    vi.useFakeTimers();
+    try {
+      const hooks = fakeHooks();
+      const send = vi.fn(async () => ({ kind: "sent" }));
+      const s = await two({ env: { BB_HOOKS_URL: HOOKS_URL }, hooks, sdk: { threads: { send } } });
+      await s.tool("linear_watch_issue", { key: "ENG-123" }, { threadId: "thr-1", projectId: "prj-1" });
+      await s.tool("linear_watch_issue", { key: "OPS-7" }, { threadId: "thr-1", projectId: "prj-1" });
+      const service = s.harness.runService("watches");
+      await vi.advanceTimersByTimeAsync(0);
+      hooks.last().send(hooks.hello("c_1"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hooks.subscribes.map((b) => [b.token, b.watches]).sort()).toEqual([
+        ["at-acme", [{ kind: "issue", id: "uuid-1" }]],
+        ["at-globex", [{ kind: "issue", id: "uuid-g" }]],
+      ]);
+      // A doorbell for the second workspace's issue is read with its token.
+      hooks.last().send(hooks.doorbell("uuid-g", "t-ops"));
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(lastRead(s.linear.calls)).toMatchObject({ token: "at-globex", body: { variables: { id: "uuid-g" } } });
+      // The usage view links each issue into its own workspace.
+      const view = (await s.harness.callRpc("watches", null)) as { watches: Array<{ target: { key: string; url: string } }> };
+      expect(view.watches.map((w) => w.target.url).sort()).toEqual(["https://linear.app/acme/issue/ENG-123", "https://linear.app/globex/issue/OPS-7"]);
+      service.controller.abort();
+      await service.done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finds a stewards issue by UUID in whichever workspace has it, and goes there first next time", async () => {
+    const UUID = "44444444-4444-4444-8444-444444444444";
+    const { harness, linear } = await two({
+      linear: {
+        answer: (body, token) =>
+          body.query.includes("attachments") ? (token === "at-globex" ? { data: { issue: snapshotIssue({ id: UUID }) } } : { data: null, errors: [{ message: "Entity not found: Issue" }] }) : answer(body, token),
+      },
+    });
+    const snapshots = () => linear.calls.filter((c) => c.body?.query.includes("attachments")).map((c) => c.token);
+    expect(((await harness.callRpc("sourceSnapshot", { id: UUID })) as { snapshot: { id: string } }).snapshot.id).toBe(UUID);
+    expect(snapshots()).toEqual(["at-acme", "at-globex"]);
+    await harness.callRpc("sourceSnapshot", { id: UUID });
+    expect(snapshots()).toEqual(["at-acme", "at-globex", "at-globex"]);
+  });
+
+  it("bb linear status lists the workspaces, and --account picks one", async () => {
+    const { harness, linear } = await two();
+    const status = await harness.runCli(["status"]);
+    expect(status.stdout).toBe("Connected to 2 Linear workspaces:\n  acme (default): jane in Acme\n  globex: jane in Globex");
+    const out = await harness.runCli(["issue", "WEB-2", "--account", "globex", "--json"]);
+    expect(out.exitCode).toBe(0);
+    expect(lastRead(linear.calls).token).toBe("at-globex");
+    const ambiguous = await harness.runCli(["issue", "WEB-2"]);
+    expect(ambiguous.exitCode).not.toBe(0);
   });
 });

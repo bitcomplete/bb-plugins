@@ -1,5 +1,6 @@
-// The plugin's settings section: connect or disconnect Linear, and who the
-// connection acts as.
+// The plugin's settings section: the Linear workspaces this server is
+// connected to and who each acts as; connect another, pick the default,
+// disconnect one.
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -7,12 +8,18 @@ import { Button } from "@/components/ui/button";
 import { WatchesSection } from "@/components/watches-section";
 import { WATCHES_CHANGED } from "./channels";
 
+interface Account {
+  key: string;
+  user: { id: string; name: string; email: string | null };
+  organization: { name: string; urlKey: string };
+  isDefault: boolean;
+}
+
 interface Status {
   connected: boolean;
   configured: boolean;
-  user: { id: string; name: string; email: string | null } | null;
-  organization: { name: string; urlKey: string } | null;
   linearUrl: string;
+  accounts: Account[];
 }
 
 function LinearSection() {
@@ -50,10 +57,10 @@ function LinearSection() {
     }
   };
 
-  const disconnect = async () => {
+  const act = async (run: () => Promise<unknown>) => {
     setBusy(true);
     try {
-      await rpc.call("disconnect");
+      await run();
       refetch();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -66,28 +73,43 @@ function LinearSection() {
     return <p className="text-sm text-muted-foreground">{error ?? "Loading…"}</p>;
   }
 
+  const several = status.accounts.length > 1;
+
   return (
     <div className="flex flex-col gap-4 text-sm">
       {status.connected ? (
-        <div className="flex items-center justify-between gap-4">
-          <p>
-            Connected
-            {status.user !== null ? (
-              <>
-                {" "}as <code>{status.user.name}</code>
-              </>
-            ) : null}
-            {status.organization !== null ? (
-              <>
-                {" "}in <code>{status.organization.name}</code>
-              </>
-            ) : null}
-            . Threads read and update issues as you.
-          </p>
-          <Button variant="outline" size="sm" disabled={busy} onClick={() => void disconnect()}>
-            Disconnect
-          </Button>
-        </div>
+        <>
+          <ul className="flex flex-col gap-2">
+            {status.accounts.map((a) => (
+              <li key={a.key} className="flex items-center justify-between gap-4">
+                <p>
+                  <code>{a.organization.name}</code> as <code>{a.user.name}</code>
+                  {several && a.isDefault ? <span className="text-muted-foreground"> · default</span> : null}
+                </p>
+                <div className="flex shrink-0 gap-2">
+                  {several && !a.isDefault ? (
+                    <Button variant="ghost" size="sm" disabled={busy} onClick={() => void act(() => rpc.call("setDefault", { account: a.key }))}>
+                      Make default
+                    </Button>
+                  ) : null}
+                  <Button variant="outline" size="sm" disabled={busy} onClick={() => void act(() => rpc.call("disconnect", { account: a.key }))}>
+                    Disconnect
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-muted-foreground">
+              {several
+                ? "Threads read and update issues as you. An issue or team key picks its workspace; anything else goes to the default."
+                : "Threads read and update issues as you. Connect another workspace to use more than one; Linear asks which."}
+            </p>
+            <Button variant="outline" size="sm" disabled={busy || !status.configured} onClick={() => void connect()}>
+              Connect another workspace
+            </Button>
+          </div>
+        </>
       ) : (
         <div className="flex items-center justify-between gap-4">
           <p className="text-muted-foreground">
@@ -109,7 +131,7 @@ export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "linear",
     title: "Linear",
-    description: "The Linear account this server's threads act as.",
+    description: "The Linear workspaces this server's threads act in, and as whom.",
     component: LinearSection,
   });
   app.slots.settingsSection({

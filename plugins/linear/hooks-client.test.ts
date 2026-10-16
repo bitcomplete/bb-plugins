@@ -160,7 +160,7 @@ describe("the loop", () => {
     await vi.advanceTimersByTimeAsync(ms);
   };
 
-  function start(hooks: ReturnType<typeof fakeHooks>, over: { leases?: () => Lease[]; token?: () => Promise<string>; idleMs?: number } = {}) {
+  function start(hooks: ReturnType<typeof fakeHooks>, over: { leases?: () => Lease[]; token?: (account?: string) => Promise<string>; idleMs?: number } = {}) {
     const logs: string[] = [];
     const sweeps: string[] = [];
     const doorbells: string[] = [];
@@ -281,6 +281,33 @@ describe("the loop", () => {
     expect(hooks.subscribes.at(-1)!.connection).toBe("c_2");
     expect(s.rejected).toEqual([[{ kind: "issue", id: "i-1", reason: "forbidden" }]]);
     expect(s.sweeps.filter((r) => r === "connected")).toHaveLength(2);
+    s.controller.abort();
+    await s.done;
+  });
+
+  it("proves each workspace's leases with its own token, one call each, and says whose a refused lease was", async () => {
+    const hooks = fakeHooks();
+    hooks.state.answer = (body) =>
+      body.token === "tok-globex"
+        ? Response.json({ leases: [], rejected: [{ ...body.watches[0], reason: "forbidden" }] })
+        : Response.json({ leases: body.watches, rejected: [] });
+    const s = start(hooks, {
+      token: async (account) => `tok-${account}`,
+      leases: () => [
+        { kind: "issue", id: "i-1", account: "acme" },
+        { kind: "issue", id: "i-2", account: "globex" },
+        { kind: "team", id: "t-1", account: "acme" },
+      ],
+    });
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    expect(hooks.subscribes.map((b) => [b.token, b.watches])).toEqual([
+      ["tok-acme", [{ kind: "issue", id: "i-1" }, { kind: "team", id: "t-1" }]],
+      ["tok-globex", [{ kind: "issue", id: "i-2" }]],
+    ]);
+    expect(s.rejected).toEqual([[{ kind: "issue", id: "i-2", reason: "forbidden", account: "globex" }]]);
+    expect(s.loop.connected).toBe(true);
     s.controller.abort();
     await s.done;
   });

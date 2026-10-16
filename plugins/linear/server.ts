@@ -1,12 +1,14 @@
-// Linear: connect a developer's Linear account to this bb server once, and
+// Linear: connect a developer's Linear workspaces to this bb server once, and
 // give every thread a few native tools that read and update issues as them.
 //
-// The connection is OAuth with PKCE (oauth.ts): Connect sends the browser to
-// Linear, the callback below exchanges the code, and the access and refresh
-// tokens land in secret settings. Every Linear call is made here on the
-// server with that token; a thread sees results, never the token. Access
-// tokens last a day, so each call refreshes first when one is about to
-// expire, and once more on a 401.
+// Each connection is OAuth with PKCE (oauth.ts): Connect sends the browser to
+// Linear, whose consent screen picks a workspace, the callback below
+// exchanges the code, and the access and refresh tokens land in a secret
+// setting beside any other workspace's (accounts.ts). Every Linear call is
+// made here on the server with the token of the workspace it is for, chosen
+// by the issue or team key unless the caller names one; a thread sees
+// results, never a token. Access tokens last a day, so each call refreshes
+// first when one is about to expire, and once more on a 401.
 //
 // The same reads are a `bb linear` command, so a script automation on this
 // server (which has no thread and therefore no tools) can poll Linear
@@ -87,6 +89,19 @@ import {
   type PendingConnect,
   type Tokens,
 } from "./oauth.js";
+import {
+  AccountChoiceError,
+  accountKey,
+  accountsWithTeam,
+  defaultAccount,
+  describeAccount,
+  findAccount,
+  listAccounts,
+  parseAccounts,
+  serializeAccounts,
+  teamOfIssueKey,
+  type Account,
+} from "./accounts.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
 import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
@@ -116,17 +131,27 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       connected: z.boolean(),
       configured: z.boolean(),
+      /** The default workspace's user and organization; null when none is connected. */
       user: userSchema.nullable(),
       organization: organizationSchema.nullable(),
       linearUrl: z.string(),
+      /** Every connected workspace, oldest first. */
+      accounts: z.array(z.object({ key: z.string(), user: userSchema, organization: organizationSchema, isDefault: z.boolean() })),
     }),
   },
+  /** Start a connection. Linear's consent screen picks the workspace; connecting one already connected renews it. */
   connect: {
     input: z.null(),
     output: z.object({ url: z.string() }),
   },
+  /** Disconnect one workspace, or every one when the input is null. */
   disconnect: {
-    input: z.null(),
+    input: z.object({ account: z.string().min(1) }).nullable(),
+    output: z.object({ ok: z.boolean() }),
+  },
+  /** Make a workspace the one calls go to when nothing else picks one. */
+  setDefault: {
+    input: z.object({ account: z.string().min(1) }),
     output: z.object({ ok: z.boolean() }),
   },
   /** Every watch on this server and what the doorbell stream is doing. */
@@ -165,17 +190,23 @@ export function settingDescriptors(env: Record<string, string | undefined>) {
     description: "Where tokens are exchanged and queries are sent.",
     default: LINEAR_API_URL,
   },
+  accounts: {
+    type: "string",
+    secret: true,
+    label: "Connected workspaces",
+    description: "Filled in by Connect Linear below, one entry per Linear workspace, and refreshed by the plugin. Do not edit.",
+  },
   accessToken: {
     type: "string",
     secret: true,
     label: "Access token",
-    description: "Filled in by Connect Linear below, and refreshed by the plugin. Paste one only if you got it another way.",
+    description: "To add a workspace with a token you got another way, paste it here; the plugin moves it into Connected workspaces and clears this field.",
   },
   refreshToken: {
     type: "string",
     secret: true,
     label: "Refresh token",
-    description: "Filled in by Connect Linear below.",
+    description: "The refresh token that goes with a pasted access token, if it has one.",
   },
   } as const;
 }
@@ -224,12 +255,21 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     const settings = bb.settings.define(settingDescriptors(deps.env));
     const clientIdOf = (cfg: { clientId: string }) => (cfg.clientId.trim() === "" ? (deps.env[ENV_CLIENT_ID]?.trim() ?? "") : cfg.clientId.trim());
 
-    // ---- the connection ---------------------------------------------------
+    // ---- the connections ---------------------------------------------------
+    //
+    // One account per Linear workspace (accounts.ts), tokens in the
+    // `accounts` secret setting as JSON. Every read-modify-write of it goes
+    // through `updateAccounts`, one at a time, so a refresh in one workspace
+    // and a Connect in another cannot write over each other.
 
     const pendingKey = (state: string) => `connect/pending/${state}`;
-    const CONNECTION_KEY = "connection";
-    const EXPIRY_KEY = "expiresAt";
-    const connectionRecord = z.object({ tokenFingerprint: z.string(), user: userSchema, organization: organizationSchema });
+    /** The default account's key, when one was chosen. */
+    const DEFAULT_KEY = "defaultAccount";
+    // Left by a build that held one token in accessToken/refreshToken; read
+    // once, to move that token into the accounts.
+    const LEGACY_CONNECTION_KEY = "connection";
+    const LEGACY_EXPIRY_KEY = "expiresAt";
+    const legacyConnectionRecord = z.object({ tokenFingerprint: z.string(), user: userSchema, organization: organizationSchema });
 
     function redirectUri(): string {
       const appUrl = bb.server.experimental_appUrl;
@@ -247,24 +287,91 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
     }
 
-    async function storeTokens(tokens: Tokens): Promise<void> {
-      await settings.experimental_set({ accessToken: tokens.accessToken, refreshToken: tokens.refreshToken });
-      if (tokens.expiresAt === null) await bb.storage.kv.delete(EXPIRY_KEY);
-      else await bb.storage.kv.set(EXPIRY_KEY, tokens.expiresAt);
+    let chosenDefault = (await bb.storage.kv.get<string>(DEFAULT_KEY)) ?? undefined;
+    /** The accounts as last read, for the places that must answer synchronously (leases, doorbells). */
+    let known: Account[] = parseAccounts((await settings.get()).accounts);
+    const defaultKey = () => defaultAccount(known, chosenDefault)?.key ?? null;
+    const knownAccount = (key: string) => known.find((a) => a.key === key) ?? null;
+
+    let accountsChain: Promise<unknown> = Promise.resolve();
+    function updateAccounts(change: (accounts: Account[]) => Account[]): Promise<Account[]> {
+      const run = async () => {
+        const next = change(parseAccounts((await settings.get()).accounts));
+        await settings.experimental_set({ accounts: next.length === 0 ? null : serializeAccounts(next) });
+        known = next;
+        return next;
+      };
+      const next = accountsChain.then(run, run);
+      accountsChain = next.catch(() => undefined);
+      return next;
     }
 
-    // The developer the token belongs to. Asked of Linear once per token and
-    // remembered by the token's fingerprint, so a pasted token is asked too.
-    async function whoIs(accessToken: string, apiUrl: string, signal: AbortSignal): Promise<Viewer> {
-      const fp = tokenFingerprint(accessToken);
-      const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
-      if (stored.success && stored.data.tokenFingerprint === fp) return { user: stored.data.user, organization: stored.data.organization };
-      const viewer = parseViewer(await graphql(apiUrl, accessToken, VIEWER_QUERY, undefined, deps.fetch, signal));
-      await bb.storage.kv.set(CONNECTION_KEY, { tokenFingerprint: fp, ...viewer });
-      return viewer;
+    /** Add a workspace's connection, or replace its tokens when it is connected already. */
+    function upsertAccount(tokens: Tokens, viewer: Viewer): Promise<Account[]> {
+      const key = accountKey(viewer.organization.urlKey);
+      return updateAccounts((list) => {
+        const before = list.find((a) => a.key === key);
+        const account: Account = {
+          key,
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          expiresAt: tokens.expiresAt,
+          user: viewer.user,
+          organization: viewer.organization,
+          connectedAt: before?.connectedAt ?? deps.now(),
+        };
+        return [...list.filter((a) => a.key !== key), account];
+      });
     }
 
-    // The settings section and the watch service both want to know when the
+    // A token in the old single-token settings (from an older build, or
+    // pasted) becomes an account once Linear says whose it is. The old
+    // build remembered that by the token's fingerprint, so an upgrade
+    // usually costs no request.
+    let migrating: Promise<void> | null = null;
+    function adoptLegacyToken(): Promise<void> {
+      migrating ??= (async () => {
+        const cfg = await settings.get();
+        const token = cfg.accessToken?.trim() ?? "";
+        if (token === "") return;
+        const stored = legacyConnectionRecord.safeParse(await bb.storage.kv.get(LEGACY_CONNECTION_KEY));
+        const expiresAt = await bb.storage.kv.get<number>(LEGACY_EXPIRY_KEY);
+        const refreshToken = cfg.refreshToken?.trim() ?? "";
+        let tokens: Tokens = { accessToken: token, refreshToken: refreshToken === "" ? null : refreshToken, expiresAt: typeof expiresAt === "number" ? expiresAt : null };
+        let viewer: Viewer;
+        if (stored.success && stored.data.tokenFingerprint === tokenFingerprint(token)) {
+          viewer = { user: stored.data.user, organization: stored.data.organization };
+        } else {
+          const ask = (accessToken: string) => graphql(cfg.apiUrl, accessToken, VIEWER_QUERY, undefined, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS));
+          try {
+            viewer = parseViewer(await ask(token));
+          } catch (error) {
+            // An old build's token may have lapsed while nothing used it.
+            if (!(error instanceof LinearRequestError) || error.status !== 401) throw error;
+            if (tokens.refreshToken === null) throw new Error("The Linear token was refused and there is no refresh token. Connect Linear again.");
+            tokens = await refreshTokens(cfg.apiUrl, clientIdOf(cfg), tokens.refreshToken, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS), deps.now());
+            viewer = parseViewer(await ask(tokens.accessToken));
+          }
+        }
+        await upsertAccount(tokens, viewer);
+        await settings.experimental_set({ accessToken: null, refreshToken: null });
+        await bb.storage.kv.delete(LEGACY_CONNECTION_KEY);
+        await bb.storage.kv.delete(LEGACY_EXPIRY_KEY);
+        bb.log.info(`moved the Linear token for ${viewer.user.name} in ${viewer.organization.name} into the connected workspaces`);
+      })().finally(() => {
+        migrating = null;
+      });
+      return migrating;
+    }
+
+    /** Every connected workspace, oldest first. */
+    async function accounts(): Promise<Account[]> {
+      await adoptLegacyToken();
+      known = parseAccounts((await settings.get()).accounts);
+      return known;
+    }
+
+    // The settings section and the watch service both want to know when a
     // connection comes or goes. A pasted or cleared token changes it too, so
     // settings changes count alongside Connect and Disconnect.
     const connectionListeners = new Set<() => void>();
@@ -272,75 +379,164 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       bb.realtime.publish(CONNECTION_CHANGED, { connected });
       for (const listener of connectionListeners) listener();
     }
+    // A refresh rewrites the setting too; only a workspace coming or going is news.
+    const workspaces = (raw: string | undefined) => parseAccounts(raw).map((a) => a.key).sort().join(" ");
     settings.onChange((next, prev) => {
-      if ((next.accessToken?.trim() ?? "") !== (prev.accessToken?.trim() ?? "")) for (const listener of connectionListeners) listener();
+      known = parseAccounts(next.accounts);
+      const pasted = (next.accessToken?.trim() ?? "") !== (prev.accessToken?.trim() ?? "");
+      if (!pasted && workspaces(next.accounts) === workspaces(prev.accounts)) return;
+      const after = pasted && (next.accessToken?.trim() ?? "") !== "" ? adoptLegacyToken().catch((error: unknown) => bb.log.warn(`could not add the pasted Linear token: ${errorMessage(error)}`)) : Promise.resolve();
+      void after.then(() => {
+        for (const listener of connectionListeners) listener();
+      });
     });
     async function isConnected(): Promise<boolean> {
-      return ((await settings.get()).accessToken?.trim() ?? "") !== "";
+      try {
+        return (await accounts()).length > 0;
+      } catch {
+        // A token waiting to be adopted while Linear is unreachable still counts.
+        return ((await settings.get()).accessToken?.trim() ?? "") !== "";
+      }
     }
 
-    // One refresh at a time: two tools on the same expiring token must not
-    // both refresh, or the second would hand Linear a refresh token the first
-    // may already have rotated.
-    let refreshing: Promise<string> | null = null;
-    function refresh(reason: string): Promise<string> {
-      if (refreshing !== null) return refreshing;
-      refreshing = (async () => {
+    // One refresh at a time per workspace: two tools on the same expiring
+    // token must not both refresh, or the second would hand Linear a refresh
+    // token the first may already have rotated.
+    const refreshing = new Map<string, Promise<string>>();
+    function refresh(key: string, reason: string): Promise<string> {
+      const running = refreshing.get(key);
+      if (running !== undefined) return running;
+      const next = (async () => {
         const cfg = await settings.get();
-        const refreshToken = cfg.refreshToken?.trim() ?? "";
-        if (refreshToken === "") throw new Error(`The Linear token ${reason} and there is no refresh token. Connect Linear again.`);
-        const tokens = await refreshTokens(cfg.apiUrl, clientIdOf(cfg), refreshToken, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS), deps.now());
-        await storeTokens(tokens);
-        // The developer is the same; carry the record to the new fingerprint.
-        const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
-        if (stored.success) await bb.storage.kv.set(CONNECTION_KEY, { ...stored.data, tokenFingerprint: tokenFingerprint(tokens.accessToken) });
-        bb.log.info(`Linear token refreshed (${reason})`);
+        const account = (await accounts()).find((a) => a.key === key);
+        if (account === undefined) throw new Error(`The Linear workspace ${key} is not connected.`);
+        if (account.refreshToken === null) throw new Error(`The Linear token for ${describeAccount(account)} ${reason} and there is no refresh token. Connect Linear again.`);
+        const tokens = await refreshTokens(cfg.apiUrl, clientIdOf(cfg), account.refreshToken, deps.fetch, AbortSignal.timeout(REQUEST_TIMEOUT_MS), deps.now());
+        await updateAccounts((list) => list.map((a) => (a.key === key ? { ...a, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt } : a)));
+        bb.log.info(`Linear token for ${key} refreshed (${reason})`);
         return tokens.accessToken;
       })().finally(() => {
-        refreshing = null;
+        refreshing.delete(key);
       });
-      return refreshing;
+      refreshing.set(key, next);
+      return next;
     }
 
-    /** A usable access token: refreshed first when it is about to expire. */
-    async function accessToken(): Promise<string> {
-      const cfg = await settings.get();
-      const token = cfg.accessToken?.trim() ?? "";
-      if (token === "") throw new Error(NOT_CONNECTED);
-      const expiresAt = await bb.storage.kv.get<number>(EXPIRY_KEY);
-      if (typeof expiresAt === "number" && expiresAt - deps.now() < REFRESH_MARGIN_MS && (cfg.refreshToken?.trim() ?? "") !== "") {
-        return refresh("is about to expire");
+    /** A usable access token for a workspace: refreshed first when it is about to expire. */
+    async function accessToken(key: string): Promise<string> {
+      const account = (await accounts()).find((a) => a.key === key);
+      if (account === undefined) throw new Error(known.length === 0 ? NOT_CONNECTED : `The Linear workspace ${key} is not connected. Connected: ${listAccounts(known)}.`);
+      if (account.expiresAt !== null && account.expiresAt - deps.now() < REFRESH_MARGIN_MS && account.refreshToken !== null) {
+        return refresh(key, "is about to expire");
       }
-      return token;
+      return account.accessToken;
     }
 
-    /** A query as the developer, refreshing once if Linear says the token is gone. */
-    async function query(document: string, variables: Record<string, unknown> | undefined, signal: AbortSignal): Promise<unknown> {
+    /** A query as the developer in one workspace, refreshing once if Linear says the token is gone. */
+    async function query(account: string, document: string, variables: Record<string, unknown> | undefined, signal: AbortSignal): Promise<unknown> {
       const { apiUrl } = await settings.get();
-      let token = await accessToken();
+      let token = await accessToken(account);
       try {
         return await graphql(apiUrl, token, document, variables, deps.fetch, signal);
       } catch (error) {
         if (!(error instanceof LinearRequestError) || error.status !== 401) throw error;
-        token = await refresh("was refused");
+        token = await refresh(account, "was refused");
         return graphql(apiUrl, token, document, variables, deps.fetch, signal);
       }
+    }
+
+    // ---- which workspace -------------------------------------------------
+    //
+    // Each workspace's teams (key to UUID) are remembered in kv, asked of
+    // Linear when a key is missing everywhere, at most once a minute per
+    // workspace so a typo does not cost a request per call. The same map
+    // gives stewards' team leases their UUIDs.
+
+    const TEAMS_PREFIX = "teams/";
+    const TEAMS_RECHECK_MS = 60_000;
+    const teamMaps = new Map<string, Record<string, string>>();
+    const teamsAskedAt = new Map<string, number>();
+    const teamMapRecord = z.record(z.string(), z.string()).catch({});
+    for (const key of await bb.storage.kv.list(TEAMS_PREFIX)) teamMaps.set(key.slice(TEAMS_PREFIX.length), teamMapRecord.parse(await bb.storage.kv.get(key)));
+    // The single-workspace build kept one map under this key; the per-workspace maps replace it.
+    await bb.storage.kv.delete("stewards/teamIds");
+
+    async function refreshTeams(account: string, signal: AbortSignal): Promise<Record<string, string>> {
+      teamsAskedAt.set(account, deps.now());
+      const map = Object.fromEntries(parseTeams(await query(account, TEAMS_QUERY, undefined, signal)).map((t) => [t.key.toUpperCase(), t.id]));
+      teamMaps.set(account, map);
+      await bb.storage.kv.set(`${TEAMS_PREFIX}${account}`, map);
+      return map;
+    }
+
+    /** Ask again, in every workspace not asked within the minute, when one of these team keys is in none of the maps: it may be new. */
+    async function ensureTeams(keys: string[], signal: AbortSignal, force = false): Promise<void> {
+      const all = await accounts();
+      if (!force && keys.every((k) => accountsWithTeam(all, (a) => teamMaps.get(a), k).length > 0)) return;
+      const stale = all.filter((a) => force || !teamMaps.has(a.key) || deps.now() - (teamsAskedAt.get(a.key) ?? 0) >= TEAMS_RECHECK_MS);
+      const failures: unknown[] = [];
+      await Promise.all(stale.map((a) => refreshTeams(a.key, signal).catch((error: unknown) => failures.push(error))));
+      if (failures.length > 0 && failures.length === stale.length) throw failures[0];
+    }
+
+    /**
+     * The workspace a call goes to: the one named, else the one with the
+     * team (an issue key's prefix, or a team key), else the default. With
+     * one workspace connected that is always it, and nothing is asked.
+     */
+    async function pick(want: { account?: string | undefined; team?: string | null | undefined }, signal: AbortSignal): Promise<Account> {
+      const all = await accounts();
+      if (all.length === 0) throw new Error(NOT_CONNECTED);
+      const named = want.account?.trim() ?? "";
+      if (named !== "") {
+        const found = findAccount(all, named);
+        if (found === null) throw new AccountChoiceError(`No Linear workspace ${JSON.stringify(named)} is connected. Connected: ${listAccounts(all)}.`);
+        return found;
+      }
+      if (all.length === 1) return all[0]!;
+      const fallback = defaultAccount(all, chosenDefault)!;
+      const team = want.team?.trim().toUpperCase() ?? "";
+      if (team === "") return fallback;
+      try {
+        await ensureTeams([team], signal);
+      } catch (error) {
+        bb.log.warn(`could not list Linear teams to route ${team}: ${errorMessage(error)}`);
+      }
+      const having = accountsWithTeam(all, (a) => teamMaps.get(a), team);
+      if (having.length === 1) return having[0]!;
+      if (having.length > 1) throw new AccountChoiceError(`Team ${team} exists in more than one connected Linear workspace: ${listAccounts(having)}. Pass account to say which.`);
+      // A renamed team's old keys still resolve in Linear; let the default try.
+      return fallback;
+    }
+
+    /** The workspace a watch or stewards' issue was read in; null when it is no longer connected. */
+    function accountForStored(account: string | null | undefined): Account | null {
+      if (account === null || account === undefined) {
+        const key = defaultKey();
+        return key === null ? null : knownAccount(key);
+      }
+      return knownAccount(account);
     }
 
     /** The connection as the settings section and `bb linear status` show it. */
     async function connectionStatus() {
       const cfg = await settings.get();
-      const token = cfg.accessToken?.trim() ?? "";
-      let user: Viewer["user"] | null = null;
-      let organization: Viewer["organization"] | null = null;
-      if (token !== "") {
-        const stored = connectionRecord.safeParse(await bb.storage.kv.get(CONNECTION_KEY));
-        if (stored.success && stored.data.tokenFingerprint === tokenFingerprint(token)) {
-          user = stored.data.user;
-          organization = stored.data.organization;
-        }
+      let all: Account[];
+      try {
+        all = await accounts();
+      } catch (error) {
+        bb.log.warn(`could not add the pasted Linear token: ${errorMessage(error)}`);
+        all = known;
       }
-      return { connected: token !== "", configured: clientIdOf(cfg) !== "", user, organization, linearUrl: cfg.linearUrl };
+      const def = defaultAccount(all, chosenDefault);
+      return {
+        connected: all.length > 0,
+        configured: clientIdOf(cfg) !== "",
+        user: def?.user ?? null,
+        organization: def?.organization ?? null,
+        linearUrl: cfg.linearUrl,
+        accounts: all.map((a) => ({ key: a.key, user: a.user, organization: a.organization, isDefault: a.key === def?.key })),
+      };
     }
 
     bb.rpc.register(rpcContract, {
@@ -355,20 +551,39 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         await bb.storage.kv.set(pendingKey(pending.state), pending);
         return { url: authorizeUrl(cfg.linearUrl, clientIdOf(cfg), pending) };
       },
-      async disconnect() {
+      async disconnect(input) {
         const cfg = await settings.get();
-        const token = cfg.accessToken?.trim() ?? "";
-        if (token !== "") {
+        const all = await accounts().catch(() => known);
+        const target = input === null ? null : findAccount(all, input.account);
+        if (input !== null && target === null) throw new Error(`No Linear workspace ${JSON.stringify(input.account)} is connected.`);
+        const going = target === null ? all : [target];
+        for (const account of going) {
           try {
-            await revokeToken(cfg.apiUrl, token, deps.fetch, AbortSignal.timeout(10_000));
+            await revokeToken(cfg.apiUrl, account.accessToken, deps.fetch, AbortSignal.timeout(10_000));
           } catch (error) {
-            bb.log.warn(`could not revoke the Linear token: ${errorMessage(error)}`);
+            bb.log.warn(`could not revoke the Linear token for ${account.key}: ${errorMessage(error)}`);
           }
+          teamMaps.delete(account.key);
+          teamsAskedAt.delete(account.key);
+          await bb.storage.kv.delete(`${TEAMS_PREFIX}${account.key}`);
         }
-        await settings.experimental_set({ accessToken: null, refreshToken: null });
-        await bb.storage.kv.delete(CONNECTION_KEY);
-        await bb.storage.kv.delete(EXPIRY_KEY);
-        announceConnection(false);
+        const keys = new Set(going.map((a) => a.key));
+        const left = await updateAccounts((list) => list.filter((a) => !keys.has(a.key)));
+        if (input === null) await settings.experimental_set({ accessToken: null, refreshToken: null });
+        if (chosenDefault !== undefined && keys.has(chosenDefault)) {
+          chosenDefault = undefined;
+          await bb.storage.kv.delete(DEFAULT_KEY);
+        }
+        bb.log.info(`disconnected Linear ${[...keys].join(", ") || "(nothing connected)"}`);
+        announceConnection(left.length > 0);
+        return { ok: true };
+      },
+      async setDefault({ account }) {
+        const found = findAccount(await accounts(), account);
+        if (found === null) throw new Error(`No Linear workspace ${JSON.stringify(account)} is connected.`);
+        chosenDefault = found.key;
+        await bb.storage.kv.set(DEFAULT_KEY, found.key);
+        announceConnection(true);
         return { ok: true };
       },
       watches: () => usage(),
@@ -414,14 +629,19 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         const cfg = await settings.get();
         try {
           const tokens = await exchangeCode(cfg.apiUrl, clientIdOf(cfg), pending, code, deps.fetch, AbortSignal.timeout(15_000), deps.now());
-          await storeTokens(tokens);
-          await bb.storage.kv.delete(CONNECTION_KEY);
-          const viewer = await whoIs(tokens.accessToken, cfg.apiUrl, AbortSignal.timeout(15_000));
+          const viewer = parseViewer(await graphql(cfg.apiUrl, tokens.accessToken, VIEWER_QUERY, undefined, deps.fetch, AbortSignal.timeout(15_000)));
+          const before = await accounts().catch(() => known);
+          const all = await upsertAccount(tokens, viewer);
+          const key = accountKey(viewer.organization.urlKey);
+          // A reconnect may come with teams that were not visible before.
+          teamsAskedAt.delete(key);
           announceConnection(true);
-          bb.log.info(`connected to Linear as ${viewer.user.name} in ${viewer.organization.name}`);
+          const again = before.some((a) => a.key === key);
+          bb.log.info(`${again ? "reconnected" : "connected"} to Linear as ${viewer.user.name} in ${viewer.organization.name}`);
+          const others = all.filter((a) => a.key !== key);
           return resultPage(
             "Linear connected",
-            `bb threads can now read and update Linear issues in ${viewer.organization.name} as ${viewer.user.name}. You can close this tab.`,
+            `bb threads can now read and update Linear issues in ${viewer.organization.name} as ${viewer.user.name}.${others.length > 0 ? ` Also connected: ${others.map((a) => a.organization.name).join(", ")}.` : ""} You can close this tab.`,
             200,
           );
         } catch (error) {
@@ -434,31 +654,37 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     // ---- the reads the tools and the CLI share -----------------------------
 
-    const notFound = (key: string) => new Error(`No Linear issue ${key}, or it is not visible to the connected user.`);
+    const notFound = (key: string, account?: Account) =>
+      new Error(`No Linear issue ${key}, or it is not visible to the connected user${account !== undefined && known.length > 1 ? ` in ${describeAccount(account)} (connected: ${listAccounts(known)}; pass account to look in another)` : ""}.`);
 
-    async function readIssue(key: string, signal: AbortSignal): Promise<Issue | null> {
-      return parseIssue(await query(ISSUE_QUERY, { id: key }, signal));
+    /** The workspace an issue key belongs to, unless the caller named one. */
+    const forIssue = (key: string, account: string | undefined, signal: AbortSignal) => pick({ account, team: teamOfIssueKey(key) }, signal);
+
+    async function readIssue(account: Account, key: string, signal: AbortSignal): Promise<Issue | null> {
+      return parseIssue(await query(account.key, ISSUE_QUERY, { id: key }, signal));
     }
 
-    async function searchIssues(input: SearchInput, signal: AbortSignal): Promise<{ issues: Issue[]; heading: string }> {
+    async function searchIssues(input: SearchInput & { account?: string | undefined }, signal: AbortSignal): Promise<{ issues: Issue[]; heading: string }> {
+      const account = await pick({ account: input.account, team: input.team }, signal);
       const openOnly = input.openOnly ?? true;
       const filter = issueFilter({ ...input, openOnly });
       const first = searchLimit(input.limit);
       const term = input.query?.trim() ?? "";
       const issues =
         term === ""
-          ? parseIssueList(await query(ISSUES_QUERY, { filter, first }, signal), "issues")
-          : parseIssueList(await query(SEARCH_QUERY, { term, filter, first }, signal), "searchIssues");
+          ? parseIssueList(await query(account.key, ISSUES_QUERY, { filter, first }, signal), "issues")
+          : parseIssueList(await query(account.key, SEARCH_QUERY, { term, filter, first }, signal), "searchIssues");
       const what = [term === "" ? null : JSON.stringify(term), input.team ? `team ${input.team}` : null, input.state ? `state ${input.state}` : null, input.assignee ? `assignee ${input.assignee}` : null]
         .filter((s): s is string => s !== null)
         .join(", ");
-      return { issues, heading: `Linear issues${what === "" ? "" : ` matching ${what}`}` };
+      const where = known.length > 1 ? ` in ${describeAccount(account)}` : "";
+      return { issues, heading: `Linear issues${where}${what === "" ? "" : ` matching ${what}`}` };
     }
 
     /** A read-only document's data, with Linear's GraphQL errors alongside. */
-    async function readOnlyQuery(document: string, variables: Record<string, unknown> | undefined, signal: AbortSignal): Promise<{ data: unknown; errors: string[] }> {
+    async function readOnlyQuery(account: string | undefined, document: string, variables: Record<string, unknown> | undefined, signal: AbortSignal): Promise<{ data: unknown; errors: string[] }> {
       if (!isReadOnlyDocument(document)) throw new Error("Only queries are allowed here. Use linear_create_issue, linear_comment or linear_update_issue to change issues.");
-      const payload = await query(document, variables, signal);
+      const payload = await query((await pick({ account }, signal)).key, document, variables, signal);
       const errors = graphqlErrors(payload);
       const data = payload !== null && typeof payload === "object" ? (payload as { data?: unknown }).data : undefined;
       if (data === undefined || data === null) throw new Error(errors.length > 0 ? `Linear: ${errors.join("; ")}` : "Linear answered without data");
@@ -476,9 +702,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // "me" is the connected user. Anyone else is matched by exact name or
     // email first, then as the only partial match; several matches ask for
     // an email rather than guessing.
-    async function resolveAssignee(who: string, signal: AbortSignal): Promise<{ id: string } | { error: string }> {
-      if (who.toLowerCase() === "me") return { id: parseViewer(await query(VIEWER_QUERY, undefined, signal)).user.id };
-      const users = parseUsers(await query(USERS_QUERY, { who }, signal)).filter((u) => u.active);
+    async function resolveAssignee(account: Account, who: string, signal: AbortSignal): Promise<{ id: string } | { error: string }> {
+      if (who.toLowerCase() === "me") return { id: account.user.id };
+      const users = parseUsers(await query(account.key, USERS_QUERY, { who }, signal)).filter((u) => u.active);
       const exact = users.filter((u) => u.name.toLowerCase() === who.toLowerCase() || u.email?.toLowerCase() === who.toLowerCase());
       const chosen = exact.length === 1 ? exact[0] : users.length === 1 ? users[0] : null;
       if (chosen === null) {
@@ -492,18 +718,30 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return { id: chosen.id };
     }
 
+    // Several workspaces: the issue or team key usually settles which, so the
+    // parameter is optional everywhere and needed only to break a tie or to
+    // search or query somewhere other than the default.
+    const accountParam = z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe("Which connected Linear workspace, by its URL key (acme in linear.app/acme). Leave out unless several are connected and the issue or team key does not settle it.");
+
     bb.agents.registerTool({
       name: "linear_issue",
       description:
         "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
       instructions:
-        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes.",
+        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes. If several Linear workspaces are connected, an issue or team key picks its workspace; pass account only for a search without a team, for linear_query, or when told a key is ambiguous.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
-      parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
-      async execute({ key }, { signal }) {
+      parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123."), account: accountParam }),
+      async execute({ key, account }, { signal }) {
         try {
-          const issue = await readIssue(key, signal);
-          return issue === null ? toolError(notFound(key)) : formatIssue(issue);
+          const where = await forIssue(key, account, signal);
+          const issue = await readIssue(where, key, signal);
+          return issue === null ? toolError(notFound(key, where)) : formatIssue(issue);
         } catch (error) {
           return toolError(error);
         }
@@ -522,6 +760,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         assignee: z.string().trim().max(100).optional().describe("A person's name or email, or 'me'."),
         openOnly: z.boolean().optional().describe("Leave out completed and canceled issues. Default true unless a state is given."),
         limit: z.number().int().min(1).max(SEARCH_LIMIT_MAX).optional().describe("At most this many issues (default 20)."),
+        account: accountParam,
       }),
       async execute(input, { signal }) {
         try {
@@ -540,12 +779,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       parameters: z.object({
         key: issueKey.describe("The issue key, such as ENG-123."),
         body: z.string().trim().min(1).max(20_000).describe("The comment, in Markdown."),
+        account: accountParam,
       }),
-      async execute({ key, body }, { threadId, signal }) {
+      async execute({ key, body, account }, { threadId, signal }) {
         try {
-          const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: key }, signal));
-          if (ref === null) return toolError(new Error(`No Linear issue ${key}, or it is not visible to the connected user.`));
-          const created = parseCommentCreate(await query(COMMENT_CREATE, { input: { issueId: ref.id, body: signed(body, threadId) } }, signal));
+          const where = await forIssue(key, account, signal);
+          const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: key }, signal));
+          if (ref === null) return toolError(notFound(key, where));
+          const created = parseCommentCreate(await query(where.key, COMMENT_CREATE, { input: { issueId: ref.id, body: signed(body, threadId) } }, signal));
           return `Commented on ${ref.identifier}${created.url === null ? "" : `: ${created.url}`}`;
         } catch (error) {
           return toolError(error);
@@ -567,6 +808,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           removeLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to remove, matched ignoring case."),
           priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
           description: z.string().trim().min(1).max(50_000).optional().describe("The whole new description, in Markdown. Replaces the old one."),
+          account: accountParam,
         })
         .refine(
           (v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined || v.description !== undefined,
@@ -574,8 +816,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         ),
       async execute(input, { threadId, signal }) {
         try {
-          const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: input.key }, signal));
-          if (ref === null) return toolError(new Error(`No Linear issue ${input.key}, or it is not visible to the connected user.`));
+          const where = await forIssue(input.key, input.account, signal);
+          const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.key }, signal));
+          if (ref === null) return toolError(notFound(input.key, where));
           const update: Record<string, unknown> = {};
           const changed: string[] = [];
 
@@ -592,7 +835,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             if (input.assignee.toLowerCase() === "nobody") {
               update.assigneeId = null;
             } else {
-              const resolved = await resolveAssignee(input.assignee, signal);
+              const resolved = await resolveAssignee(where, input.assignee, signal);
               if ("error" in resolved) return toolError(new Error(resolved.error));
               update.assigneeId = resolved.id;
             }
@@ -616,7 +859,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
           if (input.description !== undefined) update.description = signed(input.description, threadId);
 
-          const updated = parseIssueUpdate(await query(ISSUE_UPDATE, { id: ref.id, input: update }, signal));
+          const updated = parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, signal));
           if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
           if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
           if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
@@ -643,12 +886,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         labels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names, matched ignoring case."),
         priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
         parent: issueKey.optional().describe("The parent issue's key, to file this as a sub-issue."),
+        account: accountParam,
       }),
       async execute(input, { threadId, signal }) {
         try {
           const teamKey = input.team.trim().toUpperCase();
-          const team = parseTeam(await query(TEAM_QUERY, { key: teamKey }, signal));
-          if (team === null) return toolError(new Error(`No Linear team ${teamKey}, or it is not visible to the connected user.`));
+          const where = await pick({ account: input.account, team: teamKey }, signal);
+          const team = parseTeam(await query(where.key, TEAM_QUERY, { key: teamKey }, signal));
+          if (team === null) return toolError(new Error(`No Linear team ${teamKey}, or it is not visible to the connected user${known.length > 1 ? ` in any connected workspace (${listAccounts(known)})` : ""}.`));
 
           const create: Record<string, unknown> = { teamId: team.id, title: input.title.trim() };
           create.description = signed(input.description?.trim() ?? "", threadId);
@@ -675,7 +920,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
           const assignee = input.assignee?.trim() ?? "";
           if (assignee !== "") {
-            const resolved = await resolveAssignee(assignee, signal);
+            const resolved = await resolveAssignee(where, assignee, signal);
             if ("error" in resolved) return toolError(new Error(resolved.error));
             create.assigneeId = resolved.id;
           }
@@ -683,13 +928,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (input.priority !== undefined) create.priority = PRIORITIES[input.priority];
 
           if (input.parent !== undefined) {
-            const parent = parseIssueRef(await query(ISSUE_REF_QUERY, { id: input.parent }, signal));
-            if (parent === null) return toolError(new Error(`No Linear issue ${input.parent}, or it is not visible to the connected user.`));
+            const parent = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.parent }, signal));
+            if (parent === null) return toolError(notFound(input.parent, where));
             if (parent.team.key !== team.key) return toolError(new Error(`${parent.identifier} is in team ${parent.team.key}, so a sub-issue of it must be filed in ${parent.team.key}, not ${team.key}.`));
             create.parentId = parent.id;
           }
 
-          const created = parseIssueCreate(await query(ISSUE_CREATE, { input: create }, signal));
+          const created = parseIssueCreate(await query(where.key, ISSUE_CREATE, { input: create }, signal));
           return `Filed ${created.identifier}: ${input.title.trim()}${created.url === null ? "" : `\n${created.url}`}`;
         } catch (error) {
           return toolError(error);
@@ -705,10 +950,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       parameters: z.object({
         query: z.string().trim().min(1).max(20_000).describe("A GraphQL query document."),
         variables: z.record(z.string(), z.unknown()).optional().describe("Variables for the query."),
+        account: accountParam.describe("Which connected Linear workspace to query, by its URL key. The default workspace when left out."),
       }),
-      async execute({ query: document, variables }, { signal }) {
+      async execute({ query: document, variables, account }, { signal }) {
         try {
-          const { data, errors } = await readOnlyQuery(document, variables, signal);
+          const { data, errors } = await readOnlyQuery(account, document, variables, signal);
           const text = JSON.stringify(data, null, 1);
           return errors.length > 0 ? `${text}\n\nErrors: ${errors.join("; ")}` : text;
         } catch (error) {
@@ -754,13 +1000,21 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       await wake(watch.threadId, `Linear issue ${watch.issueKey} is no longer visible to the connected user (deleted, moved, or access removed), so this thread has stopped watching it.`);
     }
 
+    /** The workspace an issue's watches read it in; null while that workspace is disconnected. */
+    function accountForWatches(watching: WatchRow[]): Account | null {
+      return accountForStored(watching.map((w) => w.account ?? null).find((a) => a !== null) ?? null);
+    }
+
     /** Read the issue once and settle every watch on it against what it remembers. */
     async function checkIssue(issueId: string): Promise<void> {
       const watching = watches.forIssue(issueId);
       if (watching.length === 0) return;
+      // Disconnected: left as they are, and caught up once it is connected again.
+      const account = accountForWatches(watching);
+      if (account === null) return;
       let issue: Issue | null;
       try {
-        issue = await readIssue(issueId, checkSignal());
+        issue = await readIssue(account, issueId, checkSignal());
       } catch (error) {
         // Left as it was: the cursors still point at the last thing seen, so
         // the next doorbell or sweep reports everything since then.
@@ -793,7 +1047,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         bb.log.info(`forgot ${expired} Linear watch${expired === 1 ? "" : "es"} idle for a week`);
         announceWatches();
       }
-      const ids = watches.issueIds();
+      const ids = watches.issues().filter((w) => accountForStored(w.account) !== null).map((w) => w.issueId);
       if (ids.length > 0) bb.log.info(`checking ${ids.length} watched Linear issue${ids.length === 1 ? "" : "s"} (${reason})`);
       await checks.sweep(ids);
     }
@@ -804,25 +1058,56 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // says which teams and issues it manages through sourceSetInterest. The
     // interest is stored in kv so a restart leases it again without waiting
     // for stewards to repeat itself. Teams come as keys and are leased by
-    // UUID, which is also what a doorbell's unit names; issues come as UUIDs
-    // or keys, and keys are resolved with a read. Anything that cannot be
+    // UUID, which is also what a doorbell's unit names, in each workspace
+    // that has the key; issues come as UUIDs or keys, and keys are resolved
+    // with a read in their team's workspace. Anything that cannot be
     // resolved yet (Linear not connected, or down) stays as given and is
     // tried again when the stream next connects or the interest next changes.
 
     const INTEREST_KEY = "stewards/interest";
-    const TEAM_IDS_KEY = "stewards/teamIds";
+    const ENTITY_ACCOUNTS_KEY = "stewards/entityAccounts";
     const interestRecord = z.object({ units: z.array(z.string()), entities: z.array(z.string()) });
     const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
     /** Team keys, and issues as UUIDs or keys not yet resolved. */
     let interest = interestRecord.catch({ units: [], entities: [] }).parse(await bb.storage.kv.get(INTEREST_KEY));
-    /** Team key to UUID, for every team the connected user could see when last asked. */
-    let teamIds = z.record(z.string(), z.string()).catch({}).parse(await bb.storage.kv.get(TEAM_IDS_KEY));
-    /** What a doorbell is matched against: issue UUIDs, and team UUIDs as a doorbell's unit names them. */
-    let ringFor = { issues: new Set<string>(), teams: new Set<string>() };
+    /** Issue UUID to the workspace it was found in, for stewards' issues; learned on resolution and on snapshots. */
+    const entityAccounts = new Map(Object.entries(z.record(z.string(), z.string()).catch({}).parse(await bb.storage.kv.get(ENTITY_ACCOUNTS_KEY))));
+    async function learnEntityAccounts(ids: string[], account: string): Promise<void> {
+      // Worth remembering only when there is more than one place to look.
+      if (known.length < 2) return;
+      const fresh = ids.map((id) => id.toLowerCase()).filter((id) => entityAccounts.get(id) !== account);
+      if (fresh.length === 0) return;
+      for (const id of fresh) entityAccounts.set(id, account);
+      await bb.storage.kv.set(ENTITY_ACCOUNTS_KEY, Object.fromEntries(entityAccounts));
+    }
+    /**
+     * Where to look for an issue: a key in its team's workspace; a UUID
+     * first where it was last found, then in each of the others.
+     */
+    async function candidatesFor(entity: string, all: Account[], signal: AbortSignal): Promise<Account[]> {
+      if (!UUID.test(entity)) return [await pick({ team: teamOfIssueKey(entity) }, signal)];
+      const learnedAt = entityAccounts.get(entity.toLowerCase());
+      return [...all.filter((a) => a.key === learnedAt), ...all.filter((a) => a.key !== learnedAt)];
+    }
+    /** The workspace a stewards issue was found in, or the default when it has not been found yet (one workspace needs no finding). */
+    const accountOfEntity = (id: string) => accountForStored(entityAccounts.get(id) ?? null);
+    /** Team key to its UUID and workspace in every workspace that has it. */
+    const teamsNamed = (key: string) =>
+      known.flatMap((a) => {
+        const id = teamMaps.get(a.key)?.[key];
+        return id === undefined ? [] : [{ id, account: a.key }];
+      });
+    /** A team UUID's key, for logs and the usage view. */
+    const teamKeyOf = (id: string) => {
+      for (const map of teamMaps.values()) for (const [key, t] of Object.entries(map)) if (t === id) return key;
+      return id;
+    };
+    /** What a doorbell is matched against: issue UUIDs, and team UUIDs as a doorbell's unit names them, each with its workspace. */
+    let ringFor = { issues: new Set<string>(), teams: new Map<string, string>() };
     function recomputeRings(): void {
       ringFor = {
         issues: new Set(interest.entities.filter((e) => UUID.test(e))),
-        teams: new Set(interest.units.map((key) => teamIds[key]).filter((id): id is string => id !== undefined)),
+        teams: new Map(interest.units.flatMap((key) => teamsNamed(key).map((t) => [t.id, t.account] as const))),
       };
     }
     recomputeRings();
@@ -833,10 +1118,19 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     /** Stewards' leases bb-gate-hooks refused: `team:<uuid>` or an issue UUID. */
     const refusals = createRefusals(deps.now);
 
-    /** Every lease the stream holds: watched issues, stewards' issues, stewards' teams. */
+    /** Every lease the stream holds: watched issues, stewards' issues, stewards' teams; each proven in its own workspace. */
     function leases(): Lease[] {
-      const issues = new Set([...watches.issueIds(), ...ringFor.issues]);
-      return [...[...issues].map((id) => ({ kind: "issue" as const, id })), ...[...ringFor.teams].map((id) => ({ kind: "team" as const, id }))];
+      const out = new Map<string, Lease>();
+      for (const w of watches.issues()) {
+        const account = accountForStored(w.account);
+        if (account !== null) out.set(w.issueId, { kind: "issue", id: w.issueId, account: account.key });
+      }
+      for (const id of ringFor.issues) {
+        const account = accountOfEntity(id);
+        if (account !== null && !out.has(id)) out.set(id, { kind: "issue", id, account: account.key });
+      }
+      const teams = [...ringFor.teams].filter(([, account]) => knownAccount(account) !== null).map(([id, account]) => ({ kind: "team" as const, id, account }));
+      return [...out.values(), ...teams];
     }
 
     // The SDK's callRpc takes JSON input; ringStewards hands it the
@@ -855,17 +1149,6 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     /** Linear says "Entity not found" for an id that names nothing, rather than a null issue. */
     const isNotFound = (error: unknown) => /entity not found|could not find/iu.test(errorMessage(error));
 
-    async function refreshTeamIds(): Promise<Record<string, string>> {
-      teamIds = Object.fromEntries(parseTeams(await query(TEAMS_QUERY, undefined, checkSignal())).map((t) => [t.key.toUpperCase(), t.id]));
-      await bb.storage.kv.set(TEAM_IDS_KEY, teamIds);
-      return teamIds;
-    }
-
-    /** The team map, asked of Linear again when one of these keys is missing from it: the team may be new. */
-    async function teamIdsFor(keys: string[]): Promise<Record<string, string>> {
-      return keys.some((k) => teamIds[k] === undefined) ? refreshTeamIds() : teamIds;
-    }
-
     // One change to the interest at a time: a resolution finishing after a
     // newer set would otherwise write the older set back.
     let interestChain: Promise<void> = Promise.resolve();
@@ -875,37 +1158,55 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return next;
     }
 
+    /**
+     * Where an issue named by key or UUID lives, and its UUID and key: the
+     * key's workspace, or for a UUID the one it was last found in, else each
+     * workspace in turn. Null when no connected workspace can see it.
+     */
+    async function locateIssue(entity: string, signal: AbortSignal): Promise<{ account: Account; id: string; identifier: string } | null> {
+      const candidates = await candidatesFor(entity, await accounts(), signal);
+      let failure: unknown = null;
+      for (const account of candidates) {
+        try {
+          const found = parseIssueId(await query(account.key, ISSUE_ID_QUERY, { id: entity }, signal));
+          if (found !== null) return { account, id: found.id.toLowerCase(), identifier: found.identifier };
+        } catch (error) {
+          if (!isNotFound(error)) failure = error;
+        }
+      }
+      if (failure !== null) throw failure;
+      return null;
+    }
+
     /** Resolve what can be resolved, store the result, and lease whatever is new right away. */
     async function resolveAndLease(why: string): Promise<void> {
       const before = ringFor;
       if (await isConnected()) {
         try {
-          if (interest.units.length > 0) await teamIdsFor(interest.units);
+          if (interest.units.length > 0) await ensureTeams(interest.units, checkSignal());
         } catch (error) {
           bb.log.warn(`could not list Linear teams for stewards (${why}): ${errorMessage(error)}`);
         }
         const entities: string[] = [];
         invisible = [];
+        const single = known.length === 1;
         for (const entity of interest.entities) {
-          if (UUID.test(entity)) {
+          // A UUID needs finding only when there is more than one place to look.
+          if (UUID.test(entity) && (single || entityAccounts.has(entity))) {
             entities.push(entity);
             continue;
           }
           try {
-            const found = parseIssueId(await query(ISSUE_ID_QUERY, { id: entity }, checkSignal()));
+            const found = await locateIssue(entity, checkSignal());
             if (found === null) {
               bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
               invisible.push(entity);
             } else {
-              entities.push(found.id.toLowerCase());
-              issueKeys.set(found.id.toLowerCase(), found.identifier);
+              entities.push(found.id);
+              issueKeys.set(found.id, found.identifier);
+              await learnEntityAccounts([found.id], found.account.key);
             }
           } catch (error) {
-            if (isNotFound(error)) {
-              bb.log.warn(`stewards asked about Linear issue ${entity}, which the connected user cannot see; leaving it out`);
-              invisible.push(entity);
-              continue;
-            }
             bb.log.warn(`could not resolve Linear issue ${entity} for stewards (${why}): ${errorMessage(error)}`);
             entities.push(entity);
           }
@@ -915,12 +1216,8 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       recomputeRings();
       announceWatches();
-      const issues = [...ringFor.issues].filter((id) => !before.issues.has(id));
-      const teams = [...ringFor.teams].filter((id) => !before.teams.has(id));
-      await Promise.all([
-        hooks.added("issue", ...issues).catch((error: unknown) => bb.log.warn(`could not lease stewards' issues right away: ${errorMessage(error)}`)),
-        hooks.added("team", ...teams).catch((error: unknown) => bb.log.warn(`could not lease stewards' teams right away: ${errorMessage(error)}`)),
-      ]);
+      const fresh = leases().filter((l) => (l.kind === "issue" ? ringFor.issues.has(l.id) && !before.issues.has(l.id) : !before.teams.has(l.id)));
+      await hooks.addedLeases(fresh).catch((error: unknown) => bb.log.warn(`could not lease stewards' issues and teams right away: ${errorMessage(error)}`));
     }
 
     const resolveInterest = (why: string) =>
@@ -938,37 +1235,41 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       });
     }
 
-    /** The connected user's name, for a snapshot's `viewer`; null when it cannot be learned. */
-    async function viewerName(): Promise<string | null> {
-      try {
-        return (await whoIs(await accessToken(), (await settings.get()).apiUrl, checkSignal())).user.name;
-      } catch (error) {
-        bb.log.warn(`could not learn who Linear is connected as: ${errorMessage(error)}`);
-        return null;
+    async function sourceSnapshot(id: string) {
+      const entity = id.trim();
+      const all = await accounts();
+      if (all.length === 0) throw new Error(NOT_CONNECTED);
+      for (const account of await candidatesFor(entity, all, checkSignal())) {
+        let issue;
+        try {
+          issue = parseSnapshotIssue(await query(account.key, SNAPSHOT_QUERY, { id: entity }, checkSignal()));
+        } catch (error) {
+          if (isNotFound(error)) continue;
+          throw error;
+        }
+        if (issue === null) continue;
+        await learnEntityAccounts([issue.id], account.key);
+        return { snapshot: snapshotOfIssue(issue, account.user.name) };
       }
+      return { snapshot: null };
     }
 
-    async function sourceSnapshot(id: string) {
-      let issue;
-      try {
-        issue = parseSnapshotIssue(await query(SNAPSHOT_QUERY, { id: id.trim() }, checkSignal()));
-      } catch (error) {
-        if (isNotFound(error)) return { snapshot: null };
-        throw error;
-      }
-      return { snapshot: issue === null ? null : snapshotOfIssue(issue, await viewerName()) };
-    }
+    /** The default workspace's user, for stewards' `viewer` where no one issue decides it. */
+    const defaultViewer = () => defaultAccount(known, chosenDefault)?.user.name ?? null;
 
     // Validation answers rather than throws: `bb stewards check` reports a
     // disconnected Linear as one line, beside whatever github says.
     async function sourceValidate(input: { units: string[]; label: string; states: string[] }) {
       if (!(await isConnected())) return { viewer: null, units: [], mine: [], error: NOT_CONNECTED };
       try {
-        const viewer = await viewerName();
-        const mine = parseTeams(await query(MY_TEAMS_QUERY, undefined, checkSignal())).map((t) => ({ unit: t.key, name: t.name }));
+        const all = await accounts();
+        const viewer = defaultViewer();
+        const mine = (await Promise.all(all.map(async (a) => parseTeams(await query(a.key, MY_TEAMS_QUERY, undefined, checkSignal())).map((t) => ({ unit: t.key, name: all.length > 1 ? `${t.name} (${a.key})` : t.name }))))).flat();
         const units = [];
         for (const unit of input.units) {
-          const team = parseTeam(await query(TEAM_QUERY, { key: unit.trim().toUpperCase() }, checkSignal()));
+          const key = unit.trim().toUpperCase();
+          const account = await pick({ team: key }, checkSignal());
+          const team = parseTeam(await query(account.key, TEAM_QUERY, { key }, checkSignal()));
           units.push(
             team === null
               ? { unit, found: false, labelFound: false, missingStates: [] }
@@ -990,27 +1291,36 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     // here: oldest first, which is the order a capped nightly pass adopts in.
     async function sourceAdoptable(input: { units: string[]; label: string; limit: number }) {
       if (!(await isConnected())) return { viewer: null, entities: [], errors: [NOT_CONNECTED] };
-      const viewer = await viewerName();
+      const all = await accounts();
+      const viewer = defaultViewer();
       const keys = [...new Set(input.units.map((u) => u.trim().toUpperCase()))];
       const entities: AdoptableEntity[] = [];
       const errors: string[] = [];
-      let known: Record<string, string> | null = null;
+      let listed = true;
       try {
-        known = await teamIdsFor(keys);
+        await ensureTeams(keys, checkSignal());
       } catch (error) {
+        listed = false;
         errors.push(`Linear teams: ${errorMessage(error)}`);
       }
       for (const key of keys) {
-        if (known !== null && known[key] === undefined) {
+        const having = accountsWithTeam(all, (a) => teamMaps.get(a), key);
+        if (listed && having.length === 0) {
           errors.push(`${key}: no such Linear team, or it is not visible to the connected user`);
           continue;
         }
+        if (having.length > 1) {
+          errors.push(`${key}: a team with this key is in more than one connected Linear workspace (${listAccounts(having)}); none of its issues were read`);
+          continue;
+        }
+        const account = having[0] ?? defaultAccount(all, chosenDefault)!;
         try {
           let after: string | null = null;
           let pages = 0;
           do {
-            const page = parseAdoptablePage(await query(ADOPTABLE_QUERY, { filter: adoptableFilter(key, input.label), first: ADOPTABLE_PAGE, after }, checkSignal()));
+            const page = parseAdoptablePage(await query(account.key, ADOPTABLE_QUERY, { filter: adoptableFilter(key, input.label), first: ADOPTABLE_PAGE, after }, checkSignal()));
             entities.push(...page.entities);
+            await learnEntityAccounts(page.entities.map((e) => e.id), account.key);
             after = page.next;
           } while (after !== null && ++pages < ADOPTABLE_PAGES_MAX);
           if (after !== null) errors.push(`${key}: more than ${ADOPTABLE_PAGE * ADOPTABLE_PAGES_MAX} open issues carry ${input.label}; only those were read`);
@@ -1038,16 +1348,17 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       for (const r of rejected) {
         if (r.kind === "team") {
           refusals.add(`team:${r.id}`, r.reason);
-          const key = Object.entries(teamIds).find(([, id]) => id === r.id)?.[0] ?? r.id;
-          bb.log.warn(`bb-gate-hooks refused a lease on Linear team ${key} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
+          bb.log.warn(`bb-gate-hooks refused a lease on Linear team ${teamKeyOf(r.id)} (${r.reason}); stewards hears of its issues only through their own leases until a renewal succeeds`);
           continue;
         }
         if (r.kind === "issue" && ringFor.issues.has(r.id)) refusals.add(r.id, r.reason);
         if (r.kind !== "issue" || r.reason !== "forbidden") continue;
         const watching = watches.forIssue(r.id);
         if (watching.length === 0) continue;
+        const account = (r.account === undefined ? null : knownAccount(r.account)) ?? accountForWatches(watching);
+        if (account === null) continue;
         try {
-          if ((await readIssue(r.id, checkSignal())) !== null) {
+          if ((await readIssue(account, r.id, checkSignal())) !== null) {
             bb.log.warn(`bb-gate-hooks refused a lease on ${watching[0]!.issueKey} that the connected user can read; keeping the watch`);
             continue;
           }
@@ -1064,8 +1375,9 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       baseUrl: hooksUrl,
       now: deps.now,
       log: bb.log,
-      token: accessToken,
-      refreshToken: () => refresh("was refused by bb-gate-hooks"),
+      // A lease names its workspace; one without falls back to the default.
+      token: (account) => accessToken(account ?? defaultKey() ?? ""),
+      refreshToken: (account) => refresh(account ?? defaultKey() ?? "", "was refused by bb-gate-hooks"),
       leases,
       // A watch check reads the issue only when a thread watches it, so every
       // doorbell goes to it; stewards hears of the ones it asked about.
@@ -1086,7 +1398,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     async function usage() {
       const rows = watches.all();
       const status = await connectionStatus();
-      const base = status.organization === null ? null : `${status.linearUrl.replace(/\/$/u, "")}/${status.organization.urlKey}/issue/`;
+      const base = (account: Account | null) => (account === null ? null : `${status.linearUrl.replace(/\/$/u, "")}/${account.organization.urlKey}/issue/`);
       const titles = new Map<string, string | null>();
       await Promise.all(
         [...new Set(rows.map((r) => r.threadId))].map(async (threadId) => {
@@ -1104,8 +1416,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         configured: hooksUrl !== "",
         now: deps.now(),
         titles,
-        target: (row) => ({ id: row.issueId, key: row.issueKey, kind: "issue", title: row.snapshot.title, url: base === null ? null : `${base}${row.issueKey}` }),
-        interest: await interestView(status.connected, base),
+        target: (row) => {
+          const b = base(accountForStored(row.account));
+          return { id: row.issueId, key: row.issueKey, kind: "issue", title: row.snapshot.title, url: b === null ? null : `${b}${row.issueKey}` };
+        },
+        interest: await interestView(status.connected, (id) => base(accountOfEntity(id))),
       });
     }
 
@@ -1114,23 +1429,27 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
      * what is asked for but not leased. Keys missing from the cache are
      * asked of Linear in one query; an issue Linear cannot name shows its UUID.
      */
-    async function interestView(connected: boolean, base: string | null): Promise<InterestView> {
+    async function interestView(connected: boolean, base: (issueId: string) => string | null): Promise<InterestView> {
       for (const row of watches.all()) issueKeys.set(row.issueId, row.issueKey);
       const uuids = interest.entities.filter((e) => UUID.test(e));
       const missing = uuids.filter((id) => !issueKeys.has(id));
       if (connected && missing.length > 0) {
-        try {
-          for (let i = 0; i < missing.length; i += 250) {
-            for (const found of parseIssueKeys(await query(ISSUE_KEYS_QUERY, { ids: missing.slice(i, i + 250) }, checkSignal()))) issueKeys.set(found.id.toLowerCase(), found.identifier);
+        // Each workspace names the ones it has; a UUID it does not know is simply left out of its answer.
+        for (const account of known) {
+          const ask = missing.filter((id) => !issueKeys.has(id));
+          if (ask.length === 0) break;
+          try {
+            for (let i = 0; i < ask.length; i += 250) {
+              for (const found of parseIssueKeys(await query(account.key, ISSUE_KEYS_QUERY, { ids: ask.slice(i, i + 250) }, checkSignal()))) issueKeys.set(found.id.toLowerCase(), found.identifier);
+            }
+          } catch (error) {
+            bb.log.warn(`could not name stewards' Linear issues in ${account.key}: ${errorMessage(error)}`);
           }
-        } catch (error) {
-          bb.log.warn(`could not name stewards' Linear issues: ${errorMessage(error)}`);
         }
       }
       const keyOf = (id: string) => issueKeys.get(id) ?? id;
-      const teamKeyOf = (id: string) => Object.entries(teamIds).find(([, t]) => t === id)?.[0] ?? id;
       const unleased: InterestView["unleased"] = [];
-      for (const unit of interest.units) if (teamIds[unit] === undefined) unleased.push({ key: unit, reason: "no such team, or not visible to the connected Linear user" });
+      for (const unit of interest.units) if (teamsNamed(unit).length === 0) unleased.push({ key: unit, reason: "no such team, or not visible to the connected Linear user" });
       for (const entity of interest.entities) if (!UUID.test(entity)) unleased.push({ key: entity, reason: "not resolved to a Linear issue yet" });
       for (const key of invisible) unleased.push({ key, reason: "not visible to the connected Linear user" });
       for (const [id, reason] of refusals.current()) {
@@ -1141,7 +1460,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return {
         nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] },
         units: interest.units,
-        entities: uuids.map((id) => ({ key: keyOf(id), url: base === null || !issueKeys.has(id) ? null : `${base}${keyOf(id)}` })).sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true })),
+        entities: uuids.map((id) => {
+          const b = base(id);
+          return { key: keyOf(id), url: b === null || !issueKeys.has(id) ? null : `${b}${keyOf(id)}` };
+        }).sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true })),
         unleased,
       };
     }
@@ -1172,7 +1494,15 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             const session = new AbortController();
             const stop = () => session.abort();
             signal.addEventListener("abort", stop, { once: true });
-            const onChange = () => void isConnected().then((connected) => (connected ? undefined : session.abort()));
+            // A workspace connected or disconnected while others stay: lease
+            // what it brings now rather than at the next renewal, and resolve
+            // stewards' issues and teams against it.
+            const onChange = () =>
+              void isConnected().then((connected) => {
+                if (!connected) return session.abort();
+                void resolveInterest("workspaces changed");
+                hooks.addedLeases(leases()).catch((error: unknown) => bb.log.warn(`could not lease after the workspaces changed: ${errorMessage(error)}`));
+              });
             connectionListeners.add(onChange);
             // Interest stored while Linear was disconnected, or before a
             // restart, may still name keys; resolve them now there is a token.
@@ -1203,19 +1533,21 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       description:
         "Watch a Linear issue from this thread: when its state, assignee, priority, labels, title or other fields change, or someone else comments, this thread is sent a message describing the change (which starts a new turn if the thread is idle). Use it when there is nothing to do until the ticket moves, then end the turn instead of polling. A thread can watch up to 10 issues; a watch nobody has woken in a week is dropped.",
       presentation: { label: { pending: "Watching a Linear issue", completed: "Watching a Linear issue" } },
-      parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123.") }),
-      async execute({ key }, { threadId, projectId, signal }) {
+      parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123."), account: accountParam }),
+      async execute({ key, account }, { threadId, projectId, signal }) {
         if (hooksUrl === "") {
           return toolError(new Error("Watching Linear issues is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set). Read the issue again later instead."));
         }
         try {
-          const issue = await readIssue(key, signal);
-          if (issue === null) return toolError(notFound(key));
+          const where = await forIssue(key, account, signal);
+          const issue = await readIssue(where, key, signal);
+          if (issue === null) return toolError(notFound(key, where));
           const added = watches.add({
             threadId,
             projectId,
             issueId: issue.id,
             issueKey: issue.identifier,
+            account: where.key,
             snapshot: snapshotOf(issue),
             ...initialCursors(issue, new Date(deps.now()).toISOString()),
           });
@@ -1226,7 +1558,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (added.outcome === "already") return `Already watching ${issue.identifier}: ${title}. This thread will be messaged when it changes; you can end the turn.`;
           // Not awaited: the lease lands within seconds when the stream is up,
           // and the next hello covers it when it is not. The tool need not wait.
-          hooks.added("issue", issue.id).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
+          hooks.addedLeases([{ kind: "issue", id: issue.id, account: where.key }]).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
           announceWatches();
           return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
         } catch (error) {
@@ -1247,7 +1579,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     const cliError = (error: unknown): never => {
       const message = errorMessage(error);
       throw new PluginCliError(message, {
-        code: message.startsWith("Linear is not connected") ? "not_connected" : error instanceof LinearRequestError ? "linear_request_failed" : "linear_error",
+        code: message.startsWith("Linear is not connected")
+          ? "not_connected"
+          : error instanceof AccountChoiceError
+            ? "account_ambiguous"
+            : error instanceof LinearRequestError
+              ? "linear_request_failed"
+              : "linear_error",
         ...(message.startsWith("Linear is not connected") ? { hint: "Connect Linear in Settings → Plugins → Linear, then run this again." } : {}),
       });
     };
@@ -1265,24 +1603,30 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return parsed as Record<string, unknown>;
     };
     const JSON_OPTION = { type: "boolean", description: "Emit machine-readable JSON" } as const;
+    const ACCOUNT_OPTION = { type: "string", description: "Which connected Linear workspace, by its URL key; inferred from an issue or team key, else the default", aliases: ["workspace"] } as const;
 
     bb.cli.register(
       defineCli({
         name: "linear",
         summary: "Read Linear issues as the connected user, from scripts and automations",
         description:
-          "Runs on the bb server with the Linear connection made in Settings → Plugins → Linear. Reads only; " +
-          "the token never appears in output. Made for script automations, which have no thread and no tools.",
+          "Runs on the bb server with the Linear connections made in Settings → Plugins → Linear. Reads only; " +
+          "the token never appears in output. Made for script automations, which have no thread and no tools. " +
+          "With several workspaces connected, an issue or team key picks its workspace and --account picks one outright.",
         commands: {
           status: cliCommand({
-            summary: "Who Linear is connected as on this server",
+            summary: "Which Linear workspaces this server is connected to, and as whom",
             options: { json: JSON_OPTION },
             async run(input) {
               const status = await connectionStatus();
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(status) };
               if (!status.connected) return { exitCode: 0, stdout: status.configured ? "Linear is not connected." : "Linear is not connected, and no OAuth client ID is set." };
-              const who = status.user === null ? "an unknown user" : status.user.name;
-              return { exitCode: 0, stdout: `Connected to Linear as ${who}${status.organization === null ? "" : ` in ${status.organization.name}`}.` };
+              if (status.accounts.length === 1) {
+                const only = status.accounts[0]!;
+                return { exitCode: 0, stdout: `Connected to Linear as ${only.user.name} in ${only.organization.name}.` };
+              }
+              const lines = status.accounts.map((a) => `  ${a.key}${a.isDefault ? " (default)" : ""}: ${a.user.name} in ${a.organization.name}`);
+              return { exitCode: 0, stdout: [`Connected to ${status.accounts.length} Linear workspaces:`, ...lines].join("\n") };
             },
           }),
 
@@ -1300,12 +1644,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           issue: cliCommand({
             summary: "Read one issue by key, with its description and latest comments",
             positionals: [{ name: "key", description: "The issue key, such as ENG-123", required: true }],
-            options: { json: JSON_OPTION },
+            options: { account: ACCOUNT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const key = issueKey.safeParse(input.positionals.key);
               if (!key.success) throw new PluginCliError(`${JSON.stringify(input.positionals.key)} is not an issue key.`, { code: "invalid_issue_key", hint: "Pass a key such as ENG-123." });
-              const issue = await readIssue(key.data, cliSignal(ctx)).catch(cliError);
-              if (issue === null) throw new PluginCliError(notFound(key.data).message, { code: "issue_not_found" });
+              const where = await forIssue(key.data, input.options.account, cliSignal(ctx)).catch(cliError);
+              const issue = await readIssue(where, key.data, cliSignal(ctx)).catch(cliError);
+              if (issue === null) throw new PluginCliError(notFound(key.data, where).message, { code: "issue_not_found" });
               return { exitCode: 0, stdout: input.options.json ? JSON.stringify(issue) : formatIssue(issue) };
             },
           }),
@@ -1320,12 +1665,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
               assignee: { type: "string", description: "A person's name or email, or 'me' for the connected user" },
               all: { type: "boolean", description: "Include completed and canceled issues (default when --state is given)", aliases: ["include-closed"] },
               limit: { type: "integer", min: 1, max: SEARCH_LIMIT_MAX, default: SEARCH_LIMIT_DEFAULT, description: `At most this many issues (1 to ${SEARCH_LIMIT_MAX})` },
+              account: ACCOUNT_OPTION,
               json: JSON_OPTION,
             },
             async run(input, ctx) {
               const o = input.options;
               if (o.query !== undefined && o.query.length > 500) throw new PluginCliError("--query is at most 500 characters.", { code: "invalid_query" });
-              const search: SearchInput = {
+              const search: SearchInput & { account?: string } = {
+                ...(o.account === undefined ? {} : { account: o.account }),
                 ...(o.query === undefined ? {} : { query: o.query }),
                 ...(o.team === undefined ? {} : { team: o.team }),
                 ...(o.state === undefined ? {} : { state: o.state }),
@@ -1344,13 +1691,14 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             positionals: [{ name: "document", description: "A GraphQL query document", required: true }],
             options: {
               variables: { type: "string", description: "Variables for the query, as a JSON object", aliases: ["vars"] },
+              account: { ...ACCOUNT_OPTION, description: "Which connected Linear workspace to query, by its URL key; the default when left out" },
               json: JSON_OPTION,
             },
             async run(input, ctx) {
               const document = input.positionals.document;
               if (document.trim() === "" || document.length > 20_000) throw new PluginCliError("The document must be 1 to 20000 characters.", { code: "invalid_document" });
               const variables = parseVariables(input.options.variables);
-              const { data, errors } = await readOnlyQuery(document, variables, cliSignal(ctx)).catch(cliError);
+              const { data, errors } = await readOnlyQuery(input.options.account, document, variables, cliSignal(ctx)).catch(cliError);
               return { exitCode: 0, stdout: JSON.stringify(data), ...(errors.length > 0 ? { stderr: `Linear: ${errors.join("; ")}` } : {}) };
             },
           }),

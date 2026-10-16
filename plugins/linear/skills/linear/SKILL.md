@@ -21,6 +21,14 @@ token stays on the server; a thread never sees it and needs no API key.
 | `linear_query` | Any read-only GraphQL query, for projects, cycles, teams, documents and anything the tools above lack. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue by key. This thread is messaged when its state, assignee, priority, labels, title or other fields change, or when someone else comments; the message starts a new turn. Up to ten per thread. |
 
+Every tool takes an optional `account`. Leave it out: when the developer has
+connected several Linear workspaces, an issue key (`OPS-7`) or a `team`
+picks the workspace that has that team. Pass it, as the workspace's URL key
+(`acme` in `linear.app/acme`), only for a search with no team or a
+`linear_query` outside the default workspace, or when a tool answers that a
+team key exists in more than one workspace. `bb linear status` lists the
+connected workspaces.
+
 Ticket keys appear in branch names, PR titles and thread titles
 (`ENG-123`, `eng-123-fix-login`). Read the ticket before starting work on
 one, and prefer these tools over asking the user to paste its contents.
@@ -46,7 +54,8 @@ do not poll.
 ## From a script
 
 The same reads are a `bb linear` command (`status`, `issue <key>`,
-`search`, `query <document>`), each with `--json`. It runs on the server
+`search`, `query <document>`), each with `--json`, and `--account` on the
+reads. It runs on the server
 inside the plugin, so a script automation can poll Linear with no token of
 its own: `bb linear search --team ENG --state "Build Ready" --json`. Prefer
 the tools inside a thread; reach for the command when writing a script
@@ -84,3 +93,7 @@ the application.
 A token that stops working (a 401 the refresh cannot fix) means the
 developer revoked the application in Linear or the refresh token
 expired: connect again the same way.
+
+"No Linear workspace "x" is connected" lists the workspaces that are; use
+one of those, or ask the user to choose **Connect another workspace** in
+the same settings section.

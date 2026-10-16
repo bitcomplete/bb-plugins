@@ -13,6 +13,47 @@ never the token, so no Linear credential reaches a machine.
 The [Team setup](../team-setup) checklist has a Linear row that starts the
 same connect.
 
+## Several workspaces
+
+A developer in more than one Linear workspace (their own company's and a
+client's, say) connects each one: **Connect another workspace** runs the
+same approval, and Linear's consent screen picks the workspace. Each becomes
+an account named by the workspace's URL key (`acme` in `linear.app/acme`),
+and connecting a workspace already connected renews its tokens. Each row in
+the settings section has its own Disconnect, and **Make default** chooses
+the default account; until one is chosen, the first workspace connected is
+the default.
+
+Which workspace a call goes to:
+
+1. The one named by the tool's optional `account` argument (or the CLI's
+   `--account`), by URL key or workspace name, ignoring case.
+2. Else the workspace that has the team: an issue key's prefix (`OPS` in
+   `OPS-7`), or the `team` given to a search or a new issue. Each
+   workspace's teams are listed once and remembered, then asked again when a
+   key is in none of them, at most once a minute per workspace.
+3. Else the default: a search without a team, `linear_query`, or a key no
+   workspace claims (a renamed team's old keys still resolve in Linear).
+
+Two workspaces with the same team key are an error that names both and asks
+for `account`, not a guess. With one workspace connected none of this
+costs anything: every call goes to it and no teams are listed.
+
+Watches remember the workspace the issue was read in, and leases on
+bb-gate-hooks are proven per workspace: one stream, one subscribe call per
+workspace with that workspace's token. Disconnecting one workspace leaves
+its watches in place but unchecked and unleased until it is connected
+again. Stewards' teams are leased in the workspace that has them, and a
+stewards issue named by UUID is looked for in the workspace it was last
+found in, then in the others.
+
+All the tokens live in one secret setting, `accounts`, as JSON, so they
+stay in the plugin's 0600 secrets file and never reach the database or a
+browser. A token in the old single-token settings (from a build before
+several workspaces, or pasted in by hand) is moved into `accounts` the first
+time it is needed; the move asks Linear whose it is unless the old build
+already knew, and refreshes it first if it has lapsed.
+
 ## Tools
 
 | Tool | What it does |
@@ -24,6 +65,8 @@ same connect.
 | `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
+
+Every tool takes an optional `account`; see "Several workspaces".
 
 Writes are deliberately named tools rather than a raw mutation tool, so the
 thread's timeline says what changed. Everything runs as the connected user
@@ -146,10 +189,10 @@ command runs inside the plugin on the server, so the token never leaves it.
 
 | Command | What it does |
 |---|---|
-| `bb linear status [--json]` | Who Linear is connected as. |
-| `bb linear issue <key> [--json]` | One issue, as the tool shows it, or its JSON. |
-| `bb linear search [--query <text>] [--team <key>] [--state <name>] [--assignee <who>] [--all] [--limit <n>] [--json]` | Issues, newest first. Open ones only unless `--state` or `--all`. `--json` prints an array of issue objects. |
-| `bb linear query <document> [--variables <json>]` | A read-only GraphQL query's `data`, as JSON. Mutations are refused. |
+| `bb linear status [--json]` | Which workspaces Linear is connected to, and as whom. |
+| `bb linear issue <key> [--account <key>] [--json]` | One issue, as the tool shows it, or its JSON. |
+| `bb linear search [--query <text>] [--team <key>] [--state <name>] [--assignee <who>] [--all] [--limit <n>] [--account <key>] [--json]` | Issues, newest first. Open ones only unless `--state` or `--all`. `--json` prints an array of issue objects. |
+| `bb linear query <document> [--variables <json>] [--account <key>]` | A read-only GraphQL query's `data`, as JSON, in the default workspace unless `--account` names another. Mutations are refused. |
 | `bb linear watches [--json]` | Every watch on this server with its counters and flags, what stewards has leased, and the doorbell stream's state; see "Seeing what is watched". |
 
 A dispatcher that spawns a thread per issue in a state, as a script
@@ -180,7 +223,7 @@ API → OAuth applications:
 | Field | Value |
 |---|---|
 | Callback URL | `https://<bb host>/api/v1/plugins/linear/http/connect/callback` — for the team, `https://bb.boreray-eel.ts.net/api/v1/plugins/linear/http/connect/callback` |
-| Public | Yes. The plugin uses PKCE and sends no client secret. |
+| Public | Yes. The plugin uses PKCE and sends no client secret. A developer can connect a workspace other than the one that owns the application only if the application allows installs from other workspaces. |
 
 Then give every server the application's client ID through the
 `LINEAR_CLIENT_ID` environment variable, the way thread-briefs takes
@@ -192,9 +235,14 @@ protects the exchange. The scopes requested are `read`, `write`,
 `issues:create`, `comments:create`.
 
 Linear access tokens last 24 hours. The plugin refreshes one that is within
-five minutes of expiry before using it, and once more if Linear answers 401;
-a refresh that fails is reported to the agent as "connect again".
-Disconnect revokes the token at Linear.
+five minutes of expiry before using it, and once more if Linear answers 401,
+each workspace on its own; a refresh that fails is reported to the agent as
+"connect again". Disconnect revokes the token at Linear.
+
+A watch on an issue in another workspace is only as prompt as that
+workspace's webhooks: bb-gate-hooks hears of it only if the application's
+webhook delivers that workspace's events. Without them the watch still
+works, through the ten-minute baseline re-check.
 
 ## Settings
 
@@ -203,8 +251,9 @@ Disconnect revokes the token at Linear.
 | `clientId` | `LINEAR_CLIENT_ID` from the server's environment | The Linear OAuth application's client ID. Required before Connect works. |
 | `linearUrl` | `https://linear.app` | Where the browser approves. |
 | `apiUrl` | `https://api.linear.app` | Token exchange and GraphQL. |
-| `accessToken` | — | Secret. Set by Connect Linear, refreshed by the plugin. |
-| `refreshToken` | — | Secret. Set by Connect Linear. |
+| `accounts` | — | Secret. Every connected workspace's tokens and who they belong to, as JSON. Set by Connect Linear, refreshed by the plugin; do not edit. |
+| `accessToken` | — | Secret. Paste a token for one more workspace; the plugin moves it into `accounts` and clears this. Also where builds before several workspaces kept the one token. |
+| `refreshToken` | — | Secret. The refresh token for a pasted `accessToken`, if it has one. |
 
 | Environment | Meaning |
 |---|---|
