@@ -91,7 +91,7 @@ import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./ho
 import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
-import { compare, createCheckQueue, createWatchStore, initialCursors, signature, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
+import { compare, createCheckQueue, createWatchStore, initialCursors, signed, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
 export const CALLBACK_PATH = "/connect/callback";
 export { CONNECTION_CHANGED, WATCHES_CHANGED };
@@ -535,7 +535,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
 
     bb.agents.registerTool({
       name: "linear_comment",
-      description: "Add a comment to a Linear issue, as the connected user. Markdown is supported. The comment is signed with this thread's id.",
+      description: "Add a comment to a Linear issue, as the connected user. Markdown is supported. The comment is signed with this thread's id; do not sign it yourself.",
       presentation: { label: { pending: "Commenting on a Linear issue", completed: "Commented on a Linear issue" } },
       parameters: z.object({
         key: issueKey.describe("The issue key, such as ENG-123."),
@@ -545,7 +545,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         try {
           const ref = parseIssueRef(await query(ISSUE_REF_QUERY, { id: key }, signal));
           if (ref === null) return toolError(new Error(`No Linear issue ${key}, or it is not visible to the connected user.`));
-          const created = parseCommentCreate(await query(COMMENT_CREATE, { input: { issueId: ref.id, body: body + signature(threadId) } }, signal));
+          const created = parseCommentCreate(await query(COMMENT_CREATE, { input: { issueId: ref.id, body: signed(body, threadId) } }, signal));
           return `Commented on ${ref.identifier}${created.url === null ? "" : `: ${created.url}`}`;
         } catch (error) {
           return toolError(error);
@@ -556,7 +556,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_update_issue",
       description:
-        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id; read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
+        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id (do not sign it yourself); read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
       presentation: { label: { pending: "Updating a Linear issue", completed: "Updated a Linear issue" } },
       parameters: z
         .object({
@@ -614,7 +614,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
 
           if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
-          if (input.description !== undefined) update.description = input.description + signature(threadId);
+          if (input.description !== undefined) update.description = signed(input.description, threadId);
 
           const updated = parseIssueUpdate(await query(ISSUE_UPDATE, { id: ref.id, input: update }, signal));
           if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
@@ -632,7 +632,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_create_issue",
       description:
-        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, and a parent issue key. The description is signed with this thread's id. Returns the new issue's key and URL.",
+        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, and a parent issue key. The description is signed with this thread's id; do not sign it yourself. Returns the new issue's key and URL.",
       presentation: { label: { pending: "Filing a Linear issue", completed: "Filed a Linear issue" } },
       parameters: z.object({
         team: z.string().trim().min(1).max(20).describe("The team key, such as ENG."),
@@ -651,8 +651,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (team === null) return toolError(new Error(`No Linear team ${teamKey}, or it is not visible to the connected user.`));
 
           const create: Record<string, unknown> = { teamId: team.id, title: input.title.trim() };
-          const description = input.description?.trim() ?? "";
-          create.description = description === "" ? signature(threadId).trimStart() : description + signature(threadId);
+          create.description = signed(input.description?.trim() ?? "", threadId);
 
           const state = input.state?.trim() ?? "";
           if (state !== "") {

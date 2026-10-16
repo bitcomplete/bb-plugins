@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { diffObserved, gateState, lifecycle, specHash, stuckDue } from "./reconcile.js";
+import { diffObserved, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -51,6 +51,15 @@ describe("what changed", () => {
     expect(actionable(diffObserved(before, theirs, ctx))).toEqual(["Pushed bbbbbbb by sam", "Checks finished: failure (failing: ci)", "Review: lee approved", "Your review was requested"]);
   });
 
+  it("names its comment counts so a queued one can be told apart", () => {
+    const after = { entity: issue({ comments: [comment()] }), pulls: [pull({ comments: [comment({ id: "p1" }), comment({ id: "p2", author: "Lee" })] })] };
+    const lines = actionable(diffObserved({ entity: issue(), pulls: [pull()] }, after, ctx));
+    expect(lines).toEqual(["1 new comment from Sam", "acme/web#7: 2 new comments from Sam, Lee"]);
+    expect(lines.every(isCommentNews)).toBe(true);
+    expect(isCommentNews("acme/web#7: State: open → merged")).toBe(false);
+    expect(isCommentNews('Worker "ENG-12: 1 new comment from Sam" finished its turn.')).toBe(false);
+  });
+
   it("follows a ticket's linked pull requests", () => {
     const before = { entity: issue(), pulls: [pull()] };
     const after = { entity: issue(), pulls: [pull({ state: "merged" })] };
@@ -68,6 +77,22 @@ describe("the ready gate", () => {
     expect(gateState(tickets, ready({ checklist: allMet }), hash)).toMatchObject({ passed: false, approvalNeeded: true });
     expect(gateState(tickets, ready({ checklist: allMet, substantial: false }), hash).passed).toBe(true);
     expect(gateState(tickets, ready({ checklist: allMet, approval: { at: 1, specHash: hash, by: "thr_s" } }), hash).passed).toBe(true);
+  });
+
+  it("knows a reported item by its number or the playbook's own words, never a paraphrase", () => {
+    const items = ["The problem, as observed: the current behaviour and where in the code it comes from", "What is out of scope"];
+    expect(resolveChecklistItem(items, 1)).toBe(items[0]);
+    expect(resolveChecklistItem(items, "2")).toBe(items[1]);
+    expect(resolveChecklistItem(items, "#2.")).toBe(items[1]);
+    expect(resolveChecklistItem(items, "what is  out of scope.")).toBe(items[1]);
+    // What bithub's stewards actually reported, and numbers past either end.
+    for (const bad of ["The problem, as observed", "Out of scope", 0, 3, "0"]) expect(resolveChecklistItem(items, bad), String(bad)).toBeNull();
+  });
+
+  it("matches what was recorded to the checklist ignoring case and spacing", () => {
+    const hash = specHash(issue(), "thr_s");
+    const loose = tickets.ready!.checklist.map((item) => ({ item: `${item.toUpperCase()}.`, met: true }));
+    expect(gateState(tickets, ready({ checklist: loose, substantial: false }), hash).passed).toBe(true);
   });
 
   it("pins approval to the description and spec comments", () => {

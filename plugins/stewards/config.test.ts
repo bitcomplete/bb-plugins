@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isTerminal, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
+import { isTerminal, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
@@ -61,5 +61,18 @@ describe("playbooks", () => {
     if (!r.ok) expect(r.error).toMatch(/needs a ready gate/u);
     const overlap = GITHUB_PRS.replace("terminal: [merged, closed]", "terminal: [merged, closed, open]");
     expect(parsePlaybook(overlap, "github-prs")).toMatchObject({ ok: false });
+  });
+});
+
+describe("model specs", () => {
+  it("takes a model id with slashes, and the level only when the last part names one", () => {
+    const parse = (text: string) => modelSpecSchema.parse(text);
+    expect(parse("claude/claude-opus-5-5/high")).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
+    expect(parse("pi")).toMatchObject({ providerId: "pi", model: null, reasoningLevel: null });
+    expect(parse("pi/fireworks/accounts/fireworks/models/deepseek-v4p1-flash")).toMatchObject({ providerId: "pi", model: "fireworks/accounts/fireworks/models/deepseek-v4p1-flash", reasoningLevel: null });
+    expect(parse("pi/fireworks/accounts/fireworks/models/deepseek-v4p1-flash/low")).toMatchObject({ model: "fireworks/accounts/fireworks/models/deepseek-v4p1-flash", reasoningLevel: "low" });
+    // "high" alone after the provider is a model, as before.
+    expect(parse("claude/high")).toMatchObject({ model: "high", reasoningLevel: null });
+    for (const bad of ["/x", "claude/", "claude//high", "pi/a//b"]) expect(modelSpecSchema.safeParse(bad).success, bad).toBe(false);
   });
 });

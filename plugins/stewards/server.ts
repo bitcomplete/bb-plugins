@@ -35,7 +35,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, diffObserved, gateState, hasLabel, lifecycle, newestCommentAt, phaseAndStage, specHash, stuckDue } from "./reconcile.js";
+import { advanced, diffObserved, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -46,7 +46,7 @@ import {
   type EntitySnapshot,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type ReadyState, type Store } from "./store.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type WakeReason } from "./wake.js";
 
@@ -758,7 +758,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       if (b.requeueAt !== null && b.requeueAt <= now()) changes.push({ text: "Requeue time came", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
-      for (const n of b.pending) changes.push({ text: n.text, actionable: true });
+      // A note queued while the steward was busy can say what this comparison
+      // says again. Comment news is counted from the cursor, which only a wake
+      // moves, so the comparison's count is the current one and a queued count
+      // is stale; anything else is kept once.
+      for (const n of b.pending) {
+        if (isCommentNews(n.text) || changes.some((c) => c.text === n.text)) continue;
+        changes.push({ text: n.text, actionable: true });
+      }
 
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
       const due = reason !== null || changes.some((c) => c.actionable);
@@ -1220,11 +1227,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         tools: ["steward_report", "steward_update"],
         skills: ["stewards"],
         instructions:
-          `You are the steward of ${JSON.stringify(b.entityKey)} (binding ${b.id}, a ${b.kind} binding under playbook ${JSON.stringify(b.playbook)}). ` +
+          `You are the steward of ${JSON.stringify(b.entityKey)} (binding ${b.id}, a ${b.kind} binding under playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
           "You act on it as the user, by the playbook. Decide what the project's guidance settles; escalate the rest with steward_report. " +
           "When the user tells you something about how to handle it, save it with steward_update. Every wake message is self-contained; act on it, then end the turn with steward_report. " +
-          "Delegate code to workers (`bb thread spawn`, as each wake shows). Sign what you write: the linear_ tools do it for you; with gh, end with " +
-          `${JSON.stringify(signatureLine("<this thread id>"))}. Read the stewards skill for the protocol.`,
+          "Delegate code to workers (`bb thread spawn`, as each wake shows). Sign what you write on GitHub: with gh, end it with " +
+          `${JSON.stringify(signatureLine(context.thread.id))}. The linear_ tools sign for you, so add no signature to what you pass them. Read the stewards skill for the protocol.`,
       };
     });
 
@@ -1284,12 +1291,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         conditions: z.array(z.string().trim().min(1).max(200)).max(10).optional().describe("Anything else a reader of the status should know at a glance."),
         ready: z
           .object({
-            checklist: z.array(z.object({ item: z.string().trim().min(1).max(300), met: z.boolean(), note: z.string().trim().max(300).optional() })).max(30),
+            checklist: z
+              .array(
+                z.object({
+                  item: z.union([z.number().int().min(1).max(30), z.string().trim().min(1).max(300)]).describe("The item's number in the wake's ready gate (1 is the first)."),
+                  met: z.boolean(),
+                  note: z.string().trim().max(300).optional(),
+                }),
+              )
+              .max(30),
             substantial: z.boolean().optional(),
             why: z.string().trim().max(600).optional(),
           })
           .optional()
-          .describe("The ready gate as you judge it now: every checklist item from the wake, met or not, and whether the ticket is substantial."),
+          .describe("The ready gate as you judge it now: every checklist item from the wake, by its number, met or not, and whether the ticket is substantial."),
         voidApproval: z.boolean().optional().describe("The spec changed materially since approval: void it and ask again."),
         escalate: z
           .object({
@@ -1308,9 +1323,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const requeueMs = input.requeueAfter ?? playbook?.requeueDefaultMs ?? 2 * 86_400_000;
           let ready = b.ready;
           if (input.ready !== undefined) {
+            // Stored in the playbook's own words, so the gate matches what was meant.
+            const items = playbook?.ready?.checklist ?? null;
+            const checklist = new Map<string, ReadyState["checklist"][number]>();
+            const unknown: string[] = [];
+            for (const c of input.ready.checklist) {
+              const item = items === null ? String(c.item) : resolveChecklistItem(items, c.item);
+              if (item === null) unknown.push(JSON.stringify(c.item));
+              else checklist.set(item, { item, met: c.met, note: c.note ?? null });
+            }
+            if (unknown.length > 0) {
+              const numbered = items!.map((item, i) => `${i + 1}. ${item}`).join("\n");
+              throw new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a ready checklist item" : "are not ready checklist items"}. Report each item by its number:\n${numbered}`);
+            }
             ready = {
               ...ready,
-              checklist: input.ready.checklist.map((c) => ({ item: c.item, met: c.met, note: c.note ?? null })),
+              checklist: [...checklist.values()],
               substantial: input.ready.substantial ?? ready.substantial,
               why: input.ready.why ?? ready.why,
             };
@@ -1349,7 +1377,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (parent !== null && parent.endedAt === null) tell(threadId, parent, `Child ${b.entityKey}: ${status.summary} Next: ${status.nextAction} (${status.actor})`);
           }
           const escalated = raised === null ? "" : ` Escalation ${raised.id} is with ${raised.route === "parent" ? "your parent steward" : "the project steward"}; do what you said meanwhile.`;
-          return `Reported.${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+          // Where the gate stands after this report, so a miss shows now and not at the next wake.
+          let gateNote = "";
+          if (input.ready !== undefined && playbook !== null && playbook.ready !== null) {
+            const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHash(b.lastSnapshot.entity, b.threadId));
+            const unmet = gate.unmet.map((item) => playbook.ready!.checklist.indexOf(item) + 1);
+            const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
+            gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
+          }
+          return `Reported.${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
         } catch (error) {
           return toolError(error);
         }

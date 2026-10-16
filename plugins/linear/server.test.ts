@@ -300,6 +300,11 @@ describe("tools", () => {
     const input = mutation.body!.variables!.input as { issueId: string; body: string };
     expect(input.issueId).toBe("uuid-1");
     expect(input.body).toMatch(/^PR opened: https:\/\/github\.com\/x\/y\/pull\/1\n\n_— from bb thread .+_$/u);
+
+    // A signature written by hand, even one naming another thread, gives way to the tool's own: one, and right.
+    await tool("linear_comment", { key: "ENG-123", body: "Spec posted.\n\n_— from bb thread thr_wrong_\n\n*— from bb thread thr-1*" }, { threadId: "thr-1" });
+    const again = linear.calls.filter((c) => c.body?.query.startsWith("mutation($input")).at(-1)!.body!.variables!.input as { body: string };
+    expect(again.body).toBe("Spec posted.\n\n_— from bb thread thr-1_");
   });
 
   it("linear_update_issue applies state, assignee, labels and priority together", async () => {
@@ -860,6 +865,9 @@ describe("editing a description", () => {
     expect(input).toMatchObject({ stateId: "s-done", priority: 2 });
     expect(input.description).toMatch(/^Scope: login only\.\n\n_— from bb thread thr-1_$/u);
     expect(text(await tool("linear_update_issue", { key: "ENG-123", description: "Only this." }, { threadId: "thr-1" }))).toBe("ENG-123: description replaced.");
+    // A description read back and rewritten keeps one signature, not one per edit.
+    await tool("linear_update_issue", { key: "ENG-123", description: "Only this.\n\n_— from bb thread thr-0_" }, { threadId: "thr-1" });
+    expect((linear.calls.filter((c) => c.body?.query.startsWith("mutation")).at(-1)!.body!.variables!.input as Record<string, unknown>).description).toBe("Only this.\n\n_— from bb thread thr-1_");
   });
 });
 

@@ -115,6 +115,12 @@ function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: { prefix: 
   return changes;
 }
 
+const commentNews = (prefix: string, fresh: SnapshotComment[]) =>
+  `${prefix}${fresh.length} new comment${fresh.length === 1 ? "" : "s"} from ${[...new Set(fresh.map((c) => c.author))].join(", ")}`;
+
+/** Whether a line of "what changed" is diffObserved's comment count. */
+export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comments? from /u.test(text);
+
 /** Every change between two observations: the entity, then each linked pull request. */
 export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string }): Change[] {
   const viewer = after.entity.viewer;
@@ -131,7 +137,7 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
   // news at the next turn.
   for (const e of [after.entity, ...after.pulls]) {
     const fresh = newHumanComments(e, ctx.cursor, ctx.own);
-    if (fresh.length > 0) changes.push({ text: `${e === after.entity ? "" : `${e.key}: `}${fresh.length} new comment${fresh.length === 1 ? "" : "s"} from ${[...new Set(fresh.map((c) => c.author))].join(", ")}`, actionable: true });
+    if (fresh.length > 0) changes.push({ text: commentNews(e === after.entity ? "" : `${e.key}: `, fresh), actionable: true });
   }
   return changes;
 }
@@ -152,10 +158,31 @@ export type GateState = {
   passed: boolean;
 };
 
+/** Checklist wording as compared: case, runs of spaces and trailing punctuation do not count. */
+const checklistKey = (s: string) => s.toLowerCase().replace(/\s+/gu, " ").replace(/[\s.:;,]+$/u, "").trim();
+
+/** What the steward last reported for one of the playbook's checklist items. */
+export const reportedItem = (ready: ReadyState, item: string): ReadyState["checklist"][number] | undefined =>
+  ready.checklist.find((c) => checklistKey(c.item) === checklistKey(item));
+
+/**
+ * The playbook's own wording for a reported checklist entry: by its number
+ * in the wake (1-based), or by its text as the playbook writes it. Null for
+ * anything else. Stewards paraphrase long items, so a paraphrase is refused
+ * rather than guessed at: a guess that misses leaves the gate shut in
+ * silence, which is how it never passed.
+ */
+export function resolveChecklistItem(items: readonly string[], reported: string | number): string | null {
+  const text = String(reported);
+  const number = /^\s*#?(\d+)\.?\s*$/u.exec(text);
+  if (number !== null) return items[Number(number[1]) - 1] ?? null;
+  return items.find((item) => checklistKey(item) === checklistKey(text)) ?? null;
+}
+
 export function gateState(playbook: Playbook, ready: ReadyState, currentSpecHash: string): GateState {
   if (playbook.ready === null) return { none: true, checklistMet: true, unmet: [], substantial: null, approvalNeeded: false, approved: false, approvalStale: false, passed: true };
   const items = playbook.ready.checklist;
-  const unmet = items.filter((item) => !ready.checklist.some((c) => c.item.toLowerCase() === item.toLowerCase() && c.met));
+  const unmet = items.filter((item) => reportedItem(ready, item)?.met !== true);
   const checklistMet = unmet.length === 0;
   // Unjudged counts as substantial: the safe side of the gate.
   const approvalNeeded = ready.substantial !== false;

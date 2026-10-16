@@ -165,9 +165,11 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/# Steward wake: ENG-12 — Fix login/u);
     expect(prompt).toMatch(/You have just been bound/u);
     expect(prompt).toMatch(/Specify the ticket against the ready checklist/u);
-    expect(prompt).toMatch(/\[ \] Acceptance criteria are testable/u);
+    expect(prompt).toMatch(/\[ \] 2\. Acceptance criteria are testable/u);
     expect(prompt).toMatch(/given by the project steward/u);
-    expect(prompt).toMatch(/bb thread spawn --parent-self --lifecycle-owner-thread "\$BB_THREAD_ID" --visibility hidden --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high/u);
+    // The first wake is the spawn prompt, before the thread has an id.
+    expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
+    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
@@ -211,6 +213,69 @@ describe("a Linear ticket steward", () => {
     expect(t.sends).toHaveLength(1);
     expect(t.sends[0]!.text).toMatch(/1 new comment from Sam/u);
     expect(t.sends[0]!.text).toMatch(/Can we also cover SSO\?/u);
+  });
+
+  it("passes the ready gate on the checklist reported by number, and refuses a paraphrase", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" };
+
+    // What bithub's stewards sent: short names for long items. Refused, with the numbers to use, and nothing recorded.
+    const paraphrased = await t.tool("steward_report", { ...base, ready: { checklist: [{ item: "Problem stated", met: true }, { item: 2, met: true }], substantial: false } }, steward);
+    expect(paraphrased.error).toBe(true);
+    expect(paraphrased.text).toMatch(/"Problem stated" is not a ready checklist item/u);
+    expect(paraphrased.text).toMatch(/\n1\. Problem and desired outcome are stated\n2\. Acceptance criteria are testable/u);
+    expect((await t.list())[0]!.summary).toBeNull();
+
+    const partly = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3].map((item) => ({ item, met: true })), substantial: false } }, steward);
+    expect(partly.text).toMatch(/Ready gate: not passed \(unmet: 4\)/u);
+    const met = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, "Out of scope is stated"].map((item) => ({ item, met: true, note: "in the spec" })), substantial: false } }, steward);
+    expect(met).toMatchObject({ error: false, text: expect.stringMatching(/Ready gate: passed\./u) });
+
+    // Moving to a build stage now is no conflict, and the wake says the gate passed.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const wake = t.sends.at(-1)!.text;
+    expect(wake).not.toMatch(/before the ready gate passed/u);
+    expect(wake).toMatch(/- \[x\] 1\. Problem and desired outcome are stated — in the spec/u);
+    expect(wake).toMatch(/- \[x\] 4\. Out of scope is stated/u);
+    expect(wake).toMatch(/Gate: PASSED/u);
+    expect(wake).toContain(`Your thread id is ${steward}.`);
+  });
+
+  it("tells the steward its own thread id and that the linear tools sign for it", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: steward, title: null, parentThreadId: null, sourceThreadId: null } }));
+    expect(config.instructions).toContain(`your thread id is ${steward}`);
+    expect(config.instructions).toContain(`_— from bb thread ${steward}_`);
+    expect(config.instructions).toMatch(/add no signature to what you pass them/u);
+  });
+
+  it("says news that arrived while the steward was busy once", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "Todo", summary: "Specifying.", nextAction: "Post a spec", actor: "steward" }, steward);
+
+    t.threads.get(steward)!.status = "active";
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" }), comment({ id: "c2", author: "Lee", createdAt: "2026-10-14T16:05:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends).toEqual([]);
+
+    t.threads.get(steward)!.status = "idle";
+    await t.idle(steward);
+    expect(t.sends).toHaveLength(1);
+    const changed = t.sends[0]!.text.split("## 5. What changed since your last turn")[1]!;
+    expect(changed.match(/new comment/gu)).toHaveLength(1);
+    expect(changed).toMatch(/- 2 new comments from Sam, Lee/u);
   });
 
   it("escalates to the project steward, which decides from guidance and forwards only big decisions", async () => {

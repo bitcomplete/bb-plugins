@@ -513,8 +513,8 @@ requeue-default: 2d
   The project steward is titled "<project name> project steward" and kept
   out of thread-briefs' status sections, so it stays where you put it.
 - Workers are hidden children of their steward, started by the steward with
-  `bb thread spawn --parent-self --lifecycle-owner-thread … --visibility
-  hidden` and recognized by the plugin as children of a steward thread.
+  `bb thread spawn --project … --parent-self --lifecycle-owner-thread …
+  --visibility hidden` and recognized by the plugin as children of a steward thread.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. Ended bindings are archived
   by this plugin, not by thread-briefs.

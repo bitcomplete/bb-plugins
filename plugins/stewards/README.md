@@ -93,8 +93,15 @@ Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`), `source`,
 `phases` (state → `{ stage, stuck }`), `terminal`, `ready` (`checklist`,
 `substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as
-`provider/model/level`; `claude` means `claude-code`), `requeue-default`,
-`skip-authors`.
+`provider/model/level`; `claude` means `claude-code`; the model may hold
+slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last
+part is the level only when it names one), `requeue-default`, `skip-authors`.
+
+The wake numbers the ready checklist, and `steward_report` takes each item by
+its number (or the playbook's exact words). It stores the playbook's wording,
+so the gate matches what the steward meant, and it refuses anything else and
+records nothing, listing the numbers. Checklist items can then be as long as
+a project needs.
 
 ## Enforcement
 

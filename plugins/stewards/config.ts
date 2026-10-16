@@ -49,24 +49,26 @@ export type ReasoningLevel = (typeof REASONING)[number];
 
 export type ModelSpec = { text: string; providerId: string; model: string | null; reasoningLevel: ReasoningLevel | null };
 
-/** "provider/model/level", "provider/model" or "provider". */
+/**
+ * "provider/model/level", "provider/model" or "provider". A model id may
+ * itself hold slashes (Pi's are "fireworks/accounts/…/deepseek-v4p1-flash"),
+ * so the level is the last part only when it names one.
+ */
 export const modelSpecSchema = z
   .string()
   .trim()
   .min(1)
   .max(200)
   .transform((text, ctx): ModelSpec => {
-    const parts = text.split("/");
-    const [provider = "", model = "", level = ""] = parts;
-    if (parts.length > 3 || provider === "") {
+    const [provider = "", ...rest] = text.split("/");
+    const last = rest.length >= 2 ? rest.at(-1)! : "";
+    const level = (REASONING as readonly string[]).includes(last) ? (last as ReasoningLevel) : null;
+    const model = (level === null ? rest : rest.slice(0, -1)).join("/");
+    if (provider === "" || (rest.length > 0 && (model === "" || model.split("/").includes("")))) {
       ctx.addIssue({ code: "custom", message: `${JSON.stringify(text)} is not provider/model/level, such as claude/claude-sonnet-5-5/medium` });
       return z.NEVER;
     }
-    if (level !== "" && !(REASONING as readonly string[]).includes(level)) {
-      ctx.addIssue({ code: "custom", message: `${JSON.stringify(level)} is not a reasoning level (${REASONING.join(", ")})` });
-      return z.NEVER;
-    }
-    return { text, providerId: PROVIDER_ALIASES[provider] ?? provider, model: model === "" ? null : model, reasoningLevel: level === "" ? null : (level as ReasoningLevel) };
+    return { text, providerId: PROVIDER_ALIASES[provider] ?? provider, model: model === "" ? null : model, reasoningLevel: level };
   });
 
 // ---- the project file -------------------------------------------------------------

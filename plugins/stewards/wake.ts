@@ -5,7 +5,7 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
-import { newHumanComments, type GateState } from "./reconcile.js";
+import { newHumanComments, reportedItem, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Observed, Worker } from "./store.js";
 
@@ -93,10 +93,11 @@ function gateLines(input: WakeInput): string[] {
   const { gate, binding, playbook } = input;
   if (gate.none) return ["No ready gate in this playbook."];
   const lines: string[] = [];
-  for (const item of playbook.ready!.checklist) {
-    const c = binding.ready.checklist.find((x) => x.item.toLowerCase() === item.toLowerCase());
-    lines.push(`- [${c?.met ? "x" : " "}] ${item}${c?.note ? ` — ${c.note}` : ""}`);
-  }
+  playbook.ready!.checklist.forEach((item, i) => {
+    const c = reportedItem(binding.ready, item);
+    lines.push(`- [${c?.met ? "x" : " "}] ${i + 1}. ${item}${c?.note ? ` — ${c.note}` : ""}`);
+  });
+  lines.push("  Report each item in steward_report's ready.checklist by its number: { item: 1, met: true, note }.");
   lines.push(`- Substantial: ${gate.substantial === null ? "not judged yet (treated as yes)" : gate.substantial ? "yes" : "no"}${binding.ready.why ? ` — ${binding.ready.why}` : ""}`);
   lines.push(`  Substantial when any of: ${playbook.ready!.substantial.join("; ") || "(none listed)"}`);
   const approval = playbook.ready!.approval;
@@ -115,6 +116,12 @@ export function formatWake(input: WakeInput): string {
   const out: string[] = [];
   out.push(`# Steward wake: ${e.key} — ${e.title ?? "(untitled)"}`);
   out.push(`Binding ${binding.id} · ${binding.kind} · playbook ${playbook.name}@${playbook.version} · phase ${binding.phase ?? e.state}${binding.stage === null ? "" : ` (stage ${binding.stage})`}`);
+  // Stewards share the project steward's workspace, whose path names that
+  // thread; a steward that read its id from there signed as the project steward.
+  out.push(
+    "",
+    `${binding.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${binding.threadId}.`} Use it wherever you name yourself (a worker's task, a gh signature), and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`,
+  );
   const special = LIFECYCLE_INSTRUCTIONS[input.reason];
   if (special !== undefined) out.push("", `**${special}**`);
 
@@ -128,7 +135,9 @@ export function formatWake(input: WakeInput): string {
     "",
     "Start a worker for one bounded task with:",
     "",
-    `    bb thread spawn --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden ${input.workerFlags} --title "${e.key}: <task>" --prompt "<the whole task>"`,
+    `    bb thread spawn --project ${binding.projectId} --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden ${input.workerFlags} --title "${e.key}: <task>" --prompt-file - <<'EOF'`,
+    "    <the whole task>",
+    "    EOF",
     "",
     "Follow it up with `bb thread tell <id> <message>`. You are woken when a worker finishes, with its final message.",
   );

@@ -28,6 +28,20 @@ export const WAKE_COMMENT_CHARS = 1000;
  */
 export const signature = (threadId: string) => `\n\n_— from bb thread ${threadId}_`;
 
+/** Signature lines at the end of a text, in either emphasis (Linear rewrites `_` as `*` on edit). */
+const TRAILING_SIGNATURES = /(?:\s*([_*])— from bb thread [A-Za-z0-9_-]+\1)+\s*$/u;
+
+/**
+ * A text signed with the thread's id, and only that. Agents often sign by
+ * hand as well, and a description read back and rewritten keeps its old
+ * signature: both are dropped from the end first, so the text carries one
+ * signature and it names the thread that wrote it.
+ */
+export function signed(text: string, threadId: string): string {
+  const body = text.replace(TRAILING_SIGNATURES, "").trimEnd();
+  return body === "" ? signature(threadId).trimStart() : body + signature(threadId);
+}
+
 // Append-only: bb.storage.migrate records each statement's hash and refuses
 // a changed one, so a schema change is a new statement at the end.
 export const WATCH_MIGRATIONS = [
