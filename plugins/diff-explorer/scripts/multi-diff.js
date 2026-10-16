@@ -74,7 +74,7 @@ class EditorViewModel {
 /**
  * documents: { path: string, original: ITextModel, modified: ITextModel, label: string, options: IDiffEditorOptions, estimatedHeight: number }[]
  */
-export function createMultiDiffEditor(element, onFileAction) {
+export function createMultiDiffEditor(element, onFileAction, readOnly = false) {
   element.style.cssText = "height:100%;display:flex;flex-direction:column";
   const editorElement = document.createElement("div");
   editorElement.style.cssText = "flex:1;min-height:0";
@@ -163,7 +163,7 @@ export function createMultiDiffEditor(element, onFileAction) {
             el.textContent = uri === undefined ? "" : (document?.label ?? uri.path);
             el.style.textDecoration = options?.strikethrough ? "line-through" : "";
             for (const button of buttons) {
-              button.disabled = uri === undefined || (button.title === "Delete file" && document?.options.readOnly);
+              button.disabled = readOnly || uri === undefined || (button.title === "Delete file" && document?.options.readOnly);
               button.style.opacity = button.disabled ? "0.4" : "1";
             }
           },

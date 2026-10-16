@@ -5,6 +5,60 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 import { findDiffMatches } from "./scripts/diff-search.js";
+import { flushFile, flushFiles, reconcileFile, releaseFile } from "./file-models";
+
+test("historical diffs block saves and file actions while working diffs retain both", async () => {
+  const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");
+  const source = ts.createSourceFile("app.tsx", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = source.statements.find((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && node.name?.text === "MultiDiff");
+  assert.ok(component?.body);
+  const constants = source.statements.filter(ts.isVariableStatement).filter((node) =>
+    node.declarationList.declarations.some((d) => ["EDITOR_OPTIONS", "DIFF_OPTIONS", "DELETED_DIFF_OPTIONS", "COMMIT_DIFF_OPTIONS", "SAVE_DELAY_MS", "HEADER_HEIGHT", "LINE_HEIGHT"].includes(d.name.getText(source))));
+  const body = component.body.statements.filter((node) => !ts.isReturnStatement(node)).map((node) => node.getText(source)).join("\n");
+  for (const readOnly of [true, false]) {
+    const effects: (() => void | (() => void))[] = [];
+    let documents: any[] = [];
+    let action: (path: string, kind: string) => Promise<void>;
+    let actions = 0;
+    const writes: string[] = [];
+    const model = (content: string) => {
+      let changed = () => {};
+      return { getValue: () => content, setValue(value: string) { content = value; changed(); },
+        onDidChangeContent(listener: () => void) { changed = listener; return { dispose() { changed = () => {}; } }; }, dispose() {} };
+    };
+    const flush = { current: null as null | (() => Promise<void>) };
+    const context = vm.createContext({
+      readOnly, root: "/workspace", panelId: "panel", OLD: "bbold", NEW: "bbnew", files: [{ path: "file.ts", oldText: "before", newText: "after", additions: 1, deletions: 1, changeKind: "modified" }],
+      bundle: { monaco: { Uri: { from: (uri: unknown) => uri }, editor: { createModel: model } },
+        createMultiDiffEditor: (_element: unknown, callback: typeof action, disabled: boolean) => {
+          assert.equal(disabled, readOnly); action = callback;
+          return { update(value: any[]) { documents = value; }, dispose() {} };
+        } },
+      editor: { current: null }, flush, save: async (_path: string, content: string) => { writes.push(content); },
+      fileAction: async () => { actions++; }, onError() {},
+      useRef: (current: unknown) => ({ current }), useState: (initial: unknown) => [initial, () => {}],
+      useEffect: (effect: typeof effects[number]) => effects.push(effect), languageFor: () => "typescript",
+      flushFile, flushFiles, reconcileFile, releaseFile, setTimeout, clearTimeout,
+    });
+    vm.runInContext(ts.transpileModule(`${constants.map((node) => node.getText(source)).join("\n")}\n(function () { ${body} })()`, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText, context);
+    const dispose = effects[0]() as () => void;
+    try {
+      effects[1]();
+      assert.equal(documents[0].options.readOnly, readOnly);
+      assert.equal(flush.current === null, readOnly);
+      await action!("/workspace/file.ts", "ignore");
+      documents[0].modified.setValue("edited");
+      if (flush.current) await flush.current();
+    } finally {
+      dispose();
+    }
+    await setImmediate();
+    assert.equal(actions, readOnly ? 0 : 1);
+    assert.deepEqual(writes, readOnly ? [] : ["edited"]);
+  }
+});
 
 test("Monaco initialization cleans up a failed attempt and retries a fresh URL while sharing success", async () => {
   const text = await readFile(new URL("../app.tsx", import.meta.url), "utf8");

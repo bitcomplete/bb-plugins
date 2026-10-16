@@ -12,7 +12,7 @@ import {
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import type { z } from "zod";
-import type { DiffFile, DiffTarget, FileAction, Location, Report, rpcContract } from "./contract";
+import type { DiffFile, FileAction, Location, Report, rpcContract } from "./contract";
 import { version as pluginVersion } from "./package.json";
 import { flushFile, flushFiles, reconcileFile, reloadFile, releaseFile, type FileModels, type SaveFile } from "./file-models";
 
@@ -43,7 +43,7 @@ type MultiDiffDocument = {
 };
 type Bundle = {
   monaco: MonacoApi;
-  createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void): { update(documents: MultiDiffDocument[]): void; openSearch(): void; dispose(): void };
+  createMultiDiffEditor(element: HTMLElement, onFileAction: (path: string, action: FileAction) => void, readOnly?: boolean): { update(documents: MultiDiffDocument[]): void; openSearch(): void; dispose(): void };
 };
 let bundlePromise: Promise<Bundle> | null = null;
 let bundleAttempt = 0;
@@ -156,6 +156,7 @@ const DIFF_OPTIONS = {
   hideUnchangedRegions: { enabled: true },
 } satisfies Monaco.editor.IDiffEditorOptions;
 const DELETED_DIFF_OPTIONS = { ...DIFF_OPTIONS, readOnly: true } satisfies Monaco.editor.IDiffEditorOptions;
+const COMMIT_DIFF_OPTIONS = { ...DELETED_DIFF_OPTIONS, renderMarginRevertIcon: false } satisfies Monaco.editor.IDiffEditorOptions;
 const SAVE_DELAY_MS = 600;
 
 const LINE_HEIGHT = 19;
@@ -166,6 +167,7 @@ function MultiDiff({
   panelId,
   root,
   files,
+  readOnly,
   save,
   read,
   fileAction,
@@ -177,6 +179,7 @@ function MultiDiff({
   panelId: string;
   root: string;
   files: DiffFile[];
+  readOnly: boolean;
   save: SaveFile;
   read(path: string): Promise<string>;
   fileAction(path: string, action: FileAction): Promise<unknown>;
@@ -197,6 +200,7 @@ function MultiDiff({
 
   useEffect(() => {
     const created = bundle.createMultiDiffEditor(container.current!, async (path, action) => {
+      if (readOnly) return;
       const m = models.current.get(path);
       if (m === undefined || m.deleting) return;
       if (action === "delete") {
@@ -220,10 +224,10 @@ function MultiDiff({
           m.timer = setTimeout(() => flushFile(path, m, saveRef), SAVE_DELAY_MS);
         }
       }
-    });
+    }, readOnly);
     editor.current = created;
     const owned = models.current;
-    flush.current = () => flushFiles(owned, saveRef);
+    flush.current = readOnly ? null : () => flushFiles(owned, saveRef);
     return () => {
       flush.current = null;
       editor.current = null;
@@ -231,7 +235,7 @@ function MultiDiff({
       for (const [path, m] of owned) releaseFile(path, m, saveRef);
       owned.clear();
     };
-  }, [bundle, editor, flush]);
+  }, [bundle, editor, flush, readOnly]);
 
   useEffect(() => {
     const { monaco } = bundle;
@@ -249,7 +253,7 @@ function MultiDiff({
           saving: Promise.resolve(),
           timer: undefined,
           listener: modified.onDidChangeContent(() => {
-            if (created.deleting || created.reloading) return;
+            if (readOnly || created.deleting || created.reloading) return;
             clearTimeout(created.timer);
             created.timer = setTimeout(() => flushFile(abs, created, saveRef), SAVE_DELAY_MS);
           }),
@@ -264,7 +268,7 @@ function MultiDiff({
         original: m.original,
         modified: m.modified,
         label: `${file.path} · ${file.changeKind}`,
-        options: file.changeKind === "deleted" ? DELETED_DIFF_OPTIONS : DIFF_OPTIONS,
+        options: readOnly ? COMMIT_DIFF_OPTIONS : file.changeKind === "deleted" ? DELETED_DIFF_OPTIONS : DIFF_OPTIONS,
         // Placeholder height until the widget renders the file; ~ changed lines plus collapsed-region rows.
         estimatedHeight: HEADER_HEIGHT + (file.additions + file.deletions + 8) * LINE_HEIGHT,
       };
@@ -277,7 +281,7 @@ function MultiDiff({
       current.delete(abs);
     }
     setConflicts((paths) => paths.filter((path) => current.has(path)));
-  }, [bundle, panelId, root, files]);
+  }, [bundle, panelId, root, files, readOnly]);
 
   const discard = async (path: string) => {
     const m = models.current.get(path);
@@ -386,7 +390,10 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [stack, setStack] = useState<Location[]>([]);
   const [reload, setReload] = useState(0);
-  const [target, setTarget] = useState<DiffTarget>("uncommitted");
+  const [target, setTarget] = useState("uncommitted");
+  const [commits, setCommits] = useState<z.infer<(typeof rpcContract)["commits"]["output"]>>([]);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const historical = target !== "all" && target !== "uncommitted";
   const [reportStatus, setReportStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [showReports, setShowReports] = useState(false);
   const [committing, setCommitting] = useState(false);
@@ -474,7 +481,16 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
     if ((payload as { root: string }).root === data?.root) setReload((n) => n + 1);
   });
 
-  useEffect(() => { setCommitThread(null); }, [threadId]);
+  useEffect(() => { setCommitThread(null); setCommits([]); setHistoryError(null); }, [threadId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    rpc.call("commits", { threadId }).then(
+      (commits) => { if (!cancelled) { setCommits(commits); setHistoryError(null); } },
+      (cause) => { if (!cancelled) setHistoryError(cause instanceof Error ? cause.message : String(cause)); },
+    );
+    return () => { cancelled = true; };
+  }, [rpc, threadId, reload]);
 
   useEffect(() => {
     monaco?.editor.setTheme(mode === "dark" ? "vs-dark" : "vs");
@@ -532,14 +548,20 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
           <>
             <select
               aria-label="Changes to show"
-              className="rounded border border-border bg-background px-1 py-0.5"
+              className="min-w-0 max-w-80 truncate rounded border border-border bg-background px-1 py-0.5"
               value={target}
-              onChange={(event) => setTarget(event.target.value as DiffTarget)}
+              onChange={(event) => setTarget(event.target.value)}
             >
               <option value="all">All changes{data === null ? "" : ` vs ${data.baseBranch}`}</option>
-              <option value="uncommitted">Uncommitted</option>
+              <option value="uncommitted">Uncommitted (since last commit)</option>
+              {historical && !commits.some((commit) => commit.sha === target) ? <option value={target}>{target.slice(0, 8)} (commit)</option> : null}
+              {commits.length === 0 ? null : <optgroup label="Recent commits">
+                {commits.map((commit) => <option key={commit.sha} value={commit.sha}>{commit.sha.slice(0, 8)} · {commit.subject}</option>)}
+              </optgroup>}
+              {historyError === null ? null : <option disabled>Commit history unavailable: {historyError}</option>}
             </select>
-            <span className="text-muted-foreground">
+            {historical ? <span className="shrink-0 text-muted-foreground">Read-only</span> : null}
+            <span className="shrink-0 whitespace-nowrap text-muted-foreground">
               {data === null ? "Loading…" : `${data.files.length} files`}
             </span>
             <button type="button" aria-label="Commit changes" title="Review and commit uncommitted changes with Claude Haiku"
@@ -612,12 +634,14 @@ function DiffsPanel({ threadId }: PluginThreadPanelProps) {
             )}
             <div className="min-h-0 flex-1">
               <MultiDiff
+                key={target}
                 flush={flushEdits}
                 editor={diffEditor}
                 bundle={bundle}
                 panelId={panelId}
                 root={data.root}
                 files={data.files}
+                readOnly={historical}
                 save={(path, content, expected) => rpc.call("write", { environmentId: data.environmentId, path, content, expected })}
                 read={async (path) => (await rpc.call("read", { environmentId: data.environmentId, path })).content}
                 fileAction={async (path, action) => {

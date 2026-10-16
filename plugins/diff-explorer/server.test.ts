@@ -155,12 +155,14 @@ test("commit launches Haiku in the source environment, scopes the prompt, and pr
   }
 });
 
-test("load skips paths rejected by the read root while preserving other files and errors", async () => {
+test("load routes working and commit diffs, skipping read-root failures while preserving other files and errors", async () => {
   let handlers: Record<string, (input: any) => Promise<any>>;
   const link = ".agents/skills/workers-best-practices";
   let failure = new Error(`HTTP 400: Path "/workspace/${link}" escapes read root`);
   const readPaths: string[] = [];
   const hostCalls: { method: string; input: any }[] = [];
+  const sha = "a".repeat(40);
+  let selectedTarget = "uncommitted";
   const bb = {
     events: { on() {} },
     onInstall() {},
@@ -169,6 +171,7 @@ test("load skips paths rejected by the read root while preserving other files an
       async call(method: string, input: unknown) {
         hostCalls.push({ method, input });
         if (method === "definition") return { locations: [] };
+        if (method === "commits") return [{ sha, subject: "Recent commit" }];
       },
     }) },
     cli: { register() {} },
@@ -177,7 +180,10 @@ test("load skips paths rejected by the read root while preserving other files an
       threads: { async get() { return { environmentId: "env" }; } },
       environments: {
         async get() { return { path: "/workspace", hostId: "host", defaultBranch: "main" }; },
-        async diffFiles() {
+        async diffFiles(input: unknown) {
+          assert.deepEqual(input, selectedTarget === sha ? { environmentId: "env", target: "commit", sha }
+            : selectedTarget === "all" ? { environmentId: "env", target: "all", mergeBaseBranch: "main" }
+            : { environmentId: "env", target: "uncommitted" });
           return {
             outcome: "available", mergeBaseRef: "base",
             files: [
@@ -188,7 +194,9 @@ test("load skips paths rejected by the read root while preserving other files an
             ],
           };
         },
-        async diffFile({ path, side }: { path: string; side: string }) {
+        async diffFile(input: { path: string; side: string; target: string; sha?: string }) {
+          const { path, side } = input;
+          if (selectedTarget === sha) assert.deepEqual(input, { environmentId: "env", target: "commit", sha, path, side });
           readPaths.push(path);
           if (path === link) throw failure;
           return { contentEncoding: "utf8", content: side === "old" ? "before" : "after" };
@@ -197,7 +205,10 @@ test("load skips paths rejected by the read root while preserving other files an
     },
   } as unknown as BbPluginApi;
   await plugin(bb);
-  for (const target of ["uncommitted", "all"]) {
+  assert.deepEqual(await handlers!.commits({ threadId: "thread" }), [{ sha, subject: "Recent commit" }]);
+  assert.deepEqual(hostCalls.at(-1), { method: "commits", input: { root: "/workspace" } });
+  for (const target of ["uncommitted", "all", sha]) {
+    selectedTarget = target;
     const result = rpcContract.load.output.parse(await handlers!.load({ threadId: "thread", target }));
     assert.deepEqual(result.files, [{ path: "main.ts", changeKind: "modified", additions: 1, deletions: 1, oldText: "before", newText: "after" }]);
     assert.deepEqual(result.skipped, ["image.png", "huge.txt", link]);
@@ -210,7 +221,9 @@ test("load skips paths rejected by the read root while preserving other files an
     method: "definition", input: { root: "/workspace", path: "/workspace/main.ts", line: 2, column: 3, content: "unsaved edit" },
   });
   failure = new Error("HTTP 500: Host unavailable");
+  selectedTarget = "uncommitted";
   await assert.rejects(handlers!.load({ threadId: "thread", target: "uncommitted" }), /Host unavailable/);
+  assert.equal(rpcContract.load.input.safeParse({ threadId: "thread", target: "HEAD~1" }).success, false);
 });
 
 test("inbox records survive registration reloads and are readable by RPC and CLI", async () => {

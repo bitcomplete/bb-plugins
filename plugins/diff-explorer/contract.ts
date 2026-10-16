@@ -22,6 +22,7 @@ export type FileAction = z.infer<typeof fileAction>["action"];
 
 const commitPaths = z.array(z.string().min(1).max(4096)).min(1).max(1000);
 const objectId = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+const recentCommits = z.array(z.object({ sha: objectId, subject: z.string() })).max(50);
 export const commitSnapshot = z.object({ head: objectId.nullable(), branch: z.string().startsWith("refs/heads/"), tree: objectId, index: z.string().regex(/^[0-9a-f]{64}$/) });
 export type CommitSnapshot = z.infer<typeof commitSnapshot>;
 export const commitJob = z.object({
@@ -31,6 +32,10 @@ export const commitJob = z.object({
 const commitResult = z.object({ commit: objectId.nullable(), pushed: z.boolean(), error: z.string().nullable() });
 
 export const hostContract = defineRpcContract({
+  commits: {
+    input: z.object({ root: z.string().startsWith("/") }),
+    output: recentCommits,
+  },
   reviewCommit: {
     input: z.object({ root: z.string().startsWith("/"), paths: commitPaths, snapshot: commitSnapshot.optional() }),
     output: z.object({ snapshot: commitSnapshot, diff: z.string() }),
@@ -78,8 +83,7 @@ const diffFile = z.object({
 });
 export type DiffFile = z.infer<typeof diffFile>;
 
-const diffTarget = z.enum(["all", "uncommitted"]);
-export type DiffTarget = z.infer<typeof diffTarget>;
+const diffTarget = z.union([z.enum(["all", "uncommitted"]), objectId]);
 
 // Keep diagnostics JSON-only and bounded below KV's 256 KB limit.
 const reportSetup = z.object({
@@ -91,6 +95,10 @@ export type Report = z.infer<typeof report>;
 const reportSummary = report.omit({ setup: true });
 
 export const rpcContract = defineRpcContract({
+  commits: {
+    input: z.object({ threadId: z.string() }),
+    output: recentCommits,
+  },
   commit: {
     input: z.object({ threadId: z.string().min(1), push: z.boolean(), paths: commitPaths.optional() }),
     output: z.object({ threadId: z.string() }),

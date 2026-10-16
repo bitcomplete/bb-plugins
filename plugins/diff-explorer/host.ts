@@ -201,6 +201,20 @@ export default experimental_defineHostEntry({
   contract: hostContract,
   experimental_signals: hostSignals,
   handlers: {
+    async commits({ root }) {
+      const git = (args: string[]) => promisify(execFile)("git", ["-C", root, ...args], { maxBuffer: 1024 * 1024 });
+      try {
+        await git(["rev-parse", "--verify", "--quiet", "HEAD"]);
+      } catch (error) {
+        if ((error as { code?: number }).code === 1) return [];
+        throw error;
+      }
+      const { stdout } = await git(["log", "-50", "--format=%H%x00%s", "-z", "HEAD", "--"]);
+      const fields = stdout.split("\0");
+      const commits = [];
+      for (let i = 0; i + 1 < fields.length; i += 2) commits.push({ sha: fields[i], subject: fields[i + 1] });
+      return commits;
+    },
     async reviewCommit({ root, paths, snapshot }) { return reviewCommit(root, paths, snapshot); },
     async finishCommit({ root, paths, snapshot, messageFile, push }) { return finishCommit(root, paths, snapshot, messageFile, push); },
     async fileAction({ root, path: file, action }) {

@@ -211,23 +211,35 @@ export default async function plugin(bb: BbPluginApi) {
       return { baseUrl: preview.baseUrl };
     },
 
+    async commits({ threadId }) {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (!thread.environmentId) throw new Error("This thread has no environment");
+      const { root, hostId } = await environment(thread.environmentId);
+      return host.call("commits", { root }, { hostId });
+    },
+
     async load({ threadId, target }) {
       const thread = await bb.sdk.threads.get({ threadId });
       if (!thread.environmentId) throw new Error("This thread has no environment");
       const environmentId = thread.environmentId;
       const { root, hostId, baseBranch } = await environment(environmentId);
-      if (baseBranch === null) throw new Error("This environment has no base branch");
+      if (target === "all" && baseBranch == null) throw new Error("This environment has no base branch");
+      const historical = target !== "all" && target !== "uncommitted";
       // "all" = everything since the merge base with the base branch, committed or not.
       const diff = await bb.sdk.environments.diffFiles(
         target === "uncommitted"
           ? { environmentId, target: "uncommitted" }
-          : { environmentId, target: "all", mergeBaseBranch: baseBranch },
+          : target === "all"
+            ? { environmentId, target: "all", mergeBaseBranch: baseBranch! }
+            : { environmentId, target: "commit", sha: target },
       );
       if (diff.outcome !== "available") {
         throw new Error(diff.outcome === "unavailable" ? diff.failure.message : diff.message);
       }
       const { mergeBaseRef } = diff;
-      const query = target === "uncommitted" ? ({ target } as const) : mergeBaseRef === null ? null : ({ target, mergeBaseRef } as const);
+      const query = target === "uncommitted" ? ({ target } as const)
+        : historical ? ({ target: "commit", sha: target } as const)
+        : mergeBaseRef === null ? null : ({ target: "all", mergeBaseRef } as const);
       if (query === null) throw new Error(`No merge base with ${baseBranch}`);
       const side = async (filePath: string, which: "old" | "new") => {
         const result = await bb.sdk.environments.diffFile({ environmentId, ...query, path: filePath, side: which });
@@ -271,10 +283,10 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const files = [...byPath.values()];
       host.call("watch", { root }, { hostId }).catch((error) => bb.log.warn(`File watch failed: ${error}`));
-      host
+      if (!historical) host
         .call("warm", { root, paths: files.filter((f) => f.newText !== "").map((f) => path.join(root, f.path)) }, { hostId })
         .catch((error) => bb.log.warn(`Language server warm-up failed: ${error}`));
-      return { environmentId, root, baseBranch, files, skipped };
+      return { environmentId, root, baseBranch: baseBranch ?? "", files, skipped };
     },
 
     async definition({ environmentId, ...position }) {

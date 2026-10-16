@@ -11,6 +11,31 @@ import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/
 import entry from "./host";
 import type { FileAction } from "./contract";
 
+test("recent commits come from the checkout in newest-first order, excluding working edits", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "diff-explorer-history-"));
+  const host = experimental_createHostEntryHarness(entry);
+  const git = (args: string[]) => promisify(childProcess.execFile)("git", ["-C", root, ...args]);
+  try {
+    await git(["init", "--quiet"]);
+    assert.deepEqual(await host.experimental_call("commits", { root }), []);
+    for (const subject of ["Initial content", "Update · with symbols | and spaces"]) {
+      await writeFile(path.join(root, "file.txt"), subject);
+      await git(["add", "file.txt"]);
+      await git(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", subject]);
+    }
+    const { stdout } = await git(["rev-parse", "HEAD"]);
+    await writeFile(path.join(root, "file.txt"), "uncommitted content");
+    const commits = await host.experimental_call("commits", { root });
+    assert.equal(commits[0].sha, stdout.trim());
+    assert.deepEqual(commits.map((commit) => commit.subject), ["Update · with symbols | and spaces", "Initial content"]);
+    // An invalid root must not look like an empty history.
+    await assert.rejects(host.experimental_call("commits", { root: path.dirname(root) }));
+  } finally {
+    await host.experimental_dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("file actions delete only files and append literal, idempotent local and shared ignore entries", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "diff-explorer-actions-"));
   const root = path.join(dir, "workspace");
