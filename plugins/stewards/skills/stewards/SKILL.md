@@ -73,6 +73,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   ends, its workers are stopped and your thread is archived. A later wake
   brings it back. If someone moves the entity out of its terminal state
   before then, the ending is taken back and you carry on.
+- **Waiting.** Report `actor: other` only when someone else really is next.
+  The plugin then archives your thread after a wake turn, unless a worker
+  runs or an escalation is open, and the next wake brings it back.
 
 ## If you are the project steward
 

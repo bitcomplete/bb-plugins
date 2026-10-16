@@ -59,8 +59,9 @@ export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
  * What thread-briefs is asked to leave alone, seeded into this plugin's
  * metadata namespace on each thread it spawns (thread-briefs' README, "Threads
  * a plugin runs"). Every steward keeps the title it was given, which carries
- * the entity key, and is archived by this plugin when its binding ends rather
- * than whenever its brief reads done between wakes, and its sidebar row
+ * the entity key, and is archived by this plugin when its binding ends, or
+ * when a wake turn ends waiting on someone else, rather than whenever its
+ * brief reads done between wakes, and its sidebar row
  * draws no stage ring, which for a thread that idles between wakes mostly
  * says done about work that is not. Stewards also stay out of the status
  * sections, where one idle between wakes would read done: the project
@@ -721,6 +722,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         lastJudgmentAt: now(),
         commentCursor: cursor > b.commentCursor ? cursor : b.commentCursor,
         pending: [],
+        archiveWhenIdle: false,
         // A fallback until the report names its own.
         requeueAt: now() + playbook.requeueDefaultMs,
       });
@@ -1171,9 +1173,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       // Compaction makes the thread busy; a wake that finds it so waits as notes for the next idle.
-      await compactIfLarge(thread.id);
-      if (store.binding(b.id)!.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
+      const compacting = await compactIfLarge(thread.id);
+      const after = store.binding(b.id)!;
+      if (after.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
+      // Compaction ends in another idle, which archives.
+      else if (after.archiveWhenIdle && !compacting) await archiveWaiting(after);
     });
+
+    /**
+     * Archive a steward whose wake turn ended waiting on someone else, so the
+     * sidebar holds only stewards with something to do. Its binding stays:
+     * the next wake brings it back (sendTo). Not while a worker runs or an
+     * escalation is open, which the user should still see.
+     */
+    async function archiveWaiting(b: Binding): Promise<void> {
+      store.patch(b.id, { archiveWhenIdle: false });
+      if (b.threadId === null || b.endedAt !== null || b.ending !== null) return;
+      if (store.workers(b.id).some((w) => w.status === "running") || store.openEscalations(b.id).length > 0) return;
+      const info = await threadInfo(b.threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) return;
+      await quietly(`archive ${b.entityKey}'s waiting steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+      bb.log.info(`stewards: ${b.entityKey} waits on others; archived its steward until the next wake`);
+    }
 
     /**
      * Compact a steward's context once it has grown past the setting, while it
@@ -1183,18 +1204,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * acted on twice, should the provider not report a new one.
      */
     const compactedOn = new Map<string, number>();
-    async function compactIfLarge(threadId: string): Promise<void> {
+    async function compactIfLarge(threadId: string): Promise<boolean> {
       const limit = (await settings.get()).compactAboveTokens;
-      if (!(limit > 0)) return;
+      if (!(limit > 0)) return false;
       try {
         const [usage] = await bb.sdk.threads.events.list({ threadId, types: ["thread/contextWindowUsage/updated"], order: "desc", limit: "1" });
         const used = (usage?.data as { contextWindowUsage?: { usedTokens?: number | null } } | undefined)?.contextWindowUsage?.usedTokens ?? null;
-        if (used === null || used <= limit || compactedOn.get(threadId) === used) return;
+        if (used === null || used <= limit || compactedOn.get(threadId) === used) return false;
         compactedOn.set(threadId, used);
         await bb.sdk.threads.compact({ threadId });
         bb.log.info(`stewards: compacted ${threadId} at ${used} context tokens`);
+        return true;
       } catch (error) {
         bb.log.warn(`stewards: could not compact ${threadId}: ${errorMessage(error)}`);
+        return false;
       }
     }
 
@@ -1499,7 +1522,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             at: now(),
           };
           const moved = advanced(b.status, status);
+          // A wake turn that ends waiting on someone else is archived when it
+          // goes idle; a turn the user started is left where they can see it.
+          const archiveWhenIdle = input.actor === "other" && (b.awaitingReport || b.archiveWhenIdle);
           b = store.patch(b.id, {
+            archiveWhenIdle,
             status,
             statusAt: now(),
             ...(moved ? { advancedAt: now() } : {}),
@@ -1526,7 +1553,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
             return `Reported.${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
-          return `Reported.${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+          const archived = archiveWhenIdle && open.length === 0 ? " Your thread is archived when the turn ends, and comes back on that wake." : "";
+          return `Reported.${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${archived} End the turn now.`;
         } catch (error) {
           return toolError(error);
         }

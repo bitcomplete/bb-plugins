@@ -53,7 +53,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   thread is archived, and the workers go with their lifecycle owner.
   Reopening, or re-adding the label, wakes the same thread, bringing it back
   from the archive; an entity that leaves its terminal state before the
-  binding has ended takes the ending back.
+  binding has ended takes the ending back. A steward whose wake turn reports
+  `actor: other` (waiting on a reviewer or the author) is archived too,
+  unless a worker runs or an escalation is open; its next wake brings it
+  back.
 - **thread-briefs.** Every steward, the project steward included, is
   spawned with `threadBriefs: { rename: false, group: false, archive: false, ring: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin

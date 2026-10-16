@@ -93,6 +93,8 @@ export const MIGRATIONS = [
   // A terminal binding its steward kept open to finish what the entity's state does not cover.
   `ALTER TABLE bindings ADD COLUMN follow_through TEXT`,
   `ALTER TABLE bindings ADD COLUMN follow_through_until INTEGER`,
+  // A wake turn reported that it waits on someone else: archive the steward when it goes idle.
+  `ALTER TABLE bindings ADD COLUMN archive_when_idle INTEGER NOT NULL DEFAULT 0`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -185,6 +187,8 @@ export type Binding = {
   awaitingReport: boolean;
   wokeAt: number | null;
   missedReports: number;
+  /** The wake turn under way reported actor "other": archive the thread when it goes idle. */
+  archiveWhenIdle: boolean;
   /** A wrap-up or stop turn is under way: "terminal" or "detach". */
   ending: string | null;
   endingAt: number | null;
@@ -237,6 +241,7 @@ function rowToBinding(r: BindingRow): Binding {
     awaitingReport: Number(r.awaiting_report) === 1,
     wokeAt: num("woke_at"),
     missedReports: Number(r.missed_reports ?? 0),
+    archiveWhenIdle: Number(r.archive_when_idle ?? 0) === 1,
     ending: str("ending"),
     endingAt: num("ending_at"),
     followThrough: str("follow_through"),
@@ -276,6 +281,7 @@ const COLUMNS = {
   awaitingReport: "awaiting_report",
   wokeAt: "woke_at",
   missedReports: "missed_reports",
+  archiveWhenIdle: "archive_when_idle",
   ending: "ending",
   endingAt: "ending_at",
   followThrough: "follow_through",

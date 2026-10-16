@@ -668,6 +668,103 @@ describe("pull requests", () => {
   });
 });
 
+describe("stewards waiting on others", () => {
+  const waiting = { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", blockedOn: "sam" };
+
+  it("archives a review steward after a wake turn that ends waiting, and brings it back on the next", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    const steward = t.spawns[1]!.id;
+
+    const report = await t.tool("steward_report", waiting, steward);
+    expect(report.text).toMatch(/Your thread is archived when the turn ends/u);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect((await t.list())[0]).toMatchObject({ ended: false, threadId: steward });
+
+    // Sam pushes: the same thread comes back for the round, then goes again.
+    t.entities.set("acme/web#7", pull({}, { headSha: "bbbbbbb2" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.sends.at(-1)!.text).toMatch(/Pushed bbbbbbb/u);
+    await t.tool("steward_report", waiting, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.spawns).toHaveLength(2);
+  });
+
+  it("archives a ticket steward waiting on reviews of its pull requests", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Review", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...waiting, phase: "In Review", blockedOn: "reviewers on acme/web#7" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+  });
+
+  it("leaves a steward in the sidebar when the user is next, a worker runs, or an escalation is open", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    await t.tool("steward_report", { ...waiting, actor: "me" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+
+    // One worker finishes and wakes it while another still runs.
+    await t.created("thr_w1", steward);
+    await t.created("thr_w2", steward);
+    await t.idle("thr_w1", "Done.");
+    expect(t.sends.at(-1)!.text).toMatch(/finished its turn/u);
+    await t.tool("steward_report", { phase: "In Progress", summary: "Implementing.", nextAction: "Wait for the second worker", actor: "other" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+  });
+
+  it("leaves a steward with an open escalation in the sidebar", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+  });
+
+  it("does not archive a turn the user started", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", waiting, steward);
+    await t.idle(steward);
+    // The user brings it back to talk to it; its report then is theirs to read.
+    t.threads.get(steward)!.archivedAt = null;
+    await t.tool("steward_report", waiting, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+  });
+
+  it("archives after compaction rather than during it", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", waiting, steward);
+    t.usage.set(steward, 500_000);
+    await t.idle(steward);
+    expect(t.harness.sdk.callsTo("threads.compact")).toHaveLength(1);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    // Compaction ends in another idle.
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+  });
+});
+
 describe("passes", () => {
   it("adopts at most perPass per sweep, oldest first", async () => {
     const t = await setup();

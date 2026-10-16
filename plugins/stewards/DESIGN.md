@@ -105,12 +105,14 @@ These were settled while designing; each changes what gets built.
 - **Stewards end their own threads; the rest of the sidebar is the user's.**
   Stewards pin nothing and create no sidebar sections. A finished steward
   says so in its last turn and the plugin archives it when the binding ends;
-  a later wake brings it back. thread-briefs is asked, through each
-  thread's metadata, not to archive or rename stewards and not to group the
-  project steward: between wakes a steward reads done while its entity is
-  still open, and its title carries the entity key. (This first left
-  archiving to thread-briefs. In use, review stewards for open pull requests
-  were archived and unarchived on every wake.)
+  a later wake brings it back. A steward waiting on someone else is
+  archived between wakes too (§5, "Waiting"). thread-briefs is asked,
+  through each thread's metadata, not to archive or rename stewards and not
+  to group the project steward: between wakes a steward reads done while
+  its entity is still open, and its title carries the entity key. (This
+  first left archiving to thread-briefs, which archived every steward whose
+  brief read done, whoever was next. The plugin now decides from the status
+  record instead.)
 
 ## 3. Configuration
 
@@ -259,6 +261,13 @@ plugins.
   steward gets one turn to stop. Re-adding the label resumes it the same way. Deleting
   the steward thread detaches it until the label is removed and re-added.
 - **Review stewards** end when the pull request is merged or closed.
+- **Waiting.** A wake turn whose report names `other` as the next actor
+  (a review posted and the author's move, a ticket in review waiting on
+  reviewers) archives the steward's thread when the turn ends. The binding
+  stays, and the next wake brings the same thread back. It stays in the
+  sidebar while a worker runs or an escalation is open, while it follows
+  through after a terminal state, when the user is next, and after a turn
+  the user started, which is theirs to read.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
 

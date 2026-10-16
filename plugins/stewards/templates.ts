@@ -140,7 +140,7 @@ may: [comment, review, approve, spawn-worker]
 models:
   steward: claude/claude-haiku-5-5/low
   worker: claude/claude-opus-5-5/high
-requeue-default: 3d
+requeue-default: 7d
 skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
 ---
 
