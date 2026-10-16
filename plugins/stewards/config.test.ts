@@ -45,6 +45,9 @@ describe("playbooks", () => {
     expect(phaseInstructions(p, "todo")).toMatch(/Specify the ticket/u);
     expect(p.general).toMatch(/You steward one Linear ticket/u);
     expect(p.requeueDefaultMs).toBe(2 * 86_400_000);
+    expect(p.followThroughMs).toBe(6 * 3_600_000);
+    const shorter = parsePlaybook(LINEAR_TICKETS.replace("requeue-default: 2d", "requeue-default: 2d\nfollow-through: 90m"), "linear-tickets");
+    expect(shorter.ok && shorter.value.followThroughMs).toBe(90 * 60_000);
     expect(p.ready?.approval).toBe("project");
     expect(playbookStates(p)).toEqual(expect.arrayContaining(["Todo", "In Review", "Done", "Canceled"]));
     expect(p.version).toMatch(/^[0-9a-f]{12}$/u);

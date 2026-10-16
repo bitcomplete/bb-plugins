@@ -34,17 +34,40 @@ function fit(head: string[], middle: string[], tail: string[]): string {
 }
 
 /** Why this wake: an ordinary reconcile, or a lifecycle turn with its own instructions. */
-export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "detach" | "reopen";
+export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "reopen";
 
 const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
-  terminal:
-    "The entity has reached a terminal state. This is your wrap-up turn: post a final signed comment if one is useful, start no workers, and end with steward_report. The binding and its workers are archived after this turn.",
   detach:
     "The label was removed, so this binding is detached. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying the work is done here. Adding the label back brings this thread back.",
   reopen: "The entity came back from a terminal or detached state and this binding has resumed. Re-read everything below as if new.",
   adopted: "You have just been bound to this entity. Read everything below, then act on the phase's instructions.",
   nightly: "This is the nightly reconcile pass: nothing may have changed. Check for drift the event path missed, and report.",
 };
+
+/**
+ * The terminal state ends the binding only once the steward says its work
+ * is done: merged is not deployed, and Done set by an automation is not
+ * verified. Running workers are left alone until then.
+ */
+function lifecycleInstructions(input: WakeInput): string | undefined {
+  const { binding: b, playbook, observed } = input;
+  if (input.reason === "terminal") {
+    return (
+      `The entity has reached a terminal state (${observed.entity.state}). This is your wrap-up turn. Running workers have not been stopped. ` +
+      `If the work does not end here — a worker still finishing, a deploy to watch, production to verify, as the playbook says — keep the binding open: end with steward_report and followThrough saying what remains. ` +
+      `It then stays open for up to ${formatDuration(playbook.followThroughMs)}, and you may start a worker for that remaining work only. ` +
+      "Otherwise post a final signed comment if one is useful and end with steward_report without followThrough: running workers are stopped, and the binding and its workers are archived after this turn."
+    );
+  }
+  if (input.reason === "follow-through") {
+    return (
+      `The entity is in a terminal state (${observed.entity.state}) and you kept this binding open to follow through: ${JSON.stringify(b.followThrough ?? "")}. ` +
+      `Do that work only; start nothing new. It runs out at ${b.followThroughUntil === null ? "the playbook's limit" : iso(b.followThroughUntil)}, when running workers are stopped and the binding ends. ` +
+      "End with steward_report: with followThrough again if something still remains, or without it once it is done, and the binding and its workers are archived after this turn."
+    );
+  }
+  return LIFECYCLE_INSTRUCTIONS[input.reason];
+}
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
 
@@ -136,7 +159,7 @@ export function formatWake(input: WakeInput): string {
     "",
     `${binding.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${binding.threadId}.`} Use it wherever you name yourself (a worker's task, a gh signature), and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`,
   );
-  const special = LIFECYCLE_INSTRUCTIONS[input.reason];
+  const special = lifecycleInstructions(input);
   if (special !== undefined) out.push("", `**${special}**`);
 
   out.push("", "## 1. Instructions");

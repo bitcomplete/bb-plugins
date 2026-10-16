@@ -442,6 +442,128 @@ describe("a Linear ticket steward", () => {
   });
 });
 
+describe("terminal states and follow-through", () => {
+  /** A ticket in progress with its steward and one worker at work. */
+  async function working() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    await t.created("thr_w1", steward!, "ENG-12: Merge, watch the deploy, verify");
+    const done = async () => {
+      t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed" }));
+      await t.ring("linear", "uuid-12");
+    };
+    const report = (args: Record<string, unknown> = {}) => t.tool("steward_report", { phase: "Done", summary: "Merged.", nextAction: "Nothing", actor: "steward", ...args }, steward!);
+    const stops = () => t.harness.sdk.callsTo("threads.stop").map(([args]) => (args as { threadId: string }).threadId);
+    const archives = () => t.harness.sdk.callsTo("threads.archive").map(([args]) => (args as { threadId: string }).threadId);
+    return { ...t, project: project!, steward: steward!, done, report, stops, archives };
+  }
+
+  it("leaves workers running through the wrap-up turn, and stops them when it ends without follow-through", async () => {
+    const t = await working();
+    await t.done();
+    const wrapUp = t.sends.at(-1)!.text;
+    expect(wrapUp).toMatch(/terminal state \(Done\)\. This is your wrap-up turn\. Running workers have not been stopped/u);
+    expect(wrapUp).toMatch(/followThrough saying what remains/u);
+    expect(wrapUp).toMatch(/ENG-12: Merge, watch the deploy, verify \(thread thr_w1\): running/u);
+    expect(t.stops()).toEqual([]);
+
+    expect((await t.report()).text).toMatch(/The binding ends when this turn does/u);
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.stops()).toEqual(["thr_w1"]);
+    expect(t.archives()).toEqual([t.steward]);
+  });
+
+  it("keeps the binding open while the steward follows through, and ends it once the work is done", async () => {
+    const t = await working();
+    await t.done();
+    const kept = await t.report({ followThrough: "thr_w1 is watching deploy 1206 and will verify production." });
+    expect(kept).toMatchObject({ error: false, text: expect.stringMatching(/stays open to follow through until 2026-10-14T21:00:00Z/u) });
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    expect(t.stops()).toEqual([]);
+    expect(t.archives()).toEqual([]);
+
+    // A worker started for the remaining work is the steward's like any other.
+    await t.created("thr_w2", t.steward, "ENG-12: Verify production");
+    expect(t.hooks.store.workers(t.hooks.store.byThread(t.steward)!.id).map((w) => w.threadId)).toContain("thr_w2");
+
+    await t.idle("thr_w1", "Deploy 1206 is live; verified in production.");
+    const followUp = t.sends.at(-1)!;
+    expect(followUp.threadId).toBe(t.steward);
+    expect(followUp.text).toMatch(/you kept this binding open to follow through: "thr_w1 is watching deploy 1206/u);
+    expect(followUp.text).toMatch(/runs out at 2026-10-14T21:00:00Z/u);
+    expect(followUp.text).toMatch(/verified in production\./u);
+
+    // Saying so again keeps it open; leaving it out ends it.
+    await t.report({ followThrough: "thr_w2 is checking the logs." });
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    await t.report();
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.stops()).toEqual(["thr_w2"]);
+    expect(t.archives()).toEqual([t.steward]);
+  });
+
+  it("ends a follow-through that runs out, stopping its workers and telling the project steward", async () => {
+    const t = await working();
+    await t.done();
+    await t.report({ followThrough: "thr_w1 is watching the deploy." });
+    await t.idle(t.steward);
+    t.advance(6 * 3_600_000 + 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.stops()).toEqual(["thr_w1"]);
+    const told = t.sends.filter((x) => x.threadId === t.project).at(-1)!.text;
+    expect(told).toMatch(/follow-through ran out on ENG-12/u);
+    expect(told).toMatch(/these workers were stopped: ENG-12: Merge, watch the deploy, verify/u);
+  });
+
+  it("an ending turn that does not report ends the binding, follow-through or not", async () => {
+    const t = await working();
+    await t.done();
+    await t.report({ followThrough: "thr_w1 is watching the deploy." });
+    await t.idle(t.steward);
+    await t.idle("thr_w1", "Still deploying.");
+    // Woken to follow through, and ended without a word.
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+  });
+
+  it("takes back the ending when the ticket is moved back before the binding ends", async () => {
+    const t = await working();
+    await t.done();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const back = t.sends.at(-1)!.text;
+    expect(back).toMatch(/came back from a terminal or detached state/u);
+    expect(back).toMatch(/reopened before the binding ended: now In Progress/u);
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    expect(t.stops()).toEqual([]);
+    expect(t.archives()).toEqual([]);
+    // followThrough means nothing outside an ending.
+    expect((await t.report({ phase: "In Progress", followThrough: "watch the deploy" })).error).toBe(true);
+  });
+
+  it("counts a worker woken again as running, so a detach stops it", async () => {
+    const t = await working();
+    await t.idle("thr_w1", "Waiting on the review verdict.");
+    expect(t.sends.at(-1)!.text).toMatch(/\(thread thr_w1\): finished/u);
+    // Its own watch wakes it.
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", labels: [] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends.at(-1)!.text).toMatch(/this binding is detached/u);
+    expect(t.stops()).toEqual(["thr_w1"]);
+  });
+});
+
 describe("the project steward", () => {
   it("is renamed to its project and tagged for thread-briefs when it predates both", async () => {
     const t = await setup();

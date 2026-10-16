@@ -180,6 +180,9 @@ const readySchema = z
   .strict();
 export type ReadyConfig = z.infer<typeof readySchema>;
 
+/** The default cap on follow-through: a deploy and its verification, with room to spare. */
+export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
+
 export const frontMatterSchema = z
   .object({
     name: playbookName,
@@ -193,6 +196,8 @@ export const frontMatterSchema = z
     may: z.array(z.string().trim().min(1).max(60)).default([]),
     models: z.object({ steward: modelSpecSchema.optional(), worker: modelSpecSchema.optional() }).strict().default({}),
     "requeue-default": durationSchema.default(2 * 86_400_000),
+    /** How long a steward may keep a binding open past a terminal state to finish its work. */
+    "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
   })
@@ -209,6 +214,7 @@ export type Playbook = {
   may: string[];
   models: { steward: ModelSpec | null; worker: ModelSpec | null };
   requeueDefaultMs: number;
+  followThroughMs: number;
   skipAuthors: string[];
   /** The text before the first `## ` heading: instructions for every phase. */
   general: string;
@@ -257,6 +263,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       may: fm.may,
       models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null },
       requeueDefaultMs: fm["requeue-default"],
+      followThroughMs: fm["follow-through"],
       skipAuthors: fm["skip-authors"],
       general,
       sections,

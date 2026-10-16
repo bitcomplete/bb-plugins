@@ -42,11 +42,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   spec). Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
   children of a steward thread.
-- **Lifecycle.** A terminal state gets one wrap-up turn and the binding
-  ends; removing the label gets one stop turn. When the binding ends, the
-  steward's thread is archived, and its workers go with their lifecycle
-  owner. Reopening, or re-adding the label, wakes the same thread,
-  bringing it back from the archive.
+- **Lifecycle.** A terminal state gets a wrap-up turn with its workers
+  still running. The steward either ends the binding there, or keeps it open
+  to follow through (`steward_report { followThrough }`) on what the state
+  does not cover, such as a deploy to watch or production to verify. It is
+  then woken as usual until it reports without `followThrough`, or until the
+  playbook's `follow-through` cap (6h by default) runs out and the project
+  steward is told. Removing the label stops the workers at once and gets one
+  stop turn. When the binding ends, its workers are stopped, the steward's
+  thread is archived, and the workers go with their lifecycle owner.
+  Reopening, or re-adding the label, wakes the same thread, bringing it back
+  from the archive; an entity that leaves its terminal state before the
+  binding has ended takes the ending back.
 - **thread-briefs.** Every steward, the project steward included, is
   spawned with `threadBriefs: { rename: false, group: false, archive: false, ring: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
@@ -107,7 +114,9 @@ Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`), `source`,
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as
 `provider/model/level`; `claude` means `claude-code`; the model may hold
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last
-part is the level only when it names one), `requeue-default`, `skip-authors`.
+part is the level only when it names one), `requeue-default`,
+`follow-through` (how long a terminal binding may be kept open, 6h by
+default), `skip-authors`.
 
 The wake numbers the ready checklist, and `steward_report` takes each item by
 its number (or the playbook's exact words). It stores the playbook's wording,

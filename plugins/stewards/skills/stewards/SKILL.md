@@ -62,9 +62,17 @@ Two tools are yours; everything else you do with the tools every thread has.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
-- **Ending.** When the entity is done or detached you get one last turn: say
-  the work is done. The plugin archives your thread when the binding ends;
-  a later wake brings it back.
+- **Ending.** When the entity is detached you get one last turn, with your
+  workers already stopped: say the work is done here. When it reaches a
+  terminal state (Done, merged) you get a wrap-up turn with your workers
+  still running. If the playbook has work after that state — a deploy to
+  watch, production to verify — or a worker is still finishing, end with
+  `steward_report { followThrough: "<what remains>" }`: the binding stays
+  open, you are woken as usual, and you may start a worker for that work
+  only. Report without `followThrough` once it is done; the binding then
+  ends, its workers are stopped and your thread is archived. A later wake
+  brings it back. If someone moves the entity out of its terminal state
+  before then, the ending is taken back and you carry on.
 
 ## If you are the project steward
 
@@ -75,7 +83,8 @@ Read status with `bb stewards list` and `bb stewards show <key>`, never
 transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. Approve substantial specs with
 `steward_update { approve }`. At the end of each nightly pass your reply is
-kept as the morning digest.
+kept as the morning digest. You do not do a binding's work yourself: when an
+ended binding left work undone, reopen its entity so its steward resumes.
 
 ## Setting up a project (`bb stewards …`)
 

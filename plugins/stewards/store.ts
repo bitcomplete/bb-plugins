@@ -90,6 +90,9 @@ export const MIGRATIONS = [
    )`,
   // The title this plugin last put on the project steward, so a rename by hand sticks.
   `ALTER TABLE project_stewards ADD COLUMN title TEXT`,
+  // A terminal binding its steward kept open to finish what the entity's state does not cover.
+  `ALTER TABLE bindings ADD COLUMN follow_through TEXT`,
+  `ALTER TABLE bindings ADD COLUMN follow_through_until INTEGER`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -185,6 +188,10 @@ export type Binding = {
   /** A wrap-up or stop turn is under way: "terminal" or "detach". */
   ending: string | null;
   endingAt: number | null;
+  /** What the steward said remains after a terminal state; set, the ending waits for it. */
+  followThrough: string | null;
+  /** When follow-through runs out, whatever the steward says: set when it is first declared. */
+  followThroughUntil: number | null;
   manualDetach: boolean;
   createdAt: number;
   endedAt: number | null;
@@ -232,6 +239,8 @@ function rowToBinding(r: BindingRow): Binding {
     missedReports: Number(r.missed_reports ?? 0),
     ending: str("ending"),
     endingAt: num("ending_at"),
+    followThrough: str("follow_through"),
+    followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
@@ -269,6 +278,8 @@ const COLUMNS = {
   missedReports: "missed_reports",
   ending: "ending",
   endingAt: "ending_at",
+  followThrough: "follow_through",
+  followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
   endedAt: "ended_at",
   endReason: "end_reason",

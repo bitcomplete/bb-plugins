@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { diffObserved, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
+import { diffObserved, endingDeadline, followingThrough, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -147,7 +147,7 @@ describe("the ready gate", () => {
 });
 
 describe("lifecycle", () => {
-  const open = { kind: "ticket" as const, endedAt: null, endReason: null, manualDetach: false };
+  const open = { kind: "ticket" as const, endedAt: null, endReason: null, manualDetach: false, ending: null };
   it("ends on a terminal state or a removed label, and comes back", () => {
     expect(lifecycle(open, tickets, issue(), "bb-managed").kind).toBe("continue");
     expect(lifecycle(open, tickets, issue({ state: "Done" }), "bb-managed").kind).toBe("terminal");
@@ -155,6 +155,24 @@ describe("lifecycle", () => {
     expect(lifecycle({ ...open, endedAt: 1, endReason: "terminal" }, tickets, issue({ state: "Todo" }), "bb-managed").kind).toBe("reopen");
     expect(lifecycle({ ...open, endedAt: 1, endReason: "detach" }, tickets, issue(), "bb-managed").kind).toBe("reopen");
     expect(lifecycle({ ...open, endedAt: 1, endReason: "detach", manualDetach: true }, tickets, issue(), "bb-managed").kind).toBe("stay-ended");
+  });
+
+  it("takes back an ending when the entity leaves its terminal state before the binding ends", () => {
+    // Linear's merge-to-Done automation, and someone moving the ticket straight back.
+    const ending = { ...open, ending: "terminal" };
+    expect(lifecycle(ending, tickets, issue({ state: "Done" }), "bb-managed").kind).toBe("terminal");
+    expect(lifecycle(ending, tickets, issue({ state: "In Progress" }), "bb-managed")).toEqual({ kind: "reopen", why: "reopened before the binding ended: now In Progress" });
+    // A detach under way is not undone by a state change.
+    expect(lifecycle({ ...open, ending: "detach" }, tickets, issue({ state: "In Progress", labels: [] }), "bb-managed").kind).toBe("detach");
+  });
+
+  it("keeps an ending open for follow-through until its cap, and a bare wrap-up turn for its timeout", () => {
+    expect(followingThrough({ ending: "terminal", followThrough: "watch the deploy" })).toBe(true);
+    expect(followingThrough({ ending: "terminal", followThrough: null })).toBe(false);
+    expect(followingThrough({ ending: "detach", followThrough: "watch the deploy" })).toBe(false);
+    expect(endingDeadline({ ending: null, endingAt: null, followThroughUntil: null }, 60_000)).toBeNull();
+    expect(endingDeadline({ ending: "terminal", endingAt: 1000, followThroughUntil: null }, 60_000)).toBe(61_000);
+    expect(endingDeadline({ ending: "terminal", endingAt: 1000, followThroughUntil: 9_000_000 }, 60_000)).toBe(9_000_000);
   });
 
   it("does not detach a review binding, which has no label", () => {

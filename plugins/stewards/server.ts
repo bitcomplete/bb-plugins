@@ -15,6 +15,7 @@
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
+  DEFAULT_FOLLOW_THROUGH_MS,
   DEFAULT_PLAYBOOKS,
   ESCALATION_KINDS,
   KINDS,
@@ -35,7 +36,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, diffObserved, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, type Change } from "./reconcile.js";
+import { advanced, diffObserved, endingDeadline, followingThrough, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -79,7 +80,7 @@ export interface Timing {
   requeueTickMs: number;
   /** Between two nightly turns. */
   nightlyStaggerMs: number;
-  /** A wrap-up or stop turn that has not finished in this long is finished for it. */
+  /** A wrap-up or stop turn that has not finished in this long is finished for it (follow-through has its own cap, from the playbook). */
   endingTimeoutMs: number;
   /** A steward that ends this many woken turns in a row without a report is stuck. */
   missedReportsForStuck: number;
@@ -764,11 +765,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         reason = "reopen";
       }
       if (life.kind === "terminal" || life.kind === "detach") {
-        if (b.ending === null) await beginEnding(b, config, playbook, life.kind, observed);
-        else store.patch(b.id, { lastSnapshot: observed });
-        return;
-      }
-      if (b.ending !== null) {
+        if (b.ending === null) {
+          await beginEnding(b, config, playbook, life.kind, observed);
+          return;
+        }
+        // Following through, the steward is woken as before; otherwise its
+        // one last turn is under way and there is nothing to add to it.
+        if (life.kind !== "terminal" || !followingThrough(b)) {
+          store.patch(b.id, { lastSnapshot: observed });
+          return;
+        }
+        if (b.followThroughUntil !== null && now() >= b.followThroughUntil) {
+          await followThroughRanOut(b);
+          return;
+        }
+      } else if (b.ending !== null) {
         store.patch(b.id, { lastSnapshot: observed });
         return;
       }
@@ -833,7 +844,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (reason !== null && reason !== "changed") store.note(b.id, `Due: ${reason}`);
         return;
       }
-      await wake(b, config, playbook, observed, lines, reason ?? (b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"));
+      await wake(b, config, playbook, observed, lines, reason ?? (followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"));
     }
 
     // ---- lifecycle -------------------------------------------------------------------------------
@@ -846,10 +857,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** The one wrap-up (terminal) or stop (detach) turn before the binding ends. */
+    /**
+     * The one wrap-up (terminal) or stop (detach) turn before the binding
+     * ends. A detach stops the workers now: someone took the label off. A
+     * terminal state leaves them running through the wrap-up turn, in which
+     * the steward may keep the binding open to follow through (a deploy to
+     * watch, production to verify); they are stopped when it ends.
+     */
     async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
-      b = store.patch(b.id, { ending: kind, endingAt: now(), lastSnapshot: observed });
-      await stopWorkers(b);
+      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed });
+      if (kind === "detach") await stopWorkers(b);
       bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : "was detached"}; one last turn`);
       if (b.threadId === null) {
         await finishEnding(b, kind);
@@ -872,7 +889,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * in the sidebar rather than archived mid-turn.
      */
     async function finishEnding(b: Binding, reason: string): Promise<void> {
-      b = store.patch(b.id, { ending: null, endingAt: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
+      b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.");
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
@@ -892,10 +909,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function reopen(b: Binding, why: string): Promise<Binding> {
       // The wake that follows brings the thread back if it was archived meanwhile.
-      b = store.patch(b.id, { endedAt: null, endReason: null, ending: null, endingAt: null, awaitingReport: false, missedReports: 0 });
+      b = store.patch(b.id, { endedAt: null, endReason: null, ending: null, endingAt: null, followThrough: null, followThroughUntil: null, awaitingReport: false, missedReports: 0 });
       bb.log.info(`stewards: ${b.entityKey} resumed (${why})`);
       pushInterest();
       return store.note(b.id, why);
+    }
+
+    /**
+     * The playbook's cap on follow-through came before the steward said it
+     * was done. The binding ends as any terminal one does, and the project
+     * steward hears what was left, since nobody else will.
+     */
+    async function followThroughRanOut(b: Binding): Promise<void> {
+      const what = b.followThrough ?? "(not said)";
+      const stopped = store.workers(b.id).filter((w) => w.status === "running").map((w) => w.title);
+      bb.log.warn(`stewards: ${b.entityKey}'s follow-through ran out (${what})`);
+      await finishEnding(b, "terminal");
+      await wakeProject(b.projectId, `follow-through ran out on ${b.entityKey}`, {
+        digestDue: false,
+        notes: [
+          `${b.entityKey} reached a terminal state and its steward kept it open to follow through: ${JSON.stringify(what)}. That ran out before the steward said it was done, so the binding ended${stopped.length > 0 ? ` and these workers were stopped: ${stopped.join("; ")}` : ""}.`,
+          "Decide from the project's guidance whether the work needs finishing. Reopening the entity resumes its steward; do not do a steward's work yourself.",
+        ],
+      });
     }
 
     // ---- adoption ------------------------------------------------------------------------------
@@ -1116,6 +1152,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const b = store.byThread(thread.id);
       if (b === null || b.endedAt !== null) return;
       if (b.ending !== null) {
+        // A steward following through ends when a turn finishes without
+        // saying something still remains, or without reporting at all.
+        if (followingThrough(b) && !b.awaitingReport) {
+          await compactIfLarge(thread.id);
+          if (store.binding(b.id)!.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
+          return;
+        }
         await serial(`b:${b.id}`, () => finishEnding(store.binding(b.id)!, b.ending!));
         return;
       }
@@ -1299,7 +1342,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           tools: ["steward_update"],
           skills: ["stewards"],
           instructions:
-            "You are this project's steward. Decide escalations from the project's own guidance (AGENTS.md, architecture and design docs); only the project's big decisions go to the user. Read status with `bb stewards list` and `bb stewards show <key>`; steer with steward_update. Read the stewards skill for the protocol.",
+            "You are this project's steward. Decide escalations from the project's own guidance (AGENTS.md, architecture and design docs); only the project's big decisions go to the user. Read status with `bb stewards list` and `bb stewards show <key>`; steer with steward_update. Do not do a binding's work yourself: when an ended binding left work undone, reopen its entity so its steward resumes. Read the stewards skill for the protocol.",
         };
       }
       const b = role.binding;
@@ -1359,7 +1402,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "steward_report",
       description:
-        "End a steward's turn with its status record: where the entity is, what happens next and who does it, what it waits on, and when to wake it if nothing else does. Also records the ready-gate checklist, voids an approval when the spec changed materially, and raises an escalation when something is not yours to decide. Required at the end of every turn you were woken for.",
+        "End a steward's turn with its status record: where the entity is, what happens next and who does it, what it waits on, and when to wake it if nothing else does. Also records the ready-gate checklist, voids an approval when the spec changed materially, raises an escalation when something is not yours to decide, and, after a terminal state, keeps the binding open while work remains. Required at the end of every turn you were woken for.",
       presentation: { label: { pending: "Reporting status", completed: "Reported status" } },
       parameters: z.object({
         phase: z.string().trim().min(1).max(100).describe("The entity's phase as you understand it, usually its state."),
@@ -1394,13 +1437,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           })
           .optional()
           .describe("Something the project's guidance does not let you decide. It goes to your parent steward, then the project steward; the answer comes back as guidance and wakes you."),
+        followThrough: z
+          .string()
+          .trim()
+          .min(1)
+          .max(600)
+          .optional()
+          .describe("Only after a terminal state (a wrap-up or follow-through turn): what remains to finish, such as a worker watching the deploy and verifying it. The binding stays open, its workers keep running, and you are woken as usual. Leave it out once the work is done, and the binding ends after this turn."),
       }),
       async execute(input, { threadId }) {
         try {
           let b = ownBinding(threadId);
+          if (input.followThrough !== undefined && b.ending !== "terminal") {
+            return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
+          }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : playbookFor(config, b.kind);
-          const requeueMs = input.requeueAfter ?? playbook?.requeueDefaultMs ?? 2 * 86_400_000;
+          // Follow-through has one deadline from when it was first declared; a
+          // requeue past it is a requeue at it.
+          const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (input.followThrough === undefined ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
+          const requeueMs = Math.min(input.requeueAfter ?? playbook?.requeueDefaultMs ?? 2 * 86_400_000, followThroughUntil === null ? Infinity : Math.max(60_000, followThroughUntil - now()));
           let ready = b.ready;
           if (input.ready !== undefined) {
             // Stored in the playbook's own words, so the gate matches what was meant.
@@ -1451,6 +1507,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             awaitingReport: false,
             missedReports: 0,
             ready,
+            ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
           if (moved && b.parentBindingId !== null) {
             const parent = store.binding(b.parentBindingId);
@@ -1464,6 +1521,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const unmet = gate.unmet.map((item) => playbook.ready!.checklist.indexOf(item) + 1);
             const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
+          }
+          if (b.ending === "terminal") {
+            if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           return `Reported.${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
         } catch (error) {
@@ -1608,8 +1669,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const playbooks = config.playbooks;
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(b.threadId);
-          if (b.ending !== null && b.endingAt !== null && now() - b.endingAt > timing.endingTimeoutMs) {
-            await serial(`b:${b.id}`, () => finishEnding(store.binding(b.id)!, b.ending!));
+          const deadline = endingDeadline(b, timing.endingTimeoutMs);
+          if (deadline !== null && now() > deadline) {
+            await serial(`b:${b.id}`, async () => {
+              const fresh = store.binding(b.id);
+              if (fresh === null || fresh.ending === null || fresh.endedAt !== null) return;
+              if (followingThrough(fresh)) await followThroughRanOut(fresh);
+              else await finishEnding(fresh, fresh.ending!);
+            });
             continue;
           }
           const playbook = playbooks[b.kind];

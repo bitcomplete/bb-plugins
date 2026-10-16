@@ -224,8 +224,12 @@ const hasLabel = (entity: EntitySnapshot, label: string) => entity.labels.some((
  * What the entity's state means for the binding. A review binding is not
  * labelled, so only the terminal state ends it; a ticket or pr binding also
  * ends when the label goes, and comes back when it returns.
+ *
+ * An entity that leaves its terminal state while the binding is still
+ * ending reopens it too: a ticket an automation moved to Done and someone
+ * moved straight back should not cost its steward its workers.
  */
-export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach">, playbook: Playbook, entity: EntitySnapshot, label: string): Lifecycle {
+export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string): Lifecycle {
   const terminal = isTerminal(playbook, entity.state);
   const labelled = binding.kind === "review" || hasLabel(entity, label);
   if (binding.endedAt !== null) {
@@ -234,12 +238,26 @@ export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason
     if (binding.endReason === "detach") return { kind: "reopen", why: `the ${label} label is back` };
     return { kind: "stay-ended" };
   }
+  if (binding.ending === "terminal" && !terminal && labelled) return { kind: "reopen", why: `reopened before the binding ended: now ${entity.state}` };
   if (terminal) return { kind: "terminal" };
   if (!labelled) return { kind: "detach" };
   return { kind: "continue" };
 }
 
 export { hasLabel };
+
+/** Whether a terminal binding is being kept open by its steward to finish its work. */
+export const followingThrough = (b: Pick<Binding, "ending" | "followThrough">): boolean => b.ending === "terminal" && b.followThrough !== null;
+
+/**
+ * When an ending is overdue: the follow-through's cap once the steward has
+ * declared one, otherwise the wrap-up turn's own timeout.
+ */
+export function endingDeadline(b: Pick<Binding, "ending" | "endingAt" | "followThroughUntil">, turnTimeoutMs: number): number | null {
+  if (b.ending === null) return null;
+  if (b.followThroughUntil !== null) return b.followThroughUntil;
+  return b.endingAt === null ? null : b.endingAt + turnTimeoutMs;
+}
 
 /** The phase and stage for the entity's state, or nulls when the playbook does not name it. */
 export function phaseAndStage(playbook: Playbook, state: string): { phase: string; stage: Binding["stage"] } {

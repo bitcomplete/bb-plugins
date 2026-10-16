@@ -232,15 +232,31 @@ plugins.
 ## 5. Lifecycle
 
 - **Terminal.** The entity reaches a state the playbook declares terminal
-  (Linear Done or Canceled; GitHub merged or closed). Its workers are
-  stopped and the steward gets one wrap-up turn — a final comment, saying
-  the work is done — and the binding ends. The thread is archived then,
-  unless it is still running, and workers follow their lifecycle owner.
+  (Linear Done or Canceled; GitHub merged or closed). The steward gets a
+  wrap-up turn — a final comment, saying the work is done — with its
+  workers still running, and the binding ends after it. Its workers are
+  stopped then, the thread is archived unless it is still running, and
+  workers follow their lifecycle owner.
+- **Follow-through.** A terminal state is not always the end of the work:
+  merged is not deployed, and Done set by an automation is not verified.
+  In its wrap-up turn the steward may keep the binding open with
+  `steward_report { followThrough }`, saying what remains. Running workers
+  keep going, it may start a worker for that work only, and it is woken as
+  usual (a worker finishing, a comment, its requeue). Each of those turns
+  says `followThrough` again or the binding ends after it; a turn without a
+  report ends it too. The playbook's `follow-through` duration (6h by
+  default) caps it from when it is first declared: past it, the workers are
+  stopped, the binding ends, and the project steward is told what was left.
+  The steward decides, not the plugin: a running worker alone does not hold
+  a binding open, since a Canceled ticket's workers should stop.
 - **Reopen.** The entity leaves a terminal state. The binding resumes and
   the same thread is woken, brought back from the archive. No second
-  thread.
-- **Detach.** The label is removed. Workers are stopped and the steward gets
-  one turn to stop. Re-adding the label resumes it the same way. Deleting
+  thread. An entity that leaves its terminal state while the binding is
+  still ending — in its wrap-up turn or following through — takes the
+  ending back: nothing is stopped or archived, and the steward is woken to
+  reopen.
+- **Detach.** The label is removed. Workers are stopped at once and the
+  steward gets one turn to stop. Re-adding the label resumes it the same way. Deleting
   the steward thread detaches it until the label is removed and re-added.
 - **Review stewards** end when the pull request is merged or closed.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
@@ -266,7 +282,8 @@ Plugin code. No model turn.
    - open escalations and the ready gate.
 3. The snapshot is compared with the last one. A judgment turn is due only
    when something actionable changed:
-   - phase changed, or a terminal state, reopen or detach;
+   - phase changed, or a terminal state, reopen or detach (while a binding
+     follows through, the rest of this list still wakes it);
    - a human comment, a review submitted, a review re-requested;
    - checks finished; a pull request merged, closed or pushed by someone else;
    - a worker finished or failed; a child steward's status changed;
@@ -508,6 +525,7 @@ promote: "A sub-issue that needs more than one pull request or its own approval.
 may: [comment, edit-description, set-state, set-labels, create-sub-issue, open-pr, request-review, spawn-worker]
 models: { ... }                   # §13
 requeue-default: 2d
+follow-through: 6h                # how long a terminal binding may be kept open (§5)
 ```
 
 - **Phases are the entity's own states**, so the playbook needs no state
@@ -603,7 +621,10 @@ plugins' contract before stewards uses them, bb-plugins before bb-gate.
   stewarding the same ticket.
 - **`may` is not a wall.** See §11.
 - **Deploys are not observed.** "Merged" is the terminal state for pull
-  requests. A deploy event source would be new work.
+  requests. A deploy event source (GitHub deployment or workflow-run events
+  through bb-gate-hooks, and the deploy in the snapshot) would be new work in
+  three repos. Until then, a playbook that wants a deploy watched has the
+  steward follow through (§5) while a worker watches and verifies it.
 - **Comments and the team lease.** bb-gate-hooks does not always know a
   Linear comment's team, so a team lease alone misses some comments. That is
   why every binding also holds an issue lease for its own entity (§16).
