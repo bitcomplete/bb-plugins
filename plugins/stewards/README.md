@@ -78,7 +78,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   what the project file lists under `bigDecisions` is forwarded to you, by
   the project steward asking in its own thread, where thread-briefs shows it
   as waiting on you. Substantial specs are approved by the project steward
-  unless a playbook says `approval: me`.
+  unless a playbook says `approval: me`. The plugin asks for that approval
+  itself: whenever a ready gate's checklist is met, the ticket is
+  substantial and the current spec has no approval, it files an `approval`
+  escalation with the approver (the project steward, or the user in the
+  steward's thread), whatever the steward's report says, and closes it once
+  approved or no longer needed. A request the approver declines is not made
+  again until the spec changes. When the entity changes while one of its
+  escalations is with you, the project steward is woken with the change too,
+  since you may have answered on the ticket rather than in its thread. A
+  status blocked on the project steward or the user with no open
+  escalation is flagged in `bb stewards list` and the digest.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.

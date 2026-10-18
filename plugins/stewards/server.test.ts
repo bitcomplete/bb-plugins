@@ -329,6 +329,151 @@ describe("a Linear ticket steward", () => {
     expect((await t.tool("steward_update", { approve: true, quote: "go ahead" }, steward!)).error).toBe(false);
   });
 
+  // HUB-196: the steward posted a new spec, met the checklist, and only said in
+  // its status that it waited on the project steward. Nobody heard.
+  it("asks the project steward to approve a met, substantial spec without the steward escalating", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true, why: "two repos" };
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", blockedOn: "project steward's approval of the new spec" };
+
+    const reported = await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(reported.text).toMatch(/Approval of the spec is requested from the project steward \(esc_[\w-]+\); wait for it, and do not escalate for it\./u);
+    expect(toProject()).toHaveLength(1);
+    const wake = toProject()[0]!.text;
+    expect(wake).toMatch(/approval requested for ENG-12/u);
+    expect(wake).toMatch(/(esc_[\w-]+) from ENG-12 \(approval\): Approve ENG-12's spec \(Fix login\)\? .*substantial \(two repos\)/u);
+    expect(wake).toMatch(/steward_update \{ binding, approve: true \}/u);
+    const id = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(wake)![1]!;
+
+    // A second report asks nothing twice, and the steward's next wake says it is asked for.
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(toProject()).toHaveLength(1);
+    expect((await t.list())[0]!.escalations).toBe(1);
+
+    // Approving closes the request and wakes the steward with the gate passed.
+    const approved = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project!);
+    expect(approved).toMatchObject({ error: false, text: "ENG-12: spec approved." });
+    await t.flush();
+    expect((await t.list())[0]!.escalations).toBe(0);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Gate: PASSED/u);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toContain(`Escalation ${id} approval (resolved, project)`);
+
+    // A new spec voids nothing by itself, but the gate needs approval again, and the approver is asked again.
+    t.entities.set("uuid-12", issue({ comments: [comment({ id: "s2", author: "Jane", body: "**Spec:** narrower scope", signedBy: steward!, createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/the spec has changed since, so the gate needs it again/u);
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(toProject()).toHaveLength(2);
+    expect(toProject()[1]!.text).toMatch(/the spec has changed since its last approval/u);
+
+    // Declined: not asked again for the same spec; asked again once it changes.
+    const second = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(toProject()[1]!.text)![1]!;
+    await t.tool("steward_update", { binding: "ENG-12", guidance: "Name the migration in the spec.", resolve: second }, project!);
+    await t.flush();
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(toProject()).toHaveLength(2);
+    t.entities.set("uuid-12", issue({ description: "Users cannot log in. Migration: none." }));
+    await t.ring("linear", "uuid-12");
+    await t.tool("steward_report", { ...base, ready: met }, steward!);
+    expect(toProject()).toHaveLength(3);
+  });
+
+  it("wakes the project steward once when the steward escalates in the same report that asks for approval", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met, escalate: { kind: "decision", question: "Approve the spec?", meanwhile: "Wait." } }, steward!);
+    const wakes = t.sends.filter((s) => s.threadId === project);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.text).toMatch(/escalation and approval request from ENG-12/u);
+    expect(wakes[0]!.text).toMatch(/If the steward also escalated asking for this approval, resolve that one too/u);
+    // Approving names what is still open, so the duplicate is closed too.
+    const approved = await t.tool("steward_update", { binding: "ENG-12", approve: true }, project!);
+    expect(approved.text).toMatch(/spec approved; still open on it: esc_[\w-]+ \(decision, with project\): Approve the spec\?/u);
+  });
+
+  it("asks for a gate left waiting by a report from before, on the next look", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    // Record a met gate the way an older version left it: no request filed.
+    const b = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(b.id, { ready: { ...b.ready, checklist: ["Problem and desired outcome are stated", "Acceptance criteria are testable", "Affected repos are named", "Out of scope is stated"].map((item) => ({ item, met: true, note: null })), substantial: true }, awaitingReport: false });
+    await t.ring("linear", "uuid-12");
+    expect(t.sends.filter((s) => s.threadId === project).at(-1)?.text).toMatch(/approval requested for ENG-12/u);
+    // Asking needs no turn of the steward's (its first wake was its spawn).
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(0);
+  });
+
+  it("asks the user, in the steward's thread, when the playbook says approval: me", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "me", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward!);
+    expect(reported.text).toMatch(/requested from the user \(esc_[\w-]+\): they approve in this thread/u);
+    expect(t.sends.filter((s) => s.threadId === project)).toHaveLength(0);
+    t.userTurns.push({ threadId: steward!, text: "Approved, go ahead." });
+    expect((await t.tool("steward_update", { approve: true, quote: "go ahead" }, steward!)).error).toBe(false);
+    expect((await t.list())[0]!.escalations).toBe(0);
+  });
+
+  // HUB-196's other half: the user answered a forwarded escalation by
+  // rewriting the ticket, and only the steward heard.
+  it("tells the project steward when the entity changes while the user has one of its escalations", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    const toProject = () => t.sends.filter((s) => s.threadId === project);
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, steward!);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(toProject()[0]!.text)![1]!;
+    expect((await t.tool("steward_update", { binding: "ENG-12", forward: id, recommendation: "Leave SSO out." }, project!)).text).toMatch(/forwarded .* to the user/u);
+    const before = toProject().length;
+
+    // The steward's own signed edit is no answer.
+    t.entities.set("uuid-12", issue({ description: `Users cannot log in.\n\n_— from bb thread ${steward}_` }));
+    await t.ring("linear", "uuid-12");
+    expect(toProject()).toHaveLength(before);
+
+    // The user rewrites the description (keeping the signature line).
+    t.entities.set("uuid-12", issue({ description: `Users cannot log in. SSO is out of scope.\n\n_— from bb thread ${steward}_` }));
+    await t.ring("linear", "uuid-12");
+    expect(toProject()).toHaveLength(before + 1);
+    const wake = toProject().at(-1)!.text;
+    expect(wake).toMatch(/ENG-12 changed while the user has its escalation/u);
+    expect(wake).toMatch(/What changed on ENG-12 .*: Description edited\./u);
+    expect(wake).toContain(`Escalation ${id} (scope) is with the user: Include SSO?`);
+    expect(wake).toMatch(/## Escalations with the user[\s\S]*Your recommendation: Leave SSO out\./u);
+    // The steward heard it too.
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/- Description edited/u);
+
+    // Resolved from the project steward's thread, it reaches the steward; later changes wake the project steward no more.
+    await t.tool("steward_update", { binding: "ENG-12", guidance: "SSO is out of scope (the user said so on the ticket).", resolve: id }, project!);
+    await t.flush();
+    const after = toProject().length;
+    t.entities.set("uuid-12", issue({ description: "Users cannot log in. SSO is out of scope. Retry once.", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(toProject()).toHaveLength(after);
+  });
+
+  it("flags a status that waits on the project steward with no escalation", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "other", blockedOn: "the project steward's call on scope" }, steward);
+    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toMatch(/waits on the project steward, with no open escalation/u);
+  });
+
   it("recognizes workers the steward starts with bb thread spawn, and wakes when one finishes", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));

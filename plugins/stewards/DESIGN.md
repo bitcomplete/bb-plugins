@@ -387,6 +387,16 @@ ready:
   `steward_update`. With `approval: me` you approve in the steward's thread,
   and the steward records it quoting your words. With a Linear signal, the
   steward waits for it.
+- **The plugin asks for it.** Whenever the checklist is met, the ticket is
+  substantial (or not yet judged) and the current spec has no approval, the
+  plugin files an `approval` escalation with the approver — the project
+  steward, or you with `approval: me` — after the steward's report or on
+  the next look, and closes it when the gate passes or stops needing it.
+  The gate does not depend on the steward remembering to escalate: on
+  HUB-196 a steward posted a new spec and said only in its status that it
+  waited on the project steward, which nothing delivers. Approving
+  resolves the request; declining it (guidance + resolve) is remembered
+  against the spec, which is not asked about again until it changes.
 - **The approval is pinned to the spec.** It is stored with a hash of the
   description and the spec comments it was given against. The mechanical tier
   flags any change after approval; the steward judges whether it is material,
@@ -469,6 +479,15 @@ until it is resolved.
   and asks you in its own thread, which thread-briefs then shows as waiting
   on you. Nothing else reaches you.
 - **Your answer**, in any of the threads involved, becomes standing guidance.
+- **An answer on the entity.** You may answer by editing the ticket,
+  commenting, or moving it, rather than in a thread. Then only the steward
+  would hear, and the escalation would stay with you. So when the entity
+  changes while one of its escalations is with you, the project steward is
+  woken with the change, and resolves the escalation or leaves it open.
+  The steward's own signed description edit does not count.
+- **Waits nobody hears.** A status whose `blockedOn` names the project
+  steward or you, with no open escalation, is flagged in `bb stewards list`
+  and the project steward's wakes, so the nightly digest shows the drift.
 - **Backstop:** a status record that has not advanced within the playbook's
   `stuck` limit gets a `stuck` escalation raised for it.
 

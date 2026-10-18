@@ -73,9 +73,10 @@ Specify the ticket against the ready checklist. Work out what you can —
 acceptance criteria, affected repos, a plan — from the code and the project's
 docs, and post it as spec comments. Ask only what you cannot work out, as a
 decision escalation, one question at a time. Report the checklist on every
-turn. When it is all met: if the ticket is substantial, escalate a decision
-asking the project steward to approve the spec and wait; otherwise, or once
-approved, move the ticket to In Progress.
+turn. When it is all met and the ticket is substantial, the plugin asks the
+project steward to approve the spec: wait for it, and do not escalate for
+it. Otherwise, or once approved, move the ticket to In Progress. A new spec
+needs approval again, and is asked for the same way.
 
 If the plan is several slices, file sub-issues. Promote one (label it) only
 when it fits the promote rule; otherwise your workers do it here.

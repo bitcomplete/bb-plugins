@@ -10,8 +10,12 @@ import { isTerminal, phaseOf, type Playbook } from "./config.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Observed, ReadyState } from "./store.js";
 
-/** One line of "what changed", and whether it alone makes a judgment turn due. */
-export type Change = { text: string; actionable: boolean };
+/**
+ * One line of "what changed", and whether it alone makes a judgment turn due.
+ * `own` marks the steward's own doing (its signed description edit), which is
+ * news to nobody above it.
+ */
+export type Change = { text: string; actionable: boolean; own?: boolean };
 
 /** A spec comment is one of the steward's own signed comments that starts by saying so. */
 export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null): boolean =>
@@ -23,8 +27,13 @@ export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null
  * left out of the description, so the steward's own signed edit hashes the
  * same as the text it wrote.
  */
+const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
+
+/** The thread that signed the description, when its last edit was signed. */
+export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DESCRIPTION_SIGNATURE.exec(entity.description ?? "")?.[1] ?? null;
+
 export function specHash(entity: EntitySnapshot, stewardThreadId: string | null): string {
-  const description = (entity.description ?? "").replace(/\s*_— from bb thread [A-Za-z0-9_-]+_\s*$/u, "").trim();
+  const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
   const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId)).map((c) => `${c.id}\n${c.body}`);
   return createHash("sha256").update([description, ...specs].join("\n\u0000\n")).digest("hex").slice(0, 16);
 }
@@ -73,7 +82,13 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
   if (!same(before.assignees, after.assignees)) changes.push({ text: `${p}Assignees: ${after.assignees.join(", ") || "(none)"}`, actionable: false });
   if ((before.priority ?? "") !== (after.priority ?? "")) changes.push({ text: `${p}Priority: ${after.priority ?? "(none)"}`, actionable: false });
   if (before.estimate !== after.estimate) changes.push({ text: `${p}Estimate: ${after.estimate ?? "(none)"}`, actionable: false });
-  if (descriptionHash(before) !== descriptionHash(after)) changes.push({ text: `${p}Description edited`, actionable: !(ctx.workerRunning && after.pull !== null) });
+  if (descriptionHash(before) !== descriptionHash(after)) {
+    // Only an edit that adds the signature is surely the steward's: someone
+    // rewriting a description it signed earlier usually keeps the line.
+    const signer = descriptionSignedBy(after);
+    const own = signer !== null && ctx.own.has(signer) && descriptionSignedBy(before) !== signer;
+    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerRunning && after.pull !== null), ...(own ? { own } : {}) });
+  }
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
@@ -207,6 +222,25 @@ export function gateState(playbook: Playbook, ready: ReadyState, currentSpecHash
   const approvalStale = approved && ready.approval!.specHash !== currentSpecHash;
   const passed = checklistMet && (!approvalNeeded || (approved && !approvalStale));
   return { none: false, checklistMet, unmet, substantial: ready.substantial, approvalNeeded, approved, approvalStale, passed };
+}
+
+/**
+ * Whether the gate waits on its approver: the checklist is met, the ticket
+ * is (or may be) substantial, and the current spec has no approval. The
+ * plugin asks the approver itself then, so the gate does not depend on the
+ * steward remembering to.
+ */
+export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.checklistMet && gate.approvalNeeded && !gate.passed;
+
+/**
+ * A status that says it waits on the project steward or the user while
+ * none of its escalations is open: a wait nobody above it hears about.
+ */
+export function unheardWait(status: Binding["status"], open: readonly Escalation[]): string | null {
+  if (status === null || status.blockedOn === null || open.length > 0) return null;
+  if (/project steward/iu.test(status.blockedOn)) return "waits on the project steward, with no open escalation";
+  if (/\buser\b/iu.test(status.blockedOn)) return "waits on the user, with no open escalation";
+  return null;
 }
 
 // ---- lifecycle -----------------------------------------------------------------------

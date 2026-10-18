@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { diffObserved, endingDeadline, followingThrough, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue } from "./reconcile.js";
+import { approvalWanted, diffObserved, endingDeadline, followingThrough, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue, unheardWait } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -107,6 +107,27 @@ describe("what changed", () => {
   });
 });
 
+describe("waits nobody hears", () => {
+  const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null }];
+
+  it("flags a status blocked on the project steward or the user with no escalation open", () => {
+    expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);
+    expect(unheardWait(status("the user's answer on scope"), [])).toMatch(/the user/u);
+    expect(unheardWait(status("project steward's approval"), open)).toBeNull();
+    expect(unheardWait(status("Sam's review"), [])).toBeNull();
+    expect(unheardWait(status(null), [])).toBeNull();
+  });
+
+  it("tells the steward's own signed description edit from someone else's edit of it", () => {
+    const signed = (text: string) => issue({ description: `${text}\n\n_— from bb thread thr_s_` });
+    const own = (before: ReturnType<typeof issue>, after: ReturnType<typeof issue>) => diffObserved({ entity: before, pulls: [] }, { entity: after, pulls: [] }, ctx).find((c) => c.text.startsWith("Description edited"))!;
+    expect(own(issue(), signed("New scope."))).toMatchObject({ own: true, actionable: true });
+    expect(own(signed("New scope."), signed("Newer scope, by hand.")).own).toBeUndefined();
+    expect(own(issue(), issue({ description: "By hand." })).own).toBeUndefined();
+  });
+});
+
 describe("the ready gate", () => {
   const ready = (over: object) => readyStateSchema.parse(over);
   const allMet = tickets.ready!.checklist.map((item) => ({ item, met: true }));
@@ -117,6 +138,17 @@ describe("the ready gate", () => {
     expect(gateState(tickets, ready({ checklist: allMet }), hash)).toMatchObject({ passed: false, approvalNeeded: true });
     expect(gateState(tickets, ready({ checklist: allMet, substantial: false }), hash).passed).toBe(true);
     expect(gateState(tickets, ready({ checklist: allMet, approval: { at: 1, specHash: hash, by: "thr_s" } }), hash).passed).toBe(true);
+  });
+
+  it("wants its approver while the checklist is met and the current spec has none", () => {
+    const hash = specHash(issue(), "thr_s");
+    const approval = { at: 1, specHash: hash, by: "thr_p" };
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet.slice(1), substantial: true }), hash))).toBe(false);
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: false }), hash))).toBe(false);
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: true }), hash))).toBe(true);
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet }), hash))).toBe(true);
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: true, approval }), hash))).toBe(false);
+    expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: true, approval }), "changed"))).toBe(true);
   });
 
   it("knows a reported item by its number or the playbook's own words, never a paraphrase", () => {

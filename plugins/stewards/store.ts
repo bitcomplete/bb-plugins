@@ -109,6 +109,8 @@ export const readyStateSchema = z.object({
   approval: z.object({ at: z.number(), specHash: z.string(), by: z.string() }).nullable().default(null),
   /** Set when an approval was voided, so the steward knows to ask again. */
   voidedAt: z.number().nullable().default(null),
+  /** The spec an approval request was declined for: not asked again until the spec changes. */
+  declinedSpecHash: z.string().nullable().default(null),
 });
 export type ReadyState = z.infer<typeof readyStateSchema>;
 

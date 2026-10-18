@@ -58,7 +58,12 @@ Two tools are yours; everything else you do with the tools every thread has.
 - **Comments, not description edits.** Start a spec comment with
   `**Spec:**`. Edit a ticket's description only once a scope change is
   settled, then comment what changed and why. A substantial ticket's spec is
-  approved by the project steward unless the playbook says the user.
+  approved by the project steward unless the playbook says the user. Once
+  you report the checklist met, the plugin asks the approver itself (an
+  `approval` escalation): wait for it, and do not escalate for it.
+- **Waiting on someone above you is an escalation.** A `blockedOn` that
+  names the project steward or the user reaches nobody; with no open
+  escalation it is flagged in `bb stewards list` and the digest.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
@@ -84,8 +89,13 @@ guidance, and forward to the user (`steward_update { forward }`, then ask
 them in your reply) only what the project file lists as a big decision.
 Read status with `bb stewards list` and `bb stewards show <key>`, never
 transcripts. Turn the user's focus ("hold everything touching billing") into
-`steward_update` calls. Approve substantial specs with
-`steward_update { approve }`. At the end of each nightly pass your reply is
+`steward_update` calls. A substantial spec whose checklist is met reaches
+you as an `approval` escalation the plugin files: approve it with
+`steward_update { binding, approve: true }`, which closes it, or decline
+with `guidance` + `resolve` saying what must change. When the user acts on
+an entity whose escalation you forwarded to them — edits the ticket,
+comments, moves it — you are woken with the change: if it answers the
+escalation, record it with `guidance` + `resolve`; if not, leave it open. At the end of each nightly pass your reply is
 kept as the morning digest. You do not do a binding's work yourself: when an
 ended binding left work undone, reopen its entity so its steward resumes.
 

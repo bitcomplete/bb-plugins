@@ -5,7 +5,7 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
-import { newHumanComments, reportedItem, type GateState } from "./reconcile.js";
+import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Observed, Worker } from "./store.js";
 
@@ -139,9 +139,18 @@ function gateLines(input: WakeInput): string[] {
   lines.push(`  Substantial when any of: ${playbook.ready!.substantial.join("; ") || "(none listed)"}`);
   const approval = playbook.ready!.approval;
   const how = approval === "me" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval["linear-state"]}`;
+  const request = input.escalations.find((x) => x.status === "open" && x.kind === "approval");
+  const asked =
+    request === undefined
+      ? approval === "me" || approval === "project"
+        ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
+        : ""
+      : request.route === "me"
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
-  else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}`);
-  else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? " — the spec has changed since. Judge whether the change is material; if so void it (steward_report voidApproval) and ask again." : ""}`);
+  else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
+  else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
   lines.push(`- Gate: ${gate.passed ? "PASSED" : "not passed — start no implementation workers"}`);
   return lines;
 }
@@ -233,6 +242,8 @@ export function formatProjectWake(input: {
   reason: string;
   bindings: Array<{ binding: Binding; openEscalations: Escalation[] }>;
   routed: Array<{ escalation: Escalation; from: Binding }>;
+  /** Escalations forwarded to the user and not yet answered. */
+  withUser?: Array<{ escalation: Escalation; from: Binding }>;
   problems: string[];
   digestDue: boolean;
   notes: string[];
@@ -253,19 +264,31 @@ export function formatProjectWake(input: {
       ...input.bigDecisions.map((d) => `- ${d}`),
       "",
     );
+    if (input.routed.some((r) => r.escalation.kind === "approval")) {
+      out.push(
+        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, which closes the request; or decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "",
+      );
+    }
+  }
+  const withUser = input.withUser ?? [];
+  if (withUser.length > 0) {
+    out.push("## Escalations with the user", "");
+    for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
+    out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve }.", "");
   }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
-    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null].filter((f): f is string => f !== null);
+    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
   if (input.digestDue) {
     out.push(
       "",
-      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck, and today's priorities. Your reply is saved as the digest.",
+      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding flagged as waiting with no open escalation: find out what it waits for), and today's priorities. Your reply is saved as the digest.",
     );
   }
   return fit(head, bindings, out);

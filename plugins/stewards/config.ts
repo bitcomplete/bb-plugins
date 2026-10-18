@@ -159,8 +159,10 @@ export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string
 export const STAGES = ["spec", "build", "review"] as const;
 export type Stage = (typeof STAGES)[number];
 
+/** What a steward raises. */
 export const ESCALATION_KINDS = ["blocked", "decision", "scope", "conflict", "stuck"] as const;
-export type EscalationKind = (typeof ESCALATION_KINDS)[number];
+/** Those, and the plugin's own: a ready gate waiting on its approver. */
+export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval";
 
 const phaseSchema = z
   .object({
