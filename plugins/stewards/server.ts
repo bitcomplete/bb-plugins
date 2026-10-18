@@ -1963,9 +1963,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return id;
     }
 
-    function bindingOrThrow(key: string): Binding {
-      const b = store.find(key);
-      if (b === null) throw new PluginCliError(`No binding for ${key}.`, { code: "binding_not_found", hint: "bb stewards list --all shows every binding." });
+    function bindingOrThrow(key: string, projectId?: string): Binding {
+      const b = store.find(key, projectId);
+      if (b === null)
+        throw new PluginCliError(`No binding for ${key}${projectId === undefined ? "" : ` in project ${projectId}`}.`, {
+          code: "binding_not_found",
+          hint: "bb stewards list --all shows the project's bindings; pass --project for another project's.",
+        });
       return b;
     }
 
@@ -2061,9 +2065,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           show: cliCommand({
             summary: "One binding in full: status, ready gate, guidance, escalations, workers, action log",
             positionals: [{ name: "key", description: "The entity key (ENG-12, owner/repo#3) or binding id", required: true }],
-            options: { json: JSON_OPTION },
-            async run(input) {
-              const b = bindingOrThrow(input.positionals.key);
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
               const detail = { binding: b, escalations: store.escalations(b.id), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(detail) };
               const lines = [formatBindings([b]), "", `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
@@ -2079,8 +2083,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             summary: "Stop stewarding an entity: its steward gets one stop turn",
             description: "It stays detached until its label is removed and added again.",
             positionals: [{ name: "key", description: "The entity key or binding id", required: true }],
-            async run(input) {
-              const b = bindingOrThrow(input.positionals.key);
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
               if (b.endedAt !== null) return { exitCode: 0, stdout: `${b.entityKey} has already ended (${b.endReason}).` };
               store.patch(b.id, { manualDetach: true });
               const config = await loadConfig(b.projectId);

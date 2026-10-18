@@ -426,10 +426,12 @@ export function createStore(db: Database.Database, now: () => number) {
       return r === undefined ? null : rowToBinding(r);
     },
     /** By key (ENG-12, owner/repo#3) or binding id: open bindings first, then the newest. */
-    find(keyOrId: string): Binding | null {
+    /** A binding by id or entity key; with a project, only that project's. */
+    find(keyOrId: string, projectId?: string): Binding | null {
+      const inProject = (r: BindingRow) => projectId === undefined || r.project_id === projectId;
       const direct = getBinding.get(keyOrId);
-      if (direct !== undefined) return rowToBinding(direct);
-      const r = byKey.all(keyOrId)[0];
+      if (direct !== undefined && inProject(direct)) return rowToBinding(direct);
+      const r = byKey.all(keyOrId).find(inProject);
       return r === undefined ? null : rowToBinding(r);
     },
     byThread(threadId: string): Binding | null {

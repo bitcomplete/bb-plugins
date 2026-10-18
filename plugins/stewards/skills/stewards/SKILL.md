@@ -116,6 +116,9 @@ The project must be a multi-repo project: configuration is read from its
    project steward's, not under it: a parent thread is woken whenever a
    child finishes a turn, and stewards report through their bindings.
 
+Every command takes `--project <id>`; left out, it is the invoking thread's
+project.
+
 | Command | Does |
 |---|---|
 | `bb stewards list [--all] [--json]` | Bindings and their status records |

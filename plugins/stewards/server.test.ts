@@ -381,6 +381,8 @@ describe("a Linear ticket steward", () => {
     expect((await t.list())[0]!.escalations).toBe(0);
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Gate: PASSED/u);
     expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toContain(`Escalation ${id} approval (resolved, project)`);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toContain(`Escalation ${id} approval (resolved, project)`);
+    expect(await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p2"])).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/No binding for ENG-12 in project p2/u) });
 
     // A new spec voids nothing by itself, but the gate needs approval again, and the approver is asked again.
     t.entities.set("uuid-12", issue({ comments: [comment({ id: "s2", author: "Jane", body: "**Spec:** narrower scope", signedBy: steward!, createdAt: "2026-10-14T16:00:00Z" })] }));
