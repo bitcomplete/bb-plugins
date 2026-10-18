@@ -64,7 +64,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   runs"). thread-briefs then never renames a steward, whose title carries
   its entity key, never moves one into a status section or auto-archives
   it, since between wakes it reads done while its entity is still open.
-  Its row draws the stage ring like any thread's. The project steward
+  A ticket or pull request steward's row draws the stage ring like any
+  thread's. The project steward also gets `ring: false`: it has no stage of
+  its own, so its row keeps bb's own indicators. The project steward
   is titled "<project name> project steward". The sweep tags threads
   spawned before this, lets go of stewards an earlier version made children
   of another steward, and renames an older project steward once. After

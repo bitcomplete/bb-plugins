@@ -179,8 +179,8 @@ describe("a Linear ticket steward", () => {
 
     const [project, steward] = t.spawns;
     expect(project).toMatchObject({ title: "Acme project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
-    // thread-briefs keeps its hands off: no renames, auto-archiving or row ring for any steward, and no grouping for the project steward.
-    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false } } });
+    // thread-briefs keeps its hands off: no renames, auto-archiving or grouping for any steward, and no row ring for the project steward.
+    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
     // Both in the project's own sidebar section, and nothing pinned.
@@ -748,7 +748,7 @@ describe("the project steward", () => {
     t.hooks.forgetTags();
     await t.hooks.sweep();
     expect(t.threads.get(project!.id)!.title).toBe("Acme project steward");
-    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
     expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, group: false, archive: false } });
 
     // A name given by hand afterwards sticks.

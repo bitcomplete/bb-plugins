@@ -61,13 +61,16 @@ export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
  * a plugin runs"). Every steward keeps the title it was given, which carries
  * the entity key, and is archived by this plugin when its binding ends, or
  * when a wake turn ends waiting on someone else, rather than whenever its
- * brief reads done between wakes. Its sidebar row draws the stage ring like
- * any thread's. Stewards stay out of the status
+ * brief reads done between wakes. Stewards stay out of the status
  * sections, where one idle between wakes would read done: the project
  * steward is never finished, and a steward is finished when its binding ends.
+ * A ticket or pull request steward's row draws the stage ring like any
+ * thread's, following its entity's work. The project steward's draws none:
+ * it has no stage to show, and its ring would only say done about a project
+ * that is not.
  */
 export const STEWARD_BRIEFS = { rename: false, group: false, archive: false } as const;
-export const PROJECT_BRIEFS = STEWARD_BRIEFS;
+export const PROJECT_BRIEFS = { ...STEWARD_BRIEFS, ring: false } as const;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */

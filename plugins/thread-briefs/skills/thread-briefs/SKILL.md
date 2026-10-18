@@ -828,7 +828,8 @@ A plugin that spawns a thread can exempt it from three things by setting
 in its own metadata namespace on that thread. thread-briefs reads it through
 the thread's `originPluginId`. Stewards does this: no steward is renamed or
 auto-archived, and every steward, the project steward included, is kept out of
-the status sections. Steward rows do draw the ring.
+the status sections. Ticket and pull request steward rows draw the ring; the
+project steward's does not.
 
 - A thread kept out of the sections sits in bb's **Threads** group. Pin it to
   keep it at the top.
