@@ -96,6 +96,19 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
+- **The Stewards page** (a nav panel, [app.tsx](app.tsx)) has a tab per
+  stewarded project: what waits on you (questions the project steward put
+  to you, which you can answer and close there, forwarded escalations and
+  approval requests), what is in flight by stage with each status record
+  and running workers, what is stuck or held, what ended in the last two
+  weeks, and the latest digest with its date.
+- **Questions to you** are kept in the store from the moment the project
+  steward asks (`steward_update { ask }`, or forwarding an escalation)
+  until it records your answer (`steward_update { resolve: "<question id>",
+  answer }`) or you close it on the page. A forwarded escalation and its
+  question close together. The nightly wake lists them, with the previous
+  digest, what moved, what waits on you and what is stuck, all read from
+  the store, so the digest does not depend on the project steward's memory.
 - **The settings page** (Settings → Plugins → Stewards, [app.tsx](app.tsx))
   shows each stewarded project's configuration, problems, project steward
   and nightly pass, runs `bb stewards check` on a button, and lists every

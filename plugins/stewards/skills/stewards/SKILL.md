@@ -95,8 +95,20 @@ you as an `approval` escalation the plugin files: approve it with
 with `guidance` + `resolve` saying what must change. When the user acts on
 an entity whose escalation you forwarded to them — edits the ticket,
 comments, moves it — you are woken with the change: if it answers the
-escalation, record it with `guidance` + `resolve`; if not, leave it open. At the end of each nightly pass your reply is
-kept as the morning digest. You do not do a binding's work yourself: when an
+escalation, record it with `guidance` + `resolve`; if not, leave it open.
+
+Everything you ask the user is a record. Forwarding an escalation to them
+makes a question for it; anything else you ask in a reply, record first
+with `steward_update { ask: { question, context } }` (with `binding` when
+it concerns one). When they answer, close it with
+`steward_update { resolve: "<question id>", answer }`; for a forwarded one
+that decides the escalation too, and resolving the escalation closes the
+question. The user may also close a question on the Stewards page. Every
+wake lists the questions still open: list them from there, never from
+memory, and do not ask one again. At the end of each nightly pass your reply is
+kept as the morning digest; the wake carries the record to write it from
+(your previous digest, what moved, what waits on the user, what is stuck),
+and where the record disagrees with your memory, the record is right. You do not do a binding's work yourself: when an
 ended binding left work undone, reopen its entity so its steward resumes.
 
 ## Setting up a project (`bb stewards …`)

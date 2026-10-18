@@ -512,6 +512,31 @@ hard stop is the runaway guard (§12).
   you, and writes the morning digest as its reply to the nightly wake.
 - **Woken** at the end of the nightly pass, by escalations that reach it, and
   by your messages.
+- **Questions to you are records.** Whatever the project steward asks you is
+  a row in the `questions` table, not just a sentence in its reply, so a
+  compaction cannot lose it and an answer given elsewhere cannot leave it
+  listed as open. A row is made two ways: when it forwards an escalation to
+  you (`steward_update { forward }` with the route reaching `me`), bound to
+  that escalation and its binding; and when it asks you something itself
+  with `steward_update { ask: { question, context } }`, bound to a binding
+  when it names one. It closes when the project steward records your answer
+  (`steward_update { resolve: "<question id>", answer }`) or when you close
+  it on the stewards page, with or without an answer. A question made by
+  forwarding and its escalation close together, in one transaction, from
+  either side: resolving the escalation (by decision, by the binding
+  ending) closes the question with the same text, and closing the question
+  resolves the escalation and tells the binding's steward. Every project
+  steward wake lists the open questions from the table, and tells it not
+  to ask one again.
+- **The digest is written from the record.** The nightly wake carries a
+  section the plugin assembles from its tables: the previous digest with
+  its date; what moved since then (open bindings whose status record
+  advanced, bindings that ended, questions answered); what waits on you
+  (open questions, then open escalations with you that no question covers,
+  such as approval requests); and what is stuck or held (open `stuck`
+  escalations, bindings on hold). The project steward writes prose and
+  priorities on top, and is told the record wins where it disagrees with
+  its earlier digest. Only the latest digest is kept.
 - **Budget is advisory.** Status records report what each binding uses; the
   project steward keeps the total sensible through priority and holds.
 - **Runaway guard.** A hard cap on worker spawns per binding per hour: a
@@ -617,7 +642,12 @@ follow-through: 6h                # how long a terminal binding may be kept open
   the project's sidebar section.
 - **Agent tools:** `steward_report` and `steward_update`.
 - **CLI:** `bb stewards init | check | list | show | detach | pass | digest`.
-- **UI:** a board of status records, later.
+- **UI:** the Stewards page, a nav panel with one tab per stewarded project:
+  waiting on you (open questions, which you can close there, forwarded
+  escalations and approval requests), in flight by stage (summary, next
+  action and actor, running workers), stuck or held, ended in the last two
+  weeks, and the latest digest with its date. Settings → Plugins →
+  Stewards keeps each project's configuration and health.
 
 ### Changes to linear and github
 
@@ -662,7 +692,8 @@ plugins' contract before stewards uses them, bb-plugins before bb-gate.
 3. **Project steward.** Escalation routing and decisions, big decisions to
    you, priority and holds, the nightly pass, the morning digest.
 4. **Reviews.** Review bindings, review workers.
-5. **Board.**
+5. **Board.** Built: the Stewards page, the question record (§12), and the
+   digest assembled from records.
 
 ## Known limits
 

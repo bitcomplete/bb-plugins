@@ -1059,6 +1059,147 @@ describe("bb stewards init", () => {
   });
 });
 
+describe("questions to the user", () => {
+  type Board = {
+    projects: Array<{ projectId: string; name: string }>;
+    board: {
+      digest: { text: string; at: number } | null;
+      questions: Array<{ id: string; question: string; key: string | null; escalationId: string | null }>;
+      withUser: Array<{ id: string; kind: string }>;
+      stewards: Array<{ key: string; stage: string | null; summary: string | null; nextAction: string | null; actor: string | null; workers: Array<{ threadId: string; title: string }> }>;
+      stuck: Array<{ key: string; why: string }>;
+      ended: Array<{ key: string; endReason: string | null }>;
+    } | null;
+  };
+  const client = { experimental_caller: { kind: "client" } } as const;
+
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as Board).board!;
+    const qid = (text: string) => /(qst_[\w-]+)/u.exec(text)![1]!;
+    return { ...t, project, steward, board, qid };
+  }
+
+  it("are recorded by the project steward with ask, bound or not, and closed with resolve and the answer", async () => {
+    const t = await adopted();
+    const unbound = await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?", context: "Two contrast failures in review." } }, t.project);
+    expect(unbound).toMatchObject({ error: false, text: expect.stringMatching(/question qst_\S+ recorded: ask the user in your reply/u) });
+    const bound = await t.tool("steward_update", { binding: "ENG-12", ask: { question: "Keep the old login page?" } }, t.project);
+    expect(bound.text).toMatch(/recorded about ENG-12/u);
+    expect((await t.board()).questions).toMatchObject([
+      { id: t.qid(unbound.text), question: "Should I file an a11y ticket?", key: null },
+      { id: t.qid(bound.text), key: "ENG-12" },
+    ]);
+
+    // Only the project steward keeps questions; a steward escalates.
+    expect((await t.tool("steward_update", { ask: { question: "Mine?" } }, t.steward)).error).toBe(true);
+    // Nothing else is done without a binding.
+    expect((await t.tool("steward_update", { priority: "high" }, t.project)).text).toMatch(/Name the binding/u);
+    expect((await t.tool("steward_update", { resolve: t.qid(unbound.text) }, t.project)).text).toMatch(/Give the user's answer/u);
+
+    const closed = await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project);
+    expect(closed).toMatchObject({ error: false, text: `closed ${t.qid(unbound.text)}.` });
+    expect((await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Again." }, t.project)).text).toMatch(/already closed/u);
+    // Guidance with a bound question's answer lands on its binding.
+    expect((await t.tool("steward_update", { resolve: t.qid(bound.text), guidance: "Remove the old login page." }, t.project)).text).toMatch(/ENG-12: closed qst_\S+; guidance saved/u);
+    expect((await t.board()).questions).toEqual([]);
+
+    // The next wake lists what is still open, and only that.
+    const third = await t.tool("steward_update", { ask: { question: "Freeze on Friday?" } }, t.project);
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain(`- ${t.qid(third.text)} (asked 2026-10-14): Freeze on Friday?`);
+    expect(wake).not.toContain("a11y");
+  });
+
+  it("is made when the project steward forwards an escalation, and closes when it is resolved", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc, recommendation: "Leave SSO out." }, t.project);
+    expect(forwarded.text).toMatch(/forwarded esc_\S+ to the user as question qst_/u);
+    const [q] = (await t.board()).questions;
+    expect(q).toMatchObject({ id: t.qid(forwarded.text), question: "Include SSO?", key: "ENG-12", escalationId: esc });
+    // Listed once on the page, as its question.
+    expect((await t.board()).withUser).toEqual([]);
+
+    await t.tool("steward_update", { binding: "ENG-12", guidance: "SSO is out of scope.", resolve: esc }, t.project);
+    expect((await t.board()).questions).toEqual([]);
+  });
+
+  it("closing a forwarded question with resolve decides its escalation and tells the steward", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
+    const closed = await t.tool("steward_update", { resolve: qst, answer: "No SSO for now." }, t.project);
+    expect(closed).toMatchObject({ error: false, text: expect.stringMatching(new RegExp(`ENG-12: guidance saved; resolved ${esc}`, "u")) });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
+    const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(list).toMatch(/\(resolved, me\): Include SSO\? → No SSO for now\./u);
+  });
+
+  it("is closed by the user from the page, which resolves a forwarded escalation and tells its steward", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
+
+    await expect(t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: "x" }, { experimental_caller: { kind: "plugin", pluginId: "linear" } })).rejects.toThrow(/by the user/u);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: "Leave SSO out." }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/ENG-12's steward has been told/u) });
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: null }, client)).toMatchObject({ ok: false });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided by the user: Leave SSO out\./u);
+    expect((await t.list())[0]!.escalations).toBe(0);
+
+    // A plain question closes without an answer too.
+    const plain = t.qid((await t.tool("steward_update", { ask: { question: "Freeze on Friday?" } }, t.project)).text);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: null }, client)).toMatchObject({ ok: true, message: "Closed." });
+    expect((await t.board()).questions).toEqual([]);
+  });
+
+  it("the page shows a project's board: waiting on you, in flight by stage with workers, stuck or held, ended, and the digest", async () => {
+    const t = await adopted();
+    await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?" } }, t.project);
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Ask the reviewer", actor: "steward" }, t.steward);
+    await t.created("thr_w1", t.steward, "Implement retry");
+    await t.tool("steward_update", { binding: "ENG-12", hold: "billing freeze" }, t.project);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    await t.idle(t.project, "Morning: ENG-12 is held.");
+
+    const result = (await t.harness.callRpc("stewardsBoard", { projectId: null })) as Board;
+    expect(result.projects).toEqual([{ projectId: "p1", name: "Acme" }]);
+    const b = result.board!;
+    expect(b.questions).toMatchObject([{ question: "Should I file an a11y ticket?" }]);
+    expect(b.stewards).toMatchObject([{ key: "ENG-12", stage: "spec", summary: "Spec drafted.", nextAction: "Ask the reviewer", actor: "steward", workers: [{ threadId: "thr_w1", title: "Implement retry" }] }]);
+    expect(b.stuck).toEqual([expect.objectContaining({ key: "ENG-12", why: "On hold: billing freeze" })]);
+    expect(b.digest).toMatchObject({ text: "Morning: ENG-12 is held." });
+    expect(((await t.harness.callRpc("stewardsBoard", { projectId: "nope" })) as Board).board).toBeNull();
+  });
+
+  it("the nightly wake carries the previous digest and the record since it", async () => {
+    const t = await adopted();
+    await t.hooks.nightlyPass("p1", "first");
+    await t.flush();
+    await t.idle(t.project, "PR #429 still waits for approval.");
+    t.advance(60_000);
+    await t.tool("steward_report", { phase: "Todo", summary: "PR #429 merged.", nextAction: "Verify the deploy", actor: "steward" }, t.steward);
+    await t.tool("steward_update", { ask: { question: "Should I file an a11y ticket?" } }, t.project);
+    t.advance(60_000);
+    await t.hooks.nightlyPass("p1", "second");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toMatch(/### Your previous digest \(2026-10-14T15:00:00Z\)\n\n> PR #429 still waits for approval\./u);
+    expect(wake).toMatch(/### What moved\n\n- ENG-12 \(ticket, Todo\), moved 2026-10-14T15:01:00Z: PR #429 merged\. Next: Verify the deploy \(steward\)/u);
+    expect(wake).toMatch(/### Waiting on the user\n\n- Question qst_\S+ \(since 2026-10-14\): Should I file an a11y ticket\?/u);
+  });
+});
+
 describe("the settings page", () => {
   type Overview = { paused: boolean; projects: Array<{ name: string; configured: boolean; repos: string[]; playbooks: Array<{ kind: string; version: string | null }>; problems: string[]; projectStewardThreadId: string | null; stewards: Array<{ key: string; summary: string | null; actor: string | null; escalations: Array<{ route: string; question: string }> }> }> };
 

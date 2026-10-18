@@ -102,6 +102,20 @@ export const MIGRATIONS = [
      thread_id TEXT PRIMARY KEY,
      placed_at INTEGER NOT NULL
    )`,
+  // Questions put to the user: asked by the project steward (steward_update ask) or an escalation it forwarded.
+  `CREATE TABLE IF NOT EXISTS questions (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     binding_id TEXT,
+     escalation_id TEXT,
+     question TEXT NOT NULL,
+     context TEXT,
+     status TEXT NOT NULL DEFAULT 'open',
+     answer TEXT,
+     answered_by TEXT,
+     created_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -329,6 +343,27 @@ export type Escalation = {
   resolvedAt: number | null;
 };
 
+/**
+ * A question put to the user, kept until it is answered so the project
+ * steward lists it from here, not from its transcript. One made by forwarding
+ * an escalation closes with that escalation, and closing it resolves the
+ * escalation: the two records never disagree.
+ */
+export type Question = {
+  id: string;
+  projectId: string;
+  bindingId: string | null;
+  escalationId: string | null;
+  question: string;
+  context: string | null;
+  status: "open" | "answered";
+  answer: string | null;
+  /** The thread that recorded the answer, or "user" from the page. */
+  answeredBy: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
@@ -364,6 +399,15 @@ export function createStore(db: Database.Database, now: () => number) {
   const rerouteEscalation = db.prepare("UPDATE escalations SET route = ?, recommendation = ? WHERE id = ? AND status = 'open'");
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
+  const insertQuestion = db.prepare(
+    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @created_at)",
+  );
+  const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE id = ?");
+  const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'open' ORDER BY created_at");
+  const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'answered' AND resolved_at >= ? ORDER BY resolved_at");
+  const answerQuestion = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
+  const answerForEscalation = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE escalation_id = ? AND status = 'open'");
+
   const insertWorker = db.prepare("INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES (?, ?, ?, 'running', ?)");
   const getWorker = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE thread_id = ?");
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
@@ -384,6 +428,19 @@ export function createStore(db: Database.Database, now: () => number) {
     recommendation: r.recommendation === null ? null : String(r.recommendation),
     status: String(r.status) as "open" | "resolved",
     resolution: r.resolution === null ? null : String(r.resolution),
+    createdAt: Number(r.created_at),
+    resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
+  });
+  const toQuestion = (r: Record<string, unknown>): Question => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    bindingId: r.binding_id === null ? null : String(r.binding_id),
+    escalationId: r.escalation_id === null ? null : String(r.escalation_id),
+    question: String(r.question),
+    context: r.context === null ? null : String(r.context),
+    status: String(r.status) as "open" | "answered",
+    answer: r.answer === null ? null : String(r.answer),
+    answeredBy: r.answered_by === null ? null : String(r.answered_by),
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
   });
@@ -503,14 +560,47 @@ export function createStore(db: Database.Database, now: () => number) {
     escalations(bindingId: string, limit = 20): Escalation[] {
       return escalationsFor.all(bindingId, limit).map(toEscalation);
     },
-    resolve(id: string, resolution: string): boolean {
-      return resolveEscalation.run(resolution, now(), id).changes > 0;
+    /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
+    resolve(id: string, resolution: string, by = "plugin"): boolean {
+      return db.transaction(() => {
+        const at = now();
+        if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
+        answerForEscalation.run(resolution, by, at, id);
+        return true;
+      })();
     },
     reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
       return rerouteEscalation.run(route, recommendation, id).changes > 0;
     },
     lastResolved(bindingId: string, kind: EscalationKind): number | null {
       return lastResolvedOfKind.get(bindingId, kind)?.resolved_at ?? null;
+    },
+
+    // questions to the user
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null }): Question {
+      const id = newId("qst");
+      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, created_at: now() });
+      return toQuestion(getQuestion.get(id)!);
+    },
+    question(id: string): Question | null {
+      const r = getQuestion.get(id);
+      return r === undefined ? null : toQuestion(r);
+    },
+    openQuestions(projectId: string): Question[] {
+      return openQuestions.all(projectId).map(toQuestion);
+    },
+    answeredSince(projectId: string, since: number): Question[] {
+      return answeredSince.all(projectId, since).map(toQuestion);
+    },
+    /** Close an open question with its answer, and resolve the escalation it was forwarded for, if any. */
+    answer(id: string, answer: string, by: string): boolean {
+      return db.transaction(() => {
+        const at = now();
+        if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
+        const q = toQuestion(getQuestion.get(id)!);
+        if (q.escalationId !== null) resolveEscalation.run(answer, at, q.escalationId);
+        return true;
+      })();
     },
 
     // workers

@@ -7,7 +7,7 @@
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
 import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, Worker } from "./store.js";
+import type { Binding, Escalation, Observed, Question, Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -248,6 +248,10 @@ export function formatProjectWake(input: {
   digestDue: boolean;
   notes: string[];
   bigDecisions: string[];
+  /** Questions open with the user, from the record, with the binding each is about. */
+  questions?: Array<{ question: Question; about: Binding | null }>;
+  /** With digestDue: the records the digest is written from. */
+  records?: DigestRecords;
 }): string {
   const out: string[] = [`# Project steward: ${input.reason}`, ""];
   if (input.notes.length > 0) out.push(...input.notes.map((n) => `- ${n}`), "");
@@ -277,6 +281,19 @@ export function formatProjectWake(input: {
     for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
     out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve }.", "");
   }
+  const questions = input.questions ?? [];
+  if (questions.length > 0) {
+    out.push("## Questions open with the user", "");
+    for (const { question: q, about } of questions) {
+      const where = [`asked ${day(q.createdAt)}`, about === null ? null : `about ${about.entityKey}`, q.escalationId === null ? null : `forwarded escalation ${q.escalationId}`].filter((f) => f !== null).join(", ");
+      out.push(`- ${q.id} (${where}): ${oneLine(q.question)}${q.context === null ? "" : ` Context: ${oneLine(q.context)}`}`);
+    }
+    out.push(
+      "",
+      'This is the record: do not ask one of these again, and do not tell the user one is open once it is gone from this list. When the user answers one — here, on the stewards page, or anywhere else — close it with steward_update { resolve: "<question id>", answer }; for a forwarded escalation that also resolves the escalation, and the reverse.',
+      "",
+    );
+  }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
@@ -286,12 +303,93 @@ export function formatProjectWake(input: {
   }
   const bindings = out.splice(0);
   if (input.digestDue) {
+    if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions));
     out.push(
       "",
-      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding flagged as waiting with no open escalation: find out what it waits for), and today's priorities. Your reply is saved as the digest.",
+      "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding flagged as waiting with no open escalation: find out what it waits for), and today's priorities. " +
+        "Write it from the record above, not from memory: a question or escalation not listed as open is closed, and a binding listed as ended has ended, whatever an earlier digest said. " +
+        "If the digest asks the user something new, record it first with steward_update { ask: { question, context } } (with binding when it concerns one). Your reply is saved as the digest.",
     );
   }
   return fit(head, bindings, out);
+}
+
+const day = (ms: number) => iso(ms).slice(0, 10);
+const oneLine = (text: string, max = 400) => {
+  const flat = text.replace(/\s+/gu, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+};
+const PREVIOUS_DIGEST_CHARS = 6000;
+const RECORD_LINES = 50;
+
+/** What the nightly digest is written from, read from the store by the plugin. */
+export type DigestRecords = {
+  /** The last digest kept, and when. */
+  previous: { text: string; at: number } | null;
+  /** The window's start: the previous digest, or a day back. */
+  since: number;
+  /** Open bindings whose status record moved in the window. */
+  moved: Binding[];
+  /** Bindings that ended in the window. */
+  ended: Binding[];
+  /** Questions closed in the window. */
+  answered: Question[];
+  /** Open escalations with the user: forwarded ones and approval requests. */
+  withUser: Array<{ escalation: Escalation; from: Binding }>;
+  /** Open `stuck` escalations, wherever they are. */
+  stuck: Array<{ escalation: Escalation; from: Binding }>;
+  /** Open bindings on hold. */
+  held: Binding[];
+};
+
+function capped(lines: string[], none: string): string[] {
+  if (lines.length === 0) return [none];
+  return lines.length <= RECORD_LINES ? lines : [...lines.slice(0, RECORD_LINES), `- … and ${lines.length - RECORD_LINES} more`];
+}
+
+/**
+ * The digest's skeleton, built mechanically from the tables: the previous
+ * digest with its date, what moved, what waits on the user, what is stuck.
+ * The project steward writes prose on top; after a compaction this is what
+ * it starts from rather than its summary of itself.
+ */
+export function formatRecords(r: DigestRecords, questions: Array<{ question: Question; about: Binding | null }>): string[] {
+  const out: string[] = [
+    `## The record since ${iso(r.since)}`,
+    "",
+    "Assembled by the plugin from its tables. Where it disagrees with your previous digest or with what you remember, it is right.",
+    "",
+  ];
+  if (r.previous === null) out.push("### Your previous digest", "", "None yet.", "");
+  else out.push(`### Your previous digest (${iso(r.previous.at)})`, "", quote(clip(r.previous.text, PREVIOUS_DIGEST_CHARS)), "");
+
+  const moved = [
+    ...r.moved.map((b) => {
+      const s = b.status;
+      return `- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}), moved ${b.advancedAt === null ? "?" : iso(b.advancedAt)}: ${s === null ? "no report yet" : `${oneLine(s.summary)} Next: ${oneLine(s.nextAction)} (${s.actor})`}`;
+    }),
+    ...r.ended.map((b) => `- Ended: ${b.entityKey} (${b.kind}${b.title === null ? "" : `, ${oneLine(b.title, 120)}`}), ${b.endReason ?? "ended"} at ${b.endedAt === null ? "?" : iso(b.endedAt)}`),
+    ...r.answered.map((q) => `- Answered: ${q.id} "${oneLine(q.question, 200)}" → ${oneLine(q.answer ?? "", 300)} (${q.answeredBy === "user" ? "by the user, on the stewards page" : "recorded by you"})`),
+  ];
+  out.push("### What moved", "", ...capped(moved, "Nothing moved."), "");
+
+  const asked = new Set(questions.map(({ question: q }) => q.escalationId).filter((id) => id !== null));
+  const waiting = [
+    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}`),
+    ...r.withUser
+      .filter(({ escalation: x }) => !asked.has(x.id))
+      .map(({ escalation: x, from }) =>
+        x.kind === "approval" ? `- Approval of ${from.entityKey}'s spec (${x.id}, since ${day(x.createdAt)})` : `- Escalation ${x.id} from ${from.entityKey} (${x.kind}, since ${day(x.createdAt)}): ${oneLine(x.question)}`,
+      ),
+  ];
+  out.push("### Waiting on the user", "", ...capped(waiting, "Nothing."), "");
+
+  const stuck = [
+    ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
+    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}`),
+  ];
+  out.push("### Stuck or held", "", ...capped(stuck, "Nothing."));
+  return out;
 }
 
 export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Linear ticket and GitHub pull request in this project that is being managed has its own steward thread; you sit above them all.
@@ -299,6 +397,7 @@ export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Line
 - You decide what the stewards below you cannot, from the project's own guidance: AGENTS.md, architecture and design docs. Only the project's big decisions go to the user.
 - You read status records, never transcripts: \`bb stewards list\` and \`bb stewards show <key>\`.
 - steward_update sets guidance, priority, holds and models on any binding, approves a substantial ticket's spec, and resolves or forwards escalations.
+- Before you ask the user something in a reply, record it with steward_update { ask: { question, context } } (with binding when it concerns one); close it with steward_update { resolve: "<question id>", answer } when they answer. Every wake lists the questions still open, so list them from there, not from memory.
 - You are woken by escalations, at the end of each nightly pass to write the morning digest, and by the user. When the user says something like "hold everything touching billing", turn it into steward_update calls on the bindings it concerns, and say what you changed.
 - Budget is advisory: keep the total work sensible through priority and holds.
 
