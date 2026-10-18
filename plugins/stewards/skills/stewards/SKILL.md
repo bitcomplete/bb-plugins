@@ -140,3 +140,10 @@ above which a steward is compacted after its turn.
 - **A playbook edit has no effect.** It is not merged to `.bb`'s HEAD yet, or
   it fails validation and bindings run under the last good version; `check`
   says which.
+- **Stewards are not in their project's sidebar section.** The section,
+  named after the project, shows only when the sidebar is organized
+  chronologically (`bb thread-list prefs get organizationMode`). A steward
+  is placed there once and never moved back; one dragged out stays out. A
+  section deleted by hand is not recreated: `bb thread section create
+  "<project name>"` brings it back for new stewards. Workers sit under their
+  steward's row; collapse that row to hide them.

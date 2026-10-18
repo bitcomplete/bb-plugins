@@ -568,15 +568,38 @@ follow-through: 6h                # how long a terminal binding may be kept open
 ## 15. Organization
 
 - Stewards are no thread's children (§4): who reports to whom is in the
-  bindings. The plugin creates no sidebar sections and pins nothing; how the
-  sidebar is organized is the user's. Stewards, the project steward
-  included, are kept out of thread-briefs' status sections, where one idle
-  between wakes would read done, so they stay where you put them. The
-  project steward is titled "<project name> project steward".
-- Workers are children of their steward, nested under its sidebar row,
-  started by the steward with `bb thread spawn --project … --parent-self
-  --lifecycle-owner-thread …` and recognized by the plugin as children of a
-  steward thread.
+  bindings. They are grouped in the sidebar instead: each stewarded project
+  gets one sidebar section, named after the project, holding its project
+  steward and every ticket and pull request steward. Sections are flat in bb,
+  and only shown when the sidebar is organized chronologically; in the
+  project organization the project's own group does the same job.
+- **Placed once, then the user's.** A steward is put in its project's
+  section when it is spawned, and one that predates the section is put there
+  by the sweep, but only when it is in no section. Either way the thread is
+  then recorded as placed (`placed_threads`) and never moved again, so a
+  steward dragged elsewhere stays where it was put. The plugin pins
+  nothing.
+- **The section is remembered by id** (`project_stewards.section_id`), so a
+  rename by hand sticks. One deleted by hand stays deleted: the id is kept
+  as a tombstone and new stewards land loose. Creating a section with the
+  project's exact name brings placement back; an existing section with that
+  name is adopted rather than duplicated. When a project stops being
+  stewarded, the sweep deletes its section once nothing unarchived is left
+  in it, since its stewards are archived as their bindings end; a thread
+  filed there by hand keeps it.
+- Stewards, the project steward included, are kept out of thread-briefs'
+  status sections (`group: false`), where one idle between wakes would read
+  done. thread-briefs only moves threads in and out of its own sections, so
+  it leaves the project section alone. The project steward is titled
+  "<project name> project steward".
+- Workers are visible children of their steward, started by the steward
+  with `bb thread spawn --project … --parent-self --lifecycle-owner-thread
+  …` and recognized by the plugin as children of a steward thread. bb's list
+  builds the parent tree before it files trees into sections, so a worker
+  shows under its steward's row in the project section whatever section
+  thread-briefs gives the worker itself, and collapses with that row
+  (`collapsedThreads`). Workers are not tagged for thread-briefs: their
+  briefs, renames and auto-archiving are thread-briefs' as for any thread.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. Ended bindings are archived
   by this plugin, not by thread-briefs.
@@ -590,7 +613,8 @@ follow-through: 6h                # how long a terminal binding may be kept open
 - **Store:** bindings, status records, escalations, workers.
 - **Reconciler:** mechanical tier, debounce, nightly pass, `requeueAfter`
   timers, escalation routing.
-- **Threads:** spawning stewards, recognizing workers, building wake messages.
+- **Threads:** spawning stewards, recognizing workers, building wake messages,
+  the project's sidebar section.
 - **Agent tools:** `steward_report` and `steward_update`.
 - **CLI:** `bb stewards init | check | list | show | detach | pass | digest`.
 - **UI:** a board of status records, later.

@@ -14,8 +14,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   steward reports to its nearest managed ancestor's steward, or to the
   project's **project steward**, through its binding — not as a child
   thread: bb wakes a parent thread every time a child finishes a turn, and
-  on bithub that was 88 of the project steward's 96 turns. Stewards make no
-  sidebar sections and pin nothing; the sidebar stays the user's.
+  on bithub that was 88 of the project steward's 96 turns. A project's
+  stewards share one sidebar section, named after the project, with each
+  steward's workers nested under it; see DESIGN.md §15.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with

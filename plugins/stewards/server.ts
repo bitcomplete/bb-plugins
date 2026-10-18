@@ -447,7 +447,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; sectionId: string | null };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
@@ -462,6 +462,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           environmentHostId: t.environmentHostId ?? null,
           providerId: String(t.providerId ?? ""),
           parentThreadId: t.parentThreadId ?? null,
+          sectionId: t.sectionId ?? null,
         };
       } catch (error) {
         const e = error as { code?: string; status?: number };
@@ -552,13 +553,86 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The same, as `bb thread spawn` flags, for the worker command a wake shows. */
     const environmentFlags = (hostId: string | null) => (hostId === null ? "" : `--environment-provider ${MULTI_REPO_ENVIRONMENT_PROVIDER_ID} --machine ${hostId}`);
 
-    /** "<project name> project steward", or the bare role when bb cannot name the project. */
-    async function projectStewardTitle(projectId: string): Promise<string> {
-      const name = await bb.sdk.projects
+    /** The project's name in bb, or "" when bb cannot say. */
+    const projectName = (projectId: string): Promise<string> =>
+      bb.sdk.projects
         .get({ projectId })
         .then((p) => p.name.trim())
         .catch(() => "");
+
+    /** "<project name> project steward", or the bare role when bb cannot name the project. */
+    async function projectStewardTitle(projectId: string): Promise<string> {
+      const name = await projectName(projectId);
       return name === "" ? "Project steward" : `${name} project steward`;
+    }
+
+    /**
+     * The sidebar section a project's stewards are put in, named after the
+     * project; null when there is none to use. The one this plugin made is
+     * remembered by id, so a rename by hand sticks. One deleted by hand stays
+     * deleted: its id is kept as a tombstone, and only a section given the
+     * project's name again brings placement back. A section already carrying
+     * the project's name is adopted rather than duplicated.
+     */
+    async function projectSection(projectId: string): Promise<string | null> {
+      let sectionId: string | null = null;
+      await serial(`section:${projectId}`, async () => {
+        const row = store.project(projectId);
+        const sections = await bb.sdk.threadSections.list();
+        if (row.sectionId !== null && sections.some((s) => s.id === row.sectionId)) {
+          sectionId = row.sectionId;
+          return;
+        }
+        const name = await projectName(projectId);
+        if (name === "") return;
+        const named = sections.find((s) => s.name === name);
+        if (named !== undefined) {
+          store.patchProject(projectId, { sectionId: named.id });
+          sectionId = named.id;
+          return;
+        }
+        if (row.sectionId !== null) return;
+        const created = await bb.sdk.threadSections.create({ name });
+        store.patchProject(projectId, { sectionId: created.id });
+        bb.log.info(`stewards: made the sidebar section ${JSON.stringify(name)} for ${projectId} (${created.id})`);
+        sectionId = created.id;
+      });
+      return sectionId;
+    }
+
+    /**
+     * Put a steward in its project's section, once. One already in a section
+     * is the user's doing and is left there; either way, where it sits from
+     * then on is the user's, so a steward dragged out is never pulled back.
+     */
+    async function placeOnce(projectId: string, info: ThreadInfo): Promise<void> {
+      if (store.placed(info.id)) return;
+      if (info.sectionId === null) {
+        const sectionId = await projectSection(projectId);
+        if (sectionId === null) return;
+        try {
+          await bb.sdk.threads.update({ threadId: info.id, sectionId });
+        } catch (error) {
+          bb.log.warn(`stewards: could not put ${info.id} in its project's section: ${errorMessage(error)}`);
+          return;
+        }
+      }
+      store.markPlaced(info.id);
+    }
+
+    /**
+     * Delete the section of a project no longer stewarded, once nothing
+     * unarchived is left in it. Its stewards are archived as their bindings
+     * end, so it empties on its own; a thread the user filed there keeps it.
+     */
+    async function retireSection(projectId: string, sectionId: string): Promise<void> {
+      const sections = await bb.sdk.threadSections.list();
+      if (!sections.some((s) => s.id === sectionId)) return;
+      const left = await bb.sdk.threads.list({ sectionId, archived: false, limit: 1 });
+      if (left.length > 0) return;
+      await bb.sdk.threadSections.delete({ id: sectionId });
+      store.patchProject(projectId, { sectionId: null });
+      bb.log.info(`stewards: deleted the empty sidebar section of ${projectId}, no longer stewarded`);
     }
 
     /**
@@ -588,6 +662,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(row.threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return;
       await tagThread(row.threadId, PROJECT_BRIEFS);
+      await placeOnce(projectId, info);
       if (row.title !== null && info.title !== row.title) return;
       const title = await projectStewardTitle(projectId);
       if (info.title !== title) await quietly(`retitle the project steward ${row.threadId}`, () => bb.sdk.threads.update({ threadId: row.threadId!, title }));
@@ -606,15 +681,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
         }
         const title = await projectStewardTitle(config.projectId);
+        const sectionId = await projectSection(config.projectId);
         const thread = await bb.sdk.threads.spawn({
           projectId: config.projectId,
           environment: freshEnvironment(await projectHost(config.projectId)),
           prompt: PROJECT_STEWARD_INTRO,
           title,
           ...modelArgs(config.file.projectSteward.model ?? null),
+          ...(sectionId === null ? {} : { sectionId }),
           pluginMetadata: { role: "project", threadBriefs: PROJECT_BRIEFS },
         });
         tagged.add(thread.id);
+        if (sectionId !== null) store.markPlaced(thread.id);
         store.patchProject(config.projectId, { threadId: thread.id, title });
         bb.log.info(`stewards: started the project steward for ${config.projectId} (${thread.id})`);
         threadId = thread.id;
@@ -631,7 +709,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * go here, once per run.
      */
     const kept = new Set<string>();
-    async function keepSteward(threadId: string): Promise<void> {
+    async function keepSteward(projectId: string, threadId: string): Promise<void> {
       if (kept.has(threadId)) return;
       await tagThread(threadId, STEWARD_BRIEFS);
       const info = await threadInfo(threadId).catch(() => null);
@@ -645,6 +723,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return;
         }
       }
+      await placeOnce(projectId, info);
       kept.add(threadId);
     }
 
@@ -653,8 +732,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Stewards decide and delegate; they need no checkout of their own. They
       // share the project steward's environment, and workers get fresh ones.
       const env = projectThread === null ? null : (await threadInfo(projectThread))?.environmentId ?? null;
+      const sectionId = await projectSection(b.projectId);
       const base = {
         projectId: b.projectId,
+        ...(sectionId === null ? {} : { sectionId }),
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...modelArgs(stewardModel(b, playbook)),
@@ -670,6 +751,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       tagged.add(thread.id);
       kept.add(thread.id);
+      if (sectionId !== null) store.markPlaced(thread.id);
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
@@ -1786,7 +1868,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await keepProjectSteward(config.projectId);
         const playbooks = config.playbooks;
         for (const b of store.open(config.projectId)) {
-          if (b.threadId !== null) await keepSteward(b.threadId);
+          if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
           if (deadline !== null && now() > deadline) {
             await serial(`b:${b.id}`, async () => {
@@ -1804,6 +1886,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           scheduleReconcile(b.id);
         }
+      }
+      const stewarded = new Set(projects.map((c) => c.projectId));
+      for (const row of store.projects()) {
+        if (stewarded.has(row.projectId) || row.sectionId === null) continue;
+        await quietly(`retire the section of ${row.projectId}`, () => retireSection(row.projectId, row.sectionId!));
       }
     }
 
@@ -2040,12 +2127,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
-    testHooks.set(bb.pluginId, { sweep, store, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
+    testHooks.set(bb.pluginId, { sweep, store, db, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

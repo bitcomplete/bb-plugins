@@ -20,7 +20,8 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
   const rpcCalls: Call[] = [];
-  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null }>();
+  const sections: Array<{ id: string; name: string }> = [];
   /** Each thread's latest context window reading, as bb reports it. */
   const usage = new Map<string, number>();
   const metadata = new Map<string, Record<string, unknown>>();
@@ -66,11 +67,23 @@ function world() {
       }),
     },
     hosts: { list: async () => [{ id: "host_off", status: "disconnected" }, { id: "host_on", status: "connected" }] },
-    threadSections: { list: async () => [], create: async () => ({ id: "sec1", name: "Managed" }) },
+    threadSections: {
+      list: async () => sections.map((s) => ({ ...s })),
+      create: async ({ name }: { name: string }) => {
+        const section = { id: `sec_${sections.length + 1}`, name };
+        sections.push(section);
+        return { ...section };
+      },
+      delete: async ({ id }: { id: string }) => {
+        sections.splice(sections.findIndex((s) => s.id === id), 1);
+        for (const t of threads.values()) if (t.sectionId === id) t.sectionId = null;
+        return {};
+      },
+    },
     threads: {
       spawn: async (args: Record<string, unknown>) => {
         const id = `thr_${++n}`;
-        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null });
+        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null, sectionId: (args.sectionId as string | undefined) ?? null });
         metadata.set(id, { ...((args.pluginMetadata as Record<string, unknown> | undefined) ?? {}) });
         spawns.push({ ...args, id });
         return makeThreadResponse({ id });
@@ -82,8 +95,12 @@ function world() {
       get: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
-        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null });
+        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null });
       },
+      list: async ({ sectionId, archived }: { sectionId?: string; archived?: boolean }) =>
+        [...threads.entries()]
+          .filter(([, t]) => (sectionId === undefined || t.sectionId === sectionId) && (archived !== false || t.archivedAt === null))
+          .map(([id]) => makeThreadResponse({ id })),
       archive: async ({ threadId }: { threadId: string }) => {
         threads.get(threadId)!.archivedAt = 1;
         return {};
@@ -93,8 +110,9 @@ function world() {
         return {};
       },
       stop: async () => ({}),
-      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null }) => {
+      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null; sectionId?: string | null }) => {
         const t = threads.get(args.threadId);
+        if (t !== undefined && args.sectionId !== undefined) t.sectionId = args.sectionId;
         if (t !== undefined && args.title !== undefined) t.title = args.title;
         if (t !== undefined && args.parentThreadId !== undefined) t.parentThreadId = args.parentThreadId;
         return {};
@@ -116,7 +134,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, repos, entities, rpcCalls, threads, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup() {
@@ -165,9 +183,11 @@ describe("a Linear ticket steward", () => {
     expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false } } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
-    // No sidebar sections or pins: the sidebar is the user's.
+    // Both in the project's own sidebar section, and nothing pinned.
+    expect(t.sections).toEqual([{ id: "sec_1", name: "Acme" }]);
+    expect(project).toMatchObject({ sectionId: "sec_1" });
+    expect(steward).toMatchObject({ sectionId: "sec_1" });
     expect(project).not.toHaveProperty("pinned");
-    expect(steward).not.toHaveProperty("sectionId");
     expect(steward).toMatchObject({ title: "ENG-12: Fix login", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false } } });
     // No parent: bb would wake a parent every time a steward finishes a turn.
     expect(steward).not.toHaveProperty("parentThreadId");
@@ -753,6 +773,67 @@ describe("stewards and the sidebar", () => {
     const updates = t.harness.sdk.callsTo("threads.update").length;
     await t.hooks.sweep();
     expect(t.harness.sdk.callsTo("threads.update")).toHaveLength(updates);
+  });
+
+  it("puts stewards that predate it in their project's section once, and leaves them where you move them", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Fix logout" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const [project, steward, other] = t.spawns.map((x) => x.id);
+    // As an earlier version left them: no section anywhere, one filed by hand.
+    t.sections.splice(0);
+    t.sections.push({ id: "sec_later", name: "Later" });
+    t.hooks.store.patchProject("p1", { sectionId: null });
+    t.hooks.db.prepare("DELETE FROM placed_threads").run();
+    for (const id of [project!, steward!]) t.threads.get(id)!.sectionId = null;
+    t.threads.get(other!)!.sectionId = "sec_later";
+
+    t.hooks.forgetTags();
+    await t.hooks.sweep();
+    const acme = t.sections.find((s) => s.name === "Acme")!;
+    expect(t.threads.get(project!)!.sectionId).toBe(acme.id);
+    expect(t.threads.get(steward!)!.sectionId).toBe(acme.id);
+    expect(t.threads.get(other!)!.sectionId).toBe("sec_later");
+
+    // Dragged out, renamed: both stick.
+    t.threads.get(steward!)!.sectionId = null;
+    acme.name = "Acme stewards";
+    t.hooks.forgetTags();
+    await t.hooks.sweep();
+    expect(t.threads.get(steward!)!.sectionId).toBeNull();
+    expect(t.sections.map((s) => s.name)).toEqual(["Later", "Acme stewards"]);
+  });
+
+  it("does not bring back a section you deleted, and adopts one named after the project", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.sections.splice(0);
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Fix logout" }));
+    await t.ring("linear", "uuid-13");
+    expect(t.sections).toEqual([]);
+    expect(t.spawns[2]).not.toHaveProperty("sectionId");
+
+    t.sections.push({ id: "sec_mine", name: "Acme" });
+    t.entities.set("uuid-14", issue({ id: "uuid-14", key: "ENG-14", title: "Fix signup" }));
+    await t.ring("linear", "uuid-14");
+    expect(t.spawns[3]).toMatchObject({ sectionId: "sec_mine" });
+  });
+
+  it("deletes the section of a project no longer stewarded once it is empty", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.files[PROJECT_FILE] = null;
+    await t.hooks.sweep();
+    // Its stewards are still there, unarchived.
+    expect(t.sections).toHaveLength(1);
+    for (const thread of t.threads.values()) thread.archivedAt = 1;
+    await t.hooks.sweep();
+    expect(t.sections).toEqual([]);
+    expect(t.hooks.store.project("p1").sectionId).toBeNull();
   });
 
   it("cuts a long wake in its snapshot, never in what changed", async () => {
