@@ -454,7 +454,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
-        const t = (await bb.sdk.threads.get({ threadId })) as unknown as Partial<ThreadInfo>;
+        const t = (await bb.sdk.threads.get({ threadId })) as unknown as Partial<ThreadInfo> & { environment?: { hostId?: string | null } | null };
         return {
           id: threadId,
           title: t.title ?? null,
@@ -462,7 +462,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           archivedAt: t.archivedAt ?? null,
           deletedAt: t.deletedAt ?? null,
           environmentId: t.environmentId ?? null,
-          environmentHostId: t.environmentHostId ?? null,
+          // The SDK's thread carries its machine on `environment`, not at the top level.
+          environmentHostId: t.environment?.hostId ?? t.environmentHostId ?? null,
           providerId: String(t.providerId ?? ""),
           parentThreadId: t.parentThreadId ?? null,
           sectionId: t.sectionId ?? null,
@@ -2032,7 +2033,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
               const dir = input.options.dir ?? (ctx.cwd === undefined ? undefined : `${ctx.cwd.replace(/\/$/u, "")}/.bb`);
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
-              const hostId = ctx.threadId === undefined ? undefined : ((await threadInfo(ctx.threadId))?.environmentHostId ?? undefined);
+              // Write on the thread's machine, else the project's: left to core, the
+              // write lands on the server's own daemon, which bb-gate's servers lack.
+              const hostId =
+                (ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null)) ??
+                (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ??
+                undefined;
               const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
