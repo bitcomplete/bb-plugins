@@ -20,7 +20,8 @@ function world() {
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
   const rpcCalls: Call[] = [];
-  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string }>();
+  const writes: Array<{ path: string; hostId?: string }> = [];
   const sections: Array<{ id: string; name: string }> = [];
   /** Each thread's latest context window reading, as bb reports it. */
   const usage = new Map<string, number>();
@@ -66,6 +67,13 @@ function world() {
         ],
       }),
     },
+    files: {
+      mkdir: async () => ({}),
+      write: async (args: { path: string; hostId?: string }) => {
+        writes.push({ path: args.path, hostId: args.hostId });
+        return { outcome: "written" };
+      },
+    },
     hosts: { list: async () => [{ id: "host_off", status: "disconnected" }, { id: "host_on", status: "connected" }] },
     threadSections: {
       list: async () => sections.map((s) => ({ ...s })),
@@ -95,7 +103,10 @@ function world() {
       get: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
-        return makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null });
+        return {
+          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
+          ...(t.hostId === undefined ? {} : { environment: { hostId: t.hostId } }),
+        };
       },
       list: async ({ sectionId, archived }: { sectionId?: string; archived?: boolean }) =>
         [...threads.entries()]
@@ -134,7 +145,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup() {
@@ -1026,6 +1037,25 @@ describe("passes", () => {
     expect(check.stdout).toMatch(/linear-tickets\.md has no YAML front matter/u);
     expect(check.stdout).toMatch(/keep running under the last good linear-tickets/u);
     expect(check.stdout).toMatch(/ticket: linear-tickets@/u);
+  });
+});
+
+describe("bb stewards init", () => {
+  it("writes on the thread's own machine", async () => {
+    const t = await setup();
+    t.threads.set("thr_me", { status: "active", archivedAt: null, hostId: "host_me" });
+    const out = await t.harness.behavior.runCli(["init", "--teams", "eng"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(out.exitCode).toBe(0);
+    expect(t.writes).toContainEqual({ path: `/w/.bb/${PROJECT_FILE}`, hostId: "host_me" });
+    expect(t.writes.every((w) => w.hostId === "host_me")).toBe(true);
+  });
+
+  it("writes on the project's machine when the thread names none, never on the server's own", async () => {
+    const t = await setup();
+    t.threads.set("thr_me", { status: "active", archivedAt: null });
+    await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
+    expect(t.writes.length).toBe(4);
+    expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 });
 
