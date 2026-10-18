@@ -58,19 +58,19 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   unless a worker runs or an escalation is open; its next wake brings it
   back.
 - **thread-briefs.** Every steward, the project steward included, is
-  spawned with `threadBriefs: { rename: false, group: false, archive: false, ring: false }`
+  spawned with `threadBriefs: { rename: false, group: false, archive: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
   runs"). thread-briefs then never renames a steward, whose title carries
   its entity key, never moves one into a status section or auto-archives
-  it, since between wakes it reads done while its entity is still open, and
-  draws no stage ring on its row, leaving bb's own indicators. Its brief
-  is still written, for the Brief panel and the board. The project steward
+  it, since between wakes it reads done while its entity is still open.
+  Its row draws the stage ring like any thread's. The project steward
   is titled "<project name> project steward". The sweep tags threads
   spawned before this, lets go of stewards an earlier version made children
   of another steward, and renames an older project steward once. After
   that, a project steward renamed by hand keeps its name.
-- **Workers** are hidden child threads with their own checkout, one per
-  bounded task, owned by their steward. A runaway guard stops a steward's
+- **Workers** are child threads with their own checkout, one per bounded
+  task, owned by their steward. They show nested under their steward's
+  sidebar row, which collapses them like any parent. A runaway guard stops a steward's
   workers past a per-hour limit.
 - **Decisions stay with the agents.** Escalations are conditions on the
   status record, routed to the parent steward, then the project steward,

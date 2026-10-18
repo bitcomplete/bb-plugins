@@ -573,9 +573,10 @@ follow-through: 6h                # how long a terminal binding may be kept open
   included, are kept out of thread-briefs' status sections, where one idle
   between wakes would read done, so they stay where you put them. The
   project steward is titled "<project name> project steward".
-- Workers are hidden children of their steward, started by the steward with
-  `bb thread spawn --project … --parent-self --lifecycle-owner-thread …
-  --visibility hidden` and recognized by the plugin as children of a steward thread.
+- Workers are children of their steward, nested under its sidebar row,
+  started by the steward with `bb thread spawn --project … --parent-self
+  --lifecycle-owner-thread …` and recognized by the plugin as children of a
+  steward thread.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. Ended bindings are archived
   by this plugin, not by thread-briefs.

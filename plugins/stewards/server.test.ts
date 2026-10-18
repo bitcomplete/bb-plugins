@@ -162,13 +162,13 @@ describe("a Linear ticket steward", () => {
     const [project, steward] = t.spawns;
     expect(project).toMatchObject({ title: "Acme project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
     // thread-briefs keeps its hands off: no renames, auto-archiving or row ring for any steward, and no grouping for the project steward.
-    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } } });
+    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false } } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
     // No sidebar sections or pins: the sidebar is the user's.
     expect(project).not.toHaveProperty("pinned");
     expect(steward).not.toHaveProperty("sectionId");
-    expect(steward).toMatchObject({ title: "ENG-12: Fix login", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false, ring: false } } });
+    expect(steward).toMatchObject({ title: "ENG-12: Fix login", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false } } });
     // No parent: bb would wake a parent every time a steward finishes a turn.
     expect(steward).not.toHaveProperty("parentThreadId");
     const prompt = String(steward!.prompt);
@@ -179,7 +179,7 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/given by the project steward/u);
     // The first wake is the spawn prompt, before the thread has an id.
     expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
-    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
@@ -726,8 +726,8 @@ describe("the project steward", () => {
     t.hooks.forgetTags();
     await t.hooks.sweep();
     expect(t.threads.get(project!.id)!.title).toBe("Acme project steward");
-    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
-    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
+    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, group: false, archive: false } });
 
     // A name given by hand afterwards sticks.
     t.threads.get(project!.id)!.title = "Acme overseer";

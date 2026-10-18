@@ -181,7 +181,7 @@ export function formatWake(input: WakeInput): string {
     "",
     "Start a worker for one bounded task with:",
     "",
-    `    bb thread spawn --project ${binding.projectId} --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --visibility hidden ${input.workerFlags} --title "${e.key}: <task>" --prompt-file - <<'EOF'`,
+    `    bb thread spawn --project ${binding.projectId} --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" ${input.workerFlags} --title "${e.key}: <task>" --prompt-file - <<'EOF'`,
     "    <the whole task>",
     "    EOF",
     "",
