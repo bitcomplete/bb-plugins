@@ -545,12 +545,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** Message a thread, bringing it back first if it was archived while it waited. */
-    async function sendTo(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
+    /**
+     * Message a thread, bringing it back first if it was archived while it
+     * waited. A function for the text is called just before the send, after
+     * those awaits, so it reads the store as of the send.
+     */
+    async function sendTo(threadId: string, text: string | (() => string)): Promise<"sent" | "gone" | "failed"> {
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return "gone";
       if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
-      return send(threadId, text);
+      return send(threadId, typeof text === "string" ? text : text());
     }
 
     async function quietly(what: string, fn: () => Promise<unknown>): Promise<void> {
@@ -1221,17 +1225,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (config === null) return;
       const threadId = await ensureProjectSteward(config);
       if (threadId === null) return;
-      const open = store.open(projectId);
-      const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
-      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
-      const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
-      const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const records = opts.digestDue ? digestRecords(projectId) : undefined;
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
-      await sendTo(
-        threadId,
-        formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) }),
-      );
+      // Read as of the send, so an escalation resolved meanwhile is left out,
+      // and marked delivered in the same step, so a prompt sent right after
+      // lists it as still open rather than new.
+      const delivered = { ids: [] as string[], at: 0 };
+      const sent = await sendTo(threadId, () => {
+        const open = store.open(projectId);
+        const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
+        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
+        const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
+        const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
+        delivered.ids = routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id);
+        delivered.at = store.markDelivered(delivered.ids);
+        return formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
+      });
+      if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
     }
 
     /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
@@ -1913,9 +1923,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         try {
           const done: string[] = [];
           const notes: string[] = [];
+          /** Close the question and record the one asked, once every check has passed. */
+          const questionWrites = (closing: { question: Question; answer: string; guidanceDropped: boolean } | null, target: Binding | null): string[] => {
+            const out: string[] = [];
+            if (closing !== null) {
+              const closed = store.answer(closing.question.id, closing.answer, threadId);
+              const dropped = closing.guidanceDropped ? " (guidance not saved: it is kept per binding, so name one with binding to give it)" : "";
+              out.push(`${closed ? `closed ${closing.question.id}` : `${closing.question.id} already closed with this answer`}${dropped}`);
+            }
+            if (input.ask !== undefined) {
+              const q = store.ask({ projectId: projectOf!, bindingId: target?.id ?? null, escalationId: null, question: input.ask.question, context: input.ask.context ?? null });
+              out.push(`question ${q.id} recorded${target === null ? "" : ` about ${target.entityKey}`}: ask the user in your reply, and close it with steward_update { resolve: "${q.id}", answer } once they answer`);
+            }
+            return out;
+          };
           let resolve = input.resolve;
           let guidance = input.guidance;
           let bindingRef = input.binding;
+
+          // Every check comes before the first write, so a call that fails
+          // changes nothing and a model can retry it as it was.
 
           // Questions to the user are the project steward's, and kept until answered.
           const projectOf = store.projectByThread(threadId)?.projectId ?? null;
@@ -1927,16 +1954,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
             if (q === null || q.projectId !== projectOf) return toolError(new Error(`No question ${resolve} in this project.`));
-            if (q.status !== "open") return toolError(new Error(`Question ${q.id} is already closed.`));
             const answer = input.answer ?? guidance;
             if (answer === undefined) return toolError(new Error("Give the user's answer (answer) when closing a question."));
             const x = q.escalationId === null ? null : store.escalation(q.escalationId);
             if (x !== null) {
               // A forwarded escalation: decided as one, which closes the question with it.
+              // Closed already (the binding ended, a retry) is answered the same way.
               resolve = x.id;
               guidance ??= answer;
               bindingRef ??= x.bindingId;
             } else {
+              // A retry of the close that already happened changes nothing.
+              if (q.status !== "open" && q.answer !== answer) return toolError(new Error(`Question ${q.id} is already closed.`));
               closing = { question: q, answer, guidanceDropped: false };
               resolve = undefined;
               if (input.guidance !== undefined && (input.answer !== undefined || q.bindingId !== null)) bindingRef ??= q.bindingId ?? undefined;
@@ -1954,30 +1983,67 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (target === null) {
             const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.stewardModel, input.workerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
+            if (closing === null && input.ask === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, or close one."));
+            return `${questionWrites(closing, null).join("; ")}.`;
           }
-          if (input.ask !== undefined && target !== null && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
-          if (closing !== null) {
-            store.answer(closing.question.id, closing.answer, threadId);
-            done.push(`closed ${closing.question.id}${closing.guidanceDropped ? " (guidance not saved: it is kept per binding, so name one with binding to give it)" : ""}`);
-          }
-          if (input.ask !== undefined) {
-            const q = store.ask({ projectId: projectOf!, bindingId: target?.id ?? null, escalationId: null, question: input.ask.question, context: input.ask.context ?? null });
-            done.push(`question ${q.id} recorded${target === null ? "" : ` about ${target.entityKey}`}: ask the user in your reply, and close it with steward_update { resolve: "${q.id}", answer } once they answer`);
-          }
-          if (target === null) {
-            if (done.length === 0) return toolError(new Error("Nothing to update: name a binding, ask a question, or close one."));
-            return `${done.join("; ")}.`;
-          }
+          if (input.ask !== undefined && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
           const self = target.threadId === threadId;
 
+          const forwarding = input.forward === undefined ? null : store.escalation(input.forward);
           if (input.forward !== undefined) {
-            const x = store.escalation(input.forward);
-            if (x === null || x.status !== "open" || x.bindingId !== target.id) return toolError(new Error(`No open escalation ${input.forward} on ${target.entityKey}.`));
-            const holder = x.route === "parent" ? store.binding(target.parentBindingId ?? "")?.threadId : x.route === "project" ? store.project(target.projectId).threadId : null;
-            if (holder !== threadId) return toolError(new Error(`Escalation ${x.id} is not with this thread, so it cannot forward it.`));
-            const route = nextRoute(target, x.route);
-            const recommendation = input.recommendation ?? x.recommendation;
-            store.reroute(x.id, route, recommendation);
+            if (forwarding === null || forwarding.status !== "open" || forwarding.bindingId !== target.id) return toolError(new Error(`No open escalation ${input.forward} on ${target.entityKey}.`));
+            const holder = forwarding.route === "parent" ? store.binding(target.parentBindingId ?? "")?.threadId : forwarding.route === "project" ? store.project(target.projectId).threadId : null;
+            if (holder !== threadId) return toolError(new Error(`Escalation ${forwarding.id} is not with this thread, so it cannot forward it.`));
+          }
+
+          const directs = mayDirect(threadId, target);
+          if (!directs && forwarding === null) return toolError(new Error(`This thread does not steer ${target.entityKey}: only its own steward, a steward above it, or the project steward does.`));
+          let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
+          let resolving: Escalation | null = null;
+          if (directs) {
+            if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
+              return toolError(new Error("A steward does not set its own priority, hold or model; its parent or the project steward does."));
+            }
+            if (input.approve === true) {
+              const config = await loadConfig(target.projectId);
+              const playbook = config === null ? null : playbookFor(config, target.kind);
+              const mode = playbook?.ready?.approval ?? null;
+              if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
+              if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
+              if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
+              const byProject = mode === "project" && isProjectSteward(threadId, target);
+              const byUser = input.quote !== undefined && (await userSaid(threadId, input.quote));
+              if (!byProject && !byUser) {
+                return toolError(
+                  new Error(
+                    mode === "me"
+                      ? "This spec is approved by the user: quote their words from a message they sent in this thread."
+                      : "This spec is approved by the project steward (or by the user, quoting their words from this thread). Escalate a decision instead.",
+                  ),
+                );
+              }
+              // Pinned to the spec as it is now, not as last observed: a spec
+              // comment posted since the last ring is part of what was read.
+              approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser };
+            }
+            if (resolve !== undefined) {
+              if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
+              resolving = store.escalation(resolve);
+              if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
+            }
+            if (input.stewardModel !== undefined && target.threadId !== null) {
+              const info = await threadInfo(target.threadId);
+              if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
+            }
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, closing ?? undefined];
+            if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, or ask."));
+          }
+
+          done.push(...questionWrites(closing, target));
+          if (forwarding !== null) {
+            const route = nextRoute(target, forwarding.route);
+            const recommendation = input.recommendation ?? forwarding.recommendation;
+            store.reroute(forwarding.id, route, recommendation);
             // Kept as a question to the user too, which closes when the escalation is resolved. Made
             // before the await below, so the escalation cannot be resolved in between and leave it open.
             const q =
@@ -1986,68 +2052,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 : store.ask({
                     projectId: target.projectId,
                     bindingId: target.id,
-                    escalationId: x.id,
-                    question: x.question,
-                    context: [`A ${x.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${x.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    escalationId: forwarding.id,
+                    question: forwarding.question,
+                    context: [`A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
                   });
-            await deliver(target, store.escalation(x.id)!);
-            if (q !== null) done.push(`forwarded ${x.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
-            else done.push(`forwarded ${x.id} to the project steward`);
+            await deliver(target, store.escalation(forwarding.id)!);
+            if (q !== null) done.push(`forwarded ${forwarding.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
+            else done.push(`forwarded ${forwarding.id} to the project steward`);
           }
+          if (!directs) return `${target.entityKey}: ${done.join("; ")}.`;
 
-          if (!mayDirect(threadId, target)) {
-            if (done.length > 0) return `${target.entityKey}: ${done.join("; ")}.`;
-            return toolError(new Error(`This thread does not steer ${target.entityKey}: only its own steward, a steward above it, or the project steward does.`));
-          }
-          if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
-            return toolError(new Error("A steward does not set its own priority, hold or model; its parent or the project steward does."));
-          }
-
-          if (input.approve === true) {
-            const config = await loadConfig(target.projectId);
-            const playbook = config === null ? null : playbookFor(config, target.kind);
-            const mode = playbook?.ready?.approval ?? null;
-            if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
-            if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
-            if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
-            const byProject = mode === "project" && isProjectSteward(threadId, target);
-            const byUser = input.quote !== undefined && (await userSaid(threadId, input.quote));
-            if (!byProject && !byUser) {
-              return toolError(
-                new Error(
-                  mode === "me"
-                    ? "This spec is approved by the user: quote their words from a message they sent in this thread."
-                    : "This spec is approved by the project steward (or by the user, quoting their words from this thread). Escalate a decision instead.",
-                ),
-              );
-            }
-            // Pinned to the spec as it is now, not as last observed: a spec
-            // comment posted since the last ring is part of what was read.
-            const entity = (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHash(entity, target.threadId), by: threadId }, voidedAt: null, declinedSpecHash: null } });
-            for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${byUser ? ` by the user: "${input.quote}"` : " by the project steward"}.`);
+          if (approval !== null) {
+            const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHash(approval.entity, target.threadId), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
-            notes.push(`The spec was approved${byUser ? ` by the user: "${input.quote}"` : " by the project steward"}.`);
+            notes.push(`The spec was approved${by}.`);
           }
 
           if (guidance !== undefined) {
-            store.addGuidance(target.id, guidance, threadId);
-            done.push("guidance saved");
-            if (resolve === undefined) notes.push(`New guidance: ${guidance}`);
+            // The same guidance again within minutes is a retry: saved once.
+            const saved = store.addGuidance(target.id, guidance, threadId);
+            done.push(saved ? "guidance saved" : "guidance already saved");
+            if (saved && resolve === undefined) notes.push(`New guidance: ${guidance}`);
           }
-          if (resolve !== undefined) {
-            if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
-            const x = store.escalation(resolve);
-            if (x === null || x.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
-            // Approving closes its own request, so naming it in resolve too is no error.
-            if (!store.resolve(x.id, guidance, threadId) && !(x.kind === "approval" && input.approve === true)) return toolError(new Error(`Escalation ${resolve} is already resolved.`));
-            if (x.kind === "approval" && input.approve !== true && target.lastSnapshot !== null) {
+          if (resolving !== null) {
+            // Already resolved (the binding ended, a retry) is no error: the answer is added to the record.
+            const outcome = store.answerEscalation(resolving.id, guidance!, threadId);
+            if (resolving.kind === "approval" && resolving.status === "open" && input.approve !== true && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
               store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHash(fresh.lastSnapshot!.entity, fresh.threadId) } });
             }
-            done.push(`resolved ${x.id}`);
-            notes.push(`Escalation ${x.id} decided: ${guidance}`);
+            if (resolving.status === "open") done.push(`resolved ${resolving.id}`);
+            else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
+            else done.push(`${resolving.id} already has this answer`);
+            if (outcome !== "unchanged") notes.push(`Escalation ${resolving.id} decided: ${guidance}`);
           }
           if (input.priority !== undefined || input.hold !== undefined) {
             store.patch(target.id, { ...(input.priority === undefined ? {} : { priority: input.priority }), ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold }) });
@@ -2056,15 +2096,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             notes.push(`Set by your ${isProjectSteward(threadId, target) ? "project" : "parent"} steward: ${what}`);
           }
           if (input.stewardModel !== undefined && target.threadId !== null) {
-            const info = await threadInfo(target.threadId);
-            if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             await bb.sdk.threads.update({ threadId: target.threadId, ...(input.stewardModel.model === null ? {} : { model: input.stewardModel.model }), ...(input.stewardModel.reasoningLevel === null ? {} : { reasoningLevel: input.stewardModel.reasoningLevel }) });
           }
           if (input.stewardModel !== undefined || input.workerModel !== undefined) {
             store.patch(target.id, { ...(input.stewardModel === undefined ? {} : { modelSteward: input.stewardModel.text }), ...(input.workerModel === undefined ? {} : { modelWorker: input.workerModel.text }) });
             done.push(`models: steward ${input.stewardModel?.text ?? "unchanged"}, workers ${input.workerModel?.text ?? "unchanged"}`);
           }
-          if (done.length === 0) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, or ask."));
           for (const n of notes) tell(threadId, target, n);
           return `${target.entityKey}: ${done.join("; ")}.`;
         } catch (error) {

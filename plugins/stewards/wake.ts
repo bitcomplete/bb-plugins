@@ -261,12 +261,14 @@ export function formatProjectWake(input: {
   if (input.notes.length > 0) out.push(...input.notes.map((n) => `- ${n}`), "");
   if (input.problems.length > 0) out.push("## Configuration problems", "", ...input.problems.map((p) => `- ${p}`), "");
   if (input.routed.length > 0) {
-    out.push("## Escalations routed to you", "");
-    for (const { escalation: x, from } of input.routed) {
-      out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
-    }
+    // New: not in an earlier prompt. Still open: sent before and not yet decided.
+    const fresh = input.routed.filter((r) => r.escalation.deliveredAt === null);
+    const before = input.routed.filter((r) => r.escalation.deliveredAt !== null);
+    const line = ({ escalation: x, from }: { escalation: Escalation; from: Binding }) =>
+      `- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`;
+    if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
+    if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "",
       "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions:",
       "",
       ...input.bigDecisions.map((d) => `- ${d}`),
