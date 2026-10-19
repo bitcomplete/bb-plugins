@@ -1,9 +1,9 @@
 ---
 name: pr-inbox
-description: Read PR Feedback's Your turn list, refresh GitHub feedback, dismiss rows, or start a thread to address selected PRs.
+description: Read the Your turn list in My PRs, refresh GitHub feedback, dismiss rows, or start a thread to address selected PRs.
 ---
 
-# PR Feedback
+# My PRs
 
 Use `bb pr-inbox list --json` for the current snapshot and
 `bb pr-inbox poll --json` for fresh GitHub state. `status` reports the last

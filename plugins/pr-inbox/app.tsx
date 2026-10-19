@@ -192,7 +192,7 @@ export function InboxPage() {
   const lastRead = view?.poll?.lastSuccess;
   return <div ref={rootRef} className={cn("flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground", POINTER_CURSORS)}>
     <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/70 px-3 py-1">
-      <h1 className="text-[13px] font-semibold">PR Feedback</h1>
+      <h1 className="text-[13px] font-semibold">My PRs</h1>
       <button type="button" disabled={polling} onClick={() => { void poll(); }} aria-label="Refresh GitHub feedback"
         title={lastRead ? `Last read ${new Date(lastRead).toLocaleString()} · check GitHub now` : "Check GitHub now"}
         className={cn("ml-auto inline-flex min-w-0 items-center gap-1 rounded text-[11.5px] text-muted-foreground hover:text-foreground disabled:hover:text-inherit", RING)}>
@@ -203,7 +203,7 @@ export function InboxPage() {
     <div className="@container min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <main className={cn(COLUMN, "px-2 pb-10 pt-3 @min-[720px]:px-4")}>
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
-        {view && !view.project ? <p className="px-2 pb-3 text-[12px] text-muted-foreground">Choose a project in PR Feedback settings to enable Address comments.</p> : null}
+        {view && !view.project ? <p className="px-2 pb-3 text-[12px] text-muted-foreground">Choose a project in My PRs settings to enable Address comments.</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
           <section aria-label="Your turn">
             <div className="flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 bg-background py-1 pl-2 pr-1">
@@ -247,5 +247,5 @@ function InboxCount() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "PR Feedback", icon: "GitBranch", path: "inbox", component: InboxPage, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, headerContent: InboxCount });
 });

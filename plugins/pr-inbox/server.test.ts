@@ -25,7 +25,7 @@ const firstSelection = async (env: Awaited<ReturnType<typeof setup>>) => {
   const row = (await env.view()).rows[0]; if (!row) throw new Error("Expected a PR"); return { id: row.id, activity: row.activity };
 };
 
-describe("PR Feedback behavior", () => {
+describe("My PRs behavior", () => {
   it("polling never starts work; dismissal survives reload and a new human comment restores the row", async () => {
     const env = await setup(); const selection = await firstSelection(env);
     expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);

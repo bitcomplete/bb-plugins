@@ -1,8 +1,8 @@
-# PR Feedback
+# My PRs
 
-PR Feedback shows human feedback waiting on your authored pull requests. It is a
+My PRs shows human feedback waiting on your authored pull requests. It is a
 standalone sibling of Review Watch, whose Reviews page shows requests for your
-review of other people's PRs. PR Feedback does not require Workstreams.
+review of other people's PRs. My PRs does not require Workstreams.
 
 ## Install and configure
 
@@ -15,13 +15,13 @@ bb plugin reload pr-inbox
 bb pr-inbox poll --json
 ```
 
-Open **PR Feedback** in the sidebar. The first successful refresh shows your open
+Open **My PRs** in the sidebar. The first successful refresh shows your open
 PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
 The page uses the same compact, area-grouped layout as Reviews. Its
-branch-and-arrow icon distinguishes PR Feedback in the sidebar. Groups come from PR title
+branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
 Choose one PR's **Address**, or select several rows and choose **Address N**.
@@ -53,9 +53,9 @@ a change request, but comments and approval notes require a reply. A bot's
 reply does not answer a human's thread. A later standing approval covers that
 reviewer's earlier comments.
 
-PR Feedback keeps no effort assignments, holds, merge gates, or model
+My PRs keeps no effort assignments, holds, merge gates, or model
 enrichment. Workstreams' existing Your turn view continues to work independently.
-Workstreams' local **Confirm handled** records do not transfer to PR Feedback.
+Workstreams' local **Confirm handled** records do not transfer to My PRs.
 
 GitHub search, reviews, conversation comments, review requests, review threads,
 and comments inside threads all paginate. The search limit is 1,000 open authored

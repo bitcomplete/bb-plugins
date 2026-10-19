@@ -1,6 +1,6 @@
 ## Your pull requests waiting on you
 
-PR Feedback shows the human feedback on your authored PRs that still needs a
+My PRs shows the human feedback on your authored PRs that still needs a
 response. Every row says why: an approval note, a change request, a comment,
 or an open thread where another person spoke last. Bot feedback alone does
 not add a PR. Drafts stay visible when a person is waiting.
@@ -24,5 +24,5 @@ Choose a BB project whose default environment has the repository checkouts for
 Address threads. Optional provider and model settings override that project's
 defaults. Agent work uses the configured provider account.
 
-PR Feedback runs independently of Workstreams. Review Watch is its companion for
+My PRs runs independently of Workstreams. Review Watch is its companion for
 PRs where someone else needs your review.
