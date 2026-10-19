@@ -24,6 +24,10 @@ The page uses the same compact, area-grouped layout as Reviews. Its
 branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
+The header shows the number of PRs on Your turn. The same count is registered
+for sidebar badges; it appears there when the BB server supports sidebar
+accessories.
+
 Choose one PR's **Address**, or select several rows and choose **Address N**.
 Group checkboxes select an area; Shift-click selects a range. Press **b** to
 address the selection or **Esc** to clear it. Address starts one thread in the

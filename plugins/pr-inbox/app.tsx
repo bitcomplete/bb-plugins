@@ -247,5 +247,5 @@ function InboxCount() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_sidebarAccessory: InboxCount, headerContent: InboxCount });
 });

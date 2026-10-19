@@ -95,3 +95,19 @@ it("keeps thread, clear-attempt, dismissal, and restore actions available in com
   fireEvent.click(slot.getByRole("button", { name: "Restore example/editor#2" }));
   await waitFor(() => expect(JSON.stringify(slot.inspection.rpcCalls)).toContain('"dismissed":false'));
 });
+
+it("registers a sidebar badge that counts actionable feedback and follows realtime updates", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const badge = app.navPanels[0]?.experimental_sidebarAccessory;
+  if (!badge) throw new Error("Missing My PRs sidebar badge");
+  let view: View = { project: "project-test", poll: null, rows: [
+    row(1), { ...row(2), dismissed: true }, { ...row(3), turn: null },
+  ] };
+  const slot = renderSlot({ component: badge }, {}, { rpc: { inbox_get: () => view } });
+  cleanups.push(() => slot.lifecycle.unmount());
+  await slot.findByText("1");
+  view = { ...view, rows: [row(1), row(2), { ...row(3), turn: null }] };
+  await slot.behavior.emitRealtime("inbox-changed", {});
+  await slot.findByText("2");
+  expect(slot.inspection.rpcCalls.every((call) => call.method === "inbox_get")).toBe(true);
+});
