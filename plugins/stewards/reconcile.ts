@@ -8,7 +8,7 @@
 import { createHash } from "node:crypto";
 import { isTerminal, phaseOf, type Playbook } from "./config.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, ReadyState, Worker } from "./store.js";
+import type { Binding, Escalation, Need, Observed, ReadyState, Worker } from "./store.js";
 
 /**
  * One line of "what changed", and whether it alone makes a judgment turn due.
@@ -39,7 +39,7 @@ export function reviewMarker(body: string): ReviewMarker | null {
 }
 
 /** The newest reviewer marker in a comment list, by comment time. */
-function latestMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
+export function latestReviewMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
   let at = "";
   let latest: ReviewMarker | null = null;
   for (const c of comments) {
@@ -57,8 +57,8 @@ function latestMarker(comments: readonly SnapshotComment[]): ReviewMarker | null
  * `bb-review` marker the steward hears while a worker is in flight.
  */
 export function markerLaneChange(before: readonly SnapshotComment[], after: readonly SnapshotComment[]): { from: string; to: string } | null {
-  const b = latestMarker(before);
-  const a = latestMarker(after);
+  const b = latestReviewMarker(before);
+  const a = latestReviewMarker(after);
   if (b === null || a === null || b.lane === a.lane) return null;
   return { from: b.lane, to: a.lane };
 }
@@ -246,6 +246,104 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
   return changes;
 }
 
+// ---- the merge gate -------------------------------------------------------------------
+
+/**
+ * Whether the owner has approved a pull request: an unsigned approving comment
+ * by the connected user, or an APPROVED review from them. A signed comment is
+ * a thread's (the reviewer's marker, a worker's), never the owner's.
+ */
+export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: string | null } {
+  const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
+  if (viewer === null) return { approved: false, at: null };
+  let at: string | null = null;
+  for (const c of entity.comments) {
+    if (c.signedBy !== null || c.author.toLowerCase() !== viewer) continue;
+    if (classifyApproval(c.body) !== "approve") continue;
+    if (at === null || c.createdAt > at) at = c.createdAt;
+  }
+  for (const r of entity.pull?.reviews ?? []) {
+    if (r.author.toLowerCase() !== viewer || r.state.toLowerCase() !== "approved") continue;
+    const when = r.submittedAt ?? "";
+    if (at === null || when > at) at = when;
+  }
+  return { approved: at !== null, at };
+}
+
+/**
+ * The lane gate from the build-tickets skill, in one place: the reviewer's
+ * latest marker names the current head with verdict `approved`, every check has
+ * passed, and, in the owner-reviewed lane, the owner has approved. It is used
+ * by the merge button, by the item the plugin files, and by the wake text that
+ * tells a steward whether a pull request's gate is met.
+ */
+export type PrGate = {
+  headSha: string | null;
+  marker: ReviewMarker | null;
+  lane: string | null;
+  checksGreen: boolean;
+  checksState: string | null;
+  ownerApproved: boolean;
+  ownerApprovalAt: string | null;
+  gateMet: boolean;
+  /** What is missing, in words; null when the gate is met. */
+  missing: string | null;
+  /** The plugin's `approve-pr` condition: owner lane, marker approved on the head, checks green, no owner approval yet. */
+  needsOwnerApproval: boolean;
+};
+
+const short = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
+
+export function prGate(entity: EntitySnapshot): PrGate {
+  const pull = entity.pull;
+  const headSha = pull?.headSha ?? null;
+  const marker = latestReviewMarker(entity.comments);
+  const lane = marker?.lane ?? null;
+  const checksState = pull?.checks?.state ?? null;
+  const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
+  const owner = ownerApproval(entity);
+  const markerOnHead = marker !== null && headSha !== null && marker.sha === headSha;
+  const markerApproved = markerOnHead && marker.verdict === "approved";
+  const ownerLane = lane === "owner-reviewed";
+  const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || owner.approved);
+  const missing = gateMet
+    ? null
+    : pull === null
+      ? "not a pull request"
+      : marker === null
+        ? "no reviewer round yet"
+        : !markerOnHead
+          ? `reviewer round ${marker.round} is on ${short(marker.sha)}; the head is ${short(headSha)}`
+          : marker.verdict !== "approved"
+            ? `reviewer verdict: ${marker.verdict}`
+            : !checksGreen
+              ? `checks ${checksState ?? "not run"}`
+              : ownerLane && !owner.approved
+                ? "owner approval needed"
+                : "not met";
+  return {
+    headSha,
+    marker,
+    lane,
+    checksGreen,
+    checksState,
+    ownerApproved: owner.approved,
+    ownerApprovalAt: owner.at,
+    gateMet,
+    missing,
+    needsOwnerApproval: ownerLane && markerApproved && checksGreen && !owner.approved,
+  };
+}
+
+/**
+ * A `blockedOn` that names the user, the owner or a human. A status record
+ * naming one of them without an open `needs` item is refused: the item is what
+ * puts the ask on the Stewards page.
+ */
+export function namesUserAsBlocker(text: string): boolean {
+  return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
+}
+
 // ---- approval words -------------------------------------------------------------------
 
 /**
@@ -284,8 +382,8 @@ export function classifyApproval(text: string | null | undefined): ApprovalVerdi
  * violation `bb stewards show` points at. Only an imperative next action
  * counts, so merely waiting on the request is not flagged.
  */
-export function asksForOpenApproval(status: Binding["status"], open: readonly Escalation[]): string | null {
-  if (status === null || !open.some((x) => x.kind === "approval")) return null;
+export function asksForOpenApproval(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
+  if (status === null || (!open.some((x) => x.kind === "approval") && !needs.some((n) => n.kind === "approve-spec"))) return null;
   const next = status.nextAction.trim();
   if (!/^(?:ask|asks|asking|request|requests|requesting|remind|reminds|reminding|tell|tells|telling|prompt|prompts|prompting)\b/iu.test(next)) return null;
   if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(next)) return null;
@@ -381,8 +479,8 @@ export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.c
  * A status that says it waits on the project steward or the user while
  * none of its escalations is open: a wait nobody above it hears about.
  */
-export function unheardWait(status: Binding["status"], open: readonly Escalation[]): string | null {
-  if (status === null || status.blockedOn === null || open.length > 0) return null;
+export function unheardWait(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
+  if (status === null || status.blockedOn === null || open.length > 0 || needs.length > 0) return null;
   if (/project steward/iu.test(status.blockedOn)) return "waits on the project steward, with no open escalation";
   if (/\buser\b/iu.test(status.blockedOn)) return "waits on the user, with no open escalation";
   return null;

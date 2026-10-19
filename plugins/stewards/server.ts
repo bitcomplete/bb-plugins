@@ -37,7 +37,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
+import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -48,7 +48,8 @@ import {
   type EntitySnapshot,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, type Binding, type Escalation, type EscalationRoute, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeReason, type WorkerQuestion } from "./wake.js";
 
@@ -106,6 +107,8 @@ export const DEFAULT_TIMING: Timing = {
 export interface StewardsDeps {
   now: () => number;
   timing?: Partial<Timing>;
+  /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
+  github?: GithubWriter;
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -143,6 +146,7 @@ export const rpcContract = defineRpcContract({
           nextAction: z.string().nullable(),
           actor: z.string().nullable(),
           escalations: z.number(),
+          needs: z.number(),
           ended: z.boolean(),
         }),
       ),
@@ -220,6 +224,23 @@ export const rpcContract = defineRpcContract({
           withUser: z.array(
             z.object({ id: z.string(), kind: z.string(), question: z.string(), recommendation: z.string().nullable(), key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), createdAt: z.number() }),
           ),
+          /** "Needs you" items: links and the one-click action each supports. */
+          needs: z.array(
+            z.object({
+              id: z.string(),
+              bindingId: z.string(),
+              key: z.string(),
+              kind: z.string(),
+              url: z.string().nullable(),
+              what: z.string(),
+              how: z.string().nullable(),
+              threadId: z.string().nullable(),
+              createdAt: z.number(),
+              /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
+              actionable: z.boolean(),
+              why: z.string().nullable(),
+            }),
+          ),
           stewards: z.array(
             z.object({
               key: z.string(),
@@ -250,6 +271,17 @@ export const rpcContract = defineRpcContract({
     input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable() }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
+  // The user presses a button on a "needs you" item: approve or decline a spec,
+  // approve a pull request, merge one, mark a configure step done, or provide a
+  // secret. It runs as the connected user, unsigned.
+  stewardsNeedAction: {
+    input: z.object({
+      needId: z.string().min(1).max(100),
+      action: z.enum(["approve", "decline", "done", "merge", "provide"]),
+      note: z.string().trim().max(4000).nullable().optional(),
+    }),
+    output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
+  },
 });
 
 /** How long an ended binding stays on the page. */
@@ -272,6 +304,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
   return async (bb) => {
     const timing: Timing = { ...DEFAULT_TIMING, ...deps.timing };
     const now = deps.now;
+    const github = deps.github ?? createGhWriter();
     const settings = bb.settings.define({
       paused: {
         type: "boolean",
@@ -874,6 +907,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         children: store.children(b.id).map((c) => ({ binding: c, openEscalations: store.openEscalations(c.id) })),
         workerFlags: [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
         changes,
+        needs: store.openNeeds(b.id),
         own: ownThreads(b),
         label: config.file.label,
         now: now(),
@@ -1020,6 +1054,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      await syncNeeds(b, observed, playbook, workerInFlight);
       /**
        * Keep news for the next turn: what is actionable as a reason for it, the
        * rest as quiet notes. A quiet comment count is not kept: the next wake
@@ -1296,7 +1331,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
+      const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, needs, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -1319,6 +1355,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
         withUser: openWith((x) => x.route === "me"),
+        needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
       };
@@ -1360,6 +1397,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function syncApprovalRequest(b: Binding, playbook: Playbook): Promise<Escalation | null> {
       const mode = playbook.ready?.approval ?? null;
       if (mode === null || typeof mode === "object" || b.lastSnapshot === null) return null;
+      // `approval: me` is the user's, and is filed as an `approve-spec` need by
+      // syncNeeds; the escalation below is only for the project steward.
+      if (mode === "me") return null;
       const open = store.openEscalations(b.id).filter((x) => x.kind === "approval");
       const current = specHashFor(b, b.lastSnapshot.entity);
       const gate = gateState(playbook, b.ready, current);
@@ -1370,7 +1410,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return null;
       }
       if (open.length > 0) return null;
-      const by = mode === "project" ? "the project steward" : "the user";
       const x = store.escalate({
         bindingId: b.id,
         kind: "approval",
@@ -1378,11 +1417,86 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           `Approve ${b.entityKey}'s spec${b.title === null ? "" : ` (${b.title})`}? The ready checklist is met and the ticket is ${b.ready.substantial === null ? "not yet judged, so treated as substantial" : "substantial"}${b.ready.why === null ? "" : ` (${b.ready.why})`}; ` +
           (gate.approvalStale ? "the spec has changed since its last approval." : "the current spec has no approval."),
         meanwhile: "Waiting: no implementation workers start until it is approved.",
-        route: mode === "project" ? "project" : "me",
+        route: "project",
         recommendation: null,
       });
-      bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on ${by}; asked for approval (${x.id})`);
-      return x.route === "project" ? x : null;
+      bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on the project steward; asked for approval (${x.id})`);
+      return x;
+    }
+
+    const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
+
+    /** Every pull request a binding observes: a pr binding's own entity, and a ticket's linked pulls. */
+    function observedPulls(b: Binding, observed: Observed): EntitySnapshot[] {
+      const own = observed.entity.pull === null ? [] : [observed.entity];
+      return b.kind === "ticket" ? [...own, ...observed.pulls] : own;
+    }
+
+    /**
+     * File, refresh and close the plugin's "needs you" items from a snapshot:
+     * `approve-spec` (the user's approval of the ready gate), and, per observed
+     * pull request, `approve-pr` and `merge`. The conditions are recomputed on
+     * every look, so the page only offers a button while it is true.
+     */
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean): Promise<void> {
+      const mode = playbook.ready?.approval ?? null;
+      const current = specHashFor(b, observed.entity);
+      const gate = gateState(playbook, b.ready, current);
+      const wantsSpec = mode === "me" && approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
+      if (wantsSpec) {
+        store.fileNeed({
+          bindingId: b.id,
+          kind: "approve-spec",
+          url: b.url ?? "",
+          what: `Approve ${b.entityKey}'s spec`,
+          how: "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes.",
+          data: { specHash: current },
+          filedBy: "plugin",
+        });
+      } else {
+        store.closeNeeds(b.id, "approve-spec", gate.passed ? "The spec is approved." : "The gate no longer waits on the user.");
+      }
+
+      for (const pull of observedPulls(b, observed)) {
+        const url = pull.url ?? pull.key;
+        const g = prGate(pull);
+        const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
+        if (closed) {
+          store.closeNeedByKey(b.id, "approve-pr", url, "The pull request is closed.");
+          store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
+          continue;
+        }
+        if (g.needsOwnerApproval) {
+          store.fileNeed({
+            bindingId: b.id,
+            kind: "approve-pr",
+            url,
+            what: `Approve ${pull.key} on GitHub`,
+            how: `Post the unsigned comment "Approved ${shortSha(g.headSha)} from the Stewards page" as you; that is what counts as your approval.`,
+            data: { sha: g.headSha },
+            filedBy: "plugin",
+          });
+        } else {
+          store.closeNeedByKey(b.id, "approve-pr", url, g.ownerApproved ? "Owner approval is present." : "The pull request is not waiting for an owner approval.");
+        }
+        if (g.gateMet) {
+          // A steward's own merge item (a refused merge) is left alone while a
+          // worker still runs; the plugin files its own only when none does.
+          if (!workerInFlight) {
+            store.fileNeed({
+              bindingId: b.id,
+              kind: "merge",
+              url,
+              what: `Merge ${pull.key}`,
+              how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
+              data: { sha: g.headSha },
+              filedBy: "plugin",
+            });
+          }
+        } else {
+          store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
+        }
+      }
     }
 
     /**
@@ -1691,6 +1805,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             nextAction: b.status?.nextAction ?? null,
             actor: b.status?.actor ?? null,
             escalations: store.openEscalations(b.id).length,
+            needs: store.openNeeds(b.id).length,
             ended: b.endedAt !== null,
           })),
         };
@@ -1763,6 +1878,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const questions = store.openQuestions(projectId);
         const asked = new Set(questions.map((q) => q.escalationId).filter((id) => id !== null));
         const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !asked.has(x.id)).map((x) => ({ x, b })));
+        const needs = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
@@ -1782,6 +1898,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return { id: q.id, question: q.question, context: q.context, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
             }),
             withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
+            needs,
             stewards: open.map((b) => ({
               key: b.entityKey,
               url: b.url,
@@ -1854,6 +1971,103 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
         return { ok: true, message: "Closed." };
+      },
+      // The page's buttons. Each action runs on the server as the connected user
+      // and unsigned, so it counts as a human action; each closes its item and
+      // wakes the binding's steward with the closure under "What changed".
+      async stewardsNeedAction({ needId, action, note }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("needs are actioned by the user, from the stewards page");
+        const need = store.need(needId);
+        if (need === null || need.status !== "open") return { ok: false, message: "That item is already closed." };
+        const b = store.binding(need.bindingId);
+        if (b === null) return { ok: false, message: "That binding is gone." };
+        const text = note === undefined || note === null || note.trim() === "" ? null : note.trim();
+        /** Close the item and wake the steward with what happened. */
+        const after = (closure: string): void => {
+          store.note(b.id, closure);
+          if (text !== null) store.addGuidance(b.id, text, "user");
+          scheduleReconcile(b.id);
+        };
+        const freshPull = async (): Promise<EntitySnapshot | null> => {
+          const entity = (await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          if (entity === null) return null;
+          const pulls = b.kind === "ticket" ? await linkedPulls(entity) : [];
+          return [entity, ...pulls].find((e) => (e.url ?? e.key) === need.url || e.key === need.url) ?? (entity.pull === null ? null : entity);
+        };
+
+        if (need.kind === "approve-spec") {
+          if (action !== "approve" && action !== "decline") return { ok: false, message: "Approve or decline the spec." };
+          const entity = (await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          if (entity === null) return { ok: false, message: "The ticket could not be read; try again." };
+          const hash = specHashFor(b, entity);
+          if (action === "approve") {
+            store.approve(b.id, { at: now(), specHash: hash, by: "user" }, `Approved by the user on the stewards page${text === null ? "" : `: "${text}"`}`, "user");
+            store.closeNeeds(b.id, "approve-spec", "Approved on the Stewards page.");
+            after(`The user approved ${b.entityKey}'s spec on the Stewards page${text === null ? "" : `: ${text}`}.`);
+            return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+          }
+          store.decline(b.id, hash, `Declined by the user on the stewards page${text === null ? "" : `: "${text}"`}`, "user");
+          store.closeNeeds(b.id, "approve-spec", "Declined on the Stewards page.");
+          after(`The user declined ${b.entityKey}'s spec on the Stewards page${text === null ? "" : `: ${text}`}.`);
+          return { ok: true, message: `Declined; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "approve-pr") {
+          const ref = parsePullRef(need.url);
+          if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
+          const pull = await freshPull();
+          const gate = pull === null ? null : prGate(pull);
+          if (pull === null || gate === null || !gate.needsOwnerApproval) return { ok: false, message: `Not now: ${gate?.missing ?? "the pull request has not been observed yet"}.` };
+          const body = `Approved ${gate.headSha ?? "?"} from the Stewards page`;
+          try {
+            await github.comment(ref.repo, ref.number, body);
+          } catch (error) {
+            return { ok: false, message: `GitHub refused the comment: ${errorMessage(error)}` };
+          }
+          store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
+          after(`The user approved ${pull.key} from the Stewards page: "${body}".`);
+          return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "merge") {
+          const ref = parsePullRef(need.url);
+          if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
+          const pull = await freshPull();
+          const gate = pull === null ? null : prGate(pull);
+          if (pull === null || gate === null || !gate.gateMet) return { ok: false, message: `The gate is not met: ${gate?.missing ?? "the pull request could not be read"}.` };
+          if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
+          const lane = gate.lane ?? "no-review";
+          const summary = `Merged: ${lane} lane, reviewer approved ${shortSha(gate.headSha)}, checks green${gate.ownerApproved ? ", approved by the owner" : ""}.`;
+          try {
+            await github.squashMerge(ref.repo, ref.number, `Merge ${pull.key}`, summary);
+            await github.comment(ref.repo, ref.number, summary).catch(() => undefined);
+          } catch (error) {
+            return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
+          }
+          store.closeNeedByKey(b.id, "merge", need.url, "Merged from the Stewards page.");
+          after(`${pull.key} was merged from the Stewards page. ${summary}`);
+          return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "configure") {
+          if (action !== "done") return { ok: false, message: "Press Done once the step is finished." };
+          store.closeNeedByKey(b.id, "configure", need.url, text === null ? "Done on the Stewards page." : `Done on the Stewards page: ${text}`);
+          after(`The user did ${need.what}${text === null ? "" : `: ${text}`}.`);
+          return { ok: true, message: `Marked done; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "provide-secret") {
+          if (action !== "provide" && action !== "done") return { ok: false, message: "Provide the secret, or mark it done." };
+          const threadId = typeof need.data.workerThreadId === "string" ? need.data.workerThreadId : null;
+          store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Provided on the Stewards page." : `Provided on the Stewards page: ${text}`);
+          after(`The user provided ${typeof need.data.variable === "string" ? need.data.variable : need.what}${text === null ? "" : `: ${text}`}.`);
+          return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId };
+        }
+
+        // `decide` is the question mechanism; a raw item of that kind just closes.
+        store.closeNeedByKey(b.id, need.kind, need.url, text === null ? "Closed on the Stewards page." : `Closed on the Stewards page: ${text}`);
+        after(`${need.kind} item ${need.id} was closed on the Stewards page${text === null ? "" : `: ${text}`}.`);
+        return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
       },
     });
 
@@ -1996,6 +2210,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .optional()
           .describe("The ready gate as you judge it now: every checklist item from the wake, by its number, met or not, and whether the ticket is substantial."),
         voidApproval: z.boolean().optional().describe("The spec changed materially since approval: void it and ask again."),
+        needs: z
+          .array(
+            z.object({
+              kind: z.enum(NEEDS_KINDS).describe("approve-spec, approve-pr, merge, decide, provide-secret, or configure."),
+              url: z.string().trim().max(500).optional().describe("The link: the entity, the pull request, the external page, or the worker thread."),
+              what: z.string().trim().min(1).max(300).describe("One line saying what the user must do."),
+              how: z.string().trim().max(4000).optional().describe("The steps, in Markdown."),
+              variable: z.string().trim().max(200).optional().describe("provide-secret: the variable name."),
+              purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
+              worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
+              page: z.string().trim().max(500).optional().describe("configure: the external page where the step happens."),
+            }),
+          )
+          .max(20)
+          .optional()
+          .describe("Things only the user can do. They appear on the Stewards page with their buttons, and are deduplicated by (binding, kind, url), so re-reporting updates the wording."),
         escalate: z
           .object({
             kind: z.enum(ESCALATION_KINDS).describe("blocked, decision, scope (the scope must change), conflict (the entity's state contradicts the playbook), or stuck."),
@@ -2047,6 +2277,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             };
           }
           if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now() };
+          // A status that waits on the user, the owner or a human has to say so
+          // with an item, not only in prose: the item is what reaches the page.
+          if (input.blockedOn !== undefined && namesUserAsBlocker(input.blockedOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
+            return toolError(
+              new Error(
+                `blockedOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) and it appears on the Stewards page; blockedOn stays for third parties.`,
+              ),
+            );
+          }
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
@@ -2083,6 +2322,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
+          for (const n of input.needs ?? []) {
+            store.fileNeed({
+              bindingId: b.id,
+              kind: n.kind,
+              url: n.url ?? n.worker ?? b.url ?? "",
+              what: n.what,
+              how: n.how ?? null,
+              data: {
+                ...(n.variable === undefined ? {} : { variable: n.variable }),
+                ...(n.purpose === undefined ? {} : { purpose: n.purpose }),
+                ...(n.worker === undefined ? {} : { workerThreadId: n.worker }),
+                ...(n.page === undefined ? {} : { page: n.page }),
+              },
+              filedBy: "steward",
+            });
+          }
+          if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
           if (raised !== null && !(raised.route === "project" && requested !== null)) await deliver(b, raised);
           if (requested !== null) await wakeProject(b.projectId, raised === null ? `approval requested for ${b.entityKey}` : `escalation and approval request from ${b.entityKey}`, { digestDue: false });
           if (moved && b.parentBindingId !== null) {
@@ -2099,13 +2355,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
           }
           const request = store.openEscalations(b.id).find((x) => x.kind === "approval");
+          const specNeed = store.openNeeds(b.id).find((n) => n.kind === "approve-spec");
           if (request !== undefined) {
-            gateNote +=
-              request.route === "me"
-                ? ` Approval of the spec is requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-                : ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
+            gateNote += ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
+          } else if (specNeed !== undefined) {
+            gateNote += ` Approval of the spec is requested from the user, on the Stewards page (${specNeed.id}): they press Approve or Decline there.`;
+          }
+          if (request !== undefined || specNeed !== undefined) {
             gateNote += " Do not ask the user again; it is listed on the Stewards page.";
-            if (asksForOpenApproval(status, store.openEscalations(b.id)) !== null) gateNote += " This report asks for an approval that is already open: a playbook violation, shown by bb stewards show.";
+            if (asksForOpenApproval(status, store.openEscalations(b.id), store.openNeeds(b.id)) !== null) gateNote += " This report asks for an approval that is already open: a playbook violation, shown by bb stewards show.";
           }
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
@@ -2304,6 +2562,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (approval !== null) {
             const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
             store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
@@ -2349,13 +2608,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
     });
 
+    /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+      let actionable = true;
+      let why: string | null = null;
+      let threadId: string | null = null;
+      if (n.kind === "approve-pr" || n.kind === "merge") {
+        const observed = b.lastSnapshot;
+        const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
+        const gate = target === null ? null : prGate(target);
+        if (n.kind === "approve-pr") {
+          actionable = gate?.needsOwnerApproval ?? false;
+          why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
+        } else {
+          const working = anyWorkerInFlight(store.workers(b.id));
+          actionable = (gate?.gateMet ?? false) && !working;
+          why = actionable ? null : working ? "a worker is still running" : (gate?.missing ?? "the pull request has not been observed yet");
+        }
+      } else if (n.kind === "provide-secret") {
+        // Always actionable: with a worker named, the page opens it; without,
+        // the action tells the steward to start the worker that requests it.
+        threadId = typeof n.data.workerThreadId === "string" ? n.data.workerThreadId : null;
+      }
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: n.url === "" ? null : n.url, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
+    }
+
     function formatBindings(rows: Binding[]): string {
       if (rows.length === 0) return "No bindings.";
       return rows
         .map((b) => {
           const s = b.status;
           const open = store.openEscalations(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), unheardWait(s, open), asksForOpenApproval(s, open)].filter((f) => f !== null);
+          const needs = store.openNeeds(b.id);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -2584,14 +2869,72 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
-              const detail = { binding: b, escalations: store.escalations(b.id), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey) };
+              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(detail) };
               const lines = [formatBindings([b]), "", `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
               lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
               for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+              for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
               return { exitCode: 0, stdout: lines.join("\n") };
+            },
+          }),
+
+          needs: cliCommand({
+            summary: "Things waiting on the user: links and the action each supports",
+            description: "The same items as the Stewards page's \"Waiting on you\" section. `done <id>` closes one from a thread.",
+            options: { all: { type: "boolean", description: "Include closed items" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = input.options.all ? store.allNeedsForProject(projectId) : store.openNeedsForProject(projectId);
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
+              if (rows.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
+              return {
+                exitCode: 0,
+                stdout: rows
+                  .map((n) => {
+                    const b = store.binding(n.bindingId);
+                    const view = b === null ? null : needView(n, b);
+                    return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                  })
+                  .join("\n"),
+              };
+            },
+          }),
+
+          done: cliCommand({
+            summary: "Close a waiting item from a thread",
+            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed.",
+            positionals: [{ name: "id", description: "The item id (need_…) or question id (qst_…)", required: true }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const id = input.positionals.id;
+              // A question is the `decide` kind's mechanism; close it the same way.
+              const q = store.question(id);
+              if (q !== null) {
+                if (q.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+                const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+                store.answer(q.id, "Closed from a thread.", "user");
+                if (x !== null) {
+                  const b = store.binding(x.bindingId);
+                  if (b !== null) {
+                    store.note(b.id, `Question ${q.id} was closed from a thread.`);
+                    scheduleReconcile(b.id);
+                  }
+                }
+                return { exitCode: 0, stdout: `Closed ${id}.` };
+              }
+              const n = store.need(id);
+              if (n === null) throw new PluginCliError(`No waiting item ${id}.`, { code: "need_not_found", hint: "bb stewards needs lists them." });
+              if (n.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+              const b = store.binding(n.bindingId);
+              store.closeNeed(n.id, "Closed from a thread.");
+              if (b !== null) {
+                store.note(b.id, `${n.kind} item ${n.id} was closed from a thread.`);
+                scheduleReconcile(b.id);
+              }
+              return { exitCode: 0, stdout: `Closed ${id}.` };
             },
           }),
 
