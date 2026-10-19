@@ -16,7 +16,7 @@ on its own. The queue notifies; you dispatch.
   `bb review-watch` CLI, RPC for the page, and the realtime signal that keeps
   every open page current.
 - `app.tsx` — the **Reviews** page in the left sidebar
-  (`app.slots.navPanel`), a pending count on its navigation entry, two review counts in the
+  (`app.slots.navPanel`), two review counts on its sidebar row and
   thread header, and a hover preview of up to five review requests.
 - `src/types.ts` — the shared vocabulary: `Rule`, `PullRequest`, `QueueItem`.
 - `src/github.ts` — the GitHub client and its two transports, a personal access
@@ -50,11 +50,9 @@ item. Every command that takes a key accepts an unambiguous prefix.
 ## Notifications
 
 BB exposes no public SDK route for a plugin to raise a user notification. The
-navigation badge shows the total number of pending initial reviews and
-follow-ups. It uses a warning tone when follow-ups are waiting and clears when
-the queue is empty. This requires a BB server with Plugin SDK 0.6.53 or newer.
-The thread-header badge keeps both counts in separate colored chips, including
-zero counts. Hover over the header badge to see labeled counts,
+sidebar and thread-header badges show `review-requested` and
+`review-followup` items in two colored chips. Each badge shows both counts,
+including zero counts. Hover over the header badge to see labeled counts,
 preview up to five review requests, and open the full **Reviews** page. The
 realtime signal keeps these surfaces current.
 
@@ -282,5 +280,5 @@ Confused by the API, or need something the types don't explain? Clone the BB
 repo and read the source: <https://github.com/get-bb/bb>.
 
 The Reviews page groups rows alphabetically by GitHub organization, then by
-area. Organization and area checkboxes select only actionable reviews in that
-group. Archived reviews also keep their organization headings.
+area. Selection controls appear on individual rows and in one select-all header;
+organization and area headings stay plain. Shift-click selects a range. Archived reviews also keep their organization headings.

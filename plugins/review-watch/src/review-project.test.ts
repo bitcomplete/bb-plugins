@@ -102,17 +102,19 @@ it("starts an individual review in the project selected in the dialog", async ()
   } finally { slot.lifecycle.unmount(); }
 });
 
-it("groups reviews by organization and scopes organization selection to its own rows", async () => {
+it("groups reviews by organization and keeps selection controls on rows and the select-all header", async () => {
   const slot = await setup();
   try {
     const parsley = within(await slot.findByRole("region", { name: "parsleyhealth reviews" }));
-    expect(parsley.getByLabelText("Select parsleyhealth / catalog")).toBeTruthy();
+    expect(parsley.getByRole("heading", { level: 4 })).toHaveProperty("textContent", expect.stringContaining("catalog"));
+    expect(slot.getAllByRole("checkbox")).toHaveLength(3);
+    expect(parsley.getAllByRole("checkbox")).toHaveLength(1);
     expect(parsley.queryByLabelText("Select bitcomplete/hiringloop#2")).toBeNull();
-    fireEvent.click(parsley.getByLabelText("Select organization parsleyhealth"));
+    fireEvent.click(parsley.getByLabelText("Select parsleyhealth/sage#1"));
     expect(slot.getByLabelText("Select parsleyhealth/sage#1")).toHaveProperty("checked", true);
     expect(slot.getByLabelText("Select bitcomplete/hiringloop#2")).toHaveProperty("checked", false);
     expect(slot.getByRole("button", { name: /Review 1/ })).toBeTruthy();
-    fireEvent.click(parsley.getByLabelText("Clear organization parsleyhealth"));
+    fireEvent.click(parsley.getByLabelText("Select parsleyhealth/sage#1"));
     expect(slot.queryByLabelText("Selection")).toBeNull();
   } finally { slot.lifecycle.unmount(); }
 });

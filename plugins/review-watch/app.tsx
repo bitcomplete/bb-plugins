@@ -11,7 +11,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalBadge, PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
+import type { PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { groupByOrganization, type AreaGroup } from "./src/areas";
 import type { QueueItem, Rule } from "./src/types";
@@ -183,15 +183,19 @@ function QueueCountChip({
 function QueueCountChips({
   initial,
   followups,
+  sidebar = false,
 }: {
   initial: number;
   followups: number;
+  sidebar?: boolean;
 }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full border border-border bg-muted tabular-nums",
-        "gap-1.5 px-1.5 py-0.5",
+        sidebar
+          ? "min-w-[3rem] justify-center gap-0.5 px-0.5 py-0.5"
+          : "gap-1.5 px-1.5 py-0.5",
       )}
     >
       <QueueCountChip
@@ -353,29 +357,14 @@ function ScopeCheckbox({
 /** An area's title, then its rows in a card under it. */
 export function AreaSection({
   area,
-  picked,
-  onPickScope,
   children,
-  organization,
 }: {
-  organization?: string;
   area: AreaGroup;
-  picked: ReadonlySet<string>;
-  onPickScope: (keys: readonly string[], select: boolean) => void;
   children: ReactNode;
 }) {
-  const Heading = organization ? "h4" : "h3";
   return (
     <section className="min-w-0" aria-label={area.label}>
-      {/* ml-9 puts the box over the rows' boxes (the card's margin, border, and
-          padding plus the row's pl-2), and gap-2 puts the label over their PR column. */}
-      <Heading className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
-        <ScopeCheckbox
-          keys={area.items.filter(canBatchReview).map((item) => item.key)}
-          picked={picked}
-          label={organization ? `${organization} / ${area.label}` : area.label}
-          onPick={onPickScope}
-        />
+      <h4 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
         <span className="min-w-0 truncate">
           {area.label}
           {area.repos.join(", ") === area.label ? null : (
@@ -383,7 +372,7 @@ export function AreaSection({
           )}
         </span>
         <span className="font-normal tabular-nums">{area.items.length}</span>
-      </Heading>
+      </h4>
       {/* The card's edge lines up with the section's title, which keeps its rows where they were, under the area's title. */}
       <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>{children}</ul>
     </section>
@@ -551,14 +540,12 @@ function ReviewsPage() {
               ) : (
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-7 pb-1.5 pt-0.5">
                   {organizations.map((organization) => <section key={organization.label} aria-label={`${organization.label} reviews`} className="min-w-0">
-                    <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-1 pt-2 text-[12px] font-semibold">
-                      <ScopeCheckbox keys={organization.items.filter(canBatchReview).map((item) => item.key)} picked={picked}
-                        label={`organization ${organization.label}`} onPick={pickScope} />
+                    <h3 className="ml-[19px] flex min-w-0 items-center gap-2 pb-1 pt-2 text-[12px] font-semibold">
                       <span className="min-w-0 truncate">{organization.label}</span>
                       <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
                     </h3>
                     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
-                    {organization.areas.map((area) => <AreaSection key={area.key} area={area} organization={organization.label} picked={picked} onPickScope={pickScope}>
+                    {organization.areas.map((area) => <AreaSection key={area.key} area={area}>
                       {area.items.map((item) => (
                         <ReviewRow
                           key={item.key}
@@ -642,15 +629,27 @@ function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
   return { items: activeReviews, lastPoll };
 }
 
-function useQueuedBadge(): ExperimentalBadge | null {
+/**
+ * The count on the sidebar row. No public SDK API lets a plugin raise a user
+ * notification, so for a notify-only plugin this badge and the realtime signal
+ * are the notification.
+ */
+function QueuedBadge() {
   const { items } = useActiveReviewItems();
   const initial = items.filter((item) => item.rule === "review-requested").length;
   const followups = items.filter((item) => item.rule === "review-followup").length;
-  return items.length > 0 ? {
-    count: items.length,
-    tone: followups > 0 ? "warning" : "neutral",
-    label: `${initial} initial reviews, ${followups} follow-up reviews`,
-  } : null;
+  return (
+    <span
+      role="img"
+      aria-label={`${initial} initial reviews, ${followups} follow-up reviews`}
+    >
+      <QueueCountChips
+        initial={initial}
+        followups={followups}
+        sidebar
+      />
+    </span>
+  );
 }
 
 /**
@@ -759,7 +758,7 @@ export default definePluginApp((app) => {
     icon: "GitPullRequest",
     path: REVIEWS_PATH,
     component: ReviewsPage,
-    experimental_useBadge: useQueuedBadge,
+    experimental_sidebarAccessory: QueuedBadge,
   });
   app.slots.experimental_threadHeaderAction({
     id: "queued-count",
