@@ -50,7 +50,7 @@ import {
 } from "./source-contract.js";
 import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type DigestRecords, type WakeReason } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -848,6 +848,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** Wake the steward, spawning its thread on the first wake. */
     async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<void> {
       const gate = gateState(playbook, b.ready, specHash(observed.entity, b.threadId));
+      const workerQuestions = await collectWorkerQuestions(b);
       const text = formatWake({
         reason,
         binding: b,
@@ -857,6 +858,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations: store.openEscalations(b.id),
         routedToMe: routedTo(b),
         workers: store.workers(b.id),
+        workerQuestions,
         children: store.children(b.id).map((c) => ({ binding: c, openEscalations: store.openEscalations(c.id) })),
         workerFlags: [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
         changes,
@@ -1457,19 +1459,92 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /**
+     * Every thread that belongs to a worker of the binding: the workers
+     * themselves and, recursively, the threads they started (a worker's
+     * reviewer). The plugin records only the workers, so their children are
+     * read from bb.
+     */
+    async function workerThreads(b: Binding): Promise<string[]> {
+      const seen = new Set<string>();
+      const queue = store.workers(b.id).map((w) => w.threadId);
+      while (queue.length > 0) {
+        const id = queue.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        try {
+          const children = await bb.sdk.threads.list({ parentThreadId: id, archived: false, limit: 200 });
+          for (const c of children) queue.push(c.id);
+        } catch (error) {
+          bb.log.warn(`stewards: could not list the threads under worker ${id}: ${errorMessage(error)}`);
+        }
+      }
+      return [...seen];
+    }
+
+    /**
+     * Whether the binding's workers still have work. A worker is unfinished
+     * until its record says `finished` or `stopped` (a still-running or failed
+     * one), and a worker whose own turn ended may still have a running or
+     * pending child: the build-tickets loop is an idle worker with a running
+     * reviewer, and archiving the steward would archive the worker and,
+     * through it, the reviewer (BB-14).
+     */
+    async function workersHaveWork(b: Binding): Promise<boolean> {
+      if (store.workers(b.id).some((w) => w.status !== "finished" && w.status !== "stopped")) return true;
+      for (const id of await workerThreads(b)) {
+        const info = await threadInfo(id).catch(() => null);
+        if (info === null || info.deletedAt !== null || info.archivedAt !== null) continue;
+        if (busy(info.status)) return true;
+      }
+      return false;
+    }
+
+    /**
      * Archive a steward whose wake turn ended waiting on someone else, so the
      * sidebar holds only stewards with something to do. Its binding stays:
-     * the next wake brings it back (sendTo). Not while a worker runs or an
-     * escalation is open, which the user should still see.
+     * the next wake brings it back (sendTo). Not while a worker still has work
+     * (workersHaveWork), or an escalation is open, which the user should still
+     * see.
      */
     async function archiveWaiting(b: Binding): Promise<void> {
       store.patch(b.id, { archiveWhenIdle: false });
       if (b.threadId === null || b.endedAt !== null || b.ending !== null) return;
-      if (store.workers(b.id).some((w) => w.status === "running") || store.openEscalations(b.id).length > 0) return;
+      if ((await workersHaveWork(b)) || store.openEscalations(b.id).length > 0) return;
       const info = await threadInfo(b.threadId).catch(() => null);
       if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) return;
       await quietly(`archive ${b.entityKey}'s waiting steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
       bb.log.info(`stewards: ${b.entityKey} waits on others; archived its steward until the next wake`);
+    }
+
+    /**
+     * The questions the binding's workers ended their last turn with. A
+     * finished-but-archived worker is brought back so the steward's
+     * `bb thread tell` can reach it; one whose thread is gone is reported as
+     * gone, needing a fresh worker (BB-14).
+     *
+     * The plugin cannot catch the tell itself: bb rejects a message to an
+     * archived thread (409) before the `message.dispatch` hook runs, so the
+     * worker is brought back here, when its question is surfaced, instead.
+     */
+    async function collectWorkerQuestions(b: Binding): Promise<WorkerQuestion[]> {
+      const out: WorkerQuestion[] = [];
+      for (const w of store.workers(b.id)) {
+        if (w.status !== "finished") continue;
+        const question = workerQuestion(w.result);
+        if (question === null) continue;
+        const info = await threadInfo(w.threadId).catch(() => null);
+        if (info === null || info.deletedAt !== null) {
+          out.push({ threadId: w.threadId, question, state: "gone" });
+          continue;
+        }
+        if (info.archivedAt !== null) {
+          await quietly(`unarchive worker ${w.threadId}`, () => bb.sdk.threads.unarchive({ threadId: w.threadId }));
+          out.push({ threadId: w.threadId, question, state: "revived" });
+          continue;
+        }
+        out.push({ threadId: w.threadId, question, state: "live" });
+      }
+      return out;
     }
 
     /**

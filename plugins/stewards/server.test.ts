@@ -110,10 +110,15 @@ function world() {
           ...(t.hostId === undefined ? {} : { environment: { hostId: t.hostId } }),
         };
       },
-      list: async ({ sectionId, archived }: { sectionId?: string; archived?: boolean }) =>
+      list: async ({ sectionId, archived, parentThreadId }: { sectionId?: string; archived?: boolean; parentThreadId?: string }) =>
         [...threads.entries()]
-          .filter(([, t]) => (sectionId === undefined || t.sectionId === sectionId) && (archived !== false || t.archivedAt === null))
-          .map(([id]) => makeThreadResponse({ id })),
+          .filter(
+            ([, t]) =>
+              (sectionId === undefined || t.sectionId === sectionId) &&
+              (archived !== false || t.archivedAt === null) &&
+              (parentThreadId === undefined || (t.parentThreadId ?? null) === parentThreadId),
+          )
+          .map(([id, t]) => makeThreadResponse({ id, status: t.status as never, archivedAt: t.archivedAt, parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null })),
       archive: async ({ threadId }: { threadId: string }) => {
         threads.get(threadId)!.archivedAt = 1;
         return {};
@@ -172,12 +177,14 @@ async function setup() {
   };
   const list = async () => ((await harness.callRpc("stewardsList", { projectId: "p1", all: true })) as { bindings: Array<{ key: string; kind: string; threadId: string | null; ended: boolean; escalations: number; summary: string | null }> }).bindings;
   const idle = async (threadId: string, lastAssistantText: string | null = null) => {
+    const t = w.threads.get(threadId);
+    if (t !== undefined) t.status = "idle";
     await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: threadId }), lastAssistantText });
     await flush();
   };
   /** A thread a steward started with `bb thread spawn --parent-self`. */
   const created = async (id: string, parent: string, title = "Implement") => {
-    w.threads.set(id, { status: "active", archivedAt: null });
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null }) });
     await flush();
   };
@@ -1245,6 +1252,65 @@ describe("stewards waiting on others", () => {
     // Compaction ends in another idle.
     await t.idle(steward);
     expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+  });
+
+  it("does not archive while an idle worker's child is still running, and names the worker's question next wake (BB-11)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    // The build-tickets loop: the worker ended its turn to wait, and the
+    // reviewer it started is still running.
+    await t.created("thr_w1", steward);
+    await t.created("thr_r1", "thr_w1", "Review the pull request");
+    await t.idle("thr_w1", "The fix is pushed. Should I bring the reviewer back once it finishes?");
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
+    expect(t.threads.get("thr_r1")!.status).toBe("active");
+
+    // The steward reports that someone else is next and ends its turn: it must
+    // not be archived, or bb would archive the worker and, through it, the
+    // reviewer.
+    expect((await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward)).error).toBe(false);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.harness.sdk.callsTo("threads.archive").map(([args]) => (args as { threadId: string }).threadId)).not.toContain(steward);
+
+    // The next wake names the worker's question ahead of everything else.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/## 5\. What changed since your last turn\n\n- \*\*Worker thr_w1 asked:\*\* The fix is pushed\. Should I bring the reviewer back once it finishes\?/u);
+    expect(wake).toMatch(/Answer it with `bb thread tell thr_w1 <answer>`, or escalate it, before anything else\./u);
+    expect(wake.indexOf("Worker thr_w1 asked:")).toBeLessThan(wake.indexOf("1 new comment from Sam"));
+  });
+
+  it("brings back a finished-but-archived worker whose question is surfaced, and says when the worker is gone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Done. Should I open the follow-up ticket?");
+
+    // Something archived the worker since it asked; the wake brings it back so
+    // the steward's `bb thread tell` can reach it.
+    t.threads.get("thr_w1")!.archivedAt = 1;
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    const revived = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(revived).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
+    expect(revived).toMatch(/had been archived and is back now/u);
+
+    // A worker whose thread is gone is reported as gone, needing a fresh one.
+    t.threads.delete("thr_w1");
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    const gone = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(gone).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
+    expect(gone).toMatch(/Its thread is gone/u);
+    expect(gone).toMatch(/start a fresh worker/u);
   });
 });
 
