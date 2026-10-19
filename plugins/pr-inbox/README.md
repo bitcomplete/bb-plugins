@@ -24,9 +24,10 @@ The page uses the same compact, area-grouped layout as Reviews. Its
 branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
-The header shows the number of PRs on Your turn. The same count is registered
-for sidebar badges; it appears there when the BB server supports sidebar
-accessories.
+The header and navigation badge show the number of PRs on Your turn. The
+navigation badge clears when nothing needs your response. This requires a BB
+server with Plugin SDK 0.6.53 or newer; reinstalling only the desktop app does
+not update a remote server.
 
 Choose one PR's **Address**, or select several rows and choose **Address N**.
 Group checkboxes select an area; Shift-click selects a range. Press **b** to
