@@ -12,6 +12,23 @@ import type { Binding, Escalation, Observed, Question, Worker } from "./store.js
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
+
+/**
+ * What a steward must never ask for: an open escalation or approval request is
+ * already on the user's Stewards page, and repeating it in a reply is noise.
+ */
+const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. Do not ask for them in your reply.";
+
+/**
+ * The rules that hold on every wake, whatever the playbook: the generic things
+ * a steward got wrong without them. They mirror the `stewards` skill and the
+ * default playbooks, so a change here belongs there too.
+ */
+const STANDING_RULES = [
+  "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
+  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing item for it, and the worker takes the value.",
+  "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up.",
+];
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
@@ -147,8 +164,8 @@ function gateLines(input: WakeInput): string[] {
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
       : request.route === "me"
-        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it.`;
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE}`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE}`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
@@ -187,6 +204,11 @@ export function formatWake(input: WakeInput): string {
     "    EOF",
     "",
     "Follow it up with `bb thread tell <id> <message>`. You are woken when a worker finishes, with its final message.",
+    "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
+    "",
+    "**Standing rules.**",
+    "",
+    ...STANDING_RULES,
   );
 
   out.push("", "## 2. Ready gate", "", ...gateLines(input));
@@ -223,6 +245,7 @@ export function formatWake(input: WakeInput): string {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
     }
+    out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
 
   const snapshot = out.splice(0);
