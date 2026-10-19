@@ -113,17 +113,25 @@ it("keeps thread, clear-attempt, dismissal, and restore actions available in com
 
 it("registers a sidebar badge that counts actionable feedback and follows realtime updates", async () => {
   const app = await loadPluginApp(() => import("./app.js"));
-  const badge = app.navPanels[0]?.experimental_sidebarAccessory;
-  if (!badge) throw new Error("Missing My PRs sidebar badge");
+  const useBadge = app.navPanels[0]?.experimental_useBadge;
+  if (!useBadge) throw new Error("Missing My PRs sidebar badge");
   let view: View = { project: "project-test", poll: null, rows: [
     row(1), { ...row(2), dismissed: true }, { ...row(3), turn: null }, { ...row(4), holdUntil: "2099-01-01T12:00:00Z" },
   ] };
-  const slot = renderSlot({ component: badge }, {}, { rpc: { inbox_get: () => view } });
+  function BadgeProbe() { return <output aria-label="Navigation badge">{JSON.stringify(useBadge?.())}</output>; }
+  const slot = renderSlot({ component: BadgeProbe }, {}, { rpc: { inbox_get: () => view } });
   cleanups.push(() => slot.lifecycle.unmount());
-  await slot.findByText("1");
+  await waitFor(() => expect(JSON.parse(slot.getByLabelText("Navigation badge").textContent ?? "null")).toEqual({
+    count: 1, tone: "warning", label: "1 pull request waiting for your response",
+  }));
   view = { ...view, rows: [row(1), row(2), { ...row(3), turn: null }] };
   await slot.behavior.emitRealtime("inbox-changed", {});
-  await slot.findByText("2");
+  await waitFor(() => expect(JSON.parse(slot.getByLabelText("Navigation badge").textContent ?? "null")).toEqual({
+    count: 2, tone: "warning", label: "2 pull requests waiting for your response",
+  }));
+  view = { ...view, rows: [] };
+  await slot.behavior.emitRealtime("inbox-changed", {});
+  await waitFor(() => expect(slot.getByLabelText("Navigation badge").textContent).toBe("null"));
   expect(slot.inspection.rpcCalls.every((call) => call.method === "inbox_get")).toBe(true);
 });
 
