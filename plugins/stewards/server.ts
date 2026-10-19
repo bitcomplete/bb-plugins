@@ -29,6 +29,7 @@ import {
   playbookNameFor,
   playbookPath,
   playbookStates,
+  STAGES,
   type BindingKind,
   type EscalationKind,
   type ModelSpec,
@@ -209,6 +210,8 @@ export const rpcContract = defineRpcContract({
           name: z.string(),
           paused: z.boolean(),
           projectStewardThreadId: z.string().nullable(),
+          /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
+          stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
           questions: z.array(
             z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
@@ -1227,7 +1230,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
       await sendTo(
         threadId,
-        formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, ...(records === undefined ? {} : { records }) }),
+        formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) }),
       );
     }
 
@@ -1591,6 +1594,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             name: picked.name,
             paused: (await settings.get()).paused,
             projectStewardThreadId: row.threadId,
+            stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             questions: questions.map((q) => {
               const b = q.bindingId === null ? null : store.binding(q.bindingId);
@@ -1915,7 +1919,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           // Questions to the user are the project steward's, and kept until answered.
           const projectOf = store.projectByThread(threadId)?.projectId ?? null;
-          let closing: { question: Question; answer: string } | null = null;
+          let closing: { question: Question; answer: string; guidanceDropped: boolean } | null = null;
           if (input.answer !== undefined && resolve?.startsWith("qst_") !== true) return toolError(new Error('answer closes a question: give it with resolve: "<question id>".'));
           if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
             return toolError(new Error("Only the project steward keeps questions to the user; a steward escalates with steward_report."));
@@ -1933,10 +1937,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               guidance ??= answer;
               bindingRef ??= x.bindingId;
             } else {
-              closing = { question: q, answer };
+              closing = { question: q, answer, guidanceDropped: false };
               resolve = undefined;
               if (input.guidance !== undefined && (input.answer !== undefined || q.bindingId !== null)) bindingRef ??= q.bindingId ?? undefined;
               else guidance = undefined;
+              if (guidance !== undefined && bindingRef === undefined) {
+                // A question about the project as a whole: closed all the same; guidance belongs to a binding.
+                guidance = undefined;
+                closing.guidanceDropped = true;
+              }
             }
           }
 
@@ -1949,7 +1958,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (input.ask !== undefined && target !== null && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
           if (closing !== null) {
             store.answer(closing.question.id, closing.answer, threadId);
-            done.push(`closed ${closing.question.id}`);
+            done.push(`closed ${closing.question.id}${closing.guidanceDropped ? " (guidance not saved: it is kept per binding, so name one with binding to give it)" : ""}`);
           }
           if (input.ask !== undefined) {
             const q = store.ask({ projectId: projectOf!, bindingId: target?.id ?? null, escalationId: null, question: input.ask.question, context: input.ask.context ?? null });
@@ -1969,13 +1978,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const route = nextRoute(target, x.route);
             const recommendation = input.recommendation ?? x.recommendation;
             store.reroute(x.id, route, recommendation);
+            // Kept as a question to the user too, which closes when the escalation is resolved. Made
+            // before the await below, so the escalation cannot be resolved in between and leave it open.
+            const q =
+              route !== "me"
+                ? null
+                : store.ask({
+                    projectId: target.projectId,
+                    bindingId: target.id,
+                    escalationId: x.id,
+                    question: x.question,
+                    context: [`A ${x.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${x.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                  });
             await deliver(target, store.escalation(x.id)!);
-            if (route === "me") {
-              // Kept as a question to the user too, which closes when the escalation is resolved.
-              const context = [`A ${x.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${x.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" ");
-              const q = store.ask({ projectId: target.projectId, bindingId: target.id, escalationId: x.id, question: x.question, context });
-              done.push(`forwarded ${x.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
-            } else done.push(`forwarded ${x.id} to the project steward`);
+            if (q !== null) done.push(`forwarded ${x.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
+            else done.push(`forwarded ${x.id} to the project steward`);
           }
 
           if (!mayDirect(threadId, target)) {

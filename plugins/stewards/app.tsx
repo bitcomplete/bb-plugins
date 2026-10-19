@@ -313,12 +313,12 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
 
 // ---- The stewards page -------------------------------------------------------------------------
 
-const STAGES: Array<{ stage: string | null; title: string }> = [
-  { stage: "spec", title: "Spec" },
-  { stage: "build", title: "Build" },
-  { stage: "review", title: "Review" },
-  { stage: null, title: "No stage" },
-];
+/** The stage groups, in the playbook schema's order (from the server), then any other stage seen, then none. */
+function stageGroups(stages: string[], seen: Array<string | null>): Array<{ stage: string | null; title: string }> {
+  const order = [...stages, ...seen.filter((s): s is string => s !== null && !stages.includes(s))];
+  const groups: Array<{ stage: string | null; title: string }> = [...new Set(order)].map((stage) => ({ stage, title: stage.charAt(0).toUpperCase() + stage.slice(1) }));
+  return [...groups, { stage: null, title: "No stage" }];
+}
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
   return (
@@ -446,7 +446,7 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         {b.stewards.length === 0 ? (
           <None>No open stewards. Label a Linear ticket or pull request to adopt it.</None>
         ) : (
-          STAGES.map(({ stage, title }) => {
+          stageGroups(b.stages, b.stewards.map((s) => s.stage)).map(({ stage, title }) => {
             const rows = b.stewards.filter((s) => (s.stage ?? null) === stage);
             if (rows.length === 0) return null;
             return (

@@ -5,6 +5,7 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
+import { localParts } from "./nightly.js";
 import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Observed, Question, Worker } from "./store.js";
@@ -252,7 +253,10 @@ export function formatProjectWake(input: {
   questions?: Array<{ question: Question; about: Binding | null }>;
   /** With digestDue: the records the digest is written from. */
   records?: DigestRecords;
+  /** The project's nightly time zone, which dates are given in; UTC when absent. */
+  timeZone?: string;
 }): string {
+  const day = dayIn(input.timeZone ?? "UTC");
   const out: string[] = [`# Project steward: ${input.reason}`, ""];
   if (input.notes.length > 0) out.push(...input.notes.map((n) => `- ${n}`), "");
   if (input.problems.length > 0) out.push("## Configuration problems", "", ...input.problems.map((p) => `- ${p}`), "");
@@ -303,7 +307,7 @@ export function formatProjectWake(input: {
   }
   const bindings = out.splice(0);
   if (input.digestDue) {
-    if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions));
+    if (input.records !== undefined) out.push("", ...formatRecords(input.records, questions, input.timeZone));
     out.push(
       "",
       "Adjust priority and holds with steward_update first if they need it. Then reply with the morning digest, and nothing else: what moved overnight, what is waiting on the user, what is stuck (including any binding flagged as waiting with no open escalation: find out what it waits for), and today's priorities. " +
@@ -314,7 +318,8 @@ export function formatProjectWake(input: {
   return fit(head, bindings, out);
 }
 
-const day = (ms: number) => iso(ms).slice(0, 10);
+/** The calendar date of a moment in a time zone, so "asked" and "since" match the user's day. */
+const dayIn = (timeZone: string) => (ms: number) => localParts(ms, timeZone).date;
 const oneLine = (text: string, max = 400) => {
   const flat = text.replace(/\s+/gu, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
@@ -353,7 +358,8 @@ function capped(lines: string[], none: string): string[] {
  * The project steward writes prose on top; after a compaction this is what
  * it starts from rather than its summary of itself.
  */
-export function formatRecords(r: DigestRecords, questions: Array<{ question: Question; about: Binding | null }>): string[] {
+export function formatRecords(r: DigestRecords, questions: Array<{ question: Question; about: Binding | null }>, timeZone = "UTC"): string[] {
+  const day = dayIn(timeZone);
   const out: string[] = [
     `## The record since ${iso(r.since)}`,
     "",

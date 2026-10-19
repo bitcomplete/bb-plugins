@@ -66,6 +66,18 @@ describe("the nightly prompt", () => {
     expect(wake.indexOf("## The record since")).toBeLessThan(wake.indexOf("reply with the morning digest"));
   });
 
+  it("gives dates in the project's nightly time zone", () => {
+    const { s } = world();
+    const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });
+    const questions = [{ question: q, about: null }];
+    const records: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], held: [] };
+    const wake = (timeZone?: string) => formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions, records, ...(timeZone === undefined ? {} : { timeZone }) });
+    // 05:00Z on the 18th is still the evening of the 17th in Los Angeles.
+    expect(wake("America/Los_Angeles")).toContain(`- ${q.id} (asked 2026-10-17): Freeze on Friday?`);
+    expect(wake("America/Los_Angeles")).toContain(`- Question ${q.id} (since 2026-10-17): Freeze on Friday?`);
+    expect(wake()).toContain(`- ${q.id} (asked 2026-10-18): Freeze on Friday?`);
+  });
+
   it("says so when there is nothing, and leaves the record out of a wake that wants no digest", () => {
     const empty: DigestRecords = { previous: null, since: T - DAY, moved: [], ended: [], answered: [], withUser: [], stuck: [], held: [] };
     const nightly = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: true, notes: [], bigDecisions: [], questions: [], records: empty });

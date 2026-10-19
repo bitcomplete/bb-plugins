@@ -1063,6 +1063,7 @@ describe("questions to the user", () => {
   type Board = {
     projects: Array<{ projectId: string; name: string }>;
     board: {
+      stages: string[];
       digest: { text: string; at: number } | null;
       questions: Array<{ id: string; question: string; key: string | null; escalationId: string | null }>;
       withUser: Array<{ id: string; kind: string }>;
@@ -1103,6 +1104,12 @@ describe("questions to the user", () => {
     const closed = await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project);
     expect(closed).toMatchObject({ error: false, text: `closed ${t.qid(unbound.text)}.` });
     expect((await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Again." }, t.project)).text).toMatch(/already closed/u);
+    // Guidance on a question about the whole project has no binding to land on: the question closes all the same.
+    const project = await t.tool("steward_update", { ask: { question: "Adopt the new lint rules?" } }, t.project);
+    expect(await t.tool("steward_update", { resolve: t.qid(project.text), answer: "Yes.", guidance: "Lint rules apply to new code." }, t.project)).toMatchObject({
+      error: false,
+      text: `closed ${t.qid(project.text)} (guidance not saved: it is kept per binding, so name one with binding to give it).`,
+    });
     // Guidance with a bound question's answer lands on its binding.
     expect((await t.tool("steward_update", { resolve: t.qid(bound.text), guidance: "Remove the old login page." }, t.project)).text).toMatch(/ENG-12: closed qst_\S+; guidance saved/u);
     expect((await t.board()).questions).toEqual([]);
@@ -1176,6 +1183,7 @@ describe("questions to the user", () => {
     expect(result.projects).toEqual([{ projectId: "p1", name: "Acme" }]);
     const b = result.board!;
     expect(b.questions).toMatchObject([{ question: "Should I file an a11y ticket?" }]);
+    expect(b.stages).toEqual(["spec", "build", "review"]);
     expect(b.stewards).toMatchObject([{ key: "ENG-12", stage: "spec", summary: "Spec drafted.", nextAction: "Ask the reviewer", actor: "steward", workers: [{ threadId: "thr_w1", title: "Implement retry" }] }]);
     expect(b.stuck).toEqual([expect.objectContaining({ key: "ENG-12", why: "On hold: billing freeze" })]);
     expect(b.digest).toMatchObject({ text: "Morning: ENG-12 is held." });
