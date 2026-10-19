@@ -551,6 +551,35 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
   });
 
+  it("leases only the linked pull requests still open, and one not read yet", async () => {
+    const t = await setup();
+    const link = (n: number) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` });
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [link(7), link(8), link(9), link(10)] }));
+    t.entities.set("acme/web#7", pull());
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", state: "closed" }));
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", state: "merged" }, { merged: true }));
+    // acme/web#10 has no snapshot: it cannot be read yet.
+    await t.ring("linear", "uuid-12");
+    const github = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input;
+    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"] });
+  });
+
+  it("stops leasing a linked pull request once it merges", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull());
+    await t.ring("linear", "uuid-12");
+    const github = () => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher");
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"] });
+    const sent = github().length;
+
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
+    await t.ring("github", "acme/web#7");
+    expect(github()).toHaveLength(sent + 1);
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [] });
+  });
+
   it("counts a worker woken again (by a watch, a reviewer) as running", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));

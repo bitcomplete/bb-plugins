@@ -467,6 +467,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return pulls;
     }
 
+    /**
+     * The pull requests linked to a ticket that are leased for it: those
+     * still open. One with no snapshot yet (not read, or the read failed) is
+     * kept, so a new pull request is watched before its first read.
+     */
+    function leasedPulls(b: Pick<Binding, "kind" | "lastSnapshot">): string[] {
+      if (b.kind !== "ticket" || b.lastSnapshot === null) return [];
+      const pulls = b.lastSnapshot.pulls;
+      return b.lastSnapshot.entity.linkedPulls
+        .map((l) => l.key)
+        .filter((k): k is string => k !== null)
+        .filter((k) => {
+          const seen = pulls.find((p) => lc(p.key) === lc(k));
+          return seen === undefined || !["closed", "merged"].includes(lc(seen.state));
+        });
+    }
+
     // The interest set: what linear and github should lease and ring us
     // about. Sent whole, only when it changed, a moment after the change.
     const lastInterest = new Map<Source, string>();
@@ -486,7 +503,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           entities: [
             ...new Set([
               ...open.filter((b) => b.source === "github").map((b) => b.entityId),
-              ...open.flatMap((b) => (b.kind === "ticket" ? (b.lastSnapshot?.entity.linkedPulls ?? []).map((l) => l.key).filter((k): k is string => k !== null) : [])),
+              ...open.flatMap((b) => leasedPulls(b)),
             ]),
           ].sort(),
         },
@@ -875,9 +892,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * One reconcile of one binding: snapshot, lifecycle, compare, and wake
      * when something actionable changed (or `force` says this is a turn
-     * regardless: adoption, the nightly pass).
+     * regardless: adoption, the nightly pass). A linked pull request that
+     * appeared, closed or merged changes what is leased, so the interest set
+     * is pushed again.
      */
     async function reconcileBinding(bindingId: string, force: WakeReason | null): Promise<void> {
+      const before = store.binding(bindingId);
+      const leased = before === null ? "" : leasedPulls(before).join(" ");
+      try {
+        await reconcileOnce(bindingId, force);
+      } finally {
+        const after = store.binding(bindingId);
+        if (after !== null && leasedPulls(after).join(" ") !== leased) pushInterest();
+      }
+    }
+
+    async function reconcileOnce(bindingId: string, force: WakeReason | null): Promise<void> {
       let b = store.binding(bindingId);
       if (b === null) return;
       const config = await loadConfig(b.projectId);
