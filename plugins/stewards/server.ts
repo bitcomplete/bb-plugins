@@ -288,7 +288,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       compactAboveTokens: {
         type: "number",
         label: "Compact a steward above this many context tokens",
-        description: "After a steward's or the project steward's turn, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
+        description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
         default: 120_000,
       },
     });
@@ -1494,6 +1494,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const [usage] = await bb.sdk.threads.events.list({ threadId, types: ["thread/contextWindowUsage/updated"], order: "desc", limit: "1" });
         const used = (usage?.data as { contextWindowUsage?: { usedTokens?: number | null } } | undefined)?.contextWindowUsage?.usedTokens ?? null;
         if (used === null || !compactDue(used, limit, incomingChars) || compactedOn.get(threadId) === used) return false;
+        // A busy thread cannot be compacted; skip it rather than warn on every wake.
+        const info = await threadInfo(threadId).catch(() => null);
+        if (info === null || info.deletedAt !== null || busy(info.status)) return false;
         compactedOn.set(threadId, used);
         await bb.sdk.threads.compact({ threadId });
         bb.log.info(`stewards: compacted ${threadId} at ${used} context tokens`);

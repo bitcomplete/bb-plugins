@@ -305,7 +305,10 @@ Plugin code. No model turn.
    edits, and pushes and comments from the developer's account, which the
    worker and the reviewers it starts post as, often unsigned, and the
    reviewer's `bb-review` markers, whichever account posts them. A round
-   that changes the lane does wake it. People, merges and closes still do.
+   that changes the lane does wake it. A first marker, with no earlier round
+   to change from, does not: the worker's own turn ending carries it, and
+   waking on every first review would put back the wake the ticket removes.
+   People, merges and closes still do.
 4. Otherwise the snapshot is recorded and the ring ends. Most rings end here:
    the steward's own comments, label churn, its workers at work. What
    changed is kept as a quiet note and shown with the next turn something
