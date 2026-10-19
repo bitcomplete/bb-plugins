@@ -1,15 +1,23 @@
-// Settings → Plugins → Stewards: which projects are stewarded and whether
-// their configuration is healthy, then every open steward and where it
-// stands. Read-only; steering stays with the project steward and the CLI.
+// Two surfaces. The Stewards page (a nav panel, one tab per stewarded
+// project): what waits on you, what is in flight by stage, what is stuck or
+// held, what ended lately, and the latest digest; the one write is closing a
+// question put to you. Settings → Plugins → Stewards: which projects are
+// stewarded and whether their configuration is healthy, then every open
+// steward and where it stands. Steering stays with the project steward and
+// the CLI.
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { definePluginApp, experimental_Icon as Icon, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
+import { Markdown, definePluginApp, experimental_Icon as Icon, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
-type Overview = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: unknown }> : never;
+type Overview = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: unknown; lastSweepAt: unknown }> : never;
 type Project = Overview["projects"][number];
 type Steward = Project["stewards"][number];
+type BoardResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { board: unknown }> : never;
+type Board = NonNullable<BoardResult["board"]>;
 type CheckResult = { ok: boolean; lines: string[] };
+
+const BOARD_PATH = "board";
 
 const POLL_MS = 30_000;
 
@@ -26,24 +34,26 @@ function ago(at: number | null, now: number): string {
   return `${Math.round(s / 86_400)}d ago`;
 }
 
-/** The overview, refetched every half minute while the page is visible. */
-function useOverview(): { overview: Overview | null; error: string | null } {
-  const rpc = useRpc<typeof rpcContract>();
-  const [overview, setOverview] = useState<Overview | null>(null);
+/** What `load` returns, refetched every half minute while the page is visible, and on demand. */
+function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; refetch: () => void } {
+  const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
+  // Only the latest call lands, so a slow answer for the last project does not replace this one's.
+  const latest = useRef(0);
   const refetch = useCallback(() => {
-    rpc.call("stewardsOverview", null).then(
+    const call = ++latest.current;
+    load().then(
       (o) => {
-        if (!mounted.current) return;
-        setOverview(o);
+        if (!mounted.current || call !== latest.current) return;
+        setData(o);
         setError(null);
       },
       (e: unknown) => {
-        if (mounted.current) setError(message(e));
+        if (mounted.current && call === latest.current) setError(message(e));
       },
     );
-  }, [rpc]);
+  }, [load]);
   useEffect(() => {
     mounted.current = true;
     refetch();
@@ -60,11 +70,26 @@ function useOverview(): { overview: Overview | null; error: string | null } {
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refetch]);
-  return { overview, error };
+  return { data, error, refetch };
+}
+
+function useOverview(): { overview: Overview | null; error: string | null } {
+  const rpc = useRpc<typeof rpcContract>();
+  const { data, error } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
+  return { overview: data, error };
 }
 
 function Loading({ error }: { error: string | null }) {
   return <p className="text-sm text-muted-foreground">{error === null ? "Loading…" : <span className="text-destructive">{error}</span>}</p>;
+}
+
+function PageLink({ projectId, children }: { projectId: string; children: ReactNode }) {
+  const navigate = useBbNavigate();
+  return (
+    <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })}>
+      {children}
+    </button>
+  );
 }
 
 function ThreadLink({ threadId, children }: { threadId: string; children: ReactNode }) {
@@ -80,6 +105,16 @@ function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "mute
   const colors =
     tone === "bad" ? "border-destructive/40 text-destructive" : tone === "warn" ? "border-amber-500/40 text-amber-600 dark:text-amber-500" : "border-border text-muted-foreground";
   return <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
+}
+
+function EntityLink({ entityKey, url }: { entityKey: string; url: string | null }) {
+  const navigate = useBbNavigate();
+  if (url === null) return <span className="font-medium">{entityKey}</span>;
+  return (
+    <button type="button" className="font-medium underline-offset-2 hover:underline" onClick={() => navigate.openUrl(url)}>
+      {entityKey}
+    </button>
+  );
 }
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -167,6 +202,9 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
           </Row>
           <Row label="Project steward">
             {p.projectStewardThreadId === null ? <span className="text-muted-foreground">not started yet; it starts with the first steward</span> : <ThreadLink threadId={p.projectStewardThreadId}>Open thread</ThreadLink>}
+          </Row>
+          <Row label="Page">
+            <PageLink projectId={p.projectId}>Open the stewards page</PageLink>
           </Row>
           <Row label="Nightly">
             {p.nightly === null ? "—" : `${p.nightly.at} ${p.nightly.timezone}`}
@@ -273,7 +311,308 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
   );
 }
 
+// ---- The stewards page -------------------------------------------------------------------------
+
+/** The stage groups, in the playbook schema's order (from the server), then any other stage seen, then none. */
+function stageGroups(stages: string[], seen: Array<string | null>): Array<{ stage: string | null; title: string }> {
+  const order = [...stages, ...seen.filter((s): s is string => s !== null && !stages.includes(s))];
+  const groups: Array<{ stage: string | null; title: string }> = [...new Set(order)].map((stage) => ({ stage, title: stage.charAt(0).toUpperCase() + stage.slice(1) }));
+  return [...groups, { stage: null, title: "No stage" }];
+}
+
+function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="text-base font-medium">
+        {title}
+        {count === undefined ? null : <span className="ml-2 text-sm font-normal text-muted-foreground">{count}</span>}
+      </h2>
+      {children}
+    </section>
+  );
+}
+
+function List({ children }: { children: ReactNode }) {
+  return <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">{children}</ul>;
+}
+
+function None({ children }: { children: ReactNode }) {
+  return <p className="text-muted-foreground">{children}</p>;
+}
+
+function BoardPage({ subPath }: { subPath: string }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const first = subPath.split("/")[0] ?? "";
+  const wanted = first === "" ? null : decodeURIComponent(first);
+  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
+  return (
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-6 text-sm">
+        {data === null ? (
+          <Loading error={error} />
+        ) : data.projects.length === 0 ? (
+          <None>
+            No project is stewarded. Run <code>bb stewards init</code> from a thread in a multi-repo project, commit and publish it, and merge the guidance branch.
+          </None>
+        ) : (
+          <>
+            {data.projects.length > 1 ? (
+              <nav className="flex flex-wrap gap-1 border-b border-border">
+                {data.projects.map((p) => {
+                  const active = p.projectId === data.board?.projectId;
+                  return (
+                    <button
+                      key={p.projectId}
+                      type="button"
+                      aria-current={active ? "page" : undefined}
+                      className={`-mb-px border-b-2 px-3 py-1.5 ${active ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+                      onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(p.projectId) })}
+                    >
+                      {p.name}
+                    </button>
+                  );
+                })}
+              </nav>
+            ) : null}
+            {data.board === null ? <None>That project is not stewarded.</None> : <ProjectBoard board={data.board} refetch={refetch} />}
+            {error !== null ? <p className="text-xs text-destructive">Refresh failed: {error}</p> : null}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
+  const now = Date.now();
+  const waiting = b.questions.length + b.withUser.length;
+  return (
+    <>
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h1 className="text-lg font-medium">{b.name}</h1>
+        {b.projectStewardThreadId === null ? (
+          <span className="text-muted-foreground">No project steward yet; it starts with the first steward.</span>
+        ) : (
+          <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
+        )}
+      </div>
+      {b.paused ? (
+        <p className="flex items-start gap-2">
+          <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="paused" />
+          <span>Stewards are paused: nothing is woken or adopted.</span>
+        </p>
+      ) : null}
+
+      <Section title="Waiting on you" count={waiting}>
+        {waiting === 0 ? (
+          <None>Nothing is waiting on you.</None>
+        ) : (
+          <List>
+            {b.questions.map((q) => (
+              <QuestionRow key={q.id} question={q} now={now} onClosed={refetch} />
+            ))}
+            {b.withUser.map((x) => (
+              <li key={x.id} className="flex flex-col gap-1 p-3">
+                <p className="flex flex-wrap items-center gap-2">
+                  <EntityLink entityKey={x.key} url={x.url} />
+                  <Badge tone="bad">{x.kind === "approval" ? "approval request" : `${x.kind} escalation`}</Badge>
+                  <span className="text-xs text-muted-foreground">{ago(x.createdAt, now)}</span>
+                </p>
+                <p>{x.question}</p>
+                {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
+                <p className="text-xs text-muted-foreground">
+                  {x.kind === "approval" ? "Approve or decline in its steward's thread." : "Answer in the project steward's thread."}
+                  {x.kind === "approval" && x.threadId !== null ? (
+                    <>
+                      {" "}
+                      <ThreadLink threadId={x.threadId}>Open steward</ThreadLink>
+                    </>
+                  ) : null}
+                  {x.kind !== "approval" && b.projectStewardThreadId !== null ? (
+                    <>
+                      {" "}
+                      <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
+                    </>
+                  ) : null}
+                </p>
+              </li>
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title="In flight" count={b.stewards.length}>
+        {b.stewards.length === 0 ? (
+          <None>No open stewards. Label a Linear ticket or pull request to adopt it.</None>
+        ) : (
+          stageGroups(b.stages, b.stewards.map((s) => s.stage)).map(({ stage, title }) => {
+            const rows = b.stewards.filter((s) => (s.stage ?? null) === stage);
+            if (rows.length === 0) return null;
+            return (
+              <div key={title} className="flex flex-col gap-1">
+                <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  {title} · {rows.length}
+                </h3>
+                <List>
+                  {rows.map((s) => (
+                    <InFlightRow key={s.key} steward={s} now={now} />
+                  ))}
+                </List>
+              </div>
+            );
+          })
+        )}
+      </Section>
+
+      <Section title="Stuck or held" count={b.stuck.length}>
+        {b.stuck.length === 0 ? (
+          <None>Nothing is stuck or held.</None>
+        ) : (
+          <List>
+            {b.stuck.map((x, i) => (
+              <li key={`${x.key}-${i}`} className="flex flex-col gap-1 p-3">
+                <p className="flex flex-wrap items-center gap-2">
+                  <EntityLink entityKey={x.key} url={x.url} />
+                  {x.since !== null ? <span className="text-xs text-muted-foreground">{ago(x.since, now)}</span> : null}
+                </p>
+                <p className="text-amber-600 dark:text-amber-500">{x.why}</p>
+                {x.threadId !== null ? (
+                  <p className="text-xs text-muted-foreground">
+                    <ThreadLink threadId={x.threadId}>Open steward</ThreadLink>
+                  </p>
+                ) : null}
+              </li>
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title="Recently ended" count={b.ended.length}>
+        {b.ended.length === 0 ? (
+          <None>Nothing ended in the last two weeks.</None>
+        ) : (
+          <List>
+            {b.ended.map((x) => (
+              <li key={`${x.key}-${x.endedAt}`} className="flex flex-wrap items-center gap-2 p-3">
+                <EntityLink entityKey={x.key} url={x.url} />
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">{x.title}</span>
+                <Badge>{x.kind}</Badge>
+                {x.endReason !== null ? <Badge>{x.endReason}</Badge> : null}
+                <span className="text-xs text-muted-foreground">{ago(x.endedAt, now)}</span>
+              </li>
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title="Latest digest">
+        {b.digest === null ? (
+          <None>No digest yet; the project steward writes one at the end of each nightly pass.</None>
+        ) : (
+          <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+            <p className="text-xs text-muted-foreground">
+              {new Date(b.digest.at).toLocaleString()} ({ago(b.digest.at, now)})
+            </p>
+            <Markdown content={b.digest.text} />
+          </div>
+        )}
+      </Section>
+    </>
+  );
+}
+
+function QuestionRow({ question: q, now, onClosed }: { question: Board["questions"][number]; now: number; onClosed: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [answer, setAnswer] = useState("");
+  const [state, setState] = useState<"idle" | "closing" | { error: string }>("idle");
+  const close = () => {
+    setState("closing");
+    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim() }).then(
+      (r) => {
+        if (r.ok) onClosed();
+        else setState({ error: r.message });
+      },
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  return (
+    <li className="flex flex-col gap-2 p-3">
+      <p className="flex flex-wrap items-center gap-2">
+        {q.key !== null ? <EntityLink entityKey={q.key} url={q.url} /> : null}
+        <Badge tone="bad">{q.escalationId === null ? "question" : "forwarded escalation"}</Badge>
+        <span className="text-xs text-muted-foreground">asked {ago(q.createdAt, now)}</span>
+      </p>
+      <p>{q.question}</p>
+      {q.context !== null ? <p className="text-muted-foreground">{q.context}</p> : null}
+      <div className="flex flex-wrap items-start gap-2">
+        <textarea
+          value={answer}
+          onChange={(e) => setAnswer(e.target.value)}
+          rows={1}
+          placeholder="Your answer (optional)"
+          aria-label={`Answer to: ${q.question}`}
+          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+        <button type="button" disabled={state === "closing"} className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50" onClick={close}>
+          {state === "closing" ? "Closing…" : answer.trim() === "" ? "Close" : "Answer and close"}
+        </button>
+      </div>
+      {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
+    </li>
+  );
+}
+
+function InFlightRow({ steward: s, now }: { steward: Board["stewards"][number]; now: number }) {
+  return (
+    <li className="flex flex-col gap-1 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <EntityLink entityKey={s.key} url={s.url} />
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">{s.title}</span>
+        <Badge>{s.kind}</Badge>
+        {s.phase !== null ? <Badge>{s.phase}</Badge> : null}
+        {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+        {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
+      </div>
+      {s.summary === null ? (
+        <p className="text-muted-foreground">No status report yet.</p>
+      ) : (
+        <p>
+          {s.summary}{" "}
+          <span className="text-muted-foreground">
+            Next: {s.nextAction}
+            {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
+          </span>
+        </p>
+      )}
+      {s.blockedOn !== null ? <p className="text-muted-foreground">Blocked on {s.blockedOn}</p> : null}
+      <p className="text-xs text-muted-foreground">
+        Moved {ago(s.advancedAt, now)}
+        {s.threadId !== null ? (
+          <>
+            {" · "}
+            <ThreadLink threadId={s.threadId}>Open steward</ThreadLink>
+          </>
+        ) : null}
+        {s.workers.map((w) => (
+          <span key={w.threadId}>
+            {" · worker "}
+            <ThreadLink threadId={w.threadId}>{w.title}</ThreadLink>
+          </span>
+        ))}
+      </p>
+    </li>
+  );
+}
+
 export default definePluginApp((app) => {
+  app.slots.navPanel({
+    id: "board",
+    title: "Stewards",
+    icon: "ShieldCheck",
+    path: BOARD_PATH,
+    component: BoardPage,
+  });
   app.slots.settingsSection({
     id: "status",
     title: "Status",

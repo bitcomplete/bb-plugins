@@ -29,6 +29,7 @@ import {
   playbookNameFor,
   playbookPath,
   playbookStates,
+  STAGES,
   type BindingKind,
   type EscalationKind,
   type ModelSpec,
@@ -47,9 +48,9 @@ import {
   type EntitySnapshot,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type WakeReason } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type DigestRecords, type WakeReason } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -198,7 +199,61 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({ ok: z.boolean(), lines: z.array(z.string()) }),
   },
+  // The stewards page: one project's board. A null projectId picks the first project.
+  stewardsBoard: {
+    input: z.object({ projectId: z.string().min(1).max(100).nullable() }),
+    output: z.object({
+      projects: z.array(z.object({ projectId: z.string(), name: z.string() })),
+      board: z
+        .object({
+          projectId: z.string(),
+          name: z.string(),
+          paused: z.boolean(),
+          projectStewardThreadId: z.string().nullable(),
+          /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
+          stages: z.array(z.string()),
+          digest: z.object({ text: z.string(), at: z.number() }).nullable(),
+          questions: z.array(
+            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
+          ),
+          /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
+          withUser: z.array(
+            z.object({ id: z.string(), kind: z.string(), question: z.string(), recommendation: z.string().nullable(), key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), createdAt: z.number() }),
+          ),
+          stewards: z.array(
+            z.object({
+              key: z.string(),
+              url: z.string().nullable(),
+              title: z.string().nullable(),
+              kind: z.string(),
+              phase: z.string().nullable(),
+              stage: z.string().nullable(),
+              threadId: z.string().nullable(),
+              summary: z.string().nullable(),
+              nextAction: z.string().nullable(),
+              actor: z.string().nullable(),
+              blockedOn: z.string().nullable(),
+              priority: z.string().nullable(),
+              ending: z.string().nullable(),
+              advancedAt: z.number().nullable(),
+              workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
+            }),
+          ),
+          stuck: z.array(z.object({ key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), why: z.string(), since: z.number().nullable() })),
+          ended: z.array(z.object({ key: z.string(), url: z.string().nullable(), title: z.string().nullable(), kind: z.string(), endReason: z.string().nullable(), endedAt: z.number(), threadId: z.string().nullable() })),
+        })
+        .nullable(),
+    }),
+  },
+  // The user closes a question from the page, with or without an answer.
+  stewardsAnswerQuestion: {
+    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable() }),
+    output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
 });
+
+/** How long an ended binding stays on the page. */
+const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 
 type ProjectConfig = {
   projectId: string;
@@ -1170,8 +1225,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
       const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
+      const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
+      const records = opts.digestDue ? digestRecords(projectId) : undefined;
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
-      await sendTo(threadId, formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions }));
+      await sendTo(
+        threadId,
+        formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) }),
+      );
+    }
+
+    /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
+    function digestRecords(projectId: string): DigestRecords {
+      const row = store.project(projectId);
+      const since = row.digestAt ?? now() - 86_400_000;
+      const all = store.all(projectId);
+      const open = all.filter((b) => b.endedAt === null);
+      const openWith = (pick: (x: Escalation) => boolean) => open.flatMap((b) => store.openEscalations(b.id).filter(pick).map((escalation) => ({ escalation, from: b })));
+      return {
+        previous: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
+        since,
+        moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
+        ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
+        answered: store.answeredSince(projectId, since),
+        withUser: openWith((x) => x.route === "me"),
+        stuck: openWith((x) => x.kind === "stuck"),
+        held: open.filter((b) => b.hold !== null),
+      };
     }
 
     /** Where an escalation goes next, above where it is. */
@@ -1438,8 +1517,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async stewardsOverview() {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
         const configsById = new Map((await stewardedProjects()).map((c) => [c.projectId, c] as const));
-        // A project whose configuration went away still shows the stewards it has.
-        const ids = [...new Set([...configsById.keys(), ...store.all().map((b) => b.projectId)])];
+        const ids = projectIds(configsById.keys());
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
           const row = store.project(projectId);
@@ -1490,7 +1568,84 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async stewardsCheck({ projectId }) {
         return check(projectId);
       },
+      async stewardsBoard({ projectId: wanted }) {
+        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
+        const projects = projectIds((await stewardedProjects()).map((c) => c.projectId))
+          .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
+        if (picked === undefined) return { projects, board: null };
+        const { projectId } = picked;
+        const row = store.project(projectId);
+        const all = store.all(projectId);
+        const open = all.filter((b) => b.endedAt === null);
+        const questions = store.openQuestions(projectId);
+        const asked = new Set(questions.map((q) => q.escalationId).filter((id) => id !== null));
+        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !asked.has(x.id)).map((x) => ({ x, b })));
+        const stuck = open.flatMap((b) => [
+          ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
+          ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
+        ]);
+        const ended = all.filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS).sort((a, b) => b.endedAt! - a.endedAt!).slice(0, 30);
+        return {
+          projects,
+          board: {
+            projectId,
+            name: picked.name,
+            paused: (await settings.get()).paused,
+            projectStewardThreadId: row.threadId,
+            stages: [...STAGES],
+            digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
+            questions: questions.map((q) => {
+              const b = q.bindingId === null ? null : store.binding(q.bindingId);
+              return { id: q.id, question: q.question, context: q.context, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
+            }),
+            withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
+            stewards: open.map((b) => ({
+              key: b.entityKey,
+              url: b.url,
+              title: b.title,
+              kind: b.kind,
+              phase: b.phase,
+              stage: b.stage,
+              threadId: b.threadId,
+              summary: b.status?.summary ?? null,
+              nextAction: b.status?.nextAction ?? null,
+              actor: b.status?.actor ?? null,
+              blockedOn: b.status?.blockedOn ?? null,
+              priority: b.priority,
+              ending: b.ending,
+              advancedAt: b.advancedAt,
+              workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
+            })),
+            stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
+            ended: ended.map((b) => ({ key: b.entityKey, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt!, threadId: b.threadId })),
+          },
+        };
+      },
+      async stewardsAnswerQuestion({ questionId, answer }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
+        const q = store.question(questionId);
+        if (q === null || q.status !== "open") return { ok: false, message: "That question is already closed." };
+        const text = answer === null || answer === "" ? null : answer;
+        const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+        // Closes the escalation it was forwarded for, too.
+        store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
+        const b = x === null ? null : store.binding(x.bindingId);
+        if (x !== null && b !== null && b.endedAt === null) {
+          if (text !== null) store.addGuidance(b.id, text, "user");
+          store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
+          scheduleReconcile(b.id);
+          return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
+        }
+        return { ok: true, message: "Closed." };
+      },
     });
+
+    /** Stewarded projects, and those whose configuration went away but still have stewards. */
+    function projectIds(configured: Iterable<string>): string[] {
+      return [...new Set([...configured, ...store.all().map((b) => b.projectId)])];
+    }
 
     // ---- the agent surface ---------------------------------------------------------------------------
     //
@@ -1730,12 +1885,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "steward_update",
       description:
-        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions; a parent steward or the project steward may update the bindings below it, which wakes them.",
+        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions; a parent steward or the project steward may update the bindings below it, which wakes them. " +
+        "The project steward also records each question it puts to the user (ask, with or without a binding) and closes it when they answer (resolve with the question id, and answer).",
       presentation: { label: { pending: "Updating a binding", completed: "Updated a binding" } },
       parameters: z.object({
-        binding: z.string().trim().min(1).max(300).optional().describe("The entity key (ENG-12, owner/repo#3) or binding id. Leave out for this thread's own binding."),
+        binding: z.string().trim().min(1).max(300).optional().describe("The entity key (ENG-12, owner/repo#3) or binding id. Leave out for this thread's own binding, or, from the project steward, for a question about no one binding."),
         guidance: z.string().trim().min(1).max(4000).optional().describe("Standing guidance, in the user's or your own terms. With resolve, the answer to the escalation."),
-        resolve: z.string().trim().min(1).max(100).optional().describe("An open escalation on that binding that the guidance answers."),
+        resolve: z.string().trim().min(1).max(100).optional().describe("An open escalation on that binding that the guidance answers; or, from the project steward, an open question (qst_…) the user answered, with answer."),
+        answer: z.string().trim().min(1).max(4000).optional().describe("With resolve and a question id: the user's answer, kept on the question."),
+        ask: z
+          .object({
+            question: z.string().trim().min(1).max(1500).describe("The question, as you put it to the user."),
+            context: z.string().trim().max(3000).optional().describe("What the user needs to answer it."),
+          })
+          .optional()
+          .describe("Project steward only: record a question you are asking the user in your reply, so it is kept until answered. With binding, it is about that binding."),
         forward: z.string().trim().min(1).max(100).optional().describe("An escalation that reached you and that you should not decide: pass it up. From the project steward it goes to the user — then ask them in your reply."),
         recommendation: z.string().trim().max(1500).optional().describe("Your recommendation, when forwarding."),
         priority: z.enum(["urgent", "high", "normal", "low"]).optional(),
@@ -1747,11 +1911,64 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }),
       async execute(input, { threadId }) {
         try {
-          const target = input.binding === undefined ? ownBinding(threadId) : store.find(input.binding);
-          if (target === null) return toolError(new Error(`No binding for ${input.binding}.`));
-          const self = target.threadId === threadId;
           const done: string[] = [];
           const notes: string[] = [];
+          let resolve = input.resolve;
+          let guidance = input.guidance;
+          let bindingRef = input.binding;
+
+          // Questions to the user are the project steward's, and kept until answered.
+          const projectOf = store.projectByThread(threadId)?.projectId ?? null;
+          let closing: { question: Question; answer: string; guidanceDropped: boolean } | null = null;
+          if (input.answer !== undefined && resolve?.startsWith("qst_") !== true) return toolError(new Error('answer closes a question: give it with resolve: "<question id>".'));
+          if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
+            return toolError(new Error("Only the project steward keeps questions to the user; a steward escalates with steward_report."));
+          }
+          if (projectOf !== null && resolve?.startsWith("qst_") === true) {
+            const q = store.question(resolve);
+            if (q === null || q.projectId !== projectOf) return toolError(new Error(`No question ${resolve} in this project.`));
+            if (q.status !== "open") return toolError(new Error(`Question ${q.id} is already closed.`));
+            const answer = input.answer ?? guidance;
+            if (answer === undefined) return toolError(new Error("Give the user's answer (answer) when closing a question."));
+            const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+            if (x !== null) {
+              // A forwarded escalation: decided as one, which closes the question with it.
+              resolve = x.id;
+              guidance ??= answer;
+              bindingRef ??= x.bindingId;
+            } else {
+              closing = { question: q, answer, guidanceDropped: false };
+              resolve = undefined;
+              if (input.guidance !== undefined && (input.answer !== undefined || q.bindingId !== null)) bindingRef ??= q.bindingId ?? undefined;
+              else guidance = undefined;
+              if (guidance !== undefined && bindingRef === undefined) {
+                // A question about the project as a whole: closed all the same; guidance belongs to a binding.
+                guidance = undefined;
+                closing.guidanceDropped = true;
+              }
+            }
+          }
+
+          const target = bindingRef === undefined ? (projectOf !== null ? null : ownBinding(threadId)) : store.find(bindingRef);
+          if (bindingRef !== undefined && target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
+          if (target === null) {
+            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.stewardModel, input.workerModel, input.approve, input.quote];
+            if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
+          }
+          if (input.ask !== undefined && target !== null && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
+          if (closing !== null) {
+            store.answer(closing.question.id, closing.answer, threadId);
+            done.push(`closed ${closing.question.id}${closing.guidanceDropped ? " (guidance not saved: it is kept per binding, so name one with binding to give it)" : ""}`);
+          }
+          if (input.ask !== undefined) {
+            const q = store.ask({ projectId: projectOf!, bindingId: target?.id ?? null, escalationId: null, question: input.ask.question, context: input.ask.context ?? null });
+            done.push(`question ${q.id} recorded${target === null ? "" : ` about ${target.entityKey}`}: ask the user in your reply, and close it with steward_update { resolve: "${q.id}", answer } once they answer`);
+          }
+          if (target === null) {
+            if (done.length === 0) return toolError(new Error("Nothing to update: name a binding, ask a question, or close one."));
+            return `${done.join("; ")}.`;
+          }
+          const self = target.threadId === threadId;
 
           if (input.forward !== undefined) {
             const x = store.escalation(input.forward);
@@ -1759,9 +1976,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const holder = x.route === "parent" ? store.binding(target.parentBindingId ?? "")?.threadId : x.route === "project" ? store.project(target.projectId).threadId : null;
             if (holder !== threadId) return toolError(new Error(`Escalation ${x.id} is not with this thread, so it cannot forward it.`));
             const route = nextRoute(target, x.route);
-            store.reroute(x.id, route, input.recommendation ?? x.recommendation);
+            const recommendation = input.recommendation ?? x.recommendation;
+            store.reroute(x.id, route, recommendation);
+            // Kept as a question to the user too, which closes when the escalation is resolved. Made
+            // before the await below, so the escalation cannot be resolved in between and leave it open.
+            const q =
+              route !== "me"
+                ? null
+                : store.ask({
+                    projectId: target.projectId,
+                    bindingId: target.id,
+                    escalationId: x.id,
+                    question: x.question,
+                    context: [`A ${x.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${x.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                  });
             await deliver(target, store.escalation(x.id)!);
-            done.push(route === "me" ? `forwarded ${x.id} to the user: ask them in your reply, then record their answer with guidance + resolve` : `forwarded ${x.id} to the project steward`);
+            if (q !== null) done.push(`forwarded ${x.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
+            else done.push(`forwarded ${x.id} to the project steward`);
           }
 
           if (!mayDirect(threadId, target)) {
@@ -1795,28 +2026,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const entity = (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
             store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHash(entity, target.threadId), by: threadId }, voidedAt: null, declinedSpecHash: null } });
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${byUser ? ` by the user: "${input.quote}"` : " by the project steward"}.`);
-            const others = store.openEscalations(target.id).filter((x) => x.id !== input.resolve);
+            const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
             notes.push(`The spec was approved${byUser ? ` by the user: "${input.quote}"` : " by the project steward"}.`);
           }
 
-          if (input.guidance !== undefined) {
-            store.addGuidance(target.id, input.guidance, threadId);
+          if (guidance !== undefined) {
+            store.addGuidance(target.id, guidance, threadId);
             done.push("guidance saved");
-            if (input.resolve === undefined) notes.push(`New guidance: ${input.guidance}`);
+            if (resolve === undefined) notes.push(`New guidance: ${guidance}`);
           }
-          if (input.resolve !== undefined) {
-            if (input.guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
-            const x = store.escalation(input.resolve);
-            if (x === null || x.bindingId !== target.id) return toolError(new Error(`No escalation ${input.resolve} on ${target.entityKey}.`));
+          if (resolve !== undefined) {
+            if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
+            const x = store.escalation(resolve);
+            if (x === null || x.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
             // Approving closes its own request, so naming it in resolve too is no error.
-            if (!store.resolve(x.id, input.guidance) && !(x.kind === "approval" && input.approve === true)) return toolError(new Error(`Escalation ${input.resolve} is already resolved.`));
+            if (!store.resolve(x.id, guidance, threadId) && !(x.kind === "approval" && input.approve === true)) return toolError(new Error(`Escalation ${resolve} is already resolved.`));
             if (x.kind === "approval" && input.approve !== true && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
               store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHash(fresh.lastSnapshot!.entity, fresh.threadId) } });
             }
             done.push(`resolved ${x.id}`);
-            notes.push(`Escalation ${x.id} decided: ${input.guidance}`);
+            notes.push(`Escalation ${x.id} decided: ${guidance}`);
           }
           if (input.priority !== undefined || input.hold !== undefined) {
             store.patch(target.id, { ...(input.priority === undefined ? {} : { priority: input.priority }), ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold }) });
@@ -1833,7 +2064,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             store.patch(target.id, { ...(input.stewardModel === undefined ? {} : { modelSteward: input.stewardModel.text }), ...(input.workerModel === undefined ? {} : { modelWorker: input.workerModel.text }) });
             done.push(`models: steward ${input.stewardModel?.text ?? "unchanged"}, workers ${input.workerModel?.text ?? "unchanged"}`);
           }
-          if (done.length === 0) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, or approve."));
+          if (done.length === 0) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, or ask."));
           for (const n of notes) tell(threadId, target, n);
           return `${target.entityKey}: ${done.join("; ")}.`;
         } catch (error) {
