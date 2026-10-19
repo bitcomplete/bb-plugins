@@ -116,6 +116,10 @@ export const MIGRATIONS = [
      created_at INTEGER NOT NULL,
      resolved_at INTEGER
    )`,
+  // When an escalation was first put to the project steward as new; later prompts list it as still open.
+  `ALTER TABLE escalations ADD COLUMN delivered_at INTEGER`,
+  // Escalations open before delivery was recorded were all delivered already.
+  `UPDATE escalations SET delivered_at = created_at WHERE status = 'open' AND delivered_at IS NULL`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -341,6 +345,8 @@ export type Escalation = {
   resolution: string | null;
   createdAt: number;
   resolvedAt: number | null;
+  /** When the project steward was first sent it as new. */
+  deliveredAt: number | null;
 };
 
 /**
@@ -369,6 +375,9 @@ export type Worker = { threadId: string; bindingId: string; title: string; statu
 
 export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null };
 
+/** Guidance repeated within this window is a retry, not new guidance. */
+export const GUIDANCE_DEDUPE_MS = 5 * 60_000;
+
 export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("base64url")}`;
 
 export function createStore(db: Database.Database, now: () => number) {
@@ -396,7 +405,10 @@ export function createStore(db: Database.Database, now: () => number) {
   const openEscalations = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND status = 'open' ORDER BY created_at");
   const escalationsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? ORDER BY created_at DESC LIMIT ?");
   const resolveEscalation = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
-  const rerouteEscalation = db.prepare("UPDATE escalations SET route = ?, recommendation = ? WHERE id = ? AND status = 'open'");
+  const appendResolution = db.prepare("UPDATE escalations SET resolution = ? WHERE id = ? AND status = 'resolved'");
+  const rerouteEscalation = db.prepare("UPDATE escalations SET route = ?, recommendation = ?, delivered_at = NULL WHERE id = ? AND status = 'open'");
+  const markDelivered = db.prepare("UPDATE escalations SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL");
+  const clearDelivered = db.prepare("UPDATE escalations SET delivered_at = NULL WHERE id = ? AND delivered_at = ?");
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
   const insertQuestion = db.prepare(
@@ -407,6 +419,7 @@ export function createStore(db: Database.Database, now: () => number) {
   const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'answered' AND resolved_at >= ? ORDER BY resolved_at");
   const answerQuestion = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
   const answerForEscalation = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE escalation_id = ? AND status = 'open'");
+  const appendAnswerForEscalation = db.prepare("UPDATE questions SET answer = ? WHERE escalation_id = ? AND status = 'answered'");
 
   const insertWorker = db.prepare("INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES (?, ?, ?, 'running', ?)");
   const getWorker = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE thread_id = ?");
@@ -430,6 +443,7 @@ export function createStore(db: Database.Database, now: () => number) {
     resolution: r.resolution === null ? null : String(r.resolution),
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
+    deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
   });
   const toQuestion = (r: Record<string, unknown>): Question => ({
     id: String(r.id),
@@ -463,6 +477,16 @@ export function createStore(db: Database.Database, now: () => number) {
     title: r.title === null || r.title === undefined ? null : String(r.title),
     sectionId: r.section_id === null || r.section_id === undefined ? null : String(r.section_id),
   });
+
+  /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
+  function resolve(id: string, resolution: string, by = "plugin"): boolean {
+    return db.transaction(() => {
+      const at = now();
+      if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
+      answerForEscalation.run(resolution, by, at, id);
+      return true;
+    })();
+  }
 
   function patch(id: string, fields: BindingPatch): Binding {
     const entries = Object.entries(fields).filter(([, v]) => v !== undefined) as Array<[keyof typeof COLUMNS, unknown]>;
@@ -539,9 +563,13 @@ export function createStore(db: Database.Database, now: () => number) {
       }
       return patch(id, { pending });
     },
-    addGuidance(id: string, text: string, by: string): Binding {
+    /** Save guidance; false when it repeats the binding's last guidance by the same author within five minutes (a retry), which saves nothing. */
+    addGuidance(id: string, text: string, by: string): boolean {
       const b = rowToBinding(getBinding.get(id)!);
-      return patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
+      const last = b.guidance.at(-1);
+      if (last !== undefined && last.text === text && last.by === by && now() - last.at < GUIDANCE_DEDUPE_MS) return false;
+      patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
+      return true;
     },
 
     // escalations
@@ -560,14 +588,33 @@ export function createStore(db: Database.Database, now: () => number) {
     escalations(bindingId: string, limit = 20): Escalation[] {
       return escalationsFor.all(bindingId, limit).map(toEscalation);
     },
-    /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
-    resolve(id: string, resolution: string, by = "plugin"): boolean {
+    resolve,
+    /**
+     * Record an answer: resolve the escalation if it is open; if it is
+     * already resolved (the binding ended, a retry), append the answer to
+     * what it says, and to the question forwarding it made, unless it
+     * already says it.
+     */
+    answerEscalation(id: string, text: string, by: string): "resolved" | "appended" | "unchanged" {
       return db.transaction(() => {
-        const at = now();
-        if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
-        answerForEscalation.run(resolution, by, at, id);
-        return true;
+        if (resolve(id, text, by)) return "resolved" as const;
+        const x = getEscalation.get(id);
+        const resolution = x === undefined || x.resolution === null ? "" : String(x.resolution);
+        if (x === undefined || resolution === text || resolution.endsWith(`\n${text}`)) return "unchanged" as const;
+        const appended = resolution === "" ? text : `${resolution}\n${text}`;
+        appendResolution.run(appended, id);
+        appendAnswerForEscalation.run(appended, id);
+        return "appended" as const;
       })();
+    },
+    /** Mark escalations delivered to the project steward; returns the time, to undo with undeliver if the send fails. */
+    markDelivered(ids: string[]): number {
+      const at = now();
+      for (const id of ids) markDelivered.run(at, id);
+      return at;
+    },
+    undeliver(ids: string[], at: number): void {
+      for (const id of ids) clearDelivered.run(id, at);
     },
     reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
       return rerouteEscalation.run(route, recommendation, id).changes > 0;

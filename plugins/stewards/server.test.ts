@@ -1,9 +1,11 @@
+import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { createStewardsPlugin, testHooks } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
+import { MIGRATIONS } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
@@ -620,6 +622,119 @@ describe("a Linear ticket steward", () => {
   });
 });
 
+// HUB-195/196: two escalations seconds apart, and the second prompt listed
+// the first as if new. HUB-183: a retried steward_update recorded its answer
+// twice, and the escalation kept "The binding ended." instead.
+describe("escalations delivered once, updates safe to retry", () => {
+  /** Two tickets with their stewards, and a way for each to escalate. */
+  async function two() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", url: "https://linear.app/acme/issue/ENG-13", title: "Fix logout" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const project = t.hooks.store.project("p1").threadId!;
+    const escalate = async (key: string, question: string) => {
+      await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question, meanwhile: "Wait." } }, t.hooks.store.find(key)!.threadId!);
+      return t.hooks.store.openEscalations(t.hooks.store.find(key)!.id).at(-1)!.id;
+    };
+    const toProject = () => t.sends.filter((s) => s.threadId === project).map((s) => s.text);
+    /** The escalation lines under one heading of a project steward prompt. */
+    const under = (text: string, heading: string) => (text.split(`## ${heading}`)[1]?.split("\n## ")[0] ?? "").split("\n").filter((l) => l.startsWith("- esc_"));
+    return { ...t, project, escalate, toProject, under };
+  }
+
+  it("lists an escalation as new once, then as still open, and leaves out one resolved before the send", async () => {
+    const t = await two();
+    const first = await t.escalate("ENG-12", "Include SSO?");
+    expect(t.toProject()).toHaveLength(1);
+    expect(t.under(t.toProject()[0]!, "New escalations routed to you")).toEqual([expect.stringContaining(`${first} from ENG-12 (decision): Include SSO?`)]);
+    expect(t.toProject()[0]).not.toContain("## Escalations still open with you");
+
+    const second = await t.escalate("ENG-13", "Keep the old logout route?");
+    expect(t.toProject()).toHaveLength(2);
+    const wake = t.toProject()[1]!;
+    expect(wake).toMatch(/# Project steward: escalation from ENG-13/u);
+    expect(t.under(wake, "New escalations routed to you")).toEqual([expect.stringContaining(`${second} from ENG-13`)]);
+    expect(t.under(wake, "Escalations still open with you")).toEqual([expect.stringContaining(`${first} from ENG-12`)]);
+    expect(t.hooks.store.escalation(first)!.deliveredAt).not.toBeNull();
+
+    // The first is decided while the third prompt is on its way (here, while
+    // the project steward is brought back from the archive): the prompt leaves it out.
+    t.threads.get(t.project)!.archivedAt = 1;
+    t.harness.sdk.stub("threads.unarchive", async (args: { threadId: string }) => {
+      t.hooks.store.resolve(first, "Yes, include SSO.");
+      return t.sdk.threads.unarchive(args);
+    });
+    const third = await t.escalate("ENG-12", "Which SSO provider?");
+    const last = t.toProject().at(-1)!;
+    expect(t.under(last, "New escalations routed to you")).toEqual([expect.stringContaining(`${third} from ENG-12`)]);
+    expect(t.under(last, "Escalations still open with you")).toEqual([expect.stringContaining(`${second} from ENG-13`)]);
+    expect(last).not.toContain(first);
+  });
+
+  it("counts escalations open before delivery was recorded as delivered", () => {
+    const db = new Database(":memory:");
+    const added = MIGRATIONS.findIndex((m) => m.includes("ADD COLUMN delivered_at"));
+    for (const m of MIGRATIONS.slice(0, added)) db.exec(m);
+    const insert = db.prepare("INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at) VALUES (?, 'b', 'decision', 'q', 'm', 'project', ?, 5)");
+    insert.run("esc_open", "open");
+    insert.run("esc_done", "resolved");
+    for (const m of MIGRATIONS.slice(added)) db.exec(m);
+    expect(db.prepare("SELECT id, delivered_at FROM escalations ORDER BY id").all()).toEqual([
+      { id: "esc_done", delivered_at: null },
+      { id: "esc_open", delivered_at: 5 },
+    ]);
+  });
+
+  it("writes nothing when a forward, resolve or approve target is bad", async () => {
+    const t = await two();
+    const steward = t.hooks.store.find("ENG-12")!.threadId!;
+    const bad = [
+      [{ binding: "ENG-12", guidance: "Use SAML.", resolve: "esc_nope", priority: "high" }, t.project],
+      [{ binding: "ENG-12", guidance: "Use SAML.", forward: "esc_nope", priority: "high" }, t.project],
+      [{ guidance: "Use SAML.", approve: true }, steward],
+    ] as const;
+    for (const [args, thread] of bad) expect((await t.tool("steward_update", args, thread)).error).toBe(true);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.guidance).toEqual([]);
+    expect(b.priority).toBeNull();
+    expect(b.ready.approval).toBeNull();
+  });
+
+  it("saves guidance repeated within five minutes once, and again after", async () => {
+    const t = await two();
+    const update = () => t.tool("steward_update", { binding: "ENG-12", guidance: "Keep SSO out of this ticket." }, t.project);
+    expect((await update()).text).toBe("ENG-12: guidance saved.");
+    t.advance(60_000);
+    expect(await update()).toEqual({ error: false, text: "ENG-12: guidance already saved." });
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(1);
+    t.advance(5 * 60_000);
+    expect((await update()).text).toBe("ENG-12: guidance saved.");
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(2);
+    // The same text from someone else is theirs to say, not a retry.
+    expect(t.hooks.store.addGuidance(t.hooks.store.find("ENG-12")!.id, "Keep SSO out of this ticket.", "thr_someone_else")).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(3);
+  });
+
+  it("accepts guidance resolving an approval request that approve: true already closed", async () => {
+    const t = await two();
+    const steward = t.hooks.store.find("ENG-12")!.threadId!;
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", ready: met }, steward);
+    const id = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.toProject().at(-1)!)![1]!;
+
+    expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, t.project)).error).toBe(false);
+    const answered = await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved; keep the migration reversible.", resolve: id }, t.project);
+    expect(answered).toMatchObject({ error: false, text: expect.stringMatching(/guidance saved; recorded the answer on esc_[\w-]+, which was already resolved \(Approved by the project steward\.\)/u) });
+    expect(t.hooks.store.escalation(id)!.resolution).toBe("Approved by the project steward.\nApproved; keep the migration reversible.");
+    // Answering an approval already granted is no decline.
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.ready.approval).not.toBeNull();
+    expect(b.ready.declinedSpecHash).toBeNull();
+  });
+});
+
 describe("terminal states and follow-through", () => {
   /** A ticket in progress with its steward and one worker at work. */
   async function working() {
@@ -710,6 +825,43 @@ describe("terminal states and follow-through", () => {
     // Woken to follow through, and ended without a word.
     await t.idle(t.steward);
     expect((await t.list())[0]).toMatchObject({ ended: true });
+  });
+
+  it("takes an answer to an escalation the ending resolved, once, keeping what the ending said", async () => {
+    const t = await working();
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Building the rest." } }, t.steward);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
+    await t.done();
+    await t.report();
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.hooks.store.escalation(id)).toMatchObject({ status: "resolved", resolution: "The binding ended." });
+
+    const answer = { binding: "ENG-12", guidance: "Yes, include SSO.", resolve: id };
+    const first = await t.tool("steward_update", answer, t.project);
+    expect(first).toMatchObject({ error: false, text: expect.stringMatching(/guidance saved; recorded the answer on esc_[\w-]+, which was already resolved \(The binding ended\.\)/u) });
+    // A retry changes nothing and is no error.
+    expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/guidance already saved; esc_[\w-]+ already has this answer/u) });
+    expect(t.hooks.store.escalation(id)!.resolution).toBe("The binding ended.\nYes, include SSO.");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["Yes, include SSO."]);
+  });
+
+  it("takes an answer to a forwarded question the ending closed, on the question and its escalation alike", async () => {
+    const t = await working();
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Building the rest." } }, t.steward);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = /(qst_[\w-]+)/u.exec((await t.tool("steward_update", { binding: "ENG-12", forward: id }, t.project)).text)![1]!;
+    await t.done();
+    await t.report();
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "The binding ended." });
+
+    const answer = { resolve: qst, answer: "Yes, include SSO." };
+    expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/ENG-12: guidance saved; recorded the answer on esc_[\w-]+, which was already resolved/u) });
+    expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/ENG-12: guidance already saved; esc_[\w-]+ already has this answer/u) });
+    expect(t.hooks.store.escalation(id)!.resolution).toBe("The binding ended.\nYes, include SSO.");
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "The binding ended.\nYes, include SSO." });
   });
 
   it("takes back the ending when the ticket is moved back before the binding ends", async () => {
@@ -1103,6 +1255,8 @@ describe("questions to the user", () => {
 
     const closed = await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project);
     expect(closed).toMatchObject({ error: false, text: `closed ${t.qid(unbound.text)}.` });
+    // A retry of the same close is no error and changes nothing.
+    expect(await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project)).toMatchObject({ error: false, text: `${t.qid(unbound.text)} already closed with this answer.` });
     expect((await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Again." }, t.project)).text).toMatch(/already closed/u);
     // Guidance on a question about the whole project has no binding to land on: the question closes all the same.
     const project = await t.tool("steward_update", { ask: { question: "Adopt the new lint rules?" } }, t.project);
@@ -1148,6 +1302,15 @@ describe("questions to the user", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
     const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
     expect(list).toMatch(/\(resolved, me\): Include SSO\? → No SSO for now\./u);
+
+    // A retry is no error, records nothing twice, and does not tell the steward again.
+    const told = t.sends.filter((s) => s.threadId === t.steward).length;
+    expect(await t.tool("steward_update", { resolve: qst, answer: "No SSO for now." }, t.project)).toMatchObject({ error: false, text: `ENG-12: guidance already saved; ${esc} already has this answer.` });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward)).toHaveLength(told);
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "No SSO for now." });
+    expect(t.hooks.store.escalation(esc)!.resolution).toBe("No SSO for now.");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["No SSO for now."]);
   });
 
   it("is closed by the user from the page, which resolves a forwarded escalation and tells its steward", async () => {
