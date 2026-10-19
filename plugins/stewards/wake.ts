@@ -198,8 +198,8 @@ function gateLines(input: WakeInput): string[] {
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
       : request.route === "me"
-        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE}`
-        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE}`;
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
@@ -334,7 +334,7 @@ export function formatProjectWake(input: {
     );
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
       out.push(
-        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, which closes the request; or decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
         "",
       );
     }

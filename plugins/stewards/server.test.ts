@@ -450,6 +450,7 @@ describe("a Linear ticket steward", () => {
     expect(wake).toMatch(/approval requested for ENG-12/u);
     expect(wake).toMatch(/(esc_[\w-]+) from ENG-12 \(approval\): Approve ENG-12's spec \(Fix login\)\? .*substantial \(two repos\)/u);
     expect(wake).toMatch(/steward_update \{ binding, approve: true \}/u);
+    expect(wake).toMatch(/approving words in the guidance/u);
     const id = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(wake)![1]!;
 
     // A second report asks nothing twice, and the steward's next wake says it is asked for.
@@ -1605,6 +1606,228 @@ describe("questions to the user", () => {
     const plain = t.qid((await t.tool("steward_update", { ask: { question: "Freeze on Friday?" } }, t.project)).text);
     expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: plain, answer: null }, client)).toMatchObject({ ok: true, message: "Closed." });
     expect((await t.board()).questions).toEqual([]);
+  });
+
+  // BB-13: one spec approval, from any surface. The page answer, the project
+  // steward's words, an unsigned comment on the entity, and the user's own
+  // amendment all approve the same gate.
+  describe("one spec approval from any surface (BB-13)", () => {
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" };
+
+    /** A bound, specified ticket whose approval request is with the project steward. */
+    async function requested() {
+      const t = await adopted();
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      const esc = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
+      const stewardWakes = () => t.sends.filter((s) => s.threadId === t.steward).length;
+      const projectWakes = () => t.sends.filter((s) => s.threadId === t.project).length;
+      return { ...t, esc, qst, stewardWakes, projectWakes };
+    }
+
+    it("records a page answer that approves, resolving the escalation in one step", async () => {
+      const t = await requested();
+      const answered = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "Approved" }, client);
+      expect(answered).toMatchObject({ ok: true, message: expect.stringMatching(/Approved/u) });
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.approval!.by).toBe("user");
+      expect(b.ready.declinedSpecHash).toBeNull();
+      expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "resolved" });
+      expect(t.hooks.store.question(t.qst)!.status).toBe("answered");
+      expect((await t.list())[0]!.escalations).toBe(0);
+      // No fresh request is filed for the same spec.
+      const before = t.projectWakes();
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      expect(t.projectWakes()).toBe(before);
+    });
+
+    it("declines a page answer that clearly refuses", async () => {
+      const t = await requested();
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "No, not yet" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).toBeNull();
+      expect(b.ready.declinedSpecHash).not.toBeNull();
+      expect(t.hooks.store.escalation(t.esc)!.status).toBe("resolved");
+    });
+
+    it("hands an ambiguous page answer to the project steward, not a decline", async () => {
+      const t = await requested();
+      const before = t.projectWakes();
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "What about SSO?" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/project steward/u) });
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).toBeNull();
+      expect(b.ready.declinedSpecHash).toBeNull();
+      const x = t.hooks.store.escalation(t.esc)!;
+      expect(x).toMatchObject({ status: "open", route: "project" });
+      expect(t.projectWakes()).toBeGreaterThan(before);
+      expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/ambiguous/u);
+    });
+
+    it("records approval when the project steward resolves with approving words, no approve: true", async () => {
+      const t = await requested();
+      const resolved = await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved, the spec is complete.", resolve: t.esc }, t.project);
+      expect(resolved.error).toBe(false);
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.declinedSpecHash).toBeNull();
+      expect(t.hooks.store.escalation(t.esc)!.status).toBe("resolved");
+    });
+
+    it("still declines when the project steward resolves without approving words", async () => {
+      const t = await requested();
+      await t.tool("steward_update", { binding: "ENG-12", guidance: "Name the migration in the spec.", resolve: t.esc }, t.project);
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).toBeNull();
+      expect(b.ready.declinedSpecHash).not.toBeNull();
+    });
+
+    it("does not let a steward approve its own spec with approving words", async () => {
+      const t = await requested();
+      expect((await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved, the spec is complete.", resolve: t.esc }, t.steward)).error).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    });
+
+    it("does not let the project steward approve for the user when the approver is me", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!.id;
+      expect((await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved", resolve: esc }, project)).error).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    });
+
+    it("takes the user's unsigned approving comment on the entity as the quote", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const spec = comment({ id: "s1", author: "Jane", body: "**Spec:** acceptance criteria", signedBy: steward, createdAt: "2026-10-14T15:10:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [spec, comment({ id: "u1", author: "Jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T15:20:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      expect((await t.tool("steward_update", { approve: true, quote: "LGTM" }, steward)).error).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
+    });
+
+    it("does not take an approving comment from before the latest spec comment", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      t.entities.set(
+        "uuid-12",
+        issue({
+          comments: [comment({ id: "u1", author: "Jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T15:10:00Z" }), comment({ id: "s1", author: "Jane", body: "**Spec:** acceptance criteria", signedBy: steward, createdAt: "2026-10-14T15:20:00Z" })],
+        }),
+      );
+      await t.ring("linear", "uuid-12");
+      expect((await t.tool("steward_update", { approve: true, quote: "LGTM" }, steward)).error).toBe(true);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    });
+
+    it("takes the user's own spec comment as approval when the approver is me", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      t.entities.set("uuid-12", issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_design", createdAt: "2026-10-14T15:30:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.declinedSpecHash).toBeNull();
+      expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/user's spec comment approves/u);
+    });
+
+    it("carries the user's own amendment's approval even after a stale one (approver me)", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const s1 = comment({ id: "s1", author: "Jane", body: "**Spec:** acceptance criteria", signedBy: steward, createdAt: "2026-10-14T15:10:00Z" });
+      const u1 = comment({ id: "u1", author: "Jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T15:20:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [s1, u1] }));
+      await t.ring("linear", "uuid-12");
+      expect((await t.tool("steward_update", { approve: true, quote: "LGTM" }, steward)).error).toBe(false);
+      const approved = t.hooks.store.find("ENG-12")!.ready.approval!.specHash;
+      // The steward amends the spec: the approval is stale but still pinned to the old hash.
+      const s2 = comment({ id: "s2", author: "Jane", body: "**Spec:** narrower scope", signedBy: steward, createdAt: "2026-10-14T15:30:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [s1, u1, s2] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.hooks.store.find("ENG-12")!.ready.approval!.specHash).toBe(approved);
+      // The user amends from their own thread: it carries its own approval for the new spec.
+      t.entities.set("uuid-12", issue({ comments: [s1, u1, s2, comment({ id: "u2", author: "Jane", body: "**Spec:** even narrower", signedBy: "thr_design", createdAt: "2026-10-14T15:40:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.approval!.specHash).not.toBe(approved);
+    });
+
+    it("files a fresh request and tells the steward the user authored the spec (approver project)", async () => {
+      const t = await adopted();
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      await t.tool("steward_update", { binding: "ENG-12", approve: true }, t.project);
+      const before = t.sends.filter((s) => s.threadId === t.project).length;
+      t.entities.set("uuid-12", issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_design", createdAt: "2026-10-14T15:40:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/Spec comment added by the user/u);
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      expect(t.sends.filter((s) => s.threadId === t.project).length).toBeGreaterThan(before);
+      expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/the spec has changed since its last approval/u);
+    });
+
+    it("says not to ask the user again, and flags a report that does", async () => {
+      const t = await requested();
+      expect((await t.tool("steward_report", { ...base, ready: met }, t.steward)).text).toMatch(/Do not ask the user again; it is listed on the Stewards page/u);
+      t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/Do not ask the user again; it is listed on the Stewards page/u);
+      const bad = await t.tool("steward_report", { ...base, nextAction: "Ask the user to approve the spec", actor: "me", ready: met }, t.steward);
+      expect(bad.text).toMatch(/playbook violation/u);
+      expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toMatch(/asks for an approval that is already open/u);
+    });
+
+    it("passes the BB-11 sequence: page answer, amendment, page answer again, no duplicate request", async () => {
+      const t = await adopted();
+      const answer = async (esc: string, text: string) => {
+        const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
+        await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: text }, client);
+      };
+      const projectWakes = () => t.sends.filter((s) => s.threadId === t.project).length;
+
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      const first = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      await answer(first, "Approved");
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
+      const afterFirst = projectWakes();
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      expect(projectWakes()).toBe(afterFirst);
+
+      // The user amends the spec from their own thread: a fresh request, once.
+      t.entities.set("uuid-12", issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_design", createdAt: "2026-10-14T16:00:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      await t.tool("steward_report", { ...base, ready: met }, t.steward);
+      const second = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      expect(second).not.toBe(first);
+
+      // And approves the amended spec on the page again.
+      await answer(second, "LGTM");
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.declinedSpecHash).toBeNull();
+      expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "approval")).toEqual([]);
+    });
   });
 
   it("the page shows a project's board: waiting on you, in flight by stage with workers, stuck or held, ended, and the digest", async () => {

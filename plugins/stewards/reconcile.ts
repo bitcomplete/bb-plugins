@@ -15,7 +15,7 @@ import type { Binding, Escalation, Observed, ReadyState, Worker } from "./store.
  * `own` marks the steward's own doing (its signed description edit), which is
  * news to nobody above it.
  */
-export type Change = { text: string; actionable: boolean; own?: boolean };
+export type Change = { text: string; actionable: boolean; own?: boolean; byUser?: boolean };
 
 /**
  * A worker is in flight from its spawn until it is stopped, failed or
@@ -63,24 +63,33 @@ export function markerLaneChange(before: readonly SnapshotComment[], after: read
   return { from: b.lane, to: a.lane };
 }
 
-/** A spec comment is one of the steward's own signed comments that starts by saying so. */
-export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null): boolean =>
-  stewardThreadId !== null && c.signedBy === stewardThreadId && /^\s*(\*\*)?spec\b/iu.test(c.body);
 
 /**
- * What an approval is pinned to: the description and the steward's spec
- * comments. Any change to either changes the hash. The signature line is
- * left out of the description, so the steward's own signed edit hashes the
- * same as the text it wrote.
+ * A spec comment is a signed comment that starts by saying so. The steward's
+ * own count, and so do the user's: a thread the user runs themselves is
+ * treated as the user's own words (an amendment carries its own approval
+ * when the approver is `me`). `isUserThread` says whether a signing thread is
+ * the user's rather than a steward, worker or the project steward; without it
+ * only the steward's own comments count.
+ */
+export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): boolean =>
+  c.signedBy !== null && /^\s*(\*\*)?spec\b/iu.test(c.body) && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
+
+/**
+ * What an approval is pinned to: the description and the spec comments. The
+ * steward's own and the user's (a thread the user runs) both count. Any
+ * change to either changes the hash. The signature line is left out of the
+ * description, so the steward's own signed edit hashes the same as the text
+ * it wrote.
  */
 const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
 
 /** The thread that signed the description, when its last edit was signed. */
 export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DESCRIPTION_SIGNATURE.exec(entity.description ?? "")?.[1] ?? null;
 
-export function specHash(entity: EntitySnapshot, stewardThreadId: string | null): string {
+export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
-  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId)).map((c) => `${c.id}\n${c.body}`);
+  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).map((c) => `${c.id}\n${c.body}`);
   return createHash("sha256").update([description, ...specs].join("\n\u0000\n")).digest("hex").slice(0, 16);
 }
 
@@ -114,7 +123,7 @@ const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
  * which hears from the worker when it finishes. People and terminal states
  * still wake it.
  */
-type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerInFlight: boolean };
+type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerInFlight: boolean; userThread?: (threadId: string) => boolean };
 
 /**
  * The changes between two observations of one entity, each marked whether it
@@ -140,9 +149,15 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
-  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId)).map((c) => c.id));
-  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId) && !beforeSpecs.has(c.id));
-  if (addedSpecs.length > 0) changes.push({ text: `${p}Spec comment${addedSpecs.length === 1 ? "" : "s"} added`, actionable: ctx.approved });
+  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread)).map((c) => c.id));
+  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread) && !beforeSpecs.has(c.id));
+  if (addedSpecs.length > 0) {
+    const byUser = addedSpecs.some((c) => c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false));
+    // A spec comment the user wrote is news on its own: it carries its own
+    // approval when the approver is `me`, and when it is the project steward
+    // the steward should know the user authored it, not wait on them.
+    changes.push({ text: `${p}Spec comment${addedSpecs.length === 1 ? "" : "s"} added${byUser ? " by the user" : ""}`, actionable: ctx.approved || byUser, ...(byUser ? { byUser } : {}) });
+  }
 
   const beforeChildren = new Map(before.children.map((c) => [c.id, c]));
   for (const child of after.children) {
@@ -199,7 +214,7 @@ export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comm
  * (see DiffContext), including the reviewer's `bb-review` markers, except a
  * change of lane (criterion 3).
  */
-export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerInFlight: boolean }): Change[] {
+export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerInFlight: boolean; userThread?: (threadId: string) => boolean }): Change[] {
   const viewer = after.entity.viewer;
   const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer });
   const beforePulls = new Map(before.pulls.map((p) => [p.key.toLowerCase(), p]));
@@ -229,6 +244,53 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
     }
   }
   return changes;
+}
+
+// ---- approval words -------------------------------------------------------------------
+
+/**
+ * How a piece of text answers an approval request. Explicit approval words
+ * approve; explicit refusal words decline; anything else is ambiguous and is
+ * the project steward's to interpret. The page answer uses all three; a
+ * project steward's own guidance + resolve is a decision, so anything that
+ * does not approve declines (as before).
+ */
+export type ApprovalVerdict = "approve" | "decline" | "ambiguous";
+
+const NEGATED_APPROVE = /(?:^|[^\p{L}\p{N}])(?:not|never|cannot|do\s+not|[a-z]+n['’]t)\s+(?:\w+\s+){0,2}?(?:approv\w*|ship|lgtm|go\s+ahead|looks?\s+good|sign\s*off|yes)(?:[^\p{L}\p{N}]|$)/iu;
+const REFUSAL = /(?:^|[^\p{L}\p{N}])(?:reject(?:ed)?|declin(?:e|ed)|hold\s+off)(?:[^\p{L}\p{N}]|$)/iu;
+const APPROVE_WORDS = /(?:^|[^\p{L}\p{N}])(?:lgtm|approv(?:e|es|ed|al)|ship\s*it|go\s*ahead|looks?\s+good|sign(?:ed)?\s*off|:shipit:|yes|yep|yeah)(?:[^\p{L}\p{N}]|$)/iu;
+const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+yet|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
+
+/**
+ * A clear refusal first, so "not approved" and "don't ship it" decline rather
+ * than matching the approval word inside them; then approval words, so
+ * "LGTM, no concerns" and "ship it, no further changes needed" approve; then
+ * a bare no or a request for changes declines; anything else is ambiguous.
+ */
+export function classifyApproval(text: string | null | undefined): ApprovalVerdict {
+  const flat = (text ?? "").replace(/\s+/gu, " ").trim();
+  if (flat === "") return "ambiguous";
+  if (NEGATED_APPROVE.test(flat) || REFUSAL.test(flat)) return "decline";
+  if (APPROVE_WORDS.test(flat)) return "approve";
+  if (DECLINE_WORDS.test(flat)) return "decline";
+  return "ambiguous";
+}
+
+/**
+ * A steward that asks for an approval that is already open. The plugin files
+ * the request and lists it on the Stewards page, so the playbook says not to
+ * ask the user again; a report whose next action is to ask them anyway is a
+ * violation `bb stewards show` points at. Only an imperative next action
+ * counts, so merely waiting on the request is not flagged.
+ */
+export function asksForOpenApproval(status: Binding["status"], open: readonly Escalation[]): string | null {
+  if (status === null || !open.some((x) => x.kind === "approval")) return null;
+  const next = status.nextAction.trim();
+  if (!/^(?:ask|asks|asking|request|requests|requesting|remind|reminds|reminding|tell|tells|telling|prompt|prompts|prompting)\b/iu.test(next)) return null;
+  if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(next)) return null;
+  if (!/\b(?:user|you|your)\b/iu.test(next)) return null;
+  return "asks for an approval that is already open";
 }
 
 /**

@@ -571,6 +571,26 @@ export function createStore(db: Database.Database, now: () => number) {
       patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
       return true;
     },
+    /**
+     * Record an approval on the gate and resolve the binding's open approval
+     * escalations, in one transaction: answering an approval request approves
+     * the current spec and closes the request together.
+     */
+    approve(bindingId: string, approval: NonNullable<ReadyState["approval"]>, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
+    },
+    /** Remember the current spec as declined and close its approval request, in one transaction. */
+    decline(bindingId: string, specHash: string, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
+    },
 
     // escalations
     escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null }): Escalation {
@@ -648,6 +668,14 @@ export function createStore(db: Database.Database, now: () => number) {
         if (q.escalationId !== null) resolveEscalation.run(answer, at, q.escalationId);
         return true;
       })();
+    },
+    /**
+     * Close an open question with its answer, leaving the escalation it was
+     * forwarded for open. Used when the user's answer is ambiguous: the
+     * project steward, not the plugin, decides what it means.
+     */
+    answerQuestionOnly(id: string, answer: string, by: string): boolean {
+      return answerQuestion.run(answer, by, now(), id).changes > 0;
     },
 
     // workers
