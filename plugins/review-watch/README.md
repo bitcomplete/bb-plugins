@@ -4,7 +4,8 @@ A personal GitHub review inbox for BB. A background poller asks GitHub what
 needs your attention, stores a deduplicated queue, and surfaces it in the
 sidebar, the thread header, and on the command line. **Start** opens one thread;
 **Review selected** opens one thread for several review requests. Threads use
-the configured project's default environment.
+the configured project's default checkout on its registered machine, including
+when that machine is a remote devbox.
 
 Review Watch reads GitHub and never writes to it, and it never starts a thread
 on its own. The queue notifies; you dispatch.
