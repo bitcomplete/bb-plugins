@@ -1,7 +1,8 @@
 # Stewards
 
 Give a Linear ticket or a GitHub pull request **a long-lived thread that
-manages it until it is done**. The thread, a **steward**, acts on the entity
+manages it until it is done**, and production a thread that watches it and
+files what goes wrong. The thread, a **steward**, acts on the entity
 as you, by a playbook the project keeps in `.bb`, and you steer it only from
 bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 
@@ -17,6 +18,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   on bithub that was 88 of the project steward's 96 turns. A project's
   stewards share one sidebar section, named after the project, with each
   steward's workers nested under it; see DESIGN.md §15.
+- **Ops stewards.** Each target in the project file's `ops.targets` (a
+  Kubernetes namespace) gets an `ops` steward, reporting to the project
+  steward, for as long as it is listed. The plugin looks at the target from
+  the bb-server pod with the ServiceAccount bb-gate mounts there
+  ([kube.ts](kube.ts)): pods, Warning events, Deployments, and a failing
+  container's last log lines where `pods/log` is granted. It names each
+  problem by a fingerprint (workload, container, error signature;
+  [ops.ts](ops.ts)) and keeps a fingerprint → Linear ticket map. A new
+  problem, or one back after its ticket was resolved, wakes the steward at
+  once; one still failing under its open ticket wakes it at the requeue
+  (`requeue-default`, 1h in the template), to comment there and file
+  nothing new. A look that finds nothing wrong wakes nobody. The steward
+  files one ticket per problem and escalates a `decision` to the project
+  steward ("Filed BB-N (high), recommend adopting"); the project steward
+  adopts with the label and Todo, the ordinary path. It never changes the
+  cluster: its playbook allows reading, filing, commenting and escalating,
+  and RBAC allows only reads. Until the server can read a target, its
+  binding waits and `bb stewards check` says why. DESIGN.md §18.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
@@ -127,6 +146,7 @@ stewards/
     linear-tickets.md   front matter + one ## section per phase
     github-prs.md
     github-reviews.md
+    ops-watch.md        no phases; ## New, ## Recurring and ## Returned sections
 ```
 
 `bb stewards init` writes starting points ([templates.ts](templates.ts));
@@ -134,11 +154,17 @@ stewards/
 fails to parse is reported and bindings keep running under the last good
 version. Project file fields beyond the design: `nightly.until`,
 `nightly.max`, `playbooks` (which playbook governs each kind),
-`reviews.enabled`, `adoption.perPass`, and `bigDecisions` (what reaches you;
-defaults in [config.ts](config.ts)).
+`reviews.enabled`, `adoption.perPass`, `bigDecisions` (what reaches you;
+defaults in [config.ts](config.ts)), and `ops`: `targets` (`{ kind:
+"k8s-namespace", name }`, at most ten), `team` (where tickets are filed; the
+first of `linear.teams` by default, and it must be one of them) and
+`autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
+tickets the ops steward labels for a steward itself when it files them).
+`ops-watch.md` is read only when `ops.targets` lists something.
 
-Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`), `source`,
-`phases` (state → `{ stage, stuck }`), `terminal`, `ready` (`checklist`,
+Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
+`source` (`linear`, `github`, or `k8s` for `ops`), `phases` (state → `{ stage,
+stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as
 `provider/model/level`; `claude` means `claude-code`; the model may hold
@@ -159,7 +185,9 @@ None beyond the playbook's word. A steward acts with the user's credentials
 and a shell; its `may` list and the ready gate are stated in every wake, and
 everything it writes is signed with its thread, so what it did is visible
 afterwards. The runaway guard is the one hard stop. GitHub writes go through
-`gh`; there are no write tools to check.
+`gh`; there are no write tools to check. Ops stewards are the exception
+where a wall exists: the cluster access bb-gate grants is read-only, and
+`bb stewards check` reports any write it finds.
 
 ## The contract with linear and github-watcher
 
@@ -180,4 +208,7 @@ bb plugin build
 Deployment needs this directory added to bb-gate's
 `docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
 `BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve
-the contract.
+the contract. Ops stewards need bb-gate to mount a read-only ServiceAccount
+into the backend of the developer who runs them, at the standard path
+(`/var/run/secrets/kubernetes.io/serviceaccount`: `token` and `ca.crt`);
+the plugin calls `https://kubernetes.default.svc`.

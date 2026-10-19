@@ -2,11 +2,13 @@ import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
-import { comment, issue, pull } from "./fixtures.js";
-import { createStewardsPlugin, testHooks } from "./server.js";
+import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
+import type { OpsAccess, OpsReader } from "./kube.js";
+import { eventsOf, findingsOf, podsOf } from "./ops.js";
+import { createStewardsPlugin, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS } from "./store.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
+import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
 
@@ -150,10 +152,10 @@ function world() {
   return { files, writes, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
-async function setup() {
+async function setup(extra: Partial<StewardsDeps> = {}) {
   const w = world();
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"] });
-  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 } })(bb);
+  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
   /** Let debounced work run to completion. */
   const flush = async () => {
@@ -1291,6 +1293,7 @@ describe("bb stewards init", () => {
     const out = await t.harness.behavior.runCli(["init", "--teams", "eng"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
     expect(out.exitCode).toBe(0);
     expect(t.writes).toContainEqual({ path: `/w/.bb/${PROJECT_FILE}`, hostId: "host_me" });
+    expect(t.writes).toContainEqual({ path: `/w/.bb/${playbookPath("ops-watch")}`, hostId: "host_me" });
     expect(t.writes.every((w) => w.hostId === "host_me")).toBe(true);
   });
 
@@ -1298,7 +1301,7 @@ describe("bb stewards init", () => {
     const t = await setup();
     t.threads.set("thr_me", { status: "active", archivedAt: null });
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
-    expect(t.writes.length).toBe(4);
+    expect(t.writes.length).toBe(5);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 });
@@ -1490,5 +1493,201 @@ describe("the settings page", () => {
     expect(overview.projects[0]!.playbooks.find((p) => p.kind === "pr")!.version).toBeNull();
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
     expect(check.ok).toBe(false);
+  });
+});
+
+describe("ops stewards", () => {
+  const TARGET = "k8s-namespace/bb-gate-production";
+  const FP = `${TARGET}/bb-gate-router/router#CrashLoopBackOff:Error:1`;
+
+  /** A namespace the fake cluster serves, as kube.ts would read it, through the real parsing. */
+  function cluster() {
+    const state = { pods: [] as unknown[], events: [] as unknown[], error: null as string | null, logs: false, access: null as OpsAccess | null };
+    const reader: OpsReader = {
+      async look(target, at) {
+        if (state.error !== null) throw new Error(state.error);
+        const pods = podsOf({ items: state.pods });
+        const sightings = findingsOf(target, pods, eventsOf({ items: state.events }), at);
+        const failing = sightings.filter((x) => x.container !== null);
+        if (state.logs) for (const x of failing) x.logs = ["panic: listen tcp :8080: address already in use"];
+        return { pods: pods.length, healthy: pods.filter((p) => p.ready).length, deployments: [{ name: "bb-gate-router", ready: 0, desired: 1 }], warnings: [], logs: failing.length === 0 ? "unneeded" : state.logs ? "read" : "not granted", notes: [], sightings };
+      },
+      async access() {
+        return state.access ?? { error: "this server has no cluster access: no ServiceAccount token at /var/run/secrets/kubernetes.io/serviceaccount", reads: [], logs: null, mutating: [] };
+      },
+    };
+    return { state, reader };
+  }
+
+  const opsProject = (targets: string[] = ["bb-gate-production"], extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: targets.map((name) => ({ kind: "k8s-namespace", name })), ...extra } });
+
+  async function watched(over: { error?: string } = {}) {
+    const c = cluster();
+    const t = await setup({ ops: c.reader });
+    t.files[PROJECT_FILE] = opsProject();
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    c.state.pods = [crashingPod()];
+    c.state.events = [warningEvent("bb-gate-router-6d4f9c7b8-x2k4q")];
+    if (over.error !== undefined) c.state.error = over.error;
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = () => t.spawns.find((x) => String(x.title).startsWith("Ops watch"));
+    const wakes = () => {
+      const id = steward()?.id;
+      return id === undefined ? [] : [String(steward()!.prompt), ...t.sends.filter((x) => x.threadId === id).map((x) => x.text)];
+    };
+    return { t, c, steward, wakes };
+  }
+
+  it("watches a configured target, files one ticket for a crash loop, and comments on it while it keeps crashing", async () => {
+    const { t, steward, wakes } = await watched();
+    const [project] = t.spawns;
+    const ops = steward()!;
+    // A binding of its own, reporting to the project steward, in the list and on the page.
+    expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: ops.id, ended: false }]);
+    expect(ops).toMatchObject({ title: "Ops watch: bb-gate-production", sectionId: "sec_1", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5" });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; kind: string; stage: string | null }> } };
+    expect(board.board.stewards).toEqual([expect.objectContaining({ key: TARGET, kind: "ops", stage: "watch" })]);
+
+    const first = wakes()[0]!;
+    expect(first).toMatch(/^# Ops watch: k8s-namespace\/bb-gate-production/u);
+    expect(first).toMatch(/You have just been made the ops steward/u);
+    expect(first).toContain(`#### ${FP}`);
+    expect(first).toMatch(/### New: no ticket yet/u);
+    expect(first).toMatch(/File one ticket per problem/u);
+    expect(first).not.toMatch(/### Recurring/u);
+    expect(first).toMatch(/BackOff ×12: Back-off restarting failed container router/u);
+    // bb-gate-production grants no logs: the wake says to diagnose from status and events.
+    expect(first).toMatch(/Logs: not readable from this server \(no pods\/log grant here\)/u);
+    expect(first).toMatch(/File tickets in the Linear team ENG/u);
+    expect(first).toMatch(/Allowed actions: read, file-ticket, comment, escalate\./u);
+
+    // A fingerprint it has not seen is refused, and nothing is recorded.
+    const base = { phase: "watching", summary: "router crash-looping; filed ENG-50", nextAction: "Watch", actor: "steward" };
+    const wrong = await t.tool("steward_report", { ...base, opsTickets: [{ fingerprint: "made-up", ticket: "ENG-50", did: "filed" }] }, ops.id);
+    expect(wrong).toMatchObject({ error: true, text: expect.stringMatching(/"made-up" is not a fingerprint/u) });
+    expect(wrong.text).toContain(FP);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: null });
+
+    // It files, and escalates once to the project steward, which hears how to adopt.
+    const report = await t.tool(
+      "steward_report",
+      { ...base, opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }], escalate: { kind: "decision", question: "Filed ENG-50 (high): bb-gate-router crash-loops on start. Recommend adopting.", meanwhile: "Keep watching." } },
+      ops.id,
+    );
+    expect(report).toMatchObject({ error: false, text: expect.stringMatching(/Recorded ENG-50 \(filed\) against its fingerprint/u) });
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "ENG-50" });
+    const told = t.sends.filter((x) => x.threadId === project!.id).at(-1)!.text;
+    expect(told).toMatch(/New escalations routed to you/u);
+    expect(told).toMatch(/from k8s-namespace\/bb-gate-production \(decision\): Filed ENG-50/u);
+    expect(told).toMatch(/An escalation from an ops steward .* add the label `bb-managed` and move it to Todo/u);
+
+    // Another look before the requeue, still crashing: nothing new, nobody woken.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", title: "bb-gate-router crash-loops", labels: [], state: "Triage", stateType: "triage" }));
+    const before = wakes().length;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(before);
+
+    // At the requeue, the same problem is a comment on ENG-50: recurring, and no new ticket.
+    t.advance(61 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    const again = wakes().at(-1)!;
+    expect(wakes()).toHaveLength(before + 1);
+    expect(again).toMatch(/### Recurring: its ticket is open/u);
+    expect(again).toMatch(/ticket ENG-50 \(Triage\)/u);
+    expect(again).toMatch(/Comment on that ticket/u);
+    expect(again).toMatch(/File nothing new/u);
+    expect(again).not.toMatch(/### New/u);
+    expect(again).toMatch(/Requeue time came, with problems still failing/u);
+    expect((await t.tool("steward_report", { ...base, opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "commented" }] }, ops.id)).error).toBe(false);
+    expect(t.hooks.store.fingerprints(t.hooks.store.find(TARGET)!.id)).toMatchObject([{ fingerprint: FP, ticketKey: "ENG-50", lastCommentedAt: t.now() }]);
+
+    // The project steward adopts it the usual way (label and Todo); the team lease brings a ticket steward.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", title: "bb-gate-router crash-loops", labels: ["bb-managed"], state: "Todo" }));
+    await t.ring("linear", "ENG-50");
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "ENG-50", kind: "ticket" })]));
+
+    // Done, and the router crashes again: back at once, for the playbook to reopen or file anew.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", labels: ["bb-managed"], state: "Done", stateType: "completed" }));
+    await t.hooks.sweep();
+    await t.flush();
+    const back = wakes().at(-1)!;
+    expect(back).toMatch(/### Returned: its ticket was resolved/u);
+    expect(back).toMatch(/Back after ENG-50 was resolved \(Done\)/u);
+    expect(back).toMatch(/escalate\s+a decision recommending it be reopened/u);
+  });
+
+  it("makes a binding that waits while the server cannot read its target, and wakes once it can", async () => {
+    const { t, c, steward } = await watched({ error: "403: pods is forbidden" });
+    expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: null }]);
+    expect(steward()).toBeUndefined();
+    const listed = await t.harness.behavior.runCli(["list"], { projectId: "p1" });
+    expect(listed.stdout).toMatch(/cannot read the target: 403: pods is forbidden/u);
+
+    c.state.error = null;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(steward()).toBeDefined();
+    expect(String(steward()!.prompt)).toMatch(/You have just been made the ops steward/u);
+  });
+
+  it("ends with its target's removal from the project file, and resumes the same thread when it is back", async () => {
+    const { t, steward, wakes } = await watched();
+    const id = steward()!.id;
+    t.files[PROJECT_FILE] = opsProject([]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: TARGET, ended: true }]);
+    expect(t.threads.get(id)!.archivedAt).not.toBeNull();
+
+    t.files[PROJECT_FILE] = opsProject();
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: TARGET, ended: false, threadId: id }]);
+    expect(t.threads.get(id)!.archivedAt).toBeNull();
+    expect(wakes().at(-1)).toMatch(/configured again and its binding has resumed/u);
+    expect(t.spawns.filter((x) => String(x.title).startsWith("Ops watch"))).toHaveLength(1);
+  });
+
+  it("is checked: a target this server cannot read is a problem, as is any write it holds there", async () => {
+    const { t, c } = await watched();
+    const check = () => t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    const none = await check();
+    expect(none.exitCode).toBe(1);
+    expect(none.stdout).toMatch(/ops: tickets filed in ENG/u);
+    expect(none.stdout).toMatch(/problem: ops: this server cannot read k8s-namespace\/bb-gate-production: this server has no cluster access/u);
+    expect(none.stdout).toMatch(/^ops: ops-watch@/mu);
+
+    const reads = [{ what: "list pods", ok: true, detail: null }, { what: "list events", ok: true, detail: null }, { what: "list deployments", ok: false, detail: "403: forbidden" }];
+    c.state.access = { error: null, reads, logs: false, mutating: [] };
+    const readable = await check();
+    expect(readable.exitCode).toBe(0);
+    expect(readable.stdout).toMatch(/ops: k8s-namespace\/bb-gate-production is readable \(list pods, list events\); logs not granted, so diagnosis is from status and events/u);
+    expect(readable.stdout).toMatch(/cannot list deployments \(403: forbidden\); looks go without it/u);
+
+    c.state.access = { error: null, reads, logs: true, mutating: ["delete pods"] };
+    const writable = await check();
+    expect(writable.exitCode).toBe(1);
+    expect(writable.stdout).toMatch(/problem: ops: this server may delete pods in k8s-namespace\/bb-gate-production; an ops steward's access should be read-only/u);
+
+    // A project file whose ops section is wrong is a problem too.
+    t.files[PROJECT_FILE] = opsProject(["bb-gate-production"], { team: "SALES" });
+    expect((await check()).stdout).toMatch(/problem: stewards\/project\.json: ops\.team: SALES is not one of linear\.teams/u);
+  });
+
+  it("gives an ops steward its own instructions, and refuses opsTickets from any other steward", async () => {
+    const { t, steward } = await watched();
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: steward()!.id, title: null, parentThreadId: null, sourceThreadId: null } }));
+    expect(config.instructions).toMatch(/You are the ops steward watching "k8s-namespace\/bb-gate-production"/u);
+    expect(config.instructions).toMatch(/never change production and start no workers/u);
+
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const ticketSteward = t.spawns.find((x) => x.title === "ENG-12: Fix login")!.id;
+    const r = await t.tool("steward_report", { phase: "Todo", summary: "x", nextAction: "y", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }] }, ticketSteward);
+    expect(r).toMatchObject({ error: true, text: expect.stringMatching(/opsTickets is for an ops steward's report/u) });
   });
 });
