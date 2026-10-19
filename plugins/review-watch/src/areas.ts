@@ -70,3 +70,17 @@ function mostCommon(labels: readonly string[]): string {
   for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1);
   return [...counts].sort(([a, x], [b, y]) => y - x || a.length - b.length || a.localeCompare(b))[0]![0];
 }
+
+/** Keep title scopes within their GitHub owner, with owners in alphabetical order. */
+export function groupByOrganization(items: readonly QueueItem[]) {
+  const groups = new Map<string, QueueItem[]>();
+  for (const item of items) {
+    const organization = (item.repo.split("/")[0] || item.repo).toLowerCase();
+    const group = groups.get(organization) ?? [];
+    group.push(item);
+    groups.set(organization, group);
+  }
+  return [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([label, rows]) => ({
+    label, items: rows, areas: groupByArea(rows),
+  }));
+}

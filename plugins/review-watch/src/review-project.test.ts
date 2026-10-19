@@ -11,7 +11,7 @@ afterEach(() => { vi.unstubAllGlobals(); });
 
 const first: QueueItem = {
   key: "review-requested:one:sha", rule: "review-requested", state: "queued", repo: "parsleyhealth/sage",
-  number: 1, title: "Improve the editor", author: "alice", url: "https://github.com/parsleyhealth/sage/pull/1",
+  number: 1, title: "fix(catalog): improve the editor", author: "alice", url: "https://github.com/parsleyhealth/sage/pull/1",
   baseBranch: "main", headBranch: "editor", headSha: "sha", nodeId: "one", reason: "Review requested",
   noticedAt: "2026-10-19T12:00:00Z", updatedAt: "2026-10-19T12:00:00Z",
 };
@@ -99,5 +99,20 @@ it("starts an individual review in the project selected in the dialog", async ()
     expect(slot.inspection.rpcCalls.find((call) => call.method === "item_start")).toMatchObject({
       input: { key: first.key, projectId: "bitcomplete" },
     });
+  } finally { slot.lifecycle.unmount(); }
+});
+
+it("groups reviews by organization and scopes organization selection to its own rows", async () => {
+  const slot = await setup();
+  try {
+    const parsley = within(await slot.findByRole("region", { name: "parsleyhealth reviews" }));
+    expect(parsley.getByLabelText("Select parsleyhealth / catalog")).toBeTruthy();
+    expect(parsley.queryByLabelText("Select bitcomplete/hiringloop#2")).toBeNull();
+    fireEvent.click(parsley.getByLabelText("Select organization parsleyhealth"));
+    expect(slot.getByLabelText("Select parsleyhealth/sage#1")).toHaveProperty("checked", true);
+    expect(slot.getByLabelText("Select bitcomplete/hiringloop#2")).toHaveProperty("checked", false);
+    expect(slot.getByRole("button", { name: /Review 1/ })).toBeTruthy();
+    fireEvent.click(parsley.getByLabelText("Clear organization parsleyhealth"));
+    expect(slot.queryByLabelText("Selection")).toBeNull();
   } finally { slot.lifecycle.unmount(); }
 });

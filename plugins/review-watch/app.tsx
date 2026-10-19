@@ -11,9 +11,9 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalBadge, PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
+import type { PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { groupByArea, type AreaGroup } from "./src/areas";
+import { groupByOrganization, type AreaGroup } from "./src/areas";
 import type { QueueItem, Rule } from "./src/types";
 import { ReviewProjectDialog } from "./review-project-dialog";
 import { Button } from "@/components/ui/button";
@@ -90,7 +90,7 @@ function PrRef({ repo, number, href, strong }: { repo: string; number: number; h
       title={`${repo} #${number}`}
       className={cn("flex w-[124px] shrink-0 justify-start gap-1 whitespace-nowrap rounded-sm text-muted-foreground hover:underline @min-[720px]:w-[156px]", RING)}
     >
-      {/* The org adds nothing in a personal inbox: the repository's own name, with the full slug in the title. */}
+      {/* The organization is shown above the group; keep the full slug in the title. */}
       <span className="min-w-0 truncate">{repo.split("/").pop()}</span>
       <b className={cn("shrink-0 font-medium", strong ? "text-foreground" : "text-foreground/80")}>#{number}</b>
     </UrlLink>
@@ -183,15 +183,19 @@ function QueueCountChip({
 function QueueCountChips({
   initial,
   followups,
+  sidebar = false,
 }: {
   initial: number;
   followups: number;
+  sidebar?: boolean;
 }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full border border-border bg-muted tabular-nums",
-        "gap-1.5 px-1.5 py-0.5",
+        sidebar
+          ? "min-w-[3rem] justify-center gap-0.5 px-0.5 py-0.5"
+          : "gap-1.5 px-1.5 py-0.5",
       )}
     >
       <QueueCountChip
@@ -356,21 +360,24 @@ export function AreaSection({
   picked,
   onPickScope,
   children,
+  organization,
 }: {
+  organization?: string;
   area: AreaGroup;
   picked: ReadonlySet<string>;
   onPickScope: (keys: readonly string[], select: boolean) => void;
   children: ReactNode;
 }) {
+  const Heading = organization ? "h4" : "h3";
   return (
     <section className="min-w-0" aria-label={area.label}>
       {/* ml-9 puts the box over the rows' boxes (the card's margin, border, and
           padding plus the row's pl-2), and gap-2 puts the label over their PR column. */}
-      <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
+      <Heading className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
         <ScopeCheckbox
           keys={area.items.filter(canBatchReview).map((item) => item.key)}
           picked={picked}
-          label={area.label}
+          label={organization ? `${organization} / ${area.label}` : area.label}
           onPick={onPickScope}
         />
         <span className="min-w-0 truncate">
@@ -380,7 +387,7 @@ export function AreaSection({
           )}
         </span>
         <span className="font-normal tabular-nums">{area.items.length}</span>
-      </h3>
+      </Heading>
       {/* The card's edge lines up with the section's title, which keeps its rows where they were, under the area's title. */}
       <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>{children}</ul>
     </section>
@@ -401,9 +408,9 @@ function ReviewsPage() {
   const now = Date.now();
   const activeItems = items?.filter(isActiveItem) ?? [];
   const archivedItems = items?.filter((item) => item.state === "archived") ?? [];
-  const areas = groupByArea(activeItems);
+  const organizations = groupByOrganization(activeItems);
   // Selectable rows in drawn order: Shift ranges and the section's box use it.
-  const selectable = areas.flatMap((area) => area.items.filter(canBatchReview).map((item) => item.key));
+  const selectable = organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter(canBatchReview).map((item) => item.key)));
   const selection = selectable.filter((key) => picked.has(key));
 
   useEffect(() => {
@@ -543,12 +550,19 @@ function ReviewsPage() {
                   {activeItems.length}
                 </span>
               </div>
-              {areas.length === 0 ? (
+              {organizations.length === 0 ? (
                 <p className={EMPTY}>Nothing waiting on you.</p>
               ) : (
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-7 pb-1.5 pt-0.5">
-                  {areas.map((area) => (
-                    <AreaSection key={area.key} area={area} picked={picked} onPickScope={pickScope}>
+                  {organizations.map((organization) => <section key={organization.label} aria-label={`${organization.label} reviews`} className="min-w-0">
+                    <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-1 pt-2 text-[12px] font-semibold">
+                      <ScopeCheckbox keys={organization.items.filter(canBatchReview).map((item) => item.key)} picked={picked}
+                        label={`organization ${organization.label}`} onPick={pickScope} />
+                      <span className="min-w-0 truncate">{organization.label}</span>
+                      <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
+                    </h3>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
+                    {organization.areas.map((area) => <AreaSection key={area.key} area={area} organization={organization.label} picked={picked} onPickScope={pickScope}>
                       {area.items.map((item) => (
                         <ReviewRow
                           key={item.key}
@@ -557,8 +571,9 @@ function ReviewsPage() {
                           onPick={(shift) => pick(item.key, shift)}
                         />
                       ))}
-                    </AreaSection>
-                  ))}
+                    </AreaSection>)}
+                    </div>
+                  </section>)}
                 </div>
               )}
               {archivedItems.length > 0 ? (
@@ -566,9 +581,14 @@ function ReviewsPage() {
                   <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>
                     {archivedItems.length} archived · show
                   </summary>
-                  <ul className={cn("ml-[19px] mt-0.5 grid list-none grid-cols-[minmax(0,1fr)] opacity-70", GROUP_CARD)}>
-                    {archivedItems.map((item) => <ReviewRow key={item.key} {...rowProps(item)} />)}
-                  </ul>
+                  <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 pt-2 opacity-70">
+                    {groupByOrganization(archivedItems).map((organization) => <section key={organization.label} aria-label={`${organization.label} archived`}>
+                      <h3 className="ml-9 pb-1 text-[12px] font-medium">{organization.label} <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span></h3>
+                      <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
+                        {organization.items.map((item) => <ReviewRow key={item.key} {...rowProps(item)} />)}
+                      </ul>
+                    </section>)}
+                  </div>
                 </details>
               ) : null}
             </section>
@@ -626,15 +646,27 @@ function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
   return { items: activeReviews, lastPoll };
 }
 
-function useQueuedBadge(): ExperimentalBadge | null {
+/**
+ * The count on the sidebar row. No public SDK API lets a plugin raise a user
+ * notification, so for a notify-only plugin this badge and the realtime signal
+ * are the notification.
+ */
+function QueuedBadge() {
   const { items } = useActiveReviewItems();
   const initial = items.filter((item) => item.rule === "review-requested").length;
   const followups = items.filter((item) => item.rule === "review-followup").length;
-  return items.length > 0 ? {
-    count: items.length,
-    tone: followups > 0 ? "warning" : "neutral",
-    label: `${initial} initial reviews, ${followups} follow-up reviews`,
-  } : null;
+  return (
+    <span
+      role="img"
+      aria-label={`${initial} initial reviews, ${followups} follow-up reviews`}
+    >
+      <QueueCountChips
+        initial={initial}
+        followups={followups}
+        sidebar
+      />
+    </span>
+  );
 }
 
 /**
@@ -743,7 +775,7 @@ export default definePluginApp((app) => {
     icon: "GitPullRequest",
     path: REVIEWS_PATH,
     component: ReviewsPage,
-    experimental_useBadge: useQueuedBadge,
+    experimental_sidebarAccessory: QueuedBadge,
   });
   app.slots.experimental_threadHeaderAction({
     id: "queued-count",
