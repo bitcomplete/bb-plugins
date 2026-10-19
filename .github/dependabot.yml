@@ -1,0 +1,34 @@
+# Dependabot version updates (BB-12). Every merge to main moves bb-gate's
+# bb-plugins pin, rebuilds the bb-server image and stages a restart on every
+# developer's server, so each ecosystem's updates arrive as one grouped pull
+# request a week rather than one per package: one merge, one restart. A group
+# that spans several directories is still a single pull request.
+#
+# Nothing merges these automatically. The stewards deps-prs playbook adopts
+# dependabot[bot] pull requests and escalates them; a person merges.
+#
+# Security alerts are not handled here: they reach stewards as doorbells
+# through bb-gate-hooks and become Linear tickets with an SLA.
+version: 2
+updates:
+  # One package.json and lockfile per plugin.
+  - package-ecosystem: npm
+    directories:
+      - "/plugins/*"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps
+    groups:
+      github-actions:
+        patterns: ["*"]
