@@ -10,7 +10,7 @@
     "name": "PR Feedback",
     "description": "Your pull requests waiting on a reply: see human feedback, dismiss it, or start a thread to address it.",
     "branding": {
-      "icon": "Inbox"
+      "icon": "GitBranch"
     },
     "server": "./server.ts",
     "app": "./app.tsx"

@@ -20,10 +20,15 @@ PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
-Select one PR's **Address comments**, or select several rows and choose
-**Address N selected**. This starts one thread in the configured project's
-default environment. The thread finds checkouts, fixes code, runs checks,
-pushes the changes, and replies to review comments. It includes bot comments
+The page uses the same compact, area-grouped layout as Reviews. Its
+branch-and-arrow icon distinguishes PR Feedback in the sidebar. Groups come from PR title
+scopes, falling back to the repository name.
+
+Choose one PR's **Address**, or select several rows and choose **Address N**.
+Group checkboxes select an area; Shift-click selects a range. Press **b** to
+address the selection or **Esc** to clear it. Address starts one thread in the
+configured project's default environment. The thread finds checkouts, fixes code,
+runs checks, pushes the changes, and replies to review comments. It includes bot comments
 in that work. The prompt forbids merging, approving, closing PRs, and automatic
 thread resolution. The plugin itself only reads GitHub.
 
@@ -48,7 +53,7 @@ a change request, but comments and approval notes require a reply. A bot's
 reply does not answer a human's thread. A later standing approval covers that
 reviewer's earlier comments.
 
-PR Feedback keeps no effort assignments, holds, grouping, merge gates, or model
+PR Feedback keeps no effort assignments, holds, merge gates, or model
 enrichment. Workstreams' existing Your turn view continues to work independently.
 Workstreams' local **Confirm handled** records do not transfer to PR Feedback.
 
