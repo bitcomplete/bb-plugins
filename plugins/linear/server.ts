@@ -22,6 +22,12 @@
 // The stewards plugin reads Linear through this one too (source-contract.ts):
 // snapshots, validation, adoption, and doorbells for the issues and teams it
 // manages, forwarded as rings.
+//
+// And `@bb` mentions (bb-gate/docs/hooks.md, "Agent sessions"): this server
+// proves to bb-gate-hooks which Linear user it acts for, receives the
+// mentions routed to it, hands each to stewards, and posts the steward's one
+// reply through the service with linear_session_reply. The app token that
+// posts it never comes here.
 import { createHash } from "node:crypto";
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type JsonValue } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
@@ -102,8 +108,8 @@ import {
   teamOfIssueKey,
   type Account,
 } from "./accounts.js";
-import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
+import { createHooksLoop, HooksRequestError, HOOKS_URL_ENV, REPLY_BODY_MAX_BYTES, REPLY_KINDS, type IdentifyResponse, type Lease, type Rejection, type ReplyKind, type SessionEvent } from "./hooks-client.js";
+import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type SessionWake } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signed, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -1216,6 +1222,10 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       recomputeRings();
       announceWatches();
+      // The teams a mention can be routed here for are stewards' teams.
+      if ([...ringFor.teams.keys()].sort().join() !== [...before.teams.keys()].sort().join()) {
+        hooks.reidentify().catch((error: unknown) => bb.log.warn(`could not prove the Linear identity again after stewards' teams changed: ${errorMessage(error)}`));
+      }
       const fresh = leases().filter((l) => (l.kind === "issue" ? ringFor.issues.has(l.id) && !before.issues.has(l.id) : !before.teams.has(l.id)));
       await hooks.addedLeases(fresh).catch((error: unknown) => bb.log.warn(`could not lease stewards' issues and teams right away: ${errorMessage(error)}`));
     }
@@ -1370,6 +1380,211 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
     }
 
+    // ---- agent sessions ---------------------------------------------------
+    //
+    // A mention of @bb on a Linear issue opens an agent session, and
+    // bb-gate-hooks routes it to the server of the issue's assignee or of
+    // the person who asked (hooks.md, "Routing"). This server proves who it
+    // is with the developer's own token, beside every lease renewal; the
+    // teams it names are the ones stewards asked about, in the workspace
+    // that has most of them. A mention that arrives goes to stewards, which
+    // hands it to the issue's steward or the project steward. That steward
+    // answers once, with linear_session_reply. If stewards cannot take it,
+    // this plugin answers with an error itself. If the steward's turn ends
+    // without an answer, this plugin posts one, so every mention gets exactly
+    // one reply.
+    //
+    // Sessions are remembered for a day (the service accepts replies for
+    // that long), in kv, so a restart does not forget which were answered.
+
+    const SESSIONS_KEY = "sessions";
+    const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+    const sessionRecord = z.object({
+      issueKey: z.string(),
+      owner: z.string(),
+      /** When the latest event arrived, for expiry. */
+      eventAt: z.number(),
+      /** How many events this session has had; each needs its own reply. */
+      events: z.number(),
+      /** When it was handed to a steward's thread; null when no thread took it. */
+      handedAt: z.number().nullable(),
+      threadId: z.string().nullable(),
+      projectId: z.string().nullable(),
+      /** The event the latest reply answered; the session is answered when it is the latest. */
+      answered: z.number().nullable(),
+    });
+    type SessionRecord = z.infer<typeof sessionRecord>;
+    const sessions = new Map(Object.entries(z.record(z.string(), sessionRecord).catch({}).parse(await bb.storage.kv.get(SESSIONS_KEY))));
+    async function saveSessions(): Promise<void> {
+      const cutoff = deps.now() - SESSION_TTL_MS;
+      for (const [id, r] of sessions) if (r.eventAt < cutoff) sessions.delete(id);
+      await bb.storage.kv.set(SESSIONS_KEY, Object.fromEntries(sessions));
+    }
+    const answered = (r: SessionRecord) => r.answered === r.events;
+
+    /** Who bb-gate-hooks last said this server is, for the reply tool's errors and the logs. */
+    let identified: (IdentifyResponse & { account?: string }) | null = null;
+
+    /**
+     * The identity to prove: the workspace holding most of stewards' teams
+     * (the default on a tie, or when there are none), and those teams' UUIDs
+     * in it. A connection proves one Linear user, so teams in another
+     * workspace are not covered.
+     */
+    function identity(): { account?: string; teams: string[] } | null {
+      if (known.length === 0) return null;
+      const byAccount = new Map<string, string[]>();
+      for (const [id, account] of ringFor.teams) byAccount.set(account, [...(byAccount.get(account) ?? []), id]);
+      const def = defaultKey();
+      let best = def;
+      for (const [account, teams] of byAccount) {
+        if (knownAccount(account) === null) continue;
+        if (best === null || teams.length > (byAccount.get(best)?.length ?? 0)) best = account;
+      }
+      if (best === null) return null;
+      return { account: best, teams: [...new Set(byAccount.get(best) ?? [])].sort() };
+    }
+
+    /** A thread's address in the bb app, for a session's external link; null without a public address. */
+    function threadUrl(projectId: string | null, threadId: string): string | null {
+      const appUrl = bb.server.experimental_appUrl;
+      if (appUrl === null || projectId === null) return null;
+      return new URL(`/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}`, appUrl).toString();
+    }
+
+    /** What the service's refusals of a reply mean, for the agent. */
+    function replyError(error: unknown): Error {
+      if (!(error instanceof HooksRequestError)) return error instanceof Error ? error : new Error(String(error));
+      const code = error.code;
+      if (error.status === 403 && code === "not-identified") return new Error("bb-gate-hooks does not know which Linear user this server is yet (it proves that on connecting, every half hour, and when stewards' teams change). Try again in a minute.");
+      if (error.status === 403)
+        return new Error(
+          `bb-gate-hooks refused: this session was not routed to ${identified === null ? "this server's Linear user" : identified.user.name}, or its last event was more than a day ago, or the service restarted since. Nothing was posted. If it still needs an answer, comment on the issue instead.`,
+        );
+      if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
+      if (error.status === 400) return new Error("bb-gate-hooks refused the reply as malformed (a missing field, an unknown kind, or an external link that is not http(s)).");
+      if (error.status === 502) return new Error("Linear refused the reply. Nothing was posted; comment on the issue instead.");
+      if (error.status === 503) return new Error("bb-gate-hooks cannot post to Linear right now (Linear is unreachable, or the bb app's credentials are not set up there). Try again later, or comment on the issue instead.");
+      return new Error(`bb-gate-hooks answered HTTP ${error.status} to the reply.`);
+    }
+
+    /** Post on a session and record it as answered. Throws what replyError makes. */
+    async function postReply(session: string, reply: { kind: ReplyKind; body: string; externalUrl?: string | undefined }, signal: AbortSignal): Promise<string> {
+      let posted: { activity: string };
+      try {
+        posted = await hooks.reply(session, reply, signal);
+      } catch (error) {
+        throw replyError(error);
+      }
+      const r = sessions.get(session);
+      if (r !== undefined) {
+        sessions.set(session, { ...r, answered: r.events });
+        await saveSessions();
+      }
+      return posted.activity;
+    }
+
+    /** The plugin's own answer, when no steward will give one. Logged, never thrown: there is nobody to tell. */
+    async function answerForStewards(session: string, body: string, externalUrl?: string): Promise<void> {
+      try {
+        await postReply(session, { kind: "error", body, ...(externalUrl === undefined ? {} : { externalUrl }) }, checkSignal());
+      } catch (error) {
+        bb.log.warn(`could not answer Linear agent session ${session}: ${errorMessage(error)}`);
+      }
+    }
+
+    /**
+     * A mention routed here: hand it to stewards, which wakes a steward with
+     * it, or answer it with an error when nobody here can take it. The text
+     * is untrusted unless the owner wrote it, whatever the event says.
+     */
+    async function onSession(event: SessionEvent): Promise<void> {
+      const fromOwner = event.fromOwner && event.asker.id !== "" && event.asker.id === event.owner.id;
+      const untrusted = event.comment.untrusted || !fromOwner;
+      const text = event.comment.text.length > SESSION_TEXT_CHARS ? `${event.comment.text.slice(0, SESSION_TEXT_CHARS - 40)}\n… (cut; the rest is on Linear)` : event.comment.text;
+      const wake: SessionWake = {
+        source: "linear",
+        session: event.session,
+        action: event.action,
+        issue: { id: event.issue.id, key: event.issue.identifier, team: event.issue.team, teamKey: event.issue.teamKey },
+        asker: { id: event.asker.id, name: event.asker.name },
+        owner: { id: event.owner.id, name: event.owner.name },
+        fromOwner,
+        routedAs: event.routedAs,
+        comment: { text, untrusted },
+        at: event.at,
+      };
+      bb.log.info(`Linear agent session ${event.session} (${event.action}) on ${event.issue.identifier} from ${fromOwner ? "the owner" : "someone else"}; handing it to stewards`);
+      const previous = sessions.get(event.session);
+      sessions.set(event.session, {
+        issueKey: event.issue.identifier,
+        owner: event.owner.name,
+        eventAt: deps.now(),
+        events: (previous?.events ?? 0) + 1,
+        handedAt: null,
+        threadId: previous?.threadId ?? null,
+        projectId: previous?.projectId ?? null,
+        answered: previous?.answered ?? null,
+      });
+      await saveSessions();
+      const who = `${event.owner.name}'s bb`;
+      let out: z.infer<(typeof stewardsContract)["stewardsSession"]["output"]>;
+      const handedAt = deps.now();
+      try {
+        out = await callRpc({ pluginId: STEWARDS_PLUGIN_ID, method: "stewardsSession", input: wake, outputSchema: stewardsContract.stewardsSession.output });
+      } catch (error) {
+        if (isMissingPlugin(error)) {
+          await answerForStewards(event.session, `${who} took this, but it does not run stewards, so nothing here can act on a mention. Comment on the issue, or ask ${event.owner.name} directly.`);
+        } else {
+          bb.log.warn(`stewards could not take Linear agent session ${event.session}: ${errorMessage(error)}`);
+          await answerForStewards(event.session, `${who} took this but could not hand it to a steward. Try again in a few minutes.`);
+        }
+        return;
+      }
+      if (out.routed === "none" || out.threadId === null) {
+        await answerForStewards(
+          event.session,
+          `Stewards is not set up for team ${event.issue.teamKey || "(unknown)"} on ${who}: no bb project there lists that team in its stewards project file, so nothing here can act on this mention.`,
+        );
+        return;
+      }
+      const r = sessions.get(event.session);
+      if (r !== undefined) {
+        sessions.set(event.session, { ...r, handedAt, threadId: out.threadId, projectId: out.projectId });
+        await saveSessions();
+      }
+      bb.log.info(`Linear agent session ${event.session} went to the ${out.routed === "ticket" ? `steward of ${event.issue.identifier}` : "project steward"} (${out.threadId})`);
+    }
+
+    /**
+     * The backstop for "exactly one reply": a steward's turn that handled a
+     * mention ended without linear_session_reply. The turn that handled it is
+     * the one whose input named the session, so a turn already running when
+     * the mention arrived, or the project steward's first turn, does not
+     * count. The answer says so and links the thread.
+     */
+    async function unansweredAfterTurn(threadId: string): Promise<void> {
+      const waiting = [...sessions].filter(([, r]) => r.threadId === threadId && r.handedAt !== null && !answered(r));
+      if (waiting.length === 0) return;
+      let starts: Array<{ createdAt: number; data: unknown }>;
+      try {
+        starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
+      } catch (error) {
+        bb.log.warn(`could not read thread ${threadId}'s turns to check its Linear replies: ${errorMessage(error)}`);
+        return;
+      }
+      for (const [session, r] of waiting) {
+        const handled = starts.some((e) => e.createdAt >= r.handedAt! && JSON.stringify(e.data ?? {}).includes(session));
+        if (!handled) continue;
+        bb.log.warn(`thread ${threadId} ended the turn that handled Linear agent session ${session} without replying; answering for it`);
+        const url = threadUrl(r.projectId, threadId);
+        await answerForStewards(session, `${r.owner}'s bb handed this to a steward, but its turn ended without an answer here.${url === null ? "" : ` Its thread: ${url}`}`, url ?? undefined);
+      }
+    }
+    bb.events.on("thread.idle", ({ thread }) => {
+      void unansweredAfterTurn(thread.id).catch((error: unknown) => bb.log.warn(`checking thread ${thread.id}'s Linear replies failed: ${errorMessage(error)}`));
+    });
+
     const hooks = createHooksLoop({
       fetch: deps.fetch,
       baseUrl: hooksUrl,
@@ -1387,6 +1602,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       },
       onRejected,
       sweep,
+      identity,
+      onIdentified: (who) => {
+        const changed = identified === null || identified.user.id !== who.user.id || identified.teams.join() !== who.teams.join();
+        identified = who;
+        if (changed) bb.log.info(`bb-gate-hooks knows this server as Linear user ${who.user.name}, covering ${who.teams.length} team${who.teams.length === 1 ? "" : "s"} for @bb mentions`);
+      },
+      onSession: (event) => void onSession(event).catch((error: unknown) => bb.log.warn(`Linear agent session ${event.session} failed: ${errorMessage(error)}`)),
     });
     hooks.onStateChange(announceWatches);
 
@@ -1561,6 +1783,35 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           hooks.addedLeases([{ kind: "issue", id: issue.id, account: where.key }]).catch((error: unknown) => bb.log.warn(`could not lease ${issue.identifier} right away: ${errorMessage(error)}`));
           announceWatches();
           return `Watching ${issue.identifier}: ${title}. This thread will be messaged when its fields change or someone else comments; end the turn rather than polling.`;
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    });
+
+    bb.agents.registerTool({
+      name: "linear_session_reply",
+      description:
+        "Answer an @bb mention in Linear: post the one reply on its agent session, as the bb app, and set the session's external link to this thread. kind is response (what was done or decided), elicitation (a question, such as asking the server's owner to confirm), or error. Use it once, at the end of the turn that handled the mention, after acting; further progress goes in ticket comments. The reply is signed and linked to this thread for you.",
+      presentation: { label: { pending: "Replying in Linear", completed: "Replied in Linear" } },
+      parameters: z.object({
+        session: z.string().trim().min(1).max(200).describe("The agent session id, from the mention's wake."),
+        kind: z.enum(REPLY_KINDS).describe("response, elicitation or error."),
+        body: z.string().trim().min(1).max(60_000).describe("The reply, in Markdown: what was done or decided, and in one line who did it."),
+        externalUrl: z.string().trim().url().max(2000).optional().describe("The session's external link. Leave it out: it defaults to this thread."),
+      }),
+      async execute({ session, kind, body, externalUrl }, { threadId, projectId, signal }) {
+        if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set)."));
+        const r = sessions.get(session);
+        if (r !== undefined && answered(r)) {
+          return toolError(new Error(`This mention on ${r.issueKey} already has its reply; a mention gets exactly one. Put further progress in a comment on the issue (linear_comment). A new follow-up in the session can be answered when it arrives.`));
+        }
+        const link = externalUrl ?? threadUrl(projectId ?? r?.projectId ?? null, threadId) ?? undefined;
+        const text = signed(link === undefined || body.includes(link) ? body : `${body}\n\n[The bb thread](${link})`, threadId);
+        if (new TextEncoder().encode(text).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is longer than ${REPLY_BODY_MAX_BYTES / 1024} KiB; shorten it.`));
+        try {
+          const activity = await postReply(session, { kind, body: text, ...(link === undefined ? {} : { externalUrl: link }) }, signal);
+          return `Replied on the Linear session${r === undefined ? "" : ` for ${r.issueKey}`} (${kind}, activity ${activity})${link === undefined ? "" : `; its external link is ${link}`}. That is this mention's one reply.`;
         } catch (error) {
           return toolError(error);
         }

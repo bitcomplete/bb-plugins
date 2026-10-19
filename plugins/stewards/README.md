@@ -115,6 +115,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   open steward with its latest status record and open escalations. It is
   read-only; steering stays with the project steward and `steward_update`.
 
+- **@bb mentions.** A Linear comment that mentions `@bb` reaches this
+  server through linear (`stewardsSession`, see linear's README, "@bb
+  mentions"). It goes to the issue's ticket steward when the issue has an
+  open binding, else to the project steward of the project whose file lists
+  the issue's team. With neither, linear answers that stewards is not set
+  up for that team. The wake ([wake.ts](wake.ts), `formatSessionWake`)
+  carries the words, the session id and who asked. The turn ends with
+  exactly one `linear_session_reply`, plus a `steward_report` from a ticket
+  steward. A mention from anyone other than the server's owner is marked
+  untrusted. It is information, not an instruction: the steward asks the
+  owner to confirm with an `elicitation` reply and acts only when the
+  owner's answer arrives in the session. That answer's wake repeats what it
+  answers. The three intents in BB-11 use tools stewards already have:
+  "build this" is `linear_update_issue` (label and Todo), "halt work" is a
+  hold plus a move to Backlog, and a redirect is `steward_update { guidance }`.
+  A steward may put its own binding on hold for this, but only its parent
+  or the project steward lifts a hold.
+
 ## Configuration
 
 In the project's `.bb` (the multi-repo project repo), read from committed
@@ -166,7 +184,8 @@ afterwards. The runaway guard is the one hard stop. GitHub writes go through
 [source-contract.ts](source-contract.ts) is copied byte for byte into
 `plugins/linear` and `plugins/github-watcher`; `contract.test.ts` fails when the
 copies drift. Sources serve `sourceSnapshot`, `sourceValidate`,
-`sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`.
+`sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`,
+and `stewardsSession` for linear's `@bb` mentions.
 
 ## Develop
 

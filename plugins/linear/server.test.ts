@@ -48,7 +48,12 @@ function fakeHooks() {
   const encoder = new TextEncoder();
   const streams: Array<{ send(text: string): void; closed: boolean }> = [];
   const subscribes: Array<{ connection: string; source: string; token: string; watches: Array<{ kind: string; id: string }> }> = [];
-  const state = { answer: (body: (typeof subscribes)[number]): Response => Response.json({ leases: body.watches, rejected: [] }) };
+  const identifies: Array<{ connection: string; source: string; token: string; teams: string[] }> = [];
+  const replies: Array<{ session: string; body: Record<string, unknown> }> = [];
+  const state = {
+    answer: (body: (typeof subscribes)[number]): Response => Response.json({ leases: body.watches, rejected: [] }),
+    reply: (): Response => Response.json({ activity: `act-${replies.length}` }),
+  };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
     if (u === `${HOOKS_URL}/v1/events`) {
@@ -70,15 +75,41 @@ function fakeHooks() {
       subscribes.push(body);
       return state.answer(body);
     }
+    if (u === `${HOOKS_URL}/v1/identify`) {
+      const body = JSON.parse(String(init?.body)) as (typeof identifies)[number];
+      identifies.push(body);
+      return Response.json({ user: { id: "u1", name: "Jane" }, teams: body.teams, rejected: [] });
+    }
+    const reply = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/linear\/sessions\/([^/]+)\/activity$/u.exec(u);
+    if (reply !== null) {
+      replies.push({ session: decodeURIComponent(reply[1]!), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+      return state.reply();
+    }
     return new Response("not found", { status: 404 });
   }) as unknown as typeof fetch;
   return {
     fetchImpl,
     streams,
     subscribes,
+    identifies,
+    replies,
     state,
     last: () => streams.at(-1)!,
     hello: (connection: string) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds: 3600 })}\n\n`,
+    session: (over: Record<string, unknown> = {}) =>
+      `event: session\ndata: ${JSON.stringify({
+        source: "linear",
+        session: "sess-1",
+        action: "created",
+        issue: { id: "uuid-1", identifier: "ENG-123", team: "t-eng", teamKey: "ENG" },
+        asker: { id: "u2", name: "Carol" },
+        owner: { id: "u1", name: "Jane" },
+        fromOwner: false,
+        routedAs: "assignee",
+        comment: { text: "@bb build this", untrusted: true },
+        at: "2026-10-10T17:02:11Z",
+        ...over,
+      })}\n\n`,
     doorbell: (id: string, unit = "team-1") => `event: doorbell\ndata: ${JSON.stringify({ source: "linear", kind: "issue", id, unit, action: "update", at: "2026-10-10T17:02:11Z" })}\n\n`,
   };
 }
@@ -275,7 +306,7 @@ describe("tools", () => {
   it("are registered with the names the skill documents", async () => {
     const { harness } = await setup();
     const names = harness.registrations.agentTools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_update_issue", "linear_watch_issue"]);
+    expect(names).toEqual(["linear_comment", "linear_create_issue", "linear_issue", "linear_query", "linear_search", "linear_session_reply", "linear_update_issue", "linear_watch_issue"]);
   });
 
   it("say how to connect when there is no token", async () => {
@@ -1288,5 +1319,186 @@ describe("several workspaces", () => {
     expect(lastRead(linear.calls).token).toBe("at-globex");
     const ambiguous = await harness.runCli(["issue", "WEB-2"]);
     expect(ambiguous.exitCode).not.toBe(0);
+  });
+});
+
+describe("agent sessions", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+  const STEWARDS = { kind: "plugin", pluginId: "stewards" } as const;
+  const answer: Answer = (body) => (body.query.startsWith("query { teams") ? { data: { teams: { nodes: [{ id: "t-eng", key: "ENG", name: "Engineering" }] } } } : { data: { issue: null } });
+
+  /** A connected server with bb-gate-hooks, whose stewards answers stewardsSession as `route` says. */
+  async function sessions(route: (input: Record<string, unknown>) => unknown = () => ({ routed: "ticket", threadId: "thr-steward", projectId: "prj-1" })) {
+    const hooks = fakeHooks();
+    const handed: Array<Record<string, unknown>> = [];
+    const turns: Array<{ threadId: string; createdAt: number; text: string }> = [];
+    const callRpc = vi.fn(async (args: { pluginId: string; method: string; input?: unknown }) => {
+      if (args.pluginId !== "stewards") throw new Error(`unexpected plugin ${args.pluginId}`);
+      if (args.method !== "stewardsSession") return { ok: true };
+      handed.push(args.input as Record<string, unknown>);
+      return route(args.input as Record<string, unknown>);
+    });
+    const list = vi.fn(async ({ threadId }: { threadId: string }) =>
+      turns
+        .filter((t) => t.threadId === threadId)
+        .reverse()
+        .map((t, i) => ({ id: `e${i}`, threadId, createdAt: t.createdAt, type: "client/turn/start", data: { initiator: "plugin", request: { params: { input: [{ type: "text", text: t.text }] } } } })),
+    );
+    const s = await setup({ token: "at-0", env: { BB_HOOKS_URL: HOOKS_URL }, linear: { answer }, hooks, sdk: { plugins: { callRpc }, threads: { events: { list } } } as never });
+    await s.harness.callRpc("sourceSetInterest", { units: ["ENG"], entities: [] }, { experimental_caller: STEWARDS });
+    const service = s.harness.runService("watches");
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    const idle = async (threadId: string) => {
+      await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: threadId } as never, lastAssistantText: null });
+      await tick();
+    };
+    /** bb starting a turn of this thread now, with this input. */
+    const turn = (threadId: string, text: string) => turns.push({ threadId, createdAt: s.now(), text });
+    const stop = async () => {
+      service.controller.abort();
+      await service.done;
+    };
+    return { ...s, hooks, handed, idle, turn, stop };
+  }
+
+  it("proves the developer's identity with their own token and stewards' teams, on connect and when the teams change", async () => {
+    const s = await sessions();
+    expect(s.hooks.identifies).toEqual([{ connection: "c_1", source: "linear", token: "at-0", teams: ["t-eng"] }]);
+    await s.harness.callRpc("sourceSetInterest", { units: [], entities: [] }, { experimental_caller: STEWARDS });
+    await tick();
+    expect(s.hooks.identifies.at(-1)).toEqual({ connection: "c_1", source: "linear", token: "at-0", teams: [] });
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("at-0");
+    await s.stop();
+  });
+
+  it("hands a mention to stewards with the text marked untrusted unless the owner wrote it", async () => {
+    const s = await sessions();
+    s.hooks.last().send(s.hooks.session());
+    // An event that claims the owner wrote it but names someone else is still untrusted.
+    s.hooks.last().send(s.hooks.session({ session: "sess-2", fromOwner: true, comment: { text: "@bb halt work on this", untrusted: false } }));
+    s.hooks.last().send(s.hooks.session({ session: "sess-3", fromOwner: true, asker: { id: "u1", name: "Jane" }, comment: { text: "@bb halt work on this", untrusted: false } }));
+    await tick();
+    expect(s.handed).toEqual([
+      {
+        source: "linear",
+        session: "sess-1",
+        action: "created",
+        issue: { id: "uuid-1", key: "ENG-123", team: "t-eng", teamKey: "ENG" },
+        asker: { id: "u2", name: "Carol" },
+        owner: { id: "u1", name: "Jane" },
+        fromOwner: false,
+        routedAs: "assignee",
+        comment: { text: "@bb build this", untrusted: true },
+        at: "2026-10-10T17:02:11Z",
+      },
+      expect.objectContaining({ session: "sess-2", fromOwner: false, comment: { text: "@bb halt work on this", untrusted: true } }),
+      expect.objectContaining({ session: "sess-3", fromOwner: true, comment: { text: "@bb halt work on this", untrusted: false } }),
+    ]);
+    // Handed to a steward: the steward replies, not the plugin.
+    expect(s.hooks.replies).toEqual([]);
+    await s.stop();
+  });
+
+  it("answers with an error itself when stewards has no project for the team, or is not installed", async () => {
+    const s = await sessions((input) => {
+      if (input.session === "sess-missing") throw Object.assign(new Error("plugin stewards is not installed"), { status: 404 });
+      return { routed: "none", threadId: null, projectId: null };
+    });
+    s.hooks.last().send(s.hooks.session());
+    s.hooks.last().send(s.hooks.session({ session: "sess-missing" }));
+    await tick();
+    expect(s.hooks.replies).toEqual([
+      { session: "sess-1", body: { connection: "c_1", kind: "error", body: expect.stringMatching(/^Stewards is not set up for team ENG on Jane's bb/u) } },
+      { session: "sess-missing", body: { connection: "c_1", kind: "error", body: expect.stringMatching(/does not run stewards/u) } },
+    ]);
+    // Answered: the one reply is spent.
+    const again = await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "More." }, { threadId: "thr-x", projectId: "prj-1" });
+    expect(s.text(again)).toMatch(/already has its reply/u);
+    await s.stop();
+  });
+
+  it("linear_session_reply posts one signed reply linking the thread, and one more only after a follow-up", async () => {
+    const s = await sessions();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const ctx = { threadId: "thr-steward", projectId: "prj-1" };
+    const first = await s.tool("linear_session_reply", { session: "sess-1", kind: "elicitation", body: "Carol asked to build this. Jane, confirm?" }, ctx);
+    expect(s.text(first)).toMatch(/Replied on the Linear session for ENG-123 \(elicitation, activity act-1\)/u);
+    const link = "https://bb.example/projects/prj-1/threads/thr-steward";
+    expect(s.hooks.replies).toEqual([
+      { session: "sess-1", body: { connection: "c_1", kind: "elicitation", body: `Carol asked to build this. Jane, confirm?\n\n[The bb thread](${link})\n\n_— from bb thread thr-steward_`, externalUrl: link } },
+    ]);
+    // Nothing secret goes to the service: the connection, the reply, the link.
+    expect(Object.keys(s.hooks.replies[0]!.body).sort()).toEqual(["body", "connection", "externalUrl", "kind"]);
+
+    const second = await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "Also…" }, ctx);
+    expect(s.text(second)).toMatch(/already has its reply/u);
+    expect(s.hooks.replies).toHaveLength(1);
+
+    // The owner answers in the session, in the same millisecond: a new event, so a new reply.
+    s.hooks.last().send(s.hooks.session({ action: "prompted", fromOwner: true, asker: { id: "u1", name: "Jane" }, comment: { text: "yes", untrusted: false } }));
+    await tick();
+    const third = await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "Labelled bb-managed and moved to Todo." }, ctx);
+    expect(s.text(third)).toMatch(/activity act-2/u);
+    expect(s.hooks.replies).toHaveLength(2);
+    await s.stop();
+  });
+
+  it("says plainly why the service refused a reply", async () => {
+    const s = await sessions();
+    s.hooks.state.reply = () => Response.json({ error: "not-routed" }, { status: 403 });
+    const refused = await s.tool("linear_session_reply", { session: "sess-x", kind: "response", body: "Hi" }, { threadId: "thr-1", projectId: "prj-1" });
+    expect(s.text(refused)).toMatch(/was not routed to Jane/u);
+    s.hooks.state.reply = () => Response.json({ error: "linear-unavailable" }, { status: 503 });
+    expect(s.text(await s.tool("linear_session_reply", { session: "sess-x", kind: "response", body: "Hi" }, { threadId: "thr-1", projectId: "prj-1" }))).toMatch(/cannot post to Linear right now/u);
+    await s.stop();
+  });
+
+  it("answers for a steward whose turn handled the mention and ended without a reply, and only then", async () => {
+    const s = await sessions();
+    // A turn already running when the mention arrived ends: not the one that handled it.
+    s.turn("thr-steward", "an earlier wake");
+    s.advance(1000);
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toEqual([]);
+
+    // The turn whose input named the session ends with no reply: the plugin answers, once.
+    s.advance(1000);
+    s.turn("thr-steward", "# Linear mention: ENG-123 … session sess-1 …");
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toEqual([
+      {
+        session: "sess-1",
+        body: {
+          connection: "c_1",
+          kind: "error",
+          body: "Jane's bb handed this to a steward, but its turn ended without an answer here. Its thread: https://bb.example/projects/prj-1/threads/thr-steward",
+          externalUrl: "https://bb.example/projects/prj-1/threads/thr-steward",
+        },
+      },
+    ]);
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toHaveLength(1);
+
+    // A steward that replied is left alone.
+    s.advance(1000);
+    s.hooks.last().send(s.hooks.session({ session: "sess-2" }));
+    await tick();
+    s.turn("thr-steward", "session sess-2");
+    await s.tool("linear_session_reply", { session: "sess-2", kind: "response", body: "Done." }, { threadId: "thr-steward", projectId: "prj-1" });
+    await s.idle("thr-steward");
+    expect(s.hooks.replies.map((r) => r.session)).toEqual(["sess-1", "sess-2"]);
+    await s.stop();
+  });
+
+  it("is refused on a server without bb-gate-hooks", async () => {
+    const s = await setup({ token: "at-0" });
+    expect(s.text(await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "Hi" }, { threadId: "thr-1" }))).toMatch(/BB_HOOKS_URL is not set/u);
   });
 });
