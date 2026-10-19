@@ -2059,8 +2059,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (need.kind === "provide-secret") {
           if (action !== "provide" && action !== "done") return { ok: false, message: "Provide the secret, or mark it done." };
           const threadId = typeof need.data.workerThreadId === "string" ? need.data.workerThreadId : null;
+          const named = typeof need.data.variable === "string" ? need.data.variable : need.what;
           store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Provided on the Stewards page." : `Provided on the Stewards page: ${text}`);
-          after(`The user provided ${typeof need.data.variable === "string" ? need.data.variable : need.what}${text === null ? "" : `: ${text}`}.`);
+          if (threadId === null) after(`The user pressed Provide for ${named} on the Stewards page; start the worker that will request it, and do not ask them again.`);
+          else after(`The user provided ${named}${text === null ? "" : `: ${text}`}.`);
           return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId };
         }
 
@@ -2630,7 +2632,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the action tells the steward to start the worker that requests it.
         threadId = typeof n.data.workerThreadId === "string" ? n.data.workerThreadId : null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: n.url === "" ? null : n.url, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     function formatBindings(rows: Binding[]): string {

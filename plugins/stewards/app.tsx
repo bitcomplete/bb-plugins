@@ -548,7 +548,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
   };
   const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
-  const takesNote = n.kind === "approve-spec" || n.kind === "configure";
+  const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
   return (
     <li className="flex flex-col gap-2 p-3">
       <p className="flex flex-wrap items-center gap-2">
@@ -564,7 +564,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
           value={note}
           onChange={(e) => setNote(e.target.value)}
           rows={1}
-          placeholder={n.kind === "approve-spec" ? "Note (optional)" : "Note (optional, saved as guidance)"}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "decide" ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
           aria-label={`Note for: ${n.what}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />

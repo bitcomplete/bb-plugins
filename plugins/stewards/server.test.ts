@@ -2000,6 +2000,20 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*configure item .* closed from a thread/u);
   });
 
+  it("says so when a provide-secret item has no worker to open", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
+    expect(res).toMatchObject({ ok: true, threadId: null });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/start the worker that will request it/u);
+  });
+
   it("refuses a blockedOn naming the user with no item, and accepts one with an item", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
