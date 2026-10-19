@@ -1409,9 +1409,20 @@ describe("stewards waiting on others", () => {
     expect(revived).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
     expect(revived).toMatch(/had been archived and is back now/u);
 
+    // A worker stopped on purpose, with its thread still there, is left alone:
+    // its question is not waiting on an answer.
+    await t.created("thr_w2", steward);
+    await t.idle("thr_w2", "Should I file a follow-up?");
+    t.hooks.store.setWorker("thr_w2", "stopped", "Should I file a follow-up?");
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    const purposeful = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(purposeful).not.toContain("thr_w2 asked");
+    expect(t.threads.get("thr_w2")!.archivedAt).toBeNull();
+
     // A worker whose thread is gone is reported as gone, needing a fresh one.
     t.threads.delete("thr_w1");
-    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T18:00:00Z" })] }));
     await t.ring("linear", "uuid-12");
     const gone = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(gone).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
