@@ -35,6 +35,22 @@ describe("playbooks", () => {
     }
   });
 
+  it("tells the default playbooks to get credentials through bb secret request and to escalate build-time blockers", () => {
+    const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!linear.ok) throw new Error(linear.error);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/bb secret request/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/changes what the ticket needs/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/escalated as a `decision`/u);
+    expect(phaseInstructions(linear.value, "In Review")).toMatch(/escalated as a `decision`/u);
+    const prs = parsePlaybook(GITHUB_PRS, "github-prs");
+    if (!prs.ok) throw new Error(prs.error);
+    expect(phaseInstructions(prs.value, "draft")).toMatch(/escalated as a `decision`/u);
+    expect(phaseInstructions(prs.value, "open")).toMatch(/escalated as a `decision`/u);
+    const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!reviews.ok) throw new Error(reviews.error);
+    expect(phaseInstructions(reviews.value, "open")).toMatch(/escalated as a `decision`/u);
+  });
+
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
     const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!parsed.ok) throw new Error(parsed.error);

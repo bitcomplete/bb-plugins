@@ -265,15 +265,15 @@ plugins.
   (a review posted and the author's move, a ticket in review waiting on
   reviewers) archives the steward's thread when the turn ends. The binding
   stays, and the next wake brings the same thread back. It stays in the
-  sidebar while any worker of the binding is unfinished — its record is
-  neither `finished` nor `stopped` — while a worker's own thread or any
-  thread beneath a worker is still running or pending (an idle worker
-  between turns whose reviewer is running is not finished), or while an
-  escalation is open, while it follows through after a terminal state,
-  when the user is next, and after a turn the user started, which is
-  theirs to read. Workers stay lifecycle-owned: they are the steward's
-  children in bb, and the plugin stops them explicitly only when the
-  binding ends (a detach, or a terminal state without follow-through),
+  sidebar while any worker of the binding is in flight — from its spawn
+  until it is stopped, failed or archived, across the idle between its
+  turns — or while a worker's own thread or any thread beneath a worker is
+  still running or pending (a worker whose reviewer is running still has
+  work), or while an escalation is open, while it follows through after a
+  terminal state, when the user is next, and after a turn the user started,
+  which is theirs to read. Workers stay lifecycle-owned: they are the
+  steward's children in bb, and the plugin stops them explicitly only when
+  the binding ends (a detach, or a terminal state without follow-through),
   never to keep the steward in the sidebar. Archiving a waiting steward
   would therefore archive its workers and their descendants with it, and
   the rule above is what keeps that from happening while a worker still
@@ -314,11 +314,16 @@ Plugin code. No model turn.
    - guidance changed, an escalation resolved, an approval given or voided;
    - the spec changed (description edited, spec comment added);
    - `requeueAfter` came due.
-   While one of the steward's workers is running, its own work on a pull
-   request is not actionable: checks finishing, description edits, and
-   pushes and comments from the developer's account, which the worker and
-   the reviewers it starts post as, often unsigned. People, merges and
-   closes still are.
+   While any worker of the binding is in flight — from its spawn until it is
+   stopped, failed or archived, across the idle between its turns — its own
+   work on a pull request is not actionable: checks finishing, description
+   edits, and pushes and comments from the developer's account, which the
+   worker and the reviewers it starts post as, often unsigned, and the
+   reviewer's `bb-review` markers, whichever account posts them. A round
+   that changes the lane does wake it. A first marker, with no earlier round
+   to change from, does not: the worker's own turn ending carries it, and
+   waking on every first review would put back the wake the ticket removes.
+   People, merges and closes still do.
 4. Otherwise the snapshot is recorded and the ring ends. Most rings end here:
    the steward's own comments, label churn, its workers at work. What
    changed is kept as a quiet note and shown with the next turn something
@@ -336,10 +341,10 @@ The steward is woken with one message in a fixed form:
 
 Each wake is self-contained, so compaction can be aggressive, and it is: after
 a steward's or the project steward's turn the plugin compacts its context once
-it holds more than a setting (120,000 tokens by default). Left to the provider,
-compaction comes near the window's end, and every turn before then reads the
-whole transcript. A wake too long to send is cut in its snapshot, never in
-what changed. The steward acts and must end its turn with `steward_report`,
+it holds more than a setting (120,000 tokens by default), and before a wake
+that would push it over. Left to the provider, compaction comes near the
+window's end, and every turn before then reads the whole transcript. A wake
+too long to send is cut in its snapshot, never in what changed. The steward acts and must end its turn with `steward_report`,
 which writes the status record:
 
 | Field | Holds |

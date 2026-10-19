@@ -37,7 +37,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
+import { advanced, anyWorkerInFlight, approvalWanted, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -288,7 +288,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       compactAboveTokens: {
         type: "number",
         label: "Compact a steward above this many context tokens",
-        description: "After a steward's or the project steward's turn, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
+        description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
         default: 120_000,
       },
     });
@@ -869,6 +869,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b.threadId === null) {
         await spawnSteward(b, config, playbook, text);
       } else {
+        // A wake can be the thing that pushes the transcript over the limit;
+        // compact first (criterion 4). If compaction makes the thread busy,
+        // sendTo queues the wake for the next idle.
+        await compactIfLarge(b.threadId, text.length);
         const sent = await sendTo(b.threadId, text);
         if (sent === "gone") {
           // The user deleted the thread: that is a detach they meant.
@@ -971,8 +975,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
         changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
       }
-      const workerRunning = store.workers(b.id).some((w) => w.status === "running");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning });
+      const workerInFlight = anyWorkerInFlight(store.workers(b.id));
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight });
       changes.push(...fresh);
       // Only an entry into build from spec: review → build is the worker's
       // normal loop, and an unreported checklist is not an unmet one.
@@ -1036,7 +1040,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function stopWorkers(b: Binding): Promise<void> {
       for (const w of store.workers(b.id)) {
-        if (w.status !== "running") continue;
+        if (!workerInFlight(w)) continue;
         store.setWorker(w.threadId, "stopped", w.result);
         await quietly(`stop worker ${w.threadId}`, () => bb.sdk.threads.stop({ threadId: w.threadId }));
       }
@@ -1260,22 +1264,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (threadId === null) return;
       const records = opts.digestDue ? digestRecords(projectId) : undefined;
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
+      const info = await threadInfo(threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null) return;
+      if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
       // Read as of the send, so an escalation resolved meanwhile is left out,
       // and marked delivered in the same step, so a prompt sent right after
       // lists it as still open rather than new. The text is built before the
       // mark, so a throw while building it leaves nothing marked.
-      const delivered = { ids: [] as string[], at: 0 };
-      const sent = await sendTo(threadId, () => {
-        const open = store.open(projectId);
-        const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
-        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
-        const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
-        const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
-        const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
-        delivered.ids = routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id);
-        delivered.at = store.markDelivered(delivered.ids);
-        return text;
-      });
+      const open = store.open(projectId);
+      const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
+      const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
+      const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
+      const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
+      delivered.at = store.markDelivered(delivered.ids);
+      // A wake can be the thing that pushes the transcript over the limit.
+      await compactIfLarge(threadId, text.length);
+      const sent = await send(threadId, text);
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
     }
 
@@ -1471,28 +1477,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const id = queue.pop()!;
         if (seen.has(id)) continue;
         seen.add(id);
-        try {
-          const children = await bb.sdk.threads.list({ parentThreadId: id, archived: false, limit: 200 });
-          for (const c of children) queue.push(c.id);
-        } catch (error) {
-          bb.log.warn(`stewards: could not list the threads under worker ${id}: ${errorMessage(error)}`);
-        }
+        const children = await bb.sdk.threads.list({ parentThreadId: id, archived: false, limit: 200 });
+        for (const c of children) queue.push(c.id);
       }
       return [...seen];
     }
 
     /**
-     * Whether the binding's workers still have work. A worker is unfinished
-     * until its record says `finished` or `stopped` (a still-running or failed
-     * one), and a worker whose own turn ended may still have a running or
-     * pending child: the build-tickets loop is an idle worker with a running
+     * Whether the binding's workers still have work. Any worker in flight
+     * (BB-17: from its spawn until it is stopped, failed or archived, so
+     * `finished` still counts) blocks the archive, and a worker whose thread
+     * is stopped, failed or archived may still have a running or pending
+     * descendant: the build-tickets loop is an idle worker with a running
      * reviewer, and archiving the steward would archive the worker and,
-     * through it, the reviewer (BB-14).
+     * through it, the reviewer (BB-14). A read failure fails safe: it must not
+     * let the archive proceed over a possibly-running descendant.
      */
     async function workersHaveWork(b: Binding): Promise<boolean> {
-      if (store.workers(b.id).some((w) => w.status !== "finished" && w.status !== "stopped")) return true;
-      for (const id of await workerThreads(b)) {
-        const info = await threadInfo(id).catch(() => null);
+      if (anyWorkerInFlight(store.workers(b.id))) return true;
+      let ids: string[];
+      try {
+        ids = await workerThreads(b);
+      } catch (error) {
+        bb.log.warn(`stewards: could not list the threads under ${b.entityKey}'s workers; not archiving: ${errorMessage(error)}`);
+        return true;
+      }
+      for (const id of ids) {
+        let info: ThreadInfo | null;
+        try {
+          info = await threadInfo(id);
+        } catch (error) {
+          bb.log.warn(`stewards: could not read worker thread ${id}; not archiving ${b.entityKey}: ${errorMessage(error)}`);
+          return true;
+        }
         if (info === null || info.deletedAt !== null || info.archivedAt !== null) continue;
         if (busy(info.status)) return true;
       }
@@ -1524,7 +1541,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      *
      * The plugin cannot catch the tell itself: bb rejects a message to an
      * archived thread (409) before the `message.dispatch` hook runs, so the
-     * worker is brought back here, when its question is surfaced, instead.
+     * worker is brought back here, when its question is surfaced, instead. A
+     * lookup that fails for any reason but not-found is treated as live:
+     * claiming a live worker is gone would tell the steward to spawn a
+     * duplicate, while a tell to a really-gone thread just fails.
      */
     async function collectWorkerQuestions(b: Binding): Promise<WorkerQuestion[]> {
       const out: WorkerQuestion[] = [];
@@ -1532,7 +1552,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (w.status !== "finished") continue;
         const question = workerQuestion(w.result);
         if (question === null) continue;
-        const info = await threadInfo(w.threadId).catch(() => null);
+        let info: ThreadInfo | null;
+        try {
+          info = await threadInfo(w.threadId);
+        } catch (error) {
+          bb.log.warn(`stewards: could not read worker thread ${w.threadId}; treating it as live: ${errorMessage(error)}`);
+          out.push({ threadId: w.threadId, question, state: "live" });
+          continue;
+        }
         if (info === null || info.deletedAt !== null) {
           out.push({ threadId: w.threadId, question, state: "gone" });
           continue;
@@ -1548,20 +1575,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Compact a steward's context once it has grown past the setting, while it
-     * is idle. Every wake carries what the steward needs (DESIGN.md §6), so
-     * its transcript can go; without this a steward's context only grows, and
+     * Compact a steward's context once it has grown past the setting, or once
+     * a wake about to be sent would push it over (criterion 4), while it is
+     * idle. Every wake carries what the steward needs (DESIGN.md §6), so its
+     * transcript can go; without this a steward's context only grows, and
      * every later turn reads all of it. A reading already compacted on is not
      * acted on twice, should the provider not report a new one.
      */
     const compactedOn = new Map<string, number>();
-    async function compactIfLarge(threadId: string): Promise<boolean> {
+    async function compactIfLarge(threadId: string, incomingChars = 0): Promise<boolean> {
       const limit = (await settings.get()).compactAboveTokens;
       if (!(limit > 0)) return false;
       try {
         const [usage] = await bb.sdk.threads.events.list({ threadId, types: ["thread/contextWindowUsage/updated"], order: "desc", limit: "1" });
         const used = (usage?.data as { contextWindowUsage?: { usedTokens?: number | null } } | undefined)?.contextWindowUsage?.usedTokens ?? null;
-        if (used === null || used <= limit || compactedOn.get(threadId) === used) return false;
+        if (used === null || !compactDue(used, limit, incomingChars) || compactedOn.get(threadId) === used) return false;
+        // A busy thread cannot be compacted; skip it rather than warn on every wake.
+        const info = await threadInfo(threadId).catch(() => null);
+        if (info === null || info.deletedAt !== null || busy(info.status)) return false;
         compactedOn.set(threadId, used);
         await bb.sdk.threads.compact({ threadId });
         bb.log.info(`stewards: compacted ${threadId} at ${used} context tokens`);
@@ -1581,7 +1612,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     bb.events.on("thread.failed", ({ thread, error }) => {
       const worker = store.worker(thread.id);
-      if (worker === null || worker.status !== "running") return;
+      if (worker === null || !workerInFlight(worker)) return;
       store.setWorker(thread.id, "failed", error);
       store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
       scheduleReconcile(worker.bindingId);
@@ -1593,11 +1624,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // bring it back until it is removed and re-added.
     bb.events.on("thread.archived", ({ thread }) => {
       const worker = store.worker(thread.id);
-      if (worker !== null && worker.status === "running") store.setWorker(thread.id, "stopped", worker.result);
+      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
     });
     bb.events.on("thread.deleted", ({ thread }) => {
       const worker = store.worker(thread.id);
-      if (worker !== null && worker.status === "running") store.setWorker(thread.id, "stopped", worker.result);
+      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
       const b = store.byThread(thread.id);
       if (b === null || b.endedAt !== null) return;
       store.patch(b.id, { threadId: null, endedAt: now(), endReason: "deleted", manualDetach: true, awaitingReport: false, ending: null });
