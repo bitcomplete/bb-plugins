@@ -11,7 +11,7 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
+import type { ExperimentalBadge, PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { groupByOrganization, type AreaGroup } from "./src/areas";
 import type { QueueItem, Rule } from "./src/types";
@@ -183,19 +183,15 @@ function QueueCountChip({
 function QueueCountChips({
   initial,
   followups,
-  sidebar = false,
 }: {
   initial: number;
   followups: number;
-  sidebar?: boolean;
 }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full border border-border bg-muted tabular-nums",
-        sidebar
-          ? "min-w-[3rem] justify-center gap-0.5 px-0.5 py-0.5"
-          : "gap-1.5 px-1.5 py-0.5",
+        "gap-1.5 px-1.5 py-0.5",
       )}
     >
       <QueueCountChip
@@ -646,27 +642,15 @@ function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
   return { items: activeReviews, lastPoll };
 }
 
-/**
- * The count on the sidebar row. No public SDK API lets a plugin raise a user
- * notification, so for a notify-only plugin this badge and the realtime signal
- * are the notification.
- */
-function QueuedBadge() {
+function useQueuedBadge(): ExperimentalBadge | null {
   const { items } = useActiveReviewItems();
   const initial = items.filter((item) => item.rule === "review-requested").length;
   const followups = items.filter((item) => item.rule === "review-followup").length;
-  return (
-    <span
-      role="img"
-      aria-label={`${initial} initial reviews, ${followups} follow-up reviews`}
-    >
-      <QueueCountChips
-        initial={initial}
-        followups={followups}
-        sidebar
-      />
-    </span>
-  );
+  return items.length > 0 ? {
+    count: items.length,
+    tone: followups > 0 ? "warning" : "neutral",
+    label: `${initial} initial reviews, ${followups} follow-up reviews`,
+  } : null;
 }
 
 /**
@@ -775,7 +759,7 @@ export default definePluginApp((app) => {
     icon: "GitPullRequest",
     path: REVIEWS_PATH,
     component: ReviewsPage,
-    experimental_sidebarAccessory: QueuedBadge,
+    experimental_useBadge: useQueuedBadge,
   });
   app.slots.experimental_threadHeaderAction({
     id: "queued-count",
