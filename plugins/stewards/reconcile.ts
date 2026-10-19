@@ -225,6 +225,20 @@ export function gateState(playbook: Playbook, ready: ReadyState, currentSpecHash
 }
 
 /**
+ * Whether the gate is shut on something known rather than merely not yet
+ * reported: approval is needed and the current spec has none (missing,
+ * voided or stale), or the steward reported a checklist item unmet. An item
+ * the steward has not reported does not count, so a ticket moved on right
+ * after its approval, before the steward reports again, is not flagged.
+ */
+export function gateKnownUnmet(playbook: Playbook, ready: ReadyState, currentSpecHash: string): boolean {
+  const gate = gateState(playbook, ready, currentSpecHash);
+  if (gate.passed) return false;
+  if (gate.approvalNeeded && (!gate.approved || gate.approvalStale)) return true;
+  return gate.unmet.some((item) => reportedItem(ready, item)?.met === false);
+}
+
+/**
  * Whether the gate waits on its approver: the checklist is met, the ticket
  * is (or may be) substantial, and the current spec has no approval. The
  * plugin asks the approver itself then, so the gate does not depend on the

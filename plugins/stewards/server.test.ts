@@ -288,6 +288,69 @@ describe("a Linear ticket steward", () => {
     expect(wake).toContain(`Your thread id is ${steward}.`);
   });
 
+  // BB-7: flagged on every Todo → In Progress, approval seconds old, and on
+  // every In Review → In Progress of a worker's normal loop.
+  describe("moving into build before the ready gate passed", () => {
+    const flagged = /before the ready gate passed/u;
+    const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" };
+    const inProgress = (over: Parameters<typeof issue>[0] = {}) => issue({ state: "In Progress", stateType: "started", ...over });
+    /** A bound ticket in Todo, with its project steward and steward. */
+    const bound = async () => {
+      const t = await setup();
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+      const wakes = () => t.sends.filter((s) => s.threadId === steward).map((s) => s.text);
+      /** Move the ticket, and return the wake it brought. */
+      const move = async (entity: EntitySnapshot) => {
+        const before = wakes().length;
+        t.entities.set("uuid-12", entity);
+        await t.ring("linear", "uuid-12");
+        expect(wakes().length).toBeGreaterThan(before);
+        return wakes().at(-1)!;
+      };
+      return { t, project, steward, move };
+    };
+
+    it("is raised entering build from spec with no approval", async () => {
+      const { move } = await bound();
+      expect(await move(inProgress())).toMatch(flagged);
+    });
+
+    it("is not raised with a current approval and no checklist report yet", async () => {
+      const { t, project, move } = await bound();
+      expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, project)).error).toBe(false);
+      expect(await move(inProgress())).not.toMatch(flagged);
+    });
+
+    it("is raised when the approval is stale for the current spec", async () => {
+      const { t, project, move } = await bound();
+      await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+      expect(await move(inProgress({ description: "Users cannot log in. Also SSO." }))).toMatch(flagged);
+    });
+
+    it("is raised when the approval was voided", async () => {
+      const { t, project, steward, move } = await bound();
+      await t.tool("steward_update", { binding: "ENG-12", approve: true }, project);
+      expect((await t.tool("steward_report", { ...base, voidApproval: true }, steward)).error).toBe(false);
+      expect(await move(inProgress())).toMatch(flagged);
+    });
+
+    it("is raised when a reported checklist item is unmet, approval or not", async () => {
+      const { t, steward, move } = await bound();
+      const checklist = [1, 2, 3, 4].map((item) => ({ item, met: item !== 4 }));
+      expect((await t.tool("steward_report", { ...base, ready: { checklist, substantial: false } }, steward)).error).toBe(false);
+      expect(await move(inProgress())).toMatch(flagged);
+    });
+
+    it("is never raised moving back from review", async () => {
+      const { move } = await bound();
+      // No approval and nothing reported: a gate that is really unmet.
+      expect(await move(issue({ state: "In Review", stateType: "started" }))).not.toMatch(flagged);
+      expect(await move(inProgress())).not.toMatch(flagged);
+    });
+  });
+
   it("tells the steward its own thread id and that the linear tools sign for it", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
