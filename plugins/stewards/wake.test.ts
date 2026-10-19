@@ -5,7 +5,7 @@ import { issue } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, createStore } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
-import { formatProjectWake, formatWake, type DigestRecords, type WakeInput } from "./wake.js";
+import { formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
 const DAY = 86_400_000;
@@ -35,6 +35,7 @@ function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
     escalations: [],
     routedToMe: [],
     workers: [],
+    workerQuestions: [],
     children: [],
     workerFlags: "--provider claude-code --model claude-opus-5-5 --reasoning-level high",
     changes: [],
@@ -72,6 +73,27 @@ describe("a steward's wake", () => {
     // Once under the open escalations, once with the approval request in the gate.
     expect(wake.split(note)).toHaveLength(3);
     expect(wake).toContain("counts like a missed report toward `stuck`");
+  });
+
+  it("takes a worker's closing question, but not one it resolved later in the message", () => {
+    expect(workerQuestion("Pushed the fix.\nShould I bring the reviewer back?")).toBe("Should I bring the reviewer back?");
+    // A question buried above the last few lines is not what the message ended with.
+    expect(workerQuestion("Should I open a follow-up?\nNever mind, I did it.\nPushed.\nDone and verified.")).toBeNull();
+    expect(workerQuestion("No question here.")).toBeNull();
+    expect(workerQuestion(null)).toBeNull();
+  });
+
+  it("names a worker's question ahead of every other change, with how to answer", () => {
+    const wake = formatWake(
+      wakeInput({
+        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T }],
+        workerQuestions: [{ threadId: "thr_w1", question: "Should I bring the reviewer back?", state: "live" }],
+        changes: ["1 new comment from Sam"],
+      }),
+    );
+    expect(wake).toContain("- **Worker thr_w1 asked:** Should I bring the reviewer back?");
+    expect(wake).toContain("Answer it with `bb thread tell thr_w1 <answer>`, or escalate it, before anything else.");
+    expect(wake.indexOf("Worker thr_w1 asked:")).toBeLessThan(wake.indexOf("1 new comment from Sam"));
   });
 });
 

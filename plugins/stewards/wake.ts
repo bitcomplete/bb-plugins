@@ -36,6 +36,35 @@ const RESULT_CHARS = 1500;
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
+const oneLine = (text: string, max = 400) => {
+  const flat = text.replace(/\s+/gu, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+};
+
+/**
+ * The question a worker's final message ended with, or null when it asked
+ * nothing. The last line that asks is the one the steward must answer; the
+ * whole message is already quoted in the snapshot. Only the last few lines are
+ * scanned, so a question raised earlier in a long message and left behind is
+ * not surfaced as open.
+ */
+export function workerQuestion(result: string | null): string | null {
+  if (result === null) return null;
+  const lines = result.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  const from = Math.max(0, lines.length - 3);
+  for (let i = lines.length - 1; i >= from; i--) {
+    if (lines[i]!.includes("?")) return oneLine(lines[i]!);
+  }
+  return null;
+}
+
+/** One worker's question, first under What changed, with how to answer it. */
+function workerQuestionLines(q: WorkerQuestion): string[] {
+  const asked = `- **Worker ${q.threadId} asked:** ${q.question}`;
+  if (q.state === "gone") return [asked, `  Its thread is gone, so \`bb thread tell\` cannot reach it: start a fresh worker to answer it, before anything else.`];
+  if (q.state === "revived") return [asked, `  It had been archived and is back now: answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+  return [asked, `  Answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+}
 
 /**
  * Join a message's three parts within WAKE_MAX_CHARS, cutting the middle
@@ -89,6 +118,9 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
 
+/** A worker's final message that asked something, to answer before anything else. */
+export type WorkerQuestion = { threadId: string; question: string; state: "live" | "revived" | "gone" };
+
 export type WakeInput = {
   reason: WakeReason;
   binding: Binding;
@@ -99,6 +131,8 @@ export type WakeInput = {
   escalations: Escalation[];
   routedToMe: Array<{ escalation: Escalation; from: Binding }>;
   workers: Worker[];
+  /** Questions workers ended their last turn with; rendered ahead of other changes. */
+  workerQuestions: WorkerQuestion[];
   children: ChildView[];
   /** The worker model, as `bb thread spawn` flags. */
   workerFlags: string;
@@ -250,7 +284,8 @@ export function formatWake(input: WakeInput): string {
 
   const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
-  if (input.changes.length === 0) out.push("Nothing actionable; this is a scheduled look.");
+  for (const q of input.workerQuestions) out.push(...workerQuestionLines(q));
+  if (input.changes.length === 0 && input.workerQuestions.length === 0) out.push("Nothing actionable; this is a scheduled look.");
   for (const c of input.changes) out.push(`- ${c}`);
 
   out.push(
@@ -345,10 +380,6 @@ export function formatProjectWake(input: {
 
 /** The calendar date of a moment in a time zone, so "asked" and "since" match the user's day. */
 const dayIn = (timeZone: string) => (ms: number) => localParts(ms, timeZone).date;
-const oneLine = (text: string, max = 400) => {
-  const flat = text.replace(/\s+/gu, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
-};
 const PREVIOUS_DIGEST_CHARS = 6000;
 const RECORD_LINES = 50;
 

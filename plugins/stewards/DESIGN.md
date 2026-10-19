@@ -265,9 +265,24 @@ plugins.
   (a review posted and the author's move, a ticket in review waiting on
   reviewers) archives the steward's thread when the turn ends. The binding
   stays, and the next wake brings the same thread back. It stays in the
-  sidebar while a worker runs or an escalation is open, while it follows
-  through after a terminal state, when the user is next, and after a turn
-  the user started, which is theirs to read.
+  sidebar while any worker of the binding is in flight — from its spawn
+  until it is stopped, failed or archived, across the idle between its
+  turns — or while a worker's own thread or any thread beneath a worker is
+  still running or pending (a worker whose reviewer is running still has
+  work), or while an escalation is open, while it follows through after a
+  terminal state, when the user is next, and after a turn the user started,
+  which is theirs to read. Workers stay lifecycle-owned: they are the
+  steward's children in bb, and the plugin stops them explicitly only when
+  the binding ends (a detach, or a terminal state without follow-through),
+  never to keep the steward in the sidebar. Archiving a waiting steward
+  would therefore archive its workers and their descendants with it, and
+  the rule above is what keeps that from happening while a worker still
+  has work. When a worker's final message asks a question,
+  the next wake names it (`Worker thr_… asked: …`) ahead of every other
+  change and tells the steward to answer it with `bb thread tell` or
+  escalate before anything else; a worker archived since it asked is
+  brought back on that wake so the tell reaches it, and a worker whose
+  thread is gone is reported as gone, needing a fresh one.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
 
