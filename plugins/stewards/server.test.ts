@@ -846,6 +846,24 @@ describe("terminal states and follow-through", () => {
     expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["Yes, include SSO."]);
   });
 
+  it("takes an answer to a forwarded question the ending closed, on the question and its escalation alike", async () => {
+    const t = await working();
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Building the rest." } }, t.steward);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = /(qst_[\w-]+)/u.exec((await t.tool("steward_update", { binding: "ENG-12", forward: id }, t.project)).text)![1]!;
+    await t.done();
+    await t.report();
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "The binding ended." });
+
+    const answer = { resolve: qst, answer: "Yes, include SSO." };
+    expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/ENG-12: guidance saved; recorded the answer on esc_[\w-]+, which was already resolved/u) });
+    expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/ENG-12: guidance already saved; esc_[\w-]+ already has this answer/u) });
+    expect(t.hooks.store.escalation(id)!.resolution).toBe("The binding ended.\nYes, include SSO.");
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "The binding ended.\nYes, include SSO." });
+  });
+
   it("takes back the ending when the ticket is moved back before the binding ends", async () => {
     const t = await working();
     await t.done();
@@ -1237,6 +1255,8 @@ describe("questions to the user", () => {
 
     const closed = await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project);
     expect(closed).toMatchObject({ error: false, text: `closed ${t.qid(unbound.text)}.` });
+    // A retry of the same close is no error and changes nothing.
+    expect(await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Yes, file it in BB." }, t.project)).toMatchObject({ error: false, text: `${t.qid(unbound.text)} already closed with this answer.` });
     expect((await t.tool("steward_update", { resolve: t.qid(unbound.text), answer: "Again." }, t.project)).text).toMatch(/already closed/u);
     // Guidance on a question about the whole project has no binding to land on: the question closes all the same.
     const project = await t.tool("steward_update", { ask: { question: "Adopt the new lint rules?" } }, t.project);
@@ -1282,6 +1302,15 @@ describe("questions to the user", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/decided: No SSO for now\./u);
     const list = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
     expect(list).toMatch(/\(resolved, me\): Include SSO\? → No SSO for now\./u);
+
+    // A retry is no error, records nothing twice, and does not tell the steward again.
+    const told = t.sends.filter((s) => s.threadId === t.steward).length;
+    expect(await t.tool("steward_update", { resolve: qst, answer: "No SSO for now." }, t.project)).toMatchObject({ error: false, text: `ENG-12: guidance already saved; ${esc} already has this answer.` });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward)).toHaveLength(told);
+    expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "No SSO for now." });
+    expect(t.hooks.store.escalation(esc)!.resolution).toBe("No SSO for now.");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["No SSO for now."]);
   });
 
   it("is closed by the user from the page, which resolves a forwarded escalation and tells its steward", async () => {
