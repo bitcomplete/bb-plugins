@@ -133,7 +133,9 @@ describe("approval words", () => {
     for (const text of ["LGTM", "Approved", "approved, it is fully specified", "ship it", "go ahead", "Looks good", "yes", "signed off"]) expect(classifyApproval(text), text).toBe("approve");
     // Approving words with a bare "no" beside them still approve.
     for (const text of ["LGTM, no concerns from me", "Ship it, no further changes needed", "Approved, no notes"]) expect(classifyApproval(text), text).toBe("approve");
-    for (const text of ["no", "No.", "not approved", "don't ship it", "declined", "reject", "changes needed", "don't", "do not approve", "No, not yet"]) expect(classifyApproval(text), text).toBe("decline");
+    for (const text of ["no", "No.", "not approved", "don't ship it", "declined", "reject", "changes needed", "don't", "do not approve", "No, not yet", "won't approve until the migration is named", "can't approve without SSO", "cannot approve this spec yet", "shouldn't approve until naming is fixed", "never approve this as-is"]) expect(classifyApproval(text), text).toBe("decline");
+    // A word ending in "nt" is not a contraction: wanting to approve approves.
+    expect(classifyApproval("I want to approve")).toBe("approve");
     for (const text of ["", "maybe", "name the migration in the spec", "what about SSO?"]) expect(classifyApproval(text), text).toBe("ambiguous");
   });
 
