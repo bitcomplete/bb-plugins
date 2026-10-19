@@ -9,6 +9,7 @@
     { "name": "diff-explorer", "source": "./plugins/diff-explorer" },
     { "name": "html-preview", "source": "./plugins/html-preview" },
     { "name": "image-copy", "source": "./plugins/image-copy" },
-    { "name": "repo-dashboard", "source": "./plugins/repo-dashboard" }
+    { "name": "repo-dashboard", "source": "./plugins/repo-dashboard" },
+    { "name": "pr-inbox", "source": "./plugins/pr-inbox" }
   ]
 }
