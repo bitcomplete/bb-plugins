@@ -773,12 +773,15 @@ goes wrong there into Linear tickets for the project steward to adopt.
   Todo, the ordinary path, and the team lease brings a ticket steward; or
   declines with a reason. `ops.autoAdopt` names priorities the ops steward
   labels itself when filing, without escalating.
-- **Read-only is a convention, not a wall.** kubectl acts as the
-  developer, whose rights are broad. Every kubectl call the plugin makes
-  passes one function, `kubectlRefusal`, checked by the server before it
-  asks and by the host entry before it runs: only `get`, `describe`,
-  `logs` and `auth can-i`, and no flag that swaps the kubeconfig,
-  credentials or identity. The playbook's `may` list says the same for the
+- **Read-only is a convention, not a wall.** There is no separate
+  identity: the plugin assumes kubectl read access is available on the
+  machine, and uses whatever credential is there. **That ambient
+  credential may be broader than read** — a developer's usually can
+  delete, exec and patch — **and the verb allowlist is the plugin's only
+  guard.** Every kubectl call the plugin makes passes one function,
+  `kubectlRefusal`, checked by the server before it asks and by the host
+  entry before it runs: only `get`, `describe`, `logs` and `auth can-i`,
+  and no flag that swaps the kubeconfig, credentials or identity. The playbook's `may` list says the same for the
   steward's own kubectl (`kubectl get`, `describe`, `logs`, `auth can-i`,
   then filing, commenting and escalating), and like every `may` list it is
   advisory (§11): nothing stops the steward's shell. A real wall, such as a

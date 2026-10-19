@@ -12,7 +12,7 @@ const now = Date.parse("2026-10-14T15:00:00Z");
 describe("the kubectl gate", () => {
   it("lets through only get, describe, logs and auth can-i", () => {
     for (const ok of [["get", "pods", "-n", "x", "-o", "json"], ["describe", "pod", "p"], ["logs", "p", "-c", "c", "--previous"], ["auth", "can-i", "get", "pods/log", "-n", "x"]]) expect(kubectlRefusal(ok), ok.join(" ")).toBeNull();
-    for (const bad of [["delete", "pod", "p"], ["exec", "p", "--", "sh"], ["apply", "-f", "x.yaml"], ["rollout", "restart", "deploy/x"], ["scale", "deploy/x", "--replicas=0"], ["auth", "reconcile"], ["edit", "deploy/x"], [], ["patch", "deploy/x"]]) {
+    for (const bad of [["delete", "pod", "p"], ["exec", "p", "--", "sh"], ["apply", "-f", "x.yaml"], ["rollout", "restart", "deploy/x"], ["scale", "deploy/x", "--replicas=0"], ["auth", "reconcile"], ["edit", "deploy/x"], [], ["patch", "deploy/x"], ["create", "job", "x"], ["replace", "-f", "x"], ["label", "pod/p", "a=b"], ["annotate", "pod/p", "a=b"], ["cordon", "node"], ["drain", "node"], ["cp", "p:/etc/x", "x"], ["port-forward", "p", "8080"], ["attach", "p"], ["debug", "p"], ["proxy"], ["set", "image", "deploy/x", "a=b"], ["GET", "pods"], ["--namespace=x", "get", "pods"]]) {
       expect(kubectlRefusal(bad), bad.join(" ")).toMatch(/is not allowed: the ops kind runs only get, describe, logs, auth can-i/u);
     }
   });
