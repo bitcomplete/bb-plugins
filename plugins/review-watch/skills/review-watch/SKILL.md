@@ -67,7 +67,7 @@ matters even when the poller uses a token.
 1. Run `bb review-watch list` before you act. Use the keys it prints; never
    guess a key.
 2. To work an item, run `bb review-watch start <key>`. The new thread uses the
-   configured project's default environment and carries a prompt for the
+   configured project's default checkout on its registered machine and carries a prompt for the
    item's rule. Find the matching repository checkout before inspecting code.
 3. Report the thread id the command prints so the user can follow it.
 4. Dismiss an item only when the user asks. Dismissing hides it for good; there

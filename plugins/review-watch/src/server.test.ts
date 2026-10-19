@@ -33,6 +33,13 @@ async function setup(items: QueueItem[], githubToken?: string) {
   hosts.push(host);
   await host.bb.storage.kv.set("queue", items);
   host.harness.sdk.stub("threads.spawn", async () => ({ id: "thread-1" }));
+  host.harness.sdk.stub("projects.get", async () => ({
+    id: "project-test",
+    sources: [
+      { hostId: "server-host", path: "/wrong-checkout", isDefault: false },
+      { hostId: "devbox-host", path: "/project-checkout", isDefault: true },
+    ],
+  }));
   await plugin(host.bb);
   return host;
 }
@@ -287,7 +294,7 @@ describe("refresh after a review-watch thread becomes idle", () => {
 });
 
 describe("batch review start", () => {
-  it("spawns one project-default thread and starts each selected review", async () => {
+  it("starts selected reviews on the default checkout's remote machine", async () => {
     const first = item(1);
     const second = item(2, "review-followup");
     const host = await setup([first, second]);
@@ -307,7 +314,10 @@ describe("batch review start", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.[0]).toMatchObject({
       projectId: "project-test",
-      environment: { type: "project-default" },
+      environment: {
+        type: "host", hostId: "devbox-host",
+        workspace: { type: "unmanaged", path: "/project-checkout" },
+      },
     });
     const prompt = (calls[0]?.[0] as { prompt: string }).prompt;
     expect(prompt).toContain("owner/repo#1 (Fix review issue number 1)");
@@ -372,7 +382,20 @@ describe("batch review start", () => {
     expect(spawn.prompt).toContain(`Full title: ${followup.title}`);
     expect(spawn.prompt).toContain("`gh pr diff 4 -R owner/repo`");
     expect(spawn.prompt).toContain("If a matching local checkout exists");
-    expect(spawn.environment).toEqual({ type: "project-default" });
+    expect(spawn.environment).toEqual({
+      type: "host", hostId: "devbox-host",
+      workspace: { type: "unmanaged", path: "/project-checkout" },
+    });
+  });
+
+  it("leaves reviews queued when the project has no default checkout", async () => {
+    const first = item(3);
+    const host = await setup([first]);
+    host.harness.sdk.stub("projects.get", async () => ({ id: "project-test", sources: [] }));
+    await expect(host.harness.behavior.callRpc("item_batch_start", { keys: [first.key] }))
+      .rejects.toThrow("Choose a default project checkout");
+    expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(await host.bb.storage.kv.get<QueueItem[]>("queue")).toEqual([first]);
   });
 
   it("uses gh as the source for an initial review", async () => {

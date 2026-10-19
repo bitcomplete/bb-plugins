@@ -595,6 +595,22 @@ export default async function plugin(bb: BbPluginApi) {
   // Start — the only action with side effects.
   // -------------------------------------------------------------------------
 
+  async function reviewEnvironment(
+    projectId: string,
+  ): Promise<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"]> {
+    const project = await bb.sdk.projects.get({ projectId });
+    const source = project.sources.find((source) => source.isDefault) ??
+      (project.sources.length === 1 ? project.sources[0] : undefined);
+    if (source === undefined) {
+      throw new Error("Choose a default project checkout in BB before starting a review.");
+    }
+    return {
+      type: "host",
+      hostId: source.hostId,
+      workspace: { type: "unmanaged", path: source.path },
+    };
+  }
+
   async function startItem(key: string): Promise<Lookup> {
     return withQueueLock(async () => {
       const items = await readQueue();
@@ -615,7 +631,7 @@ export default async function plugin(bb: BbPluginApi) {
         projectId,
         prompt: promptFor(item),
         title: `Review ${item.repo}#${item.number} (${prSummary(item)})`,
-        environment: { type: "project-default" },
+        environment: await reviewEnvironment(projectId),
         pluginMetadata: { itemKey: item.key, repo: item.repo, number: item.number },
         ...(current.provider === undefined ? {} : { providerId: current.provider }),
         ...(current.model === undefined ? {} : { model: current.model }),
@@ -653,7 +669,7 @@ export default async function plugin(bb: BbPluginApi) {
         projectId,
         prompt: batchPrompt(selected),
         title: `Review ${selected.length} pull requests`,
-        environment: { type: "project-default" },
+        environment: await reviewEnvironment(projectId),
         pluginMetadata: { itemKeys: selected.map((item) => item.key) },
         ...(current.provider === undefined ? {} : { providerId: current.provider }),
         ...(current.model === undefined ? {} : { model: current.model }),
