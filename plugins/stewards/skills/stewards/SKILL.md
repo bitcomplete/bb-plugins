@@ -104,6 +104,8 @@ production and start no workers.
   ticket, did: "filed" | "commented" | "reopened" }] }`, by the fingerprint the
   wake gives. That is what makes the next look a comment instead of a
   duplicate.
+- **All healthy:** the wake says so every requeue; report it with
+  `actor: other` and end the turn.
 - **No logs** (the wake says so on `bb-gate-production`): diagnose from status
   and events, and say in the ticket that logs were not available.
 
@@ -184,8 +186,8 @@ above which a steward is compacted after its turn.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
   target` and `bb stewards check` says why: this server has no
   ServiceAccount (bb-gate mounts one only into the backend of the developer
-  who runs the project's ops steward), or it may not list pods there. A look
-  that finds nothing failing wakes nobody, by design.
+  who runs the project's ops steward), or it may not list pods there.
+  Otherwise it takes a turn every `requeue-default`, healthy or not.
 - **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,
   unless `project.json` lists it in `github.exclude` (`owner/repo`). Bindings
   already running there end with `bb stewards detach`.

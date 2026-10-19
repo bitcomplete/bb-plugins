@@ -749,7 +749,7 @@ goes wrong there into Linear tickets for the project steward to adopt.
   reads each ticket's state through linear's `sourceSnapshot`:
   - **new** — no ticket. Worth a turn at once.
   - **recurring** — its ticket is open, or cannot be read (a comment on a
-    closed ticket does less harm than a duplicate). Worth a turn only at the
+    closed ticket does less harm than a duplicate). Worth a turn at the
     requeue, so a crash loop is one comment per `requeue-default`, and
     never a second ticket.
   - **returned** — its ticket was Done or Canceled and the problem is back.
@@ -757,9 +757,11 @@ goes wrong there into Linear tickets for the project steward to adopt.
     between reopening and filing anew; the default comments on a ticket
     closed within two weeks and escalates a reopen, and otherwise files a new
     ticket linking the old one.
-  A look that finds nothing failing wakes nobody: the binding's next look
-  is a `requeue-default` away, and its last report stands. A nightly pass
-  turn still comes.
+  Every `requeue-default` the steward takes a turn whatever the look
+  found; a healthy one is cheap, a wake that says "all healthy" and a
+  report with actor `other`, which archives the thread until the next
+  look. A sweep's look between requeues wakes it only for a new or
+  returned problem.
 - **Triage is the project steward's.** The steward files one ticket per new
   problem — pod, since when, the evidence, a diagnosis, a priority, and the
   fingerprint on a line of its own — and raises one `decision` escalation

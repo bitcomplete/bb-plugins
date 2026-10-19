@@ -200,7 +200,8 @@ signature. Put it in the ticket description on a line of its own,
 "Fingerprint: \`<fingerprint>\`", so a person can match ticket and problem.
 After acting, report every ticket you filed, commented on or reopened in
 steward_report's opsTickets: that is how the next look knows a problem is
-already filed.
+already filed. When the wake says all is healthy, just report it, with actor
+other, and end the turn.
 
 A ticket you file says: which pod and container, since when and how often;
 the evidence (status, events, log lines) quoted; your diagnosis, the likely

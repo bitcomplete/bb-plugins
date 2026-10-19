@@ -308,7 +308,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
   out.push(`- ${look.pods} pod${look.pods === 1 ? "" : "s"}, ${look.healthy} healthy; logs: ${look.logs === "read" ? "read where a finding needed them" : look.logs === "not granted" ? "not granted on this target" : "none needed"}`);
   if (look.deployments.length > 0) out.push(`- Deployments: ${look.deployments.map((d) => `${d.name} ${d.ready}/${d.desired}`).join(", ")}`);
   for (const n of look.notes) out.push(`- ${n}`);
-  if (look.findings.length === 0) out.push("", "Nothing is failing.");
+  if (look.findings.length === 0) out.push("", "**All healthy: nothing is failing.** There is nothing to file or comment on: report that with steward_report (actor other) and end the turn.");
   for (const c of present) {
     out.push("", `### ${CLASS_TITLES[c]}`, "");
     for (const f of look.findings.filter((x) => x.class === c)) out.push(...findingLines(f, look));

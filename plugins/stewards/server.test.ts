@@ -1620,6 +1620,34 @@ describe("ops stewards", () => {
     expect(back).toMatch(/escalate\s+a decision recommending it be reopened/u);
   });
 
+  it("takes a short turn at every requeue when all is healthy, and none between", async () => {
+    const { t, c, steward, wakes } = await watched();
+    c.state.pods = [];
+    c.state.events = [];
+    const ops = steward()!;
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50.", nextAction: "Watch", actor: "other" }, ops.id)).error).toBe(false);
+    await t.idle(ops.id);
+    const before = wakes().length;
+
+    // A sweep's look before the requeue: healthy, nothing new, nobody woken.
+    t.advance(30 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(before);
+
+    // The requeue is a turn all the same, saying so, and its report archives the thread until the next.
+    t.advance(31 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(before + 1);
+    const healthy = wakes().at(-1)!;
+    expect(healthy).toMatch(/All healthy: nothing is failing\./u);
+    expect(healthy).toMatch(/Requeue time came: a scheduled look/u);
+    expect(healthy).not.toMatch(/#### /u);
+    const report = await t.tool("steward_report", { phase: "watching", summary: "All healthy.", nextAction: "Look again", actor: "other" }, ops.id);
+    expect(report.text).toMatch(/Your thread is archived when the turn ends/u);
+  });
+
   it("makes a binding that waits while the server cannot read its target, and wakes once it can", async () => {
     const { t, c, steward } = await watched({ error: "403: pods is forbidden" });
     expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: null }]);

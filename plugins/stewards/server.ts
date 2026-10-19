@@ -1052,9 +1052,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // entity in a source plugin. Its steward's thread has no cluster access,
     // so the plugin looks (kube.ts), compares what it saw with the
     // fingerprint map, and wakes the steward with the look: at once for a
-    // problem that is new or back after its ticket was resolved, and at the
-    // requeue for one still failing under its open ticket. A look that finds
-    // nothing wrong is recorded and wakes nobody.
+    // problem that is new or back after its ticket was resolved, and at every
+    // requeue whatever it finds, so a problem still failing under its open
+    // ticket is one comment per interval and a healthy look is one short
+    // "all healthy" report. A sweep's look between requeues that finds
+    // nothing new is recorded and wakes nobody.
 
     const opsReader = deps.ops ?? createKubeReader();
 
@@ -1100,7 +1102,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       const changes = lookChanges(before, look);
-      if (requeueCame && look.findings.length > 0) changes.push({ text: "Requeue time came, with problems still failing", actionable: true });
+      if (requeueCame) changes.push({ text: look.findings.length > 0 ? "Requeue time came, with problems still failing" : "Requeue time came: a scheduled look", actionable: true });
       if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
       const queued = b.pending;
       const loudQueued = queued.filter((n) => n.quiet !== true).length;

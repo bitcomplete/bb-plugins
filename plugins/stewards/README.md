@@ -27,9 +27,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   problem by a fingerprint (workload, container, error signature;
   [ops.ts](ops.ts)) and keeps a fingerprint → Linear ticket map. A new
   problem, or one back after its ticket was resolved, wakes the steward at
-  once; one still failing under its open ticket wakes it at the requeue
-  (`requeue-default`, 1h in the template), to comment there and file
-  nothing new. A look that finds nothing wrong wakes nobody. The steward
+  once. Every requeue (`requeue-default`, 1h in the template) is a turn
+  whatever the look found: a problem still failing under its open ticket is
+  a comment there and nothing new filed, and a healthy look is a short
+  "all healthy" report. The steward
   files one ticket per problem and escalates a `decision` to the project
   steward ("Filed BB-N (high), recommend adopting"); the project steward
   adopts with the label and Todo, the ordinary path. It never changes the
