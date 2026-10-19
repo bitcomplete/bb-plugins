@@ -3,9 +3,9 @@
 A personal GitHub review inbox for BB. A background poller asks GitHub what
 needs your attention, stores a deduplicated queue, and surfaces it in the
 sidebar, the thread header, and on the command line. **Start** opens one thread;
-**Review selected** opens one thread for several review requests. Threads use
-the configured project's default checkout on its registered machine, including
-when that machine is a remote devbox.
+**Review selected** opens one thread for several review requests. Both actions
+let you choose a BB project before starting. Threads use that project's default
+checkout on its registered machine, including a remote devbox.
 
 Review Watch reads GitHub and never writes to it, and it never starts a thread
 on its own. The queue notifies; you dispatch.
@@ -16,7 +16,7 @@ on its own. The queue notifies; you dispatch.
   `bb review-watch` CLI, RPC for the page, and the realtime signal that keeps
   every open page current.
 - `app.tsx` — the **Reviews** page in the left sidebar
-  (`app.slots.navPanel`), a pending count on its navigation entry, two review counts in the
+  (`app.slots.navPanel`), two review counts on its sidebar row and
   thread header, and a hover preview of up to five review requests.
 - `src/types.ts` — the shared vocabulary: `Rule`, `PullRequest`, `QueueItem`.
 - `src/github.ts` — the GitHub client and its two transports, a personal access
@@ -50,11 +50,9 @@ item. Every command that takes a key accepts an unambiguous prefix.
 ## Notifications
 
 BB exposes no public SDK route for a plugin to raise a user notification. The
-navigation badge shows the total number of pending initial reviews and
-follow-ups. It uses a warning tone when follow-ups are waiting and clears when
-the queue is empty. This requires a BB server with Plugin SDK 0.6.53 or newer.
-The thread-header badge keeps both counts in separate colored chips, including
-zero counts. Hover over the header badge to see labeled counts,
+sidebar and thread-header badges show `review-requested` and
+`review-followup` items in two colored chips. Each badge shows both counts,
+including zero counts. Hover over the header badge to see labeled counts,
 preview up to five review requests, and open the full **Reviews** page. The
 realtime signal keeps these surfaces current.
 
@@ -69,9 +67,28 @@ superseded reviewer threads move to **Archived threads** at the bottom, where yo
 can reopen them. Dismissed items do not appear. Workstreams displays feedback
 on your own pull requests.
 
-Each thread uses the configured project's default environment. The agent finds
+Each thread uses the selected project's default checkout. The agent finds
 the matching repository checkout before it inspects code. Review Watch does
 not create checkouts or worktrees when it starts a thread.
+
+## Review projects
+
+**Start** and **Review selected** open a project picker. Organization mappings
+preselect a project; otherwise the plugin's **Default BB project** does. You
+can override either choice for that review. If the selected PRs map to different
+projects, choose one project for the batch. Canceling starts nothing.
+
+Set **Organization projects** in the plugin's settings to a JSON object mapping
+GitHub organization names to BB project IDs. Organization names ignore case.
+Find IDs with `bb project list --json`, then configure the mapping:
+
+```sh
+bb plugin config review-watch set organizationProjects '{"parsleyhealth":"proj_parsley","bitcomplete":"proj_bitcomplete"}'
+```
+
+Replace the example IDs with your project IDs. The CLI's `start` command also
+uses these mappings and the default project; a mixed-project batch requires
+an explicit project through the picker.
 
 ## UI components
 

@@ -24,6 +24,7 @@ import {
   type GraphqlTransport,
 } from "./src/github.js";
 import { classify, mergeQueue } from "./src/rules.js";
+import { parseOrganizationProjects, projectChoiceSchema, suggestedProject } from "./src/projects.js";
 import {
   queueItemSchema,
   ruleSchema,
@@ -216,12 +217,16 @@ export const rpcContract = defineRpcContract({
     }),
   },
   item_start: {
-    input: z.object({ key: z.string().min(1) }),
+    input: z.object({ key: z.string().min(1), projectId: z.string().min(1).optional() }),
     output: z.object({ item: queueItemSchema }),
   },
   item_batch_start: {
-    input: z.object({ keys: z.array(z.string().min(1)).min(1) }),
+    input: z.object({ keys: z.array(z.string().min(1)).min(1), projectId: z.string().min(1).optional() }),
     output: z.object({ threadId: z.string(), items: z.array(queueItemSchema) }),
+  },
+  review_targets: {
+    input: z.object({ keys: z.array(z.string().min(1)).min(1) }),
+    output: projectChoiceSchema.extend({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }),
   },
   item_dismiss: {
     input: z.object({ key: z.string().min(1) }),
@@ -265,8 +270,18 @@ export default async function plugin(bb: BbPluginApi) {
     },
     project: {
       type: "project",
-      label: "BB project",
-      description: "Project a started review runs in.",
+      label: "Default BB project",
+      description: "Fallback for organizations without a project mapping. You can choose a different project when starting a review.",
+    },
+    organizationProjects: {
+      type: "string",
+      label: "Organization projects",
+      description: 'GitHub organization to BB project ID, as JSON. For example: {"parsleyhealth":"proj_example"}. Organization names ignore case.',
+      default: "{}",
+      experimental_multiline: true,
+      experimental_schema: z.string().refine((value) => {
+        try { parseOrganizationProjects(value); return true; } catch { return false; }
+      }, "Use a JSON object mapping GitHub organizations to BB project IDs."),
     },
     provider: {
       type: "string",
@@ -301,12 +316,7 @@ export default async function plugin(bb: BbPluginApi) {
     allowlist = parseAllowlist(next.repoAllowlist);
   });
 
-  // Only the project can be judged here. Neither transport can: an empty token
-  // is a valid configuration when `gh` is authenticated, and the `gh` binary is
-  // probed on first use, so the first poll is the earliest honest verdict.
-  if (!current.project) {
-    bb.status.needsConfiguration(CONFIGURE_HINT);
-  }
+  // A project can be chosen at review time; polling needs only GitHub access.
 
   // -------------------------------------------------------------------------
   // Storage. The whole queue is one JSON array: it holds tens of items, well
@@ -595,6 +605,31 @@ export default async function plugin(bb: BbPluginApi) {
   // Start — the only action with side effects.
   // -------------------------------------------------------------------------
 
+  function reviewProject(items: QueueItem[], override?: string): string {
+    if (override !== undefined) return override;
+    const choice = suggestedProject(items, parseOrganizationProjects(current.organizationProjects), current.project);
+    if (choice.projectId === null) {
+      throw new Error(choice.reason === "mixed"
+        ? "These reviews map to different projects. Choose one project for this batch."
+        : "Choose a BB project before starting this review.");
+    }
+    return choice.projectId;
+  }
+
+  function selectedReviews(queue: QueueItem[], keys: string[]): QueueItem[] {
+    if (keys.length === 0 || new Set(keys).size !== keys.length) {
+      throw new Error("Select at least one distinct queue item.");
+    }
+    return keys.map((key) => {
+      const item = queue.find((item) => item.key === key);
+      if (item === undefined) throw new Error(`No unique exact queue item matches ${key}.`);
+      if (item.state !== "queued" || item.threadId !== undefined) {
+        throw new Error(`${item.repo}#${item.number} is already ${item.state}.`);
+      }
+      return item;
+    });
+  }
+
   async function reviewEnvironment(
     projectId: string,
   ): Promise<Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"]> {
@@ -611,7 +646,7 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  async function startItem(key: string): Promise<Lookup> {
+  async function startItem(key: string, override?: string): Promise<Lookup> {
     return withQueueLock(async () => {
       const items = await readQueue();
       const found = lookup(items, key);
@@ -622,10 +657,7 @@ export default async function plugin(bb: BbPluginApi) {
         return { ok: false, message: `${item.repo}#${item.number} is already ${item.state}.` };
       }
 
-      const projectId = current.project;
-      if (projectId === undefined) {
-        return { ok: false, message: `No project is configured. ${CONFIGURE_HINT}` };
-      }
+      const projectId = reviewProject([item], override);
 
       const thread = await bb.sdk.threads.spawn({
         projectId,
@@ -644,27 +676,11 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  async function startBatch(keys: string[]): Promise<{ threadId: string; items: QueueItem[] }> {
+  async function startBatch(keys: string[], override?: string): Promise<{ threadId: string; items: QueueItem[] }> {
     return withQueueLock(async () => {
-      if (keys.length === 0 || new Set(keys).size !== keys.length) {
-        throw new Error("Select at least one distinct queue item.");
-      }
       const queue = await readQueue();
-      const selected = keys.map((key) => {
-        const matches = queue.filter((item) => item.key === key);
-        if (matches.length !== 1) throw new Error(`No unique exact queue item matches ${key}.`);
-        return matches[0]!;
-      });
-      if (new Set(selected.map((item) => item.key)).size !== selected.length) {
-        throw new Error("Select distinct queue items.");
-      }
-      for (const item of selected) {
-        if (item.state !== "queued" || item.threadId !== undefined) {
-          throw new Error(`${item.repo}#${item.number} is already ${item.state}.`);
-        }
-      }
-      const projectId = current.project;
-      if (projectId === undefined) throw new Error(`No project is configured. ${CONFIGURE_HINT}`);
+      const selected = selectedReviews(queue, keys);
+      const projectId = reviewProject(selected, override);
       const thread = await bb.sdk.threads.spawn({
         projectId,
         prompt: batchPrompt(selected),
@@ -704,12 +720,24 @@ export default async function plugin(bb: BbPluginApi) {
       items: await visibleQueue(),
       lastPoll: await readLastPoll(),
     }),
-    item_start: async ({ key }) => {
-      const result = await startItem(key);
+    item_start: async ({ key, projectId }) => {
+      const result = await startItem(key, projectId);
       if (!result.ok) throw new Error(result.message);
       return { item: result.item };
     },
-    item_batch_start: async ({ keys }) => startBatch(keys),
+    item_batch_start: async ({ keys, projectId }) => startBatch(keys, projectId),
+    review_targets: async ({ keys }): Promise<z.infer<typeof rpcContract.review_targets.output>> => {
+      const selected = selectedReviews(await readQueue(), keys);
+      const projects = (await bb.sdk.projects.list())
+        .filter((project) => project.sources.some((source) => source.isDefault) || project.sources.length === 1)
+        .map(({ id, name }) => ({ id, name }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const choice = suggestedProject(selected, parseOrganizationProjects(current.organizationProjects), current.project);
+      if (choice.projectId !== null && !projects.some((project) => project.id === choice.projectId)) {
+        return { projects, projectId: null, reason: "choose" };
+      }
+      return { projects, ...choice };
+    },
     item_dismiss: async ({ key }) => {
       const result = await dismissItem(key);
       if (!result.ok) throw new Error(result.message);
@@ -882,6 +910,7 @@ export default async function plugin(bb: BbPluginApi) {
             ghPath: transport === "gh" ? (ghBinaryPath() ?? null) : null,
             githubToken: configuredToken() !== undefined,
             project: current.project ?? null,
+            organizationProjects: parseOrganizationProjects(current.organizationProjects),
             viewerLogin: cachedLogin,
             pollMinutes: current.pollMinutes,
             repoAllowlist: allowlist,

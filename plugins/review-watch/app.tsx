@@ -11,10 +11,11 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalBadge, PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
+import type { PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { groupByArea, type AreaGroup } from "./src/areas";
 import type { QueueItem, Rule } from "./src/types";
+import { ReviewProjectDialog } from "./review-project-dialog";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
@@ -182,15 +183,19 @@ function QueueCountChip({
 function QueueCountChips({
   initial,
   followups,
+  sidebar = false,
 }: {
   initial: number;
   followups: number;
+  sidebar?: boolean;
 }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full border border-border bg-muted tabular-nums",
-        "gap-1.5 px-1.5 py-0.5",
+        sidebar
+          ? "min-w-[3rem] justify-center gap-0.5 px-0.5 py-0.5"
+          : "gap-1.5 px-1.5 py-0.5",
       )}
     >
       <QueueCountChip
@@ -390,6 +395,7 @@ function ReviewsPage() {
   const { rpc, items, lastPoll, error, report, refetch } = useQueue();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [reviewKeys, setReviewKeys] = useState<string[] | null>(null);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const anchor = useRef<string | null>(null);
   const [polling, setPolling] = useState(false);
@@ -423,36 +429,27 @@ function ReviewsPage() {
   };
   const clear = () => setPicked(new Set());
 
-  const startBatch = (keys: string[]) => {
-    if (keys.length < 2) return;
+  const startReviews = async (projectId: string) => {
+    if (reviewKeys === null) return;
     setBatchBusy(true);
-    rpc
-      .call("item_batch_start", { keys })
-      .then(
-        ({ threadId }) => {
-          clear();
-          refetch();
-          navigate.toThread(threadId);
-        },
-        report,
-      )
-      .finally(() => setBatchBusy(false));
+    try {
+      const result = reviewKeys.length === 1
+        ? await rpc.call("item_start", { key: reviewKeys[0]!, projectId }).then(({ item }) => ({ threadId: item.threadId }))
+        : await rpc.call("item_batch_start", { keys: reviewKeys, projectId });
+      if (result.threadId === undefined) throw new Error("Started review has no thread.");
+      clear();
+      setReviewKeys(null);
+      refetch();
+      navigate.toThread(result.threadId);
+    } finally { setBatchBusy(false); }
   };
 
-  const act = (key: string, method: "item_start" | "item_dismiss") => {
+  const dismiss = (key: string) => {
     setBusyKey(key);
     rpc
-      .call(method, { key })
-      .then(({ item }) => {
+      .call("item_dismiss", { key })
+      .then(() => {
         setPicked((keys) => new Set([...keys].filter((current) => current !== key)));
-        const threadId = item.threadId;
-        if (method === "item_start") {
-          if (threadId === undefined) {
-            report(new Error("Started review has no thread."));
-            return;
-          }
-          navigate.toThread(threadId);
-        }
         refetch();
       }, report)
       .finally(() => setBusyKey(null));
@@ -462,8 +459,7 @@ function ReviewsPage() {
   // One selected opens its own thread; two or more share one batch thread.
   const review = () => {
     if (starting || busyKey !== null) return;
-    if (selection.length === 1) act(selection[0]!, "item_start");
-    else startBatch(selection);
+    if (selection.length > 0) setReviewKeys(selection);
   };
 
   const poll = () => {
@@ -489,7 +485,7 @@ function ReviewsPage() {
       const root = rootRef.current;
       const active = document.activeElement;
       if (!root || (active && active !== document.body && !root.contains(active))) return;
-      if (event.metaKey || event.ctrlKey || event.altKey || typingTarget(event.target)) return;
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || typingTarget(event.target)) return;
       if (shortcut.current.count === 0) return;
       if (event.key === "Escape") {
         event.preventDefault();
@@ -507,12 +503,13 @@ function ReviewsPage() {
     item,
     now,
     busy: batchBusy || busyKey === item.key,
-    onStart: () => act(item.key, "item_start"),
-    onDismiss: () => act(item.key, "item_dismiss"),
+    onStart: () => setReviewKeys([item.key]),
+    onDismiss: () => dismiss(item.key),
   });
 
   return (
     <div ref={rootRef} className={cn("flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground", POINTER_CURSORS)}>
+      {reviewKeys === null ? null : <ReviewProjectDialog keys={reviewKeys} onClose={() => setReviewKeys(null)} onStart={startReviews} />}
       <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/70 px-3 py-1">
         <h1 className="text-[13px] font-semibold">Reviews</h1>
         <button
@@ -633,15 +630,27 @@ function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
   return { items: activeReviews, lastPoll };
 }
 
-function useQueuedBadge(): ExperimentalBadge | null {
+/**
+ * The count on the sidebar row. No public SDK API lets a plugin raise a user
+ * notification, so for a notify-only plugin this badge and the realtime signal
+ * are the notification.
+ */
+function QueuedBadge() {
   const { items } = useActiveReviewItems();
   const initial = items.filter((item) => item.rule === "review-requested").length;
   const followups = items.filter((item) => item.rule === "review-followup").length;
-  return items.length > 0 ? {
-    count: items.length,
-    tone: followups > 0 ? "warning" : "neutral",
-    label: `${initial} initial reviews, ${followups} follow-up reviews`,
-  } : null;
+  return (
+    <span
+      role="img"
+      aria-label={`${initial} initial reviews, ${followups} follow-up reviews`}
+    >
+      <QueueCountChips
+        initial={initial}
+        followups={followups}
+        sidebar
+      />
+    </span>
+  );
 }
 
 /**
@@ -750,7 +759,7 @@ export default definePluginApp((app) => {
     icon: "GitPullRequest",
     path: REVIEWS_PATH,
     component: ReviewsPage,
-    experimental_useBadge: useQueuedBadge,
+    experimental_sidebarAccessory: QueuedBadge,
   });
   app.slots.experimental_threadHeaderAction({
     id: "queued-count",
