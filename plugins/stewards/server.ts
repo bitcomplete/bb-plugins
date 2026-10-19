@@ -37,7 +37,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
+import { advanced, approvalWanted, asksForOpenApproval, classifyApproval, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -839,6 +839,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the reconcile loop ------------------------------------------------------------------
 
+    /**
+     * A thread the plugin does not know as a steward, a worker or the project
+     * steward is one the user runs themselves. Its signed comments count as
+     * the user's own words, including for the spec (criterion 4).
+     */
+    function isUserThread(threadId: string): boolean {
+      return store.byThread(threadId) === null && store.worker(threadId) === null && store.projectByThread(threadId) === null;
+    }
+
+    /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
+    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, isUserThread);
+
     const ownThreads = (b: Binding) => new Set([b.threadId, ...store.workers(b.id).map((w) => w.threadId)].filter((t): t is string => t !== null));
 
     function routedTo(b: Binding): Array<{ escalation: Escalation; from: Binding }> {
@@ -847,7 +859,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** Wake the steward, spawning its thread on the first wake. */
     async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<void> {
-      const gate = gateState(playbook, b.ready, specHash(observed.entity, b.threadId));
+      const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
       const text = formatWake({
         reason,
         binding: b,
@@ -961,7 +973,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       const { phase, stage } = phaseAndStage(playbook, entity.state);
-      const currentSpec = specHash(entity, b.threadId);
+      const currentSpec = specHashFor(b, entity);
       const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
@@ -970,8 +982,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
       }
       const workerRunning = store.workers(b.id).some((w) => w.status === "running");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning });
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning, userThread: isUserThread });
       changes.push(...fresh);
+      // Criterion 4: a spec comment the user wrote from their own thread is
+      // the user's own words. With approval: me it carries its own approval,
+      // pinned to the spec it just changed.
+      if (approval === "me" && ready.approval === null && fresh.some((c) => c.byUser === true)) {
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user" }, voidedAt: null, declinedSpecHash: null };
+        changes.push({ text: "The user's spec comment approves the spec (approval: me)", actionable: true });
+      }
       // Only an entry into build from spec: review → build is the worker's
       // normal loop, and an unreported checklist is not an unmet one.
       if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
@@ -1333,7 +1352,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const mode = playbook.ready?.approval ?? null;
       if (mode === null || typeof mode === "object" || b.lastSnapshot === null) return null;
       const open = store.openEscalations(b.id).filter((x) => x.kind === "approval");
-      const current = specHash(b.lastSnapshot.entity, b.threadId);
+      const current = specHashFor(b, b.lastSnapshot.entity);
       const gate = gateState(playbook, b.ready, current);
       const wanted = approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
       if (!wanted) {
@@ -1672,9 +1691,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (q === null || q.status !== "open") return { ok: false, message: "That question is already closed." };
         const text = answer === null || answer === "" ? null : answer;
         const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+        const b = x === null ? null : store.binding(x.bindingId);
+        // Criterion 1: an approval request answered on the page approves or
+        // declines the current spec and closes the request in one
+        // transaction. Ambiguous words are not a decline: the project steward
+        // decides, so the request goes back to it with the answer.
+        if (x !== null && b !== null && b.endedAt === null && x.kind === "approval" && text !== null) {
+          const entity = (await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          const verdict = classifyApproval(text);
+          if (verdict === "approve" && entity !== null) {
+            store.approve(b.id, { at: now(), specHash: specHashFor(b, entity), by: "user" }, `Approved by the user on the stewards page: "${text}"`, "user");
+            store.addGuidance(b.id, text, "user");
+            store.note(b.id, `Approval ${x.id} was answered by the user on the stewards page: ${text}`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+          }
+          if (verdict === "decline" && entity !== null) {
+            store.decline(b.id, specHashFor(b, entity), `Declined by the user on the stewards page: "${text}"`, "user");
+            store.addGuidance(b.id, text, "user");
+            store.note(b.id, `Approval ${x.id} was declined by the user on the stewards page: ${text}`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Declined; ${b.entityKey}'s steward has been told.` };
+          }
+          // Ambiguous: close the question, keep the escalation, and send it
+          // back to the project steward to interpret.
+          store.answerQuestionOnly(q.id, text, "user");
+          store.addGuidance(b.id, text, "user");
+          store.reroute(x.id, "project", x.recommendation);
+          store.note(b.id, `The user answered approval ${x.id} on the stewards page, but not clearly enough to approve or decline: ${text}`);
+          scheduleReconcile(b.id);
+          await wakeProject(b.projectId, `ambiguous approval answer for ${b.entityKey}`, {
+            digestDue: false,
+            notes: [`The user answered ${b.entityKey}'s approval request on the Stewards page: ${JSON.stringify(text)}. It is not clearly an approval or a decline, so interpret it: approve with steward_update { binding, approve: true }, or decline with explicit words.`, `The escalation ${x.id} is open with you again.`],
+          });
+          return { ok: true, message: `Closed; the project steward will interpret the answer.` };
+        }
         // Closes the escalation it was forwarded for, too.
         store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
-        const b = x === null ? null : store.binding(x.bindingId);
         if (x !== null && b !== null && b.endedAt === null) {
           if (text !== null) store.addGuidance(b.id, text, "user");
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
@@ -1772,6 +1825,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (JSON.stringify(data.request?.params ?? {}).replace(/\\n/gu, " ").replace(/\s+/gu, " ").toLowerCase().includes(want)) return true;
       }
       return false;
+    }
+
+    /**
+     * Whether the connected user approved in an unsigned comment on the
+     * entity, after the latest spec comment (criterion 3). `quote` is matched
+     * against the comment's text, so the steward can quote it back.
+     */
+    function userApprovedOnEntity(entity: EntitySnapshot | null, stewardThreadId: string | null, quote: string): boolean {
+      if (entity === null || entity.viewer === null) return false;
+      const viewer = entity.viewer.toLowerCase();
+      const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
+      const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
+      return entity.comments.some(
+        (c) =>
+          c.signedBy === null &&
+          c.author.toLowerCase() === viewer &&
+          c.createdAt > latestSpec &&
+          classifyApproval(c.body) === "approve" &&
+          c.body.replace(/\s+/gu, " ").toLowerCase().includes(want),
+      );
     }
 
     bb.agents.registerTool({
@@ -1901,7 +1974,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Where the gate stands after this report, so a miss shows now and not at the next wake.
           let gateNote = "";
           if (input.ready !== undefined && playbook !== null && playbook.ready !== null) {
-            const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHash(b.lastSnapshot.entity, b.threadId));
+            const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHashFor(b, b.lastSnapshot.entity));
             const unmet = gate.unmet.map((item) => playbook.ready!.checklist.indexOf(item) + 1);
             const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
@@ -1912,6 +1985,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               request.route === "me"
                 ? ` Approval of the spec is requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
                 : ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
+            gateNote += " Do not ask the user again; it is listed on the Stewards page.";
+            if (asksForOpenApproval(status, store.openEscalations(b.id)) !== null) gateNote += " This report asks for an approval that is already open: a playbook violation, shown by bb stewards show.";
           }
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
@@ -2031,7 +2106,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           const directs = mayDirect(threadId, target);
           if (!directs && forwarding === null) return toolError(new Error(`This thread does not steer ${target.entityKey}: only its own steward, a steward above it, or the project steward does.`));
-          let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
+          let approval: { entity: EntitySnapshot; byUser: boolean; by?: string } | null = null;
           let resolving: Escalation | null = null;
           if (directs) {
             if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
@@ -2044,25 +2119,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
               if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
+              const entity = (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = mode === "project" && isProjectSteward(threadId, target);
-              const byUser = input.quote !== undefined && (await userSaid(threadId, input.quote));
+              // Criterion 3: the user's words may be an unsigned comment on the entity itself, not only a message in this thread.
+              const byUser = input.quote !== undefined && ((await userSaid(threadId, input.quote)) || userApprovedOnEntity(entity, target.threadId, input.quote));
               if (!byProject && !byUser) {
                 return toolError(
                   new Error(
                     mode === "me"
-                      ? "This spec is approved by the user: quote their words from a message they sent in this thread."
+                      ? "This spec is approved by the user: quote their words from a message in this thread, or from their unsigned approving comment on the entity."
                       : "This spec is approved by the project steward (or by the user, quoting their words from this thread). Escalate a decision instead.",
                   ),
                 );
               }
               // Pinned to the spec as it is now, not as last observed: a spec
               // comment posted since the last ring is part of what was read.
-              approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser };
+              approval = { entity, byUser };
             }
             if (resolve !== undefined) {
               if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
+              // Criterion 2: the project steward's approving words are the
+              // approval; approve: true is no longer needed as well.
+              if (approval === null && resolving.kind === "approval" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
+                const config = await loadConfig(target.projectId);
+                const playbook = config === null ? null : playbookFor(config, target.kind);
+                const mode = playbook?.ready?.approval ?? null;
+                if (mode !== null && typeof mode !== "object") approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false, by: isProjectSteward(threadId, target) ? "the project steward" : "your parent steward" };
+              }
             }
             if (input.stewardModel !== undefined && target.threadId !== null) {
               const info = await threadInfo(target.threadId);
@@ -2096,8 +2181,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!directs) return `${target.entityKey}: ${done.join("; ")}.`;
 
           if (approval !== null) {
-            const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHash(approval.entity, target.threadId), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            const by = approval.byUser ? ` by the user: "${input.quote}"` : ` by ${approval.by ?? "the project steward"}`;
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
@@ -2113,9 +2198,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (resolving !== null) {
             // Already resolved (the binding ended, a retry) is no error: the answer is added to the record.
             const outcome = store.answerEscalation(resolving.id, guidance!, threadId);
-            if (resolving.kind === "approval" && resolving.status === "open" && input.approve !== true && target.lastSnapshot !== null) {
+            if (resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
-              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHash(fresh.lastSnapshot!.entity, fresh.threadId) } });
+              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) } });
             }
             if (resolving.status === "open") done.push(`resolved ${resolving.id}`);
             else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
@@ -2149,7 +2234,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         .map((b) => {
           const s = b.status;
           const open = store.openEscalations(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), unheardWait(s, open)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), unheardWait(s, open), asksForOpenApproval(s, open)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");

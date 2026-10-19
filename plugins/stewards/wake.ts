@@ -147,8 +147,8 @@ function gateLines(input: WakeInput): string[] {
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
       : request.route === "me"
-        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it.`;
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. Do not ask the user again; it is listed on the Stewards page.`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. Do not ask the user again; it is listed on the Stewards page.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);

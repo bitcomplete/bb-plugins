@@ -86,8 +86,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   substantial and the current spec has no approval, it files an `approval`
   escalation with the approver (the project steward, or the user in the
   steward's thread), whatever the steward's report says, and closes it once
-  approved or no longer needed. A request the approver declines is not made
-  again until the spec changes. When the entity changes while one of its
+  approved or no longer needed. An approval is recorded from the approver's
+  words wherever they are: the project steward's guidance that resolves the
+  request, the user's answer on the Stewards page, their message in the
+  steward's thread, or their unsigned approving comment on the entity. A
+  page answer that is neither an approval nor a clear refusal goes back to
+  the project steward to interpret, rather than being remembered as a
+  decline. A spec comment the user writes from their own thread counts
+  toward the spec and, with `approval: me`, is its own approval. A request
+  the approver declines is not made again until the spec changes, and while
+  one is open the steward is told not to ask the user again: the request is
+  on the Stewards page, and a report that asks anyway shows as a playbook
+  violation in `bb stewards show`. When the entity changes while one of its
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open
