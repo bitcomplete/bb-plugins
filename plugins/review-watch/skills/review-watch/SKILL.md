@@ -66,9 +66,10 @@ matters even when the poller uses a token.
 
 1. Run `bb review-watch list` before you act. Use the keys it prints; never
    guess a key.
-2. To work an item, run `bb review-watch start <key>`. The new thread uses the
-   configured project's default checkout on its registered machine and carries a prompt for the
-   item's rule. Find the matching repository checkout before inspecting code.
+2. To work an item, run `bb review-watch start <key>`. The repository's GitHub
+   organization mapping selects the project, falling back to the default BB
+   project. The thread uses that project's default checkout on its registered
+   machine. Find the matching repository checkout before inspecting code.
 3. Report the thread id the command prints so the user can follow it.
 4. Dismiss an item only when the user asks. Dismissing hides it for good; there
    is no undismiss in the CLI.
@@ -76,8 +77,10 @@ matters even when the poller uses a token.
    next tick.
 
 In **Reviews**, select queued review requests and follow-ups, then choose
-**Review selected** to open one aggregate review thread. This action does not
-have a CLI command. Use **Start** to open an individual review thread.
+**Review selected** to choose a project and open one aggregate review thread.
+Organization mappings preselect the project. Mixed-project selections require
+an explicit choice. **Start** opens the same picker for an individual review.
+Canceling starts nothing. The batch action does not have a CLI command.
 
 Queued and started review items stay in their action sections and remain
 counted. A started row links to its open thread and stays pending until a
@@ -112,7 +115,8 @@ Configure with `bb plugin config review-watch`:
 | Setting | Meaning |
 | --- | --- |
 | `githubToken` | A personal access token with `repo` scope. Optional: when it is empty, the poller reads GitHub through the `gh` CLI instead. |
-| `project` | The BB project whose default environment runs started reviews. Required. |
+| `project` | Default BB project for organizations without a mapping. Optional when a project is chosen through the picker. |
+| `organizationProjects` | JSON object mapping GitHub organization names to BB project IDs. Organization names ignore case. Defaults to `{}`. |
 | `pollMinutes` | Poll interval in minutes. Defaults to 5. |
 | `repoAllowlist` | Comma-separated `owner/name` entries. Empty watches every repository. |
 | `maxAgeDays` | Drop an item this old even if GitHub still lists it. Defaults to 14. |

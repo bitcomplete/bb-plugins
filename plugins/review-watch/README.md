@@ -3,9 +3,9 @@
 A personal GitHub review inbox for BB. A background poller asks GitHub what
 needs your attention, stores a deduplicated queue, and surfaces it in the
 sidebar, the thread header, and on the command line. **Start** opens one thread;
-**Review selected** opens one thread for several review requests. Threads use
-the configured project's default checkout on its registered machine, including
-when that machine is a remote devbox.
+**Review selected** opens one thread for several review requests. Both actions
+let you choose a BB project before starting. Threads use that project's default
+checkout on its registered machine, including a remote devbox.
 
 Review Watch reads GitHub and never writes to it, and it never starts a thread
 on its own. The queue notifies; you dispatch.
@@ -67,9 +67,28 @@ superseded reviewer threads move to **Archived threads** at the bottom, where yo
 can reopen them. Dismissed items do not appear. Workstreams displays feedback
 on your own pull requests.
 
-Each thread uses the configured project's default environment. The agent finds
+Each thread uses the selected project's default checkout. The agent finds
 the matching repository checkout before it inspects code. Review Watch does
 not create checkouts or worktrees when it starts a thread.
+
+## Review projects
+
+**Start** and **Review selected** open a project picker. Organization mappings
+preselect a project; otherwise the plugin's **Default BB project** does. You
+can override either choice for that review. If the selected PRs map to different
+projects, choose one project for the batch. Canceling starts nothing.
+
+Set **Organization projects** in the plugin's settings to a JSON object mapping
+GitHub organization names to BB project IDs. Organization names ignore case.
+Find IDs with `bb project list --json`, then configure the mapping:
+
+```sh
+bb plugin config review-watch set organizationProjects '{"parsleyhealth":"proj_parsley","bitcomplete":"proj_bitcomplete"}'
+```
+
+Replace the example IDs with your project IDs. The CLI's `start` command also
+uses these mappings and the default project; a mixed-project batch requires
+an explicit project through the picker.
 
 ## UI components
 
