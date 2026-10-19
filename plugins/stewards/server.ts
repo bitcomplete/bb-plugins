@@ -1229,7 +1229,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
       // Read as of the send, so an escalation resolved meanwhile is left out,
       // and marked delivered in the same step, so a prompt sent right after
-      // lists it as still open rather than new.
+      // lists it as still open rather than new. The text is built before the
+      // mark, so a throw while building it leaves nothing marked.
       const delivered = { ids: [] as string[], at: 0 };
       const sent = await sendTo(threadId, () => {
         const open = store.open(projectId);
@@ -1237,9 +1238,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
         const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
         const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
+        const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
         delivered.ids = routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id);
         delivered.at = store.markDelivered(delivered.ids);
-        return formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
+        return text;
       });
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
     }

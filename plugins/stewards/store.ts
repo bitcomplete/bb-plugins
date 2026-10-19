@@ -563,11 +563,11 @@ export function createStore(db: Database.Database, now: () => number) {
       }
       return patch(id, { pending });
     },
-    /** Save guidance; false when it repeats the binding's last guidance within five minutes (a retry), which saves nothing. */
+    /** Save guidance; false when it repeats the binding's last guidance by the same author within five minutes (a retry), which saves nothing. */
     addGuidance(id: string, text: string, by: string): boolean {
       const b = rowToBinding(getBinding.get(id)!);
       const last = b.guidance.at(-1);
-      if (last !== undefined && last.text === text && now() - last.at < GUIDANCE_DEDUPE_MS) return false;
+      if (last !== undefined && last.text === text && last.by === by && now() - last.at < GUIDANCE_DEDUPE_MS) return false;
       patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
       return true;
     },

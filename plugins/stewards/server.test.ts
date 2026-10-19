@@ -712,6 +712,9 @@ describe("escalations delivered once, updates safe to retry", () => {
     t.advance(5 * 60_000);
     expect((await update()).text).toBe("ENG-12: guidance saved.");
     expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(2);
+    // The same text from someone else is theirs to say, not a retry.
+    expect(t.hooks.store.addGuidance(t.hooks.store.find("ENG-12")!.id, "Keep SSO out of this ticket.", "thr_someone_else")).toBe(true);
+    expect(t.hooks.store.find("ENG-12")!.guidance).toHaveLength(3);
   });
 
   it("accepts guidance resolving an approval request that approve: true already closed", async () => {
