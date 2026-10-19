@@ -131,7 +131,9 @@ describe("waits nobody hears", () => {
 describe("approval words", () => {
   it("tells approval, refusal and ambiguity apart", () => {
     for (const text of ["LGTM", "Approved", "approved, it is fully specified", "ship it", "go ahead", "Looks good", "yes", "signed off"]) expect(classifyApproval(text), text).toBe("approve");
-    for (const text of ["no", "No.", "not approved", "declined", "reject", "changes needed", "don't", "do not approve"]) expect(classifyApproval(text), text).toBe("decline");
+    // Approving words with a bare "no" beside them still approve.
+    for (const text of ["LGTM, no concerns from me", "Ship it, no further changes needed", "Approved, no notes"]) expect(classifyApproval(text), text).toBe("approve");
+    for (const text of ["no", "No.", "not approved", "don't ship it", "declined", "reject", "changes needed", "don't", "do not approve", "No, not yet"]) expect(classifyApproval(text), text).toBe("decline");
     for (const text of ["", "maybe", "name the migration in the spec", "what about SSO?"]) expect(classifyApproval(text), text).toBe("ambiguous");
   });
 
@@ -139,7 +141,9 @@ describe("approval words", () => {
     const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "me" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
     const open = [{ kind: "approval" } as never];
     expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), open)).toMatch(/already open/u);
+    // Waiting on the request, or on the project steward, is not asking again.
     expect(asksForOpenApproval(status("Spec posted.", "Wait for the project steward's approval"), open)).toBeNull();
+    expect(asksForOpenApproval(status("Approval requested from the user; waiting.", "Wait for the user to approve the spec"), open)).toBeNull();
     expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), [])).toBeNull();
   });
 });

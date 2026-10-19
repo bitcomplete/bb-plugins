@@ -276,7 +276,7 @@ export function formatProjectWake(input: {
     );
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
       out.push(
-        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, which closes the request; or decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
         "",
       );
     }

@@ -986,8 +986,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       changes.push(...fresh);
       // Criterion 4: a spec comment the user wrote from their own thread is
       // the user's own words. With approval: me it carries its own approval,
-      // pinned to the spec it just changed.
-      if (approval === "me" && ready.approval === null && fresh.some((c) => c.byUser === true)) {
+      // pinned to the spec it just changed, whether or not an earlier
+      // approval has gone stale.
+      if (approval === "me" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user" }, voidedAt: null, declinedSpecHash: null };
         changes.push({ text: "The user's spec comment approves the spec (approval: me)", actionable: true });
       }
@@ -2106,7 +2107,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           const directs = mayDirect(threadId, target);
           if (!directs && forwarding === null) return toolError(new Error(`This thread does not steer ${target.entityKey}: only its own steward, a steward above it, or the project steward does.`));
-          let approval: { entity: EntitySnapshot; byUser: boolean; by?: string } | null = null;
+          let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
           let resolving: Escalation | null = null;
           if (directs) {
             if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
@@ -2141,12 +2142,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
               // Criterion 2: the project steward's approving words are the
-              // approval; approve: true is no longer needed as well.
+              // approval; approve: true is no longer needed as well. Only the
+              // approver the gate names may do it, as with approve: true: the
+              // project steward for mode project, and never a steward's own
+              // words for mode me (there the user's quote is required).
               if (approval === null && resolving.kind === "approval" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
                 const playbook = config === null ? null : playbookFor(config, target.kind);
-                const mode = playbook?.ready?.approval ?? null;
-                if (mode !== null && typeof mode !== "object") approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false, by: isProjectSteward(threadId, target) ? "the project steward" : "your parent steward" };
+                if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
               }
             }
             if (input.stewardModel !== undefined && target.threadId !== null) {
@@ -2181,7 +2184,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!directs) return `${target.entityKey}: ${done.join("; ")}.`;
 
           if (approval !== null) {
-            const by = approval.byUser ? ` by the user: "${input.quote}"` : ` by ${approval.by ?? "the project steward"}`;
+            const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
             store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);

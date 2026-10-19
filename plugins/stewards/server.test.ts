@@ -443,6 +443,7 @@ describe("a Linear ticket steward", () => {
     expect(wake).toMatch(/approval requested for ENG-12/u);
     expect(wake).toMatch(/(esc_[\w-]+) from ENG-12 \(approval\): Approve ENG-12's spec \(Fix login\)\? .*substantial \(two repos\)/u);
     expect(wake).toMatch(/steward_update \{ binding, approve: true \}/u);
+    expect(wake).toMatch(/approving words in the guidance/u);
     const id = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(wake)![1]!;
 
     // A second report asks nothing twice, and the steward's next wake says it is asked for.
@@ -1499,6 +1500,24 @@ describe("questions to the user", () => {
       expect(b.ready.declinedSpecHash).not.toBeNull();
     });
 
+    it("does not let a steward approve its own spec with approving words", async () => {
+      const t = await requested();
+      expect((await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved, the spec is complete.", resolve: t.esc }, t.steward)).error).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    });
+
+    it("does not let the project steward approve for the user when the approver is me", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!.id;
+      expect((await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved", resolve: esc }, project)).error).toBe(false);
+      expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    });
+
     it("takes the user's unsigned approving comment on the entity as the quote", async () => {
       const t = await setup();
       t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
@@ -1544,6 +1563,32 @@ describe("questions to the user", () => {
       expect(b.ready.approval).not.toBeNull();
       expect(b.ready.declinedSpecHash).toBeNull();
       expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/user's spec comment approves/u);
+    });
+
+    it("carries the user's own amendment's approval even after a stale one (approver me)", async () => {
+      const t = await setup();
+      t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const steward = t.spawns[1]!.id;
+      await t.tool("steward_report", { ...base, ready: met }, steward);
+      const s1 = comment({ id: "s1", author: "Jane", body: "**Spec:** acceptance criteria", signedBy: steward, createdAt: "2026-10-14T15:10:00Z" });
+      const u1 = comment({ id: "u1", author: "Jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T15:20:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [s1, u1] }));
+      await t.ring("linear", "uuid-12");
+      expect((await t.tool("steward_update", { approve: true, quote: "LGTM" }, steward)).error).toBe(false);
+      const approved = t.hooks.store.find("ENG-12")!.ready.approval!.specHash;
+      // The steward amends the spec: the approval is stale but still pinned to the old hash.
+      const s2 = comment({ id: "s2", author: "Jane", body: "**Spec:** narrower scope", signedBy: steward, createdAt: "2026-10-14T15:30:00Z" });
+      t.entities.set("uuid-12", issue({ comments: [s1, u1, s2] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.hooks.store.find("ENG-12")!.ready.approval!.specHash).toBe(approved);
+      // The user amends from their own thread: it carries its own approval for the new spec.
+      t.entities.set("uuid-12", issue({ comments: [s1, u1, s2, comment({ id: "u2", author: "Jane", body: "**Spec:** even narrower", signedBy: "thr_design", createdAt: "2026-10-14T15:40:00Z" })] }));
+      await t.ring("linear", "uuid-12");
+      const b = t.hooks.store.find("ENG-12")!;
+      expect(b.ready.approval).not.toBeNull();
+      expect(b.ready.approval!.specHash).not.toBe(approved);
     });
 
     it("files a fresh request and tells the steward the user authored the spec (approver project)", async () => {

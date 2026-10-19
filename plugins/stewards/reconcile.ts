@@ -29,10 +29,11 @@ export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null
   c.signedBy !== null && /^\s*(\*\*)?spec\b/iu.test(c.body) && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
 
 /**
- * What an approval is pinned to: the description and the steward's spec
- * comments. Any change to either changes the hash. The signature line is
- * left out of the description, so the steward's own signed edit hashes the
- * same as the text it wrote.
+ * What an approval is pinned to: the description and the spec comments. The
+ * steward's own and the user's (a thread the user runs) both count. Any
+ * change to either changes the hash. The signature line is left out of the
+ * description, so the steward's own signed edit hashes the same as the text
+ * it wrote.
  */
 const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
 
@@ -198,29 +199,39 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
  */
 export type ApprovalVerdict = "approve" | "decline" | "ambiguous";
 
+const NEGATED_APPROVE = /(?:^|[^\p{L}\p{N}])(?:not|do\s+not|don'?t)\s+(?:\w+\s+){0,2}?(?:approv\w*|ship|lgtm|go\s+ahead|looks?\s+good|sign\s*off|yes)(?:[^\p{L}\p{N}]|$)/iu;
+const REFUSAL = /(?:^|[^\p{L}\p{N}])(?:reject(?:ed)?|declin(?:e|ed)|hold\s+off)(?:[^\p{L}\p{N}]|$)/iu;
 const APPROVE_WORDS = /(?:^|[^\p{L}\p{N}])(?:lgtm|approv(?:e|es|ed|al)|ship\s*it|go\s*ahead|looks?\s+good|sign(?:ed)?\s*off|:shipit:|yes|yep|yeah)(?:[^\p{L}\p{N}]|$)/iu;
-const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+approv(?:e|ed)|reject(?:ed)?|declin(?:e|ed)|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
+const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+yet|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
 
+/**
+ * A clear refusal first, so "not approved" and "don't ship it" decline rather
+ * than matching the approval word inside them; then approval words, so
+ * "LGTM, no concerns" and "ship it, no further changes needed" approve; then
+ * a bare no or a request for changes declines; anything else is ambiguous.
+ */
 export function classifyApproval(text: string | null | undefined): ApprovalVerdict {
   const flat = (text ?? "").replace(/\s+/gu, " ").trim();
   if (flat === "") return "ambiguous";
-  if (DECLINE_WORDS.test(flat)) return "decline";
+  if (NEGATED_APPROVE.test(flat) || REFUSAL.test(flat)) return "decline";
   if (APPROVE_WORDS.test(flat)) return "approve";
+  if (DECLINE_WORDS.test(flat)) return "decline";
   return "ambiguous";
 }
 
 /**
  * A steward that asks for an approval that is already open. The plugin files
  * the request and lists it on the Stewards page, so the playbook says not to
- * ask the user again; a report whose next action asks them anyway is a
- * violation `bb stewards show` points at.
+ * ask the user again; a report whose next action is to ask them anyway is a
+ * violation `bb stewards show` points at. Only an imperative next action
+ * counts, so merely waiting on the request is not flagged.
  */
 export function asksForOpenApproval(status: Binding["status"], open: readonly Escalation[]): string | null {
   if (status === null || !open.some((x) => x.kind === "approval")) return null;
-  const text = [status.summary, status.nextAction, status.blockedOn ?? ""].join(" ");
-  if (!/\b(?:ask|asks|asking|request|requests|requested)\b/iu.test(text)) return null;
-  if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(text)) return null;
-  if (!/\b(?:user|you|your)\b/iu.test(text)) return null;
+  const next = status.nextAction.trim();
+  if (!/^(?:ask|asks|asking|request|requests|requesting|remind|reminds|reminding|tell|tells|telling|prompt|prompts|prompting)\b/iu.test(next)) return null;
+  if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(next)) return null;
+  if (!/\b(?:user|you|your)\b/iu.test(next)) return null;
   return "asks for an approval that is already open";
 }
 
