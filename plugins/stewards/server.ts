@@ -37,7 +37,7 @@ import {
   type ProjectFile,
 } from "./config.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
+import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -972,8 +972,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const workerRunning = store.workers(b.id).some((w) => w.status === "running");
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning });
       changes.push(...fresh);
-      const gate = gateState(playbook, ready, currentSpec);
-      if (stage === "build" && b.stage !== "build" && !gate.passed && prev !== null) {
+      // Only an entry into build from spec: review → build is the worker's
+      // normal loop, and an unreported checklist is not an unmet one.
+      if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
         changes.push({ text: `Moved into a build stage (${entity.state}) before the ready gate passed`, actionable: true });
       }
       if (b.requeueAt !== null && b.requeueAt <= now()) changes.push({ text: "Requeue time came", actionable: true });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, diffObserved, endingDeadline, followingThrough, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue, unheardWait } from "./reconcile.js";
+import { approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue, unheardWait } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -149,6 +149,18 @@ describe("the ready gate", () => {
     expect(approvalWanted(gateState(tickets, ready({ checklist: allMet }), hash))).toBe(true);
     expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: true, approval }), hash))).toBe(false);
     expect(approvalWanted(gateState(tickets, ready({ checklist: allMet, substantial: true, approval }), "changed"))).toBe(true);
+  });
+
+  it("is known unmet on a missing or stale approval or an item reported unmet, not on an unreported item", () => {
+    const hash = specHash(issue(), "thr_s");
+    const approval = { at: 1, specHash: hash, by: "thr_p" };
+    expect(gateKnownUnmet(tickets, ready({}), hash)).toBe(true);
+    expect(gateKnownUnmet(tickets, ready({ approval }), hash)).toBe(false);
+    expect(gateKnownUnmet(tickets, ready({ approval, checklist: allMet.slice(1) }), hash)).toBe(false);
+    expect(gateKnownUnmet(tickets, ready({ approval }), "changed")).toBe(true);
+    expect(gateKnownUnmet(tickets, ready({ substantial: false }), hash)).toBe(false);
+    expect(gateKnownUnmet(tickets, ready({ approval, checklist: [{ ...allMet[0]!, met: false }] }), hash)).toBe(true);
+    expect(gateKnownUnmet(tickets, ready({ checklist: allMet, approval }), hash)).toBe(false);
   });
 
   it("knows a reported item by its number or the playbook's own words, never a paraphrase", () => {
