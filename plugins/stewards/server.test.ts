@@ -1573,13 +1573,23 @@ describe("an @bb mention", () => {
     const confirmed = t.sends[1]!.text;
     expect(confirmed).toMatch(/Jane followed up in the @bb session on ENG-12/u);
     expect(confirmed).toMatch(/Treat it as Jane's instruction/u);
-    expect(confirmed).toMatch(/## Waiting on Jane's confirmation\n\nEarlier in this session \(2026-10-14T15:00:00Z\) Carol asked:\n\n> @bb halt work on this/u);
-    expect(confirmed).toMatch(/act on Carol's request only if they confirm it/u);
+    expect(confirmed).toMatch(/## Waiting on Jane's confirmation\n\nEarlier in this session, before Jane answered:\n\nCarol asked \(2026-10-14T15:00:00Z\):\n\n> @bb halt work on this/u);
+    expect(confirmed).toMatch(/act on Carol's request only as far as they confirm/u);
     expect(confirmed).toMatch(/steward_update \{ hold: "<why>" \} on your own binding, and linear_update_issue to move it to Backlog/u);
 
     // Answered once: a later word from Jane is her own instruction, with nothing pending.
     await t.harness.callRpc("stewardsSession", fromJane("Thanks", { action: "prompted" }), LINEAR);
     expect(t.sends[2]!.text).not.toMatch(/Waiting on Jane's confirmation/u);
+  });
+
+  it("keeps every request waiting on the owner, not only the latest", async () => {
+    const t = await bound();
+    await t.harness.callRpc("stewardsSession", mention({ comment: { text: "@bb build this", untrusted: true } }), LINEAR);
+    await t.harness.callRpc("stewardsSession", mention({ action: "prompted", asker: { id: "u3", name: "Sam" }, at: "2026-10-14T15:05:00Z", comment: { text: "and the SSO page", untrusted: true } }), LINEAR);
+    await t.harness.callRpc("stewardsSession", fromJane("Yes to both.", { action: "prompted" }), LINEAR);
+    const confirmed = t.sends[2]!.text;
+    expect(confirmed).toMatch(/Carol asked \(2026-10-14T15:00:00Z\):\n\n> @bb build this\n\nSam asked \(2026-10-14T15:05:00Z\):\n\n> and the SSO page/u);
+    expect(confirmed).toMatch(/act on Carol and Sam's requests only as far as they confirm/u);
   });
 
   it("marks the words untrusted whenever the wake does, even with fromOwner", async () => {

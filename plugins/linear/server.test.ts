@@ -1448,6 +1448,49 @@ describe("agent sessions", () => {
     await s.stop();
   });
 
+  it("gives a follow-up that arrives before the first reply its own reply, and no more", async () => {
+    const s = await sessions();
+    const ctx = { threadId: "thr-steward", projectId: "prj-1" };
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.turn("thr-steward", "session sess-1 (created)");
+    s.advance(1000);
+    // A second message in the session while the steward is still on the first.
+    s.hooks.last().send(s.hooks.session({ action: "prompted", comment: { text: "also the SSO page", untrusted: true } }));
+    await tick();
+    expect(s.text(await s.tool("linear_session_reply", { session: "sess-1", kind: "elicitation", body: "Jane, confirm?" }, ctx))).toMatch(/activity act-1/u);
+    // The turn that handled the first message ends: not the follow-up's turn, so no backstop.
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toHaveLength(1);
+    // The follow-up's turn replies too, once.
+    s.turn("thr-steward", "session sess-1 (prompted)");
+    expect(s.text(await s.tool("linear_session_reply", { session: "sess-1", kind: "elicitation", body: "And the SSO page?" }, ctx))).toMatch(/activity act-2/u);
+    expect(s.text(await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "More." }, ctx))).toMatch(/already has its reply/u);
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toHaveLength(2);
+    await s.stop();
+  });
+
+  it("answers for the follow-up's turn when it ends without a reply, after the first was answered", async () => {
+    const s = await sessions();
+    const ctx = { threadId: "thr-steward", projectId: "prj-1" };
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.turn("thr-steward", "session sess-1 (created)");
+    s.advance(1000);
+    s.hooks.last().send(s.hooks.session({ action: "prompted" }));
+    await tick();
+    await s.tool("linear_session_reply", { session: "sess-1", kind: "response", body: "Done." }, ctx);
+    await s.idle("thr-steward");
+    s.advance(1000);
+    s.turn("thr-steward", "session sess-1 (prompted)");
+    await s.idle("thr-steward");
+    expect(s.hooks.replies.map((r) => r.body.kind)).toEqual(["response", "error"]);
+    await s.idle("thr-steward");
+    expect(s.hooks.replies).toHaveLength(2);
+    await s.stop();
+  });
+
   it("says plainly why the service refused a reply", async () => {
     const s = await sessions();
     s.hooks.state.reply = () => Response.json({ error: "not-routed" }, { status: 403 });

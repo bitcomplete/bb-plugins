@@ -1410,7 +1410,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       handedAt: z.number().nullable(),
       threadId: z.string().nullable(),
       projectId: z.string().nullable(),
-      /** The event the latest reply answered; the session is answered when it is the latest. */
+      /**
+       * How many of those events have had their reply. Replies are counted in
+       * order, one per event, so a follow-up that arrived while the first
+       * reply was being written still gets its own.
+       */
       answered: z.number().nullable(),
     });
     type SessionRecord = z.infer<typeof sessionRecord>;
@@ -1420,7 +1424,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       for (const [id, r] of sessions) if (r.eventAt < cutoff) sessions.delete(id);
       await bb.storage.kv.set(SESSIONS_KEY, Object.fromEntries(sessions));
     }
-    const answered = (r: SessionRecord) => r.answered === r.events;
+    const answered = (r: SessionRecord) => (r.answered ?? 0) >= r.events;
 
     /** Who bb-gate-hooks last said this server is, for the reply tool's errors and the logs. */
     let identified: (IdentifyResponse & { account?: string }) | null = null;
@@ -1478,7 +1482,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       const r = sessions.get(session);
       if (r !== undefined) {
-        sessions.set(session, { ...r, answered: r.events });
+        sessions.set(session, { ...r, answered: Math.min(r.events, (r.answered ?? 0) + 1) });
         await saveSessions();
       }
       return posted.activity;
@@ -1804,7 +1808,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         if (hooksUrl === "") return toolError(new Error("Replying to Linear mentions is not available on this bb server: it has no bb-gate-hooks service (BB_HOOKS_URL is not set)."));
         const r = sessions.get(session);
         if (r !== undefined && answered(r)) {
-          return toolError(new Error(`This mention on ${r.issueKey} already has its reply; a mention gets exactly one. Put further progress in a comment on the issue (linear_comment). A new follow-up in the session can be answered when it arrives.`));
+          return toolError(new Error(`Every message in this session on ${r.issueKey} already has its reply; each gets exactly one. Put further progress in a comment on the issue (linear_comment). A new follow-up in the session can be answered when it arrives.`));
         }
         const link = externalUrl ?? threadUrl(projectId ?? r?.projectId ?? null, threadId) ?? undefined;
         const text = signed(link === undefined || body.includes(link) ? body : `${body}\n\n[The bb thread](${link})`, threadId);

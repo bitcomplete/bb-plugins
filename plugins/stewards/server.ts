@@ -1544,22 +1544,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const PENDING_KEY = "sessions/pending";
     const PENDING_TTL_MS = 7 * 86_400_000;
-    const pendingRecord = z.record(z.string(), z.object({ asker: z.string(), text: z.string(), at: z.string(), savedAt: z.number() }));
-    async function takePending(session: string, next: PendingRequest | null): Promise<PendingRequest | null> {
+    /** At most this many requests wait on the owner per session; the oldest go first. */
+    const PENDING_MAX = 5;
+    const pendingItem = z.object({ asker: z.string(), text: z.string(), at: z.string() });
+    const pendingRecord = z.record(z.string(), z.object({ requests: z.array(pendingItem), savedAt: z.number() }));
+    /** Add a request waiting on the owner, or (with null) take every one waiting, which the owner's words answer. */
+    async function updatePending(session: string, add: PendingRequest | null): Promise<PendingRequest[]> {
       const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
-      const before = all[session] ?? null;
-      if (next === null) delete all[session];
-      else all[session] = { ...next, savedAt: now() };
+      const before = all[session]?.requests ?? [];
+      if (add === null) delete all[session];
+      else all[session] = { requests: [...before, add].slice(-PENDING_MAX), savedAt: now() };
       for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
       await bb.storage.kv.set(PENDING_KEY, all);
-      return before === null ? null : { asker: before.asker, text: before.text, at: before.at };
+      return before;
     }
 
     async function onSession(w: SessionWake): Promise<{ routed: "ticket" | "project" | "none"; threadId: string | null; projectId: string | null }> {
       const trusted = w.fromOwner && !w.comment.untrusted;
-      // An untrusted request is what the owner's next words may confirm; the
-      // owner's words answer it, so it is taken off.
-      const pending = trusted ? await takePending(w.session, null) : (await takePending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at }), null);
+      // Untrusted requests are what the owner's next words may confirm; the
+      // owner's words answer them, so they are taken off.
+      const pending = trusted ? await updatePending(w.session, null) : (await updatePending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at }), []);
 
       const bound = store.byEntity("linear", w.issue.id);
       if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
