@@ -6,13 +6,23 @@ import { comment, fixture, transportFor } from "./fixtures.js";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0)) await dispose(); });
-async function setup() {
+async function setup(settings: Record<string, unknown> = {}) {
   const data = [fixture(), fixture(2)]; let fail = false;
-  const host = createFakePluginHost({ pluginId: "pr-inbox", settings: { project: "project-test" }, sdk: { threads: {
+  const host = createFakePluginHost({ pluginId: "pr-inbox", settings: { project: "project-test", ...settings }, sdk: { threads: {
     spawn: async () => makeThreadResponse({ id: "thread-address" }),
     get: async () => makeThreadResponse({ id: "thread-address", status: "idle" }),
   } } });
   cleanup.push(() => host.harness.lifecycle.dispose());
+  host.harness.inspection.sdk.stub("projects.get", async ({ projectId }) => ({
+    id: projectId, sources: [
+      { hostId: "server-host", path: "/wrong-checkout", isDefault: false },
+      { hostId: projectId === "project-parsley" ? "parsley-host" : "devbox-host", path: projectId === "project-parsley" ? "/home/dev/parsley" : "/project-checkout", isDefault: true },
+    ],
+  }));
+  host.harness.inspection.sdk.stub("projects.list", async () => [
+    { id: "project-test", name: "Default", sources: [{ isDefault: true }] },
+    { id: "project-parsley", name: "Parsley", sources: [{ isDefault: true }] },
+  ]);
   const base = transportFor(() => data);
   const factory = createPlugin({ transport: (query, variables, signal) => { if (fail) throw new Error("GitHub unavailable"); return base(query, variables, signal); } });
   await factory(host.bb);
@@ -43,6 +53,7 @@ describe("My PRs behavior", () => {
     expect(await env.rpc("address", { items })).toEqual({ threadId: "thread-address" });
     const calls = env.harness.inspection.sdk.callsTo("threads.spawn");
     expect(calls).toHaveLength(1);
+    expect(calls[0]?.[0]).toMatchObject({ environment: { type: "host", hostId: "devbox-host", workspace: { type: "unmanaged", path: "/project-checkout" } } });
     expect(JSON.stringify(calls)).toContain("https://github.com/example/editor/pull/1");
     expect(JSON.stringify(calls)).toContain("Never merge");
     expect((await env.view()).rows.map((row) => row.dispatch)).toEqual([{ kind: "linked", threadId: "thread-address" }, { kind: "linked", threadId: "thread-address" }]);
@@ -92,7 +103,7 @@ describe("My PRs behavior", () => {
     expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
   });
   it("uses only the public plugin SDK and package-local source", async () => {
-    const scan = await experimental_scanPublicSdkOnly(import.meta.dirname, { allow: [/^react$/, /^@testing-library\/react$/, /^@radix-ui\/react-slot$/, /^class-variance-authority$/, /^clsx$/, /^tailwind-merge$/] });
+    const scan = await experimental_scanPublicSdkOnly(import.meta.dirname, { allow: [/^react-dom$/, /^@radix-ui\/react-dialog$/, /^react$/, /^@testing-library\/react$/, /^@radix-ui\/react-slot$/, /^class-variance-authority$/, /^clsx$/, /^tailwind-merge$/] });
     expect(scan.violations).toEqual([]); expect(scan.privateDependencies).toEqual([]);
   });
 });
@@ -133,4 +144,43 @@ it("reads saved state from before holds were introduced without losing dismissal
   expect((await env.view()).rows.find((row) => row.id === selection.id)).toMatchObject({
     holdUntil: null, dismissed: true, dispatch: { kind: "linked", threadId: "thread-address" },
   });
+});
+
+it("targets the selected project and its remote machine when addressing feedback", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  await env.rpc("address", { items: [selection], projectId: "project-parsley" });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+    projectId: "project-parsley", environment: { type: "host", hostId: "parsley-host", workspace: { type: "unmanaged", path: "/home/dev/parsley" } },
+  });
+});
+
+it("preselects the organization mapping and uses it for CLI-style starts", async () => {
+  const env = await setup({ organizationProjects: '{"EXAMPLE":"project-parsley"}' });
+  const selection = await firstSelection(env);
+  expect(await env.rpc("address_targets", { items: [selection] })).toMatchObject({ projectId: "project-parsley", reason: "organization" });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  await env.rpc("address", { items: [selection] });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({ projectId: "project-parsley", environment: { hostId: "parsley-host" } });
+});
+
+it("requires a project for mixed mappings and handles missing project checkouts before marking dispatch", async () => {
+  const env = await setup({ organizationProjects: '{"example":"project-parsley"}' });
+  const second = env.data[1]; if (!second) throw new Error("Missing second PR");
+  second.pr.repository.nameWithOwner = "other/editor";
+  await env.rpc("poll_now", null);
+  const items = (await env.view()).rows.map(({ id, activity }) => ({ id, activity }));
+  expect(await env.rpc("address_targets", { items })).toMatchObject({ projectId: null, reason: "mixed" });
+  await expect(env.rpc("address", { items })).rejects.toThrow("Choose one project");
+  env.harness.inspection.sdk.stub("projects.get", async () => ({ id: "project-test", sources: [] }));
+  await expect(env.rpc("address", { items, projectId: "project-test" })).rejects.toThrow("default project checkout");
+  expect((await env.view()).rows.every((row) => row.dispatch.kind === "none")).toBe(true);
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+});
+
+it("allows a manual project without a default and offers a choice if a mapped project was deleted", async () => {
+  const env = await setup({ project: undefined, organizationProjects: '{"example":"project-deleted"}' });
+  const selection = await firstSelection(env);
+  expect(await env.rpc("address_targets", { items: [selection] })).toMatchObject({ projectId: null, reason: "choose" });
+  await env.rpc("address", { items: [selection], projectId: "project-parsley" });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({ projectId: "project-parsley" });
 });

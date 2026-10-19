@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
+import { AddressProjectDialog } from "./address-project-dialog.js";
 import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
 import type { rpcContract } from "./server.js";
@@ -44,8 +44,8 @@ function ScopeCheckbox({ items, selected, label, disabled, onPick }: {
     onChange={() => onPick(items, !full)} className={CHECKBOX} />;
 }
 
-function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, onAddress, onDismiss, onClear, onHold }: {
-  row: Row; kind: SectionKind; now: number; pending: boolean; canAddress: boolean; selected: boolean;
+function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onDismiss, onClear, onHold }: {
+  row: Row; kind: SectionKind; now: number; pending: boolean; selected: boolean;
   onPick: (shift: boolean) => void; onAddress: () => void; onDismiss: () => void; onClear: () => void; onHold: (until: string | null) => void;
 }) {
   const navigate = useBbNavigate();
@@ -74,7 +74,7 @@ function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, on
             {threadId !== null ? <button type="button" onClick={() => navigate.toThread(threadId)}
               title={`Open its feedback thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, GRAY, "hover:underline", RING)}>Open<span aria-hidden>↗</span></button> :
               row.dispatch.kind === "starting" ? <span className={cn(CHIP, GRAY)}><Spin />Starting…</span> :
-                kind === "turn" && row.dispatch.kind === "none" ? <button type="button" disabled={pending || !canAddress}
+                kind === "turn" && row.dispatch.kind === "none" ? <button type="button" disabled={pending}
                   aria-label={`Address comments on ${row.repo}#${row.number}`} title="Start a thread to address these comments" onClick={onAddress}
                   className={cn(BUTTON, "h-5 border-border px-1.5 text-[11px] hover:bg-foreground/[0.06]")}>Address</button> : null}
             {clearable ? <button type="button" disabled={pending} onClick={onClear} className={cn(GHOST, "h-5 px-1 text-[11px]")}>Clear attempt</button> : null}
@@ -121,6 +121,7 @@ export function InboxPage() {
   const anchor = useRef<string | null>(null);
   const [selected, setSelected] = useState<Map<string, string>>(new Map());
   const [pending, setPending] = useState(false);
+  const [addressItems, setAddressItems] = useState<Row[] | null>(null);
   const [polling, setPolling] = useState(false);
   const rows = view?.rows ?? [];
   const yours = rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil);
@@ -145,10 +146,15 @@ export function InboxPage() {
     catch (cause) { report(cause); refresh(); }
     finally { setPending(false); }
   };
-  const address = (items: Row[]) => act(async () => {
-    const result = await rpc.call("address", { items: items.map(({ id, activity }) => ({ id, activity })) });
-    setSelected(new Map()); navigate.toThread(result.threadId);
-  });
+  const address = (items: Row[]) => setAddressItems(items);
+  const startAddress = async (items: Row[], projectId: string) => {
+    setPending(true); setError(null);
+    try {
+      const result = await rpc.call("address", { items: items.map(({ id, activity }) => ({ id, activity })), projectId });
+      setSelected(new Map()); setAddressItems(null); refresh(); navigate.toThread(result.threadId);
+    } catch (cause) { refresh(); throw cause; }
+    finally { setPending(false); }
+  };
   const pickScope = (items: readonly Row[], select: boolean) => setSelected((current) => {
     const next = new Map(current);
     for (const row of items) { if (select) next.set(row.id, row.activity); else next.delete(row.id); }
@@ -170,7 +176,7 @@ export function InboxPage() {
   };
   const shortcuts = useRef({ run: () => {}, clear: () => {}, count: 0, enabled: false });
   shortcuts.current = { run: () => { void address(chosen); }, clear: () => setSelected(new Map()), count: chosen.length,
-    enabled: !pending && Boolean(view?.project) && chosen.length <= 20 };
+    enabled: !pending && chosen.length <= 20 };
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const root = rootRef.current;
@@ -188,23 +194,19 @@ export function InboxPage() {
 
   const renderGroups = (items: Row[], kind: SectionKind) => <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6 pb-1.5 pt-2">
     {groupByOrganization(items).map((organization) => <section key={organization.label} aria-label={`${organization.label} ${kind === "turn" ? "your turn" : kind}`} className="min-w-0">
-      <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-1 text-[12px] font-semibold">
-        <ScopeCheckbox items={kind === "turn" ? organization.items.filter((row) => row.dispatch.kind === "none") : []}
-          selected={selected} label={`Select organization ${organization.label}`} disabled={pending} onPick={pickScope} />
+      <h3 className="ml-[19px] flex min-w-0 items-center gap-2 pb-1 text-[12px] font-semibold">
         <span className="min-w-0 truncate">{organization.label}</span>
         <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
       </h3>
       <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
         {organization.areas.map((area) => <section key={area.key} aria-label={area.label} className="min-w-0">
           <h4 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
-            <ScopeCheckbox items={kind === "turn" ? area.items.filter((row) => row.dispatch.kind === "none") : []}
-              selected={selected} label={`Select ${organization.label} / ${area.label}`} disabled={pending} onPick={pickScope} />
             <span className="min-w-0 truncate">{area.label}{area.repos.join(", ") === area.label ? null : <span className="font-normal text-muted-foreground/70"> · {area.repos.join(", ")}</span>}</span>
             <span className="font-normal tabular-nums">{area.items.length}</span>
           </h4>
           <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
             {area.items.map((row) => <FeedbackRow key={row.id} row={row} kind={kind} now={now} pending={pending}
-              canAddress={Boolean(view?.project)} selected={kind === "turn" && selected.get(row.id) === row.activity}
+              selected={kind === "turn" && selected.get(row.id) === row.activity}
               onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
               onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
               onHold={(until) => { void act(() => rpc.call("hold", { id: row.id, activity: row.activity, until })); }}
@@ -228,7 +230,6 @@ export function InboxPage() {
     <div className="@container min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <main className={cn(COLUMN, "px-2 pb-10 pt-3 @min-[720px]:px-4")}>
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
-        {view && !view.project ? <p className="px-2 pb-3 text-[12px] text-muted-foreground">Choose a project in My PRs settings to enable Address comments.</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
           <section aria-label="Your turn">
             <div className="flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 bg-background py-1 pl-2 pr-1">
@@ -257,7 +258,7 @@ export function InboxPage() {
     {chosen.length > 0 ? <div aria-label="Selection" className="shrink-0 border-t border-border bg-background">
       <div className={cn(COLUMN, "flex flex-wrap items-center gap-1.5 px-4 py-1.5 text-[12px]")}>
         <b className="mr-1 font-semibold">{chosen.length} selected</b>
-        <button type="button" disabled={pending || !view?.project || chosen.length > 20} aria-busy={pending || undefined}
+        <button type="button" disabled={pending || chosen.length > 20} aria-busy={pending || undefined}
           aria-label={`Address ${chosen.length} selected`} title="Start one thread to address the selected PRs" onClick={() => { void address(chosen); }}
           className={cn(BUTTON, "border-foreground bg-foreground font-medium text-background")}>
           {pending ? <><Spin />Starting…</> : <>Address {chosen.length}<Kbd inverted>b</Kbd></>}
@@ -267,13 +268,9 @@ export function InboxPage() {
         <button type="button" onClick={() => setSelected(new Map())} className={GHOST}>Clear<Kbd>esc</Kbd></button>
       </div>
     </div> : null}
+    {addressItems === null ? null : <AddressProjectDialog items={addressItems} onClose={() => setAddressItems(null)}
+      onStart={(projectId) => startAddress(addressItems, projectId)} />}
   </div>;
-}
-
-function useInboxBadge(): ExperimentalBadge | null {
-  const { view } = useInbox();
-  const count = view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0;
-  return count > 0 ? { count, tone: "warning", label: `${count} pull request${count === 1 ? "" : "s"} waiting for your response` } : null;
 }
 
 function InboxCount() {
@@ -282,5 +279,5 @@ function InboxCount() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_useBadge: useInboxBadge, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_sidebarAccessory: InboxCount, headerContent: InboxCount });
 });

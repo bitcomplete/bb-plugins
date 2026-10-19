@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, expect, it } from "vitest";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { rpcContract } from "./server.js";
 import { feedbackOf } from "./feedback.js";
@@ -8,7 +8,15 @@ import { fixture } from "./fixtures.js";
 import type { View } from "./types.js";
 
 const cleanups: (() => void)[] = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+beforeEach(() => { vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} })); });
+afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); vi.unstubAllGlobals(); });
+const targets = () => ({ projects: [{ id: "project-test", name: "Default" }, { id: "project-parsley", name: "Parsley" }], projectId: "project-test", reason: "default" });
+async function confirmAddress() {
+  const dialog = within(await screen.findByRole("dialog"));
+  await dialog.findByLabelText("Project");
+  await waitFor(() => expect(dialog.getByRole("button", { name: "Address feedback" })).toHaveProperty("disabled", false));
+  fireEvent.click(dialog.getByRole("button", { name: "Address feedback" }));
+}
 it("selects feedback and starts one explicit batch, then navigates to its thread", async () => {
   const app = await loadPluginApp(() => import("./app.js"));
   const panel = app.navPanels[0]; if (!panel) throw new Error("Missing inbox page");
@@ -17,6 +25,7 @@ it("selects feedback and starts one explicit batch, then navigates to its thread
     project: "project-test", poll: { at: "2026-10-19T12:00:00Z", lastSuccess: "2026-10-19T12:00:00Z", login: "me", error: null } };
   const slot = renderSlot(panel, { subPath: "" }, { rpc: {
     inbox_get: () => view,
+    address_targets: targets,
     address: () => ({ threadId: "thread-address" }),
   } });
   cleanups.push(() => slot.lifecycle.unmount());
@@ -24,6 +33,7 @@ it("selects feedback and starts one explicit batch, then navigates to its thread
   expect(slot.inspection.rpcCalls.filter((call) => call.method === "address")).toEqual([]);
   fireEvent.click(slot.getByRole("checkbox", { name: "Select all actionable PRs" }));
   fireEvent.click(await slot.findByRole("button", { name: "Address 2 selected" }));
+  await confirmAddress();
   await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-address" }));
   const calls = slot.inspection.rpcCalls.filter((call) => call.method === "address");
   expect(calls).toHaveLength(1);
@@ -37,6 +47,7 @@ async function renderFeedback(rows: View["rows"]) {
   if (!panel) throw new Error("Missing feedback page");
   const slot = renderSlot(panel, { subPath: "" }, { rpc: {
     inbox_get: () => ({ rows, project: "project-test", poll: null }),
+    address_targets: targets,
     address: () => ({ threadId: "thread-address" }), dismiss: () => ({ ok: true }), clear_dispatch: () => ({ ok: true }),
   } });
   cleanups.push(() => slot.lifecycle.unmount());
@@ -55,11 +66,13 @@ it("groups related feedback across repositories and selects only actionable rows
     { ...row(4), title: "fix(catalog): already started", dispatch: { kind: "linked", threadId: "thread-existing" }, threadStatus: "running" },
   ]);
   expect(slot.queryByLabelText("Selection")).toBeNull();
-  fireEvent.click(slot.getByRole("checkbox", { name: "Select parsleyhealth / catalog" }));
+  fireEvent.click(slot.getByLabelText("Select parsleyhealth/store#1"));
+  fireEvent.click(slot.getByLabelText("Select parsleyhealth/api#2"), { shiftKey: true });
   expect(slot.getByText("2 selected")).toBeTruthy();
   expect(slot.getByRole("checkbox", { name: "Select all actionable PRs" })).toHaveProperty("indeterminate", true);
   expect(slot.queryByRole("checkbox", { name: "Select example/editor#4" })).toBeNull();
   fireEvent.click(slot.getByRole("button", { name: "Address 2 selected" }));
+  await confirmAddress();
   await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-address" }));
   const call = JSON.stringify(slot.inspection.rpcCalls.find((call) => call.method === "address"));
   expect(call).toContain('"id":"PR_1"'); expect(call).toContain('"id":"PR_2"'); expect(call).not.toContain('"id":"PR_4"');
@@ -77,6 +90,7 @@ it("supports shift selection, Escape to clear, and b to address without acting w
   fireEvent.keyDown(input, { key: "b" });
   expect(slot.inspection.rpcCalls.filter((call) => call.method === "address")).toHaveLength(0);
   input.remove(); fireEvent.keyDown(window, { key: "b" });
+  await confirmAddress();
   await waitFor(() => expect(slot.inspection.rpcCalls.filter((call) => call.method === "address")).toHaveLength(1));
   expect(JSON.stringify(slot.inspection.rpcCalls.find((call) => call.method === "address"))).toContain('"id":"PR_2"');
 });
@@ -99,29 +113,21 @@ it("keeps thread, clear-attempt, dismissal, and restore actions available in com
 
 it("registers a sidebar badge that counts actionable feedback and follows realtime updates", async () => {
   const app = await loadPluginApp(() => import("./app.js"));
-  const useBadge = app.navPanels[0]?.experimental_useBadge;
-  if (!useBadge) throw new Error("Missing My PRs sidebar badge");
+  const badge = app.navPanels[0]?.experimental_sidebarAccessory;
+  if (!badge) throw new Error("Missing My PRs sidebar badge");
   let view: View = { project: "project-test", poll: null, rows: [
     row(1), { ...row(2), dismissed: true }, { ...row(3), turn: null }, { ...row(4), holdUntil: "2099-01-01T12:00:00Z" },
   ] };
-  function BadgeProbe() { return <output aria-label="Navigation badge">{JSON.stringify(useBadge?.())}</output>; }
-  const slot = renderSlot({ component: BadgeProbe }, {}, { rpc: { inbox_get: () => view } });
+  const slot = renderSlot({ component: badge }, {}, { rpc: { inbox_get: () => view } });
   cleanups.push(() => slot.lifecycle.unmount());
-  await waitFor(() => expect(JSON.parse(slot.getByLabelText("Navigation badge").textContent ?? "null")).toEqual({
-    count: 1, tone: "warning", label: "1 pull request waiting for your response",
-  }));
+  await slot.findByText("1");
   view = { ...view, rows: [row(1), row(2), { ...row(3), turn: null }] };
   await slot.behavior.emitRealtime("inbox-changed", {});
-  await waitFor(() => expect(JSON.parse(slot.getByLabelText("Navigation badge").textContent ?? "null")).toEqual({
-    count: 2, tone: "warning", label: "2 pull requests waiting for your response",
-  }));
-  view = { ...view, rows: [] };
-  await slot.behavior.emitRealtime("inbox-changed", {});
-  await waitFor(() => expect(slot.getByLabelText("Navigation badge").textContent).toBe("null"));
+  await slot.findByText("2");
   expect(slot.inspection.rpcCalls.every((call) => call.method === "inbox_get")).toBe(true);
 });
 
-it("keeps the same area in different organizations separate and selects one organization", async () => {
+it("keeps the same area in different organizations separate with only row and select-all checkboxes", async () => {
   const slot = await renderFeedback([
     { ...row(1), title: "fix(catalog): parsley", repo: "parsleyhealth/store" },
     { ...row(2), title: "fix(catalog): bit", repo: "bitcomplete/store" },
@@ -129,10 +135,14 @@ it("keeps the same area in different organizations separate and selects one orga
   const parsley = within(slot.getByRole("region", { name: "parsleyhealth your turn" }));
   expect(parsley.getByText("fix(catalog): parsley")).toBeTruthy();
   expect(parsley.queryByText("fix(catalog): bit")).toBeNull();
-  fireEvent.click(slot.getByLabelText("Select organization parsleyhealth"));
+  expect(slot.getAllByRole("checkbox")).toHaveLength(3);
+  expect(parsley.getAllByRole("checkbox")).toHaveLength(1);
+  expect(parsley.queryByLabelText("Select organization parsleyhealth")).toBeNull();
+  fireEvent.click(slot.getByLabelText("Select parsleyhealth/store#1"));
   expect(slot.getByLabelText("Select parsleyhealth/store#1")).toHaveProperty("checked", true);
   expect(slot.getByLabelText("Select bitcomplete/store#2")).toHaveProperty("checked", false);
   fireEvent.click(slot.getByRole("button", { name: "Address 1 selected" }));
+  await confirmAddress();
   await waitFor(() => expect(slot.inspection.rpcCalls.find((call) => call.method === "address")).toMatchObject({
     input: { items: [{ id: "PR_1", activity: row(1).activity }] },
   }));
@@ -161,4 +171,56 @@ it("moves a selected PR to the faded hold section, excludes it from selection, a
   expect(slot.inspection.rpcCalls.filter((call) => call.method === "hold")).toMatchObject([
     { input: { id: "PR_1", until: expect.any(String) } }, { input: { id: "PR_1", until: null } },
   ]);
+});
+
+it("preselects the mapped project and lets a batch choose another project", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing inbox");
+  const slot = renderSlot(panel, { subPath: "" }, { rpc: {
+    inbox_get: () => ({ rows: [row(1), row(2)], project: "project-test", poll: null }),
+    address_targets: () => ({ ...targets(), projectId: "project-parsley", reason: "organization" }),
+    address: () => ({ threadId: "thread-picked" }),
+  } });
+  cleanups.push(() => slot.lifecycle.unmount());
+  fireEvent.click(await slot.findByLabelText("Select all actionable PRs"));
+  fireEvent.click(slot.getByRole("button", { name: "Address 2 selected" }));
+  const dialog = within(await screen.findByRole("dialog"));
+  const project = await dialog.findByLabelText("Project");
+  expect(project).toHaveProperty("value", "project-parsley");
+  expect(slot.inspection.rpcCalls.some((call) => call.method === "address")).toBe(false);
+  fireEvent.change(project, { target: { value: "project-test" } });
+  fireEvent.click(dialog.getByRole("button", { name: "Address feedback" }));
+  await waitFor(() => expect(slot.inspection.rpcCalls.find((call) => call.method === "address")).toMatchObject({
+    input: { projectId: "project-test", items: expect.arrayContaining([{ id: "PR_1", activity: row(1).activity }, { id: "PR_2", activity: row(2).activity }]) },
+  }));
+  await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-picked" }));
+});
+
+it("requires a choice for mixed projects, preserves selection on failure, and cancels without work", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing inbox");
+  const slot = renderSlot(panel, { subPath: "" }, { rpc: {
+    inbox_get: () => ({ rows: [row(1), row(2)], project: null, poll: null }),
+    address_targets: () => ({ ...targets(), projectId: null, reason: "mixed" }),
+    address: () => { throw new Error("Selected machine is offline"); },
+  } });
+  cleanups.push(() => slot.lifecycle.unmount());
+  fireEvent.click(await slot.findByLabelText("Select all actionable PRs"));
+  fireEvent.click(slot.getByRole("button", { name: "Address 2 selected" }));
+  const dialog = within(await screen.findByRole("dialog"));
+  const project = await dialog.findByLabelText("Project");
+  const start = dialog.getByRole("button", { name: "Address feedback" });
+  expect(start).toHaveProperty("disabled", true);
+  fireEvent.change(project, { target: { value: "project-parsley" } });
+  fireEvent.click(start);
+  expect(await dialog.findByRole("alert")).toHaveProperty("textContent", "Selected machine is offline");
+  expect(slot.getByText("2 selected")).toBeTruthy();
+  fireEvent.click(dialog.getByRole("button", { name: "Cancel" }));
+  const item = slot.getByLabelText("Select example/editor#1").closest("li"); if (!item) throw new Error("Missing row");
+  fireEvent.click(within(item).getByRole("button", { name: "Address comments on example/editor#1" }));
+  const single = within(await screen.findByRole("dialog", { name: "Address feedback" }));
+  await single.findByLabelText("Project");
+  fireEvent.click(single.getByRole("button", { name: "Cancel" }));
+  expect(slot.inspection.rpcCalls.filter((call) => call.method === "address")).toHaveLength(1);
+  expect(slot.inspection.navigateCalls).toHaveLength(0);
 });

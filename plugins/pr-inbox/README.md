@@ -24,15 +24,17 @@ The page groups PRs alphabetically by GitHub organization, then by area, using t
 branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
-The header and navigation badge show the number of PRs on Your turn. The
-navigation badge clears when nothing needs your response. This requires a BB
-server with Plugin SDK 0.6.53 or newer; reinstalling only the desktop app does
-not update a remote server.
+The header shows the number of PRs on Your turn. The same count is registered
+for sidebar badges; it appears there when the BB server supports sidebar
+accessories.
 
 Choose one PR's **Address**, or select several rows and choose **Address N**.
-Group checkboxes select an organization or area; Shift-click selects a range. Press **b** to
-address the selection or **Esc** to clear it. Address starts one thread in the
-configured project's default environment. The thread finds checkouts, fixes code,
+Checkboxes select individual PRs, with one select-all control at the top.
+Organization and area headings are labels and counts. Shift-click selects a range. Press **b** to
+address the selection or **Esc** to clear it. Address opens a project picker, then starts one thread on the chosen project's
+default checkout and machine. Organization mappings preselect the project; the
+configured default is a fallback. Override it for an individual PR or batch.
+A batch spanning different mapped projects requires a choice. The thread finds checkouts, fixes code,
 runs checks, pushes the changes, and replies to review comments. It includes bot comments
 in that work. The prompt forbids merging, approving, closing PRs, and automatic
 thread resolution. The plugin itself only reads GitHub.
@@ -76,7 +78,8 @@ an error. Address refreshes and checks the selected activity before dispatch.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `project` | Unset | Project for Address threads. Required to dispatch. |
+| `project` | Unset | Fallback project for Address threads. The picker can override it. |
+| `organizationProjects` | `{}` | JSON mapping of GitHub organization names to BB project IDs; names ignore case. |
 | `githubToken` | Unset | Secret GitHub token. Empty uses the server's `gh`. |
 | `repoAllowlist` | Empty | Comma-separated `owner/repo` names. Empty includes every repository. |
 | `pollMinutes` | 5 | Refresh interval, clamped to 1–60 minutes. |
@@ -84,7 +87,7 @@ an error. Address refreshes and checks the selected activity before dispatch.
 | `model` | Unset | Optional model for Address threads. |
 
 Token and repository changes clear the old snapshot. Changes apply to the next
-refresh. Reload after setting the initial project to clear the configuration notice.
+refresh. The project picker works even when no default project is configured.
 
 ## CLI
 

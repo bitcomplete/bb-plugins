@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { parseOrganizationProjects, projectChoiceSchema, suggestedProject } from "./projects.js";
 import { createGithubClient, githubTransport, type Transport } from "./github.js";
 import { pollSchema, pullRequestSchema, savedStateSchema, selectionSchema, viewSchema,
   type PullRequest, type Row, type SavedState, type Selection } from "./types.js";
@@ -10,7 +11,9 @@ export const rpcContract = defineRpcContract({
   poll_now: { input: z.null(), output: pollSchema },
   dismiss: { input: selectionSchema.extend({ dismissed: z.boolean() }), output: z.object({ ok: z.literal(true) }) },
   hold: { input: selectionSchema.extend({ until: z.string().datetime().nullable() }), output: z.object({ ok: z.literal(true) }) },
-  address: { input: z.object({ items: z.array(selectionSchema).min(1).max(20) }), output: z.object({ threadId: z.string() }) },
+  address_targets: { input: z.object({ items: z.array(selectionSchema).min(1).max(20) }),
+    output: projectChoiceSchema.extend({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }) },
+  address: { input: z.object({ items: z.array(selectionSchema).min(1).max(20), projectId: z.string().min(1).optional() }), output: z.object({ threadId: z.string() }) },
   clear_dispatch: { input: z.object({ id: z.string() }), output: z.object({ ok: z.literal(true) }) },
 });
 
@@ -33,7 +36,14 @@ export function addressPrompt(prs: PullRequest[]): string {
 export function createPlugin(options: { transport?: Transport } = {}) {
   return async function plugin(bb: BbPluginApi) {
     const settings = bb.settings.define({
-      project: { type: "project", label: "BB project", description: "Address threads start in this project's default environment." },
+      project: { type: "project", label: "Default BB project", description: "Fallback for organizations without a project mapping. You can choose a different project when addressing feedback." },
+      organizationProjects: {
+        type: "string", label: "Organization projects", default: "{}", experimental_multiline: true,
+        description: 'GitHub organization to BB project ID, as JSON. Organization names ignore case.',
+        experimental_schema: z.string().refine((value) => {
+          try { parseOrganizationProjects(value); return true; } catch { return false; }
+        }, "Use a JSON object mapping GitHub organizations to BB project IDs."),
+      },
       githubToken: { type: "string", label: "GitHub token", secret: true, description: "Optional. Leave empty to use the BB server's authenticated gh." },
       repoAllowlist: { type: "string", label: "Repositories", default: "", description: "Comma-separated owner/repo names. Empty includes all your repositories." },
       pollMinutes: { type: "number", label: "Poll interval (minutes)", default: 5 },
@@ -74,7 +84,6 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       current = next;
       bb.realtime.publish("inbox-changed", {});
     });
-    if (!current.project) bb.status.needsConfiguration("Choose the BB project in My PRs settings to enable Address comments.");
 
     const readPoll = async () => {
       const stored = await bb.storage.kv.get<unknown>("poll");
@@ -133,11 +142,20 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       return pr;
     }
     const addressing = new Set<string>();
-    async function address(items: Selection[]) {
+    async function address(items: Selection[], override?: string) {
       if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error("Select each PR once.");
       const configuration = current;
-      const projectId = configuration.project;
-      if (!projectId) throw new Error("Choose a BB project in My PRs settings first.");
+      const choice = suggestedProject(items.map(checked), parseOrganizationProjects(configuration.organizationProjects), configuration.project);
+      const projectId = override ?? choice.projectId;
+      if (projectId === null) throw new Error(choice.reason === "mixed"
+        ? "These PRs map to different projects. Choose one project for this batch."
+        : "Choose a BB project before addressing feedback.");
+      const project = await bb.sdk.projects.get({ projectId });
+      const source = project.sources.find((source) => source.isDefault) ?? (project.sources.length === 1 ? project.sources[0] : undefined);
+      if (source === undefined) throw new Error("Choose a default project checkout in BB before addressing feedback.");
+      const environment: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"] = {
+        type: "host", hostId: source.hostId, workspace: { type: "unmanaged", path: source.path },
+      };
       const fresh = await poll();
       if (fresh.error) throw new Error(`Could not verify the current feedback: ${fresh.error}`);
       if (current !== configuration) throw new Error("Settings changed. Try again.");
@@ -154,7 +172,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       }
       try {
         const thread = await bb.sdk.threads.spawn({
-          projectId, environment: { type: "project-default" }, prompt: addressPrompt(selected),
+          projectId, environment, prompt: addressPrompt(selected),
           title: selected.length === 1 ? `Address ${selected[0]?.repo}#${selected[0]?.number}` : `Address feedback on ${selected.length} PRs`,
           pluginMetadata: { prs: selected.map((pr) => pr.url) },
           ...(configuration.provider ? { providerId: configuration.provider } : {}),
@@ -182,7 +200,16 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         saveState(id, { ...readState(id), holdUntil: until });
         return { ok: true as const };
       },
-      address: ({ items }: { items: Selection[] }) => address(items),
+      address_targets: async ({ items }: { items: Selection[] }) => {
+        const selected = items.map(checked);
+        const projects = (await bb.sdk.projects.list())
+          .filter((project) => project.sources.some((source) => source.isDefault) || project.sources.length === 1)
+          .map(({ id, name }) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+        const choice = suggestedProject(selected, parseOrganizationProjects(current.organizationProjects), current.project);
+        return choice.projectId !== null && !projects.some((project) => project.id === choice.projectId)
+          ? { projects, projectId: null, reason: "choose" as const } : { projects, ...choice };
+      },
+      address: ({ items, projectId }: { items: Selection[]; projectId?: string }) => address(items, projectId),
       clear_dispatch: async ({ id }: { id: string }) => {
         const state = readState(id);
         if (addressing.has(id) || state.dispatch.kind === "starting") throw new Error("The thread is still starting.");
