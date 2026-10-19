@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, anyWorkerInFlight, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
+import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -196,6 +196,28 @@ describe("waits nobody hears", () => {
   });
 });
 
+describe("approval words", () => {
+  it("tells approval, refusal and ambiguity apart", () => {
+    for (const text of ["LGTM", "Approved", "approved, it is fully specified", "ship it", "go ahead", "Looks good", "yes", "signed off"]) expect(classifyApproval(text), text).toBe("approve");
+    // Approving words with a bare "no" beside them still approve.
+    for (const text of ["LGTM, no concerns from me", "Ship it, no further changes needed", "Approved, no notes"]) expect(classifyApproval(text), text).toBe("approve");
+    for (const text of ["no", "No.", "not approved", "don't ship it", "declined", "reject", "changes needed", "don't", "do not approve", "No, not yet", "won't approve until the migration is named", "can't approve without SSO", "cannot approve this spec yet", "shouldn't approve until naming is fixed", "never approve this as-is"]) expect(classifyApproval(text), text).toBe("decline");
+    // A word ending in "nt" is not a contraction: wanting to approve approves.
+    expect(classifyApproval("I want to approve")).toBe("approve");
+    for (const text of ["", "maybe", "name the migration in the spec", "what about SSO?"]) expect(classifyApproval(text), text).toBe("ambiguous");
+  });
+
+  it("flags a report that asks for an approval already open, and only that", () => {
+    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "me" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+    const open = [{ kind: "approval" } as never];
+    expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), open)).toMatch(/already open/u);
+    // Waiting on the request, or on the project steward, is not asking again.
+    expect(asksForOpenApproval(status("Spec posted.", "Wait for the project steward's approval"), open)).toBeNull();
+    expect(asksForOpenApproval(status("Approval requested from the user; waiting.", "Wait for the user to approve the spec"), open)).toBeNull();
+    expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), [])).toBeNull();
+  });
+});
+
 describe("the ready gate", () => {
   const ready = (over: object) => readyStateSchema.parse(over);
   const allMet = tickets.ready!.checklist.map((item) => ({ item, met: true }));
@@ -255,6 +277,22 @@ describe("the ready gate", () => {
     // Others' comments are not spec; the steward's signature on its own edit does not change the hash.
     expect(specHash(issue({ comments: [comment({ body: "Spec: mine" })] }), "thr_s")).toBe(hash);
     expect(specHash(issue({ description: "Users cannot log in.\n\n_— from bb thread thr_s_" }), "thr_s")).toBe(hash);
+  });
+
+  it("counts a spec comment the user wrote, and tells it apart from the steward's", () => {
+    const base = specHash(issue(), "thr_s");
+    const user = (tid: string) => tid === "thr_user";
+    const amended = issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_user", createdAt: "2026-10-14T16:00:00Z" })] });
+    // Without the predicate the signing thread is unknown, so it is not spec.
+    expect(specHash(amended, "thr_s")).toBe(base);
+    expect(specHash(amended, "thr_s", user)).not.toBe(base);
+  });
+
+  it("marks a spec comment the user wrote as the user's, and wakes for it", () => {
+    const before = { entity: issue(), pulls: [] };
+    const after = { entity: issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_user" })] }), pulls: [] };
+    const changes = diffObserved(before, after, { ...ctx, userThread: (tid) => tid === "thr_user" });
+    expect(changes).toContainEqual({ text: "Spec comment added by the user", actionable: true, byUser: true });
   });
 });
 
