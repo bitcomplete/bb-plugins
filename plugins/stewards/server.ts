@@ -1545,28 +1545,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * lookup that fails for any reason but not-found is treated as live:
      * claiming a live worker is gone would tell the steward to spawn a
      * duplicate, while a tell to a really-gone thread just fails.
+     *
+     * An archived worker is surfaced even though BB-17's `thread.archived`
+     * handler has already flipped its record from `finished` to `stopped`:
+     * archiving is exactly the case that needs reviving, and reviving restores
+     * the record to `finished` so the question stays visible until answered.
+     * A worker stopped on purpose, with its thread still there, is not.
      */
     async function collectWorkerQuestions(b: Binding): Promise<WorkerQuestion[]> {
       const out: WorkerQuestion[] = [];
       for (const w of store.workers(b.id)) {
-        if (w.status !== "finished") continue;
+        if (w.status === "running" || w.status === "failed") continue;
         const question = workerQuestion(w.result);
         if (question === null) continue;
         let info: ThreadInfo | null;
         try {
           info = await threadInfo(w.threadId);
         } catch (error) {
+          if (w.status !== "finished") continue;
           bb.log.warn(`stewards: could not read worker thread ${w.threadId}; treating it as live: ${errorMessage(error)}`);
           out.push({ threadId: w.threadId, question, state: "live" });
           continue;
         }
-        if (info === null || info.deletedAt !== null) {
-          out.push({ threadId: w.threadId, question, state: "gone" });
+        const gone = info === null || info.deletedAt !== null;
+        const archived = info !== null && info.deletedAt === null && info.archivedAt !== null;
+        // A worker stopped on purpose, with its thread still there, is done.
+        if (w.status === "stopped" && !archived && !gone) continue;
+        if (archived) {
+          await quietly(`unarchive worker ${w.threadId}`, () => bb.sdk.threads.unarchive({ threadId: w.threadId }));
+          store.setWorker(w.threadId, "finished", w.result);
+          out.push({ threadId: w.threadId, question, state: "revived" });
           continue;
         }
-        if (info.archivedAt !== null) {
-          await quietly(`unarchive worker ${w.threadId}`, () => bb.sdk.threads.unarchive({ threadId: w.threadId }));
-          out.push({ threadId: w.threadId, question, state: "revived" });
+        if (gone) {
+          out.push({ threadId: w.threadId, question, state: "gone" });
           continue;
         }
         out.push({ threadId: w.threadId, question, state: "live" });

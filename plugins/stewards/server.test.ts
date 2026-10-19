@@ -1393,12 +1393,18 @@ describe("stewards waiting on others", () => {
     await t.created("thr_w1", steward);
     await t.idle("thr_w1", "Done. Should I open the follow-up ticket?");
 
-    // Something archived the worker since it asked; the wake brings it back so
-    // the steward's `bb thread tell` can reach it.
+    // Something archived the worker since it asked (a user tidying the
+    // sidebar, or the cascade from a manually archived steward): bb flips its
+    // record to stopped through the thread.archived event. The wake must still
+    // bring it back so the steward's `bb thread tell` can reach it.
     t.threads.get("thr_w1")!.archivedAt = 1;
+    await t.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
     await t.ring("linear", "uuid-12");
     expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
     const revived = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(revived).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
     expect(revived).toMatch(/had been archived and is back now/u);
