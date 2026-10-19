@@ -73,7 +73,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       current = next;
       bb.realtime.publish("inbox-changed", {});
     });
-    if (!current.project) bb.status.needsConfiguration("Choose the BB project in PR Inbox settings to enable Address comments.");
+    if (!current.project) bb.status.needsConfiguration("Choose the BB project in PR Feedback settings to enable Address comments.");
 
     const readPoll = async () => {
       const stored = await bb.storage.kv.get<unknown>("poll");
@@ -135,7 +135,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error("Select each PR once.");
       const configuration = current;
       const projectId = configuration.project;
-      if (!projectId) throw new Error("Choose a BB project in PR Inbox settings first.");
+      if (!projectId) throw new Error("Choose a BB project in PR Feedback settings first.");
       const fresh = await poll();
       if (fresh.error) throw new Error(`Could not verify the current feedback: ${fresh.error}`);
       if (current !== configuration) throw new Error("Settings changed. Try again.");
@@ -190,7 +190,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     bb.rpc.register(rpcContract, handlers);
     bb.cli.register({
       name: "pr-inbox", summary: "Read and address human feedback on your pull requests",
-      commands: ["list", "poll", "status", "dismiss", "restore", "address", "clear"].map((name) => ({ name, summary: `${name} PR Inbox`, usage: `bb pr-inbox ${name} [PR-id...] [--json]` })),
+      commands: ["list", "poll", "status", "dismiss", "restore", "address", "clear"].map((name) => ({ name, summary: `${name} PR Feedback`, usage: `bb pr-inbox ${name} [PR-id...] [--json]` })),
       async run(argv) {
         const [command, ...ids] = argv.filter((arg) => arg !== "--json");
         try {
@@ -211,7 +211,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
             } else throw new Error("Unknown command. Use list, poll, status, dismiss, restore, address, or clear.");
           } else throw new Error("Supply one PR id, or a list of PR ids for address.");
           const stdout = JSON.stringify(result, null, argv.includes("--json") ? undefined : 2);
-          if (Buffer.byteLength(stdout) > 200_000) throw new Error("Inbox exceeds CLI output limit. Read it in the PR Inbox page.");
+          if (Buffer.byteLength(stdout) > 200_000) throw new Error("Inbox exceeds CLI output limit. Read it in the PR Feedback page.");
           return { exitCode: command === "poll" && (await readPoll())?.error ? 1 : 0, stdout };
         } catch (cause) { return { exitCode: 1, stderr: cause instanceof Error ? cause.message : String(cause) }; }
       },

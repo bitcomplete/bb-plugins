@@ -78,7 +78,7 @@ export function InboxPage() {
       </div>
       <p className="mt-3 text-xs text-muted-foreground">{view?.poll?.lastSuccess ? `@${view.poll.login} · Last refreshed ${new Date(view.poll.lastSuccess).toLocaleString()}` : "Waiting for the first GitHub refresh…"}</p>
       {error || view?.poll?.error ? <p role="alert" className="mt-3 rounded-md border border-destructive p-3 text-sm text-destructive">{error ?? view?.poll?.error}</p> : null}
-      {view && !view.project ? <p className="mt-3 text-sm text-muted-foreground">Choose a project in PR Inbox settings to enable Address comments.</p> : null}
+      {view && !view.project ? <p className="mt-3 text-sm text-muted-foreground">Choose a project in PR Feedback settings to enable Address comments.</p> : null}
       {view === null ? <p role="status" className="mt-6 text-sm text-muted-foreground">Loading pull requests…</p> : <>
         {chosen.length > 0 ? <div className="mt-5 flex items-center gap-3"><Button disabled={pending || !view.project || chosen.length > 20} onClick={() => void address(chosen)}>Address {chosen.length} selected</Button><span className="text-xs text-muted-foreground">One thread · up to 20 PRs</span></div> : null}
         {section("Your turn", yours, "turn")}
@@ -96,5 +96,5 @@ function InboxCount() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "PR Inbox", icon: "Inbox", path: "inbox", component: InboxPage, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "PR Feedback", icon: "Inbox", path: "inbox", component: InboxPage, headerContent: InboxCount });
 });

@@ -7,7 +7,7 @@
     "bbPluginSdk": ">=0.6.37"
   },
   "bb": {
-    "name": "PR Inbox",
+    "name": "PR Feedback",
     "description": "Your pull requests waiting on a reply: see human feedback, dismiss it, or start a thread to address it.",
     "branding": {
       "icon": "Inbox"

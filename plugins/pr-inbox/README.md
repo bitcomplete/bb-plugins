@@ -1,8 +1,8 @@
-# PR Inbox
+# PR Feedback
 
-PR Inbox shows human feedback waiting on your authored pull requests. It is a
+PR Feedback shows human feedback waiting on your authored pull requests. It is a
 standalone sibling of Review Watch, whose Reviews page shows requests for your
-review of other people's PRs. PR Inbox does not require Workstreams.
+review of other people's PRs. PR Feedback does not require Workstreams.
 
 ## Install and configure
 
@@ -15,7 +15,7 @@ bb plugin reload pr-inbox
 bb pr-inbox poll --json
 ```
 
-Open **PR Inbox** in the sidebar. The first successful refresh shows your open
+Open **PR Feedback** in the sidebar. The first successful refresh shows your open
 PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
@@ -48,9 +48,9 @@ a change request, but comments and approval notes require a reply. A bot's
 reply does not answer a human's thread. A later standing approval covers that
 reviewer's earlier comments.
 
-PR Inbox keeps no effort assignments, holds, grouping, merge gates, or model
+PR Feedback keeps no effort assignments, holds, grouping, merge gates, or model
 enrichment. Workstreams' existing Your turn view continues to work independently.
-Workstreams' local **Confirm handled** records do not transfer to PR Inbox.
+Workstreams' local **Confirm handled** records do not transfer to PR Feedback.
 
 GitHub search, reviews, conversation comments, review requests, review threads,
 and comments inside threads all paginate. The search limit is 1,000 open authored
