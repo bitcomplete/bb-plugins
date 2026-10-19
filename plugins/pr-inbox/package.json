@@ -4,7 +4,7 @@
   "type": "module",
   "engines": {
     "bb": ">=0.46",
-    "bbPluginSdk": ">=0.6.53"
+    "bbPluginSdk": ">=0.6.37"
   },
   "bb": {
     "name": "My PRs",
@@ -20,7 +20,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.6.54",
+    "@get-bb/plugin-sdk": "0.6.37",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

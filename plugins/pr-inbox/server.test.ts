@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makeThreadResponse, experimental_scanPublicSdkOnly } from "@get-bb/plugin-sdk/testing";
 import { createPlugin } from "./server.js";
+import { GithubRateLimitError, type Transport } from "./github.js";
 import { viewSchema } from "./types.js";
 import { comment, fixture, transportFor } from "./fixtures.js";
 
@@ -24,12 +25,13 @@ async function setup(settings: Record<string, unknown> = {}) {
     { id: "project-parsley", name: "Parsley", sources: [{ isDefault: true }] },
   ]);
   const base = transportFor(() => data);
-  const factory = createPlugin({ transport: (query, variables, signal) => { if (fail) throw new Error("GitHub unavailable"); return base(query, variables, signal); } });
+  const reads: { query: string; id?: string }[] = [];
+  const factory = createPlugin({ transport: (query, variables, signal) => { reads.push({ query, id: variables.id }); if (fail) throw new Error("GitHub unavailable"); return base(query, variables, signal); } });
   await factory(host.bb);
   const rpc = host.harness.behavior.callRpc;
   const view = async () => viewSchema.parse(await rpc("inbox_get", null));
   await rpc("poll_now", null);
-  return { ...host, data, rpc, view, factory, fail: () => { fail = true; } };
+  return { ...host, data, rpc, view, factory, reads, fail: () => { fail = true; } };
 }
 const firstSelection = async (env: Awaited<ReturnType<typeof setup>>) => {
   const row = (await env.view()).rows[0]; if (!row) throw new Error("Expected a PR"); return { id: row.id, activity: row.activity };
@@ -183,4 +185,41 @@ it("allows a manual project without a default and offers a choice if a mapped pr
   expect(await env.rpc("address_targets", { items: [selection] })).toMatchObject({ projectId: null, reason: "choose" });
   await env.rpc("address", { items: [selection], projectId: "project-parsley" });
   expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({ projectId: "project-parsley" });
+});
+
+
+it("Address verifies only selected PRs and leaves unrelated cached rows intact", async () => {
+  const env = await setup(); const item = await firstSelection(env);
+  const unrelated = (await env.view()).rows.find((row) => row.id !== item.id);
+  env.reads.length = 0;
+  await env.rpc("address", { items: [item] });
+  expect(env.reads.some((read) => read.query.includes("search("))).toBe(false);
+  expect(env.reads.filter((read) => read.id && read.id !== item.id)).toEqual([]);
+  expect((await env.view()).rows.find((row) => row.id === unrelated?.id)).toEqual(unrelated);
+});
+
+
+it("keeps the snapshot and suspends GitHub reads until reset, including after reload", async () => {
+  const env = await setup(); const before = await env.view(); const item = await firstSelection(env);
+  const reset = Date.now() + 3_600_000;
+  const reads = vi.fn<Transport>(async () => { throw new GithubRateLimitError(new Date(reset).toISOString()); });
+  const factory = createPlugin({ transport: reads });
+  const next = await env.harness.lifecycle.reload(factory);
+  cleanup.push(() => next.harness.lifecycle.dispose());
+  const poll = await next.harness.behavior.callRpc("poll_now", null);
+  expect(poll).toMatchObject({ error: expect.stringContaining("Try again after"), retryAt: expect.any(String) });
+  expect(viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null)).rows).toEqual(before.rows);
+  await next.harness.behavior.callRpc("poll_now", null);
+  next.harness.inspection.sdk.stub("projects.get", async () => ({ sources: [{ hostId: "devbox-host", path: "/project-checkout", isDefault: true }] }));
+  await expect(next.harness.behavior.callRpc("address", { items: [item] })).rejects.toThrow("Try again after");
+  expect(reads).toHaveBeenCalledTimes(1);
+  const reloaded = await next.harness.lifecycle.reload(factory);
+  cleanup.push(() => reloaded.harness.lifecycle.dispose());
+  await reloaded.harness.behavior.callRpc("poll_now", null);
+  expect(reads).toHaveBeenCalledTimes(1);
+  reads.mockImplementation(transportFor(() => env.data));
+  const clock = vi.spyOn(Date, "now").mockReturnValue(reset + 1);
+  try { expect(await reloaded.harness.behavior.callRpc("poll_now", null)).toMatchObject({ error: null, retryAt: null }); }
+  finally { clock.mockRestore(); }
+  expect(reads.mock.calls.length).toBeGreaterThan(1);
 });

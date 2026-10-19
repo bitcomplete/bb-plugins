@@ -2,7 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { parseOrganizationProjects, projectChoiceSchema, suggestedProject } from "./projects.js";
-import { createGithubClient, githubTransport, type Transport } from "./github.js";
+import { createGithubClient, githubTransport, GithubRateLimitError, type Transport } from "./github.js";
 import { pollSchema, pullRequestSchema, savedStateSchema, selectionSchema, viewSchema,
   type PullRequest, type Row, type SavedState, type Selection } from "./types.js";
 
@@ -89,6 +89,21 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       const stored = await bb.storage.kv.get<unknown>("poll");
       return stored ? pollSchema.parse(stored) : null;
     };
+    let retryAt = await bb.storage.kv.get<string>("github-retry-at");
+    function githubClient() {
+      const transport = options.transport ?? githubTransport(current.githubToken);
+      return createGithubClient(async (query, variables, signal) => {
+        if (retryAt && Date.parse(retryAt) > Date.now()) throw new GithubRateLimitError(retryAt);
+        try { return await transport(query, variables, signal); }
+        catch (cause) {
+          if (cause instanceof GithubRateLimitError) {
+            retryAt = cause.retryAt;
+            await bb.storage.kv.set("github-retry-at", retryAt);
+          }
+          throw cause;
+        }
+      });
+    }
     let polling: Promise<z.infer<typeof pollSchema>> | null = null;
     async function poll(signal = lifecycle.signal) {
       if (polling) return polling;
@@ -97,7 +112,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         const previous = await readPoll();
         let result: z.infer<typeof pollSchema>;
         try {
-          const client = createGithubClient(options.transport ?? githubTransport(current.githubToken));
+          const client = githubClient();
           const inbox = await client.fetchInbox(current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean), AbortSignal.any([signal, lifecycle.signal]));
           if (revision !== startedRevision) throw new Error("GitHub settings changed during refresh. Refresh again.");
           db.transaction(() => {
@@ -106,13 +121,13 @@ export function createPlugin(options: { transport?: Transport } = {}) {
             for (const pr of inbox.prs) insert.run(pr.id, JSON.stringify(pr));
           })();
           const at = new Date().toISOString();
-          result = { at, login: inbox.login, error: null, lastSuccess: at };
+          result = { at, login: inbox.login, error: null, lastSuccess: at, retryAt: null };
         } catch (cause) {
           if (lifecycle.signal.aborted || signal.aborted) throw cause;
           const error = cause instanceof Error ? cause.message : String(cause);
           bb.log.warn(JSON.stringify({ message: "GitHub refresh failed", error }));
           result = { at: new Date().toISOString(), login: previous?.login ?? null,
-            lastSuccess: previous?.lastSuccess ?? null, error };
+            lastSuccess: previous?.lastSuccess ?? null, error, retryAt: cause instanceof GithubRateLimitError ? cause.retryAt : null };
         }
         await bb.storage.kv.set("poll", result);
         bb.realtime.publish("inbox-changed", {});
@@ -156,9 +171,23 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       const environment: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"] = {
         type: "host", hostId: source.hostId, workspace: { type: "unmanaged", path: source.path },
       };
-      const fresh = await poll();
-      if (fresh.error) throw new Error(`Could not verify the current feedback: ${fresh.error}`);
+      const client = githubClient();
+      const allowed = configuration.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean);
+      const refreshed: (PullRequest | null)[] = [];
+      try {
+        for (const item of items) refreshed.push(await client.fetchPullRequest(item.id, allowed, lifecycle.signal));
+      } catch (cause) {
+        throw new Error(`Could not verify the current feedback: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
       if (current !== configuration) throw new Error("Settings changed. Try again.");
+      db.transaction(() => {
+        for (const [index, item] of items.entries()) {
+          const pr = refreshed[index];
+          if (pr) db.prepare("INSERT OR REPLACE INTO inbox_prs (id, body) VALUES (?, ?)").run(pr.id, JSON.stringify(pr));
+          else db.prepare("DELETE FROM inbox_prs WHERE id = ?").run(item.id);
+        }
+      })();
+      bb.realtime.publish("inbox-changed", {});
       const selected = items.map((item) => {
         const pr = checked(item), state = readState(pr.id);
         if (!pr.turn || state.dismissedActivity === pr.activity) throw new Error(`${pr.repo}#${pr.number} no longer waits on you.`);

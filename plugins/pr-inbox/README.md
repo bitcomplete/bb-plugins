@@ -24,10 +24,9 @@ The page groups PRs alphabetically by GitHub organization, then by area, using t
 branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
-The header and navigation badge show the number of PRs on Your turn. The
-navigation badge clears when nothing needs your response. This requires a BB
-server with Plugin SDK 0.6.53 or newer; reinstalling only the desktop app does
-not update a remote server.
+The header shows the number of PRs on Your turn. The same count is registered
+for sidebar badges; it appears there when the BB server supports sidebar
+accessories.
 
 Choose one PR's **Address**, or select several rows and choose **Address N**.
 Checkboxes select individual PRs, with one select-all control at the top.
@@ -73,7 +72,11 @@ Workstreams' local **Confirm handled** records do not transfer to My PRs.
 GitHub search, reviews, conversation comments, review requests, review threads,
 and comments inside threads all paginate. The search limit is 1,000 open authored
 PRs. An incomplete or failed read keeps the last successful inbox and displays
-an error. Address refreshes and checks the selected activity before dispatch.
+an error. Address reads only the selected PRs and checks their current heads and
+feedback before dispatch. Each PR’s initial feedback connections share one
+request; further pages load only when needed. If GitHub rate limits a request,
+the plugin keeps the inbox and pauses API reads until the reported reset time,
+including across plugin reloads.
 
 ## Settings
 

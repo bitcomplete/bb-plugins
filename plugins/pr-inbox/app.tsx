@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { AddressProjectDialog } from "./address-project-dialog.js";
-import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
 import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
 import type { rpcContract } from "./server.js";
@@ -274,17 +273,11 @@ export function InboxPage() {
   </div>;
 }
 
-function useInboxBadge(): ExperimentalBadge | null {
-  const { view } = useInbox();
-  const count = view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0;
-  return count > 0 ? { count, tone: "warning", label: `${count} pull request${count === 1 ? "" : "s"} waiting for your response` } : null;
-}
-
 function InboxCount() {
   const { view } = useInbox();
   return <span className={cn("inline-flex min-w-4 justify-center rounded px-1 py-1 text-[10px] font-medium leading-none", AMBER)}>{view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0}</span>;
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_useBadge: useInboxBadge, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_sidebarAccessory: InboxCount, headerContent: InboxCount });
 });

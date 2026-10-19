@@ -30,6 +30,7 @@ export type Row = z.infer<typeof rowSchema>;
 export const pollSchema = z.object({
   at: z.string(), login: z.string().nullable(), error: z.string().nullable(),
   lastSuccess: z.string().nullable(),
+  retryAt: z.string().datetime().nullable().default(null),
 });
 export const viewSchema = z.object({ rows: z.array(rowSchema), poll: pollSchema.nullable(), project: z.string().nullable() });
 export type View = z.infer<typeof viewSchema>;
