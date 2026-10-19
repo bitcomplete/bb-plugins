@@ -8,7 +8,7 @@
 import { createHash } from "node:crypto";
 import { isTerminal, phaseOf, type Playbook } from "./config.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, ReadyState } from "./store.js";
+import type { Binding, Escalation, Observed, ReadyState, Worker } from "./store.js";
 
 /**
  * One line of "what changed", and whether it alone makes a judgment turn due.
@@ -16,6 +16,53 @@ import type { Binding, Escalation, Observed, ReadyState } from "./store.js";
  * news to nobody above it.
  */
 export type Change = { text: string; actionable: boolean; own?: boolean; byUser?: boolean };
+
+/**
+ * A worker is in flight from its spawn until it is stopped, failed or
+ * archived. Its turn ending is a pause, not a finish: a worker waits on its
+ * reviewer, is woken again, and pushes again. Own-pull-request activity is
+ * the worker's while any worker of the binding is in flight (criterion 1).
+ */
+export const workerInFlight = (w: Pick<Worker, "status">): boolean => w.status === "running" || w.status === "finished";
+export const anyWorkerInFlight = (workers: readonly Pick<Worker, "status">[]): boolean => workers.some(workerInFlight);
+
+/** A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the first line of a comment. */
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string };
+
+const REVIEW_MARKER = /^<!--\s*bb-review\s+round=(\d+)\s+sha=(\S+)\s+verdict=(\S+)\s+lane=(\S+)\s*-->/u;
+
+/** The reviewer's marker on a comment, or null for any other comment. */
+export function reviewMarker(body: string): ReviewMarker | null {
+  const first = body.split("\n", 1)[0]!.trim();
+  const m = REVIEW_MARKER.exec(first);
+  return m === null ? null : { round: Number(m[1]), sha: m[2]!, verdict: m[3]!, lane: m[4]! };
+}
+
+/** The newest reviewer marker in a comment list, by comment time. */
+function latestMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
+  let at = "";
+  let latest: ReviewMarker | null = null;
+  for (const c of comments) {
+    const m = reviewMarker(c.body);
+    if (m !== null && c.createdAt >= at) {
+      at = c.createdAt;
+      latest = m;
+    }
+  }
+  return latest;
+}
+
+/**
+ * A change in the lane a reviewer's rounds are in: the one thing about a
+ * `bb-review` marker the steward hears while a worker is in flight.
+ */
+export function markerLaneChange(before: readonly SnapshotComment[], after: readonly SnapshotComment[]): { from: string; to: string } | null {
+  const b = latestMarker(before);
+  const a = latestMarker(after);
+  if (b === null || a === null || b.lane === a.lane) return null;
+  return { from: b.lane, to: a.lane };
+}
+
 
 /**
  * A spec comment is a signed comment that starts by saying so. The steward's
@@ -68,13 +115,15 @@ const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.des
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
 /**
- * Whose pull request events are the steward's own work in progress. While one
- * of its workers is running, the worker pushes, edits the description, posts
- * as the viewer (every thread acts as the developer, signed or not) and waits
- * for checks; none of that is news to the steward, which hears from the
- * worker when it finishes. People and terminal states still wake it.
+ * Whose pull request events are the steward's own work in progress. While any
+ * worker of the binding is in flight (criterion 1: from its spawn until it
+ * finishes, not only while its turn runs), the worker pushes, edits the
+ * description, posts as the viewer (every thread acts as the developer,
+ * signed or not) and waits for checks; none of that is news to the steward,
+ * which hears from the worker when it finishes. People and terminal states
+ * still wake it.
  */
-type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerRunning: boolean; userThread?: (threadId: string) => boolean };
+type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerInFlight: boolean; userThread?: (threadId: string) => boolean };
 
 /**
  * The changes between two observations of one entity, each marked whether it
@@ -95,7 +144,7 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
     // rewriting a description it signed earlier usually keeps the line.
     const signer = descriptionSignedBy(after);
     const own = signer !== null && ctx.own.has(signer) && descriptionSignedBy(before) !== signer;
-    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerRunning && after.pull !== null), ...(own ? { own } : {}) });
+    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerInFlight && after.pull !== null), ...(own ? { own } : {}) });
   }
 
   // A spec comment the steward just posted is its own doing; it only matters
@@ -140,7 +189,7 @@ function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContex
   const bChecks = b.checks?.state ?? null;
   const aChecks = a.checks?.state ?? null;
   if (aChecks !== null && SETTLED.has(aChecks) && (bChecks !== aChecks || !same(b.checks?.failing ?? [], a.checks?.failing ?? []))) {
-    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerRunning });
+    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerInFlight });
   }
   const seen = new Set(b.reviews.map((r) => `${r.author}|${r.submittedAt}|${r.state}`));
   for (const r of a.reviews) {
@@ -161,10 +210,11 @@ export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comm
 
 /**
  * Every change between two observations: the entity, then each linked pull
- * request. `workerRunning` quiets the steward's own work on pull requests
- * (see DiffContext).
+ * request. `workerInFlight` quiets the steward's own work on pull requests
+ * (see DiffContext), including the reviewer's `bb-review` markers, except a
+ * change of lane (criterion 3).
  */
-export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerRunning: boolean; userThread?: (threadId: string) => boolean }): Change[] {
+export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerInFlight: boolean; userThread?: (threadId: string) => boolean }): Change[] {
   const viewer = after.entity.viewer;
   const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer });
   const beforePulls = new Map(before.pulls.map((p) => [p.key.toLowerCase(), p]));
@@ -177,13 +227,21 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
   // Comments are compared with what the steward was last shown, not with the
   // last ring, so a comment that arrived while the binding was held is still
   // news at the next turn.
+  const beforeByKey = new Map<string, EntitySnapshot>([[before.entity.key.toLowerCase(), before.entity], ...before.pulls.map((p) => [p.key.toLowerCase(), p] as const)]);
   for (const e of [after.entity, ...after.pulls]) {
+    const prefix = e === after.entity ? "" : `${e.key}: `;
     const fresh = newHumanComments(e, ctx.cursor, ctx.own);
-    // On a pull request a running worker owns, the viewer's comments are the
-    // worker's and its reviewers': they post as the developer, often unsigned.
-    const ownWork = ctx.workerRunning && e.pull !== null;
-    const people = ownWork ? fresh.filter((c) => lc(c.author) !== lc(e.viewer)) : fresh;
-    if (fresh.length > 0) changes.push({ text: commentNews(e === after.entity ? "" : `${e.key}: `, fresh), actionable: people.length > 0 });
+    // On a pull request a worker owns, the viewer's comments are the worker's
+    // and its reviewers': they post as the developer, often unsigned. The
+    // reviewer's markers are the worker's business too, whoever posts them;
+    // a round that changes the lane is not.
+    const ownWork = ctx.workerInFlight && e.pull !== null;
+    const people = ownWork ? fresh.filter((c) => reviewMarker(c.body) === null && lc(c.author) !== lc(e.viewer)) : fresh;
+    if (fresh.length > 0) changes.push({ text: commentNews(prefix, fresh), actionable: people.length > 0 });
+    if (ownWork) {
+      const lane = markerLaneChange(beforeByKey.get(e.key.toLowerCase())?.comments ?? [], e.comments);
+      if (lane !== null) changes.push({ text: `${prefix}Review lane: ${lane.from} → ${lane.to}`, actionable: true });
+    }
   }
   return changes;
 }
@@ -233,6 +291,18 @@ export function asksForOpenApproval(status: Binding["status"], open: readonly Es
   if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(next)) return null;
   if (!/\b(?:user|you|your)\b/iu.test(next)) return null;
   return "asks for an approval that is already open";
+}
+
+/**
+ * Whether to compact a steward's context: it already holds more than the
+ * limit, or the wake about to be sent would push it over (criterion 4).
+ * Tokens are estimated from the wake's characters; the provider's reading is
+ * exact. A non-positive limit leaves compaction to the provider.
+ */
+export const CHARS_PER_TOKEN = 4;
+export function compactDue(usedTokens: number | null, limit: number, incomingChars = 0): boolean {
+  if (!(limit > 0) || usedTokens === null) return false;
+  return usedTokens > limit || usedTokens + Math.ceil(incomingChars / CHARS_PER_TOKEN) > limit;
 }
 
 // ---- the ready gate ------------------------------------------------------------------

@@ -615,6 +615,74 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
   });
 
+  // BB-17: BB-11's steward was woken 22 times in four hours because a worker
+  // that had ended its turn to wait read as not running, so its reviewer's
+  // comments, its checks and its own pushes all woke the steward.
+  it("covers the BB-11 sequence: a worker's own PR activity is quiet until it finishes", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const toSteward = () => t.sends.filter((s) => s.threadId === steward);
+    const before = toSteward().length;
+
+    // The worker spawns, opens the PR and goes idle waiting on its reviewer:
+    // the steward is woken once, with the worker's message.
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
+    expect(toSteward()).toHaveLength(before + 1);
+    expect(toSteward().at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+    expect(toSteward().at(-1)!.text).toMatch(/Opened acme\/web#7; waiting on the reviewer\./u);
+    const woken = toSteward().length;
+
+    // The reviewer posts its marker as the developer (unsigned), checks
+    // finish, and the worker pushes: all the worker's, none of it wakes.
+    const marker = "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->";
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(toSteward()).toHaveLength(woken);
+  });
+
+  it("wakes for a reviewer round that changes the lane while a worker is in flight", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    const marker = (round: number, lane: string) => comment({ id: `r${round}`, author: "jane", body: `<!-- bb-review round=${round} sha=abc${round} verdict=approved lane=${lane} -->`, createdAt: `2026-10-14T1${round}:00:00Z` });
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [marker(1, "no-review")] }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const woken = t.sends.filter((s) => s.threadId === steward).length;
+
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [marker(1, "no-review"), marker(2, "owner-reviewed")] }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(woken + 1);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Review lane: no-review → owner-reviewed/u);
+  });
+
+  it("stops suppressing a worker's PR activity once it is stopped", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting.");
+    // Stopped (or archived): no longer in flight, so its work is news again.
+    t.hooks.store.setWorker("thr_w1", "stopped", null);
+    const woken = t.sends.filter((s) => s.threadId === steward).length;
+
+    t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "w1", author: "jane", body: "Round 3: pushed.", createdAt: "2026-10-14T17:00:00Z" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(woken + 1);
+  });
+
   it("leases only the linked pull requests still open, and one not read yet", async () => {
     const t = await setup();
     const link = (n: number) => ({ key: `acme/web#${n}`, url: `https://github.com/acme/web/pull/${n}` });
@@ -679,6 +747,20 @@ describe("a Linear ticket steward", () => {
     t.usage.set(project!, 200_000);
     await t.idle(project!);
     expect(compacted()).toEqual([steward, project]);
+  });
+
+  it("compacts before a wake that would push the context over the limit", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const compacted = () => t.harness.sdk.callsTo("threads.compact").map(([args]) => (args as { threadId: string }).threadId);
+
+    // At the limit: not yet over, but the next wake would push it over.
+    t.usage.set(steward, 120_000);
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(compacted()).toEqual([steward]);
   });
 
   it("stops a looping steward's workers past the runaway guard", async () => {
@@ -890,7 +972,7 @@ describe("terminal states and follow-through", () => {
     await t.report();
     await t.idle(t.steward);
     expect((await t.list())[0]).toMatchObject({ ended: true });
-    expect(t.stops()).toEqual(["thr_w2"]);
+    expect(t.stops()).toEqual(["thr_w1", "thr_w2"]);
     expect(t.archives()).toEqual([t.steward]);
   });
 

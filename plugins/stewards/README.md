@@ -23,12 +23,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   the last observation, and the steward is woken only for an actionable
   change: a phase change, a human comment, a review, checks finishing,
   someone else's push, a worker finishing, guidance, an approval, a spec
-  change, or its requeue time. While one of its workers is running, the
-  worker's own work on a pull request — checks finishing, description
-  edits, pushes and comments from your account, which every thread posts
-  as — is not a reason to wake. Everything not actionable is kept as a
-  quiet note and shown in "What changed" at the next turn something else
-  makes due.
+  change, or its requeue time. While any worker of the binding is in flight
+  — from its spawn until it is stopped, failed or archived, across the idle
+  between its turns — the worker's own work on a pull request (checks
+  finishing, description edits, pushes and comments from your account, which
+  every thread posts as, and the reviewer's `bb-review` markers) is not a
+  reason to wake; a reviewer round that changes the lane is. Everything not
+  actionable is kept as a quiet note and shown in "What changed" at the next
+  turn something else makes due.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
   woken turn ends with `steward_report`, the status record. A wake past
@@ -36,7 +38,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   a wake carries what the steward needs, its transcript can go: after a
   steward's or the project steward's turn, the plugin compacts its context
   once it holds more than **Compact a steward above this many context
-  tokens** (120,000 by default; 0 leaves it to the provider).
+  tokens** (120,000 by default; 0 leaves it to the provider), and before a
+  wake that would push it over.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a

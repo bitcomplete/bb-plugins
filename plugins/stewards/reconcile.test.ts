@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, asksForOpenApproval, classifyApproval, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue, unheardWait } from "./reconcile.js";
+import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -16,7 +16,7 @@ const reviews = (() => {
   return p.value;
 })();
 
-const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerRunning: false };
+const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerInFlight: false };
 const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
 
 describe("what changed", () => {
@@ -63,7 +63,7 @@ describe("what changed", () => {
   it("while a worker runs, its own work on a pull request is not news, and people still are", () => {
     // HUB-183 on bithub: the worker pushes, edits the description, posts as
     // the viewer (unsigned, and its reviewer too) and waits for checks.
-    const running = { ...ctx, workerRunning: true };
+    const running = { ...ctx, workerInFlight: true };
     const before = { entity: issue(), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
     const busy = {
       entity: issue(),
@@ -104,6 +104,74 @@ describe("what changed", () => {
     const before = { entity: issue(), pulls: [pull()] };
     const after = { entity: issue(), pulls: [pull({ state: "merged" })] };
     expect(actionable(diffObserved(before, after, ctx))).toEqual(["acme/web#7: State: open → merged"]);
+  });
+});
+
+describe("a worker in flight between its turns (BB-11)", () => {
+  const worker = (status: "running" | "finished" | "failed" | "stopped") => ({ status });
+
+  it("counts a worker in flight from spawn until it is stopped, failed or archived", () => {
+    expect(workerInFlight(worker("running"))).toBe(true);
+    // Its turn ending is a pause, not a finish: it is woken again to push.
+    expect(workerInFlight(worker("finished"))).toBe(true);
+    expect(workerInFlight(worker("failed"))).toBe(false);
+    expect(workerInFlight(worker("stopped"))).toBe(false);
+    expect(anyWorkerInFlight([worker("stopped"), worker("finished")])).toBe(true);
+    expect(anyWorkerInFlight([worker("stopped"), worker("failed")])).toBe(false);
+    expect(anyWorkerInFlight([])).toBe(false);
+  });
+
+  it("keeps the reviewer's marker comments for the worker, and wakes on a lane change", () => {
+    const marker = (round: number, lane: string) => comment({ id: `m${round}`, author: "jane", body: `<!-- bb-review round=${round} sha=abc${round} verdict=approved lane=${lane} -->\n\nLGTM.`, createdAt: `2026-10-02T0${round}:00:00Z` });
+    expect(reviewMarker(marker(1, "no-review").body)).toEqual({ round: 1, sha: "abc1", verdict: "approved", lane: "no-review" });
+    expect(reviewMarker("just a comment")).toBeNull();
+    // A marker is a marker only on the first line.
+    expect(reviewMarker("Hello\n<!-- bb-review round=1 sha=abc verdict=approved lane=no-review -->")).toBeNull();
+
+    const before = { entity: pull({ author: "jane" }), pulls: [] };
+    const after = { entity: pull({ author: "jane", comments: [marker(1, "no-review")] }), pulls: [] };
+    // In flight, the round is the worker's business.
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // A round that changes the lane is not.
+    const changed = { entity: pull({ author: "jane", comments: [marker(1, "no-review"), marker(2, "owner-reviewed")] }), pulls: [] };
+    expect(actionable(diffObserved(after, changed, { ...ctx, workerInFlight: true }))).toEqual(["Review lane: no-review → owner-reviewed"]);
+    expect(markerLaneChange(after.entity.comments, changed.entity.comments)).toEqual({ from: "no-review", to: "owner-reviewed" });
+    // Once no worker is in flight, the same markers are ordinary comment news.
+    expect(actionable(diffObserved(before, after, ctx))).toEqual(["1 new comment from jane"]);
+  });
+
+  it("covers the BB-11 sequence: a worker's own PR activity stays quiet until it finishes", () => {
+    // Worker spawns, goes idle waiting (still in flight), the reviewer posts,
+    // checks finish, the worker pushes; only the finish is actionable.
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    const before = { entity: issue({ state: "In Progress", stateType: "started", ...linked }), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
+    // Its turn ended to wait, so its status is `finished`; it is still in flight.
+    expect(anyWorkerInFlight([worker("finished")])).toBe(true);
+    const reviewed = {
+      entity: issue({ state: "In Progress", stateType: "started", ...linked }),
+      pulls: [pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->", createdAt: "2026-10-02T00:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } })],
+    };
+    expect(actionable(diffObserved(before, reviewed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // The worker pushes (woken again), still in flight.
+    const pushed = { entity: reviewed.entity, pulls: [pull({ author: "jane", comments: reviewed.pulls[0]!.comments }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } })] };
+    expect(actionable(diffObserved(reviewed, pushed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // Nothing was actionable while it was in flight, so the steward is woken
+    // once, at the finish, with all of it as quiet notes.
+    const changes = diffObserved(before, pushed, { ...ctx, workerInFlight: anyWorkerInFlight([worker("stopped")]) });
+    expect(actionable(changes)).toEqual(["acme/web#7: Checks finished: success", "acme/web#7: 1 new comment from jane"]);
+    expect(changes.map((c) => c.text)).toContain("acme/web#7: Pushed bbbbbbb by jane");
+  });
+
+  it("compacts when the transcript is over the limit or the wake would push it over", () => {
+    expect(compactDue(null, 120_000, 0)).toBe(false);
+    expect(compactDue(90_000, 120_000, 0)).toBe(false);
+    expect(compactDue(121_000, 120_000, 0)).toBe(true);
+    // A 115k-token steward and a 30k-character wake (the wake cap) overshoot.
+    expect(compactDue(115_000, 120_000, 30_000)).toBe(true);
+    expect(compactDue(90_000, 120_000, 30_000)).toBe(false);
+    expect(compactDue(90_000, 120_000, 1_000)).toBe(false);
+    // 0 leaves compaction to the provider.
+    expect(compactDue(1_000_000, 0, 1_000_000)).toBe(false);
   });
 });
 
