@@ -18,10 +18,12 @@ export const dispatchSchema = z.discriminatedUnion("kind", [
 ]);
 export const savedStateSchema = z.object({
   dismissedActivity: z.string().nullable(), dispatch: dispatchSchema,
+  holdUntil: z.string().datetime().nullable().default(null),
 });
 export type SavedState = z.infer<typeof savedStateSchema>;
 export const rowSchema = pullRequestSchema.extend({
   dismissed: z.boolean(), dispatch: dispatchSchema,
+  holdUntil: z.string().datetime().nullable().default(null),
   threadStatus: z.string().nullable(),
 });
 export type Row = z.infer<typeof rowSchema>;

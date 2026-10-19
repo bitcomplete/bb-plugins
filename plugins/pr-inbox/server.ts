@@ -9,6 +9,7 @@ export const rpcContract = defineRpcContract({
   inbox_get: { input: z.null(), output: viewSchema },
   poll_now: { input: z.null(), output: pollSchema },
   dismiss: { input: selectionSchema.extend({ dismissed: z.boolean() }), output: z.object({ ok: z.literal(true) }) },
+  hold: { input: selectionSchema.extend({ until: z.string().datetime().nullable() }), output: z.object({ ok: z.literal(true) }) },
   address: { input: z.object({ items: z.array(selectionSchema).min(1).max(20) }), output: z.object({ threadId: z.string() }) },
   clear_dispatch: { input: z.object({ id: z.string() }), output: z.object({ ok: z.literal(true) }) },
 });
@@ -50,7 +51,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       .map((row) => pullRequestSchema.parse(JSON.parse(bodySchema.parse(row).body)));
     const readState = (id: string): SavedState => {
       const row = db.prepare("SELECT body FROM inbox_state WHERE id = ?").get(id);
-      return row ? savedStateSchema.parse(JSON.parse(bodySchema.parse(row).body)) : { dismissedActivity: null, dispatch: { kind: "none" } };
+      return row ? savedStateSchema.parse(JSON.parse(bodySchema.parse(row).body)) : { dismissedActivity: null, dispatch: { kind: "none" }, holdUntil: null };
     };
     const saveState = (id: string, value: SavedState) => {
       db.prepare("INSERT OR REPLACE INTO inbox_state (id, body) VALUES (?, ?)").run(id, JSON.stringify(value));
@@ -119,7 +120,8 @@ export function createPlugin(options: { transport?: Transport } = {}) {
           try { threadStatus = (await bb.sdk.threads.get({ threadId: state.dispatch.threadId })).status; }
           catch { threadStatus = "unavailable"; }
         }
-        return { ...pr, dismissed: pr.turn !== null && state.dismissedActivity === pr.activity, dispatch: state.dispatch, threadStatus };
+        return { ...pr, dismissed: pr.turn !== null && state.dismissedActivity === pr.activity, dispatch: state.dispatch, threadStatus,
+          holdUntil: state.holdUntil && Date.parse(state.holdUntil) > Date.now() ? state.holdUntil : null };
       }));
       rows.sort((a, b) => (a.turn?.since ?? Infinity) - (b.turn?.since ?? Infinity) || a.repo.localeCompare(b.repo) || a.number - b.number);
       return { rows, poll: await readPoll(), project: current.project ?? null };
@@ -142,6 +144,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       const selected = items.map((item) => {
         const pr = checked(item), state = readState(pr.id);
         if (!pr.turn || state.dismissedActivity === pr.activity) throw new Error(`${pr.repo}#${pr.number} no longer waits on you.`);
+        if (state.holdUntil && Date.parse(state.holdUntil) > Date.now()) throw new Error(`${pr.repo}#${pr.number} is on hold. Resume it first.`);
         if (addressing.has(pr.id) || state.dispatch.kind !== "none") throw new Error("This PR already has a dispatch. Open its thread, or clear the previous attempt first.");
         return pr;
       });
@@ -171,6 +174,12 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       dismiss: async ({ id, activity, dismissed }: Selection & { dismissed: boolean }) => {
         checked({ id, activity });
         saveState(id, { ...readState(id), dismissedActivity: dismissed ? activity : null });
+        return { ok: true as const };
+      },
+      hold: async ({ id, activity, until }: Selection & { until: string | null }) => {
+        checked({ id, activity });
+        if (until !== null && Date.parse(until) <= Date.now()) throw new Error("Choose a hold time in the future.");
+        saveState(id, { ...readState(id), holdUntil: until });
         return { ok: true as const };
       },
       address: ({ items }: { items: Selection[] }) => address(items),

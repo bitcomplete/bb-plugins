@@ -7,7 +7,9 @@ description: Read the Your turn list in My PRs, refresh GitHub feedback, dismiss
 
 Use `bb pr-inbox list --json` for the current snapshot and
 `bb pr-inbox poll --json` for fresh GitHub state. `status` reports the last
-poll and its error. PR ids come from each row's `id` field.
+poll and its error. PR ids come from each row's `id` field. `holdUntil` is null for active rows or
+the ISO timestamp when a temporary hold ends. Held rows are excluded from
+Your turn counts and cannot be dispatched until resumed or expired.
 
 Your turn includes human feedback on the authenticated user's authored PRs.
 Bots alone never add a PR. A push answers changes requested, but comments and

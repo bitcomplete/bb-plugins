@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFakePluginHost, makeThreadResponse, experimental_scanPublicSdkOnly } from "@get-bb/plugin-sdk/testing";
 import { createPlugin } from "./server.js";
 import { viewSchema } from "./types.js";
@@ -94,5 +94,43 @@ describe("My PRs behavior", () => {
   it("uses only the public plugin SDK and package-local source", async () => {
     const scan = await experimental_scanPublicSdkOnly(import.meta.dirname, { allow: [/^react$/, /^@testing-library\/react$/, /^@radix-ui\/react-slot$/, /^class-variance-authority$/, /^clsx$/, /^tailwind-merge$/] });
     expect(scan.violations).toEqual([]); expect(scan.privateDependencies).toEqual([]);
+  });
+});
+
+it("persists holds through reload and new feedback, blocks dispatch, then expires automatically", async () => {
+  const env = await setup();
+  const selection = await firstSelection(env);
+  const until = new Date(Date.now() + 3_600_000).toISOString();
+  await env.rpc("hold", { ...selection, until });
+  await expect(env.rpc("address", { items: [selection] })).rejects.toThrow("on hold");
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  const next = await env.harness.lifecycle.reload(env.factory);
+  cleanup.push(() => next.harness.lifecycle.dispose());
+  env.data[0]?.comments.push(comment());
+  await next.harness.behavior.callRpc("poll_now", null);
+  const read = async () => viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null));
+  expect((await read()).rows.find((row) => row.id === selection.id)?.holdUntil).toBe(until);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse(until));
+  try { expect((await read()).rows.find((row) => row.id === selection.id)?.holdUntil).toBeNull(); }
+  finally { clock.mockRestore(); }
+});
+
+it("validates hold times and stale activity, and allows early resume", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  await expect(env.rpc("hold", { ...selection, until: "2000-01-01T00:00:00Z" })).rejects.toThrow("future");
+  await expect(env.rpc("hold", { ...selection, until: "not a date" })).rejects.toThrow();
+  await expect(env.rpc("hold", { ...selection, activity: "stale", until: null })).rejects.toThrow("changed");
+  await env.rpc("hold", { ...selection, until: "2099-01-01T00:00:00Z" });
+  await env.rpc("hold", { ...selection, until: null });
+  expect((await env.view()).rows.find((row) => row.id === selection.id)?.holdUntil).toBeNull();
+  expect(await env.rpc("address", { items: [selection] })).toEqual({ threadId: "thread-address" });
+});
+
+it("reads saved state from before holds were introduced without losing dismissal or dispatch", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  env.bb.storage.database().prepare("INSERT OR REPLACE INTO inbox_state (id, body) VALUES (?, ?)").run(selection.id,
+    JSON.stringify({ dismissedActivity: selection.activity, dispatch: { kind: "linked", threadId: "thread-address" } }));
+  expect((await env.view()).rows.find((row) => row.id === selection.id)).toMatchObject({
+    holdUntil: null, dismissed: true, dispatch: { kind: "linked", threadId: "thread-address" },
   });
 });

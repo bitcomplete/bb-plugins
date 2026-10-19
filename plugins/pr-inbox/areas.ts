@@ -24,3 +24,17 @@ export function groupByArea(items: readonly Row[]) {
     };
   }).sort((a, b) => b.items.length - a.items.length || b.latest - a.latest || a.key.localeCompare(b.key));
 }
+
+/** Keep title scopes within their GitHub owner, with owners in alphabetical order. */
+export function groupByOrganization(items: readonly Row[]) {
+  const groups = new Map<string, Row[]>();
+  for (const item of items) {
+    const organization = (item.repo.split("/")[0] || item.repo).toLowerCase();
+    const group = groups.get(organization) ?? [];
+    group.push(item);
+    groups.set(organization, group);
+  }
+  return [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([label, rows]) => ({
+    label, items: rows, areas: groupByArea(rows),
+  }));
+}

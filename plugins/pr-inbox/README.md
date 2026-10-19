@@ -20,22 +20,26 @@ PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
-The page uses the same compact, area-grouped layout as Reviews. Its
+The page groups PRs alphabetically by GitHub organization, then by area, using the same compact layout as Reviews. Its
 branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
-The header and navigation badge show the number of PRs on Your turn. The
-navigation badge clears when nothing needs your response. This requires a BB
-server with Plugin SDK 0.6.53 or newer; reinstalling only the desktop app does
-not update a remote server.
+The header shows the number of PRs on Your turn. The same count is registered
+for sidebar badges; it appears there when the BB server supports sidebar
+accessories.
 
 Choose one PR's **Address**, or select several rows and choose **Address N**.
-Group checkboxes select an area; Shift-click selects a range. Press **b** to
+Group checkboxes select an organization or area; Shift-click selects a range. Press **b** to
 address the selection or **Esc** to clear it. Address starts one thread in the
 configured project's default environment. The thread finds checkouts, fixes code,
 runs checks, pushes the changes, and replies to review comments. It includes bot comments
 in that work. The prompt forbids merging, approving, closing PRs, and automatic
 thread resolution. The plugin itself only reads GitHub.
+
+**Hold…** moves a PR to a faded **On hold** section at the bottom for 1 hour,
+until tomorrow at 9 AM in your browser’s timezone, or for 1 week. Held PRs stay
+out of Your turn counts and batch selection. Holds survive new feedback and
+restarts, expire automatically, and can be ended early with **Resume**.
 
 **Dismiss** hides feedback until a new commit or new human feedback changes
 that PR. Open the dismissed list and choose **Restore** to bring it back.
@@ -58,7 +62,7 @@ a change request, but comments and approval notes require a reply. A bot's
 reply does not answer a human's thread. A later standing approval covers that
 reviewer's earlier comments.
 
-My PRs keeps no effort assignments, holds, merge gates, or model
+My PRs keeps no effort assignments, merge gates, or model
 enrichment. Workstreams' existing Your turn view continues to work independently.
 Workstreams' local **Confirm handled** records do not transfer to My PRs.
 

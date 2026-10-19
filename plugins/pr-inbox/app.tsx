@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
-import { groupByArea } from "./areas.js";
+import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
 import type { rpcContract } from "./server.js";
 import type { Row, View } from "./types.js";
@@ -17,7 +16,7 @@ const GROUP_CARD = "min-w-0 rounded-[10px] border border-border/50 bg-foreground
 const CHECKBOX = "size-3.5 shrink-0 accent-sky-600 disabled:opacity-20";
 const EMPTY = "py-8 text-center text-[12px] text-muted-foreground";
 const POINTER_CURSORS = "[&_button:not(:disabled)]:cursor-pointer [&_summary]:cursor-pointer [&_a[href]]:cursor-pointer [&_input[type=checkbox]:not(:disabled)]:cursor-pointer";
-type SectionKind = "turn" | "dismissed" | "other";
+type SectionKind = "turn" | "dismissed" | "other" | "held";
 
 function age(at: number, now: number) {
   const seconds = Math.max(0, Math.floor((now - at) / 1_000));
@@ -44,13 +43,14 @@ function ScopeCheckbox({ items, selected, label, disabled, onPick }: {
     onChange={() => onPick(items, !full)} className={CHECKBOX} />;
 }
 
-function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, onAddress, onDismiss, onClear }: {
+function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, onAddress, onDismiss, onClear, onHold }: {
   row: Row; kind: SectionKind; now: number; pending: boolean; canAddress: boolean; selected: boolean;
-  onPick: (shift: boolean) => void; onAddress: () => void; onDismiss: () => void; onClear: () => void;
+  onPick: (shift: boolean) => void; onAddress: () => void; onDismiss: () => void; onClear: () => void; onHold: (until: string | null) => void;
 }) {
   const navigate = useBbNavigate();
   const threadId = row.dispatch.kind === "linked" ? row.dispatch.threadId : null;
   const clearable = row.dispatch.kind === "uncertain" || (row.dispatch.kind === "linked" && ["idle", "error"].includes(row.threadStatus ?? ""));
+  const holdLabel = row.holdUntil ? `On hold until ${new Date(row.holdUntil).toLocaleString()}` : null;
   const why = row.turn?.why ?? "Waiting on reviewers or checks";
   const updated = `${age(Date.parse(row.updatedAt), now)} ago`;
   return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
@@ -66,9 +66,9 @@ function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, on
       <div className="min-w-0 flex-1">
         <p className={cn("truncate", kind !== "turn" && "text-foreground/80")} title={row.title}>{row.title}</p>
         <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
-          <span className="min-w-0" title={`${why} · ${updated}`}>{why} · {updated}</span>
+          <span className="min-w-0" title={holdLabel ?? `${why} · ${updated}`}>{holdLabel ?? `${why} · ${updated}`}</span>
           <span className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
-            <span className={cn(CHIP, kind === "turn" ? AMBER : GRAY)}>{kind === "turn" ? "Your turn" : kind === "dismissed" ? "Dismissed" : "Waiting"}</span>
+            <span className={cn(CHIP, kind === "turn" ? AMBER : GRAY)}>{kind === "turn" ? "Your turn" : kind === "dismissed" ? "Dismissed" : kind === "held" ? "On hold" : "Waiting"}</span>
             {row.draft ? <span className={cn(CHIP, GRAY)}>Draft</span> : null}
             {threadId !== null ? <button type="button" onClick={() => navigate.toThread(threadId)}
               title={`Open its feedback thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, GRAY, "hover:underline", RING)}>Open<span aria-hidden>↗</span></button> :
@@ -77,7 +77,18 @@ function FeedbackRow({ row, kind, now, pending, canAddress, selected, onPick, on
                   aria-label={`Address comments on ${row.repo}#${row.number}`} title="Start a thread to address these comments" onClick={onAddress}
                   className={cn(BUTTON, "h-5 border-border px-1.5 text-[11px] hover:bg-foreground/[0.06]")}>Address</button> : null}
             {clearable ? <button type="button" disabled={pending} onClick={onClear} className={cn(GHOST, "h-5 px-1 text-[11px]")}>Clear attempt</button> : null}
-            {kind !== "other" ? <button type="button" disabled={pending} onClick={onDismiss}
+            {kind === "held" ? <button type="button" disabled={pending} onClick={() => onHold(null)}
+              aria-label={`Resume ${row.repo}#${row.number}`} className={cn(GHOST, "h-5 px-1 text-[11px]")}>Resume</button> :
+              kind !== "dismissed" ? <select aria-label={`Hold ${row.repo}#${row.number}`} title="Temporarily move this PR out of your active list"
+                disabled={pending} value="" onChange={(event) => {
+                  const until = new Date(now);
+                  if (event.target.value === "tomorrow") { until.setDate(until.getDate() + 1); until.setHours(9, 0, 0, 0); }
+                  else until.setTime(now + Number(event.target.value) * 3_600_000);
+                  onHold(until.toISOString());
+                }} className={cn("h-5 max-w-24 rounded border-none bg-transparent px-1 text-[11px] text-muted-foreground", RING)}>
+                <option value="" disabled>Hold…</option><option value="1">1 hour</option><option value="tomorrow">Tomorrow</option><option value="168">1 week</option>
+              </select> : null}
+            {kind === "turn" || kind === "dismissed" ? <button type="button" disabled={pending} onClick={onDismiss}
               aria-label={`${kind === "dismissed" ? "Restore" : "Dismiss"} ${row.repo}#${row.number}`}
               title={kind === "dismissed" ? "Restore this feedback" : "Dismiss until new commits or human feedback"}
               className={cn("shrink-0 rounded px-1 text-[11px] text-muted-foreground opacity-60 hover:bg-foreground/[0.06] hover:text-foreground group-hover:opacity-100 group-focus-within:opacity-100", RING)}>
@@ -111,17 +122,18 @@ export function InboxPage() {
   const [pending, setPending] = useState(false);
   const [polling, setPolling] = useState(false);
   const rows = view?.rows ?? [];
-  const yours = rows.filter((row) => row.turn && !row.dismissed);
-  const dismissed = rows.filter((row) => row.turn && row.dismissed);
-  const other = rows.filter((row) => !row.turn);
-  const areas = groupByArea(yours);
-  const eligible = areas.flatMap((area) => area.items.filter((row) => row.dispatch.kind === "none"));
+  const yours = rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil);
+  const dismissed = rows.filter((row) => row.turn && row.dismissed && !row.holdUntil);
+  const other = rows.filter((row) => !row.turn && !row.holdUntil);
+  const held = rows.filter((row) => row.holdUntil);
+  const organizations = groupByOrganization(yours);
+  const eligible = organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter((row) => row.dispatch.kind === "none")));
   const chosen = eligible.filter((row) => selected.get(row.id) === row.activity);
   const now = Date.now();
 
   useEffect(() => {
     if (!view) return;
-    const eligible = new Map(view.rows.filter((row) => row.turn && !row.dismissed && row.dispatch.kind === "none").map((row) => [row.id, row.activity]));
+    const eligible = new Map(view.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil && row.dispatch.kind === "none").map((row) => [row.id, row.activity]));
     setSelected((current) => new Map([...current].filter(([id, activity]) => eligible.get(id) === activity)));
   }, [view]);
 
@@ -173,21 +185,32 @@ export function InboxPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const renderGroups = (items: Row[], kind: SectionKind) => <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-7 pb-1.5 pt-0.5">
-    {groupByArea(items).map((area) => <section key={area.key} aria-label={area.label} className="min-w-0">
-      <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
-        <ScopeCheckbox items={kind === "turn" ? area.items.filter((row) => row.dispatch.kind === "none") : []}
-          selected={selected} label={`Select ${area.label}`} disabled={pending} onPick={pickScope} />
-        <span className="min-w-0 truncate">{area.label}{area.repos.join(", ") === area.label ? null : <span className="font-normal text-muted-foreground/70"> · {area.repos.join(", ")}</span>}</span>
-        <span className="font-normal tabular-nums">{area.items.length}</span>
+  const renderGroups = (items: Row[], kind: SectionKind) => <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-6 pb-1.5 pt-2">
+    {groupByOrganization(items).map((organization) => <section key={organization.label} aria-label={`${organization.label} ${kind === "turn" ? "your turn" : kind}`} className="min-w-0">
+      <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-1 text-[12px] font-semibold">
+        <ScopeCheckbox items={kind === "turn" ? organization.items.filter((row) => row.dispatch.kind === "none") : []}
+          selected={selected} label={`Select organization ${organization.label}`} disabled={pending} onPick={pickScope} />
+        <span className="min-w-0 truncate">{organization.label}</span>
+        <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
       </h3>
-      <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
-        {area.items.map((row) => <FeedbackRow key={row.id} row={row} kind={kind} now={now} pending={pending}
-          canAddress={Boolean(view?.project)} selected={kind === "turn" && selected.get(row.id) === row.activity}
-          onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
-          onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
-          onDismiss={() => { void act(() => rpc.call("dismiss", { id: row.id, activity: row.activity, dismissed: kind !== "dismissed" })); }} />)}
-      </ul>
+      <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
+        {organization.areas.map((area) => <section key={area.key} aria-label={area.label} className="min-w-0">
+          <h4 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
+            <ScopeCheckbox items={kind === "turn" ? area.items.filter((row) => row.dispatch.kind === "none") : []}
+              selected={selected} label={`Select ${organization.label} / ${area.label}`} disabled={pending} onPick={pickScope} />
+            <span className="min-w-0 truncate">{area.label}{area.repos.join(", ") === area.label ? null : <span className="font-normal text-muted-foreground/70"> · {area.repos.join(", ")}</span>}</span>
+            <span className="font-normal tabular-nums">{area.items.length}</span>
+          </h4>
+          <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
+            {area.items.map((row) => <FeedbackRow key={row.id} row={row} kind={kind} now={now} pending={pending}
+              canAddress={Boolean(view?.project)} selected={kind === "turn" && selected.get(row.id) === row.activity}
+              onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
+              onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
+              onHold={(until) => { void act(() => rpc.call("hold", { id: row.id, activity: row.activity, until })); }}
+              onDismiss={() => { void act(() => rpc.call("dismiss", { id: row.id, activity: row.activity, dismissed: kind !== "dismissed" })); }} />)}
+          </ul>
+        </section>)}
+      </div>
     </section>)}
   </div>;
   const lastRead = view?.poll?.lastSuccess;
@@ -223,6 +246,10 @@ export function InboxPage() {
             <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>Other open PRs · {other.length}</summary>
             {renderGroups(other, "other")}
           </details> : null}
+          {held.length > 0 ? <section aria-label="On hold" className="mt-7 opacity-60 hover:opacity-100 focus-within:opacity-100">
+            <h2 className="ml-9 text-[12px] font-medium">On hold <span className="font-normal tabular-nums">{held.length}</span></h2>
+            {renderGroups(held, "held")}
+          </section> : null}
         </>}
       </main>
     </div>
@@ -242,17 +269,11 @@ export function InboxPage() {
   </div>;
 }
 
-function useInboxBadge(): ExperimentalBadge | null {
-  const { view } = useInbox();
-  const count = view?.rows.filter((row) => row.turn && !row.dismissed).length ?? 0;
-  return count > 0 ? { count, tone: "warning", label: `${count} pull request${count === 1 ? "" : "s"} waiting for your response` } : null;
-}
-
 function InboxCount() {
   const { view } = useInbox();
-  return <span className={cn("inline-flex min-w-4 justify-center rounded px-1 py-1 text-[10px] font-medium leading-none", AMBER)}>{view?.rows.filter((row) => row.turn && !row.dismissed).length ?? 0}</span>;
+  return <span className={cn("inline-flex min-w-4 justify-center rounded px-1 py-1 text-[10px] font-medium leading-none", AMBER)}>{view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0}</span>;
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_useBadge: useInboxBadge, headerContent: InboxCount });
+  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_sidebarAccessory: InboxCount, headerContent: InboxCount });
 });
