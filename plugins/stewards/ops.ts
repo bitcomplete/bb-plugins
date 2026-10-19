@@ -1,7 +1,7 @@
 // The ops kind's mechanical tier, as pure functions: what a look at a watch
 // target found, each problem's fingerprint, and how each compares with the
 // fingerprint map (new, still failing under its ticket, or back after its
-// ticket was resolved). kube.ts reads the cluster; server.ts stores and
+// ticket was resolved). kubectl.ts reads the cluster; server.ts stores and
 // wakes; nothing here talks to anything.
 //
 // A fingerprint names one problem across looks and restarts: the target, the
@@ -266,7 +266,7 @@ export const opsFindingSchema = z.object({
 });
 export type OpsFinding = z.infer<typeof opsFindingSchema>;
 
-/** Whether logs were read: some were, the server may not read them (no pods/log grant), or none were needed. */
+/** Whether logs were read: some were, kubectl may not read them (forbidden), or none were needed. */
 export const LOG_ACCESS = ["read", "not granted", "unneeded"] as const;
 
 export const opsLookSchema = z.object({

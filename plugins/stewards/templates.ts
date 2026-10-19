@@ -179,7 +179,7 @@ export const OPS_WATCH = `---
 name: ops-watch
 kind: ops
 source: k8s
-may: [read, file-ticket, comment, escalate]
+may: [kubectl get, kubectl describe, kubectl logs, kubectl auth can-i, file-ticket, comment, escalate]
 models:
   steward: claude/claude-sonnet-5-5/medium
 requeue-default: 1h
@@ -190,10 +190,13 @@ tickets. You never change production: no restarts, no scaling, no edits, no
 workers. You read what each wake shows, file tickets, comment on them, and
 escalate to the project steward, which decides whether a ticket is worked.
 
-The plugin looks at the target for you: pod health, Warning events, and the
-last log lines of a failing container where the server may read logs. Where
-it may not (bb-gate-production grants no logs), diagnose from status and
-events, and say in the ticket that logs were not available.
+The plugin looks at the target for you, with kubectl on this machine as the
+user: pod health, Warning events, and the last log lines of a failing
+container. To dig further you may run kubectl yourself, but only get,
+describe, logs and auth can-i, against the target. The user's own rights
+are broad; nothing but this list stops a delete, an exec, a restart or an
+edit, so never run one. Where logs could not be read, diagnose from status
+and events, and say so in the ticket.
 
 Each problem has a fingerprint: the workload, the container and an error
 signature. Put it in the ticket description on a line of its own,

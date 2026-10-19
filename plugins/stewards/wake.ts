@@ -268,7 +268,7 @@ function findingLines(f: OpsFinding, look: OpsLook): string[] {
   lines.push(`- Workload ${f.workload}; pod${f.pods.length === 1 ? "" : "s"} ${f.pods.join(", ")}${f.container === null ? "" : `; container ${f.container}`}; first seen ${iso(f.firstSeenAt)}${ticket}`);
   if (f.events.length > 0) lines.push("- Warning events, newest first:", ...f.events.map((e) => `  - ${e}`));
   if (f.logs !== null) lines.push(`- Last log lines${f.previous ? " of the run that ended" : ""}:`, "", "```", ...(f.logs.length === 0 ? ["(empty)"] : f.logs), "```");
-  else if (f.container !== null) lines.push(look.logs === "not granted" ? "- Logs: not readable from this server (no pods/log grant here). Diagnose from status and events, and say so in the ticket." : "- Logs: not read.");
+  else if (f.container !== null) lines.push(look.logs === "not granted" ? "- Logs: kubectl may not read them here. Diagnose from status and events, and say so in the ticket." : "- Logs: not read.");
   return [...lines, ""];
 }
 

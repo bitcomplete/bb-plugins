@@ -39,7 +39,8 @@ import {
   type Playbook,
   type ProjectFile,
 } from "./config.js";
-import { createKubeReader, type OpsAccess, type OpsReader } from "./kube.js";
+import { hostContract } from "./host-contract.js";
+import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type OpsLook, type OpsTarget, type TicketState } from "./ops.js";
 import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
@@ -111,8 +112,8 @@ export const DEFAULT_TIMING: Timing = {
 export interface StewardsDeps {
   now: () => number;
   timing?: Partial<Timing>;
-  /** How ops bindings read their targets: the pod's ServiceAccount by default. */
-  ops?: OpsReader;
+  /** Runs kubectl for ops bindings: on the project's machine, through the host entry, by default. */
+  kubectl?: (args: string[], where: { projectId: string; hostId: string | null }) => Promise<KubectlResult>;
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -1049,8 +1050,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- ops bindings ----------------------------------------------------------------------------
     //
     // An ops binding watches a target the project file lists rather than an
-    // entity in a source plugin. Its steward's thread has no cluster access,
-    // so the plugin looks (kube.ts), compares what it saw with the
+    // entity in a source plugin. The plugin looks with kubectl on the
+    // project's machine (kubectl.ts, host.ts), compares what it saw with the
     // fingerprint map, and wakes the steward with the look: at once for a
     // problem that is new or back after its ticket was resolved, and at every
     // requeue whatever it finds, so a problem still failing under its open
@@ -1058,7 +1059,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // "all healthy" report. A sweep's look between requeues that finds
     // nothing new is recorded and wakes nobody.
 
-    const opsReader = deps.ops ?? createKubeReader();
+    // Made on first use: only a project with ops targets needs its host entry.
+    let hostClient: ReturnType<typeof bb.hosts.experimental_client<typeof hostContract>> | null = null;
+    const KUBECTL_TIMEOUT_MS = 30_000;
+
+    /**
+     * Every kubectl call goes through here, and only get, describe, logs and
+     * auth can-i pass (kubectlRefusal; host.ts checks again). It runs on the
+     * project's machine, the developer's own, where kubectl reaches the
+     * cluster as them. Where a stricter wall comes later, it goes here.
+     */
+    async function runKubectl(projectId: string, args: string[]): Promise<KubectlResult> {
+      const refused = kubectlRefusal(args);
+      if (refused !== null) throw new Error(refused);
+      const hostId = await projectHost(projectId);
+      if (deps.kubectl !== undefined) return deps.kubectl(args, { projectId, hostId });
+      if (hostId === null) throw new Error("the project has no machine bb can reach to run kubectl on");
+      hostClient ??= bb.hosts.experimental_client({ contract: hostContract });
+      return hostClient.call("opsKubectl", { args, timeoutMs: KUBECTL_TIMEOUT_MS }, { hostId, timeoutMs: KUBECTL_TIMEOUT_MS + 10_000 });
+    }
+
+    const opsReaderFor = (config: ProjectConfig): OpsReader =>
+      createKubectlReader((args) => runKubectl(config.projectId, args), config.file.ops.context === undefined ? {} : { context: config.file.ops.context });
 
     /** The states of the tickets a look's problems are filed under, read through linear; null for one that cannot be read. */
     async function ticketStates(keys: string[]): Promise<Map<string, TicketState>> {
@@ -1071,11 +1093,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
-    async function lookAt(b: Binding, target: OpsTarget, playbook: Playbook): Promise<OpsLook> {
+    async function lookAt(b: Binding, config: ProjectConfig, target: OpsTarget, playbook: Playbook): Promise<OpsLook> {
       const at = now();
       const since = b.opsLook !== null && b.opsLook.error === null ? b.opsLook.at : at - playbook.requeueDefaultMs;
       try {
-        const { sightings, ...rest } = await opsReader.look(target, { now: at, since });
+        const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
         const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
         const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         return { ...rest, at, target: opsTargetKey(target), error: null, findings: classify(sightings, rows, tickets, at) };
@@ -1090,13 +1112,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A target no longer listed is ended by the sweep.
       if (target === null || !opsTargets(config.file).some((t) => opsTargetKey(t) === b.entityId)) return;
       const before = b.opsLook;
-      const look = await lookAt(b, target, playbook);
+      const look = await lookAt(b, config, target, playbook);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
       // The next look is due a requeue from now, whether or not this one wakes anyone.
       const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
       b = store.patch(b.id, { opsLook: look, requeueAt });
       if (look.error !== null) {
-        // Nothing to wake the steward with until the server can read the target; `bb stewards check` says why.
+        // Nothing to wake the steward with until kubectl can read the target; `bb stewards check` says why.
         if (before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
         return;
       }
@@ -1883,7 +1905,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           skills: ["stewards"],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
-            "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. " +
+            "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. To dig further, run kubectl on the target yourself, but only get, describe, logs and auth can-i: it acts as the user, whose rights are broad. " +
             "File and comment on Linear tickets with the linear_ tools, which sign for you; escalate each ticket you file to the project steward with steward_report, as the playbook says. " +
             "End every turn you were woken for with steward_report, listing in opsTickets every ticket you filed, commented on or reopened. Read the stewards skill for the protocol.",
         };
@@ -2500,19 +2522,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (usesKind(config.file, "ops")) {
         const auto = config.file.ops.autoAdopt;
         lines.push(`ops: tickets filed in ${opsTeam(config.file) ?? "(no team)"}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
-        for (const target of opsTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await opsReader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, mutating: [] }))));
+        const host = await projectHost(projectId);
+        lines.push(`ops: kubectl runs on ${host ?? "no machine"}${config.file.ops.context === undefined ? ", in its current context" : `, in context ${config.file.ops.context}`}`);
+        const reader = opsReaderFor(config);
+        for (const target of opsTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
       }
       return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
     }
 
-    /** What `bb stewards check` says about one ops target: readable or not, logs or not, and any write it should not hold. */
+    /** What `bb stewards check` says about one ops target: readable or not, and whether its logs are. */
     function opsAccessLines(key: string, a: OpsAccess): string[] {
-      if (a.error !== null) return [`problem: ops: this server cannot read ${key}: ${a.error}`];
-      const pods = a.reads.find((r) => r.what === "list pods");
-      if (pods !== undefined && !pods.ok) return [`problem: ops: this server cannot read ${key}: list pods: ${pods.detail ?? "refused"}`];
-      const lines = [`ops: ${key} is readable (${a.reads.filter((r) => r.ok).map((r) => r.what).join(", ")}); logs ${a.logs === true ? "readable" : a.logs === false ? "not granted, so diagnosis is from status and events" : "unknown"}`];
+      if (a.error !== null) return [`problem: ops: cannot read the target ${key}: ${a.error}`];
+      const pods = a.reads.find((r) => r.what === "get pods");
+      if (pods !== undefined && !pods.ok) return [`problem: ops: cannot read the target ${key}: get pods: ${pods.detail ?? "refused"}`];
+      const lines = [`ops: ${key} is readable (${a.reads.filter((r) => r.ok).map((r) => r.what).join(", ")}); logs ${a.logs === true ? "readable" : a.logs === false ? "not readable, so diagnosis is from status and events" : "unknown"}`];
       for (const r of a.reads.filter((x) => !x.ok)) lines.push(`ops: ${key}: cannot ${r.what} (${r.detail ?? "refused"}); looks go without it`);
-      if (a.mutating.length > 0) lines.push(`problem: ops: this server may ${a.mutating.join(", ")} in ${key}; an ops steward's access should be read-only`);
+      // Expected: kubectl acts as the developer. Said so nobody mistakes the playbook for a wall.
+      if (a.writes.length > 0) lines.push(`ops: ${key}: this identity may also ${a.writes.join(", ")}; the plugin and the playbook keep to ${KUBECTL_VERBS.join(", ")}`);
       return lines;
     }
 
@@ -2563,7 +2589,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           check: cliCommand({
-            summary: "Validate the project file and every playbook against Linear and GitHub, and that this server can read every ops target",
+            summary: "Validate the project file and every playbook against Linear and GitHub, and that kubectl can read every ops target",
             options: { project: PROJECT_OPTION },
             async run(input, ctx) {
               const result = await check(projectOf(input.options.project, ctx));

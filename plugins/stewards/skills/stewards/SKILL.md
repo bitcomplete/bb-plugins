@@ -88,7 +88,9 @@ Two tools are yours; everything else you do with the tools every thread has.
 You watch one production target; the wake is the plugin's look at it (pods,
 Warning events, and log lines where the server may read them), with each
 problem's fingerprint marked new, recurring or returned. You never change
-production and start no workers.
+production and start no workers. To dig further you may run kubectl on the
+target yourself, but only `get`, `describe`, `logs` and `auth can-i`: it
+acts as the user, whose rights are broad, and nothing else stops a write.
 
 - **New:** search the team for an open ticket about it, then file one ticket
   per problem with `linear_create_issue`: pod and container, since when, the
@@ -106,8 +108,8 @@ production and start no workers.
   duplicate.
 - **All healthy:** the wake says so every requeue; report it with
   `actor: other` and end the turn.
-- **No logs** (the wake says so on `bb-gate-production`): diagnose from status
-  and events, and say in the ticket that logs were not available.
+- **No logs** (the wake says so): diagnose from status and events, and say
+  in the ticket that logs were not available.
 
 ## If you are the project steward
 
@@ -184,9 +186,10 @@ above which a steward is compacted after its turn.
   need bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
-  target` and `bb stewards check` says why: this server has no
-  ServiceAccount (bb-gate mounts one only into the backend of the developer
-  who runs the project's ops steward), or it may not list pods there.
+  target` and `bb stewards check` says why: kubectl on the project's
+  machine cannot reach the cluster (not installed, the machine not on the
+  tailnet as the developer or a tagged node, no kubeconfig or context for
+  it; `ops.context` picks one), or it may not list pods there.
   Otherwise it takes a turn every `requeue-default`, healthy or not.
 - **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,
   unless `project.json` lists it in `github.exclude` (`owner/repo`). Bindings

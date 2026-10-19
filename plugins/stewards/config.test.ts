@@ -105,11 +105,11 @@ describe("playbooks", () => {
 });
 
 describe("the ops playbook", () => {
-  it("has no phases or terminal states, sections for what a look found, and a may list that only reads, files, comments and escalates", () => {
+  it("has no phases or terminal states, sections for what a look found, and a may list of read-only kubectl, filing, commenting and escalating", () => {
     const parsed = parsePlaybook(OPS_WATCH, "ops-watch");
     if (!parsed.ok) throw new Error(parsed.error);
     const p = parsed.value;
-    expect(p).toMatchObject({ kind: "ops", source: "k8s", phases: {}, terminal: [], ready: null, may: ["read", "file-ticket", "comment", "escalate"], requeueDefaultMs: 3_600_000 });
+    expect(p).toMatchObject({ kind: "ops", source: "k8s", phases: {}, terminal: [], ready: null, may: ["kubectl get", "kubectl describe", "kubectl logs", "kubectl auth can-i", "file-ticket", "comment", "escalate"], requeueDefaultMs: 3_600_000 });
     expect(phaseInstructions(p, "new")).toMatch(/File one ticket per problem/u);
     expect(phaseInstructions(p, "recurring")).toMatch(/File nothing new/u);
     expect(phaseInstructions(p, "returned")).toMatch(/reopened/u);

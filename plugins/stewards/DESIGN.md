@@ -696,9 +696,8 @@ plugins' contract before stewards uses them, bb-plugins before bb-gate.
 4. **Reviews.** Review bindings, review workers.
 5. **Board.** Built: the Stewards page, the question record (§12), and the
    digest assembled from records.
-6. **Ops.** Built in this plugin (§18). It reads only what bb-gate grants the
-   server, so the read-only cluster access in `bb-gate` lands first; until
-   it does, ops bindings wait and `bb stewards check` says why.
+6. **Ops.** Built in this plugin (§18), with kubectl on the developer's
+   machine; nothing changes in bb-gate or devbox.
 
 ## 18. Ops stewards
 
@@ -726,14 +725,18 @@ goes wrong there into Linear tickets for the project steward to adopt.
   steward and has no workers. On the Stewards page it is grouped as
   `watch`; in `bb stewards list` it shows when it last looked and how many
   problems are failing.
-- **The plugin looks; the steward judges.** Steward threads run on a
-  developer's machine with no cluster access, so the plugin reads the
-  target itself, from the bb-server pod, with the ServiceAccount bb-gate
-  mounts there (`kube.ts`): pods, Warning events, Deployments, and the last
-  log lines of a failing container where `pods/log` is granted, with
-  obvious credentials redacted. A look happens at every sweep and requeue.
-  It is the ops binding's snapshot (`bindings.ops_look`), and the wake
-  carries it.
+- **The plugin looks with kubectl, as the developer; the steward judges.**
+  There is no cluster identity of the plugin's own. The project's machine
+  — the developer's, a tailnet node, where the steward's turns run too —
+  has `kubectl`, which reaches the cluster through the developer's
+  kubeconfig (for bc-prod, the Tailscale API proxy) as them. The plugin's
+  server is elsewhere, so it asks the machine to run kubectl through its
+  host entry (`host.ts`, one method, `opsKubectl`), and reads with it
+  (`kubectl.ts`): pods, Warning events, Deployments, and the last log lines
+  of a failing container, with obvious credentials redacted. `ops.context`
+  names the kubeconfig context; the machine's current one otherwise. A look
+  happens at every sweep and requeue. It is the ops binding's snapshot
+  (`bindings.ops_look`), and the wake carries it.
 - **Fingerprints.** A problem is named by its target, its workload (a
   Deployment's pods share it whatever their generated names, so a rollout
   or a second replica is the same problem), its container, and an error
@@ -770,20 +773,27 @@ goes wrong there into Linear tickets for the project steward to adopt.
   Todo, the ordinary path, and the team lease brings a ticket steward; or
   declines with a reason. `ops.autoAdopt` names priorities the ops steward
   labels itself when filing, without escalating.
-- **`may` is `[read, file-ticket, comment, escalate]`**, and like every
-  `may` list it is advisory (§11). The wall is RBAC: the ServiceAccount
-  holds get, list and watch on pods, events and deployments, and
-  `pods/log` only where no developer's backend runs; nothing mutating. The
-  plugin itself only issues GETs, plus SelfSubjectAccessReviews for
-  `check`, which change nothing.
+- **Read-only is a convention, not a wall.** kubectl acts as the
+  developer, whose rights are broad. Every kubectl call the plugin makes
+  passes one function, `kubectlRefusal`, checked by the server before it
+  asks and by the host entry before it runs: only `get`, `describe`,
+  `logs` and `auth can-i`, and no flag that swaps the kubeconfig,
+  credentials or identity. The playbook's `may` list says the same for the
+  steward's own kubectl (`kubectl get`, `describe`, `logs`, `auth can-i`,
+  then filing, commenting and escalating), and like every `may` list it is
+  advisory (§11): nothing stops the steward's shell. A real wall, such as a
+  read-only identity for kubectl, would slot in behind that one function.
 - **`bb stewards check`** validates `ops` (namespace names, duplicates,
-  that the team is one of `linear.teams`), then asks the API server, for
-  each target, whether this server can list its pods, events and
-  deployments and read its logs. A target it cannot read is a problem, as is
-  any write the account holds there.
-- **Before the access exists** (no token mounted, or a 403), the binding is
-  made but its steward is not spawned or woken; `bb stewards list` shows
-  `cannot read the target`, and the first look that succeeds wakes it.
+  that the team is one of `linear.teams`), then runs kubectl on the
+  project's machine for each target: `get` its pods, events and
+  deployments, and `auth can-i` for its logs. A target kubectl cannot
+  reach — no kubectl, the machine not on the tailnet as the developer, no
+  kubeconfig or context for the cluster, pods forbidden — is a problem,
+  "cannot read the target". Writes the identity holds there are said, not
+  counted as a problem: they are expected of a developer.
+- **When kubectl cannot read the target**, the binding is made but its
+  steward is not spawned or woken; `bb stewards list` shows `cannot read
+  the target`, and the first look that succeeds wakes it.
 
 ## Known limits
 
@@ -799,19 +809,20 @@ goes wrong there into Linear tickets for the project steward to adopt.
   through bb-gate-hooks, and the deploy in the snapshot) would be new work in
   three repos. Until then, a playbook that wants a deploy watched has the
   steward follow through (§5) while a worker watches and verifies it.
-- **One server watches production.** An ops binding runs on the server of
-  the developer who runs the project's stewards, the only one bb-gate gives
-  the ServiceAccount, like everything else here (one developer per
-  project). Nothing looks while that server is down, and in particular
-  during bb-gate's 03:00–05:00 US Eastern quiet window, when staged updates
-  restart servers: a crash in that window is seen at the first look after.
-  Nothing pages anyone either: this is periodic looks, not alerting.
-- **Logs are partial.** In `bb-gate-production`, where developers' own
-  backends run, RBAC cannot grant `pods/log` for some pods only, so there
-  are no logs: diagnosis is from status and events. Healthy pods' logs are
-  never scanned, so an error that does not crash, restart or unready a pod
-  goes unseen. Push sources (Sentry, alerts through bb-gate-hooks) would
-  cover that, and are separate work.
+- **One developer's server and machine watch production.** An ops binding
+  runs on the server of the developer who runs the project's stewards, and
+  looks with kubectl on their machine, as them, like everything else here
+  (one developer per project). Nothing looks while either is down: in
+  particular during bb-gate's 03:00–05:00 US Eastern quiet window, when
+  staged updates restart servers, and while the machine is off or off the
+  tailnet. A crash then is seen at the first look after. Nothing pages
+  anyone either: this is periodic looks, not alerting.
+- **Read-only rests on the gate and the playbook.** kubectl runs with the
+  developer's own rights (§18); a steward that ignored its `may` list could
+  use them.
+- **Healthy pods' logs are never scanned**, so an error that does not
+  crash, restart or unready a pod goes unseen. Push sources (Sentry, alerts
+  through bb-gate-hooks) would cover that, and are separate work.
 - **Comments and the team lease.** bb-gate-hooks does not always know a
   Linear comment's team, so a team lease alone misses some comments. That is
   why every binding also holds an issue lease for its own entity (§16).

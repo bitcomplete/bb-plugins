@@ -20,10 +20,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   steward's workers nested under it; see DESIGN.md §15.
 - **Ops stewards.** Each target in the project file's `ops.targets` (a
   Kubernetes namespace) gets an `ops` steward, reporting to the project
-  steward, for as long as it is listed. The plugin looks at the target from
-  the bb-server pod with the ServiceAccount bb-gate mounts there
-  ([kube.ts](kube.ts)): pods, Warning events, Deployments, and a failing
-  container's last log lines where `pods/log` is granted. It names each
+  steward, for as long as it is listed. The plugin looks at the target with
+  `kubectl` on the project's machine, the developer's own, as them (through
+  its host entry, [host.ts](host.ts), and [kubectl.ts](kubectl.ts)): pods,
+  Warning events, Deployments, and a failing container's last log lines.
+  It names each
   problem by a fingerprint (workload, container, error signature;
   [ops.ts](ops.ts)) and keeps a fingerprint → Linear ticket map. A new
   problem, or one back after its ticket was resolved, wakes the steward at
@@ -33,10 +34,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   "all healthy" report. The steward
   files one ticket per problem and escalates a `decision` to the project
   steward ("Filed BB-N (high), recommend adopting"); the project steward
-  adopts with the label and Todo, the ordinary path. It never changes the
-  cluster: its playbook allows reading, filing, commenting and escalating,
-  and RBAC allows only reads. Until the server can read a target, its
-  binding waits and `bb stewards check` says why. DESIGN.md §18.
+  adopts with the label and Todo, the ordinary path. Every kubectl call the
+  plugin makes passes one gate that allows only `get`, `describe`, `logs`
+  and `auth can-i`, and the playbook's `may` list holds the steward to the
+  same; the developer's own rights are broad, so that is a convention, not a
+  wall. Until kubectl can read a target, its binding waits and `bb stewards
+  check` says "cannot read the target". DESIGN.md §18.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
@@ -159,7 +162,8 @@ version. Project file fields beyond the design: `nightly.until`,
 defaults in [config.ts](config.ts)), and `ops`: `targets` (`{ kind:
 "k8s-namespace", name }`, at most ten), `team` (where tickets are filed; the
 first of `linear.teams` by default, and it must be one of them) and
-`autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
+`context` (the kubeconfig context kubectl uses; the machine's current one
+when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
 tickets the ops steward labels for a steward itself when it files them).
 `ops-watch.md` is read only when `ops.targets` lists something.
 
@@ -186,9 +190,9 @@ None beyond the playbook's word. A steward acts with the user's credentials
 and a shell; its `may` list and the ready gate are stated in every wake, and
 everything it writes is signed with its thread, so what it did is visible
 afterwards. The runaway guard is the one hard stop. GitHub writes go through
-`gh`; there are no write tools to check. Ops stewards are the exception
-where a wall exists: the cluster access bb-gate grants is read-only, and
-`bb stewards check` reports any write it finds.
+`gh`; there are no write tools to check. Ops stewards are no exception:
+kubectl acts as the developer, and only the plugin's verb gate and the
+playbook keep the steward to reading.
 
 ## The contract with linear and github-watcher
 
@@ -209,7 +213,7 @@ bb plugin build
 Deployment needs this directory added to bb-gate's
 `docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
 `BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve
-the contract. Ops stewards need bb-gate to mount a read-only ServiceAccount
-into the backend of the developer who runs them, at the standard path
-(`/var/run/secrets/kubernetes.io/serviceaccount`: `token` and `ca.crt`);
-the plugin calls `https://kubernetes.default.svc`.
+the contract. Ops stewards need `kubectl` on the project's machine, with a
+kubeconfig that reaches the cluster as the developer (for bc-prod, the
+Tailscale API proxy: the machine on the tailnet as its developer, not a
+tagged node). The plugin's host entry runs it there.

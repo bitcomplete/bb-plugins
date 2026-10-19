@@ -3,8 +3,7 @@ import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadRe
 import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
-import type { OpsAccess, OpsReader } from "./kube.js";
-import { eventsOf, findingsOf, podsOf } from "./ops.js";
+import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { createStewardsPlugin, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS } from "./store.js";
@@ -1500,36 +1499,40 @@ describe("ops stewards", () => {
   const TARGET = "k8s-namespace/bb-gate-production";
   const FP = `${TARGET}/bb-gate-router/router#CrashLoopBackOff:Error:1`;
 
-  /** A namespace the fake cluster serves, as kube.ts would read it, through the real parsing. */
+  /** A fake kubectl on the project's machine, serving one namespace, recording every call. */
   function cluster() {
-    const state = { pods: [] as unknown[], events: [] as unknown[], error: null as string | null, logs: false, access: null as OpsAccess | null };
-    const reader: OpsReader = {
-      async look(target, at) {
-        if (state.error !== null) throw new Error(state.error);
-        const pods = podsOf({ items: state.pods });
-        const sightings = findingsOf(target, pods, eventsOf({ items: state.events }), at);
-        const failing = sightings.filter((x) => x.container !== null);
-        if (state.logs) for (const x of failing) x.logs = ["panic: listen tcp :8080: address already in use"];
-        return { pods: pods.length, healthy: pods.filter((p) => p.ready).length, deployments: [{ name: "bb-gate-router", ready: 0, desired: 1 }], warnings: [], logs: failing.length === 0 ? "unneeded" : state.logs ? "read" : "not granted", notes: [], sightings };
-      },
-      async access() {
-        return state.access ?? { error: "this server has no cluster access: no ServiceAccount token at /var/run/secrets/kubernetes.io/serviceaccount", reads: [], logs: null, mutating: [] };
-      },
+    const state = { pods: [] as unknown[], events: [] as unknown[], unreachable: false, logs: true, deployments: true, writes: false };
+    const calls: Array<{ args: string[]; hostId: string | null }> = [];
+    const kubectl = async (args: string[], where: { hostId: string | null }): Promise<KubectlResult> => {
+      calls.push({ args, hostId: where.hostId });
+      const ok = (stdout: string): KubectlResult => ({ exitCode: 0, stdout, stderr: "" });
+      const fail = (stderr: string, exitCode = 1): KubectlResult => ({ exitCode, stdout: "", stderr });
+      if (state.unreachable) return fail("Unable to connect to the server: dial tcp: lookup bc-prod.example.ts.net: no such host");
+      const a = args.filter((x) => !x.startsWith("--request-timeout") && !x.startsWith("--context"));
+      const names = (items: unknown[]) => items.map((i, n) => `${a[1]}/${(i as { metadata?: { name: string } }).metadata?.name ?? n}`).join("\n");
+      if (a[0] === "get") {
+        const items = a[1] === "pods" ? state.pods : a[1] === "events" ? state.events : [{ metadata: { name: "bb-gate-router" }, spec: { replicas: 1 }, status: { readyReplicas: 0 } }];
+        if (a[1] === "deployments" && !state.deployments) return fail('Error from server (Forbidden): deployments.apps is forbidden: User "jane@acme.com" cannot list resource "deployments"');
+        return ok(a.includes("json") ? JSON.stringify({ items }) : names(items));
+      }
+      if (a[0] === "logs") return state.logs ? ok("starting router\npanic: listen tcp :8080: address already in use\n") : fail('Error from server (Forbidden): pods "x" is forbidden: User cannot get resource "pods/log"');
+      if (a[0] === "auth") return a[3] === "pods/log" ? (state.logs ? ok("yes\n") : { exitCode: 1, stdout: "no\n", stderr: "" }) : state.writes ? ok("yes\n") : { exitCode: 1, stdout: "no\n", stderr: "" };
+      return fail(`unexpected kubectl ${args.join(" ")}`);
     };
-    return { state, reader };
+    return { state, calls, kubectl };
   }
 
   const opsProject = (targets: string[] = ["bb-gate-production"], extra: Record<string, unknown> = {}) =>
     JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: targets.map((name) => ({ kind: "k8s-namespace", name })), ...extra } });
 
-  async function watched(over: { error?: string } = {}) {
+  async function watched(over: { unreachable?: boolean } = {}) {
     const c = cluster();
-    const t = await setup({ ops: c.reader });
+    const t = await setup({ kubectl: c.kubectl });
     t.files[PROJECT_FILE] = opsProject();
     t.files[playbookPath("ops-watch")] = OPS_WATCH;
     c.state.pods = [crashingPod()];
     c.state.events = [warningEvent("bb-gate-router-6d4f9c7b8-x2k4q")];
-    if (over.error !== undefined) c.state.error = over.error;
+    if (over.unreachable === true) c.state.unreachable = true;
     await t.hooks.sweep();
     await t.flush();
     const steward = () => t.spawns.find((x) => String(x.title).startsWith("Ops watch"));
@@ -1541,7 +1544,7 @@ describe("ops stewards", () => {
   }
 
   it("watches a configured target, files one ticket for a crash loop, and comments on it while it keeps crashing", async () => {
-    const { t, steward, wakes } = await watched();
+    const { t, c, steward, wakes } = await watched();
     const [project] = t.spawns;
     const ops = steward()!;
     // A binding of its own, reporting to the project steward, in the list and on the page.
@@ -1558,10 +1561,15 @@ describe("ops stewards", () => {
     expect(first).toMatch(/File one ticket per problem/u);
     expect(first).not.toMatch(/### Recurring/u);
     expect(first).toMatch(/BackOff ×12: Back-off restarting failed container router/u);
-    // bb-gate-production grants no logs: the wake says to diagnose from status and events.
-    expect(first).toMatch(/Logs: not readable from this server \(no pods\/log grant here\)/u);
+    // The crashed run's last log lines, read with kubectl as the developer.
+    expect(first).toMatch(/Last log lines of the run that ended:\n\n```\nstarting router\npanic: listen tcp :8080: address already in use\n```/u);
+    // Every kubectl call ran on the project's machine, and only get, logs and auth can-i.
+    expect(c.calls.length).toBeGreaterThan(0);
+    expect(c.calls.every((x) => x.hostId === "host_on" && kubectlRefusal(x.args) === null)).toBe(true);
+    expect(c.calls.map((x) => x.args.slice(0, 2).join(" "))).toEqual(expect.arrayContaining(["get pods", "get events", "get deployments", "logs bb-gate-router-6d4f9c7b8-x2k4q"]));
+    expect(c.calls.find((x) => x.args[0] === "logs")!.args).toEqual(["logs", "bb-gate-router-6d4f9c7b8-x2k4q", "-n", "bb-gate-production", "-c", "router", "--tail=60", "--previous", "--request-timeout=20s"]);
     expect(first).toMatch(/File tickets in the Linear team ENG/u);
-    expect(first).toMatch(/Allowed actions: read, file-ticket, comment, escalate\./u);
+    expect(first).toMatch(/Allowed actions: kubectl get, kubectl describe, kubectl logs, kubectl auth can-i, file-ticket, comment, escalate\./u);
 
     // A fingerprint it has not seen is refused, and nothing is recorded.
     const base = { phase: "watching", summary: "router crash-looping; filed ENG-50", nextAction: "Watch", actor: "steward" };
@@ -1648,14 +1656,14 @@ describe("ops stewards", () => {
     expect(report.text).toMatch(/Your thread is archived when the turn ends/u);
   });
 
-  it("makes a binding that waits while the server cannot read its target, and wakes once it can", async () => {
-    const { t, c, steward } = await watched({ error: "403: pods is forbidden" });
+  it("makes a binding that waits while kubectl cannot read its target, and wakes once it can", async () => {
+    const { t, c, steward } = await watched({ unreachable: true });
     expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: null }]);
     expect(steward()).toBeUndefined();
     const listed = await t.harness.behavior.runCli(["list"], { projectId: "p1" });
-    expect(listed.stdout).toMatch(/cannot read the target: 403: pods is forbidden/u);
+    expect(listed.stdout).toMatch(/cannot read the target: Unable to connect to the server: dial tcp: lookup bc-prod\.example\.ts\.net: no such host/u);
 
-    c.state.error = null;
+    c.state.unreachable = false;
     await t.hooks.sweep();
     await t.flush();
     expect(steward()).toBeDefined();
@@ -1680,30 +1688,52 @@ describe("ops stewards", () => {
     expect(t.spawns.filter((x) => String(x.title).startsWith("Ops watch"))).toHaveLength(1);
   });
 
-  it("is checked: a target this server cannot read is a problem, as is any write it holds there", async () => {
+  it("is checked: a target kubectl cannot reach is a problem; writes the developer holds are only said", async () => {
     const { t, c } = await watched();
     const check = () => t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    c.state.unreachable = true;
     const none = await check();
     expect(none.exitCode).toBe(1);
     expect(none.stdout).toMatch(/ops: tickets filed in ENG/u);
-    expect(none.stdout).toMatch(/problem: ops: this server cannot read k8s-namespace\/bb-gate-production: this server has no cluster access/u);
+    expect(none.stdout).toMatch(/ops: kubectl runs on host_on, in its current context/u);
+    expect(none.stdout).toMatch(/problem: ops: cannot read the target k8s-namespace\/bb-gate-production: Unable to connect to the server/u);
     expect(none.stdout).toMatch(/^ops: ops-watch@/mu);
 
-    const reads = [{ what: "list pods", ok: true, detail: null }, { what: "list events", ok: true, detail: null }, { what: "list deployments", ok: false, detail: "403: forbidden" }];
-    c.state.access = { error: null, reads, logs: false, mutating: [] };
+    c.state.unreachable = false;
+    c.state.logs = false;
+    c.state.deployments = false;
     const readable = await check();
+    expect(readable.stdout).not.toMatch(/problem:/u);
     expect(readable.exitCode).toBe(0);
-    expect(readable.stdout).toMatch(/ops: k8s-namespace\/bb-gate-production is readable \(list pods, list events\); logs not granted, so diagnosis is from status and events/u);
-    expect(readable.stdout).toMatch(/cannot list deployments \(403: forbidden\); looks go without it/u);
+    expect(readable.stdout).toMatch(/ops: k8s-namespace\/bb-gate-production is readable \(get pods, get events\); logs not readable, so diagnosis is from status and events/u);
+    expect(readable.stdout).toMatch(/cannot get deployments \(Error from server \(Forbidden\): deployments\.apps is forbidden.*\); looks go without it/u);
 
-    c.state.access = { error: null, reads, logs: true, mutating: ["delete pods"] };
+    // kubectl acts as the developer, whose rights are broad: said, not a problem.
+    c.state.writes = true;
     const writable = await check();
-    expect(writable.exitCode).toBe(1);
-    expect(writable.stdout).toMatch(/problem: ops: this server may delete pods in k8s-namespace\/bb-gate-production; an ops steward's access should be read-only/u);
+    expect(writable.exitCode).toBe(0);
+    expect(writable.stdout).toMatch(/this identity may also delete pods, create pods\/exec, patch deployments; the plugin and the playbook keep to get, describe, logs, auth can-i/u);
+    expect(c.calls.every((x) => kubectlRefusal(x.args) === null)).toBe(true);
 
     // A project file whose ops section is wrong is a problem too.
     t.files[PROJECT_FILE] = opsProject(["bb-gate-production"], { team: "SALES" });
     expect((await check()).stdout).toMatch(/problem: stewards\/project\.json: ops\.team: SALES is not one of linear\.teams/u);
+    // A context, when named, is passed on every call.
+    t.files[PROJECT_FILE] = opsProject(["bb-gate-production"], { context: "bc-prod" });
+    expect((await check()).stdout).toMatch(/kubectl runs on host_on, in context bc-prod/u);
+    expect(c.calls.at(-1)!.args.at(-1)).toBe("--context=bc-prod");
+  });
+
+  it("runs kubectl through its host entry on the project's machine by default", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = opsProject();
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const calls = t.harness.experimental_hostRpcCalls;
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls[0]).toMatchObject({ method: "opsKubectl", hostId: "host_on", input: { args: ["get", "pods", "-n", "bb-gate-production", "-o", "json", "--request-timeout=20s"] } });
+    expect(calls.every((x) => kubectlRefusal((x.input as { args: string[] }).args) === null)).toBe(true);
   });
 
   it("gives an ops steward its own instructions, and refuses opsTickets from any other steward", async () => {

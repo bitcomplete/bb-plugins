@@ -148,13 +148,16 @@ export const projectFileSchema = z
      * Production to watch: one ops binding per target, which files a Linear
      * ticket for each problem it finds and escalates it to the project
      * steward. `team` is where tickets are filed (the first of linear.teams
-     * when left out); `autoAdopt` names the priorities whose tickets are
-     * labelled for a steward when filed, without asking.
+     * when left out); `context` is the kubeconfig context kubectl reads it
+     * with; `autoAdopt` names the priorities whose tickets are labelled for
+     * a steward when filed, without asking.
      */
     ops: z
       .object({
         targets: z.array(opsTargetSchema).max(10).default([]),
         team: teamKey.optional(),
+        /** The kubeconfig context kubectl uses on the developer's machine; its current context when left out. */
+        context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
         autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
       })
       .strict()
