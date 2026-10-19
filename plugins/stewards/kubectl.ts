@@ -14,15 +14,21 @@ import { deploymentsOf, eventsOf, findingsOf, logTail, otherWarnings, podsOf, ty
 /** What the ops kind may ask kubectl to do. Nothing else is run. */
 export const KUBECTL_VERBS = ["get", "describe", "logs", "auth can-i"] as const;
 
-/** Flags that would point kubectl at other credentials or another identity. */
-const REFUSED_FLAGS = /^--(?:kubeconfig|token|server|as|as-group|as-uid|username|password|client-certificate|client-key|insecure-skip-tls-verify)(?:=|$)/u;
+/**
+ * Flags that would point kubectl at other credentials or another identity,
+ * or (`--raw`) turn a get into an arbitrary API path, such as a secrets dump.
+ */
+const REFUSED_FLAGS = /^--(?:kubeconfig|token|server|as|as-group|as-uid|username|password|client-certificate|client-key|insecure-skip-tls-verify|raw)(?:=|$)/u;
 
 /** Why kubectl may not run these arguments, or null when it may. */
 export function kubectlRefusal(args: readonly string[]): string | null {
   const verb = args[0] === "auth" ? `auth ${args[1] ?? ""}`.trim() : (args[0] ?? "");
   if (!(KUBECTL_VERBS as readonly string[]).includes(verb)) return `kubectl ${verb || "(nothing)"} is not allowed: the ops kind runs only ${KUBECTL_VERBS.join(", ")}`;
   const flag = args.find((a) => REFUSED_FLAGS.test(a));
-  if (flag !== undefined) return `kubectl ${flag.split("=")[0]} is not allowed: the ops kind uses the machine's own kubeconfig as it is`;
+  if (flag !== undefined) {
+    const name = flag.split("=")[0]!;
+    return name === "--raw" ? "kubectl --raw is not allowed: the ops kind reads resources by name, not arbitrary API paths" : `kubectl ${name} is not allowed: the ops kind uses the machine's own kubeconfig as it is`;
+  }
   return null;
 }
 

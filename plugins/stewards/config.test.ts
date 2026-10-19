@@ -122,6 +122,10 @@ describe("the ops playbook", () => {
     expect(parsePlaybook(OPS_WATCH.replace("may:", "terminal: [Done]\nmay:"), "ops-watch")).toMatchObject({ ok: false });
     expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook reads k8s/u) });
     expect(parsePlaybook(GITHUB_PRS.replace("terminal: [merged, closed]\n", ""), "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/terminal: name at least one state/u) });
+    // A ticket, pr or review playbook still needs its phases, as before ops.
+    const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");
+    expect(noPhases).not.toMatch(/phases:/u);
+    expect(parsePlaybook(noPhases, "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/phases: map the entity's states to stages/u) });
   });
 });
 

@@ -245,7 +245,8 @@ export const frontMatterSchema = z
     kind: z.enum(KINDS),
     /** Where the entity lives; an ops playbook watches k8s, and has no entity state. */
     source: z.enum(PLAYBOOK_SOURCES),
-    phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})).default({}),
+    /** Required for every kind but ops, which has none. */
+    phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})).optional(),
     terminal: z.array(z.string().trim().min(1).max(100)).default([]),
     ready: readySchema.optional(),
     promote: z.string().trim().max(1000).optional(),
@@ -301,14 +302,18 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   if (fm.source !== expectedSource) return { ok: false, error: `${file}: ${fm.kind === "ops" ? "an" : "a"} ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
   if (fm.kind === "ops") {
     // An ops binding watches a target for as long as it is configured: no state to key phases on, and nothing terminal.
-    if (Object.keys(fm.phases).length > 0 || fm.terminal.length > 0 || fm.ready !== undefined || fm.promote !== undefined) {
+    if (Object.keys(fm.phases ?? {}).length > 0 || fm.terminal.length > 0 || fm.ready !== undefined || fm.promote !== undefined) {
       return { ok: false, error: `${file}: an ops playbook has no phases, terminal states, ready gate or promote rule: it watches a target, not an entity` };
     }
-  } else if (fm.terminal.length === 0) return { ok: false, error: `${file}: terminal: name at least one state that ends the binding` };
-  const lowerPhases = new Set(Object.keys(fm.phases).map((p) => p.toLowerCase()));
+  } else {
+    if (fm.phases === undefined) return { ok: false, error: `${file}: phases: map the entity's states to stages` };
+    if (fm.terminal.length === 0) return { ok: false, error: `${file}: terminal: name at least one state that ends the binding` };
+  }
+  const phases = fm.phases ?? {};
+  const lowerPhases = new Set(Object.keys(phases).map((p) => p.toLowerCase()));
   const overlap = fm.terminal.filter((t) => lowerPhases.has(t.toLowerCase()));
   if (overlap.length > 0) return { ok: false, error: `${file}: ${overlap.join(", ")} cannot be both a phase and terminal` };
-  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(fm.phases).some((p) => p.stage === "build")) {
+  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(phases).some((p) => p.stage === "build")) {
     return { ok: false, error: `${file}: a ticket playbook with a build stage needs a ready gate` };
   }
 
@@ -319,7 +324,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       name: fm.name,
       kind: fm.kind,
       source: fm.source,
-      phases: fm.phases,
+      phases,
       terminal: fm.terminal,
       ready: fm.ready ?? null,
       promote: fm.promote ?? null,

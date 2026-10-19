@@ -23,6 +23,12 @@ describe("the kubectl gate", () => {
     }
     expect(kubectlRefusal(["get", "pods", "--context=bc-prod", "--request-timeout=20s"])).toBeNull();
   });
+
+  it("refuses --raw, which would make a get read any API path", () => {
+    for (const raw of [["get", "--raw", "/api/v1/namespaces/x/secrets"], ["get", "--raw=/api/v1/namespaces/x/secrets"], ["get", "pods", "--raw", "/healthz"]]) {
+      expect(kubectlRefusal(raw), raw.join(" ")).toMatch(/kubectl --raw is not allowed/u);
+    }
+  });
 });
 
 describe("the kubectl reader", () => {
