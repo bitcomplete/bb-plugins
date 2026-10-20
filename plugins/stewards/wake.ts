@@ -800,7 +800,11 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   ];
   out.push("### What moved", "", ...capped(moved, "Nothing moved."), "");
 
-  const asked = new Set(questions.map(({ question: q }) => q.escalationId).filter((id) => id !== null));
+  // A question or a need covers the escalation it was made for: list the
+  // question or the item, never the raw escalation too.
+  const asked = new Set(
+    [...questions.map(({ question: q }) => q.escalationId), ...(r.needs ?? []).map(({ need: n }) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null))].filter((id): id is string => id !== null),
+  );
   const waiting = [
     ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}`),
     ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`),

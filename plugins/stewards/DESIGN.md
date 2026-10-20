@@ -537,11 +537,14 @@ hard stop is the runaway guard (§12).
 - **Questions to you are records.** Whatever the project steward asks you is
   a row in the `questions` table, not just a sentence in its reply, so a
   compaction cannot lose it and an answer given elsewhere cannot leave it
-  listed as open. A row is made two ways: when it forwards an escalation to
-  you (`steward_update { forward }` with the route reaching `me`), bound to
-  that escalation and its binding; and when it asks you something itself
-  with `steward_update { ask: { question, context } }`, bound to a binding
-  when it names one. It closes when the project steward records your answer
+  listed as open. A row is made when the project steward asks you something
+  itself with `steward_update { ask: { question, context } }`, bound to a
+  binding when it names one; and when it forwards a non-approval escalation
+  to you (`steward_update { forward }` with the route reaching `me`), bound
+  to that escalation and its binding. A forwarded `approval` escalation is
+  not a question: it becomes an `approve-spec` need with Approve/Decline
+  (§18), and the escalation stays open, linked to it. A question closes when
+  the project steward records your answer
   (`steward_update { resolve: "<question id>", answer }`) or when you close
   it on the stewards page, with or without an answer. A question made by
   forwarding and its escalation close together, in one transaction, from
@@ -830,7 +833,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 
 | kind | filed by | link | done when | one-click action |
 | -- | -- | -- | -- | -- |
-| `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me` | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
+| `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
 | `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the question record's text box) |
@@ -862,6 +865,15 @@ The rules that hold:
   changed", and the wake lists the binding's open items and says not to ask the
   user about them in prose. Closing an item from the page or with
   `bb stewards done <id>` does the same.
+- **A forwarded approval is a need.** When the project steward forwards an
+  `approval` escalation to the user, the plugin files an `approve-spec` need
+  on the binding and keeps the escalation open, linked to it
+  (`data.escalationId`), instead of a free-text question: the binding is
+  waiting on the user's approval exactly as `approval: me` would be. The
+  page's Approve and Decline, and `bb stewards done` for Approve, record the
+  gate verdict and resolve the open `approval` escalations in the same step,
+  so the project steward is not left holding the request. A forwarded
+  `decision` escalation stays a question, answered in prose.
 - **Dedupe.** A need is keyed by (binding, kind, url) while open: a steward
   that re-reports updates the wording rather than adding a row. The store
   enforces it with a partial unique index.
