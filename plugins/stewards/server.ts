@@ -2983,7 +2983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             kind: z.enum(ESCALATION_KINDS).describe("blocked, decision, scope (the scope must change), conflict (the entity's state contradicts the playbook), or stuck."),
             question: z.string().trim().min(1).max(1500).describe("One answerable question."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
-            choices: choicesSchema.optional().describe("2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
+            choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
           })
           .optional()
           .describe("Something the project's guidance does not let you decide. It goes to your parent steward, then the project steward; the answer comes back as guidance and wakes you."),
@@ -3020,6 +3020,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           if (input.followThrough !== undefined && b.ending !== "terminal") {
             return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
+          }
+          // Fixed choices are for a decision, as a `decide` need is: they are
+          // what a forwarded escalation turns into a question with buttons.
+          if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
+            return toolError(new Error("choices are for a decision escalation: escalate a decision, or file a decide need."));
           }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
@@ -3832,11 +3837,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   }
                   return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
                 }
-                store.answer(q.id, "Closed from a thread.", "user");
+                const answer = note ?? "Closed from a thread.";
+                store.answer(q.id, answer, "user");
                 if (x !== null) {
                   const b = store.binding(x.bindingId);
                   if (b !== null) {
-                    store.note(b.id, `Question ${q.id} was closed from a thread.`);
+                    if (note !== null) store.addGuidance(b.id, note, "user");
+                    store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
                     scheduleReconcile(b.id);
                   }
                 }
@@ -3881,9 +3888,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 await wakeProjectOnForwardedAnswer(b, closure, forwarded);
                 return { exitCode: 0, stdout: `Approved ${id}; ${b.entityKey}'s steward has been told.` };
               }
-              store.closeNeed(n.id, "Closed from a thread.");
+              store.closeNeed(n.id, note === null ? "Closed from a thread." : `Answered from a thread: ${note}`);
               if (b !== null) {
-                store.note(b.id, `${n.kind} item ${n.id} was closed from a thread.`);
+                if (note !== null) store.addGuidance(b.id, note, "user");
+                store.note(b.id, note === null ? `${n.kind} item ${n.id} was closed from a thread.` : `${n.kind} item ${n.id} was answered from a thread: ${note}.`);
                 scheduleReconcile(b.id);
               }
               return { exitCode: 0, stdout: `Closed ${id}.` };

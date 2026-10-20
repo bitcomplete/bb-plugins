@@ -2515,6 +2515,21 @@ describe("fixed choices on decide items and questions", () => {
     expect(wrongKind.error).toBe(false);
     expect(wrongKind.text).toMatch(/choices are for a decide item/u);
     expect(t.hooks.store.openNeeds(t.binding().id).some((n) => n.kind === "configure")).toBe(false);
+    // Choices on an escalation are for a decision, as on a need.
+    const wrongEscalation = await t.tool("steward_report", { ...base, escalate: { kind: "scope", question: "Widen it?", meanwhile: "Wait.", choices: ["Yes", "No"] } }, t.steward);
+    expect(wrongEscalation.error).toBe(true);
+    expect(wrongEscalation.text).toMatch(/choices are for a decision escalation/u);
+    expect(t.hooks.store.openEscalations(t.binding().id)).toEqual([]);
+  });
+
+  it("bb stewards done --note without --choice keeps the note as the answer and guidance", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Which way?" }] }, t.steward);
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
+    const out = await t.harness.behavior.runCli(["done", need.id, "--note", "The second way", "--project", "p1"]);
+    expect(out).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Closed/u) });
+    expect(t.hooks.store.need(need.id)!.resolution).toBe("Answered from a thread: The second way");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("The second way");
   });
 });
 
