@@ -189,6 +189,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   a choice is saved as guidance. `bb stewards done <id> --choice <label>`
   records the same from a thread. A `blockedOn` naming the user, the owner
   or a human is refused unless an open needs item says so.
+- **Lessons** are a project steward's general judgements, made permanent in
+  `.bb` instead of being lost with the ticket that raised them. It records
+  one with `steward_update { lesson: { text, file, scope } }`; a `procedure`
+  lesson it applies, commits and publishes, then self-merges with
+  `steward_update { lessonAction: { id, action: "complete" } }` (multi-repo
+  fast-forwards the canonical `.bb`, and only that lesson's file). A
+  `boundary` lesson — credentials and reach, who may direct a server,
+  irreversible production steps — is filed on the Stewards page with
+  **Merge** and **Drop**, and only you merge it. A lesson is `merged` when
+  its text is found in its file at `.bb` HEAD. `bb stewards lessons [--all]`
+  lists them, `bb stewards drop-lesson <id>` drops one. DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.

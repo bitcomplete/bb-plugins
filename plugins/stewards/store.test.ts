@@ -117,3 +117,50 @@ describe("needs you items", () => {
     expect(s.needs(binding.id, true)).toHaveLength(3);
   });
 });
+
+describe("lessons", () => {
+  it("are recorded pending with their source, and resolved once", () => {
+    const { s, binding, advance } = store();
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "New column?", meanwhile: "Wait.", route: "project", recommendation: null });
+    const lesson = s.addLesson({ projectId: "p1", bindingId: binding.id, escalationId: x.id, file: "stewards/linear-tickets.md", text: "A new column read with SELECT * breaks the previous image.", scope: "procedure", branch: "refs/heads/guidance-thr_project" });
+    expect(lesson).toMatchObject({
+      id: expect.stringMatching(/^lsn_/u),
+      projectId: "p1",
+      bindingId: binding.id,
+      escalationId: x.id,
+      file: "stewards/linear-tickets.md",
+      scope: "procedure",
+      status: "pending",
+      branch: "refs/heads/guidance-thr_project",
+      mergeSha: null,
+      createdAt: 1_000,
+      resolvedAt: null,
+    });
+    expect(s.lessons("p1").map((l) => l.id)).toEqual([lesson.id]);
+    expect(s.lessons("p2")).toEqual([]);
+    expect(s.lessons("p1", true)).toHaveLength(1);
+
+    advance(500);
+    s.markLessonMerged(lesson.id, "a".repeat(40), "refs/heads/guidance-thr_project");
+    expect(s.lesson(lesson.id)).toMatchObject({ status: "merged", mergeSha: "a".repeat(40), resolvedAt: 1_500 });
+    expect(s.lessons("p1")).toEqual([]);
+    expect(s.lessons("p1", true)).toHaveLength(1);
+    expect(s.mergedLessonsSince("p1", 1_400).map((l) => l.id)).toEqual([lesson.id]);
+    expect(s.mergedLessonsSince("p1", 1_600)).toEqual([]);
+
+    // Marking it merged again is idempotent and does not move resolved_at.
+    s.markLessonMerged(lesson.id, "b".repeat(40), null);
+    expect(s.lesson(lesson.id)).toMatchObject({ status: "merged", mergeSha: "b".repeat(40), resolvedAt: 1_500 });
+  });
+
+  it("are dropped with a note, and a dropped one is never pending again", () => {
+    const { s, binding } = store();
+    const lesson = s.addLesson({ projectId: "p1", bindingId: binding.id, escalationId: null, file: "AGENTS.md", text: "Who may direct a server.", scope: "boundary", branch: null });
+    s.setLessonBranch(lesson.id, "refs/heads/guidance-thr_project");
+    s.noteLesson(lesson.id, "Refused: changes files other than AGENTS.md.");
+    expect(s.lesson(lesson.id)).toMatchObject({ branch: "refs/heads/guidance-thr_project", note: "Refused: changes files other than AGENTS.md." });
+    s.markLessonDropped(lesson.id, "Dropped on the Stewards page.");
+    expect(s.lesson(lesson.id)).toMatchObject({ status: "dropped", resolvedAt: expect.any(Number) });
+    expect(s.lessons("p1")).toEqual([]);
+  });
+});

@@ -178,6 +178,28 @@ export const MIGRATIONS = [
   // A Sentry project binding's last look: the issues new, regressed or rung
   // since the look before, classified against the fingerprint map.
   `ALTER TABLE bindings ADD COLUMN sentry_look TEXT`,
+  // A general rule the project steward drew from an escalation or its own
+  // judgement, waiting to be made permanent in `.bb`. `procedure` lessons are
+  // self-merged by the project steward; `boundary` ones change its own
+  // escalation boundary and go to the user. `note` is the last refusal or
+  // explanation, shown in the nightly prompt.
+  `CREATE TABLE IF NOT EXISTS lessons (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     binding_id TEXT,
+     escalation_id TEXT,
+     file TEXT NOT NULL,
+     text TEXT NOT NULL,
+     scope TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     branch TEXT,
+     merge_sha TEXT,
+     note TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS lessons_project ON lessons (project_id, status)`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -496,6 +518,39 @@ export function needChoices(n: Pick<Need, "data">): string[] {
   return parsed.success ? parsed.data : [];
 }
 
+/**
+ * A lesson: a general rule the project steward drew from an escalation or its
+ * own judgement. `procedure` restates what it may already decide and it lands
+ * itself at `.bb` HEAD; `boundary` would change its own escalation boundary
+ * (credentials and reach, who may direct a server, irreversible production
+ * steps) and only the user may merge it. Every lesson keeps the binding and
+ * escalation it came from.
+ */
+export const LESSON_SCOPES = ["procedure", "boundary"] as const;
+export type LessonScope = (typeof LESSON_SCOPES)[number];
+export type LessonStatus = "pending" | "merged" | "dropped";
+export type Lesson = {
+  id: string;
+  projectId: string;
+  bindingId: string | null;
+  escalationId: string | null;
+  /** The `.bb` file the text belongs in, repo-relative. */
+  file: string;
+  /** The wording as it should read in the file. */
+  text: string;
+  scope: LessonScope;
+  status: LessonStatus;
+  /** The `guidance-<thread>` branch carrying it, once published. */
+  branch: string | null;
+  /** The canonical `.bb` commit it landed at, once merged. */
+  mergeSha: string | null;
+  /** The last refusal or explanation from a merge attempt, for the nightly prompt. */
+  note: string | null;
+  createdAt: number;
+  updatedAt: number;
+  resolvedAt: number | null;
+};
+
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
@@ -615,6 +670,18 @@ export function createStore(db: Database.Database, now: () => number) {
   const closeNeedKindStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND status = 'open'");
   const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
 
+  const insertLesson = db.prepare(
+    "INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, branch, created_at, updated_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @file, @text, @scope, @branch, @created_at, @updated_at)",
+  );
+  const getLesson = db.prepare<[string], Record<string, unknown>>("SELECT * FROM lessons WHERE id = ?");
+  const lessonsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND (? = 1 OR status = 'pending') ORDER BY created_at");
+  const mergedLessonsSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND status = 'merged' AND resolved_at >= ? ORDER BY resolved_at");
+  const setLessonBranchStmt = db.prepare("UPDATE lessons SET branch = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
+  const setLessonNoteStmt = db.prepare("UPDATE lessons SET note = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
+  const resolveLessonStmt = db.prepare(
+    "UPDATE lessons SET status = ?, merge_sha = COALESCE(?, merge_sha), branch = COALESCE(?, branch), note = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?) WHERE id = ?",
+  );
+
   const toNeed = (r: Record<string, unknown>): Need => ({
     id: String(r.id),
     bindingId: String(r.binding_id),
@@ -662,6 +729,22 @@ export function createStore(db: Database.Database, now: () => number) {
     digestPending: Number(r.digest_pending) === 1,
     title: r.title === null || r.title === undefined ? null : String(r.title),
     sectionId: r.section_id === null || r.section_id === undefined ? null : String(r.section_id),
+  });
+  const toLesson = (r: Record<string, unknown>): Lesson => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    bindingId: r.binding_id === null || r.binding_id === undefined ? null : String(r.binding_id),
+    escalationId: r.escalation_id === null || r.escalation_id === undefined ? null : String(r.escalation_id),
+    file: String(r.file),
+    text: String(r.text),
+    scope: String(r.scope) as LessonScope,
+    status: String(r.status) as LessonStatus,
+    branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
+    mergeSha: r.merge_sha === null || r.merge_sha === undefined ? null : String(r.merge_sha),
+    note: r.note === null || r.note === undefined ? null : String(r.note),
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
   });
 
   /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
@@ -961,6 +1044,60 @@ export function createStore(db: Database.Database, now: () => number) {
       const key = ticketKey.toUpperCase();
       const changed = did === "commented" ? setCommented.run(key, at, projectId, fingerprint) : setTicket.run(key, at, at, projectId, fingerprint);
       return changed.changes > 0;
+    },
+
+    // lessons: the project steward's general judgements, made permanent in `.bb`
+    /**
+     * Record a lesson, pending until its text is found at `.bb` HEAD or the
+     * user drops it. `branch` is the guidance branch it will be published on,
+     * computed from the project steward's thread when it has one.
+     */
+    addLesson(fields: { projectId: string; bindingId: string | null; escalationId: string | null; file: string; text: string; scope: LessonScope; branch: string | null }): Lesson {
+      const id = newId("lsn");
+      const at = now();
+      insertLesson.run({
+        id,
+        project_id: fields.projectId,
+        binding_id: fields.bindingId,
+        escalation_id: fields.escalationId,
+        file: fields.file,
+        text: fields.text,
+        scope: fields.scope,
+        branch: fields.branch,
+        created_at: at,
+        updated_at: at,
+      });
+      return toLesson(getLesson.get(id)!);
+    },
+    lesson(id: string): Lesson | null {
+      const r = getLesson.get(id);
+      return r === undefined ? null : toLesson(r);
+    },
+    /** A project's lessons: the pending ones by default, every one with `includeResolved`. */
+    lessons(projectId: string, includeResolved = false): Lesson[] {
+      return lessonsFor.all(projectId, includeResolved ? 1 : 0).map(toLesson);
+    },
+    /** Lessons that reached `.bb` HEAD in the window, for the digest. */
+    mergedLessonsSince(projectId: string, since: number): Lesson[] {
+      return mergedLessonsSince.all(projectId, since).map(toLesson);
+    },
+    /** Remember the guidance branch a lesson is published on. */
+    setLessonBranch(id: string, branch: string): void {
+      setLessonBranchStmt.run(branch, now(), id);
+    },
+    /** Record the last refusal or explanation from a merge attempt, for the prompt. */
+    noteLesson(id: string, note: string | null): void {
+      setLessonNoteStmt.run(note, now(), id);
+    },
+    /** Mark a lesson merged, keeping any sha and branch already recorded. */
+    markLessonMerged(id: string, sha: string | null, branch: string | null, note: string | null = null): void {
+      const at = now();
+      resolveLessonStmt.run("merged", sha, branch, note, at, at, id);
+    },
+    /** Mark a lesson dropped by the user or the project steward. */
+    markLessonDropped(id: string, note: string | null = null): void {
+      const at = now();
+      resolveLessonStmt.run("dropped", null, null, note, at, at, id);
     },
 
     // project stewards

@@ -66,7 +66,7 @@ import {
   type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
@@ -152,6 +152,20 @@ const readFilesOutput = z
   .object({ projectSourcePath: z.string().nullable(), head: z.string().nullable(), files: z.array(z.object({ path: z.string(), content: z.string().nullable() }).loose()), error: z.string().nullable() })
   .loose();
 const repoSetOutput = z.object({ repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()), error: z.string().nullable() }).loose();
+
+/** multi-repo's answer to a lesson merge, loose like the reads above. */
+const mergeGuidanceOutput = z.object({ ok: z.boolean(), sha: z.string().nullable(), branch: z.string().nullable(), message: z.string() }).loose();
+
+/**
+ * The `guidance-<thread>` ref a thread's `.bb` commits are published on.
+ * Duplicated from multi-repo's `guidanceRef` because it is a contract between
+ * the two: `workspace_publish_guidance` computes it from the calling thread,
+ * and a lesson records it before the merge so the page can name it.
+ */
+export const lessonBranchFor = (threadId: string): string => `refs/heads/guidance-${threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60)}`;
+
+/** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
+const normalizeLessonText = (text: string) => text.replace(/\s+/gu, " ").trim();
 
 /** The steward's own surface for the app and the CLI. Cross-plugin methods are in source-contract.ts. */
 export const rpcContract = defineRpcContract({
@@ -261,6 +275,8 @@ export const rpcContract = defineRpcContract({
               escalationId: z.string().nullable(),
               /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
               choices: z.array(z.string()),
+              /** The lesson a `decide` item is about, when it is a boundary lesson; null otherwise. */
+              lessonId: z.string().nullable(),
               what: z.string(),
               how: z.string().nullable(),
               threadId: z.string().nullable(),
@@ -268,6 +284,23 @@ export const rpcContract = defineRpcContract({
               /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
               actionable: z.boolean(),
               why: z.string().nullable(),
+            }),
+          ),
+          /** Pending lessons: general rules the project steward has recorded and not yet landed. */
+          lessons: z.array(
+            z.object({
+              id: z.string(),
+              bindingId: z.string().nullable(),
+              key: z.string().nullable(),
+              file: z.string(),
+              text: z.string(),
+              scope: z.string(),
+              status: z.string(),
+              branch: z.string().nullable(),
+              mergeSha: z.string().nullable(),
+              note: z.string().nullable(),
+              escalationId: z.string().nullable(),
+              createdAt: z.number(),
             }),
           ),
           stewards: z.array(
@@ -2062,7 +2095,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, needs, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, needs, lessons: store.lessons(projectId), timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -2088,7 +2121,95 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
+        lessonsMerged: store.mergedLessonsSince(projectId, since),
       };
+    }
+
+    // ---- lessons -------------------------------------------------------------------------------
+    //
+    // A lesson is a general rule the project steward drew from an escalation
+    // or its own judgement. It is pending until its text is found at `.bb`
+    // HEAD. A `procedure` lesson the project steward applies and publishes is
+    // self-merged through multi-repo; a `boundary` one changes its own
+    // escalation boundary and is filed for the user with Merge/Drop, never
+    // merged by the plugin.
+
+    /** Close the open Merge/Drop item for a boundary lesson, if one is filed. */
+    function closeLessonNeed(lesson: Lesson, resolution: string): void {
+      if (lesson.bindingId === null) return;
+      store.closeNeedByKey(lesson.bindingId, "decide", lesson.id, resolution);
+    }
+
+    /** Self-merge a procedure lesson, or file a boundary one for the user. */
+    async function completeLesson(lesson: Lesson, action: "complete" | "drop"): Promise<string> {
+      if (action === "drop") {
+        store.markLessonDropped(lesson.id, "Dropped by the project steward.");
+        closeLessonNeed(lesson, "Dropped by the project steward.");
+        return "dropped";
+      }
+      const threadId = store.project(lesson.projectId).threadId;
+      if (lesson.scope === "boundary") {
+        if (lesson.bindingId === null) return "a boundary lesson needs the binding it came from; record it with binding.";
+        const branch = lesson.branch ?? (threadId === null ? null : lessonBranchFor(threadId));
+        if (branch !== null) store.setLessonBranch(lesson.id, branch);
+        store.fileNeed({
+          bindingId: lesson.bindingId,
+          kind: "decide",
+          url: lesson.id,
+          what: `Merge or drop the boundary lesson for ${lesson.file}`,
+          how: [
+            "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
+            "",
+            `> ${lesson.text}`,
+            "",
+            `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
+            "Merge fast-forwards the canonical `.bb`; Drop discards it.",
+          ].join("\n"),
+          data: { lessonId: lesson.id, branch, file: lesson.file, choices: ["Merge", "Drop"] },
+          filedBy: "project",
+        });
+        return `boundary lesson; Merge/Drop filed for the user${branch === null ? "" : ` on ${branch}`}`;
+      }
+      if (threadId === null) {
+        store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing has been published.");
+        return "no project steward thread";
+      }
+      const result = await mergeLesson(lesson.projectId, threadId, lesson);
+      if (!result.ok) {
+        store.noteLesson(lesson.id, result.message);
+        return `merge refused: ${result.message}`;
+      }
+      store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch);
+      return `merged at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
+    }
+
+    /** Fast-forward the canonical `.bb` to a lesson's published branch, through multi-repo. */
+    async function mergeLesson(projectId: string, threadId: string, lesson: Lesson): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
+      try {
+        return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text: lesson.text }, mergeGuidanceOutput);
+      } catch (error) {
+        return { ok: false, sha: null, branch: lesson.branch, message: errorMessage(error) };
+      }
+    }
+
+    /** Each pass, a lesson whose text is already at `.bb` HEAD is merged, however it got there. */
+    async function reconcileLessons(config: ProjectConfig): Promise<void> {
+      const pending = store.lessons(config.projectId);
+      if (pending.length === 0) return;
+      for (const lesson of pending) {
+        // One lesson's file being unreadable — a bad path, a transient read
+        // failure — must not stop every other lesson being checked.
+        let content: string | null = null;
+        try {
+          content = (await readFiles(config.projectId, [lesson.file])).get(lesson.file) ?? null;
+        } catch (error) {
+          bb.log.warn(`stewards: could not read lesson ${lesson.id}'s file ${lesson.file}: ${errorMessage(error)}`);
+          continue;
+        }
+        if (content !== null && normalizeLessonText(content).includes(normalizeLessonText(lesson.text))) {
+          store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch);
+        }
+      }
     }
 
     /** Where an escalation goes next, above where it is. */
@@ -2858,6 +2979,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }),
             withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
             needs,
+            lessons: store.lessons(projectId).map((l) => {
+              const b = l.bindingId === null ? null : store.binding(l.bindingId);
+              return { id: l.id, bindingId: l.bindingId, key: b?.entityKey ?? null, file: l.file, text: l.text, scope: l.scope, status: l.status, branch: l.branch, mergeSha: l.mergeSha, note: l.note, escalationId: l.escalationId, createdAt: l.createdAt };
+            }),
             stewards: open.map((b) => ({
               key: b.entityKey,
               url: b.url,
@@ -3038,6 +3163,36 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (threadId === null) after(`The user pressed Provide for ${named} on the Stewards page; start the worker that will request it, and do not ask them again.`);
           else after(`The user provided ${named}${text === null ? "" : `: ${text}`}.`);
           return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId };
+        }
+
+        // A boundary lesson's Merge/Drop. Merge goes through the same
+        // multi-repo fast-forward the project steward's own self-merge uses;
+        // Drop discards it. Neither is a free-text answer.
+        if (need.kind === "decide" && action === "choose" && typeof need.data.lessonId === "string") {
+          const lesson = store.lesson(need.data.lessonId);
+          const label = choice === undefined || choice === null || choice === "" ? null : choice;
+          if (lesson === null || lesson.status !== "pending") {
+            store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
+            return { ok: false, message: "That lesson is already resolved." };
+          }
+          if (label === "Drop") {
+            store.markLessonDropped(lesson.id, "Dropped by the user on the Stewards page.");
+            store.closeNeedByKey(b.id, "decide", need.url, "Dropped on the Stewards page.");
+            after(`The user dropped lesson ${lesson.id} on the Stewards page.`);
+            return { ok: true, message: `Dropped; ${b.entityKey}'s steward has been told.` };
+          }
+          if (label !== "Merge") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Merge, Drop.` };
+          const threadId = store.project(b.projectId).threadId;
+          if (threadId === null) return { ok: false, message: "The project steward has no thread yet; nothing has been published." };
+          const result = await mergeLesson(b.projectId, threadId, lesson);
+          if (!result.ok) {
+            store.noteLesson(lesson.id, result.message);
+            return { ok: false, message: result.message };
+          }
+          store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged by the user on the Stewards page.");
+          store.closeNeedByKey(b.id, "decide", need.url, "Merged on the Stewards page.");
+          after(`The user merged lesson ${lesson.id} (${lesson.file}) on the Stewards page at ${result.sha ?? "?"}.`);
+          return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
         }
 
         if (need.kind === "decide" && action === "choose") {
@@ -3485,6 +3640,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
         approve: z.boolean().optional().describe("Approve the ticket's current spec for the ready gate."),
         quote: z.string().trim().min(2).max(500).optional().describe("When approving for the user: their words of approval, quoted exactly from a message they sent in this thread."),
+        lesson: z
+          .object({
+            text: z.string().trim().min(1).max(4000).describe("The rule as it should read in the file."),
+            file: z
+              .string()
+              .trim()
+              .min(1)
+              .max(300)
+              .refine(
+                (f) => !f.startsWith("/") && !f.includes("\\") && !f.includes("\0") && f.split("/").every((s) => s !== ".." && s !== "." && s.length > 0),
+                "a .bb-relative path with no leading /, backslash, NUL, or empty/./.. segment",
+              )
+              .describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
+            scope: z.enum(["procedure", "boundary"]).describe("procedure: playbook wording, sequencing, conventions the steward may already decide, which it self-merges. boundary: credentials and reach, who may direct a server, irreversible production steps — the user decides."),
+          })
+          .optional()
+          .describe("Project steward only: record a general rule drawn from an escalation or your own judgement, so it is made permanent in `.bb` instead of being lost with the ticket. With `binding` and `resolve`, it keeps the binding and escalation it came from. Apply and publish it, then complete it with lessonAction."),
+        lessonAction: z
+          .object({
+            id: z.string().trim().min(1).max(100).describe("The lesson id (lsn_…) from the nightly prompt or `bb stewards lessons`."),
+            action: z.enum(["complete", "drop"]).describe("complete: self-merge a procedure lesson, or file the user's Merge/Drop item for a boundary one. drop: discard it."),
+          })
+          .optional()
+          .describe("Project steward only: finish a pending lesson after applying and publishing it, or drop it."),
       }),
       async execute(input, { threadId }) {
         try {
@@ -3518,6 +3697,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
             return toolError(new Error("Only the project steward keeps questions to the user; a steward escalates with steward_report."));
           }
+          if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined)) {
+            return toolError(new Error("Only the project steward records and completes lessons; a steward escalates with steward_report."));
+          }
+          if (input.lessonAction !== undefined) {
+            const lesson = store.lesson(input.lessonAction.id);
+            if (lesson === null || lesson.projectId !== projectOf) return toolError(new Error(`No lesson ${input.lessonAction.id} in this project.`));
+            if (lesson.status !== "pending") return toolError(new Error(`Lesson ${lesson.id} is already ${lesson.status}.`));
+            const outcome = await completeLesson(lesson, input.lessonAction.action);
+            return `${lesson.id}: ${outcome}.`;
+          }
+          /** Record the lesson this call carries, with the binding and escalation it came from. */
+          const recordLesson = (bindingId: string | null, escalationId: string | null): string => {
+            const projectThread = store.project(projectOf!).threadId;
+            const branch = projectThread === null ? null : lessonBranchFor(projectThread);
+            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch });
+            return `lesson ${lesson.id} recorded (${lesson.scope}); apply it to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
+          };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
             if (q === null || q.projectId !== projectOf) return toolError(new Error(`No question ${resolve} in this project.`));
@@ -3550,8 +3746,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (target === null) {
             const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
-            if (closing === null && input.ask === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, or close one."));
-            return `${questionWrites(closing, null).join("; ")}.`;
+            if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
+            const written = questionWrites(closing, null);
+            if (input.lesson !== undefined) {
+              if (input.lesson.scope === "boundary") return toolError(new Error("A boundary lesson must name the binding it came from: pass binding (and resolve) so the user's Merge/Drop item has somewhere to live."));
+              written.push(recordLesson(null, closing?.question.escalationId ?? null));
+            }
+            return `${written.join("; ")}.`;
           }
           if (input.ask !== undefined && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
           const self = target.threadId === threadId;
@@ -3617,8 +3818,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const info = await threadInfo(target.threadId);
               if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             }
-            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, closing ?? undefined];
-            if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, or ask."));
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
+            if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, ask, or record a lesson."));
           }
           const behind: Binding[] = [];
           if (input.behind !== undefined) {
@@ -3649,6 +3850,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
 
           done.push(...questionWrites(closing, target));
+          if (input.lesson !== undefined) done.push(recordLesson(target.id, resolving?.id ?? closing?.question.escalationId ?? null));
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
@@ -3738,7 +3940,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -3759,7 +3961,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the action tells the steward to start the worker that requests it.
         threadId = typeof n.data.workerThreadId === "string" ? n.data.workerThreadId : null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     function formatBindings(rows: Binding[]): string {
@@ -3804,6 +4006,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (!(await settings.get()).paused) await adoptionPass(config);
         await keepProjectSteward(config.projectId);
         await syncOpsBindings(config);
+        await reconcileLessons(config);
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -3843,6 +4046,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         bb.log.info(`stewards: nightly pass for ${config.projectId} (${night})`);
         if (!(await settings.get()).paused) await adoptionPass(config);
+        await reconcileLessons(config);
         const order = store
           .open(config.projectId)
           .filter((b) => b.hold === null && b.ending === null)
@@ -4070,7 +4274,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const projectId = input.options.project ?? ctx.projectId;
               const rows = input.options.all ? store.all(projectId) : store.open(projectId);
-              return { exitCode: 0, stdout: input.options.json ? JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) : formatBindings(rows) };
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
+              const lessons = projectId === undefined ? [] : store.lessons(projectId);
+              const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
+              return { exitCode: 0, stdout: [formatBindings(rows), ...lessonLines].join("\n") };
+            },
+          }),
+
+          lessons: cliCommand({
+            summary: "Lessons the project steward recorded, and their state",
+            options: { all: { type: "boolean", description: "Include merged and dropped lessons" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = store.lessons(projectId, input.options.all ?? false);
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
+              if (rows.length === 0) return { exitCode: 0, stdout: "No pending lessons." };
+              return {
+                exitCode: 0,
+                stdout: rows
+                  .map((l) => {
+                    const b = l.bindingId === null ? null : store.binding(l.bindingId);
+                    const source = [b === null ? null : `from ${b.entityKey}`, l.escalationId].filter((x) => x !== null).join(", ");
+                    const landed = l.status === "merged" ? `${l.mergeSha === null ? "merged" : `merged at ${l.mergeSha.slice(0, 8)}`}${l.branch === null ? "" : ` on ${l.branch}`}` : l.status;
+                    return `${l.id} — ${landed}, ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
+                  })
+                  .join("\n"),
+              };
+            },
+          }),
+
+          "drop-lesson": cliCommand({
+            summary: "Drop a pending lesson the project steward recorded",
+            positionals: [{ name: "id", description: "The lesson id (lsn_…)", required: true }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const lesson = store.lesson(input.positionals.id);
+              if (lesson === null || lesson.projectId !== projectId) throw new PluginCliError(`No lesson ${input.positionals.id} in this project.`, { code: "lesson_not_found", hint: "bb stewards lessons lists them." });
+              if (lesson.status !== "pending") return { exitCode: 0, stdout: `Lesson ${lesson.id} is already ${lesson.status}.` };
+              store.markLessonDropped(lesson.id, "Dropped with bb stewards drop-lesson.");
+              if (lesson.bindingId !== null) store.closeNeedByKey(lesson.bindingId, "decide", lesson.id, "Dropped with bb stewards drop-lesson.");
+              return { exitCode: 0, stdout: `Dropped ${lesson.id}.` };
             },
           }),
 
@@ -4167,6 +4411,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const n = store.need(id);
               if (n === null) throw new PluginCliError(`No waiting item ${id}.`, { code: "need_not_found", hint: "bb stewards needs lists them." });
               if (n.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+              // A boundary lesson's Merge/Drop is not a free-text choice: Merge
+              // runs the multi-repo fast-forward, Drop discards it, and both
+              // close the item and wake the steward.
+              if (n.kind === "decide" && typeof n.data.lessonId === "string") {
+                const lesson = store.lesson(n.data.lessonId);
+                if (lesson === null || lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
+                const label = choice ?? null;
+                if (label !== "Merge" && label !== "Drop") throw new PluginCliError(`Lesson ${lesson.id} is Merge or Drop; pass --choice Merge or --choice Drop.`, { code: "choice_required" });
+                const b = store.binding(n.bindingId);
+                if (label === "Drop") {
+                  store.markLessonDropped(lesson.id, "Dropped from a thread.");
+                  store.closeNeedByKey(n.bindingId, "decide", n.url, "Dropped from a thread.");
+                  if (b !== null) {
+                    store.note(b.id, `The user dropped lesson ${lesson.id} from a thread.`);
+                    scheduleReconcile(b.id);
+                  }
+                  return { exitCode: 0, stdout: `Dropped ${lesson.id}.` };
+                }
+                const threadId = b === null ? null : store.project(b.projectId).threadId;
+                if (threadId === null) throw new PluginCliError("The project steward has no thread yet; nothing has been published.", { code: "no_project_steward" });
+                const result = await mergeLesson(b!.projectId, threadId, lesson);
+                if (!result.ok) {
+                  store.noteLesson(lesson.id, result.message);
+                  throw new PluginCliError(result.message, { code: "merge_refused" });
+                }
+                store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged from a thread.");
+                store.closeNeedByKey(n.bindingId, "decide", n.url, "Merged from a thread.");
+                if (b !== null) {
+                  store.note(b.id, `The user merged lesson ${lesson.id} from a thread at ${result.sha ?? "?"}.`);
+                  scheduleReconcile(b.id);
+                }
+                return { exitCode: 0, stdout: `Merged ${lesson.id}.` };
+              }
               if (choice !== undefined) {
                 if (n.kind !== "decide") throw new PluginCliError(`Choices are for a decide item; ${id} is ${n.kind}.`, { code: "not_decide" });
                 const choices = needChoices(n);

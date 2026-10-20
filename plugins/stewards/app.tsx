@@ -450,6 +450,30 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         )}
       </Section>
 
+      <Section title="Lessons" count={b.lessons.length}>
+        {b.lessons.length === 0 ? (
+          <None>No lessons are waiting to be landed.</None>
+        ) : (
+          <List>
+            {b.lessons.map((l) => (
+              <li key={l.id} className="flex flex-col gap-1 p-3">
+                <p className="flex flex-wrap items-center gap-2">
+                  <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
+                  <span className="font-medium">{l.file}</span>
+                  {l.key !== null ? <EntityLink entityKey={l.key} url={null} /> : null}
+                  <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
+                </p>
+                <p>{l.text}</p>
+                <p className="text-xs text-muted-foreground">
+                  {l.scope === "boundary" ? "Waiting on your Merge or Drop above." : "The project steward applies, commits and self-merges this."}
+                  {l.note !== null ? ` Last attempt: ${l.note}` : ""}
+                </p>
+              </li>
+            ))}
+          </List>
+        )}
+      </Section>
+
       <Section title="In flight" count={b.stewards.length}>
         {b.stewards.length === 0 ? (
           <None>No open stewards. Label a Linear ticket or pull request to adopt it.</None>
@@ -560,6 +584,8 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
   const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
   const choices = n.kind === "decide" ? n.choices : [];
+  // A lesson's Merge/Drop are its only choices: no free-text "Other…".
+  const lesson = n.lessonId !== null;
   const freeText = choices.length === 0 || other;
   return (
     <li className="flex flex-col gap-2 p-3">
@@ -571,7 +597,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
       <p>{n.what}</p>
       {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
       {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
-      {takesNote ? (
+      {takesNote && !lesson ? (
         <textarea
           value={note}
           onChange={(e) => setNote(e.target.value)}
@@ -614,9 +640,11 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
                 {choice}
               </button>
             ))}
-            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => setOther(true)}>
-              Other…
-            </button>
+            {lesson ? null : (
+              <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => setOther(true)}>
+                Other…
+              </button>
+            )}
           </>
         ) : (
           <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>

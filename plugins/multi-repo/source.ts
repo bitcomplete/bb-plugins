@@ -415,3 +415,78 @@ export async function pushGuidance(
     message: `Published ${head.slice(0, 8)} to ${ref} in ${projectSourcePath}. Merge it there when you are happy with it.`,
   };
 }
+
+/** The `guidance-<thread>` ref a thread's published commits land on. */
+export function guidanceRef(threadId: string): string {
+  const safeId = threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60);
+  return `refs/heads/guidance-${safeId}`;
+}
+
+/** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
+const normalized = (text: string) => text.replace(/\s+/gu, " ").trim();
+
+export interface MergeGuidanceResult {
+  ok: boolean;
+  sha: string | null;
+  branch: string | null;
+  message: string;
+}
+
+/**
+ * Fast-forward the canonical checkout to a thread's published guidance branch.
+ *
+ * {@link pushGuidance} lands a thread's `.bb` commits on `guidance-<threadId>`.
+ * This is the other half, and the only way a self-merged lesson reaches the
+ * HEAD that `readCommittedFiles` reads: the canonical repo's checked-out
+ * branch is fast-forwarded to that ref. It is deliberately narrow. It refuses
+ * a detached HEAD, a dirty working tree, a non-fast-forward, a commit range
+ * that changes anything but `file`, or a `file` that does not carry `text` —
+ * and on any refusal it leaves the branch exactly where it is, for a person to
+ * look at. A self-merged lesson may therefore only ever add its own wording to
+ * its own file; it cannot smuggle in a second change.
+ */
+export async function mergeGuidance(
+  projectSourcePath: string,
+  threadId: string,
+  file: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<MergeGuidanceResult> {
+  const branch = guidanceRef(threadId);
+  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
+  const refuse = (message: string): MergeGuidanceResult => ({ ok: false, sha: null, branch, message });
+
+  const head = await gitLine(projectSourcePath, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], options);
+  if (head === null || head.length === 0) return refuse(`${projectSourcePath} is not a git repo with a commit to fast-forward.`);
+  const current = await gitLine(projectSourcePath, ["rev-parse", "--abbrev-ref", "HEAD"], options);
+  if (current === null || current === "HEAD") return refuse(`${projectSourcePath} has a detached HEAD; check out a branch first.`);
+
+  const status = await gitIn(projectSourcePath, ["status", "--porcelain"], options);
+  if (status.code !== 0) return refuse(firstProblemLine(status));
+  if (status.stdout.trim() !== "") return refuse(`The canonical checkout has uncommitted changes; commit or stash them, then try again.`);
+
+  const ref = await gitLine(projectSourcePath, ["rev-parse", "--verify", "--quiet", `${branch}^{commit}`], options);
+  if (ref === null || ref.length === 0) return refuse(`No guidance branch ${branch} has been published; publish it first.`);
+
+  const ancestor = await gitIn(projectSourcePath, ["merge-base", "--is-ancestor", head, ref], options);
+  if (ancestor.code !== 0) return refuse(`${branch} is not a fast-forward of ${current}; merge it by hand.`);
+
+  const changed = await gitIn(projectSourcePath, ["diff", "--name-only", "-z", head, ref], options);
+  if (changed.code !== 0) return refuse(firstProblemLine(changed));
+  const paths = splitNul(changed.stdout);
+  if (paths.length === 0) return refuse(`${branch} has no commits beyond ${current}; there is nothing to merge.`);
+  const other = paths.filter((path) => path !== file);
+  if (other.length > 0) {
+    return refuse(`${branch} changes files other than ${file}: ${other.slice(0, 5).join(", ")}. Merge it by hand.`);
+  }
+
+  const content = await gitIn(projectSourcePath, ["show", `${ref}:${file}`], { ...options, maxBytes: 2_000_000 });
+  if (content.code !== 0) return refuse(`${file} is not in ${branch}.`);
+  if (!normalized(content.stdout).includes(normalized(text))) return refuse(`${file} in ${branch} does not carry the lesson text; commit it, then try again.`);
+
+  const merged = await gitIn(projectSourcePath, ["merge", "--ff-only", "--quiet", ref], options);
+  if (merged.code !== 0) return refuse(firstProblemLine(merged));
+  const newHead = await gitLine(projectSourcePath, ["rev-parse", "HEAD"], options);
+  if (newHead === null) return refuse(`Fast-forwarded ${branch}, but the new HEAD could not be read.`);
+  return { ok: true, sha: newHead, branch, message: `Fast-forwarded ${current} to ${newHead.slice(0, 8)} from ${branch}.` };
+}
