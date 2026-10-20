@@ -54,7 +54,11 @@ function world() {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
     let out: unknown;
-    if (args.method === "readProjectFiles") out = { projectSourcePath: "/p/.bb", head: "abc", files: (input.paths as string[]).map((path) => ({ path, content: files[path] ?? null })), error: null };
+    if (args.method === "readProjectFiles") {
+      const paths = input.paths as string[];
+      if (paths.some((path) => path.startsWith("/") || path.includes("\\") || path.split("/").includes(".."))) throw new Error(`bad project file path: ${paths.join(", ")}`);
+      out = { projectSourcePath: "/p/.bb", head: "abc", files: paths.map((path) => ({ path, content: files[path] ?? null })), error: null };
+    }
     else if (args.method === "repoSet") out = { repos, error: null };
     else if (args.method === "sourceSnapshot") out = { snapshot: entities.get(String(input.id)) ?? null };
     else if (args.method === "sourceSetInterest") out = { ok: true };
@@ -3301,6 +3305,7 @@ describe("lessons", () => {
     // file and text are required.
     await expect(t.tool("steward_update", { lesson: { text: lesson, scope: "procedure" } }, t.project)).rejects.toThrow(/file/u);
     await expect(t.tool("steward_update", { lesson: { file: "AGENTS.md", scope: "procedure" } }, t.project)).rejects.toThrow(/text/u);
+    await expect(t.tool("steward_update", { lesson: { text: lesson, file: "/etc/passwd", scope: "procedure" } }, t.project)).rejects.toThrow(/relative path/u);
 
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
     expect(recorded).toMatchObject({ error: false, text: expect.stringMatching(/lesson lsn_\S+ recorded \(procedure\)/u) });
@@ -3387,6 +3392,32 @@ describe("lessons", () => {
 
   it("a lesson becomes merged when its text is at .bb HEAD on the next pass", async () => {
     const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.files["AGENTS.md"] = `# Guidance\n\n${lesson}\n`;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
+  });
+
+  it("names a merged lesson, its sha, branch and source in the digest", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain("### Lessons landed");
+    expect(wake).toMatch(new RegExp(`- Merged lesson ${id} \\(procedure, AGENTS\\.md\\) at b{8} on refs/heads/guidance-${t.project} \\(from ${t.hooks.store.find("ENG-12")!.id}\\):`, "u"));
+    expect(wake).toContain(lesson);
+  });
+
+  it("does not let one unreadable lesson file stop the others being checked", async () => {
+    const t = await adopted();
+    // A bad path recorded directly (the tool refuses one now): the sweep must
+    // still mark the good lesson merged.
+    t.hooks.store.addLesson({ projectId: "p1", bindingId: t.hooks.store.find("ENG-12")!.id, escalationId: null, file: "/etc/passwd", text: "x", scope: "procedure", branch: null });
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     t.files["AGENTS.md"] = `# Guidance\n\n${lesson}\n`;

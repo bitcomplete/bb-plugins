@@ -997,9 +997,10 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   the item and wake the steward.
 - **The guard.** multi-repo exposes the merge as an RPC that refuses any
   caller but the stewards plugin, and stewards only calls it for a pending
-  lesson the project steward recorded. A `procedure` lesson may therefore
-  only ever add its own wording to its own file; it cannot smuggle in a
-  second change.
+  lesson the project steward recorded. The fast-forward can therefore only
+  change the lesson's own file, and only to a version carrying the lesson
+  text; other edits already in that file ride along, which the recorded sha
+  and the revert below cover.
 - **Status is observed, not assumed.** Every sweep and nightly pass reads
   each pending lesson's file at `.bb` HEAD and marks it `merged` when the
   normalised text is there, however it got there. `dropped` is set by the

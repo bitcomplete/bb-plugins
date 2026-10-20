@@ -1934,15 +1934,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function reconcileLessons(config: ProjectConfig): Promise<void> {
       const pending = store.lessons(config.projectId);
       if (pending.length === 0) return;
-      let contents: Map<string, string | null>;
-      try {
-        contents = await readFiles(config.projectId, [...new Set(pending.map((l) => l.file))]);
-      } catch (error) {
-        bb.log.warn(`stewards: could not check lessons for ${config.projectId}: ${errorMessage(error)}`);
-        return;
-      }
       for (const lesson of pending) {
-        const content = contents.get(lesson.file) ?? null;
+        // One lesson's file being unreadable — a bad path, a transient read
+        // failure — must not stop every other lesson being checked.
+        let content: string | null = null;
+        try {
+          content = (await readFiles(config.projectId, [lesson.file])).get(lesson.file) ?? null;
+        } catch (error) {
+          bb.log.warn(`stewards: could not read lesson ${lesson.id}'s file ${lesson.file}: ${errorMessage(error)}`);
+          continue;
+        }
         if (content !== null && normalizeLessonText(content).includes(normalizeLessonText(lesson.text))) {
           store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch);
         }
@@ -2922,7 +2923,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const threadId = store.project(b.projectId).threadId;
           if (threadId === null) return { ok: false, message: "The project steward has no thread yet; nothing has been published." };
           const result = await mergeLesson(b.projectId, threadId, lesson);
-          if (!result.ok) return { ok: false, message: result.message };
+          if (!result.ok) {
+            store.noteLesson(lesson.id, result.message);
+            return { ok: false, message: result.message };
+          }
           store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged by the user on the Stewards page.");
           store.closeNeedByKey(b.id, "decide", need.url, "Merged on the Stewards page.");
           after(`The user merged lesson ${lesson.id} (${lesson.file}) on the Stewards page at ${result.sha ?? "?"}.`);
@@ -3370,7 +3374,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         lesson: z
           .object({
             text: z.string().trim().min(1).max(4000).describe("The rule as it should read in the file."),
-            file: z.string().trim().min(1).max(300).describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
+            file: z
+              .string()
+              .trim()
+              .min(1)
+              .max(300)
+              .refine(
+                (f) => !f.startsWith("/") && !f.includes("\\") && !f.includes("\0") && f.split("/").every((s) => s !== ".." && s !== "." && s.length > 0),
+                "a .bb-relative path with no leading /, backslash, NUL, or empty/./.. segment",
+              )
+              .describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
             scope: z.enum(["procedure", "boundary"]).describe("procedure: playbook wording, sequencing, conventions the steward may already decide, which it self-merges. boundary: credentials and reach, who may direct a server, irreversible production steps — the user decides."),
           })
           .optional()
@@ -4104,7 +4117,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const threadId = b === null ? null : store.project(b.projectId).threadId;
                 if (threadId === null) throw new PluginCliError("The project steward has no thread yet; nothing has been published.", { code: "no_project_steward" });
                 const result = await mergeLesson(b!.projectId, threadId, lesson);
-                if (!result.ok) throw new PluginCliError(result.message, { code: "merge_refused" });
+                if (!result.ok) {
+                  store.noteLesson(lesson.id, result.message);
+                  throw new PluginCliError(result.message, { code: "merge_refused" });
+                }
                 store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged from a thread.");
                 store.closeNeedByKey(n.bindingId, "decide", n.url, "Merged from a thread.");
                 if (b !== null) {
