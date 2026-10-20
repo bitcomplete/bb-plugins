@@ -2044,7 +2044,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (wantsSpec) {
         fileApproveSpecNeed(b, observed.entity, forwarded?.id ?? null);
       } else {
-        store.closeNeeds(b.id, "approve-spec", gate.passed ? "The spec is approved." : "The gate no longer waits on the user.");
+        const why = gate.passed ? "The spec is approved." : !gate.checklistMet ? "Withdrawn: the ready checklist is no longer met." : !gate.approvalNeeded ? "Withdrawn: the ticket is not substantial." : "Withdrawn.";
+        store.closeNeeds(b.id, "approve-spec", why);
+        // The gate no longer waits, so a forwarded request is withdrawn with
+        // it rather than left open for the page's raw-escalation prose row.
+        if (forwarded !== null) store.resolve(forwarded.id, why);
       }
 
       for (const pull of observedPulls(b, observed)) {
@@ -3764,7 +3768,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // gate, the need and the forwarded escalation move together.
               // Decline it on the Stewards page.
               if (b !== null && n.kind === "approve-spec") {
-                const entity = b.lastSnapshot?.entity ?? null;
+                // Fresh like the page, so both surfaces pin the same spec.
+                const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
                 if (entity === null) throw new PluginCliError(`Cannot read ${b.entityKey}'s spec to approve it.`, { code: "need_not_readable", hint: "Look at it again with bb stewards pass, then retry." });
                 const { closure, forwarded } = recordSpecVerdict(b, "approve", entity, null, "from a thread");
                 store.note(b.id, closure);

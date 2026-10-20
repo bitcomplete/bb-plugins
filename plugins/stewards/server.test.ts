@@ -2502,6 +2502,25 @@ describe("forwarded spec approvals", () => {
     expect(t.hooks.store.openQuestions("p1")).toHaveLength(1);
     expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id)).toEqual([]);
   });
+
+  it("still interprets an ambiguous answer to a legacy forwarded approval question", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project] = t.spawns.map((x) => x.id) as [string, string];
+    const binding = t.hooks.store.find("ENG-12")!;
+    // A question forwarded before BB-19, kept for live databases: bound to an
+    // approval escalation and answered with words that are not a verdict.
+    const esc = t.hooks.store.escalate({ bindingId: binding.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "me", recommendation: null });
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: binding.id, escalationId: esc.id, question: esc.question, context: null });
+    const projectWakes = () => t.sends.filter((s) => s.threadId === project).length;
+    const before = projectWakes();
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: q.id, answer: "What about SSO?" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/project steward/u) });
+    expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
+    expect(t.hooks.store.find("ENG-12")!.ready.declinedSpecHash).toBeNull();
+    expect(t.hooks.store.escalation(esc.id)).toMatchObject({ status: "open", route: "project" });
+    expect(projectWakes()).toBeGreaterThan(before);
+  });
 });
 
 describe("the settings page", () => {
