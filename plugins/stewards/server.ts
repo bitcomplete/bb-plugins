@@ -279,6 +279,8 @@ export const rpcContract = defineRpcContract({
               lessonId: z.string().nullable(),
               what: z.string(),
               how: z.string().nullable(),
+              /** For a provide-secret item: where the value goes, in words. */
+              destination: z.string().nullable(),
               threadId: z.string().nullable(),
               createdAt: z.number(),
               /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
@@ -383,43 +385,146 @@ export const choicesSchema = z
   .max(6)
   .refine((labels) => new Set(labels).size === labels.length, "choices must be distinct");
 
+/**
+ * The dotenv value `bb secret request` wrote for one variable, or null. The
+ * file is read on the invoking thread's host through `bb.sdk.files`; only the
+ * named variable's value is returned, and the value is never logged.
+ */
+export function parseDotenvValue(content: string, name: string): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const pattern = new RegExp(`^\\s*(?:export\\s+)?${escaped}\\s*=\\s*(.*)$`, "u");
+  for (const line of content.split(/\r?\n/u)) {
+    const match = pattern.exec(line);
+    if (match === null) continue;
+    return unquoteDotenvValue(stripDotenvComment((match[1] ?? "").trim()));
+  }
+  return null;
+}
+
+function stripDotenvComment(raw: string): string {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote === '"' && ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = quote === ch ? null : (quote ?? ch);
+      continue;
+    }
+    if (ch === "#" && quote === null && i > 0 && /\s/u.test(raw[i - 1] ?? "")) return raw.slice(0, i).trimEnd();
+  }
+  return raw;
+}
+
+function unquoteDotenvValue(raw: string): string {
+  if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1);
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    return raw
+      .slice(1, -1)
+      .replace(/\\n/gu, "\n")
+      .replace(/\\r/gu, "\r")
+      .replace(/\\"/gu, '"')
+      .replace(/\\\\/gu, "\\");
+  }
+  return raw;
+}
+
+/** Where a provide-secret item's value goes, for the page and the requester prompt. */
+export function secretDestination(need: Pick<Need, "data">): string | null {
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  if (setting !== null) return `the stewards setting ${setting}`;
+  const writeEnv = typeof need.data.writeEnv === "string" && need.data.writeEnv.trim() !== "" ? need.data.writeEnv.trim() : null;
+  if (writeEnv !== null) return `the dotenv ${writeEnv}`;
+  return "a dotenv on this machine";
+}
+
+/** The env var a provide-secret item's dotenv holds: `variable`, else the setting name in SCREAMING_SNAKE_CASE. */
+export function secretVariable(need: Pick<Need, "what" | "data">): string {
+  const variable = typeof need.data.variable === "string" && need.data.variable.trim() !== "" ? need.data.variable.trim() : null;
+  if (variable !== null) return variable;
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  if (setting !== null) return setting.replace(/([a-z0-9])([A-Z])/gu, "$1_$2").replace(/[^A-Za-z0-9_]/gu, "_").toUpperCase();
+  return need.what.trim();
+}
+
+/**
+ * The fixed prompt the plugin gives the requester thread it spawns for a
+ * provide-secret need. The form opens in that thread's first turn; the value
+ * never reaches the agent, argv, logs or the timeline. The prompt says what to
+ * report when the request fails, so the steward is told.
+ */
+export function requesterPrompt(b: Pick<Binding, "entityKey">, need: Pick<Need, "what" | "data">, writeEnv: string): string {
+  const variable = secretVariable(need);
+  const rawPurpose = typeof need.data.purpose === "string" && need.data.purpose.trim() !== "" ? need.data.purpose.trim() : `the value ${b.entityKey} needs`;
+  const purpose = rawPurpose.replace(/\s+/gu, " ");
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  const lines = [
+    `You are a one-task requester thread started by the stewards plugin for ${b.entityKey}. The user is waiting to enter a secret through bb's secure form. Do only this; do not explore the workspace or do anything else.`,
+    "",
+    "Run this command and wait for the user to submit the form in this thread:",
+    "",
+    `    bb secret request ${variable} --purpose ${JSON.stringify(purpose)} --write-env ${JSON.stringify(writeEnv)}`,
+  ];
+  if (setting !== null) {
+    lines.push("", "Then, once it succeeds, run:", "", `    bb stewards secret import --from ${JSON.stringify(writeEnv)} --setting ${setting}`);
+  }
+  lines.push(
+    "",
+    "The form is masked; the value never reaches you, argv, logs or the timeline. Never read, echo or cat the dotenv file. When it succeeds, reply with one short line saying the secret was provided.",
+    "If the request fails or is cancelled, reply with one line saying what failed (the error code or message). Do not retry more than once, and never paste any value.",
+  );
+  return lines.join("\n");
+}
+
+export const STEWARDS_SETTINGS = {
+  paused: {
+    type: "boolean",
+    label: "Pause stewards",
+    description: "No steward is woken and nothing new is adopted while this is on. Changes still queue up and are delivered when it is turned off.",
+    default: false,
+  },
+  workerSpawnsPerHour: {
+    type: "number",
+    label: "Worker spawns per binding per hour",
+    description: "The runaway guard: a steward that tries to start more workers than this in an hour is refused. Not a budget.",
+    default: 6,
+  },
+  compactAboveTokens: {
+    type: "number",
+    label: "Compact a steward above this many context tokens",
+    description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
+    default: 120_000,
+  },
+  sentryToken: {
+    type: "string",
+    secret: true,
+    label: "Sentry token",
+    description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its bb-gate-hooks leases with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
+  },
+  sentryApiUrl: {
+    type: "string",
+    label: "Sentry API",
+    description: "Where Sentry is read; change it for a self-hosted Sentry.",
+    default: SENTRY_API_URL,
+  },
+} as const;
+
+/** The declared settings a provide-secret need may name: only `secret: true` fields are accepted. */
+export const SECRET_SETTING_NAMES = new Set(Object.entries(STEWARDS_SETTINGS).filter(([, descriptor]) => "secret" in descriptor && descriptor.secret === true).map(([name]) => name));
+
 export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
     const timing: Timing = { ...DEFAULT_TIMING, ...deps.timing };
     const now = deps.now;
     const github = deps.github ?? createGhWriter();
-    const settings = bb.settings.define({
-      paused: {
-        type: "boolean",
-        label: "Pause stewards",
-        description: "No steward is woken and nothing new is adopted while this is on. Changes still queue up and are delivered when it is turned off.",
-        default: false,
-      },
-      workerSpawnsPerHour: {
-        type: "number",
-        label: "Worker spawns per binding per hour",
-        description: "The runaway guard: a steward that tries to start more workers than this in an hour is refused. Not a budget.",
-        default: 6,
-      },
-      compactAboveTokens: {
-        type: "number",
-        label: "Compact a steward above this many context tokens",
-        description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
-        default: 120_000,
-      },
-      sentryToken: {
-        type: "string",
-        secret: true,
-        label: "Sentry token",
-        description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its bb-gate-hooks leases with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
-      },
-      sentryApiUrl: {
-        type: "string",
-        label: "Sentry API",
-        description: "Where Sentry is read; change it for a self-hosted Sentry.",
-        default: SENTRY_API_URL,
-      },
-    });
+    const settings = bb.settings.define(STEWARDS_SETTINGS);
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
 
@@ -1013,6 +1118,72 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.patch(b.id, { threadId: thread.id });
       bb.log.info(`stewards: ${b.entityKey} is stewarded by thread ${thread.id}`);
       return thread.id;
+    }
+
+    /**
+     * The dotenv the requester writes for a provide-secret need. The need's
+     * own `writeEnv` wins; a stewards setting always uses the requester's
+     * temporary storage; otherwise the named worker's thread storage, so the
+     * value lands where the worker reads it.
+     */
+    async function requesterWriteEnv(need: Need, requesterHostId: string | null): Promise<string> {
+      const named = typeof need.data.writeEnv === "string" && need.data.writeEnv.trim() !== "" ? need.data.writeEnv.trim() : null;
+      if (named !== null) return named;
+      if (typeof need.data.setting === "string" && need.data.setting.trim() !== "") return "$BB_THREAD_STORAGE/.secrets.env";
+      const workerThreadId = typeof need.data.workerThreadId === "string" ? need.data.workerThreadId : null;
+      if (workerThreadId !== null) {
+        try {
+          const location = await bb.sdk.threads.storageLocation({ threadId: workerThreadId });
+          if (typeof location.storageRootPath === "string" && location.storageRootPath !== "") {
+            // Only write another thread's storage when it is on the requester's
+            // own machine; a cross-host path is not the requester's to write.
+            if (requesterHostId === null || location.hostId === requesterHostId) return `${location.storageRootPath.replace(/\/$/u, "")}/.secrets.env`;
+            bb.log.warn(`stewards: worker ${workerThreadId} is on ${location.hostId}, not the requester's ${requesterHostId}; writing the requester's own storage`);
+          }
+        } catch (error) {
+          bb.log.warn(`stewards: could not resolve worker ${workerThreadId}'s storage (${errorMessage(error)}); using the requester's own`);
+        }
+      }
+      return "$BB_THREAD_STORAGE/.secrets.env";
+    }
+
+    /**
+     * Spawn the fixed-prompt requester thread for an open provide-secret need,
+     * on the same machine and with the same model the binding's workers use. It
+     * is recorded as a worker so the steward is told when it finishes, and
+     * bound to the need so `bb stewards secret import` accepts only it.
+     */
+    async function spawnRequester(b: Binding, need: Need): Promise<string> {
+      const config = await loadConfig(b.projectId);
+      const playbook = config === null ? null : bindingPlaybook(config, b);
+      const model = playbook === null ? parseModel(b.modelWorker) : workerModel(b, playbook);
+      const hostId = await projectHost(b.projectId);
+      const writeEnv = await requesterWriteEnv(need, hostId);
+      const variable = secretVariable(need);
+      const title = `Provide ${variable} for ${b.entityKey}`;
+      const sectionId = await projectSection(b.projectId);
+      const thread = await bb.sdk.threads.spawn({
+        projectId: b.projectId,
+        environment: freshEnvironment(hostId),
+        prompt: requesterPrompt(b, need, writeEnv),
+        title,
+        ...modelArgs(model),
+        ...(sectionId === null ? {} : { sectionId }),
+        pluginMetadata: { role: "requester", bindingId: b.id, needId: need.id },
+      });
+      store.setSecretRequester(thread.id, need.id);
+      store.addWorker(thread.id, b.id, title);
+      bb.log.info(`stewards: started a requester thread for ${b.entityKey}'s ${variable} (${thread.id})`);
+      return thread.id;
+    }
+
+    /** Close the provide-secret need a requester was spawned for, once it has finished. */
+    function closeRequesterNeed(threadId: string): void {
+      const requester = store.secretRequester(threadId);
+      if (requester === null) return;
+      const need = store.need(requester.needId);
+      if (need === null || need.status !== "open") return;
+      store.closeNeed(need.id, "The requester thread finished; the secret was provided through bb's secure form.");
     }
 
     // ---- the reconcile loop ------------------------------------------------------------------
@@ -2547,6 +2718,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (worker !== null) {
         if (worker.status === "stopped") return;
         store.setWorker(thread.id, "finished", lastAssistantText === null ? null : clip(lastAssistantText, 4000));
+        closeRequesterNeed(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
         store.note(b.id, `Worker "${worker.title}" finished its turn.`);
@@ -2766,6 +2938,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const worker = store.worker(thread.id);
       if (worker === null || !workerInFlight(worker)) return;
       store.setWorker(thread.id, "failed", error);
+      closeRequesterNeed(thread.id);
       store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
       scheduleReconcile(worker.bindingId);
     });
@@ -2777,6 +2950,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.archived", ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+      // An archived requester can no longer import; drop its binding so the
+      // page's next Provide spawns a fresh one.
+      if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
     });
     bb.events.on("thread.deleted", ({ thread }) => {
       const worker = store.worker(thread.id);
@@ -3157,12 +3333,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
         if (need.kind === "provide-secret") {
           if (action !== "provide" && action !== "done") return { ok: false, message: "Provide the secret, or mark it done." };
-          const threadId = typeof need.data.workerThreadId === "string" ? need.data.workerThreadId : null;
-          const named = typeof need.data.variable === "string" ? need.data.variable : need.what;
-          store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Provided on the Stewards page." : `Provided on the Stewards page: ${text}`);
-          if (threadId === null) after(`The user pressed Provide for ${named} on the Stewards page; start the worker that will request it, and do not ask them again.`);
-          else after(`The user provided ${named}${text === null ? "" : `: ${text}`}.`);
-          return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId };
+          const named = typeof need.data.variable === "string" && need.data.variable.trim() !== "" ? need.data.variable.trim() : need.what;
+          // Done is the manual escape hatch: the value was entered another way.
+          if (action === "done") {
+            store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Marked done on the Stewards page." : `Marked done on the Stewards page: ${text}`);
+            after(`The user marked ${named} done on the Stewards page${text === null ? "" : `: ${text}`}; the value was entered another way.`);
+            return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId: null };
+          }
+          // Provide opens bb's secure form in a requester thread the plugin
+          // spawns, so the user never has to prompt one. The need stays open
+          // until the requester finishes, so `bb stewards secret import`
+          // (case B) is accepted while it runs.
+          const existing = store.secretRequesterForNeed(need.id);
+          if (existing !== null) {
+            const info = await threadInfo(existing.threadId).catch(() => null);
+            if (info !== null && info.deletedAt === null && info.archivedAt === null) return { ok: true, message: `The form is already open for ${named}.`, threadId: existing.threadId };
+            store.clearSecretRequester(existing.threadId);
+          }
+          let requesterId: string;
+          try {
+            requesterId = await spawnRequester(b, need);
+          } catch (error) {
+            return { ok: false, message: `Could not start the requester thread: ${errorMessage(error)}` };
+          }
+          store.note(b.id, `Started a requester thread for ${named}; the user is entering it there.`);
+          return { ok: true, message: `Opening the secure form for ${named} in a new thread.`, threadId: requesterId };
         }
 
         // A boundary lesson's Merge/Drop. Merge goes through the same
@@ -3391,6 +3586,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               variable: z.string().trim().max(200).optional().describe("provide-secret: the variable name."),
               purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
               worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
+              writeEnv: z.string().trim().max(500).optional().describe("provide-secret: the dotenv path the requester writes (case A); defaults to the named worker's thread storage."),
+              setting: z.string().trim().max(200).optional().describe("provide-secret: the stewards plugin secret setting the value goes to (case B); only a declared secret setting is accepted."),
               page: z.string().trim().max(500).optional().describe("configure: the external page where the step happens."),
               choices: choicesSchema.optional().describe('decide only: 2-6 short labels the user picks between (["Merge", "Close", "Verify first"]); the page shows one button each, so do not write "reply with your choice" in prose.'),
             }),
@@ -3548,6 +3745,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: choices are for a decide item.`);
               continue;
             }
+            if (n.kind === "provide-secret" && n.variable === undefined && n.setting === undefined) {
+              refused.push(`provide-secret for ${n.what} not filed: name the env var with \`variable\`, or a stewards secret setting with \`setting\`.`);
+              continue;
+            }
+            if (n.setting !== undefined) {
+              if (n.kind !== "provide-secret") {
+                refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: setting is for a provide-secret item.`);
+                continue;
+              }
+              if (!SECRET_SETTING_NAMES.has(n.setting)) {
+                refused.push(`provide-secret for ${n.variable ?? n.what} not filed: ${JSON.stringify(n.setting)} is not a secret setting of the stewards plugin (secret settings: ${[...SECRET_SETTING_NAMES].join(", ") || "none"}).`);
+                continue;
+              }
+            }
             store.fileNeed({
               bindingId: b.id,
               kind: n.kind,
@@ -3558,6 +3769,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 ...(n.variable === undefined ? {} : { variable: n.variable }),
                 ...(n.purpose === undefined ? {} : { purpose: n.purpose }),
                 ...(n.worker === undefined ? {} : { workerThreadId: n.worker }),
+                ...(n.writeEnv === undefined ? {} : { writeEnv: n.writeEnv }),
+                ...(n.setting === undefined ? {} : { setting: n.setting }),
                 ...(n.page === undefined ? {} : { page: n.page }),
                 ...(n.choices === undefined ? {} : { choices: n.choices }),
               },
@@ -3940,7 +4153,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -3957,11 +4170,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           why = actionable ? null : working ? "a worker is still running" : (gate?.missing ?? "the pull request has not been observed yet");
         }
       } else if (n.kind === "provide-secret") {
-        // Always actionable: with a worker named, the page opens it; without,
-        // the action tells the steward to start the worker that requests it.
-        threadId = typeof n.data.workerThreadId === "string" ? n.data.workerThreadId : null;
+        // Always actionable: the page opens a requester thread and the form
+        // appears in its first turn. Link the thread once one has been spawned.
+        threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     function formatBindings(rows: Binding[]): string {
@@ -4534,6 +4747,54 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return { exitCode: 0, stdout: row.digest === null ? "No digest yet." : `${iso(row.digestAt ?? 0)}\n\n${row.digest}` };
             },
           }),
+
+          // Case B of a provide-secret need: a stewards secret setting cannot
+          // be reached by `bb secret request` (which writes a dotenv on the
+          // worker's machine), so the requester thread the plugin spawned
+          // reads that dotenv here and writes the setting. Only that thread,
+          // only while its need is open, and only for the need's own setting.
+          "secret import": cliCommand({
+            summary: "Write a secret from a dotenv into a declared secret setting (requester threads only)",
+            description:
+              "Only the requester thread the plugin spawned for an open provide-secret need may run this, and only for that need's own setting. The dotenv is read through bb.sdk.files on the invoking thread's host, the value is written with the plugin's settings, and the file is deleted. The value never appears in argv, logs, messages or output.",
+            options: {
+              from: { type: "string", required: true, description: "The dotenv file to read, on the invoking thread's host." },
+              setting: { type: "string", required: true, description: "The declared secret setting to write." },
+            },
+            async run(input, ctx) {
+              const from = input.options.from;
+              const setting = input.options.setting;
+              if (ctx.threadId === undefined) throw new PluginCliError("bb stewards secret import must run from a bb thread.", { code: "missing_thread" });
+              const requester = store.secretRequester(ctx.threadId);
+              if (requester === null) throw new PluginCliError("This thread is not a provide-secret requester thread.", { code: "not_requester", hint: "Press Provide on the Stewards page to open one." });
+              const need = store.need(requester.needId);
+              if (need === null || need.kind !== "provide-secret" || need.status !== "open") throw new PluginCliError("That provide-secret item is closed.", { code: "need_closed" });
+              const expected = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+              if (expected !== setting) throw new PluginCliError(`This item's secret goes to ${JSON.stringify(expected ?? "no setting")}, not ${JSON.stringify(setting)}.`, { code: "wrong_setting" });
+              if (!SECRET_SETTING_NAMES.has(setting)) throw new PluginCliError(`${JSON.stringify(setting)} is not a secret setting of the stewards plugin.`, { code: "not_secret_setting", hint: `Secret settings: ${[...SECRET_SETTING_NAMES].join(", ") || "none"}.` });
+              const variable = secretVariable(need);
+              const info = await threadInfo(ctx.threadId);
+              const hostId = info?.environmentHostId ?? null;
+              if (hostId === null) throw new PluginCliError("The requester thread has no machine to read the file from.", { code: "no_host" });
+              let content: string;
+              try {
+                const result = await bb.sdk.files.read({ hostId, path: from });
+                if (result.contentEncoding !== "utf8") throw new Error("the file is not UTF-8 text");
+                content = result.content;
+              } catch (error) {
+                throw new PluginCliError(`Could not read ${from} on the thread's machine: ${errorMessage(error)}`, { code: "read_failed" });
+              }
+              const value = parseDotenvValue(content, variable);
+              if (value === null || value === "") throw new PluginCliError(`${variable} is not set in ${from}.`, { code: "missing_value" });
+              try {
+                await settings.experimental_set({ [setting]: value } as unknown as Parameters<typeof settings.experimental_set>[0]);
+              } catch {
+                throw new PluginCliError(`Could not write the ${setting} setting; the value was not saved.`, { code: "write_failed" });
+              }
+              await bb.sdk.files.remove({ hostId, path: from }).catch(() => undefined);
+              return { exitCode: 0, stdout: `Imported ${setting}; the dotenv is gone.` };
+            },
+          }),
         },
       }),
     );
@@ -4543,12 +4804,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
-    testHooks.set(bb.pluginId, { sweep, store, db, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

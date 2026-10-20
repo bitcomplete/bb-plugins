@@ -200,6 +200,14 @@ export const MIGRATIONS = [
      resolved_at INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS lessons_project ON lessons (project_id, status)`,
+  // The requester thread the plugin spawned for an open provide-secret need
+  // (BB-22). `bb stewards secret import` accepts only this thread, only while
+  // the need is open, and only for the need's own `setting`.
+  `CREATE TABLE IF NOT EXISTS secret_requesters (
+     thread_id TEXT PRIMARY KEY,
+     need_id TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   )`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -494,7 +502,8 @@ export type NeedKind = (typeof NEEDS_KINDS)[number];
  * plugin from a snapshot or by a steward through `steward_report`. `url` is the
  * link (the ticket, the pull request, the external page); with `kind` it is the
  * dedupe key. `data` carries kind-specific fields (the pull request sha, the
- * secret's variable name, the worker thread to open).
+ * secret's variable name, purpose, `writeEnv` dotenv path or `setting`, and the
+ * worker thread to open).
  */
 export type Need = {
   id: string;
@@ -553,6 +562,9 @@ export type Lesson = {
 
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
+
+/** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
+export type SecretRequester = { threadId: string; needId: string; createdAt: number };
 
 /** One problem an ops steward has seen, and the ticket it is tracked under. */
 export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null; severity: string | null; ecosystem: string | null };
@@ -613,6 +625,10 @@ export function createStore(db: Database.Database, now: () => number) {
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
   const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
+  const insertSecretRequester = db.prepare("INSERT OR REPLACE INTO secret_requesters (thread_id, need_id, created_at) VALUES (?, ?, ?)");
+  const getSecretRequester = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE thread_id = ?");
+  const getSecretRequesterForNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE need_id = ? ORDER BY created_at DESC LIMIT 1");
+  const deleteSecretRequester = db.prepare("DELETE FROM secret_requesters WHERE thread_id = ?");
 
   const getFingerprint = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE project_id = ? AND fingerprint = ?");
   const fingerprintsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE binding_id = ? ORDER BY first_seen_at");
@@ -705,6 +721,11 @@ export function createStore(db: Database.Database, now: () => number) {
     result: r.result === null ? null : String(r.result),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
+  });
+  const toSecretRequester = (r: Record<string, unknown>): SecretRequester => ({
+    threadId: String(r.thread_id),
+    needId: String(r.need_id),
+    createdAt: Number(r.created_at),
   });
   const toFingerprint = (r: Record<string, unknown>): Fingerprint => ({
     projectId: String(r.project_id),
@@ -1011,6 +1032,22 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+    },
+
+    // provide-secret requester threads (BB-22)
+    setSecretRequester(threadId: string, needId: string): void {
+      insertSecretRequester.run(threadId, needId, now());
+    },
+    secretRequester(threadId: string): SecretRequester | null {
+      const r = getSecretRequester.get(threadId);
+      return r === undefined ? null : toSecretRequester(r);
+    },
+    secretRequesterForNeed(needId: string): SecretRequester | null {
+      const r = getSecretRequesterForNeed.get(needId);
+      return r === undefined ? null : toSecretRequester(r);
+    },
+    clearSecretRequester(threadId: string): void {
+      deleteSecretRequester.run(threadId);
     },
 
     // the fingerprint map

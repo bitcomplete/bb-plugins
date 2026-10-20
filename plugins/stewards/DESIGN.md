@@ -849,9 +849,9 @@ what a wake carries.
   from the wake's evidence and the code in its workspace. **Until a token
   is set, the look fails with "no Sentry token is configured"; that one
   failure wakes the steward**, which files the `provide-secret` need naming
-  the setting (variable `sentryToken`, the Sentry auth-tokens page, the
-  scopes) and does nothing else; later looks are quiet until the token
-  appears. Any other read failure (403, a wrong URL) is logged and shown by
+  the setting (variable `SENTRY_TOKEN`, setting `sentryToken`, the Sentry
+  auth-tokens page, the scopes) and does nothing else; later looks are quiet
+  until the token appears. Any other read failure (403, a wrong URL) is logged and shown by
   `bb stewards check`, and wakes nobody, as a namespace kubectl cannot read
   does not.
 - **Doorbells come from bb-gate-hooks directly** (`hooks-client.ts`, a copy
@@ -919,7 +919,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 | `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
-| `provide-secret` | steward, with the variable name and purpose | the worker thread | the worker's `bb secret request` completes | **Provide**: opens the worker thread named in the item, or wakes the steward to start the worker that will request it |
+| `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
 | `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |
 
 The rules that hold:
@@ -943,6 +943,18 @@ The rules that hold:
   since as not actionable and says why ("reviewer round 3 pending", "a worker
   is still running"). The merge action re-checks `prGate` against a fresh
   snapshot before it merges.
+- **A `provide-secret` item's import is bound to its requester.** Provide
+  spawns a fixed-prompt requester thread on the binding's machine with its
+  worker model and records the thread id against the need; the need stays open
+  until the requester finishes. `bb stewards secret import` accepts only that
+  thread, only while the need is open, and only for the need's own `setting`; a
+  non-secret setting, another thread, another setting, a file on another host,
+  and any import after the need closes are refused. The limit rests on
+  `ctx.threadId`, the thread id the CLI client posts (the same assumption
+  `bb stewards init` makes about "the thread's" machine): a shell could spoof
+  it, so the import is also confined to a setting the plugin itself declared
+  `secret: true`, and the value is never readable back through the plugin. The
+  value never appears in argv, logs, messages or output.
 - **Every action wakes the steward with the item's closure** under "What
   changed", and the wake lists the binding's open items and says not to ask the
   user about them in prose. Closing an item from the page or with

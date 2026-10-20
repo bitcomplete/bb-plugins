@@ -9,7 +9,7 @@ import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL } from "./config.js";
  * user sees.
  */
 const SECRET_REQUEST =
-  "A credential the work needs is the worker's to obtain with `bb secret request` (the `secrets` skill): put that in the task, never the secret, and never a script for the user to run. You file the user-facing item for it.";
+  "A credential the work needs is a `provide-secret` need, not a worker's job to prompt: file it with `steward_report { needs: [{ kind: \"provide-secret\", url, what, how, variable, purpose }] }` and the plugin opens bb's secure form in a requester thread. Name the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings. Never paste the secret, and never a script for the user to run.";
 
 /**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,

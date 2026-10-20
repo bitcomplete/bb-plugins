@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
-import { createStewardsPlugin, testHooks, type StewardsDeps } from "./server.js";
+import { createStewardsPlugin, parseDotenvValue, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
@@ -30,6 +30,9 @@ function world() {
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
   const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
+  /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
+  const fileContents = new Map<string, string>();
+  const fileKey = (hostId: string | undefined, path: string) => `${hostId ?? ""}:${path}`;
   const sections: Array<{ id: string; name: string }> = [];
   /** Each thread's latest context window reading, as bb reports it. */
   const usage = new Map<string, number>();
@@ -104,6 +107,16 @@ function world() {
         writes.push({ path: args.path, hostId: args.hostId });
         return { outcome: "written" };
       },
+      read: async (args: { path: string; hostId?: string }) => {
+        const key = fileKey(args.hostId, args.path);
+        if (!fileContents.has(key)) throw Object.assign(new Error("no such file"), { status: 404 });
+        const content = fileContents.get(key)!;
+        return { path: args.path, content, contentEncoding: "utf8" as const, sizeBytes: content.length, sha256: "sha" };
+      },
+      remove: async (args: { path: string; hostId?: string }) => {
+        fileContents.delete(fileKey(args.hostId, args.path));
+        return {};
+      },
     },
     hosts: { list: async () => [{ id: "host_off", status: "disconnected" }, { id: "host_on", status: "connected" }] },
     threadSections: {
@@ -122,7 +135,8 @@ function world() {
     threads: {
       spawn: async (args: Record<string, unknown>) => {
         const id = `thr_${++n}`;
-        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null, sectionId: (args.sectionId as string | undefined) ?? null });
+        const environment = args.environment as { machine?: { hostId?: string } } | undefined;
+        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null, sectionId: (args.sectionId as string | undefined) ?? null, ...(environment?.machine?.hostId === undefined ? {} : { hostId: environment.machine.hostId }) });
         metadata.set(id, { ...((args.pluginMetadata as Record<string, unknown> | undefined) ?? {}) });
         spawns.push({ ...args, id });
         return makeThreadResponse({ id });
@@ -165,6 +179,7 @@ function world() {
         return {};
       },
       compact: async () => ({ ok: true }),
+      storageLocation: async ({ threadId }: { threadId: string }) => ({ hostId: "host_on", storageRootPath: `/storage/${threadId}` }),
       updatePluginMetadata: async (args: { threadId: string; set?: Record<string, unknown> }) => {
         const next = { ...(metadata.get(args.threadId) ?? {}), ...(args.set ?? {}) };
         metadata.set(args.threadId, next);
@@ -181,7 +196,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}) {
@@ -2290,18 +2305,168 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*configure item .* closed from a thread/u);
   });
 
-  it("says so when a provide-secret item has no worker to open", async () => {
+  it("Provide spawns a requester thread with the fixed prompt, navigates to it, and closes the need when it finishes", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
-    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
-    expect(res).toMatchObject({ ok: true, threadId: null });
+    const spawned = t.spawns.length;
+    const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(res).toMatchObject({ ok: true, threadId: expect.stringMatching(/^thr_/u) });
+    expect(t.spawns.length).toBe(spawned + 1);
+    const requester = t.spawns.at(-1)!;
+    expect(requester.id).toBe(res.threadId);
+    // Same machine and model the binding's workers use.
+    expect(requester).toMatchObject({
+      title: "Provide LINEAR_CLIENT_SECRET for ENG-12",
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+      reasoningLevel: "high",
+      environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } },
+    });
+    const prompt = String(requester.prompt);
+    expect(prompt).toContain('bb secret request LINEAR_CLIENT_SECRET --purpose "Token exchange" --write-env "/storage/thr_w1/.secrets.env"');
+    expect(prompt).toMatch(/If the request fails or is cancelled/u);
+    expect(prompt).not.toMatch(/bb stewards secret import/u);
+    // The need stays open while the requester runs, so the import is accepted.
+    expect(t.hooks.store.need(need.id)!.status).toBe("open");
+    // The requester is a worker: when it finishes, the need closes and the steward is told.
+    await t.idle(res.threadId, "Provided LINEAR_CLIENT_SECRET.");
     await t.flush();
-    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/start the worker that will request it/u);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Worker "Provide LINEAR_CLIENT_SECRET for ENG-12" finished its turn/u);
+  });
+
+  it("Provide works with no worker named, using the requester's own storage", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "SOME_TOKEN", variable: "SOME_TOKEN", purpose: "Auth" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(res.ok).toBe(true);
+    const requester = t.spawns.at(-1)!;
+    expect(String(requester.prompt)).toContain('--write-env "$BB_THREAD_STORAGE/.secrets.env"');
+  });
+
+  it("refuses a provide-secret setting that is not a declared secret setting, and a need that names no variable", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const bad = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Bad", variable: "X", purpose: "Y", setting: "paused" }] }, steward);
+    expect(bad.error).toBe(false);
+    expect(bad.text).toMatch(/is not a secret setting/u);
+    const missing = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "No variable" }] }, steward);
+    expect(missing.error).toBe(false);
+    expect(missing.text).toMatch(/name the env var with `variable`/u);
+    const good = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Good", variable: "SENTRY_TOKEN", purpose: "Y", setting: "sentryToken" }] }, steward);
+    expect(good.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.data.setting === "sentryToken")).toBe(true);
+  });
+
+  it("falls back to the requester's own storage when the named worker is on another machine", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.harness.sdk.stub("threads.storageLocation", async ({ threadId }: { threadId: string }) => ({ hostId: "host_off", storageRootPath: `/storage/${threadId}` }));
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth", worker: "thr_w1" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
+    expect(String(t.spawns.at(-1)!.prompt)).toContain('--write-env "$BB_THREAD_STORAGE/.secrets.env"');
+  });
+
+  it("respawns the requester when the first one was archived", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const first = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { threadId: string };
+    t.threads.get(first.threadId)!.archivedAt = 1;
+    const second = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(second.ok).toBe(true);
+    expect(second.threadId).not.toBe(first.threadId);
+    expect(t.hooks.store.secretRequester(first.threadId)).toBeNull();
+  });
+
+  it("Case B: a requester imports a dotenv into a declared secret setting, deletes the file, and leaks nothing", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(res.ok).toBe(true);
+    const requester = t.spawns.at(-1)!;
+    expect(String(requester.prompt)).toContain('bb stewards secret import --from "$BB_THREAD_STORAGE/.secrets.env" --setting sentryToken');
+    // The requester writes the dotenv; the import reads it, sets the setting, and deletes the file.
+    t.fileContents.set("host_on:/tmp/.secrets.env", "SENTRY_TOKEN='s3cr3t-value'\n");
+    const out = await t.harness.behavior.runCli(["secret", "import", "--from", "/tmp/.secrets.env", "--setting", "sentryToken"], { threadId: res.threadId, projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain("Imported sentryToken");
+    expect(out.stdout).not.toContain("s3cr3t-value");
+    expect(out.stderr).not.toContain("s3cr3t-value");
+    expect((await t.hooks.settings.get()).sentryToken).toBe("s3cr3t-value");
+    expect(t.fileContents.has("host_on:/tmp/.secrets.env")).toBe(false);
+    // The value appears in no message, worker result or need record either.
+    const transcript = JSON.stringify([...t.sends, ...t.userTurns, t.hooks.store.needs(b.id, true), t.hooks.store.workers(b.id)]);
+    expect(transcript).not.toContain("s3cr3t-value");
+  });
+
+  it("Case B: secret import refuses an unrelated thread, the wrong setting, a non-secret setting, a file on another host, and an import after the need closed", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    const requester = res.threadId;
+    t.fileContents.set("host_on:/tmp/.secrets.env", "SENTRY_TOKEN='s3cr3t-value'\n");
+    const importFrom = (threadId: string, setting: string, from = "/tmp/.secrets.env") =>
+      t.harness.behavior.runCli(["secret", "import", "--from", from, "--setting", setting], { threadId, projectId: "p1" });
+
+    // (a) An unrelated thread is refused.
+    const other = await importFrom("thr_other", "sentryToken");
+    expect(other.exitCode).toBe(1);
+    expect(other.stderr).toMatch(/not a provide-secret requester thread/u);
+    // (b) The right thread naming a different setting is refused.
+    const wrong = await importFrom(requester, "sentryApiUrl");
+    expect(wrong.exitCode).toBe(1);
+    expect(wrong.stderr).toMatch(/goes to/u);
+    // A non-secret setting is refused even if a need somehow names it.
+    const sneaky = t.hooks.store.fileNeed({ bindingId: b.id, kind: "provide-secret", url: "sneaky", what: "Sneaky", how: null, data: { variable: "SENTRY_TOKEN", setting: "sentryApiUrl" }, filedBy: "steward" });
+    t.hooks.store.setSecretRequester("thr_sneaky", sneaky.id);
+    const notSecret = await importFrom("thr_sneaky", "sentryApiUrl");
+    expect(notSecret.exitCode).toBe(1);
+    expect(notSecret.stderr).toMatch(/not a secret setting/u);
+    // A file that exists only on another host is not read from the invoking thread's.
+    t.fileContents.set("host_off:/tmp/elsewhere.env", "SENTRY_TOKEN='x'\n");
+    const otherHost = await importFrom(requester, "sentryToken", "/tmp/elsewhere.env");
+    expect(otherHost.exitCode).toBe(1);
+    expect(otherHost.stderr).toMatch(/Could not read/u);
+    // (c) After the need closes, the import is refused.
+    await t.idle(requester, "Provided.");
+    await t.flush();
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    const closed = await importFrom(requester, "sentryToken");
+    expect(closed.exitCode).toBe(1);
+    expect(closed.stderr).toMatch(/closed/u);
+    expect((await t.hooks.settings.get()).sentryToken).toBeUndefined();
   });
 
   it("refuses a blockedOn naming the user with no item, and accepts one with an item", async () => {
@@ -3638,7 +3803,7 @@ describe("Sentry stewards", () => {
     expect(steward()).toBeDefined();
     const first = wakes()[0]!;
     expect(first).toMatch(/The plugin has no Sentry token, so it cannot read this project/u);
-    expect(first).toMatch(/File one provide-secret need for it with steward_report: variable `sentryToken`, url https:\/\/sentry\.io\/settings\/account\/api\/auth-tokens\//u);
+    expect(first).toMatch(/File one provide-secret need for it with steward_report: variable `SENTRY_TOKEN`, setting `sentryToken`, url https:\/\/sentry\.io\/settings\/account\/api\/auth-tokens\//u);
     expect(first).toMatch(/project:read and event:read/u);
     expect(first).toMatch(/Cannot read sentry-project\/acme\/web: no Sentry token is configured/u);
     // Said once: the next looks are quiet until a token appears.
@@ -3666,5 +3831,20 @@ describe("Sentry stewards", () => {
     expect(bad.lines).toContain("problem: sentry: cannot read the target sentry-project/acme/web: Sentry answered HTTP 403 to GET /api/0/projects/acme/web/");
     // A project that stops reading is logged, not woken about: nothing new until it reads again.
     expect(sentry.calls.every((c) => c.startsWith("/api/0/"))).toBe(true);
+  });
+});
+
+describe("the dotenv a requester imports", () => {
+  it("reads the named variable, quoted or not, and strips a trailing comment", () => {
+    expect(parseDotenvValue("OTHER='x'\nSENTRY_TOKEN='s3cr3t'\n", "SENTRY_TOKEN")).toBe("s3cr3t");
+    expect(parseDotenvValue('export SENTRY_TOKEN="s3cr3t"\n', "SENTRY_TOKEN")).toBe("s3cr3t");
+    expect(parseDotenvValue("SENTRY_TOKEN=s3cr3t # the token\n", "SENTRY_TOKEN")).toBe("s3cr3t");
+    expect(parseDotenvValue("SENTRY_TOKEN='has # hash'\n", "SENTRY_TOKEN")).toBe("has # hash");
+    expect(parseDotenvValue("OTHER='x'\n", "SENTRY_TOKEN")).toBeNull();
+  });
+
+  it("derives the env var from a setting name when the need names no variable", () => {
+    expect(secretVariable({ what: "Enter it", data: { setting: "sentryToken" } })).toBe("SENTRY_TOKEN");
+    expect(secretVariable({ what: "Enter it", data: { variable: "LINEAR_CLIENT_SECRET", setting: "sentryToken" } })).toBe("LINEAR_CLIENT_SECRET");
   });
 });

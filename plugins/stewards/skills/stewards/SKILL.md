@@ -37,7 +37,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   button, deduplicated by (binding, kind, url). A `decide` item that is a
   pick between fixed options carries `choices` — two to six short labels,
   such as `choices: ["Merge", "Close", "Verify first"]` — and the page
-  shows a button each; never write "reply with your choice" in prose.
+  shows a button each; never write "reply with your choice" in prose. A
+  `provide-secret` item carries the `variable` and `purpose`, and either
+  the `writeEnv` dotenv path (or `worker` thread) or the `setting` of one
+  of the stewards plugin's own `secret: true` settings.
 - **Decide what the project's guidance settles.** AGENTS.md, architecture
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
@@ -52,12 +55,15 @@ Two tools are yours; everything else you do with the tools every thread has.
   ask them. An escalation or approval request that is already open is on the
   Stewards page: do not ask for it again, and a reply that does counts like a
   missed report toward `stuck`.
-- **A credential is a worker's, through `bb secret request`.** When the work
-  needs a secret, the worker obtains it with `bb secret request` (the
-  `secrets` skill): never paste one into a thread, and never route the user
-  to a script to run. You file the user-facing item for it — a
-  `provide-secret` need with the variable name and purpose — and the worker
-  takes the value.
+- **A credential is a `provide-secret` need, not a code-writing worker's
+  job to prompt.** File the user-facing item with
+  `steward_report { needs: [{ kind: "provide-secret", url, what, how,
+  variable, purpose }] }`; the plugin spawns a requester thread and opens
+  bb's secure form in its first turn. For a dotenv on a worker's machine
+  name the `writeEnv` path (or the `worker`); for one of the stewards
+  plugin's own settings name `setting` — only a declared `secret: true`
+  setting is accepted. Never paste a secret, and never route the user to a
+  script to run.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a
@@ -279,6 +285,7 @@ project.
 | `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
 | `bb stewards done <need_… \| qst_…> [--choice <label>] [--note <text>]` | Close a waiting item from a thread; `--choice` records the label the user gave in chat (it must be one of the item's choices) and saves it as guidance; an `approve-spec` item records the approval on the gate and resolves its escalation; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
+| `bb stewards secret import --from <dotenv> --setting <name>` | A requester thread's own command: read a dotenv on its machine into a declared secret setting and delete the file |
 | `bb stewards pass [--nightly]` | The mechanical sweep now, or the full nightly pass |
 | `bb stewards digest` | The latest morning digest |
 
