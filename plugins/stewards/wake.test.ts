@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
-import { issue } from "./fixtures.js";
+import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, createStore } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
@@ -73,6 +73,13 @@ describe("a steward's wake", () => {
     // Once under the open escalations, once with the approval request in the gate.
     expect(wake.split(note)).toHaveLength(3);
     expect(wake).toContain("counts like a missed report toward `stuck`");
+  });
+
+  it("names the reviewer's sha and the head when the approval is on an earlier commit", () => {
+    const marker = comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=bbbbbbb2 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-18T04:00:00Z" });
+    const entity = pull({ comments: [marker] }, { headSha: "aaaaaaa1", checks: { state: "success", failing: [] } });
+    const wake = formatWake(wakeInput({ observed: { entity, pulls: [] } }));
+    expect(wake).toContain("- Lane gate: met (reviewer approved bbbbbbb, head aaaaaaa, checks green, lane no-review)");
   });
 
   it("takes a worker's closing question, but not one it resolved later in the message", () => {

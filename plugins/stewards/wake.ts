@@ -172,7 +172,15 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
     const gate = prGate(e);
-    lines.push(`- Lane gate: ${gate.gateMet ? "met" : `not met — ${gate.missing}`}${gate.lane === null ? "" : ` (lane ${gate.lane})`}`);
+    const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
+    if (gate.gateMet) {
+      const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
+      const head = gate.headSha === null ? "?" : gate.headSha.slice(0, 7);
+      const detail = [`reviewer approved ${approved}`, ...(approved === head ? [] : [`head ${head}`]), "checks green", ...(lane === "" ? [] : [lane])];
+      lines.push(`- Lane gate: met (${detail.join(", ")})`);
+    } else {
+      lines.push(`- Lane gate: not met — ${gate.missing}${lane === "" ? "" : ` (${lane})`}`);
+    }
     const latest = new Map<string, string>();
     for (const r of p.reviews) latest.set(r.author, `${r.state}${r.commit === null ? "" : ` at ${r.commit.slice(0, 7)}`}`);
     if (latest.size > 0) lines.push(`- Latest reviews: ${[...latest].map(([a, s]) => `${a} ${s}`).join("; ")}`);

@@ -150,8 +150,18 @@ ${buildBlocker("the work")}
 ## open
 
 Answer review comments with a worker, one round at a time, and re-request
-review after each round. When it is approved and checks pass, merge it if the
-project's guidance says its author may; otherwise say so in a comment.
+review after each round. A small follow-up push after an approval — a
+non-blocking comment addressed, wording, docs, tests, lint or type fixes, or a
+rebase or merge of the base branch — needs no fresh approval and no new round;
+judge it from \`git diff <approved-sha> <head>\`, and ask for a new round when
+a push changes behaviour beyond what was approved, adds scope, or brings in
+something the project's guidance says needs the approver. A change that
+significantly modifies or removes existing behaviour, or is risky in kind (a
+contract, auth, a migration, a secret, production infrastructure, a big
+decision), needs the owner's approval before it merges. When it is approved
+and checks pass, merge it if the project's guidance says its author may;
+otherwise say so in a comment. The merge comment names the approved commit
+and, when newer commits landed after it, one line on what they changed.
 
 ${buildBlocker("the work")}
 `;
@@ -177,16 +187,23 @@ Each round is one review worker with fresh context; you post what it finds
 with \`gh pr review\`, signed.
 
 A round is due when the pull request is new to you, when the author pushes
-after your last review, or when your review is re-requested. Start a review
+after your last review, or when your review is re-requested. A small follow-up
+push after you approved — a non-blocking comment addressed, wording, docs,
+tests, lint or type fixes, or a rebase or merge of the base branch — gets a
+short check of the new commits, not a full round, and does not turn your
+approval into a new verdict; judge it from \`git diff <approved-sha> <head>\`
+and run a full round when a push changes behaviour beyond what you approved or
+adds scope. Start a review
 worker with the task: "Review <url> against the project's guidance
 (AGENTS.md, design docs). Check it out with gh pr checkout. Return findings as
 a list of { path, line, body }, each marked blocking or not, and a
 one-paragraph summary. Cover only what changed since <sha> when given."
 
 Request changes when a finding is blocking; comment otherwise. Approve when
-nothing blocking is left, unless the change is one of the project's big
-decisions: then escalate a decision and let the project steward take it
-further.
+nothing blocking is left, unless the change significantly modifies or removes
+existing behaviour, or is risky in kind (a contract, auth, a migration, a
+secret, production infrastructure, a big decision): then a human approves, so
+escalate a decision and let the project steward take it further.
 
 ## open
 
