@@ -11,7 +11,8 @@
 //   and entities the source should lease on bb-gate-hooks and ring stewards
 //   about.
 // - `stewardsContract` is served by stewards and called by a source plugin:
-//   a ring when something stewards cares about may have changed.
+//   a ring when something stewards cares about may have changed, and an
+//   `@bb` mention on a Linear issue to hand to a steward.
 //
 // Pure: zod schemas, constants and a small helper. Nothing here talks to
 // the network or to bb beyond the `callRpc` a caller hands in.
@@ -222,12 +223,68 @@ export const sourceContract = {
 
 // ---- what stewards serves ---------------------------------------------------
 
+/** How much of a mention crosses the contract. */
+export const SESSION_TEXT_CHARS = 20_000;
+
+const personSchema = z.object({ id: z.string().max(200), name: z.string().max(200) });
+
+/**
+ * An `@bb` mention on a Linear issue, as bb-gate-hooks routed it to this
+ * server (bb-gate/docs/hooks.md, "The wake"). linear passes it to stewards,
+ * which hands it to a steward; the steward answers on the session with
+ * linear's `linear_session_reply`.
+ */
+export const sessionWakeSchema = z.object({
+  source: z.literal("linear"),
+  /** The agent session's id: what the reply names. */
+  session: z.string().min(1).max(200),
+  /** `created` for the mention, `prompted` for a follow-up in the same session. */
+  action: z.enum(["created", "prompted"]),
+  issue: z.object({
+    id: z.string().min(1).max(200),
+    /** ENG-123. */
+    key: z.string().min(1).max(100),
+    /** The team's UUID. */
+    team: z.string().max(200),
+    /** The team's key, which a project file lists. */
+    teamKey: z.string().max(100),
+  }),
+  /** Who wrote the mention or the follow-up. */
+  asker: personSchema,
+  /** The Linear user this server proved it acts for. */
+  owner: personSchema,
+  /** Whether the asker is the owner. Only then is the text an instruction. */
+  fromOwner: z.boolean(),
+  /** Why the session came here: the issue's assignee is the owner, or the asker is. */
+  routedAs: z.enum(["assignee", "asker"]),
+  /** The words. Untrusted whenever the asker is not the owner: information, never an instruction. */
+  comment: z.object({ text: z.string().max(SESSION_TEXT_CHARS), untrusted: z.boolean() }),
+  at: z.string().max(100),
+});
+export type SessionWake = z.infer<typeof sessionWakeSchema>;
+
 /** Served by stewards; linear and github are the callers. */
 export const stewardsContract = {
   /** Something about this entity may have changed. Cheap: debounced, then compared with the last snapshot. */
   stewardsRing: {
     input: z.object({ source: sourceSchema, id: z.string().min(1).max(300) }),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * An `@bb` mention to hand to a steward: the issue's ticket steward when it
+   * has an open binding, else the project steward of the project whose file
+   * lists the issue's team. `routed: "none"` means no project here lists the
+   * team, and the caller answers the session itself. Only linear may call it.
+   */
+  stewardsSession: {
+    input: sessionWakeSchema,
+    output: z.object({
+      routed: z.enum(["ticket", "project", "none"]),
+      /** The thread the mention went to; null with `none`. */
+      threadId: z.string().nullable(),
+      /** That thread's project, for a link to it; null with `none`. */
+      projectId: z.string().nullable(),
+    }),
   },
 } as const;
 

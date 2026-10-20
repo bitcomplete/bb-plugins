@@ -65,6 +65,7 @@ already knew, and refreshes it first if it has lapsed.
 | `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
+| `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session, posted by bb-gate-hooks as the bb app, linking the thread. Needs `BB_HOOKS_URL`. See "@bb mentions". |
 
 Every tool takes an optional `account`; see "Several workspaces".
 
@@ -96,6 +97,41 @@ thread, and reads Linear through this plugin. The contract is
   Without stewards installed the ring is dropped quietly.
 
 A steward writes through the same tools as any thread, signed the same way.
+
+## @bb mentions
+
+Mentioning `@bb` in a Linear comment opens an *agent session* on the issue.
+[bb-gate-hooks](../../bb-gate/docs/hooks.md) ("Agent sessions") acknowledges
+it, routes it to the server of the issue's assignee or else of the person
+who asked, and sends that server an `event: session` on the stream this
+plugin already holds. This plugin's side:
+
+- **Identity.** Beside every lease renewal (on connect and every half hour)
+  the plugin calls `/v1/identify` with the developer's own token and the
+  UUIDs of the teams stewards asked about, in the workspace that has most
+  of them. The service reads `viewer` with the token and forgets it. It
+  identifies again whenever stewards' teams change. A service without
+  `/v1/identify` is noted once in the log, and the watches carry on.
+- **The wake.** A mention is handed to stewards (`stewardsSession` in
+  `source-contract.ts`) with the issue, the session id, who asked, and the
+  text. The text is marked untrusted unless the asker is the server's
+  owner. The plugin checks this itself and does not rely on the event's own
+  flag. Stewards gives it to the issue's steward or the project steward.
+  When no project here lists the issue's team, or stewards is not
+  installed, the plugin answers the session itself with an `error`.
+- **The reply.** The steward ends the turn that handled the mention with
+  `linear_session_reply { session, kind, body }`. `kind` is `response`,
+  `elicitation` or `error`. The tool signs the body, adds a link to the
+  thread, and sets the session's external link to it. bb-gate-hooks posts
+  it on Linear as the bb app. The app's token never reaches this server: the
+  request carries the stream's connection id and the reply, nothing else.
+  Each mention gets one reply. A second reply to the same event is refused,
+  and a follow-up in the session (a new event) can be answered again.
+- **The backstop.** If the turn whose input named the session ends without
+  a reply, the plugin posts an `error` saying so, with the thread's link.
+
+Sessions are kept in kv for a day, because the service accepts replies for
+that long, so a restart does not forget which have been answered.
 
 ## Watching an issue
 

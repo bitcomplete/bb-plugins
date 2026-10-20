@@ -52,12 +52,13 @@ import {
   sourceContract,
   stewardsContract,
   type EntitySnapshot,
+  type SessionWake,
   type Source,
 } from "./source-contract.js";
 import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, type Binding, type Escalation, type EscalationRoute, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatOpsWake, formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -1960,6 +1961,74 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pushInterest();
     });
 
+    // ---- @bb mentions ----------------------------------------------------------------------------------
+    //
+    // linear hands over a mention bb-gate-hooks routed to this server. It
+    // goes to the issue's ticket steward when the issue has an open binding,
+    // else to the project steward of the project whose file lists the
+    // issue's team; with neither, linear answers the session itself. The
+    // steward answers with linear_session_reply. A request from anyone but
+    // the server's owner waits for the owner to confirm it; it is kept here
+    // so the owner's answer arrives with what it answers.
+
+    const PENDING_KEY = "sessions/pending";
+    const PENDING_TTL_MS = 7 * 86_400_000;
+    /** At most this many requests wait on the owner per session; the oldest go first. */
+    const PENDING_MAX = 5;
+    const pendingItem = z.object({ asker: z.string(), text: z.string(), at: z.string() });
+    const pendingRecord = z.record(z.string(), z.object({ requests: z.array(pendingItem), savedAt: z.number() }));
+    /** Add a request waiting on the owner, or (with null) take every one waiting, which the owner's words answer. */
+    async function updatePending(session: string, add: PendingRequest | null): Promise<PendingRequest[]> {
+      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+      const before = all[session]?.requests ?? [];
+      if (add === null) delete all[session];
+      else all[session] = { requests: [...before, add].slice(-PENDING_MAX), savedAt: now() };
+      for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
+      await bb.storage.kv.set(PENDING_KEY, all);
+      return before;
+    }
+
+    async function onSession(w: SessionWake): Promise<{ routed: "ticket" | "project" | "none"; threadId: string | null; projectId: string | null }> {
+      const trusted = w.fromOwner && !w.comment.untrusted;
+      // Untrusted requests are what the owner's next words may confirm; the
+      // owner's words answer them, so they are taken off.
+      const pending = trusted ? await updatePending(w.session, null) : (await updatePending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at }), []);
+
+      const bound = store.byEntity("linear", w.issue.id);
+      if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
+        const config = await loadConfig(bound.projectId);
+        const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
+        await serial(`b:${bound.id}`, async () => {
+          const b = store.binding(bound.id);
+          if (b === null || b.endedAt !== null || b.threadId === null) return;
+          sent.outcome = await sendTo(b.threadId, formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, pending, label: config?.file.label ?? "bb-managed" }));
+          // A turn like any wake's: it ends with steward_report, and one
+          // waiting on someone else is archived when it is done.
+          if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+        });
+        if (sent.outcome === "sent") {
+          bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward`);
+          return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId };
+        }
+        bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
+      }
+
+      const projects = await stewardedProjects();
+      const config =
+        (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
+        projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
+      if (config === undefined) {
+        bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
+        return { routed: "none", threadId: null, projectId: null };
+      }
+      const threadId = await ensureProjectSteward(config);
+      if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
+      const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, pending, label: config.file.label }));
+      if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
+      bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
+      return { routed: "project", threadId, projectId: config.projectId };
+    }
+
     // ---- the RPC -------------------------------------------------------------------------------------
 
     bb.rpc.register(rpcContract, {
@@ -1967,6 +2036,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
         return { ok: true };
+      },
+      async stewardsSession(input, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS.linear) throw new Error("only the linear plugin hands stewards an @bb mention");
+        return onSession(input);
       },
       async stewardsList({ projectId, all }) {
         const rows = all ? store.all(projectId ?? undefined) : store.open(projectId ?? undefined);
@@ -2593,7 +2666,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "steward_update",
       description:
-        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions; a parent steward or the project steward may update the bindings below it, which wakes them. " +
+        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions, and may put it on hold but not lift the hold; a parent steward or the project steward may update the bindings below it, which wakes them. " +
         "The project steward also records each question it puts to the user (ask, with or without a binding) and closes it when they answer (resolve with the question id, and answer).",
       presentation: { label: { pending: "Updating a binding", completed: "Updated a binding" } },
       parameters: z.object({
@@ -2699,8 +2772,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
           let resolving: Escalation | null = null;
           if (directs) {
-            if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
-              return toolError(new Error("A steward does not set its own priority, hold or model; its parent or the project steward does."));
+            // A steward may put itself on hold (the owner said "halt work on
+            // this" in a Linear mention), but only its parent or the project
+            // steward lifts a hold.
+            if (self && (input.priority !== undefined || input.hold === "" || input.stewardModel !== undefined)) {
+              return toolError(new Error(input.hold === "" ? "A steward does not lift its own hold; its parent or the project steward does. Escalate with steward_report to ask." : "A steward does not set its own priority or model; its parent or the project steward does."));
             }
             if (input.approve === true) {
               const config = await loadConfig(target.projectId);
