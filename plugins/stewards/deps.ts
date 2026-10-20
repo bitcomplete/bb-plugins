@@ -83,9 +83,9 @@ export function alertLine(alert: Pick<DependabotAlert, "package" | "ecosystem" |
   return `- **${alert.severity}**${ghsa} \`${alert.package}\`${where === "" ? "" : ` (${where})`} — ${fixed}${alert.url === null ? "" : ` — ${alert.url}`}`;
 }
 
-/** A due date as Linear wants it: an ISO date, `asap` being today. */
-export function dueDate(deadline: number): string {
-  return new Date(deadline).toISOString().slice(0, 10);
+/** A due date as Linear wants it: an ISO date, in the project's time zone. */
+export function dueDate(deadline: number, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(deadline));
 }
 
 /** Whether an alert is still open. GitHub's fixed, dismissed and auto_dismissed states are not. */

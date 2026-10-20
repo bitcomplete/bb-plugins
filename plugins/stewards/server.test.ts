@@ -2585,9 +2585,9 @@ describe("dependency stewards", () => {
     ...over,
   });
 
-  async function watching(alerts: unknown[] = [alert()]) {
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}) {
     const t = await setup();
-    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
@@ -2651,7 +2651,28 @@ describe("dependency stewards", () => {
     await t.flush();
     const tightened = wakes().at(-1)!;
     expect(tightened).toContain("#### acme/web#6");
-    expect(tightened).toMatch(/Batch: tighten the open ticket ENG-50 to due \d{4}-\d{2}-\d{2}\./u);
+    expect(tightened).toMatch(/Batch: tighten the open ticket ENG-50's due date to no later than \d{4}-\d{2}-\d{2}/u);
+
+    // Once the ticket is resolved, a new low alert files a new one instead of joining it.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    t.advance(86_400_000);
+    t.dependabotAlerts.set("acme/web", [alert({ number: 7, severity: "low", ghsaId: "GHSA-low-3", package: "tar" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const afterDone = wakes().at(-1)!;
+    expect(afterDone).toContain("#### acme/web#7");
+    expect(afterDone).toMatch(/Batch: no open ticket for this repo and ecosystem; file a new one\./u);
+    expect(afterDone).not.toMatch(/Batch: join the open ticket ENG-50/u);
+  });
+
+  it("suppresses the escalation only for the severities deps.autoAdopt names", async () => {
+    const adopted = await watching();
+    expect(adopted.wakes()[0]).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+    expect(adopted.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
+
+    const escalate = await watching([alert({ number: 4, severity: "high" })], { deps: { autoAdopt: [] } });
+    expect(escalate.wakes()[0]).not.toMatch(/deps\.autoAdopt:/u);
+    expect(escalate.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
   });
 
   it("wakes on a fixed alert so its ticket is trimmed, and rings on a dependabot_alert doorbell", async () => {
@@ -2689,6 +2710,21 @@ describe("dependency stewards", () => {
     expect(prompt).toMatch(/playbook deps-prs@/u);
     expect(prompt).toMatch(/You steward one Dependabot version-update pull request/u);
     expect(prompt).toMatch(/never merge it: you adopt it, review it, and escalate it for a\s+human merge/u);
+  });
+
+  it("ends a deps-prs binding when the playbook disappears rather than falling back to a merge-capable one", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: [] }));
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "acme/web#9", kind: "pr", ended: false })]));
+
+    delete t.files[playbookPath("deps-prs")];
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "acme/web#9", kind: "pr", ended: true })]));
   });
 
   it("checks the deps SLA, batch and autoAdopt, and says which repos the gh login cannot read", async () => {

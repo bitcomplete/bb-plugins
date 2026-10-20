@@ -148,12 +148,14 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     }
 
     /**
-     * One REST call with the token, for what GraphQL does not expose:
+     * One REST page with the token, for what GraphQL does not expose:
      * Dependabot alerts. A non-2xx answer throws with the status, so a 403 or
      * 404 (no alert access, alerts off, not visible) can be told apart from a
-     * network failure and named per repository by the caller.
+     * network failure and named per repository by the caller. The `next` URL
+     * is from the `Link` header, so a repository with more than one page of
+     * alerts is read whole.
      */
-    async function rest(path: string, signal: AbortSignal): Promise<unknown> {
+    async function restPage(path: string, signal: AbortSignal): Promise<{ body: unknown; next: string | null }> {
       return asDeveloper(async (token) => {
         const response = await deps.fetch(new URL(path, apiUrl), {
           method: "GET",
@@ -165,7 +167,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           const message = body !== null && typeof body === "object" && typeof (body as { message?: unknown }).message === "string" ? (body as { message: string }).message : "";
           throw new GitHubRequestError(`GitHub answered HTTP ${response.status}${message === "" ? "" : `: ${message}`}`, response.status);
         }
-        return body;
+        const link = response.headers.get("link") ?? "";
+        const next = /<([^>]+)>;\s*rel="next"/u.exec(link)?.[1] ?? null;
+        return { body, next };
       });
     }
 
@@ -520,7 +524,14 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           }
           const name = `${repo.owner}/${repo.name}`;
           try {
-            alerts.push(...parseDependabotAlerts(await rest(dependabotAlertsPath(name, state ?? "open"), checkSignal()), name));
+            const seen = new Set<string>();
+            let next: string | null = dependabotAlertsPath(name, state ?? "open");
+            while (next !== null && !seen.has(next)) {
+              seen.add(next);
+              const page = await restPage(next, checkSignal());
+              alerts.push(...parseDependabotAlerts(page.body, name));
+              next = page.next;
+            }
           } catch (error) {
             errors.push(`${unit}: ${errorMessage(error)}`);
           }

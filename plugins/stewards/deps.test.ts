@@ -35,7 +35,9 @@ describe("severity and the SLA", () => {
     expect(deadlineAt("high", DEFAULT_SLA, now)).toBe(now + 86_400_000);
     expect(deadlineAt("medium", DEFAULT_SLA, now)).toBe(now + 7 * 86_400_000);
     expect(deadlineAt("low", DEFAULT_SLA, now)).toBe(now + 30 * 86_400_000);
-    expect(dueDate(now + 86_400_000)).toBe("2026-10-15");
+    expect(dueDate(now + 86_400_000, "UTC")).toBe("2026-10-15");
+    // The project's time zone decides the calendar day.
+    expect(dueDate(Date.parse("2026-10-15T01:00:00Z"), "America/New_York")).toBe("2026-10-14");
   });
 
   it("batches only medium and low", () => {

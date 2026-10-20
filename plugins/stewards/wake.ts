@@ -9,6 +9,7 @@ import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
+import { dueDate } from "./deps.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
@@ -424,6 +425,8 @@ export type DepsWakeInput = {
   label: string;
   /** Severities whose tickets are labelled when filed (deps.autoAdopt). */
   autoAdopt: string[];
+  /** The project's time zone, which due dates are given in. */
+  timeZone: string;
   escalations: Escalation[];
   changes: string[];
 };
@@ -436,16 +439,16 @@ const DEPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
 
 const DEPS_CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
 
-const days = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
-function depsAlertLines(a: DepsFinding): string[] {
+
+function depsAlertLines(a: DepsFinding, timeZone: string): string[] {
   const lines: string[] = [`#### ${a.fingerprint}`, ""];
   const ticket = a.ticket === null ? "" : ` · ticket ${a.ticket}${a.ticketState === null ? "" : ` (${a.ticketState})`}${a.lastCommentedAt === null ? "" : `, your last word on it ${iso(a.lastCommentedAt)}`}`;
-  lines.push(`- **${a.severity}** priority ${a.priority}, due ${days(a.dueAt)}${ticket}`);
+  lines.push(`- **${a.severity}** priority ${a.priority}, due ${dueDate(a.dueAt, timeZone)}${ticket}`);
   lines.push(`- \`${a.package}\` (${a.ecosystem})${a.manifestPath === null ? "" : ` — ${a.manifestPath}`}${a.ghsaId === null ? "" : ` — ${a.ghsaId}`}`);
   lines.push(`- ${a.fixedVersion === null ? "No fixed version yet" : `Fixed in ${a.fixedVersion}`}; first seen ${iso(a.firstSeenAt)}${a.url === null ? "" : ` — ${a.url}`}`);
   if (a.batch.kind === "join") lines.push(`- Batch: join the open ticket ${a.batch.ticketKey} (its due date is already inside this alert's).`);
-  else if (a.batch.kind === "tighten") lines.push(`- Batch: tighten the open ticket ${a.batch.ticketKey} to due ${days(a.batch.dueAt)}.`);
+  else if (a.batch.kind === "tighten") lines.push(`- Batch: tighten the open ticket ${a.batch.ticketKey}'s due date to no later than ${dueDate(a.batch.dueAt, timeZone)} (the earlier of its current due date and this deadline).`);
   else if (a.severity === "medium" || a.severity === "low") lines.push("- Batch: no open ticket for this repo and ecosystem; file a new one.");
   else lines.push("- This severity gets its own ticket.");
   return [...lines, ""];
@@ -486,7 +489,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   else if (look.alerts.length === 0) out.push("**No open alerts.** Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.");
   for (const c of present) {
     out.push("", `### ${DEPS_CLASS_TITLES[c]}`, "");
-    for (const a of look.alerts.filter((x) => x.class === c)) out.push(...depsAlertLines(a));
+    for (const a of look.alerts.filter((x) => x.class === c)) out.push(...depsAlertLines(a, input.timeZone));
   }
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {

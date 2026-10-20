@@ -38,7 +38,7 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
@@ -48,7 +48,10 @@ function fakeGitHub() {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
       if (`${dependabot[1]}/${dependabot[2]}`.toLowerCase() !== "acme/widgets") return Response.json({ message: "Not Found" }, { status: 404 });
       if (state.dependabotStatus !== 200) return Response.json({ message: state.dependabotMessage }, { status: state.dependabotStatus });
-      return Response.json(state.dependabotAlerts);
+      const page = new URL(u).searchParams.get("page");
+      if (page === "2") return Response.json(state.dependabotPage2);
+      const headers = state.dependabotPage2.length > 0 ? { link: `<${API_URL}/repos/acme/widgets/dependabot/alerts?state=open&per_page=100&page=2>; rel="next"` } : undefined;
+      return Response.json(state.dependabotAlerts, headers === undefined ? undefined : { headers });
     }
     if (u !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
     const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
@@ -550,6 +553,15 @@ describe("stewards' source contract", () => {
     w.github.state.dependabotStatus = 403;
     w.github.state.dependabotMessage = "Resource not accessible by integration";
     expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], errors: ["Acme/Widgets: GitHub answered HTTP 403: Resource not accessible by integration"] });
+  });
+
+  it("follows the Link header so a repository with more than one page of alerts is read whole", async () => {
+    const w = await setup();
+    w.github.state.dependabotAlerts = [{ number: 1, state: "open", dependency: { package: { ecosystem: "npm", name: "a" } }, security_advisory: { severity: "low" }, security_vulnerability: { first_patched_version: null } }];
+    w.github.state.dependabotPage2 = [{ number: 2, state: "open", dependency: { package: { ecosystem: "npm", name: "b" } }, security_advisory: { severity: "high" }, security_vulnerability: { first_patched_version: null } }];
+    const out = (await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)) as { alerts: Array<{ id: string }>; errors: string[] };
+    expect(out.alerts.map((a) => a.id)).toEqual(["Acme/Widgets#1", "Acme/Widgets#2"]);
+    expect(out.errors).toEqual([]);
   });
 
   describe("interest", () => {

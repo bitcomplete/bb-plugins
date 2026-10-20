@@ -1042,7 +1042,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = await loadConfig(b.projectId);
       if (config === null) return;
       const playbook = bindingPlaybook(config, b);
-      if (playbook === null) return;
+      if (playbook === null) {
+        // A dependency bot's pull request runs under deps-prs only. With the
+        // playbook gone, the binding ends rather than falling back to a
+        // merge-capable playbook the ticket says must never merge.
+        if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file) && b.endedAt === null) await finishEnding(b, "unconfigured");
+        return;
+      }
       if (b.source === "ops") {
         await reconcileOps(b, config, playbook, force);
         return;
@@ -1238,13 +1244,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The open tickets a new medium or low alert may join, one per repo and
      * ecosystem: grouped from the fingerprint map by ticket, each with the
      * tightest deadline among its alerts. Only batchable (medium and low)
-     * fingerprints count, since critical and high never coalesce.
+     * fingerprints count, since critical and high never coalesce, and a
+     * ticket that is completed or canceled is not open: a new alert for its
+     * repo and ecosystem files a new ticket rather than commenting on a
+     * resolved one. A ticket whose state cannot be read counts as open, as
+     * in `classify`.
      */
-    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"]): DepsTicket[] {
+    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"], tickets: ReadonlyMap<string, TicketState>): DepsTicket[] {
       const byTicket = new Map<string, DepsTicket>();
       for (const r of rows) {
         if (r.ticketKey === null || r.severity === null || r.ecosystem === null) continue;
         if (!isBatchable(r.severity as DependabotSeverity)) continue;
+        const state = tickets.get(r.ticketKey) ?? null;
+        if (state !== null && (state.stateType === "completed" || state.stateType === "canceled")) continue;
         const repo = repoOfFingerprint(r.fingerprint);
         if (repo === null) continue;
         const dueAt = deadlineAt(r.severity as DependabotSeverity, sla, r.firstSeenAt);
@@ -1269,10 +1281,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return { fingerprint: s.fingerprint, summary: s.summary, severity: s.severity, ecosystem: s.ecosystem };
           }),
         );
+        // Every fingerprint row, not just this look's: a batched ticket that
+        // is no longer in the open alerts still has rows, and whether it is
+        // open decides if a new medium or low alert may join it.
+        const allRows = store.fingerprints(b.id);
         const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
-        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const tickets = await ticketStates([...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
         const findings = classify(sightings, rows, tickets, at);
-        const open = openBatchedTickets(store.fingerprints(b.id), config.file.deps.sla);
+        const open = openBatchedTickets(allRows, config.file.deps.sla, tickets);
         const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
         const depsFindings: DepsFinding[] = [];
         for (const f of findings) {
@@ -1438,6 +1454,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         team: opsTeam(config.file),
         label: config.file.label,
         autoAdopt: config.file.deps.autoAdopt,
+        timeZone: config.file.nightly.timezone,
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
@@ -1599,7 +1616,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The dependency watch adopts the bot's version-update pull requests in
       // the repos it watches, whether or not they are labelled. deps-prs
       // reviews them and escalates for a human merge; it never merges.
-      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && config.repos.some((r) => lc(r) === lc(e.unit))) return "pr";
+      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && depsTargets(config.file, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
       const review = playbookFor(config, "review");
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;

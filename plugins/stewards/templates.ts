@@ -306,13 +306,15 @@ with actor other, and end the turn.
 
 Severity decides the Linear priority and the due date: the wake gives each
 alert's priority and deadline. critical and high get a ticket of their own
-and are escalated at once; medium and low coalesce into one open ticket per
-repository per ecosystem. The wake's batch plan says, for each new medium or
-low alert, whether to file a new ticket, join an open one, or tighten an open
-ticket's due date; follow it. When you file or comment, list every alert the
-ticket covers, with its package, ecosystem, manifest path, GHSA id and fixed
-version. A recurrence of an alert already on a ticket is a comment there,
-never a second ticket.
+at once; medium and low coalesce into one open ticket per repository per
+ecosystem. A severity deps.autoAdopt names is adopted when filed (labelled
+and moved to Todo) and raises no escalation; a severity it does not name
+raises one decision escalation. The wake's batch plan says, for each new
+medium or low alert, whether to file a new ticket, join an open one, or
+tighten an open ticket's due date; follow it. When you file or comment, list
+every alert the ticket covers, with its package, ecosystem, manifest path,
+GHSA id and fixed version. A recurrence of an alert already on a ticket is a
+comment there, never a second ticket.
 
 A ticket you file says: the repository and ecosystem; each alert's package,
 severity, GHSA id and fixed version; the manifest path; the priority and due
