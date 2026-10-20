@@ -29,7 +29,11 @@ Two tools are yours; everything else you do with the tools every thread has.
   you are blocked on, and `requeueAfter`. On a ticket, report the ready
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
-  without a report raise `stuck`.
+  without a report raise `stuck`. When only the user can do something — a
+  step outside the repos, a secret, a decision — file it with
+  `steward_report { needs: [{ kind, url, what, how }] }` (`configure`,
+  `provide-secret`, `decide`); it appears on the Stewards page with its
+  button, deduplicated by (binding, kind, url).
 - **Decide what the project's guidance settles.** AGENTS.md, architecture
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
@@ -45,8 +49,9 @@ Two tools are yours; everything else you do with the tools every thread has.
 - **A credential is a worker's, through `bb secret request`.** When the work
   needs a secret, the worker obtains it with `bb secret request` (the
   `secrets` skill): never paste one into a thread, and never route the user
-  to a script to run. You file the user-facing item for it — an escalation,
-  or a question as project steward — and the worker takes the value.
+  to a script to run. You file the user-facing item for it — a
+  `provide-secret` need with the variable name and purpose — and the worker
+  takes the value.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a
@@ -77,9 +82,12 @@ Two tools are yours; everything else you do with the tools every thread has.
   approved by the project steward unless the playbook says the user. Once
   you report the checklist met, the plugin asks the approver itself (an
   `approval` escalation): wait for it, and do not escalate for it.
-- **Waiting on someone above you is an escalation.** A `blockedOn` that
-  names the project steward or the user reaches nobody; with no open
-  escalation it is flagged in `bb stewards list` and the digest.
+- **Waiting on the user is a needs item.** A `blockedOn` that names the
+  project steward or the user reaches nobody; with no open escalation it is
+  flagged in `bb stewards list` and the digest. A `blockedOn` naming the
+  user, the owner or a human is refused unless an open needs item says so:
+  file it (`configure`, `provide-secret`, `decide`) instead of only saying
+  it. `blockedOn` stays for third parties.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
@@ -152,7 +160,9 @@ project.
 | Command | Does |
 |---|---|
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
-| `bb stewards show <ENG-12 \| owner/repo#3>` | One binding in full: gate, guidance, escalations, workers |
+| `bb stewards show <ENG-12 \| owner/repo#3>` | One binding in full: gate, guidance, escalations, needs, workers |
+| `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
+| `bb stewards done <need_… \| qst_…>` | Close a waiting item from a thread; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
 | `bb stewards pass [--nightly]` | The mechanical sweep now, or the full nightly pass |
 | `bb stewards digest` | The latest morning digest |
