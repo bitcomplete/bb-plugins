@@ -970,6 +970,27 @@ describe("terminal states and follow-through", () => {
     expect(t.archives()).toEqual([t.steward]);
   });
 
+  it("archives a steward whose wrap-up turn is still running when the binding ends, once that turn ends", async () => {
+    const t = await working();
+    await t.done();
+    await t.report();
+    // The idle that ends the binding finds the thread busy again (another
+    // turn, or compaction, under way): the archive is deferred, not dropped.
+    t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => ({ ...(await t.sdk.threads.get(args)), status: "active" }));
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.archives()).toEqual([]);
+
+    t.harness.sdk.stub("threads.get", t.sdk.threads.get);
+    await t.idle(t.steward);
+    expect(t.archives()).toEqual([t.steward]);
+
+    // Once: the owner writing to the ended steward later does not archive it under them.
+    t.threads.get(t.steward)!.archivedAt = null;
+    await t.idle(t.steward);
+    expect(t.archives()).toEqual([t.steward]);
+  });
+
   it("keeps the binding open while the steward follows through, and ends it once the work is done", async () => {
     const t = await working();
     await t.done();
