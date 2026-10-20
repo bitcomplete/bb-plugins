@@ -7,7 +7,7 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { DependabotTarget, K8sTarget, OpsTarget } from "./ops.js";
+import { SENTRY_SLUG, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
@@ -122,7 +122,13 @@ export const dependabotRepoSchema = z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[
 
 const dependabotTargetSchema = z.object({ kind: z.literal("dependabot"), repo: dependabotRepoSchema }).strict();
 
-const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema]);
+/** A Sentry slug as Sentry spells it in URLs; upper case is folded, since Sentry's are always lower. */
+const sentrySlug = z.string().trim().toLowerCase().regex(SENTRY_SLUG, "a Sentry slug such as acme or web-api");
+
+/** A Sentry project whose issues an ops steward watches, read with the plugin's Sentry token. */
+const sentryProjectTargetSchema = z.object({ kind: z.literal("sentry-project"), org: sentrySlug, project: sentrySlug }).strict();
+
+const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema, sentryProjectTargetSchema]);
 
 /** The per-severity SLA and batch window for Dependabot alerts. */
 const slaValueSchema = z.union([z.literal("asap"), durationSchema]);
@@ -216,7 +222,7 @@ export const projectFileSchema = z
   .superRefine((file, ctx) => {
     const seen = new Set<string>();
     file.ops.targets.forEach((t, i) => {
-      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : `${t.kind}/${t.repo.toLowerCase()}`;
+      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "dependabot" ? `${t.kind}/${t.repo.toLowerCase()}` : `${t.kind}/${t.org}/${t.project}`;
       if (seen.has(key)) ctx.addIssue({ code: "custom", path: ["ops", "targets", i], message: `${key} is listed twice` });
       seen.add(key);
     });
@@ -253,6 +259,9 @@ export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.tar
 
 /** The k8s namespaces to watch, which are read with kubectl. */
 export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");
+
+/** The Sentry projects to watch, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
+export const sentryTargets = (project: ProjectFile): SentryTarget[] => project.ops.targets.filter((t): t is SentryTarget => t.kind === "sentry-project");
 
 /**
  * The Dependabot alert targets: the project file's explicit `dependabot`
@@ -302,7 +311,7 @@ export type ReadyConfig = z.infer<typeof readySchema>;
 /** The default cap on follow-through: a deploy and its verification, with room to spare. */
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
 
-export const PLAYBOOK_SOURCES = ["linear", "github", "k8s"] as const;
+export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
 const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };
 
 export const frontMatterSchema = z
@@ -367,10 +376,11 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   const expectedSource = SOURCE_OF[fm.kind];
   if (fm.kind === "ops") {
     // An ops binding watches a target, not an entity in a source plugin: a
-    // Kubernetes namespace reads k8s, and a Dependabot alert target reads
-    // github. The playbook says which so its sections can be about the right
-    // thing; either is valid.
-    if (fm.source !== "k8s" && fm.source !== "github") return { ok: false, error: `${file}: an ops playbook watches k8s or github, not ${fm.source}` };
+    // Kubernetes namespace reads k8s, a Dependabot alert target reads
+    // github, and a Sentry project reads sentry. The playbook says which so
+    // its sections can be about the right thing; any is valid, and the
+    // ops-watch playbook serves k8s and Sentry targets alike.
+    if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry or github, not ${fm.source}` };
   } else if (fm.source !== expectedSource) {
     return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
   }

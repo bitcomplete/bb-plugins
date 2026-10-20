@@ -731,15 +731,19 @@ goes wrong there into Linear tickets for the project steward to adopt.
 
 ```jsonc
 "ops": {
-  "targets": [{ "kind": "k8s-namespace", "name": "bb-gate-production" }],
+  "targets": [
+    { "kind": "k8s-namespace", "name": "bb-gate-production" },
+    { "kind": "sentry-project", "org": "acme", "project": "web" }
+  ],
   "team": "BB",                 // where tickets are filed; the first linear.teams entry when left out
   "autoAdopt": ["urgent"]       // priorities labelled when filed, without asking; empty by default
 }
 ```
 
 - **The entity is the target.** One binding per target, keyed
-  `k8s-namespace/<name>`, with the source `ops`: there is no source plugin
-  behind it, and `source-contract.ts` does not change. It has no phases
+  `k8s-namespace/<name>` or `sentry-project/<org>/<project>`, with the
+  source `ops`: there is no source plugin behind it, and
+  `source-contract.ts` does not change. It has no phases
   keyed on entity state and no terminal state. It lives while the project
   file lists its target: taken out, the binding ends (`unconfigured`) and
   its thread is archived; put back, the same binding and thread resume.
@@ -809,17 +813,92 @@ goes wrong there into Linear tickets for the project steward to adopt.
   then filing, commenting and escalating), and like every `may` list it is
   advisory (§11): nothing stops the steward's shell. A real wall, such as a
   read-only identity for kubectl, would slot in behind that one function.
-- **`bb stewards check`** validates `ops` (namespace names, duplicates,
-  that the team is one of `linear.teams`), then runs kubectl on the
-  project's machine for each target: `get` its pods, events and
+- **`bb stewards check`** validates `ops` (namespace names, Sentry slugs,
+  duplicates, that the team is one of `linear.teams`), then runs kubectl
+  on the project's machine for each namespace: `get` its pods, events and
   deployments, and `auth can-i` for its logs. A target kubectl cannot
   reach — no kubectl, the machine not on the tailnet as the developer, no
   kubeconfig or context for the cluster, pods forbidden — is a problem,
   "cannot read the target". Writes the identity holds there are said, not
-  counted as a problem: they are expected of a developer.
+  counted as a problem: they are expected of a developer. For each Sentry
+  project it reads the project with the plugin's token (no token, or a
+  refusal, is a problem) and says how doorbells arrive: the bb-gate-hooks
+  stream's state, or that there is no service here.
 - **When kubectl cannot read the target**, the binding is made but its
   steward is not spawned or woken; `bb stewards list` shows `cannot read
   the target`, and the first look that succeeds wakes it.
+
+### Sentry projects
+
+A `sentry-project` target is the push source the k8s look lacks: an error
+that does not crash a pod is still an issue in Sentry, and Sentry knows of
+it the moment it happens. The target runs the same `ops-watch` playbook
+and the same fingerprint map; what differs is how the plugin looks and
+what a wake carries.
+
+- **The credential is the plugin's, a secret setting.** `sentryToken` on
+  the stewards plugin holds a Sentry *user auth token* with `project:read`
+  and `event:read`, entered by the user in the plugin's settings and never
+  pasted into a thread; `sentryApiUrl` points at a self-hosted Sentry. The
+  ticket's decision: no `sentry` plugin, because the source contract has no
+  use for one and a new plugin would mean the three plugin lists in the
+  `bb-server` Dockerfile. The steward's thread holds no token: it diagnoses
+  from the wake's evidence and the code in its workspace. **Until a token
+  is set, the look fails with "no Sentry token is configured"; that one
+  failure wakes the steward**, which files the `provide-secret` need naming
+  the setting (variable `sentryToken`, the Sentry auth-tokens page, the
+  scopes) and does nothing else; later looks are quiet until the token
+  appears. Any other read failure (403, a wrong URL) is logged and shown by
+  `bb stewards check`, and wakes nobody, as a namespace kubectl cannot read
+  does not.
+- **Doorbells come from bb-gate-hooks directly** (`hooks-client.ts`, a copy
+  of github-watcher's without the GitHub parts), since there is no source
+  plugin to lease through. The plugin holds one stream for the `sentry`
+  source, opened once a project lists a Sentry target, and leases a
+  `project` per target, sent as `org/slug` and leased under the slug that
+  doorbells carry as their unit, plus an `issue` per issue in the
+  fingerprint map that has a ticket and was seen within thirty days, so a
+  resolved ticket's issue still rings when it regresses. Every lease is
+  proven with the token; without one nothing is leased, and bb-gate-hooks
+  refusing the token is said once per token. A doorbell names an issue id
+  and, usually, the project slug: every open Sentry binding whose target is
+  that slug, or whose fingerprint map holds that id, notes the id as *rung*
+  and looks (bb-gate/docs/hooks.md, "Sentry"). The loop's sweeps (on
+  connect, after a failed or late renewal, every ten minutes, and every two
+  minutes while the stream is down) have every Sentry binding look for
+  itself, and the plugin's own sweep and requeue do the same, so **the
+  periodic look is the backstop**: with bb-gate-hooks down, a new issue is
+  seen at the next look.
+- **The look** reads the project's unresolved issues, newest activity
+  first (fifty), and each rung id the list does not carry. The sightings
+  are the issues *first seen* since the last look, *regressed* or
+  escalating in Sentry and active since, *rung* by a doorbell, and *known*
+  (in the fingerprint map) and still firing since; an issue Sentry has
+  resolved is never one, even when rung. Twenty at most, regressions
+  first. For the first five the latest event is read for its stack trace.
+  The rest of the unresolved list is shown for context, ten lines.
+- **The fingerprint is the Sentry issue id**: it is what the doorbell
+  carries, what the API is keyed on, and stable across events, so one
+  issue is one ticket however often it fires. The map's summary is
+  `WEB-12: <title> (<culprit>)`.
+- **The wake** (`formatSentryWake`) carries, per finding, the short id,
+  title, level, culprit, permalink, event and user counts, first and last
+  seen, Sentry's substatus, why it is in the look, and the latest event's
+  stack trace — each exception as a header, frames innermost last, in-app
+  frames marked `*` with their source line — all redacted by the same rule
+  as the kubectl look's log lines (`redactLine`): a bearer token or an
+  `api_key=` in an error message does not reach a ticket.
+- **What wakes the steward** (`sentryChanges`): a new issue, one back after
+  its ticket was resolved, and one Sentry marks regressed under an open
+  ticket, at once; a doorbell for an issue under an open ticket only when
+  the steward has not filed or commented within a `requeue-default`, so a
+  noisy issue is one comment per interval, not one per event (the
+  playbook's "a second event on the same Sentry issue is a comment, never a
+  second ticket"); and the requeue, as for every ops binding. A known issue
+  seen again, and one no longer seen, are noted quietly.
+- **What the plugin never does with Sentry:** write to it. Resolving,
+  assigning or commenting on a Sentry issue is not in the `may` list, and
+  the token's read scopes are the wall.
 
 ## 18. Needs you items and one-click actions
 
@@ -981,8 +1060,9 @@ edit.
   developer's own rights (§18); a steward that ignored its `may` list could
   use them.
 - **Healthy pods' logs are never scanned**, so an error that does not
-  crash, restart or unready a pod goes unseen. Push sources (Sentry, alerts
-  through bb-gate-hooks) would cover that, and are separate work.
+  crash, restart or unready a pod goes unseen. A `sentry-project` target
+  covers the errors Sentry sees (§18); Alertmanager or Prometheus alerts
+  through bb-gate-hooks remain separate work.
 - **Comments and the team lease.** bb-gate-hooks does not always know a
   Linear comment's team, so a team lease alone misses some comments. That is
   why every binding also holds an issue lease for its own entity (§16).

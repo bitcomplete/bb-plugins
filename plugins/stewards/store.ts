@@ -12,6 +12,7 @@ import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
+import { sentryLookSchema, type SentryLook } from "./sentry.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -174,6 +175,9 @@ export const MIGRATIONS = [
   // Fixed choices on a decide item's escalation and on the question a forwarded one makes: short labels, JSON, so the page can offer a button each (BB-20).
   `ALTER TABLE escalations ADD COLUMN choices TEXT`,
   `ALTER TABLE questions ADD COLUMN choices TEXT`,
+  // A Sentry project binding's last look: the issues new, regressed or rung
+  // since the look before, classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN sentry_look TEXT`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -293,6 +297,8 @@ export type Binding = {
   opsLook: OpsLook | null;
   /** A Dependabot alert binding's last look; null for every other kind. */
   depsLook: DepsLook | null;
+  /** A Sentry project binding's last look; null for every other kind. */
+  sentryLook: SentryLook | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -349,6 +355,7 @@ function rowToBinding(r: BindingRow): Binding {
     manualDetach: Number(r.manual_detach) === 1,
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
+    sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -395,6 +402,7 @@ const COLUMNS = {
   manualDetach: "manual_detach",
   opsLook: "ops_look",
   depsLook: "deps_look",
+  sentryLook: "sentry_look",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
