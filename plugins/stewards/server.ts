@@ -36,6 +36,7 @@ import {
   playbookNameFor,
   playbookPath,
   playbookStates,
+  sentryTargets,
   STAGES,
   usesKind,
   type BindingKind,
@@ -47,8 +48,10 @@ import {
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
+import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type Sighting, type TicketState } from "./ops.js";
+import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -67,7 +70,7 @@ import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatDepsWake, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -127,6 +130,10 @@ export interface StewardsDeps {
   kubectl?: (args: string[], where: { projectId: string; hostId: string | null }) => Promise<KubectlResult>;
   /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
   github?: GithubWriter;
+  /** What reads Sentry and subscribes to bb-gate-hooks for it; global fetch by default. */
+  fetch?: typeof fetch;
+  /** Where BB_HOOKS_URL is read from; the process environment by default. */
+  env?: Record<string, string | undefined>;
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -367,7 +374,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
         default: 120_000,
       },
+      sentryToken: {
+        type: "string",
+        secret: true,
+        label: "Sentry token",
+        description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its bb-gate-hooks leases with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
+      },
+      sentryApiUrl: {
+        type: "string",
+        label: "Sentry API",
+        description: "Where Sentry is read; change it for a self-hosted Sentry.",
+        default: SENTRY_API_URL,
+      },
     });
+    const fetchImpl = deps.fetch ?? globalThis.fetch;
+    const env = deps.env ?? process.env;
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
@@ -1249,8 +1270,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return out;
     }
 
-    /** Every ops target a project watches: the k8s namespaces and the Dependabot repositories. */
-    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...k8sTargets(config.file), ...depsTargets(config.file, config.repos)];
+    /** Every ops target a project watches: the k8s namespaces, the Sentry projects and the Dependabot repositories. */
+    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...k8sTargets(config.file), ...sentryTargets(config.file), ...depsTargets(config.file, config.repos)];
 
     /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
     async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
@@ -1380,6 +1401,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await reconcileDeps(b, config, playbook, target, force);
         return;
       }
+      if (target.kind === "sentry-project") {
+        await reconcileSentry(b, config, playbook, target, force);
+        return;
+      }
       const before = b.opsLook;
       const look = await lookAt(b, config, target, playbook);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
@@ -1488,6 +1513,241 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
     }
 
+    // ---- Sentry targets ----------------------------------------------------------------------------
+    //
+    // A sentry-project target is read with the plugin's own Sentry token (a
+    // secret setting), not through a source plugin: there is no sentry plugin,
+    // and the source contract has no use for one. bb-gate-hooks rings the
+    // binding the moment Sentry sees a new issue or a regression (the loop
+    // below holds a `project` lease per target and an `issue` lease per issue
+    // with a ticket); the look at every sweep and requeue is the backstop
+    // when hooks are down, listing what is new or regressed since the last
+    // look. The Sentry issue id is the fingerprint.
+
+    const sentryToken = async (): Promise<string | null> => {
+      const value = (await settings.get()).sentryToken;
+      const token = typeof value === "string" ? value.trim() : "";
+      return token === "" ? null : token;
+    };
+    const sentryReader = async (): Promise<SentryReader> => {
+      const value = (await settings.get()).sentryApiUrl;
+      const apiUrl = typeof value === "string" && value.trim() !== "" ? value.trim() : SENTRY_API_URL;
+      return createSentryReader(fetchImpl, { apiUrl, token: sentryToken });
+    };
+    /** Issue ids doorbells named since each binding's last look. */
+    const sentryRung = new Map<string, Set<string>>();
+    /** At most this many rung issues are read one by one when the list does not carry them. */
+    const RUNG_PER_LOOK = 10;
+    /** An issue with a ticket is leased while it was seen within this long. */
+    const ISSUE_LEASE_WINDOW_MS = 30 * 86_400_000;
+
+    const openSentryBindings = (): Array<{ binding: Binding; target: SentryTarget }> =>
+      store
+        .open()
+        .filter((b) => b.kind === "ops")
+        .flatMap((b) => {
+          const target = parseOpsTargetKey(b.entityId);
+          return target?.kind === "sentry-project" ? [{ binding: b, target }] : [];
+        });
+
+    /** One look at a Sentry project: the issues new, regressed, rung or still firing since the last look, classified against the fingerprint map. */
+    async function lookAtSentry(b: Binding, target: SentryTarget, playbook: Playbook): Promise<SentryLook> {
+      const at = now();
+      const key = opsTargetKey(target);
+      const since = b.sentryLook !== null && b.sentryLook.error === null ? b.sentryLook.at : at - playbook.requeueDefaultMs;
+      const rung = sentryRung.get(b.id) ?? new Set<string>();
+      const notes: string[] = [];
+      try {
+        const reader = await sentryReader();
+        const issues = await reader.issues(target);
+        const byId = new Set(issues.map((i) => i.id));
+        // A rung issue the list does not carry (older activity, or more than a page away) is read by itself.
+        for (const id of [...rung].filter((x) => !byId.has(x)).slice(0, RUNG_PER_LOOK)) {
+          try {
+            const issue = await reader.issue(id);
+            // Gone (resolved, or not this token's to see), or another project's with the same slug.
+            if (issue === null || (issue.project !== null && issue.project !== target.project)) continue;
+            issues.push(issue);
+          } catch (error) {
+            notes.push(`Issue ${id}, which Sentry rang for, could not be read (${errorMessage(error)})`);
+          }
+        }
+        const known = new Set(store.fingerprints(b.id).map((r) => r.fingerprint));
+        const sightings = sentrySightings(issues, { since }, rung, known);
+        sentryRung.delete(b.id);
+        const rows = store.sight(
+          b.projectId,
+          b.id,
+          sightings.map((s) => ({ fingerprint: s.fingerprint, summary: sentrySummary(s.issue) })),
+        );
+        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const asSightings: Sighting[] = sightings.map((s) => ({ fingerprint: s.fingerprint, workload: s.issue.shortId, pods: [], container: null, signature: s.reasons[0] ?? "ongoing", summary: sentrySummary(s.issue), restarts: 0, events: [], logs: null, previous: false }));
+        const classified = classify(asSightings, rows, tickets, at);
+        const findings: SentryFinding[] = [];
+        let eventsRead = 0;
+        for (const [i, s] of sightings.entries()) {
+          const c = classified[i]!;
+          let event: SentryFinding["event"] = null;
+          if (eventsRead < EVENTS_PER_LOOK) {
+            eventsRead += 1;
+            try {
+              event = await reader.latestEvent(s.issue.id);
+            } catch (error) {
+              notes.push(`The latest event of ${s.issue.shortId} could not be read (${errorMessage(error)})`);
+            }
+          }
+          const { issue } = s;
+          findings.push({
+            fingerprint: s.fingerprint,
+            shortId: issue.shortId,
+            title: issue.title,
+            culprit: issue.culprit,
+            permalink: issue.permalink,
+            level: issue.level,
+            substatus: issue.substatus,
+            count: issue.count,
+            userCount: issue.userCount,
+            firstSeen: issue.firstSeen,
+            lastSeen: issue.lastSeen,
+            reasons: s.reasons,
+            event,
+            class: c.class,
+            ticket: c.ticket,
+            ticketState: c.ticketState,
+            firstSeenAt: c.firstSeenAt,
+            lastCommentedAt: c.lastCommentedAt,
+          });
+        }
+        const covered = new Set(findings.map((f) => f.fingerprint));
+        const unresolved = issues.filter((i) => i.status === "unresolved");
+        const recent = unresolved.filter((i) => !covered.has(i.id)).slice(0, RECENT_PER_LOOK).map(recentLine);
+        return { at, target: key, error: null, unresolved: unresolved.length, recent, notes, findings };
+      } catch (error) {
+        return emptySentryLook(at, key, errorMessage(error));
+      }
+    }
+
+    /**
+     * The same turn for a Sentry project: look, compare with the last look,
+     * and wake on what changed. A look that fails for want of a token wakes
+     * the steward once, so it files the provide-secret need; any other
+     * failure is logged, and `bb stewards check` says why.
+     */
+    async function reconcileSentry(b: Binding, config: ProjectConfig, playbook: Playbook, target: SentryTarget, force: WakeReason | null): Promise<void> {
+      const before = b.sentryLook;
+      const look = await lookAtSentry(b, target, playbook);
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { sentryLook: look, requeueAt });
+      if (look.error !== null && before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
+      if (look.error !== null && look.error !== NO_TOKEN) return;
+
+      const changes = sentryChanges(before, look, playbook.requeueDefaultMs);
+      if (requeueCame && look.error === null) changes.push({ text: look.findings.length > 0 ? "Requeue time came, with issues to act on" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      // A steward that has never been woken is due its first turn as soon as the project can be read, or the need for a token can be filed.
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const text = formatSentryWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        team: opsTeam(config.file),
+        label: config.file.label,
+        autoAdopt: config.file.ops.autoAdopt,
+        escalations: store.openEscalations(b.id),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      if (!(await deliverWake(b, config, playbook, text))) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+    }
+
+    // The subscriber: one stream to bb-gate-hooks for the `sentry` source,
+    // proven with the plugin's token (bb-gate/docs/hooks.md, "Sentry"). A
+    // project lease is sent as org/slug and leased under the slug, which is
+    // what a doorbell carries as its unit; an issue lease is the issue id.
+    // Without BB_HOOKS_URL, or without a token, nothing is leased and the
+    // sweeps carry the watch.
+    const hooksUrl = env[HOOKS_URL_ENV]?.trim() ?? "";
+    /** The leases bb-gate-hooks refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
+    let sentryRefused = new Map<string, string>();
+
+    function sentryLeases(): Lease[] {
+      const seen = new Set<string>();
+      const out: Lease[] = [];
+      const add = (kind: Lease["kind"], id: string) => {
+        const k = `${kind} ${id}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({ kind, id });
+      };
+      for (const c of configs.values()) {
+        if (c.value === null) continue;
+        for (const t of sentryTargets(c.value.file)) add("project", `${t.org}/${t.project}`);
+      }
+      const recent = now() - ISSUE_LEASE_WINDOW_MS;
+      for (const { binding } of openSentryBindings()) {
+        for (const r of store.fingerprints(binding.id)) if (r.ticketKey !== null && r.lastSeenAt >= recent) add("issue", r.fingerprint);
+      }
+      return out;
+    }
+
+    /** A Sentry doorbell: the issue id, and the project slug when the service named one. Every binding it concerns looks. */
+    function onSentryDoorbell(id: string, unit: string | null): void {
+      for (const { binding, target } of openSentryBindings()) {
+        const byUnit = unit !== null && unit === target.project;
+        const byIssue = store.fingerprint(binding.projectId, id)?.bindingId === binding.id;
+        if (!byUnit && !byIssue) continue;
+        const rung = sentryRung.get(binding.id) ?? new Set<string>();
+        rung.add(id);
+        sentryRung.set(binding.id, rung);
+        scheduleReconcile(binding.id);
+      }
+    }
+
+    const sentryHooks = createHooksLoop({
+      fetch: fetchImpl,
+      baseUrl: hooksUrl,
+      now,
+      log: bb.log,
+      token: sentryToken,
+      watchIds: sentryLeases,
+      onDoorbell: (kind, id, unit) => {
+        if (kind === "issue") onSentryDoorbell(id, unit);
+      },
+      async onRejected(rejected: Rejection[]) {
+        sentryRefused = new Map(rejected.map((r) => [`${r.kind} ${r.id}`, r.reason]));
+        for (const r of rejected) bb.log.warn(`stewards: bb-gate-hooks refused a Sentry ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
+      },
+      async sweep() {
+        // Coverage cannot be proven: every Sentry binding looks for itself.
+        for (const { binding } of openSentryBindings()) scheduleReconcile(binding.id);
+      },
+    });
+    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && sentryTargets(c.value.file).length > 0);
+
     /**
      * One ops binding per configured target. A target taken out of the
      * project file ends its binding; put back, the same binding and thread
@@ -1498,8 +1758,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function syncOpsBindings(config: ProjectConfig): Promise<void> {
       const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
-      const k8sPlaybook = playbookFor(config, "ops");
-      if (k8sPlaybook !== null) for (const target of k8sTargets(config.file)) wanted.set(opsTargetKey(target), { target, playbook: k8sPlaybook });
+      const opsPlaybook = playbookFor(config, "ops");
+      if (opsPlaybook !== null) for (const target of [...k8sTargets(config.file), ...sentryTargets(config.file)]) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
       if (config.depsAlerts !== null) for (const target of depsTargets(config.file, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
       const existing = store.all(config.projectId).filter((b) => b.kind === "ops");
       for (const b of existing) {
@@ -1516,13 +1776,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const b = existing.find((x) => x.entityId === key);
         if (b === undefined) {
           let created: Binding;
-          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : `Deps watch: ${target.repo}`;
+          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : `Sentry watch: ${target.org}/${target.project}`;
           try {
             created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
           } catch {
             continue; // made concurrently
           }
           bb.log.info(`stewards: watching ${key} with an ops binding (${playbook.name})`);
+          // A Sentry project is leased as soon as it is watched; the next renewal would otherwise be up to half a lease away.
+          if (target.kind === "sentry-project") sentryHooks.added("project", `${target.org}/${target.project}`).catch((error: unknown) => bb.log.warn(`stewards: could not lease ${key} right away: ${errorMessage(error)}`));
           await serial(`b:${created.id}`, () => reconcileBinding(created.id, "adopted"));
         } else if (b.endedAt !== null && !b.manualDetach) {
           await serial(`b:${b.id}`, async () => {
@@ -2843,12 +3105,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const b = role.binding;
       if (b.kind === "ops") {
+        const sentry = parseOpsTargetKey(b.entityId)?.kind === "sentry-project";
         return {
           tools: ["steward_report", "steward_update"],
           skills: ["stewards"],
           instructions:
             `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
-            "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. To dig further, run kubectl on the target yourself, but only get, describe, logs and auth can-i: it acts as the user, whose rights are broad. " +
+            (sentry
+              ? "The plugin reads this Sentry project for you with its own token and every wake carries the issues that are new, regressed or rung, with their stack traces; you never change production and start no workers. Your thread holds no Sentry token, so diagnose from the wake and the code in your workspace. "
+              : "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. To dig further, run kubectl on the target yourself, but only get, describe, logs and auth can-i: it acts as the user, whose rights are broad. ") +
             "File and comment on Linear tickets with the linear_ tools, which sign for you; escalate each ticket you file to the project steward with steward_report, as the playbook says. " +
             "End every turn you were woken for with steward_report, listing in opsTickets every ticket you filed, commented on or reopened. Read the stewards skill for the protocol.",
         };
@@ -3014,7 +3279,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
             const unknown = opsTickets.filter((t) => store.fingerprint(b.projectId, t.fingerprint) === null).map((t) => JSON.stringify(t.fingerprint));
             if (unknown.length > 0) {
-              const known = (b.opsLook?.findings ?? []).map((f) => `- ${f.fingerprint}`).join("\n");
+              const known = [...(b.opsLook?.findings ?? []), ...(b.sentryLook?.findings ?? []), ...(b.depsLook?.alerts ?? [])].map((f) => `- ${f.fingerprint}`).join("\n");
               return toolError(new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a fingerprint" : "are not fingerprints"} this project has seen. Use them as the wake gives them${known === "" ? "." : `:\n${known}`}`));
             }
           }
@@ -3065,6 +3330,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             );
           }
           for (const t of opsTickets) store.recordTicket(b.projectId, t.fingerprint, t.ticket, t.did);
+          // A Sentry issue with a ticket is leased by itself, so its next event rings even outside the project lease.
+          if (opsTickets.length > 0 && parseOpsTargetKey(b.entityId)?.kind === "sentry-project") {
+            sentryHooks.added("issue", ...opsTickets.map((t) => t.fingerprint)).catch((error: unknown) => bb.log.warn(`stewards: could not lease a Sentry issue right away: ${errorMessage(error)}`));
+          }
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
@@ -3500,7 +3769,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const s = b.status;
           const open = store.openEscalations(b.id);
           const look = b.opsLook;
-          const watch = look === null ? null : look.error !== null ? `cannot read the target: ${look.error}` : `looked ${iso(look.at)}: ${look.findings.length === 0 ? "nothing failing" : `${look.findings.length} problem(s) failing`}`;
+          const sentry = b.sentryLook;
+          const watch =
+            look !== null
+              ? look.error !== null
+                ? `cannot read the target: ${look.error}`
+                : `looked ${iso(look.at)}: ${look.findings.length === 0 ? "nothing failing" : `${look.findings.length} problem(s) failing`}`
+              : sentry === null
+                ? null
+                : sentry.error !== null
+                  ? `cannot read the target: ${sentry.error}`
+                  : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
@@ -3598,6 +3877,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     bb.background.schedule("nightly", "*/5 * * * *", nightlyTick);
+    if (hooksUrl !== "") {
+      // The stream is opened only once a project lists a Sentry target; a
+      // server with none holds no stream for a source it never leases on.
+      bb.background.service("sentry-hooks", {
+        async start(signal) {
+          while (!signal.aborted && !sentryWanted()) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 60_000);
+              signal.addEventListener(
+                "abort",
+                () => {
+                  clearTimeout(timer);
+                  resolve();
+                },
+                { once: true },
+              );
+            });
+          }
+          if (!signal.aborted) await sentryHooks.run(signal);
+        },
+      });
+    }
     bb.background.service("loop", {
       async start(signal) {
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
@@ -3666,6 +3967,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         lines.push(`ops: kubectl runs on ${host ?? "no machine"}${config.file.ops.context === undefined ? ", in its current context" : `, in context ${config.file.ops.context}`}`);
         const reader = opsReaderFor(config);
         for (const target of k8sTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
+        const sentry = sentryTargets(config.file);
+        if (sentry.length > 0) {
+          if ((await sentryToken()) === null) lines.push(`problem: sentry: ${NO_TOKEN}: set the Sentry token in the stewards plugin's settings (a user auth token with ${TOKEN_SCOPES.join(" and ")})`);
+          const sentryApi = await sentryReader();
+          for (const target of sentry) {
+            const key = opsTargetKey(target);
+            const a = await sentryApi.access(target);
+            lines.push(a.ok ? `sentry: ${key} is readable (${a.name})` : `problem: sentry: cannot read the target ${key}: ${a.error}`);
+            const refused = sentryRefused.get(`project ${target.org}/${target.project}`);
+            if (refused !== undefined) lines.push(`sentry: ${key}: bb-gate-hooks refused its project lease (${refused}); only the periodic look sees it`);
+          }
+          const status = sentryHooks.status();
+          lines.push(hooksUrl === "" ? "sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only" : `sentry: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
+        }
       }
       const deps = config.file.deps;
       const slaText = (v: number | "asap") => (v === "asap" ? "asap" : formatDuration(v));
@@ -3951,12 +4266,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
-    testHooks.set(bb.pluginId, { sweep, store, db, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
+    testHooks.set(bb.pluginId, { sweep, store, db, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

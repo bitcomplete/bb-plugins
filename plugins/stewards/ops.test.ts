@@ -12,6 +12,12 @@ describe("targets", () => {
     expect(opsTargetKey(target)).toBe("k8s-namespace/bb-gate-production");
     expect(parseOpsTargetKey("k8s-namespace/bb-gate-production")).toEqual(target);
     expect(parseOpsTargetKey("acme/web#3")).toBeNull();
+    // A Sentry project is keyed by organization and project slug.
+    const sentry = { kind: "sentry-project", org: "acme", project: "web-api" } as const;
+    expect(opsTargetKey(sentry)).toBe("sentry-project/acme/web-api");
+    expect(parseOpsTargetKey("sentry-project/acme/web-api")).toEqual(sentry);
+    expect(parseOpsTargetKey("sentry-project/acme")).toBeNull();
+    expect(parseOpsTargetKey("sentry-project/Acme/web")).toBeNull();
   });
 });
 

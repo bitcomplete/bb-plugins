@@ -13,16 +13,23 @@ import type { Change } from "./reconcile.js";
 
 export type K8sTarget = { kind: "k8s-namespace"; name: string };
 export type DependabotTarget = { kind: "dependabot"; repo: string };
-export type OpsTarget = K8sTarget | DependabotTarget;
+/** A Sentry project, by organization and project slug, read with the plugin's Sentry token (sentry.ts). */
+export type SentryTarget = { kind: "sentry-project"; org: string; project: string };
+export type OpsTarget = K8sTarget | DependabotTarget | SentryTarget;
 
-/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production" or "dependabot/acme/web". */
-export const opsTargetKey = (t: OpsTarget): string => (t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : `${t.kind}/${t.repo}`);
+/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production", "dependabot/acme/web" or "sentry-project/acme/web". */
+export const opsTargetKey = (t: OpsTarget): string => (t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "dependabot" ? `${t.kind}/${t.repo}` : `${t.kind}/${t.org}/${t.project}`);
+
+/** A Sentry slug: what Sentry puts in URLs for an organization or a project. */
+export const SENTRY_SLUG = /^[a-z0-9][a-z0-9._-]*$/u;
 
 export function parseOpsTargetKey(key: string): OpsTarget | null {
   const k8s = /^(k8s-namespace)\/([a-z0-9][-a-z0-9]*)$/u.exec(key);
   if (k8s !== null) return { kind: "k8s-namespace", name: k8s[2]! };
   const dep = /^(dependabot)\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/u.exec(key);
-  return dep === null ? null : { kind: "dependabot", repo: dep[2]! };
+  if (dep !== null) return { kind: "dependabot", repo: dep[2]! };
+  const sentry = /^(sentry-project)\/([a-z0-9][a-z0-9._-]*)\/([a-z0-9][a-z0-9._-]*)$/u.exec(key);
+  return sentry === null ? null : { kind: "sentry-project", org: sentry[2]!, project: sentry[3]! };
 }
 
 // ---- reading the Kubernetes API's JSON --------------------------------------------
@@ -230,6 +237,12 @@ export const LOG_LINES = 30;
 const LOG_LINE_CHARS = 400;
 const SECRET = /((?:authorization|token|secret|password|passwd|api[_-]?key|cookie|set-cookie)["']?\s*[:=]\s*["']?(?:bearer\s+)?|bearer\s+)([^\s"',;]+)/giu;
 
+/** One line of evidence with obvious credentials replaced and its length clipped. Everything that goes into a ticket passes here. */
+export const redactLine = (line: string, max = LOG_LINE_CHARS): string => {
+  const clean = line.replace(SECRET, "$1[redacted]");
+  return clean.length <= max ? clean : `${clean.slice(0, max)}…`;
+};
+
 /**
  * The last lines of a log, clipped and with obvious credentials replaced.
  * They go into a Linear ticket, so a token printed by a crashing process
@@ -240,8 +253,7 @@ export function logTail(text: string, lines = LOG_LINES): string[] {
     .split(/\r?\n/u)
     .filter((l) => l.trim() !== "")
     .slice(-lines)
-    .map((l) => l.replace(SECRET, "$1[redacted]"))
-    .map((l) => (l.length <= LOG_LINE_CHARS ? l : `${l.slice(0, LOG_LINE_CHARS)}…`));
+    .map((l) => redactLine(l));
 }
 
 // ---- the look, compared with the fingerprint map ----------------------------------------

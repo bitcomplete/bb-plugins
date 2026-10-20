@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { depsTargets, isTerminal, k8sTargets, opsTeam, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
+import { depsTargets, isTerminal, k8sTargets, opsTeam, sentryTargets, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
 import { DEPS_ALERTS, DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
@@ -82,6 +82,18 @@ describe("ops in the project file", () => {
     expect(depsTargets(d.value, ["acme/web", "acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }, { kind: "dependabot", repo: "acme/other" }]);
     expect(k8sTargets(d.value)).toEqual([{ kind: "k8s-namespace", name: "prod" }]);
     expect(error({ targets: [{ kind: "dependabot", repo: "not a repo" }] })).toMatch(/ops\.targets\.0\.repo/u);
+  });
+
+  it("accepts a Sentry project by organization and project slug, folded to Sentry's lower case", () => {
+    const r = file({ targets: [{ kind: "sentry-project", org: " Acme ", project: "Web-API" }] });
+    if (!r.ok) expect.fail(r.error);
+    expect(r.value.ops.targets).toEqual([{ kind: "sentry-project", org: "acme", project: "web-api" }]);
+    expect(sentryTargets(r.value)).toEqual([{ kind: "sentry-project", org: "acme", project: "web-api" }]);
+    expect(k8sTargets(r.value)).toEqual([]);
+    expect(usesKind(r.value, "ops")).toBe(true);
+    expect(error({ targets: [{ kind: "sentry-project", org: "acme", project: "web api" }] })).toMatch(/ops\.targets\.0\.project: a Sentry slug/u);
+    expect(error({ targets: [{ kind: "sentry-project", org: "acme" }] })).toMatch(/ops\.targets\.0\.project/u);
+    expect(error({ targets: [{ kind: "sentry-project", org: "acme", project: "web" }, { kind: "sentry-project", org: "ACME", project: "web" }] })).toMatch(/ops\.targets\.1: sentry-project\/acme\/web is listed twice/u);
   });
 
   it("refuses what would watch nothing or file where nobody stewards", () => {
@@ -180,7 +192,7 @@ describe("the ops playbook", () => {
     const phased = OPS_WATCH.replace("may:", "phases:\n  open: {}\nmay:");
     expect(parsePlaybook(phased, "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook has no phases/u) });
     expect(parsePlaybook(OPS_WATCH.replace("may:", "terminal: [Done]\nmay:"), "ops-watch")).toMatchObject({ ok: false });
-    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook watches k8s or github/u) });
+    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook watches k8s, sentry or github/u) });
     expect(parsePlaybook(GITHUB_PRS.replace("terminal: [merged, closed]\n", ""), "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/terminal: name at least one state/u) });
     // A ticket, pr or review playbook still needs its phases, as before ops.
     const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");
