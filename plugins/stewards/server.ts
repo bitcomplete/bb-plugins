@@ -2015,7 +2015,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             filedBy: "plugin",
           });
         } else {
-          store.closeNeedByKey(b.id, "approve-pr", url, g.ownerApproved ? "Owner approval is present." : "The pull request is not waiting for an owner approval.");
+          store.closeNeedByKey(b.id, "approve-pr", url, g.ownerApproved ? "Owner approval is present." : `${g.missing ?? "The pull request is not waiting for an owner approval."}`);
         }
         if (g.gateMet) {
           // A steward's own merge item (a refused merge) is left alone while a
@@ -2987,7 +2987,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
           const scheduling = playbook === null ? null : await syncScheduleRequest(b, playbook);
+          // An `approve-pr` or `merge` item is filed only when the lane gate
+          // can hold it: the page's Approve and Merge buttons are already
+          // guarded this way, and filing one the gate cannot hold would be
+          // closed again by syncNeeds in this same call, silently.
+          const refused: string[] = [];
           for (const n of input.needs ?? []) {
+            if (n.kind === "approve-pr" || n.kind === "merge") {
+              const url = n.url ?? n.worker ?? b.url ?? "";
+              const wanted = lc(url);
+              const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
+              const gate = pull === undefined ? null : prGate(pull);
+              const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
+              if (!holdable) {
+                refused.push(`${n.kind} for ${url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
+                continue;
+              }
+            }
             store.fileNeed({
               bindingId: b.id,
               kind: n.kind,
@@ -3003,6 +3019,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               filedBy: "steward",
             });
           }
+          const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
           if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
           const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
           if (raised !== null && !(raised.route === "project" && requests.length > 0)) await deliver(b, raised);
@@ -3035,12 +3052,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const askedAbout = store.binding(b.id)?.scheduleAsked ?? b.scheduleAsked;
           if (schedule !== undefined) gateNote += ` Scheduling is with the project steward (${schedule.id}): ${b.entityKey} touches what ${askedAbout.join(", ")} ${askedAbout.length === 1 ? "is" : "are"} already changing. Start no workers and do not move the ticket into a build state until it decides; wait for its guidance or hold.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${refusalNote}${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${refusalNote}${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const archived = archiveWhenIdle && store.openEscalations(b.id).length === 0 ? " Your thread is archived when the turn ends, and comes back on that wake." : "";
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
-          return `Reported.${recorded}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${archived} End the turn now.`;
+          return `Reported.${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${archived} End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
