@@ -3000,7 +3000,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const gate = pull === undefined ? null : prGate(pull);
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
-                refused.push(`${n.kind} for ${url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
+                refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
                 continue;
               }
             }
