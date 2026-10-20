@@ -1,6 +1,6 @@
 ---
 name: stewards
-description: Work as a steward (a long-lived thread bound to a Linear ticket or GitHub pull request) or as the project steward, or set up and diagnose stewards for a project with `bb stewards`.
+description: Work as a steward (a long-lived thread bound to a Linear ticket or GitHub pull request, or an ops steward watching production) or as the project steward, or set up and diagnose stewards for a project with `bb stewards`.
 ---
 
 # Stewards
@@ -15,6 +15,7 @@ steward** per project sits above all of them.
 | `ticket` | the project's label (default `bb-managed`) is on a Linear issue in a listed team | `linear-tickets` |
 | `pr` | the label is on a pull request in one of the project's repos | `github-prs` |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos | `github-reviews` |
+| `ops` | `project.json` lists a target in `ops.targets` (a Kubernetes namespace) | `ops-watch` |
 
 ## If you are a steward
 
@@ -106,6 +107,34 @@ Two tools are yours; everything else you do with the tools every thread has.
   The plugin then archives your thread after a wake turn, unless a worker
   runs or an escalation is open, and the next wake brings it back.
 
+## If you are an ops steward
+
+You watch one production target; the wake is the plugin's look at it (pods,
+Warning events, and log lines where the server may read them), with each
+problem's fingerprint marked new, recurring or returned. You never change
+production and start no workers. To dig further you may run kubectl on the
+target yourself, but only `get`, `describe`, `logs` and `auth can-i`: it
+acts as the user, whose rights are broad, and nothing else stops a write.
+
+- **New:** search the team for an open ticket about it, then file one ticket
+  per problem with `linear_create_issue`: pod and container, since when, the
+  evidence quoted, your diagnosis, a priority, and a line
+  ``Fingerprint: `<fingerprint>` ``. Raise one `decision` escalation for the
+  tickets of the turn: "Filed BB-N (high): …. Recommend adopting." A priority
+  the wake says `ops.autoAdopt` covers you label and move to Todo yourself,
+  with no escalation.
+- **Recurring:** comment on its ticket when the evidence moved; file nothing.
+- **Returned:** as the playbook says: comment and escalate a reopen, or file
+  anew linking the old ticket.
+- **Report every ticket** in `steward_report { opsTickets: [{ fingerprint,
+  ticket, did: "filed" | "commented" | "reopened" }] }`, by the fingerprint the
+  wake gives. That is what makes the next look a comment instead of a
+  duplicate.
+- **All healthy:** the wake says so every requeue; report it with
+  `actor: other` and end the turn.
+- **No logs** (the wake says so): diagnose from status and events, and say
+  in the ticket that logs were not available.
+
 ## If you are the project steward
 
 You decide what the stewards below you escalate, from the project's own
@@ -120,6 +149,10 @@ with `guidance` + `resolve` saying what must change. When the user acts on
 an entity whose escalation you forwarded to them — edits the ticket,
 comments, moves it — you are woken with the change: if it answers the
 escalation, record it with `guidance` + `resolve`; if not, leave it open.
+An ops steward's `decision` escalation is a ticket it filed about
+production: adopt it when the project's guidance says it is worth working
+(add the label, move it to Todo with `linear_update_issue`; a ticket steward
+picks it up), or decline with a reason, then resolve the escalation.
 
 Everything you ask the user is a record. Forwarding an escalation to them
 makes a question for it; anything else you ask in a reply, record first
@@ -144,12 +177,15 @@ The project must be a multi-repo project: configuration is read from its
 
 1. From a thread in the project: `bb stewards init` writes
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams
-   ENG,OPS`) and the three default playbooks into the workspace's `.bb`.
+   ENG,OPS`) and the four default playbooks into the workspace's `.bb`.
+   To watch production, list targets in `ops.targets`, such as
+   `{ "kind": "k8s-namespace", "name": "bb-gate-production" }`.
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.
 3. `bb stewards check` validates the project file and playbooks against
-   Linear (teams, states, label) and GitHub (repos, label).
+   Linear (teams, states, label) and GitHub (repos, label), and that this
+   server can read every ops target (and holds no write there).
 4. Label a ticket `bb-managed`. Its steward thread appears beside the
    project steward's, not under it: a parent thread is woken whenever a
    child finishes a turn, and stewards report through their bindings.
@@ -160,7 +196,7 @@ project.
 | Command | Does |
 |---|---|
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
-| `bb stewards show <ENG-12 \| owner/repo#3>` | One binding in full: gate, guidance, escalations, needs, workers |
+| `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
 | `bb stewards done <need_… \| qst_…>` | Close a waiting item from a thread; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
@@ -177,6 +213,12 @@ above which a steward is compacted after its turn.
   ticket, its team in `linear.teams`, and the linear plugin connected. Rings
   need bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
+- **An ops steward never wakes.** `bb stewards list` shows `cannot read the
+  target` and `bb stewards check` says why: kubectl on the project's
+  machine cannot reach the cluster (not installed, the machine not on the
+  tailnet as the developer or a tagged node, no kubeconfig or context for
+  it; `ops.context` picks one), or it may not list pods there.
+  Otherwise it takes a turn every `requeue-default`, healthy or not.
 - **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,
   unless `project.json` lists it in `github.exclude` (`owner/repo`). Bindings
   already running there end with `bb stewards detach`.

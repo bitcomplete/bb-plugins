@@ -10,6 +10,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
+import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -138,6 +139,22 @@ export const MIGRATIONS = [
    )`,
   `CREATE INDEX IF NOT EXISTS needs_binding ON needs (binding_id, status)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS needs_open_key ON needs (binding_id, kind, url) WHERE status = 'open'`,
+  // An ops binding's last look at its target: what it found, classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN ops_look TEXT`,
+  // The fingerprint map: one problem an ops steward has seen, and the Linear ticket it was filed or commented on under.
+  `CREATE TABLE IF NOT EXISTS ops_fingerprints (
+     project_id TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     binding_id TEXT NOT NULL,
+     summary TEXT NOT NULL,
+     ticket_key TEXT,
+     first_seen_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL,
+     seen_count INTEGER NOT NULL DEFAULT 1,
+     filed_at INTEGER,
+     last_commented_at INTEGER,
+     PRIMARY KEY (project_id, fingerprint)
+   )`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -198,10 +215,13 @@ function json<T>(schema: z.ZodType<T>, raw: string | null, fallback: T): T {
 
 // ---- bindings --------------------------------------------------------------------------
 
+/** Where a binding's entity lives: a source plugin's, or "ops" for a watch target, which the plugin reads itself. */
+export type BindingSource = Source | "ops";
+
 export type Binding = {
   id: string;
   projectId: string;
-  source: Source;
+  source: BindingSource;
   entityId: string;
   entityKey: string;
   url: string | null;
@@ -242,6 +262,8 @@ export type Binding = {
   /** When follow-through runs out, whatever the steward says: set when it is first declared. */
   followThroughUntil: number | null;
   manualDetach: boolean;
+  /** An ops binding's last look; null for every other kind. */
+  opsLook: OpsLook | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -257,7 +279,7 @@ function rowToBinding(r: BindingRow): Binding {
   return {
     id: r.id,
     projectId: String(r.project_id),
-    source: String(r.source) as Source,
+    source: String(r.source) as BindingSource,
     entityId: String(r.entity_id),
     entityKey: String(r.entity_key),
     url: str("url"),
@@ -292,6 +314,7 @@ function rowToBinding(r: BindingRow): Binding {
     followThrough: str("follow_through"),
     followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
+    opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -332,6 +355,7 @@ const COLUMNS = {
   followThrough: "follow_through",
   followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
+  opsLook: "ops_look",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -418,6 +442,12 @@ export type Need = {
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
+/** One problem an ops steward has seen, and the ticket it is tracked under. */
+export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null };
+
+/** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
+export type TicketAction = "filed" | "commented" | "reopened";
+
 export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null };
 
 /** Guidance repeated within this window is a retry, not new guidance. */
@@ -471,6 +501,15 @@ export function createStore(db: Database.Database, now: () => number) {
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
   const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
+
+  const getFingerprint = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE project_id = ? AND fingerprint = ?");
+  const fingerprintsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE binding_id = ? ORDER BY first_seen_at");
+  const sight = db.prepare(
+    `INSERT INTO ops_fingerprints (project_id, fingerprint, binding_id, summary, first_seen_at, last_seen_at) VALUES (@project_id, @fingerprint, @binding_id, @summary, @at, @at)
+     ON CONFLICT (project_id, fingerprint) DO UPDATE SET binding_id = @binding_id, summary = @summary, last_seen_at = @at, seen_count = seen_count + 1`,
+  );
+  const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
+  const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
 
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
@@ -540,6 +579,18 @@ export function createStore(db: Database.Database, now: () => number) {
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
   });
+  const toFingerprint = (r: Record<string, unknown>): Fingerprint => ({
+    projectId: String(r.project_id),
+    fingerprint: String(r.fingerprint),
+    bindingId: String(r.binding_id),
+    summary: String(r.summary),
+    ticketKey: r.ticket_key === null ? null : String(r.ticket_key),
+    firstSeenAt: Number(r.first_seen_at),
+    lastSeenAt: Number(r.last_seen_at),
+    seenCount: Number(r.seen_count),
+    filedAt: r.filed_at === null ? null : Number(r.filed_at),
+    lastCommentedAt: r.last_commented_at === null ? null : Number(r.last_commented_at),
+  });
   const toProject = (r: Record<string, unknown>): ProjectStewardRow => ({
     projectId: String(r.project_id),
     threadId: r.thread_id === null ? null : String(r.thread_id),
@@ -575,7 +626,7 @@ export function createStore(db: Database.Database, now: () => number) {
       const r = getBinding.get(id);
       return r === undefined ? null : rowToBinding(r);
     },
-    byEntity(source: Source, entityId: string): Binding | null {
+    byEntity(source: BindingSource, entityId: string): Binding | null {
       const r = byEntity.get(source, entityId);
       return r === undefined ? null : rowToBinding(r);
     },
@@ -810,6 +861,39 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+    },
+
+    // the fingerprint map
+    fingerprint(projectId: string, fingerprint: string): Fingerprint | null {
+      const r = getFingerprint.get(projectId, fingerprint);
+      return r === undefined ? null : toFingerprint(r);
+    },
+    fingerprints(bindingId: string): Fingerprint[] {
+      return fingerprintsFor.all(bindingId).map(toFingerprint);
+    },
+    /** Record that a look saw these problems: new ones enter the map with no ticket, known ones count another sighting. */
+    sight(projectId: string, bindingId: string, seen: Array<{ fingerprint: string; summary: string }>): Map<string, Fingerprint> {
+      return db.transaction(() => {
+        const at = now();
+        const out = new Map<string, Fingerprint>();
+        for (const s of seen) {
+          sight.run({ project_id: projectId, fingerprint: s.fingerprint, binding_id: bindingId, summary: s.summary, at });
+          out.set(s.fingerprint, toFingerprint(getFingerprint.get(projectId, s.fingerprint)!));
+        }
+        return out;
+      })();
+    },
+    /**
+     * Record what a steward did about a problem. Filing or reopening points
+     * the fingerprint at that ticket, so its next sighting is a comment there
+     * and nothing new; a comment counts as the latest word on it. False when
+     * the map has no such fingerprint.
+     */
+    recordTicket(projectId: string, fingerprint: string, ticketKey: string, did: TicketAction): boolean {
+      const at = now();
+      const key = ticketKey.toUpperCase();
+      const changed = did === "commented" ? setCommented.run(key, at, projectId, fingerprint) : setTicket.run(key, at, at, projectId, fingerprint);
+      return changed.changes > 0;
     },
 
     // project stewards

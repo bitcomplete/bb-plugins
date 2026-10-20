@@ -5,7 +5,7 @@ thread that manages it until it is done**. The thread, a **steward**, acts on
 the entity as you, according to a playbook the project keeps in `.bb`, and you
 steer it only from bb.
 
-Status: built (steps 1–4 of the build order; the board is not, but the settings page lists every steward and its status). See
+Status: built (steps 1–6 of the build order, ops stewards included). See
 [README.md](README.md) for how it runs and where it goes beyond this design.
 
 ## Scope
@@ -35,8 +35,8 @@ existing bb-gate-hooks pipeline; workers for bounded tasks.
 
 | Term | Meaning |
 |---|---|
-| **Entity** | A Linear issue or a GitHub pull request. |
-| **Binding** | The durable record that a steward manages an entity. Kinds: `ticket`, `pr`, `review`. No TTL. |
+| **Entity** | A Linear issue or a GitHub pull request; for an `ops` binding, a watch target (§18). |
+| **Binding** | The durable record that a steward manages an entity. Kinds: `ticket`, `pr`, `review`, `ops`. No TTL. |
 | **Ticket steward** | The long-lived thread bound to a labelled ticket or pull request. Decides and delegates; does not write code. |
 | **Review steward** | The long-lived thread bound to a teammate's pull request. Reviews it, as you, for as long as it is open. |
 | **Project steward** | One per bb project. Reads every binding's status record, sets priorities and holds, routes escalations, writes the morning digest. |
@@ -126,6 +126,7 @@ These were settled while designing; each changes what gets built.
       linear-tickets.md
       github-prs.md
       github-reviews.md
+      ops-watch.md             only read when ops.targets lists something (§18)
 ```
 
 ### `project.json`
@@ -195,6 +196,7 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 | `ticket` | `bb-managed` added to an issue in a listed Linear team | `linear-tickets` |
 | `pr` | `bb-managed` added to a pull request in a repo from `repos.json` not in `github.exclude` | `github-prs` |
 | `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` not in `github.exclude` | `github-reviews` |
+| `ops` | a target listed in the project file's `ops.targets` (§18) | `ops-watch` |
 
 - The plugin hears triggers through bb-gate-hooks `team` and `repo` leases,
   which already exist. The nightly pass re-lists labelled tickets and open
@@ -714,6 +716,107 @@ plugins' contract before stewards uses them, bb-plugins before bb-gate.
 4. **Reviews.** Review bindings, review workers.
 5. **Board.** Built: the Stewards page, the question record (§12), and the
    digest assembled from records.
+6. **Ops.** Built in this plugin (§18), with kubectl on the developer's
+   machine; nothing changes in bb-gate or devbox.
+
+## 18. Ops stewards
+
+Every other kind manages work that already exists as a ticket or a pull
+request. Nothing watched production, so operational problems were noticed by
+a person or not at all. An `ops` binding watches a **target** and turns what
+goes wrong there into Linear tickets for the project steward to adopt.
+
+```jsonc
+"ops": {
+  "targets": [{ "kind": "k8s-namespace", "name": "bb-gate-production" }],
+  "team": "BB",                 // where tickets are filed; the first linear.teams entry when left out
+  "autoAdopt": ["urgent"]       // priorities labelled when filed, without asking; empty by default
+}
+```
+
+- **The entity is the target.** One binding per target, keyed
+  `k8s-namespace/<name>`, with the source `ops`: there is no source plugin
+  behind it, and `source-contract.ts` does not change. It has no phases
+  keyed on entity state and no terminal state. It lives while the project
+  file lists its target: taken out, the binding ends (`unconfigured`) and
+  its thread is archived; put back, the same binding and thread resume.
+  `bb stewards detach` ends it until the target is taken out and put back,
+  as a ticket stays detached until its label is. It reports to the project
+  steward and has no workers. On the Stewards page it is grouped as
+  `watch`; in `bb stewards list` it shows when it last looked and how many
+  problems are failing.
+- **The plugin looks with kubectl, as the developer; the steward judges.**
+  There is no cluster identity of the plugin's own. The project's machine
+  — the developer's, a tailnet node, where the steward's turns run too —
+  has `kubectl`, which reaches the cluster through the developer's
+  kubeconfig (for bc-prod, the Tailscale API proxy) as them. The plugin's
+  server is elsewhere, so it asks the machine to run kubectl through its
+  host entry (`host.ts`, one method, `opsKubectl`), and reads with it
+  (`kubectl.ts`): pods, Warning events, Deployments, and the last log lines
+  of a failing container, with obvious credentials redacted. `ops.context`
+  names the kubeconfig context; the machine's current one otherwise. A look
+  happens at every sweep and requeue. It is the ops binding's snapshot
+  (`bindings.ops_look`), and the wake carries it.
+- **Fingerprints.** A problem is named by its target, its workload (a
+  Deployment's pods share it whatever their generated names, so a rollout
+  or a second replica is the same problem), its container, and an error
+  signature from the container's status: `CrashLoopBackOff:<last reason>:<exit
+  code>`, `ImagePullBackOff`, `Restarted:OOMKilled:137`, `Failed:Evicted`,
+  `Unschedulable`, `NotReady` (a running pod unready for ten minutes). Log
+  text is evidence, never part of the name: it changes on every line.
+- **The fingerprint map** (`ops_fingerprints`) holds, per project, each
+  fingerprint ever seen and the Linear ticket it is tracked under. The
+  steward reports what it did in `steward_report { opsTickets: [{
+  fingerprint, ticket, did: filed | commented | reopened }] }`, and the
+  plugin records it. Each look classifies its findings against the map, and
+  reads each ticket's state through linear's `sourceSnapshot`:
+  - **new** — no ticket. Worth a turn at once.
+  - **recurring** — its ticket is open, or cannot be read (a comment on a
+    closed ticket does less harm than a duplicate). Worth a turn at the
+    requeue, so a crash loop is one comment per `requeue-default`, and
+    never a second ticket.
+  - **returned** — its ticket was Done or Canceled and the problem is back.
+    Worth a turn at once. The playbook's `## Returned` section decides
+    between reopening and filing anew; the default comments on a ticket
+    closed within two weeks and escalates a reopen, and otherwise files a new
+    ticket linking the old one.
+  Every `requeue-default` the steward takes a turn whatever the look
+  found; a healthy one is cheap, a wake that says "all healthy" and a
+  report with actor `other`, which archives the thread until the next
+  look. A sweep's look between requeues wakes it only for a new or
+  returned problem.
+- **Triage is the project steward's.** The steward files one ticket per new
+  problem — pod, since when, the evidence, a diagnosis, a priority, and the
+  fingerprint on a line of its own — and raises one `decision` escalation
+  for the tickets of the turn ("Filed BB-N (high): …. Recommend adopting.").
+  The project steward adopts by adding the label and moving the ticket to
+  Todo, the ordinary path, and the team lease brings a ticket steward; or
+  declines with a reason. `ops.autoAdopt` names priorities the ops steward
+  labels itself when filing, without escalating.
+- **Read-only is a convention, not a wall.** There is no separate
+  identity: the plugin assumes kubectl read access is available on the
+  machine, and uses whatever credential is there. **That ambient
+  credential may be broader than read** — a developer's usually can
+  delete, exec and patch — **and the verb allowlist is the plugin's only
+  guard.** Every kubectl call the plugin makes passes one function,
+  `kubectlRefusal`, checked by the server before it asks and by the host
+  entry before it runs: only `get`, `describe`, `logs` and `auth can-i`,
+  and no flag that swaps the kubeconfig, credentials or identity. The playbook's `may` list says the same for the
+  steward's own kubectl (`kubectl get`, `describe`, `logs`, `auth can-i`,
+  then filing, commenting and escalating), and like every `may` list it is
+  advisory (§11): nothing stops the steward's shell. A real wall, such as a
+  read-only identity for kubectl, would slot in behind that one function.
+- **`bb stewards check`** validates `ops` (namespace names, duplicates,
+  that the team is one of `linear.teams`), then runs kubectl on the
+  project's machine for each target: `get` its pods, events and
+  deployments, and `auth can-i` for its logs. A target kubectl cannot
+  reach — no kubectl, the machine not on the tailnet as the developer, no
+  kubeconfig or context for the cluster, pods forbidden — is a problem,
+  "cannot read the target". Writes the identity holds there are said, not
+  counted as a problem: they are expected of a developer.
+- **When kubectl cannot read the target**, the binding is made but its
+  steward is not spawned or woken; `bb stewards list` shows `cannot read
+  the target`, and the first look that succeeds wakes it.
 
 ## 18. Needs you items and one-click actions
 
@@ -780,6 +883,20 @@ The rules that hold:
   through bb-gate-hooks, and the deploy in the snapshot) would be new work in
   three repos. Until then, a playbook that wants a deploy watched has the
   steward follow through (§5) while a worker watches and verifies it.
+- **One developer's server and machine watch production.** An ops binding
+  runs on the server of the developer who runs the project's stewards, and
+  looks with kubectl on their machine, as them, like everything else here
+  (one developer per project). Nothing looks while either is down: in
+  particular during bb-gate's 03:00–05:00 US Eastern quiet window, when
+  staged updates restart servers, and while the machine is off or off the
+  tailnet. A crash then is seen at the first look after. Nothing pages
+  anyone either: this is periodic looks, not alerting.
+- **Read-only rests on the gate and the playbook.** kubectl runs with the
+  developer's own rights (§18); a steward that ignored its `may` list could
+  use them.
+- **Healthy pods' logs are never scanned**, so an error that does not
+  crash, restart or unready a pod goes unseen. Push sources (Sentry, alerts
+  through bb-gate-hooks) would cover that, and are separate work.
 - **Comments and the team lease.** bb-gate-hooks does not always know a
   Linear comment's team, so a team lease alone misses some comments. That is
   why every binding also holds an issue lease for its own entity (§16).
