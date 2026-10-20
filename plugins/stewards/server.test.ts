@@ -25,6 +25,9 @@ function world() {
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
   const rpcCalls: Call[] = [];
+  /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
+  const mergeGuidanceCalls: Record<string, unknown>[] = [];
+  let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
   const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
@@ -54,7 +57,11 @@ function world() {
     const input = (args.input ?? {}) as Record<string, unknown>;
     rpcCalls.push({ pluginId: args.pluginId, method: args.method, input });
     let out: unknown;
-    if (args.method === "readProjectFiles") out = { projectSourcePath: "/p/.bb", head: "abc", files: (input.paths as string[]).map((path) => ({ path, content: files[path] ?? null })), error: null };
+    if (args.method === "readProjectFiles") {
+      const paths = input.paths as string[];
+      if (paths.some((path) => path.startsWith("/") || path.includes("\\") || path.split("/").includes(".."))) throw new Error(`bad project file path: ${paths.join(", ")}`);
+      out = { projectSourcePath: "/p/.bb", head: "abc", files: paths.map((path) => ({ path, content: files[path] ?? null })), error: null };
+    }
     else if (args.method === "repoSet") out = { repos, error: null };
     else if (args.method === "sourceSnapshot") out = { snapshot: entities.get(String(input.id)) ?? null };
     else if (args.method === "sourceSetInterest") out = { ok: true };
@@ -71,6 +78,10 @@ function world() {
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
       out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+    }
+    else if (args.method === "mergeGuidance") {
+      mergeGuidanceCalls.push(input);
+      out = mergeGuidanceResult ?? { ok: true, sha: "b".repeat(40), branch: `refs/heads/guidance-${String(input.threadId)}`, message: "merged" };
     }
     else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
     return args.outputSchema.parse(out);
@@ -185,7 +196,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}) {
@@ -3436,6 +3447,169 @@ describe("dependency stewards", () => {
     expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
     expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
     expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
+  });
+});
+
+describe("lessons", () => {
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+  const lesson = "A new column read with SELECT * breaks the previous image.";
+  const client = { experimental_caller: { kind: "client" } } as const;
+
+  it("are recorded only by the project steward, with the binding they came from", async () => {
+    const t = await adopted();
+    // A binding steward may not record one: it escalates.
+    expect((await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.steward)).error).toBe(true);
+    expect((await t.tool("steward_update", { lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.steward)).text).toMatch(/Only the project steward/u);
+    expect((await t.tool("steward_update", { lessonAction: { id: "lsn_x", action: "complete" } }, t.steward)).text).toMatch(/Only the project steward/u);
+    // file and text are required.
+    await expect(t.tool("steward_update", { lesson: { text: lesson, scope: "procedure" } }, t.project)).rejects.toThrow(/file/u);
+    await expect(t.tool("steward_update", { lesson: { file: "AGENTS.md", scope: "procedure" } }, t.project)).rejects.toThrow(/text/u);
+    await expect(t.tool("steward_update", { lesson: { text: lesson, file: "/etc/passwd", scope: "procedure" } }, t.project)).rejects.toThrow(/relative path/u);
+
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    expect(recorded).toMatchObject({ error: false, text: expect.stringMatching(/lesson lsn_\S+ recorded \(procedure\)/u) });
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    expect(t.hooks.store.lesson(id)).toMatchObject({
+      bindingId: t.hooks.store.find("ENG-12")!.id,
+      escalationId: null,
+      file: "AGENTS.md",
+      scope: "procedure",
+      status: "pending",
+      branch: `refs/heads/guidance-${t.project}`,
+    });
+  });
+
+  it("keep the escalation they answer", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", guidance: "SSO is out.", resolve: esc, lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    expect(t.hooks.store.lesson(id)).toMatchObject({ escalationId: esc, bindingId: t.hooks.store.find("ENG-12")!.id });
+  });
+
+  it("a procedure lesson is self-merged through multi-repo and marked merged at the returned sha", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done).toMatchObject({ error: false, text: expect.stringMatching(new RegExp(`${id}: merged at b{8}`, "u")) });
+    expect(t.mergeGuidanceCalls).toEqual([{ projectId: "p1", threadId: t.project, file: "AGENTS.md", text: lesson }]);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", mergeSha: "b".repeat(40), branch: `refs/heads/guidance-${t.project}` });
+  });
+
+  it("a refused procedure merge leaves the lesson pending with the reason", async () => {
+    const t = await adopted();
+    t.setMergeGuidanceResult({ ok: false, sha: null, branch: "refs/heads/guidance-x", message: "The canonical checkout has uncommitted changes." });
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done.text).toMatch(/merge refused: The canonical checkout has uncommitted changes\./u);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "pending", note: "The canonical checkout has uncommitted changes." });
+  });
+
+  it("a boundary lesson is never self-merged; it is filed for the user with Merge/Drop", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "Only the user may grant a credential.", file: "AGENTS.md", scope: "boundary" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done.text).toMatch(/boundary lesson; Merge\/Drop filed/u);
+    // No merge was attempted for a boundary lesson.
+    expect(t.mergeGuidanceCalls).toEqual([]);
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "decide" && typeof n.data.lessonId === "string")!;
+    expect(need).toMatchObject({ url: id, filedBy: "project", data: { lessonId: id, choices: ["Merge", "Drop"] } });
+    // The page's Merge runs the same multi-repo step.
+    const merged = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Merge" }, client);
+    expect(merged).toMatchObject({ ok: true });
+    expect(t.mergeGuidanceCalls).toHaveLength(1);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", mergeSha: "b".repeat(40) });
+  });
+
+  it("merges a boundary lesson from a thread with bb stewards done --choice Merge", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "Only the user may grant a credential.", file: "AGENTS.md", scope: "boundary" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "decide")!;
+    const done = await t.harness.behavior.runCli(["done", need.id, "--choice", "Merge", "--project", "p1"]);
+    expect(done.stdout).toMatch(new RegExp(`Merged ${id}`, "u"));
+    expect(t.mergeGuidanceCalls).toHaveLength(1);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
+  });
+
+  it("Drop discards a boundary lesson and closes its item", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "Only the user may grant a credential.", file: "AGENTS.md", scope: "boundary" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "decide")!;
+    const dropped = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Drop" }, client);
+    expect(dropped).toMatchObject({ ok: true });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "dropped" });
+    expect(t.mergeGuidanceCalls).toEqual([]);
+  });
+
+  it("a lesson becomes merged when its text is at .bb HEAD on the next pass", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.files["AGENTS.md"] = `# Guidance\n\n${lesson}\n`;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
+  });
+
+  it("names a merged lesson, its sha, branch and source in the digest", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain("### Lessons landed");
+    expect(wake).toMatch(new RegExp(`- Merged lesson ${id} \\(procedure, AGENTS\\.md\\) at b{8} on refs/heads/guidance-${t.project} \\(from ${t.hooks.store.find("ENG-12")!.id}\\):`, "u"));
+    expect(wake).toContain(lesson);
+  });
+
+  it("does not let one unreadable lesson file stop the others being checked", async () => {
+    const t = await adopted();
+    // A bad path recorded directly (the tool refuses one now): the sweep must
+    // still mark the good lesson merged.
+    t.hooks.store.addLesson({ projectId: "p1", bindingId: t.hooks.store.find("ENG-12")!.id, escalationId: null, file: "/etc/passwd", text: "x", scope: "procedure", branch: null });
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.files["AGENTS.md"] = `# Guidance\n\n${lesson}\n`;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
+  });
+
+  it("lists pending lessons in the nightly prompt, and the CLI shows and drops them", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain("## Lessons pending");
+    expect(wake).toContain(lesson);
+    expect(wake).toMatch(/workspace_publish_guidance/u);
+
+    const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
+    expect(list.stdout).toMatch(/Lessons pending \(1\)/u);
+    expect(list.stdout).toContain(lesson);
+    const lessons = await t.harness.behavior.runCli(["lessons", "--project", "p1"]);
+    expect(lessons.stdout).toContain(id);
+    const dropped = await t.harness.behavior.runCli(["drop-lesson", id, "--project", "p1"]);
+    expect(dropped.stdout).toMatch(new RegExp(`Dropped ${id}`, "u"));
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "dropped" });
   });
 });
 

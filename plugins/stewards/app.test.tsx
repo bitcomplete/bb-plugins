@@ -14,6 +14,7 @@ type Need = {
   url: string | null;
   escalationId: string | null;
   choices: string[];
+  lessonId: string | null;
   what: string;
   how: string | null;
   threadId: string | null;
@@ -41,6 +42,7 @@ const need = (over: Partial<Need> = {}): Need => ({
   url: null,
   escalationId: null,
   choices: [],
+  lessonId: null,
   what: "Merge or close?",
   how: null,
   threadId: null,
@@ -85,6 +87,7 @@ const renderBoard = async (needs: Need[], questions: Question[]): Promise<Render
           questions,
           withUser: [],
           needs,
+          lessons: [],
           stewards: [],
           stuck: [],
           ended: [],

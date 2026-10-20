@@ -1318,6 +1318,34 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       }
     },
 
+    /**
+     * Fast-forward the canonical `.bb` to a thread's published guidance
+     * branch. Only the stewards plugin may ask: the project steward's lesson
+     * tooling is the one thing that writes itself into every steward's
+     * guidance, and a `procedure` lesson is the only thing it may write.
+     */
+    async mergeGuidance({ projectId, threadId, file, text }, { experimental_caller: caller }) {
+      if (caller.kind !== "plugin" || caller.pluginId !== "stewards") {
+        return { ok: false, sha: null, branch: null, message: "Only the stewards plugin merges a lesson." };
+      }
+      let location: SourceLocation | null;
+      try {
+        location = await projectSource(projectId);
+      } catch (error) {
+        return { ok: false, sha: null, branch: null, message: errorMessage(error) };
+      }
+      if (location === null) return { ok: false, sha: null, branch: null, message: "This project has no .bb checkout on any machine." };
+      try {
+        return await host.call(
+          "mergeGuidance",
+          { projectSourcePath: location.path, threadId, file, text },
+          { hostId: location.hostId, timeoutMs: ACTION_TIMEOUT_MS },
+        );
+      } catch (error) {
+        return { ok: false, sha: null, branch: null, message: errorMessage(error) };
+      }
+    },
+
     async saveRepoSet({ projectId, reposJson }) {
       const location = await projectSource(projectId);
       if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
