@@ -28,7 +28,7 @@ function world() {
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
-  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
   const fileContents = new Map<string, string>();
@@ -135,8 +135,18 @@ function world() {
     threads: {
       spawn: async (args: Record<string, unknown>) => {
         const id = `thr_${++n}`;
-        const environment = args.environment as { machine?: { hostId?: string } } | undefined;
-        threads.set(id, { status: "idle", archivedAt: null, title: (args.title as string | undefined) ?? null, sectionId: (args.sectionId as string | undefined) ?? null, ...(environment?.machine?.hostId === undefined ? {} : { hostId: environment.machine.hostId }) });
+        const environment = args.environment as { machine?: { hostId?: string }; environmentProviderId?: string } | undefined;
+        threads.set(id, {
+          status: "idle",
+          archivedAt: null,
+          title: (args.title as string | undefined) ?? null,
+          sectionId: (args.sectionId as string | undefined) ?? null,
+          ...(environment?.machine?.hostId === undefined ? {} : { hostId: environment.machine.hostId }),
+          ...(args.providerId === undefined ? {} : { providerId: args.providerId as string }),
+          ...(args.model === undefined ? {} : { model: args.model as string }),
+          ...(args.reasoningLevel === undefined ? {} : { reasoningLevel: args.reasoningLevel as string }),
+          ...(environment?.environmentProviderId === undefined ? {} : { environmentProviderId: environment.environmentProviderId }),
+        });
         metadata.set(id, { ...((args.pluginMetadata as Record<string, unknown> | undefined) ?? {}) });
         spawns.push({ ...args, id });
         return makeThreadResponse({ id });
@@ -149,9 +159,14 @@ function world() {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
         return {
-          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
-          ...(t.hostId === undefined ? {} : { environment: { hostId: t.hostId } }),
+          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
+          ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null } }),
         };
+      },
+      defaultExecutionOptions: async ({ threadId }: { threadId: string }) => {
+        const t = threads.get(threadId);
+        if (t === undefined || t.model === undefined) return null;
+        return { model: t.model, reasoningLevel: t.reasoningLevel ?? "none", serviceTier: "standard", permissionMode: "default", source: "explicit" };
       },
       list: async ({ sectionId, archived, parentThreadId }: { sectionId?: string; archived?: boolean; parentThreadId?: string }) =>
         [...threads.entries()]
@@ -226,16 +241,25 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: threadId }), lastAssistantText });
     await flush();
   };
-  /** A thread an older steward started as a child: `bb thread spawn --parent-self`. */
-  const created = async (id: string, parent: string, title = "Implement") => {
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent });
-    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null }) });
+  /** A thread a steward started with `bb thread spawn --parent-self` or `--lifecycle-owner-thread`. */
+  const created = async (
+    id: string,
+    parent: string,
+    title = "Implement",
+    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null } = {},
+  ) => {
+    const providerId = over.providerId ?? "claude-code";
+    const model = over.model === undefined ? "claude-opus-5-5" : over.model;
+    const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
+    const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
   const createdOwned = async (id: string, owner: string, title = "Implement") => {
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null });
-    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null }) });
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code" }) });
     await flush();
   };
   return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned };
@@ -3889,5 +3913,169 @@ describe("the dotenv a requester imports", () => {
   it("derives the env var from a setting name when the need names no variable", () => {
     expect(secretVariable({ what: "Enter it", data: { setting: "sentryToken" } })).toBe("SENTRY_TOKEN");
     expect(secretVariable({ what: "Enter it", data: { variable: "LINEAR_CLIENT_SECRET", setting: "sentryToken" } })).toBe("LINEAR_CLIENT_SECRET");
+  });
+});
+
+// BB-24: the invariants must reach a steward on turns the plugin did not
+// compose (a plain message, a `bb thread tell`, a child notice) and after its
+// context was compacted, and a worker spawned wrong must be caught here.
+describe("steward invariants on every turn (BB-24)", () => {
+  const spawnLine = (over = "") =>
+    `bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
+
+  it("prints the full runnable spawn command from the playbook's worker model and the project environment", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    const out = await t.harness.behavior.runCli(["spawn-flags"], { threadId: steward, projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toBe(spawnLine());
+    expect(out.stdout).not.toContain("--parent-self");
+    expect(out.stdout).not.toContain("--parent-thread");
+
+    // By key, without the invoking thread, and the same command.
+    const byKey = await t.harness.behavior.runCli(["spawn-flags", "ENG-12", "--project", "p1"]);
+    expect(byKey.stdout).toBe(out.stdout);
+    // Not from a thread that is no steward, and no binding named.
+    const stranger = await t.harness.behavior.runCli(["spawn-flags"], { threadId: "thr_stranger", projectId: "p1" });
+    expect(stranger.exitCode).toBe(1);
+    expect(stranger.stderr).toMatch(/not the steward of a binding/u);
+    // The project steward starts no workers; its own brief still works.
+    const project = t.spawns[0]!.id;
+    const fromProject = await t.harness.behavior.runCli(["spawn-flags"], { threadId: project, projectId: "p1" });
+    expect(fromProject.exitCode).toBe(1);
+    expect(fromProject.stderr).toMatch(/project steward starts no workers/u);
+    const projectBrief = await t.harness.behavior.runCli(["brief"], { threadId: project, projectId: "p1" });
+    expect(projectBrief.exitCode).toBe(0);
+    expect(projectBrief.stdout).toContain("# Project steward brief");
+  });
+
+  it("prints the brief: thread id, allowed actions, phase, ready gate, guidance and holds, standing rules and the spawn command", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.hooks.store.addGuidance(t.hooks.store.byThread(steward)!.id, "Watch the auth paths.", "user");
+
+    const out = await t.harness.behavior.runCli(["brief"], { threadId: steward, projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain(`Your thread id is ${steward}.`);
+    expect(out.stdout).toContain("Allowed actions: comment, edit-description, set-state, set-labels, create-sub-issue, open-pr, request-review, spawn-worker.");
+    expect(out.stdout).toContain("## Phase: Todo");
+    expect(out.stdout).toContain("start no implementation workers");
+    expect(out.stdout).toContain("## Guidance and holds");
+    expect(out.stdout).toContain("Watch the auth paths.");
+    expect(out.stdout).toContain("## Standing rules");
+    expect(out.stdout).toContain("End your turn with steward_report");
+    expect(out.stdout).toContain(spawnLine());
+  });
+
+  it("injects the invariants as per-turn system context, so compaction and a plain tell do not lose them", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" });
+
+    const before = instructions();
+    expect(before).not.toBeNull();
+    expect(before).toContain(`Your thread id is ${steward}.`);
+    expect(before).toContain("Allowed actions: comment, edit-description");
+    expect(before).toContain("--lifecycle-owner-thread");
+    expect(before).toContain("--model claude-opus-5-5");
+    expect(before).toContain("End your turn with steward_report");
+    expect(before).toContain("bb stewards brief");
+    // The SDK truncates a contribution at 4096 characters; the brief must fit.
+    expect(before!.length).toBeLessThanOrEqual(4096);
+    expect(before).not.toContain("--parent-self");
+
+    // Compaction replaces the transcript, not the injected context.
+    t.usage.set(steward, 200_000);
+    await t.idle(steward);
+    expect(t.harness.sdk.callsTo("threads.compact").map(([args]) => (args as { threadId: string }).threadId)).toContain(steward);
+    expect(instructions()).toBe(before);
+
+    // Every wake names the two durable commands, for the turns the plugin did not compose.
+    const wake = String(t.spawns[1]!.prompt);
+    expect(wake).toContain("bb stewards brief");
+    expect(wake).toContain("bb stewards spawn-flags");
+  });
+
+  it("stops a worker spawned with the wrong provider and wakes the steward with the right command", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    await t.created("thr_bad", steward, "ENG-12: Implement", { providerId: "codex" });
+    expect(t.harness.sdk.callsTo("threads.stop").map(([args]) => args)).toContainEqual({ threadId: "thr_bad" });
+    expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
+    const wake = t.sends.at(-1)!.text;
+    expect(wake).toMatch(/Worker thr_bad was started with the wrong provider codex instead of claude-code/u);
+    expect(wake).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
+  });
+
+  it("stops a worker on the wrong model, reasoning level or environment provider, and leaves a matching one alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    await t.created("thr_model", steward, "ENG-12: Implement", { model: "claude-sonnet-5-5" });
+    await t.created("thr_reasoning", steward, "ENG-12: Implement", { reasoningLevel: "low" });
+    await t.created("thr_env", steward, "ENG-12: Implement", { environmentProviderId: "devbox" });
+    const stopped = t.harness.sdk.callsTo("threads.stop").map(([args]) => (args as { threadId: string }).threadId);
+    expect(stopped).toEqual(expect.arrayContaining(["thr_model", "thr_reasoning", "thr_env"]));
+    expect(t.hooks.store.worker("thr_model")!.status).toBe("stopped");
+    expect(t.hooks.store.worker("thr_reasoning")!.status).toBe("stopped");
+    expect(t.hooks.store.worker("thr_env")!.status).toBe("stopped");
+
+    // A worker matching the playbook and the project environment is left alone.
+    await t.created("thr_ok", steward, "ENG-12: Implement");
+    expect(stopped).not.toContain("thr_ok");
+    expect(t.hooks.store.worker("thr_ok")!.status).not.toBe("stopped");
+  });
+
+  it("says the gate is not passed once an approved spec changes, in the brief and the injected context", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const project = t.spawns[0]!.id;
+    const steward = t.spawns[1]!.id;
+    await t.tool(
+      "steward_report",
+      { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } },
+      steward,
+    );
+    expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, project)).error).toBe(false);
+
+    const brief = () => t.harness.behavior.runCli(["brief"], { threadId: steward, projectId: "p1" });
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
+    expect((await brief()).stdout).toContain("Ready gate: PASSED");
+    expect(instructions()).toContain("Ready gate: PASSED");
+
+    // The spec changes; the approval is stale, and a brief pinned to the
+    // approval's own hash would still call the gate passed.
+    const b = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(b.id, { lastSnapshot: { entity: issue({ description: "Users cannot log in. Also SSO." }), pulls: [] } });
+    expect((await brief()).stdout).toMatch(/Ready gate: not passed/);
+    expect(instructions()).toMatch(/Ready gate: not passed/);
+  });
+
+  it("points the injected brief at `bb stewards spawn-flags` when the project's machine is not cached", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
+    expect(instructions()).toContain("bb thread spawn --project p1 --lifecycle-owner-thread");
+
+    // A machine read more than a sweep ago is not trusted for a synchronous brief.
+    t.advance(31 * 60_000);
+    const stale = instructions();
+    expect(stale).toContain("Run `bb stewards spawn-flags` for the exact worker spawn command");
+    expect(stale).not.toContain("bb thread spawn --project p1");
   });
 });

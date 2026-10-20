@@ -360,6 +360,66 @@ which writes the status record:
 
 A turn that ends without a report is noted; repeated misses raise `stuck`.
 
+#### Turns that are not wakes
+
+Not every turn a steward acts on is one the plugin composed. The turns it
+does not compose are:
+
+- a plain message the user types in the steward's thread, and an `@bb`
+  mention (the plugin builds a session wake for a mention, but the turn
+  itself is the provider's);
+- a `bb thread tell` from another thread, including the answer to a worker's
+  question;
+- bb core's child-completed notice, and any other core notice a turn starts
+  from;
+- the first turn after the provider session was reconstructed following
+  compaction.
+
+On those turns the plugin has not just handed the steward a wake, so the
+invariants reach it from two durable places, not from the transcript:
+
+- **Per-turn system context.** The SDK exposes a per-thread system-context
+  hook (`bb.agents.contributeInstructions`, resolved at `thread.start` and
+  `turn.submit`, capped at 4096 characters), and the plugin injects the
+  brief there on every turn. It carries the thread id, the playbook's allowed
+  actions, the ready gate's "start no implementation workers" line, the
+  exact `bb thread spawn` command built from `models.worker` and the project
+  environment, the standing rules, and "end with `steward_report`". It is
+  built from the live binding, and because it is system context and not the
+  transcript, compaction cannot lose it. **This is the path taken**; the
+  design's fallback (a wake rule plus a preamble on every plugin-composed
+  message) is not needed.
+- **The durable commands.** `bb stewards brief [<binding>]` prints the whole
+  brief — thread id, allowed actions, phase instructions, ready gate,
+  standing guidance and holds, standing rules, the spawn command and "end
+  with `steward_report`" — and defaults to the binding of `$BB_THREAD_ID`.
+  `bb stewards spawn-flags [<binding>]` prints just the runnable spawn
+  command. Every wake names both, so a steward whose injected context was
+  somehow lost still has a fixed line to follow.
+
+**Compaction hygiene.** The injected brief begins with a fixed prefix
+pointing at `bb stewards brief` ("Your context may have been compacted … run
+`bb stewards brief` before acting"). The SDK's `threads.compact` takes no
+body and bb's compaction summary is provider-generated, so there is no
+summary-prefix hook to write into; the fixed prefix lives in the per-turn
+system context, which the provider keeps across compaction. Compaction
+frequency is unchanged (the `compactAboveTokens` setting, 120k by default);
+tuning it against the BB and bithub stewards is a follow-up, not this design.
+
+#### Post-spawn validation
+
+A worker is recognized by the `thread.created` handler by its lifecycle
+owner first, then by its parent (for stewards spawned before BB-23). Before
+the runaway guard, the handler compares the worker's provider, model,
+reasoning level and environment provider with the playbook's `models.worker`
+(or the binding's override) and the project's environment. On a mismatch it
+stops the worker, notes the reason and the correct spawn command on the
+binding, and wakes the steward. A fact the plugin cannot read (the model
+before the thread has one, the environment before it is attached) is not a
+mismatch: validation only acts on what it observed. This is the safety net
+for every path that could spawn a worker wrong, including a compacted
+steward that reconstructed the flags from memory.
+
 ### Not repeating itself
 
 Comments and spawns are not idempotent. Before acting, a steward looks for

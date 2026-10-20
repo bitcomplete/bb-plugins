@@ -23,6 +23,22 @@ You are woken with one message in a fixed form: the phase's instructions,
 the ready gate, standing guidance and holds, a snapshot of the entity, and
 what changed. It is self-contained: act from it, not from memory.
 
+Your invariants also arrive on turns the plugin did not compose — a plain
+message, a `bb thread tell`, a child notice, or the first turn after your
+context was compacted — as per-turn system context, so they survive
+compaction. They are: your thread id, the playbook's allowed actions, the
+ready gate, the standing rules, and "end with `steward_report`". If you ever
+doubt them, the durable commands are:
+
+- `bb stewards brief [<binding>]` — the whole brief: thread id, allowed
+actions, phase instructions, ready gate, standing guidance and holds, the
+standing rules, the worker spawn command, and "end with `steward_report`".
+Defaults to the binding of `$BB_THREAD_ID`.
+- `bb stewards spawn-flags [<binding>]` — just the full runnable
+`bb thread spawn …` command for your workers, built from the playbook's
+`models.worker` and the project environment. Never reconstruct these flags;
+copy the command.
+
 Two tools are yours; everything else you do with the tools every thread has.
 
 - **`steward_report` ends every woken turn**: phase, a one-sentence summary,
@@ -74,15 +90,20 @@ Two tools are yours; everything else you do with the tools every thread has.
   every later wake. With a child steward, it also decides its escalations,
   sets priority and holds, and overrides models.
 - **You decide and delegate; you do not write code.** Start a worker for one
-  bounded task with the `bb thread spawn … --lifecycle-owner-thread` command
-  the wake shows; write the task so the worker needs nothing else. Follow up
-  with `bb thread tell`. A worker finishing starts no turn of yours: its
-  final message arrives in your next wake, under Workers.
+  bounded task with the `bb thread spawn --lifecycle-owner-thread …` command
+  the wake shows (or `bb stewards spawn-flags` prints); write the task so the
+  worker needs nothing else. The flags are the playbook's, not yours to
+  choose: never ask the user for a model. Follow up with `bb thread tell`. A
+  worker finishing starts no turn of yours: its final message arrives in your
+  next wake, under Workers.
   While it runs you are not woken for its own work on its pull request
   (checks, pushes, its comments and its reviewer's, posted as the user);
   that shows under "What changed" at your next turn. Other people's
   comments and reviews, and a merge or close, still wake you.
-  More than the runaway guard allows in an hour are stopped.
+  More than the runaway guard allows in an hour are stopped. A worker started
+  with a provider, model, reasoning level or environment that differs from
+  the playbook is stopped by the plugin, and your next wake says why and
+  gives the right command.
 - **Act as the user, signed.** `linear_comment`, `linear_update_issue` and
   `linear_create_issue` sign for you: add no signature to what you pass
   them. With `gh`, end what you write with
@@ -281,6 +302,8 @@ project.
 
 | Command | Does |
 |---|---|
+| `bb stewards brief [<binding>] [--project <id>]` | The invariants for a steward: thread id, allowed actions, phase instructions, ready gate, guidance and holds, standing rules, and the worker spawn command. Defaults to the binding of the invoking thread |
+| `bb stewards spawn-flags [<binding>] [--project <id>]` | The full runnable `bb thread spawn …` command for a steward's workers, from the playbook's `models.worker` and the project environment |
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |

@@ -36,6 +36,24 @@ const STANDING_RULES = [
   "- **A credential is a `provide-secret` need, not a worker's job to prompt.** File it with `steward_report { needs: [{ kind: \"provide-secret\", url, what, how, variable, purpose }] }`; the plugin spawns a requester thread and opens bb's secure form there. For a dotenv on a worker's machine name `writeEnv` (or `worker`); for one of the stewards plugin's own settings name `setting` (only a declared secret setting is accepted). Never paste a secret, and never route the user to a script to run.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
 ];
+/**
+ * The fixed first line of every brief, and of the per-turn system context the
+ * plugin injects: what a steward reads after its context has been compacted or
+ * on a turn the plugin did not compose. It is the durable pointer the design's
+ * "each wake is self-contained" rests on.
+ */
+export const BRIEF_PREFIX =
+  "Your context may have been compacted, and this turn may not be a wake (a plain message, a `bb thread tell`, a child notice). Run `bb stewards brief` before acting: it prints your thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules and the exact worker spawn command.";
+
+/** The worker spawn command, shared by the wake, `bb stewards spawn-flags` and the brief. */
+export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string }): string {
+  return [
+    `bb thread spawn --project ${input.projectId} --lifecycle-owner-thread "$BB_THREAD_ID"${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
+    "<the whole task>",
+    "EOF",
+  ].join("\n");
+}
+
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
@@ -83,12 +101,12 @@ function workerQuestionLines(q: WorkerQuestion): string[] {
  * (the snapshot, the list of bindings) and keeping the head and the tail: the
  * tail says what changed and what to do, which a cut wake must not lose.
  */
-function fit(head: string[], middle: string[], tail: string[]): string {
+function fit(head: string[], middle: string[], tail: string[], maxChars = WAKE_MAX_CHARS): string {
   const h = head.join("\n");
   const t = tail.join("\n");
-  const room = WAKE_MAX_CHARS - h.length - t.length - 200;
+  const room = maxChars - h.length - t.length - 200;
   const m = middle.join("\n");
-  if (room <= 0) return clip([h, t].join("\n"), WAKE_MAX_CHARS);
+  if (room <= 0) return clip([h, t].join("\n"), maxChars);
   return [h, clip(m, room), t].join("\n");
 }
 
@@ -204,7 +222,7 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
   return lines;
 }
 
-function gateLines(input: WakeInput): string[] {
+function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "escalations">): string[] {
   const { gate, binding, playbook } = input;
   if (gate.none) return ["No ready gate in this playbook."];
   const lines: string[] = [];
@@ -281,12 +299,13 @@ export function formatWake(input: WakeInput): string {
     "",
     "Start a worker for one bounded task with:",
     "",
-    `    bb thread spawn --project ${binding.projectId} --lifecycle-owner-thread "$BB_THREAD_ID" ${input.workerFlags} --title "${e.key}: <task>" --prompt-file - <<'EOF'`,
-    "    <the whole task>",
-    "    EOF",
+    ...spawnCommand({ projectId: binding.projectId, entityKey: e.key, workerFlags: input.workerFlags })
+      .split("\n")
+      .map((line) => `    ${line}`),
     "",
     "Follow it up with `bb thread tell <id> <message>`. A worker finishing starts no turn of yours: its final message arrives in your next wake, which lists it under Workers.",
     "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
+    "On a turn that is not a wake — a plain message, a `bb thread tell`, a child notice — run `bb stewards brief` first. It prints this thread's id, the allowed actions, the phase instructions, the ready gate, guidance and holds, the standing rules and the exact spawn command. `bb stewards spawn-flags` prints just the spawn command.",
     "",
     "**Standing rules.**",
     "",
@@ -351,6 +370,87 @@ export function formatWake(input: WakeInput): string {
     `Before acting, look for evidence that you already did it (a signed comment, a worker, an open pull request, a review). End your turn with steward_report; requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
   return fit(head, snapshot, out);
+}
+
+/** What `bb stewards brief` prints, and what the plugin injects as per-turn system context. */
+export type BriefInput = {
+  binding: Binding;
+  playbook: Playbook;
+  gate: GateState;
+  /** The worker spawn flags, environment first, exactly as the wake and `bb stewards spawn-flags` build them; null when the project's machine is not known yet, so the brief points at the command instead of printing one it is unsure of. */
+  workerFlags: string | null;
+  /** Open escalations, so the gate line can say who is being asked for approval or scheduling. */
+  escalations?: Escalation[];
+  /** Open bindings at work on the same paths, for the scheduling line. */
+  conflicts?: Conflict[];
+};
+
+/** One line for the head of a brief: the gate's state, and the one action it forbids while unmet. */
+function briefGateLine(gate: GateState, escalations: Escalation[]): string {
+  if (gate.none) return "Ready gate: none in this playbook.";
+  const scheduling = escalations.find((x) => x.status === "open" && x.kind === "schedule");
+  if (!gate.passed) return "Ready gate: not passed — start no implementation workers.";
+  if (scheduling === undefined) return "Ready gate: PASSED.";
+  return `Ready gate: PASSED — but scheduling is with the project steward (${scheduling.id}); start no implementation workers and do not move the ticket into a build state until it decides.`;
+}
+
+/**
+ * The steward's invariants in one block: thread id, allowed actions, the
+ * ready gate, the spawn command, phase instructions, guidance and holds, the
+ * standing rules and "end with steward_report". `bb stewards brief` prints it
+ * whole; the per-turn system context injects it with a character budget, and
+ * clips the middle (phase instructions, the gate's detail and guidance),
+ * never the head or the tail, so a compacted steward still gets what it must
+ * act on.
+ */
+export function formatBrief(input: BriefInput, maxChars?: number): string {
+  const { binding: b, playbook, gate } = input;
+  const e = b.lastSnapshot?.entity ?? null;
+  const escalations = input.escalations ?? [];
+  const ops = b.kind === "ops";
+  const head: string[] = [
+    BRIEF_PREFIX,
+    "",
+    `# Steward brief: ${b.entityKey}${e?.title ? ` — ${e.title}` : ""}`,
+    `Binding ${b.id} · ${b.kind} · playbook ${playbook.name}@${playbook.version} · phase ${b.phase ?? e?.state ?? "?"}${b.stage === null ? "" : ` (stage ${b.stage})`}`,
+    "",
+    `${b.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${b.threadId}.`} Use it wherever you name yourself (a worker's task, a gh signature), and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`,
+    "",
+    `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`,
+  ];
+  if (!ops) head.push(briefGateLine(gate, escalations));
+  if (!ops) {
+    if (input.workerFlags === null) head.push("", "Run `bb stewards spawn-flags` for the exact worker spawn command: the project's machine has not been read on this server yet.");
+    else head.push("", "Start a worker with:", "", spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags }));
+  }
+
+  const middle: string[] = [];
+  if (!ops) middle.push("", ...gateLines({ gate, binding: b, playbook, escalations }));
+  const phase = b.phase ?? e?.state ?? null;
+  if (phase !== null) {
+    const section = phaseInstructions(playbook, phase);
+    middle.push("", `## Phase: ${phase}`, "", section === null ? "(The playbook has no section for this phase; use the general instructions and escalate a decision if unsure.)" : section);
+  }
+  if (playbook.general !== "") middle.push("", "## General", "", playbook.general);
+  middle.push("", "## Guidance and holds", "");
+  if (b.guidance.length === 0) middle.push("No standing guidance.");
+  for (const g of b.guidance) middle.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
+  middle.push(`- Priority: ${b.priority ?? "normal"}`);
+  middle.push(holdLine(b, "take no new actions and start no workers until it is lifted."));
+  middle.push(...schedulingLines(b, input.conflicts ?? [], escalations));
+
+  const tail: string[] = [
+    "",
+    "## Standing rules",
+    "",
+    ...STANDING_RULES,
+    "",
+    "---",
+    `End your turn with steward_report; requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+  ];
+
+  if (maxChars === undefined) return [...head, ...middle, ...tail].join("\n");
+  return fit(head, middle, tail, maxChars);
 }
 
 export type OpsWakeInput = {
