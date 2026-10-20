@@ -3385,7 +3385,7 @@ describe("Sentry stewards", () => {
 
     // A doorbell for another organization's issue with the same project slug is read by id and left out.
     t.advance(60_000);
-    sentry.issues.set("66", sentryIssue({ id: "66", shortId: "WEB-66", title: "Not ours", permalink: "https://other.sentry.io/issues/66/", status: "ignored", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
+    sentry.issues.set("66", sentryIssue({ id: "66", shortId: "WEB-66", title: "Not ours", permalink: "https://other.sentry.io/issues/66/", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
     await doorbell("66");
     expect(wakes()).toHaveLength(before);
 
