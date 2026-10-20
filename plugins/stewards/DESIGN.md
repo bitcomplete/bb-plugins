@@ -663,13 +663,13 @@ follow-through: 6h                # how long a terminal binding may be kept open
 - **Threads:** spawning stewards, recognizing workers, building wake messages,
   the project's sidebar section.
 - **Agent tools:** `steward_report` and `steward_update`.
-- **CLI:** `bb stewards init | check | list | show | detach | pass | digest`.
+- **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest`.
 - **UI:** the Stewards page, a nav panel with one tab per stewarded project:
-  waiting on you (open questions, which you can close there, forwarded
-  escalations and approval requests), in flight by stage (summary, next
-  action and actor, running workers), stuck or held, ended in the last two
-  weeks, and the latest digest with its date. Settings → Plugins →
-  Stewards keeps each project's configuration and health.
+  waiting on you (needs items with links and buttons, open questions, which you
+  can close there, forwarded escalations and approval requests), in flight by
+  stage (summary, next action and actor, running workers), stuck or held, ended
+  in the last two weeks, and the latest digest with its date. Settings →
+  Plugins → Stewards keeps each project's configuration and health.
 
 ### Changes to linear and github
 
@@ -817,6 +817,57 @@ goes wrong there into Linear tickets for the project steward to adopt.
 - **When kubectl cannot read the target**, the binding is made but its
   steward is not spawned or woken; `bb stewards list` shows `cannot read
   the target`, and the first look that succeeds wakes it.
+
+## 18. Needs you items and one-click actions
+
+Everything a person had to do on a ticket used to exist only as prose,
+repeated across Linear comments, the project steward's digest and the stewards'
+replies. A **needs** record makes it structured: one row per thing the user
+must do, with a link, one line of what, steps, and a close rule. It is filed by
+the plugin from the snapshot or by a steward through `steward_report { needs }`,
+listed under "Waiting on you" on the Stewards page, in the digest, and by
+`bb stewards needs` and `bb stewards show`.
+
+| kind | filed by | link | done when | one-click action |
+| -- | -- | -- | -- | -- |
+| `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me` | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
+| `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's marker on the head is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
+| `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
+| `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the question record's text box) |
+| `provide-secret` | steward, with the variable name and purpose | the worker thread | the worker's `bb secret request` completes | **Provide**: opens the worker thread named in the item, or wakes the steward to start the worker that will request it |
+| `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |
+
+The rules that hold:
+
+- **One gate function.** `prGate` in `reconcile.ts` is the build-tickets lane
+  gate: the reviewer's latest marker names the current head with `approved`,
+  every check has passed, and, in the owner-reviewed lane, the owner has
+  approved — an unsigned approving comment or an APPROVED review by the
+  connected user; a signed comment is a thread's, never the owner's. The merge
+  button, the item the plugin files and the wake's "Lane gate" line all read
+  it, so a steward is told whether a pull request's gate is met in the same
+  words the button acts on.
+- **The buttons run on the server as the connected user, unsigned**, so they
+  count as human actions. Approve-PR is a comment, not a review, so GitHub is
+  the only thing that can refuse it (approving your own pull request); Merge
+  uses the server's `gh` token through the GitHub API. The server never signs
+  one with a thread id.
+- **A button is offered only while the server can verify its preconditions.**
+  `syncNeeds` recomputes the plugin's items on every look and closes the ones
+  whose condition no longer holds; the page marks one whose condition has moved
+  since as not actionable and says why ("reviewer round 3 pending", "a worker
+  is still running"). The merge action re-checks `prGate` against a fresh
+  snapshot before it merges.
+- **Every action wakes the steward with the item's closure** under "What
+  changed", and the wake lists the binding's open items and says not to ask the
+  user about them in prose. Closing an item from the page or with
+  `bb stewards done <id>` does the same.
+- **Dedupe.** A need is keyed by (binding, kind, url) while open: a steward
+  that re-reports updates the wording rather than adding a row. The store
+  enforces it with a partial unique index.
+- **`blockedOn` stays for third parties.** A `steward_report` whose `blockedOn`
+  names the user, the owner or a human with no open needs item is refused and
+  told to file one, so the ask reaches the page instead of only the prose.
 
 ## Known limits
 

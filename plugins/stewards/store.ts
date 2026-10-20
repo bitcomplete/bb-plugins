@@ -121,6 +121,24 @@ export const MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN delivered_at INTEGER`,
   // Escalations open before delivery was recorded were all delivered already.
   `UPDATE escalations SET delivered_at = created_at WHERE status = 'open' AND delivered_at IS NULL`,
+  // "Needs you" items: one structured thing the user (or the page's buttons) must
+  // do for a binding. Deduplicated per (binding, kind, url) while open.
+  `CREATE TABLE IF NOT EXISTS needs (
+     id TEXT PRIMARY KEY,
+     binding_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     url TEXT NOT NULL DEFAULT '',
+     what TEXT NOT NULL,
+     how TEXT,
+     data TEXT NOT NULL DEFAULT '{}',
+     filed_by TEXT NOT NULL DEFAULT 'steward',
+     status TEXT NOT NULL DEFAULT 'open',
+     resolution TEXT,
+     created_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS needs_binding ON needs (binding_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS needs_open_key ON needs (binding_id, kind, url) WHERE status = 'open'`,
   // An ops binding's last look at its target: what it found, classified against the fingerprint map.
   `ALTER TABLE bindings ADD COLUMN ops_look TEXT`,
   // The fingerprint map: one problem an ops steward has seen, and the Linear ticket it was filed or commented on under.
@@ -394,6 +412,33 @@ export type Question = {
   resolvedAt: number | null;
 };
 
+/** The kinds of thing that can wait on the user, from the ticket's table. */
+export const NEEDS_KINDS = ["approve-spec", "approve-pr", "merge", "decide", "provide-secret", "configure"] as const;
+export type NeedKind = (typeof NEEDS_KINDS)[number];
+
+/**
+ * One "needs you" item: a structured thing the user must do, filed by the
+ * plugin from a snapshot or by a steward through `steward_report`. `url` is the
+ * link (the ticket, the pull request, the external page); with `kind` it is the
+ * dedupe key. `data` carries kind-specific fields (the pull request sha, the
+ * secret's variable name, the worker thread to open).
+ */
+export type Need = {
+  id: string;
+  bindingId: string;
+  kind: NeedKind;
+  url: string;
+  what: string;
+  how: string | null;
+  data: Record<string, unknown>;
+  /** Who filed it: "plugin", "steward", "project" or "user". */
+  filedBy: string;
+  status: "open" | "done";
+  resolution: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
@@ -497,6 +542,34 @@ export function createStore(db: Database.Database, now: () => number) {
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
   });
+  const insertNeed = db.prepare(
+    "INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, created_at) VALUES (@id, @binding_id, @kind, @url, @what, @how, @data, @filed_by, @created_at)",
+  );
+  const getNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE id = ?");
+  const openNeedByKey = db.prepare<[string, string, string], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open' LIMIT 1");
+  const needsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND (? = 1 OR status = 'open') ORDER BY created_at");
+  const openNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.status = 'open' ORDER BY n.created_at");
+  const allNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? ORDER BY n.created_at");
+  const updateNeed = db.prepare("UPDATE needs SET what = ?, how = ?, data = ? WHERE id = ?");
+  const closeNeedStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
+  const closeNeedKindStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND status = 'open'");
+  const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
+
+  const toNeed = (r: Record<string, unknown>): Need => ({
+    id: String(r.id),
+    bindingId: String(r.binding_id),
+    kind: String(r.kind) as NeedKind,
+    url: String(r.url ?? ""),
+    what: String(r.what),
+    how: r.how === null || r.how === undefined ? null : String(r.how),
+    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
+    filedBy: String(r.filed_by ?? "steward"),
+    status: String(r.status) as "open" | "done",
+    resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
+    createdAt: Number(r.created_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
   const toWorker = (r: Record<string, unknown>): Worker => ({
     threadId: String(r.thread_id),
     bindingId: String(r.binding_id),
@@ -631,6 +704,7 @@ export function createStore(db: Database.Database, now: () => number) {
       db.transaction(() => {
         const b = rowToBinding(getBinding.get(bindingId)!);
         patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+        closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
         for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
       })();
     },
@@ -639,6 +713,7 @@ export function createStore(db: Database.Database, now: () => number) {
       db.transaction(() => {
         const b = rowToBinding(getBinding.get(bindingId)!);
         patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
+        closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
         for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
       })();
     },
@@ -727,6 +802,47 @@ export function createStore(db: Database.Database, now: () => number) {
      */
     answerQuestionOnly(id: string, answer: string, by: string): boolean {
       return answerQuestion.run(answer, by, now(), id).changes > 0;
+    },
+
+    // needs: what waits on the user
+    need(id: string): Need | null {
+      const r = getNeed.get(id);
+      return r === undefined ? null : toNeed(r);
+    },
+    needs(bindingId: string, includeDone = false): Need[] {
+      return needsFor.all(bindingId, includeDone ? 1 : 0).map(toNeed);
+    },
+    openNeeds(bindingId: string): Need[] {
+      return needsFor.all(bindingId, 0).map(toNeed);
+    },
+    openNeedsForProject(projectId: string): Need[] {
+      return openNeedsForProject.all(projectId).map(toNeed);
+    },
+    allNeedsForProject(projectId: string): Need[] {
+      return allNeedsForProject.all(projectId).map(toNeed);
+    },
+    /**
+     * File a need, deduplicated by (binding, kind, url) while open: a steward
+     * that re-reports one updates the wording rather than adding a row.
+     */
+    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+      const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
+      if (existing !== undefined) {
+        updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        return toNeed(getNeed.get(String(existing.id))!);
+      }
+      const id = newId("need");
+      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      return toNeed(getNeed.get(id)!);
+    },
+    closeNeed(id: string, resolution: string): boolean {
+      return closeNeedStmt.run(resolution, now(), id).changes > 0;
+    },
+    closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
+      return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
+    },
+    closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
+      return closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
     },
 
     // workers

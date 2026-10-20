@@ -93,3 +93,27 @@ describe("the fingerprint map", () => {
     expect(s.patch(b.id, { opsLook: look }).opsLook).toEqual(look);
   });
 });
+
+describe("needs you items", () => {
+  it("are deduplicated by (binding, kind, url) while open, and close once", () => {
+    const { s, binding, advance } = store();
+    const first = s.fileNeed({ bindingId: binding.id, kind: "configure", url: "https://linear.app/secret", what: "Add the client secret", how: "Settings → API", filedBy: "steward" });
+    expect(first).toMatchObject({ id: expect.stringMatching(/^need_/u), kind: "configure", status: "open", filedBy: "steward", createdAt: 1_000 });
+    // The same key updates the wording rather than adding a row.
+    advance(10);
+    const again = s.fileNeed({ bindingId: binding.id, kind: "configure", url: "https://linear.app/secret", what: "Add the client secret (new wording)", how: null, filedBy: "steward" });
+    expect(again.id).toBe(first.id);
+    expect(s.openNeeds(binding.id)).toHaveLength(1);
+    expect(s.openNeeds(binding.id)[0]!.what).toBe("Add the client secret (new wording)");
+    // A different url is a different item.
+    s.fileNeed({ bindingId: binding.id, kind: "configure", url: "https://linear.app/agent", what: "Install the agent", how: null, filedBy: "steward" });
+    expect(s.openNeeds(binding.id)).toHaveLength(2);
+    // Closing it lets the same key be filed again as a new row.
+    expect(s.closeNeed(first.id, "done")).toBe(true);
+    expect(s.closeNeed(first.id, "again")).toBe(false);
+    expect(s.needs(binding.id, true).filter((n) => n.kind === "configure")).toHaveLength(2);
+    const refiled = s.fileNeed({ bindingId: binding.id, kind: "configure", url: "https://linear.app/secret", what: "Add the client secret again", how: null, filedBy: "steward" });
+    expect(refiled.id).not.toBe(first.id);
+    expect(s.needs(binding.id, true)).toHaveLength(3);
+  });
+});

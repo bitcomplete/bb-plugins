@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
+import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -338,5 +338,49 @@ describe("the stuck backstop", () => {
     expect(stuckDue(b, tickets, [], 3 * 86_400_000)).toBe(2 * 86_400_000);
     expect(stuckDue({ ...b, phase: "Todo" }, tickets, [], 30 * 86_400_000)).toBeNull();
     expect(stuckDue(b, tickets, [{ kind: "stuck" } as never], 3 * 86_400_000)).toBeNull();
+  });
+});
+
+describe("the pull request gate (build-tickets)", () => {
+  const head = "aaaaaaa1";
+  const marker = (sha: string, verdict: string, lane: string) =>
+    comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const green = { checks: { state: "success", failing: [] } };
+
+  it("is met with the reviewer's approval on the head and green checks in the no-review lane", () => {
+    const gate = prGate(pull({ comments: [marker(head, "approved", "no-review")] }, green));
+    expect(gate).toMatchObject({ lane: "no-review", checksGreen: true, ownerApproved: false, gateMet: true, needsOwnerApproval: false, missing: null });
+  });
+
+  it("waits on the owner in the owner-reviewed lane, and closes once they approve", () => {
+    const waiting = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green));
+    expect(waiting).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    const approved = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green));
+    expect(approved).toMatchObject({ gateMet: true, ownerApproved: true, needsOwnerApproval: false });
+  });
+
+  it("is not met while the marker is on another sha, the verdict is not approved, or checks are not green", () => {
+    expect(prGate(pull({ comments: [marker("bbbbbbb2", "approved", "no-review")] }, green)).missing).toMatch(/reviewer round 1 is on bbbbbbb; the head is aaaaaaa/u);
+    expect(prGate(pull({ comments: [marker(head, "changes-requested", "no-review")] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
+    expect(prGate(pull({ comments: [marker(head, "approved", "no-review")] }, { checks: { state: "pending", failing: [] } })).missing).toMatch(/checks pending/u);
+    expect(prGate(pull({ comments: [] })).missing).toMatch(/no reviewer round/u);
+  });
+
+  it("takes an APPROVED review by the connected user, but never a signed comment", () => {
+    const review = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: "2026-10-14T17:00:00Z", commit: head }] });
+    expect(ownerApproval(review)).toMatchObject({ approved: true });
+    const signed = pull({ comments: [marker(head, "approved", "owner-reviewed"), comment({ author: "jane", body: "LGTM", signedBy: "thr_w" })] }, green);
+    expect(ownerApproval(signed).approved).toBe(false);
+  });
+});
+
+describe("a blockedOn naming the user", () => {
+  it("is refused without an item and allowed with one", () => {
+    expect(namesUserAsBlocker("the user's answer on scope")).toBe(true);
+    expect(namesUserAsBlocker("the owner's approval")).toBe(true);
+    expect(namesUserAsBlocker("a human has to install it")).toBe(true);
+    expect(namesUserAsBlocker("the project steward's call")).toBe(false);
+    expect(namesUserAsBlocker("sam's review")).toBe(false);
   });
 });

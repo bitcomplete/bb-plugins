@@ -7,9 +7,9 @@
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
-import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, Question, Worker } from "./store.js";
+import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -27,7 +27,8 @@ const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. 
  */
 const STANDING_RULES = [
   "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
-  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing item for it, and the worker takes the value.",
+  "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
+  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing `provide-secret` item for it, and the worker takes the value.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up.",
 ];
 const DESCRIPTION_CHARS = 4000;
@@ -138,6 +139,8 @@ export type WakeInput = {
   /** The worker model, as `bb thread spawn` flags. */
   workerFlags: string;
   changes: string[];
+  /** The binding's open "needs you" items, on the Stewards page. */
+  needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
   /** The project's adoption label. */
@@ -167,6 +170,8 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
+    const gate = prGate(e);
+    lines.push(`- Lane gate: ${gate.gateMet ? "met" : `not met — ${gate.missing}`}${gate.lane === null ? "" : ` (lane ${gate.lane})`}`);
     const latest = new Map<string, string>();
     for (const r of p.reviews) latest.set(r.author, `${r.state}${r.commit === null ? "" : ` at ${r.commit.slice(0, 7)}`}`);
     if (latest.size > 0) lines.push(`- Latest reviews: ${[...latest].map(([a, s]) => `${a} ${s}`).join("; ")}`);
@@ -247,6 +252,14 @@ export function formatWake(input: WakeInput): string {
   );
 
   out.push("", "## 2. Ready gate", "", ...gateLines(input));
+
+  const needs = input.needs ?? [];
+  out.push("", "## Waiting on you", "");
+  if (needs.length === 0) out.push("Nothing is filed for the user.");
+  else {
+    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${n.how === null ? "" : `\n  ${n.how}`}`);
+    out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
+  }
 
   out.push("", "## 3. Guidance, priority and holds", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
@@ -404,6 +417,8 @@ export function formatProjectWake(input: {
   bigDecisions: string[];
   /** Questions open with the user, from the record, with the binding each is about. */
   questions?: Array<{ question: Question; about: Binding | null }>;
+  /** Open `needs` items, with the binding each is about. */
+  needs?: Array<{ need: Need; binding: Binding }>;
   /** With digestDue: the records the digest is written from. */
   records?: DigestRecords;
   /** The project's nightly time zone, which dates are given in; UTC when absent. */
@@ -461,6 +476,12 @@ export function formatProjectWake(input: {
       "",
     );
   }
+  const needs = input.needs ?? [];
+  if (needs.length > 0) {
+    out.push("## Needs you", "");
+    for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`);
+    out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
+  }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
@@ -500,6 +521,8 @@ export type DigestRecords = {
   answered: Question[];
   /** Open escalations with the user: forwarded ones and approval requests. */
   withUser: Array<{ escalation: Escalation; from: Binding }>;
+  /** Open `needs` items filed by the plugin or a steward, for the digest. */
+  needs?: Array<{ need: Need; binding: Binding }>;
   /** Open `stuck` escalations, wherever they are. */
   stuck: Array<{ escalation: Escalation; from: Binding }>;
   /** Open bindings on hold. */
@@ -541,6 +564,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   const asked = new Set(questions.map(({ question: q }) => q.escalationId).filter((id) => id !== null));
   const waiting = [
     ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}`),
+    ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`),
     ...r.withUser
       .filter(({ escalation: x }) => !asked.has(x.id))
       .map(({ escalation: x, from }) =>

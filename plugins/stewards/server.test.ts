@@ -32,6 +32,17 @@ function world() {
   const spawns: Array<Record<string, unknown> & { id: string }> = [];
   const sends: Array<{ threadId: string; text: string }> = [];
   const userTurns: Array<{ threadId: string; text: string }> = [];
+  /** What the page's GitHub actions did. */
+  const githubComments: Array<{ repo: string; number: number; body: string }> = [];
+  const githubMerges: Array<{ repo: string; number: number; title: string; body: string }> = [];
+  const github = {
+    comment: async (repo: string, number: number, body: string) => {
+      githubComments.push({ repo, number, body });
+    },
+    squashMerge: async (repo: string, number: number, title: string, body: string) => {
+      githubMerges.push({ repo, number, title, body });
+    },
+  };
   let n = 0;
 
   const callRpc = async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
@@ -153,13 +164,13 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}) {
   const w = world();
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"] });
-  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, ...extra })(bb);
+  await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
   /** Let debounced work run to completion. */
   const flush = async () => {
@@ -176,7 +187,7 @@ async function setup(extra: Partial<StewardsDeps> = {}) {
     const r = (await harness.behavior.callAgentTool(name, args, { threadId, projectId: "p1" })) as string | { content: Array<{ text?: string }>; isError?: boolean };
     return typeof r === "string" ? { text: r, error: false } : { text: r.content.map((c) => c.text ?? "").join(""), error: r.isError === true };
   };
-  const list = async () => ((await harness.callRpc("stewardsList", { projectId: "p1", all: true })) as { bindings: Array<{ key: string; kind: string; threadId: string | null; ended: boolean; escalations: number; summary: string | null }> }).bindings;
+  const list = async () => ((await harness.callRpc("stewardsList", { projectId: "p1", all: true })) as { bindings: Array<{ key: string; kind: string; threadId: string | null; ended: boolean; escalations: number; needs: number; summary: string | null }> }).bindings;
   const idle = async (threadId: string, lastAssistantText: string | null = null) => {
     const t = w.threads.get(threadId);
     if (t !== undefined) t.status = "idle";
@@ -526,11 +537,12 @@ describe("a Linear ticket steward", () => {
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
     const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "me", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward!);
-    expect(reported.text).toMatch(/requested from the user \(esc_[\w-]+\): they approve in this thread/u);
+    expect(reported.text).toMatch(/requested from the user, on the Stewards page \(need_[\w-]+\): they press Approve or Decline there/u);
     expect(t.sends.filter((s) => s.threadId === project)).toHaveLength(0);
     t.userTurns.push({ threadId: steward!, text: "Approved, go ahead." });
     expect((await t.tool("steward_update", { approve: true, quote: "go ahead" }, steward!)).error).toBe(false);
     expect((await t.list())[0]!.escalations).toBe(0);
+    expect((await t.list())[0]!.needs).toBe(0);
   });
 
   // HUB-196's other half: the user answered a forwarded escalation by
@@ -1698,8 +1710,10 @@ describe("questions to the user", () => {
       await t.ring("linear", "uuid-12");
       const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
       await t.tool("steward_report", { ...base, ready: met }, steward);
-      const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approval")!.id;
-      expect((await t.tool("steward_update", { binding: "ENG-12", guidance: "Approved", resolve: esc }, project)).error).toBe(false);
+      const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "approve-spec")!;
+      expect(need).toBeDefined();
+      // The project steward cannot approve the user's gate for them.
+      expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, project)).error).toBe(true);
       expect(t.hooks.store.find("ENG-12")!.ready.approval).toBeNull();
     });
 
@@ -1868,6 +1882,239 @@ describe("questions to the user", () => {
     expect(wake).toMatch(/### Your previous digest \(2026-10-14T15:00:00Z\)\n\n> PR #429 still waits for approval\./u);
     expect(wake).toMatch(/### What moved\n\n- ENG-12 \(ticket, Todo\), moved 2026-10-14T15:01:00Z: PR #429 merged\. Next: Verify the deploy \(steward\)/u);
     expect(wake).toMatch(/### Waiting on the user\n\n- Question qst_\S+ \(since 2026-10-14\): Should I file an a11y ticket\?/u);
+  });
+});
+
+describe("needs you items", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
+  const head = "aaaaaaa1";
+  const marker = comment({ id: "m1", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+
+  /** A bound ticket with one linked pull request, observed. */
+  async function withPull(comments: ReturnType<typeof comment>[], pullOver: Record<string, unknown> = {}) {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments }, { checks: { state: "success", failing: [] }, ...pullOver }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  it("files approve-spec for approval: me; the page action records the approval, closes it and wakes the steward", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "approve-spec")!;
+    expect(need).toMatchObject({ what: "Approve ENG-12's spec", filedBy: "plugin" });
+    const wakes = t.sends.filter((s) => s.threadId === steward).length;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve", note: "Looks good" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Approved/u) });
+    expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBeGreaterThan(wakes);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*approved ENG-12's spec on the Stewards page: Looks good/u);
+  });
+
+  it("files approve-pr in the owner lane; the page action posts the unsigned approval and the merge item follows", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
+    expect(res).toMatchObject({ ok: true });
+    expect(t.githubComments).toEqual([{ repo: "acme/web", number: 7, body: "Approved aaaaaaa1 from the Stewards page" }]);
+    expect(t.githubComments[0]!.body).not.toMatch(/from bb thread/u);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    // The snapshot now shows the owner's approval, so the merge item is filed.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.flush();
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeDefined();
+  });
+
+  it("files merge only when the gate is met and no worker runs, and the page action merges through gh", async () => {
+    const t = await withPull([marker, owner]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
+    expect(need).toMatchObject({ what: "Merge acme/web#7", filedBy: "plugin" });
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Merged/u) });
+    expect(t.githubMerges).toHaveLength(1);
+    expect(t.githubMerges[0]).toMatchObject({ repo: "acme/web", number: 7, title: "Merge acme/web#7" });
+    expect(t.githubMerges[0]!.body).toMatch(/Merged: owner-reviewed lane, reviewer approved aaaaaaa, checks green, approved by the owner/u);
+    expect(t.githubComments.at(-1)!.body).toMatch(/Merged: owner-reviewed lane/u);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/What changed[\s\S]*merged from the Stewards page/u);
+  });
+
+  it("refuses the merge when a worker is still running", async () => {
+    const t = await withPull([marker, owner]);
+    const b = t.binding();
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "merge" }, client);
+    expect(res).toMatchObject({ ok: false, message: expect.stringMatching(/worker is still running/u) });
+    expect(t.githubMerges).toEqual([]);
+  });
+
+  it("a steward files configure and provide-secret, and bb stewards done closes one and wakes the steward", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const reported = await t.tool(
+      "steward_report",
+      {
+        ...base,
+        actor: "me",
+        needs: [
+          { kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret", how: "Settings → API → New secret" },
+          { kind: "configure", url: "https://linear.app/settings/agents", what: "Install the agent", how: "scopes: app:mentionable" },
+          { kind: "configure", url: "https://linear.app/settings/webhooks", what: "Enable Agent session events" },
+          { kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" },
+        ],
+      },
+      steward,
+    );
+    expect(reported.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(t.hooks.store.openNeeds(b.id)).toHaveLength(4);
+    // A re-report updates the wording rather than duplicating.
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret (now)" }] }, steward);
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "configure")).toHaveLength(3);
+    const configure = t.hooks.store.openNeeds(b.id).find((n) => n.url === "https://linear.app/settings/api")!;
+    expect(configure.what).toBe("Add the client secret (now)");
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const out = await t.harness.behavior.runCli(["done", configure.id, "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    await t.flush();
+    expect(t.hooks.store.need(configure.id)!.status).toBe("done");
+    expect(t.sends.filter((s) => s.threadId === steward).length).toBeGreaterThan(before);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*configure item .* closed from a thread/u);
+  });
+
+  it("says so when a provide-secret item has no worker to open", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
+    expect(res).toMatchObject({ ok: true, threadId: null });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/start the worker that will request it/u);
+  });
+
+  it("refuses a blockedOn naming the user with no item, and accepts one with an item", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const bad = await t.tool("steward_report", { ...base, actor: "me", blockedOn: "the user's answer" }, steward);
+    expect(bad.error).toBe(true);
+    expect(bad.text).toMatch(/File it as a needs item/u);
+    const ok = await t.tool("steward_report", { ...base, actor: "me", blockedOn: "the user's answer", needs: [{ kind: "decide", what: "Answer the scope question", url: "https://linear.app/acme/issue/ENG-12" }] }, steward);
+    expect(ok.error).toBe(false);
+  });
+
+  it("shows the items on the board with their actionability", async () => {
+    const t = await withPull([marker]);
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; actionable: boolean; why: string | null }> } }).board;
+    const first = await board();
+    expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
+    // Once the owner approves, a merge item appears; a running worker makes it not actionable.
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: true, why: null });
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ actionable: false, why: "a worker is still running" });
+  });
+
+  it("lists open needs in the project steward's nightly digest", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret" }] }, steward);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toMatch(/### Waiting on the user[\s\S]*configure \(need_[\w-]+, since 2026-10-14, ENG-12\): Add the client secret/u);
+    expect(wake).toMatch(/## Needs you[\s\S]*configure, ENG-12\): Add the client secret/u);
+  });
+
+  // BB-11's sequence, replayed: the spec approval, the three external steps,
+  // the secret, the pull request approval, and the merge.
+  it("passes the BB-11 replay: approve-spec, configure ×3, provide-secret, approve-pr, merge", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("approval: project", "approval: me");
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool(
+      "steward_report",
+      {
+        ...base,
+        actor: "me",
+        ready: met,
+        needs: [
+          { kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret", how: "Settings → API" },
+          { kind: "configure", url: "https://linear.app/settings/agents", what: "Install the agent with fixed scopes" },
+          { kind: "configure", url: "https://linear.app/settings/webhooks", what: "Enable the Agent session events category" },
+          { kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" },
+        ],
+      },
+      steward,
+    );
+    const b = () => t.hooks.store.find("ENG-12")!;
+    const kinds = () => t.hooks.store.openNeeds(b().id).map((n) => n.kind).sort();
+    expect(kinds()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "provide-secret"]);
+
+    // The user approves the spec on the page.
+    const spec = t.hooks.store.openNeeds(b().id).find((n) => n.kind === "approve-spec")!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: spec.id, action: "approve" }, client);
+    expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
+    const firstHash = t.hooks.store.find("ENG-12")!.ready.approval!.specHash;
+    expect(kinds()).toEqual(["approve-pr", "configure", "configure", "configure", "provide-secret"]);
+
+    // The user amends the spec from their own thread: it carries its own
+    // approval (BB-13), so the second approve-spec is never shown.
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }], comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_design", createdAt: "2026-10-14T17:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.openNeeds(b().id).some((n) => n.kind === "approve-spec")).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.ready.approval!.specHash).not.toBe(firstHash);
+
+    // The user approves the pull request on the page; the merge item follows.
+    const pr = t.hooks.store.openNeeds(b().id).find((n) => n.kind === "approve-pr")!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: pr.id, action: "approve" }, client);
+    t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
+    await t.flush();
+    expect(kinds()).toEqual(["configure", "configure", "configure", "merge", "provide-secret"]);
+
+    // The user does the three external steps and provides the secret.
+    for (const n of t.hooks.store.openNeeds(b().id).filter((x) => x.kind === "configure" || x.kind === "provide-secret")) {
+      const out = await t.harness.behavior.runCli(["done", n.id, "--project", "p1"]);
+      expect(out.exitCode).toBe(0);
+    }
+    await t.flush();
+    const all = t.hooks.store.needs(b().id, true);
+    expect(all.map((n) => n.kind).sort()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "merge", "provide-secret"]);
+    expect(all.filter((n) => n.status === "done").map((n) => n.kind).sort()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "provide-secret"]);
+    expect(all.find((n) => n.kind === "merge")!.status).toBe("open");
+    expect(t.hooks.store.openNeeds(b().id).map((n) => n.kind)).toEqual(["merge"]);
+    expect(project).toBeDefined();
   });
 });
 

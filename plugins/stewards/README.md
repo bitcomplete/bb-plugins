@@ -110,9 +110,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   unless a playbook says `approval: me`. The plugin asks for that approval
   itself: whenever a ready gate's checklist is met, the ticket is
   substantial and the current spec has no approval, it files an `approval`
-  escalation with the approver (the project steward, or the user in the
-  steward's thread), whatever the steward's report says, and closes it once
-  approved or no longer needed. An approval is recorded from the approver's
+  escalation with the project steward, or an `approve-spec` item on the
+  Stewards page when the approver is the user (`approval: me`), whatever
+  the steward's report says, and closes it once approved or no longer
+  needed. An approval is recorded from the approver's
   words wherever they are: the project steward's guidance that resolves the
   request, the user's answer on the Stewards page, their message in the
   steward's thread, or their unsigned approving comment on the entity. A
@@ -127,17 +128,32 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open
-  escalation is flagged in `bb stewards list` and the digest.
+  escalation or needs item is flagged in `bb stewards list` and the digest.
+- **"Needs you" items** are the structured things only the user can do: an
+  `approve-spec`, an `approve-pr` or a `merge` the plugin files from the
+  snapshot, and a `configure`, `provide-secret` or `decide` a steward files
+  through `steward_report { needs }`. They are deduplicated by (binding,
+  kind, url) while open, listed under "Waiting on you" on the Stewards page
+  with a link and a button each, in the digest, and by `bb stewards needs`.
+  The buttons run on the server as the connected user, unsigned: Approve
+  posts the "Approved <sha> from the Stewards page" comment, Merge re-checks
+  the lane gate and squash-merges through the server's `gh` login, and every
+  action wakes the binding's steward with the closure under "What changed".
+  A button is shown only while the server can verify its preconditions;
+  otherwise the item says why not. `bb stewards done <id>` closes one from a
+  thread. A `blockedOn` naming the user, the owner or a human is refused
+  unless an open needs item says so.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
 - **The Stewards page** (a nav panel, [app.tsx](app.tsx)) has a tab per
-  stewarded project: what waits on you (questions the project steward put
-  to you, which you can answer and close there, forwarded escalations and
-  approval requests), what is in flight by stage with each status record
-  and running workers, what is stuck or held, what ended in the last two
-  weeks, and the latest digest with its date.
+  stewarded project: what waits on you (needs items with their links and
+  buttons, questions the project steward put to you, which you can answer
+  and close there, forwarded escalations and approval requests), what is in
+  flight by stage with each status record and running workers, what is stuck
+  or held, what ended in the last two weeks, and the latest digest with its
+  date.
 - **Questions to you** are kept in the store from the moment the project
   steward asks (`steward_update { ask }`, or forwarding an escalation)
   until it records your answer (`steward_update { resolve: "<question id>",
