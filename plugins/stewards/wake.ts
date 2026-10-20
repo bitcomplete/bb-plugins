@@ -13,7 +13,7 @@ import { dueDate } from "./deps.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
-import { needChoices, type Binding, type Escalation, type Need, type Observed, type Question, type Worker } from "./store.js";
+import { needChoices, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -556,6 +556,8 @@ export function formatProjectWake(input: {
   questions?: Array<{ question: Question; about: Binding | null }>;
   /** Open `needs` items, with the binding each is about. */
   needs?: Array<{ need: Need; binding: Binding }>;
+  /** Pending lessons: general rules waiting to be landed in `.bb`. */
+  lessons?: Lesson[];
   /** With digestDue: the records the digest is written from. */
   records?: DigestRecords;
   /** The project's nightly time zone, which dates are given in; UTC when absent. */
@@ -624,6 +626,19 @@ export function formatProjectWake(input: {
     out.push("## Needs you", "");
     for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`);
     out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
+  }
+  const lessons = input.lessons ?? [];
+  if (lessons.length > 0) {
+    out.push("## Lessons pending", "");
+    for (const l of lessons) {
+      const source = [l.bindingId === null ? null : `from ${l.bindingId}`, l.escalationId === null ? null : `escalation ${l.escalationId}`].filter((x) => x !== null).join(", ");
+      out.push(`- ${l.id} (${l.scope}, ${l.file}${source === "" ? "" : `, ${source}`}): ${oneLine(l.text)}${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
+    }
+    out.push(
+      "",
+      "Apply each to the named file in your `.bb` checkout, commit it, and publish with workspace_publish_guidance. Then complete it with steward_update { lessonAction: { id: \"<id>\", action: \"complete\" } }: a `procedure` lesson is self-merged, a `boundary` one becomes a Merge/Drop item for the user. If a merge was refused, the reason is above: fix the branch and complete it again, or drop it.",
+      "",
+    );
   }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
@@ -771,6 +786,8 @@ export type DigestRecords = {
   stuck: Array<{ escalation: Escalation; from: Binding }>;
   /** Open bindings on hold. */
   held: Binding[];
+  /** Lessons that reached `.bb` HEAD in the window. */
+  lessonsMerged?: Lesson[];
 };
 
 function capped(lines: string[], none: string): string[] {
@@ -825,7 +842,13 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
   ];
-  out.push("### Stuck or held", "", ...capped(stuck, "Nothing."));
+  out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
+
+  const lessons = (r.lessonsMerged ?? []).map((l) => {
+    const source = [l.bindingId === null ? null : `from ${l.bindingId}`, l.escalationId === null ? null : `escalation ${l.escalationId}`].filter((x) => x !== null).join(", ");
+    return `- Merged lesson ${l.id} (${l.scope}, ${l.file}) at ${l.mergeSha === null ? "?" : l.mergeSha.slice(0, 8)}${l.branch === null ? "" : ` on ${l.branch}`}${source === "" ? "" : ` (${source})`}: ${oneLine(l.text)}`;
+  });
+  out.push("### Lessons landed", "", ...capped(lessons, "Nothing."));
   return out;
 }
 

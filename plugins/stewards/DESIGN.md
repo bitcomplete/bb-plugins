@@ -665,8 +665,9 @@ follow-through: 6h                # how long a terminal binding may be kept open
   timers, escalation routing.
 - **Threads:** spawning stewards, recognizing workers, building wake messages,
   the project's sidebar section.
-- **Agent tools:** `steward_report` and `steward_update`.
-- **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest`.
+- **Agent tools:** `steward_report` and `steward_update` (which also
+  records and completes lessons, §20).
+- **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.
 - **UI:** the Stewards page, a nav panel with one tab per stewarded project:
   waiting on you (needs items with links and buttons, open questions, which you
   can close there, forwarded escalations and approval requests), in flight by
@@ -690,7 +691,9 @@ follow-through: 6h                # how long a terminal binding may be kept open
 
 ### Change to multi-repo
 
-The cross-plugin RPC contract in §3.
+The cross-plugin RPC contract in §3, plus `mergeGuidance`: the narrow
+fast-forward of the canonical `.bb` to a thread's published guidance branch
+that a self-merged lesson uses (§20). Only the stewards plugin may call it.
 
 ### bb-gate
 
@@ -954,6 +957,69 @@ that has not written them runs no dependency watch, which is how the feature
 is off until it is wanted. The dependency watch's targets are derived from
 the repo set, so a repo added to `repos.json` is watched without a second
 edit.
+
+## 20. Lessons
+
+A project steward's decision that corrects a design is a general rule, but
+it reached the playbook only when a person rewrote it: the same answer was
+costing a build and a review round on one ticket, then again on the next.
+A **lesson** makes the answer a record and, for most of them, lands it.
+
+- **Recording.** The project steward calls
+  `steward_update { lesson: { text, file, scope } }`, usually with the
+  `binding` and `resolve` it is deciding. `text` is the wording as it should
+  read in `.bb`, `file` is the file it belongs in (`AGENTS.md`,
+  `stewards/linear-tickets.md`, …), and `scope` is `procedure` or
+  `boundary`. Only the project steward may record one — a binding steward
+  still escalates — and it is kept with the binding and escalation it came
+  from in the `lessons` table. A lesson is `pending` until its text is found
+  in its file at `.bb` HEAD, or it is dropped.
+- **Procedure lessons self-merge.** Playbook procedure, sequencing and
+  conventions are what the project steward may already decide. It applies
+  the text to the file in its `.bb` checkout, commits, and publishes with
+  `workspace_publish_guidance`; then
+  `steward_update { lessonAction: { id, action: "complete" } }` asks
+  multi-repo to fast-forward the canonical checkout to that branch. The
+  fast-forward is deliberately narrow: the canonical checkout must be clean
+  and not detached, the branch must be a fast-forward whose commits change
+  only the lesson's own file, and that file must carry the lesson's text
+  (whitespace-normalised). Anything else is refused and the
+  `guidance-<thread>` branch is left where it is. The merge commit's sha is
+  recorded on the lesson. This is the only way a self-merged lesson reaches
+  the HEAD that `readProjectFiles` — and so every steward — reads.
+- **Boundary lessons go to the user.** Anything that would change the
+  steward's own escalation boundary — credentials and reach, who may direct
+  a server, irreversible production steps — is never self-merged. The
+  project steward applies, commits and publishes it, then `complete` files a
+  BB-15 `decide` item on the binding with the fixed choices **Merge** and
+  **Drop**. Merge runs the same multi-repo fast-forward from the page, as
+  the connected user and unsigned; Drop marks the lesson dropped. Both close
+  the item and wake the steward.
+- **The guard.** multi-repo exposes the merge as an RPC that refuses any
+  caller but the stewards plugin, and stewards only calls it for a pending
+  lesson the project steward recorded. A `procedure` lesson may therefore
+  only ever add its own wording to its own file; it cannot smuggle in a
+  second change.
+- **Status is observed, not assumed.** Every sweep and nightly pass reads
+  each pending lesson's file at `.bb` HEAD and marks it `merged` when the
+  normalised text is there, however it got there. `dropped` is set by the
+  user's Drop button, the project steward's `drop` action, or
+  `bb stewards drop-lesson <id>`.
+- **The nightly prompt and the digest.** The project steward's nightly wake
+  lists the pending lessons and asks it to apply, commit, publish and
+  complete them, with the last refusal reason where one was refused. The
+  digest lists the lessons that landed in the window with their sha, file
+  and source binding/escalation, and names the branch.
+- **Surfaces.** Pending lessons are on the Stewards page's Lessons section
+  and in `bb stewards list`; `bb stewards lessons [--all]` lists them,
+  `bb stewards drop-lesson <id>` drops one.
+- **Undo.** A merged procedure lesson is an ordinary commit on `.bb` HEAD;
+  `bb stewards lessons --all` names its `mergeSha` and branch. To undo it,
+  revert that commit in the canonical checkout (`git revert <sha>` in the
+  project's `.bb`, then push) or edit the wording out and let the next pass
+  see it gone; the lesson row stays `merged` until it is dropped, which only
+  closes the record, not the file. A boundary lesson is undone the same way
+  once the user has merged it.
 
 ## Known limits
 

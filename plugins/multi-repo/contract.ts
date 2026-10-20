@@ -489,6 +489,30 @@ export const hostContract = defineRpcContract({
       })
       .strict(),
   },
+
+  /**
+   * Fast-forward the canonical checkout to a thread's published guidance
+   * branch. The narrow merge a self-merged lesson uses; `source.ts` has the
+   * refusals. Leaves the branch in place on any refusal.
+   */
+  mergeGuidance: {
+    input: z
+      .object({
+        projectSourcePath: absolutePath,
+        threadId: z.string().min(1).max(100),
+        file: projectFilePathSchema,
+        text: z.string().min(1).max(20_000),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        sha: z.string().max(64).nullable(),
+        branch: z.string().max(300).nullable(),
+        message: z.string().max(2000),
+      })
+      .strict(),
+  },
 });
 
 export type HostContract = typeof hostContract;
@@ -597,6 +621,33 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(100) }).strict(),
     output: repoSetViewSchema,
   },
+  /**
+   * Fast-forward the canonical `.bb` checkout to a thread's published guidance
+   * branch. Stewards calls it, and only stewards: a lesson is the one thing
+   * that writes itself into the guidance every steward reads, and the project
+   * steward's own tooling is the only thing that may ask for it. `file` and
+   * `text` are the lesson's own; the host refuses a merge that would change
+   * anything else.
+   */
+  mergeGuidance: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        threadId: z.string().min(1).max(100),
+        file: projectFilePathSchema,
+        text: z.string().min(1).max(20_000),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        sha: z.string().max(64).nullable(),
+        branch: z.string().max(300).nullable(),
+        message: z.string().max(2000),
+      })
+      .strict(),
+  },
+
   /**
    * Files from the project's `.bb` repo, read from the canonical checkout's
    * committed `HEAD` after a fast-forward-only refresh.
