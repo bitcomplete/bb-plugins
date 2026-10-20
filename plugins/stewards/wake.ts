@@ -13,6 +13,23 @@ import type { Binding, Escalation, Observed, Question, Worker } from "./store.js
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
+
+/**
+ * What a steward must never ask for: an open escalation or approval request is
+ * already on the user's Stewards page, and repeating it in a reply is noise.
+ */
+const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. Do not ask for them in your reply.";
+
+/**
+ * The rules that hold on every wake, whatever the playbook: the generic things
+ * a steward got wrong without them. They mirror the `stewards` skill and the
+ * default playbooks, so a change here belongs there too.
+ */
+const STANDING_RULES = [
+  "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
+  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing item for it, and the worker takes the value.",
+  "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up.",
+];
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
@@ -20,6 +37,35 @@ const RESULT_CHARS = 1500;
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
+const oneLine = (text: string, max = 400) => {
+  const flat = text.replace(/\s+/gu, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+};
+
+/**
+ * The question a worker's final message ended with, or null when it asked
+ * nothing. The last line that asks is the one the steward must answer; the
+ * whole message is already quoted in the snapshot. Only the last few lines are
+ * scanned, so a question raised earlier in a long message and left behind is
+ * not surfaced as open.
+ */
+export function workerQuestion(result: string | null): string | null {
+  if (result === null) return null;
+  const lines = result.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  const from = Math.max(0, lines.length - 3);
+  for (let i = lines.length - 1; i >= from; i--) {
+    if (lines[i]!.includes("?")) return oneLine(lines[i]!);
+  }
+  return null;
+}
+
+/** One worker's question, first under What changed, with how to answer it. */
+function workerQuestionLines(q: WorkerQuestion): string[] {
+  const asked = `- **Worker ${q.threadId} asked:** ${q.question}`;
+  if (q.state === "gone") return [asked, `  Its thread is gone, so \`bb thread tell\` cannot reach it: start a fresh worker to answer it, before anything else.`];
+  if (q.state === "revived") return [asked, `  It had been archived and is back now: answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+  return [asked, `  Answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+}
 
 /**
  * Join a message's three parts within WAKE_MAX_CHARS, cutting the middle
@@ -73,6 +119,9 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
 
+/** A worker's final message that asked something, to answer before anything else. */
+export type WorkerQuestion = { threadId: string; question: string; state: "live" | "revived" | "gone" };
+
 export type WakeInput = {
   reason: WakeReason;
   binding: Binding;
@@ -83,6 +132,8 @@ export type WakeInput = {
   escalations: Escalation[];
   routedToMe: Array<{ escalation: Escalation; from: Binding }>;
   workers: Worker[];
+  /** Questions workers ended their last turn with; rendered ahead of other changes. */
+  workerQuestions: WorkerQuestion[];
   children: ChildView[];
   /** The worker model, as `bb thread spawn` flags. */
   workerFlags: string;
@@ -148,8 +199,8 @@ function gateLines(input: WakeInput): string[] {
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
       : request.route === "me"
-        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it.`;
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
@@ -188,6 +239,11 @@ export function formatWake(input: WakeInput): string {
     "    EOF",
     "",
     "Follow it up with `bb thread tell <id> <message>`. You are woken when a worker finishes, with its final message.",
+    "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
+    "",
+    "**Standing rules.**",
+    "",
+    ...STANDING_RULES,
   );
 
   out.push("", "## 2. Ready gate", "", ...gateLines(input));
@@ -224,11 +280,13 @@ export function formatWake(input: WakeInput): string {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
     }
+    out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
 
   const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
-  if (input.changes.length === 0) out.push("Nothing actionable; this is a scheduled look.");
+  for (const q of input.workerQuestions) out.push(...workerQuestionLines(q));
+  if (input.changes.length === 0 && input.workerQuestions.length === 0) out.push("Nothing actionable; this is a scheduled look.");
   for (const c of input.changes) out.push(`- ${c}`);
 
   out.push(
@@ -379,7 +437,7 @@ export function formatProjectWake(input: {
     }
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
       out.push(
-        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, which closes the request; or decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
         "",
       );
     }
@@ -425,10 +483,6 @@ export function formatProjectWake(input: {
 
 /** The calendar date of a moment in a time zone, so "asked" and "since" match the user's day. */
 const dayIn = (timeZone: string) => (ms: number) => localParts(ms, timeZone).date;
-const oneLine = (text: string, max = 400) => {
-  const flat = text.replace(/\s+/gu, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
-};
 const PREVIOUS_DIGEST_CHARS = 6000;
 const RECORD_LINES = 50;
 

@@ -37,6 +37,22 @@ Two tools are yours; everything else you do with the tools every thread has.
   meanwhile } }`: it goes to your parent steward, then the project steward.
   The answer comes back as guidance and wakes you. The user hears only about
   the project's big decisions.
+- **One ask per reply, and only what is open.** Ask the user at most one
+  thing, and only what the playbook, this skill or the project's guidance
+  leaves open. Models, flags, lanes and who merges are settled there: never
+  ask them. An escalation or approval request that is already open is on the
+  Stewards page: do not ask for it again, and a reply that does counts like a
+  missed report toward `stuck`.
+- **A credential is a worker's, through `bb secret request`.** When the work
+  needs a secret, the worker obtains it with `bb secret request` (the
+  `secrets` skill): never paste one into a thread, and never route the user
+  to a script to run. You file the user-facing item for it — an escalation,
+  or a question as project steward — and the worker takes the value.
+- **A build-time blocker is a `decision` the same turn.** A worker's finding
+  that would stop the feature working once it ships, or that changes what the
+  ticket needs (a credential, an access, a contract), is escalated as a
+  `decision` in the same turn, with the worker's words quoted — never
+  relayed as a follow-up.
 - **`steward_update` saves the user's steering.** When the user tells you
   something about how to handle the entity, save it as guidance; it rides on
   every later wake. With a child steward, it also decides its escalations,
@@ -133,7 +149,9 @@ picks it up), or decline with a reason, then resolve the escalation.
 Everything you ask the user is a record. Forwarding an escalation to them
 makes a question for it; anything else you ask in a reply, record first
 with `steward_update { ask: { question, context } }` (with `binding` when
-it concerns one). When they answer, close it with
+it concerns one). Ask one thing per reply, and never ask what the playbook,
+this skill or the project's guidance settles (models, flags, lanes, who
+merges). When they answer, close it with
 `steward_update { resolve: "<question id>", answer }`; for a forwarded one
 that decides the escalation too, and resolving the escalation closes the
 question. The user may also close a question on the Stewards page. Every

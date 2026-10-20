@@ -46,12 +46,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   the last observation, and the steward is woken only for an actionable
   change: a phase change, a human comment, a review, checks finishing,
   someone else's push, a worker finishing, guidance, an approval, a spec
-  change, or its requeue time. While one of its workers is running, the
-  worker's own work on a pull request — checks finishing, description
-  edits, pushes and comments from your account, which every thread posts
-  as — is not a reason to wake. Everything not actionable is kept as a
-  quiet note and shown in "What changed" at the next turn something else
-  makes due.
+  change, or its requeue time. While any worker of the binding is in flight
+  — from its spawn until it is stopped, failed or archived, across the idle
+  between its turns — the worker's own work on a pull request (checks
+  finishing, description edits, pushes and comments from your account, which
+  every thread posts as, and the reviewer's `bb-review` markers) is not a
+  reason to wake; a reviewer round that changes the lane is. Everything not
+  actionable is kept as a quiet note and shown in "What changed" at the next
+  turn something else makes due.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
   woken turn ends with `steward_report`, the status record. A wake past
@@ -59,7 +61,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   a wake carries what the steward needs, its transcript can go: after a
   steward's or the project steward's turn, the plugin compacts its context
   once it holds more than **Compact a steward above this many context
-  tokens** (120,000 by default; 0 leaves it to the provider).
+  tokens** (120,000 by default; 0 leaves it to the provider), and before a
+  wake that would push it over.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a
@@ -109,8 +112,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   substantial and the current spec has no approval, it files an `approval`
   escalation with the approver (the project steward, or the user in the
   steward's thread), whatever the steward's report says, and closes it once
-  approved or no longer needed. A request the approver declines is not made
-  again until the spec changes. When the entity changes while one of its
+  approved or no longer needed. An approval is recorded from the approver's
+  words wherever they are: the project steward's guidance that resolves the
+  request, the user's answer on the Stewards page, their message in the
+  steward's thread, or their unsigned approving comment on the entity. A
+  page answer that is neither an approval nor a clear refusal goes back to
+  the project steward to interpret, rather than being remembered as a
+  decline. A spec comment the user writes from their own thread counts
+  toward the spec and, with `approval: me`, is its own approval. A request
+  the approver declines is not made again until the spec changes, and while
+  one is open the steward is told not to ask the user again: the request is
+  on the Stewards page, and a report that asks anyway shows as a playbook
+  violation in `bb stewards show`. When the entity changes while one of its
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open

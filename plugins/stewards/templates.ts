@@ -3,6 +3,21 @@
 // and reviewed like any other change to `.bb`.
 import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL } from "./config.js";
 
+/**
+ * A credential a worker needs, in the linear-tickets build section. The worker
+ * takes the value through the secrets skill; the steward files the item the
+ * user sees.
+ */
+const SECRET_REQUEST =
+  "A credential the work needs is the worker's to obtain with `bb secret request` (the `secrets` skill): put that in the task, never the secret, and never a script for the user to run. You file the user-facing item for it.";
+
+/**
+ * A build-time blocker is a `decision` in the same turn, never a follow-up,
+ * in a playbook's build and review sections.
+ */
+const buildBlocker = (what: string) =>
+  `A worker's finding that would stop the feature working once it ships, or that changes what ${what} needs (a credential, an access, a contract), is escalated as a \`decision\` in the same turn, with the worker's words quoted; never relay it as a follow-up.`;
+
 export function projectFileTemplate(teams: string[]): string {
   return `${JSON.stringify(
     {
@@ -91,11 +106,17 @@ repo, the branch, the acceptance criteria, and "open a draft pull request,
 link it to the ticket, and stop when checks pass". When the pull requests are
 ready, request review and move the ticket to In Review.
 
+${SECRET_REQUEST}
+
+${buildBlocker("the ticket")}
+
 ## In Review
 
 Follow the linked pull requests. Start a worker to address change requests or
 failing checks. When every linked pull request is merged, move the ticket to
 Done.
+
+${buildBlocker("the ticket")}
 `;
 
 export const GITHUB_PRS = `---
@@ -124,11 +145,15 @@ Get it ready: a worker fixes failing checks and finishes what the description
 says is left. When checks pass, mark it ready (\`gh pr ready\`) and request
 review.
 
+${buildBlocker("the work")}
+
 ## open
 
 Answer review comments with a worker, one round at a time, and re-request
 review after each round. When it is approved and checks pass, merge it if the
 project's guidance says its author may; otherwise say so in a comment.
+
+${buildBlocker("the work")}
 `;
 
 export const GITHUB_REVIEWS = `---
@@ -166,6 +191,8 @@ further.
 ## open
 
 Run a round when one is due; otherwise there is nothing to do.
+
+${buildBlocker("the work")}
 
 ## draft
 
