@@ -605,6 +605,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       sourceSnapshot: ({ id }) => sourceSnapshot(id),
       sourceValidate: (input) => sourceValidate(input),
       sourceAdoptable: (input) => sourceAdoptable(input),
+      // Dependabot alerts are a GitHub thing; linear has none. Stewards only
+      // asks github, so this is a plain answer rather than a throw.
+      async sourceDependabotAlerts() {
+        return { viewer: null, alerts: [], errors: ["Dependabot alerts are read from github, not linear"] };
+      },
       async sourceSetInterest({ units, entities }, { experimental_caller: caller }) {
         // The interest decides what this server leases and whom it rings, so
         // only stewards itself may set it; the app and the CLI are clients.
@@ -803,7 +808,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_update_issue",
       description:
-        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id (do not sign it yourself); read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
+        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, due date, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id (do not sign it yourself); read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
       presentation: { label: { pending: "Updating a Linear issue", completed: "Updated a Linear issue" } },
       parameters: z
         .object({
@@ -813,12 +818,13 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           addLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to add, matched ignoring case."),
           removeLabels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names to remove, matched ignoring case."),
           priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
+          dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/u, "a date such as 2026-10-20").optional().describe("The issue's due date, as YYYY-MM-DD."),
           description: z.string().trim().min(1).max(50_000).optional().describe("The whole new description, in Markdown. Replaces the old one."),
           account: accountParam,
         })
         .refine(
-          (v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined || v.description !== undefined,
-          { message: "Give at least one of state, assignee, addLabels, removeLabels, priority or description." },
+          (v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined || v.dueDate !== undefined || v.description !== undefined,
+          { message: "Give at least one of state, assignee, addLabels, removeLabels, priority, dueDate or description." },
         ),
       async execute(input, { threadId, signal }) {
         try {
@@ -863,6 +869,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
 
           if (input.priority !== undefined) update.priority = PRIORITIES[input.priority];
+          if (input.dueDate !== undefined) update.dueDate = input.dueDate;
           if (input.description !== undefined) update.description = signed(input.description, threadId);
 
           const updated = parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, signal));
@@ -870,6 +877,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
           if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
           if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+          if (input.dueDate !== undefined) changed.push(`due ${input.dueDate}`);
           if (input.description !== undefined) changed.push("description replaced");
           return `${updated.identifier}: ${changed.join("; ")}.`;
         } catch (error) {
@@ -881,7 +889,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_create_issue",
       description:
-        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, and a parent issue key. The description is signed with this thread's id; do not sign it yourself. Returns the new issue's key and URL.",
+        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, a due date, and a parent issue key. The description is signed with this thread's id; do not sign it yourself. Returns the new issue's key and URL.",
       presentation: { label: { pending: "Filing a Linear issue", completed: "Filed a Linear issue" } },
       parameters: z.object({
         team: z.string().trim().min(1).max(20).describe("The team key, such as ENG."),
@@ -891,6 +899,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         assignee: z.string().trim().max(100).optional().describe("A person's name or email, or 'me'."),
         labels: z.array(z.string().trim().min(1).max(100)).max(20).optional().describe("Label names, matched ignoring case."),
         priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
+        dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/u, "a date such as 2026-10-20").optional().describe("The issue's due date, as YYYY-MM-DD."),
         parent: issueKey.optional().describe("The parent issue's key, to file this as a sub-issue."),
         account: accountParam,
       }),
@@ -932,6 +941,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
 
           if (input.priority !== undefined) create.priority = PRIORITIES[input.priority];
+          if (input.dueDate !== undefined) create.dueDate = input.dueDate;
 
           if (input.parent !== undefined) {
             const parent = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.parent }, signal));

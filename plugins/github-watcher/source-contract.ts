@@ -155,6 +155,39 @@ export const adoptableEntitySchema = z.object({
 });
 export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
 
+// ---- Dependabot alerts -------------------------------------------------------
+
+/** The four Dependabot severities, as GitHub reports them. */
+export const DEPENDABOT_SEVERITIES = ["critical", "high", "medium", "low"] as const;
+export type DependabotSeverity = (typeof DEPENDABOT_SEVERITIES)[number];
+
+/**
+ * One Dependabot alert, as the github plugin reads it from
+ * `GET /repos/{owner}/{repo}/dependabot/alerts` (which needs the token's
+ * alert access, not just read access to the repository). The entity id
+ * doorbells carry is "owner/repo#<alert number>", which is the alert's own
+ * numbering, unrelated to the issue numbering. `repo` is spelled as GitHub
+ * does, which is what the doorbell carries and the github plugin leases.
+ */
+export const dependabotAlertSchema = z.object({
+  id: z.string(),
+  repo: z.string(),
+  number: z.number().int().positive(),
+  severity: z.enum(DEPENDABOT_SEVERITIES),
+  package: z.string(),
+  ecosystem: z.string(),
+  manifestPath: z.string().nullable(),
+  /** open, fixed, dismissed, auto_dismissed. */
+  state: z.string(),
+  ghsaId: z.string().nullable(),
+  fixedVersion: z.string().nullable(),
+  summary: z.string().nullable(),
+  url: z.string().nullable(),
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+});
+export type DependabotAlert = z.infer<typeof dependabotAlertSchema>;
+
 /** Served by linear and by github; stewards is the only caller. */
 export const sourceContract = {
   /** One entity, by Linear key or UUID, or by GitHub "owner/repo#12". Null when it does not exist or is not visible. */
@@ -211,13 +244,37 @@ export const sourceContract = {
    * previous set. The source leases them on bb-gate-hooks and rings stewards
    * for every doorbell that names one of the entities or falls in one of the
    * units. Only stewards may call it.
+   *
+   * `dependabot` names repositories whose Dependabot alert doorbells stewards
+   * wants. It is separate from `units` because a repository lease does not
+   * receive alert doorbells (bb-gate/docs/hooks.md): the github plugin leases
+   * each as a `dependabot_repo`. Linear ignores it.
    */
   sourceSetInterest: {
     input: z.object({
       units: z.array(z.string().min(1).max(200)).max(200),
       entities: z.array(z.string().min(1).max(300)).max(2000),
+      dependabot: z.array(z.string().min(1).max(200)).max(200).default([]),
     }),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * A repository's Dependabot alerts, for stewards' dependency watches. The
+   * github plugin reads them with the developer's token from the REST API;
+   * each repository the token cannot read (no alert access, alerts disabled,
+   * not visible) is named in `errors` rather than failing the whole call.
+   */
+  sourceDependabotAlerts: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      /** GitHub's alert state: open (the default), fixed, dismissed, auto_dismissed. */
+      state: z.string().min(1).max(60).optional(),
+    }),
+    output: z.object({
+      viewer: z.string().nullable(),
+      alerts: z.array(dependabotAlertSchema),
+      errors: z.array(z.string()),
+    }),
   },
 } as const;
 

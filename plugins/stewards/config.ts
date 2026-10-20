@@ -7,7 +7,8 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { OpsTarget } from "./ops.js";
+import type { DependabotTarget, K8sTarget, OpsTarget } from "./ops.js";
+import { DEPENDABOT_SEVERITIES } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
@@ -89,6 +90,10 @@ export type BindingKind = (typeof KINDS)[number];
 
 export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-tickets", pr: "github-prs", review: "github-reviews", ops: "ops-watch" };
 
+/** The playbooks the dependency watch uses: one for alert targets, one for the bot's pull requests. */
+export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
+export const DEPS_PRS_PLAYBOOK = "deps-prs";
+
 const playbookName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "a playbook name: lowercase letters, digits and dashes");
 
 function validTimezone(tz: string): boolean {
@@ -105,12 +110,44 @@ const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key s
 /** Linear's priorities, as `ops.autoAdopt` names them. */
 export const LINEAR_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
 
-const opsTargetSchema = z
+const k8sNamespaceTargetSchema = z
   .object({
     kind: z.literal("k8s-namespace"),
     name: z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production"),
   })
   .strict();
+
+/** A repository whose Dependabot alerts an ops steward watches. */
+export const dependabotRepoSchema = z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as acme/web");
+
+const dependabotTargetSchema = z.object({ kind: z.literal("dependabot"), repo: dependabotRepoSchema }).strict();
+
+const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema]);
+
+/** The per-severity SLA and batch window for Dependabot alerts. */
+const slaValueSchema = z.union([z.literal("asap"), durationSchema]);
+
+export const depsSchema = z
+  .object({
+    sla: z
+      .object({
+        critical: slaValueSchema.default("asap"),
+        high: slaValueSchema.default(86_400_000),
+        medium: slaValueSchema.default(7 * 86_400_000),
+        low: slaValueSchema.default(30 * 86_400_000),
+      })
+      .strict()
+      .default({ critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }),
+    batch: z
+      .object({ medium: durationSchema.default(7 * 86_400_000), low: durationSchema.default(30 * 86_400_000) })
+      .strict()
+      .default({ medium: 7 * 86_400_000, low: 30 * 86_400_000 }),
+    /** Severities whose tickets are labelled and moved to Todo when filed, without an escalation. */
+    autoAdopt: z.array(z.enum(DEPENDABOT_SEVERITIES)).max(4).default(["critical", "high"]),
+  })
+  .strict()
+  .default({ sla: { critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }, batch: { medium: 7 * 86_400_000, low: 30 * 86_400_000 }, autoAdopt: ["critical", "high"] });
+export type DepsConfig = z.infer<typeof depsSchema>;
 
 export const projectFileSchema = z
   .object({
@@ -134,8 +171,18 @@ export const projectFileSchema = z
       .strict()
       .default({ at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 }),
     projectSteward: z.object({ model: modelSpecSchema.optional() }).strict().default({}),
-    /** Which playbook governs each kind of binding. */
-    playbooks: z.object({ ticket: playbookName.optional(), pr: playbookName.optional(), review: playbookName.optional(), ops: playbookName.optional() }).strict().default({}),
+    /** Which playbook governs each kind of binding, and the two the dependency watch uses. */
+    playbooks: z
+      .object({
+        ticket: playbookName.optional(),
+        pr: playbookName.optional(),
+        review: playbookName.optional(),
+        ops: playbookName.optional(),
+        [DEPS_ALERTS_PLAYBOOK]: playbookName.optional(),
+        [DEPS_PRS_PLAYBOOK]: playbookName.optional(),
+      })
+      .strict()
+      .default({}),
     /** Reviews: on unless turned off. */
     reviews: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
     adoption: z.object({ perPass: z.number().int().min(1).max(100).default(10) }).strict().default({ perPass: 10 }),
@@ -162,12 +209,14 @@ export const projectFileSchema = z
       })
       .strict()
       .default({ targets: [], autoAdopt: [] }),
+    /** The dependency watch: per-severity SLA, the batch window, and what auto-adopts. */
+    deps: depsSchema,
   })
   .strict()
   .superRefine((file, ctx) => {
     const seen = new Set<string>();
     file.ops.targets.forEach((t, i) => {
-      const key = `${t.kind}/${t.name}`;
+      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : `${t.kind}/${t.repo.toLowerCase()}`;
       if (seen.has(key)) ctx.addIssue({ code: "custom", path: ["ops", "targets", i], message: `${key} is listed twice` });
       seen.add(key);
     });
@@ -201,6 +250,23 @@ export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string
 export const usesKind = (project: ProjectFile, kind: BindingKind): boolean => (kind === "review" ? project.reviews.enabled : kind === "ops" ? project.ops.targets.length > 0 : true);
 
 export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
+
+/** The k8s namespaces to watch, which are read with kubectl. */
+export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");
+
+/**
+ * The Dependabot alert targets: the project file's explicit `dependabot`
+ * targets, or every repo in `repos.json` not in `github.exclude` when it
+ * lists none. `repos` is the project's derived repo set.
+ */
+export function depsTargets(project: ProjectFile, repos: readonly string[]): DependabotTarget[] {
+  const explicit = project.ops.targets.filter((t): t is DependabotTarget => t.kind === "dependabot").map((t) => t.repo);
+  return (explicit.length > 0 ? explicit : [...repos]).map((repo) => ({ kind: "dependabot" as const, repo }));
+}
+
+/** The playbook a binding runs under: the deps-alerts one for a Dependabot target, else its kind's. */
+export const depsAlertsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_ALERTS_PLAYBOOK] ?? DEPS_ALERTS_PLAYBOOK;
+export const depsPrsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_PRS_PLAYBOOK] ?? DEPS_PRS_PLAYBOOK;
 
 /** The Linear team an ops steward files in. */
 export const opsTeam = (project: ProjectFile): string | null => project.ops.team ?? project.linear.teams[0] ?? null;
@@ -299,7 +365,15 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   const fm = parsed.data;
   if (fm.name !== expectedName) return { ok: false, error: `${file} names itself ${JSON.stringify(fm.name)}; the file name says ${JSON.stringify(expectedName)}` };
   const expectedSource = SOURCE_OF[fm.kind];
-  if (fm.source !== expectedSource) return { ok: false, error: `${file}: ${fm.kind === "ops" ? "an" : "a"} ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
+  if (fm.kind === "ops") {
+    // An ops binding watches a target, not an entity in a source plugin: a
+    // Kubernetes namespace reads k8s, and a Dependabot alert target reads
+    // github. The playbook says which so its sections can be about the right
+    // thing; either is valid.
+    if (fm.source !== "k8s" && fm.source !== "github") return { ok: false, error: `${file}: an ops playbook watches k8s or github, not ${fm.source}` };
+  } else if (fm.source !== expectedSource) {
+    return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
+  }
   if (fm.kind === "ops") {
     // An ops binding watches a target for as long as it is configured: no state to key phases on, and nothing terminal.
     if (Object.keys(fm.phases ?? {}).length > 0 || fm.terminal.length > 0 || fm.ready !== undefined || fm.promote !== undefined) {

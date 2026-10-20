@@ -7,7 +7,7 @@ import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { createStewardsPlugin, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS } from "./store.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
+import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
 
@@ -22,6 +22,8 @@ function world() {
   };
   const repos = [{ dir: "web", url: "https://github.com/acme/web.git" }];
   const entities = new Map<string, EntitySnapshot>();
+  /** Dependabot alerts the fake github serves, by lowercased repo. */
+  const dependabotAlerts = new Map<string, unknown[]>();
   const rpcCalls: Call[] = [];
   const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
@@ -63,6 +65,10 @@ function world() {
         errors: [],
       };
     } else if (args.method === "sourceValidate") out = { viewer: "Jane", units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
+    else if (args.method === "sourceDependabotAlerts") {
+      const units = input.units as string[];
+      out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+    }
     else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
     return args.outputSchema.parse(out);
   };
@@ -164,7 +170,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, repos, entities, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, repos, entities, dependabotAlerts, rpcCalls, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}) {
@@ -235,8 +241,8 @@ describe("a Linear ticket steward", () => {
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
-    expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"] });
-    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [] });
+    expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"], dependabot: [] });
+    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [] });
   });
 
   it("ignores unlabelled tickets, other teams, and rings from anyone but a source plugin", async () => {
@@ -713,7 +719,7 @@ describe("a Linear ticket steward", () => {
     // acme/web#10 has no snapshot: it cannot be read yet.
     await t.ring("linear", "uuid-12");
     const github = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input;
-    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"] });
+    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"], dependabot: [] });
   });
 
   it("stops leasing a linked pull request once it merges", async () => {
@@ -723,13 +729,13 @@ describe("a Linear ticket steward", () => {
     t.entities.set("acme/web#7", pull());
     await t.ring("linear", "uuid-12");
     const github = () => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher");
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"], dependabot: [] });
     const sent = github().length;
 
     t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
     await t.ring("github", "acme/web#7");
     expect(github()).toHaveLength(sent + 1);
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [] });
   });
 
   it("counts a worker woken again (by a watch, a reviewer) as running", async () => {
@@ -1496,7 +1502,7 @@ describe("bb stewards init", () => {
     const t = await setup();
     t.threads.set("thr_me", { status: "active", archivedAt: null });
     await t.harness.behavior.runCli(["init", "--teams", "ENG"], { threadId: "thr_me", projectId: "p1", cwd: "/w" });
-    expect(t.writes.length).toBe(5);
+    expect(t.writes.length).toBe(7);
     expect(t.writes.every((w) => w.hostId === "host_on")).toBe(true);
   });
 });
@@ -2555,5 +2561,178 @@ describe("ops stewards", () => {
     const ticketSteward = t.spawns.find((x) => x.title === "ENG-12: Fix login")!.id;
     const r = await t.tool("steward_report", { phase: "Todo", summary: "x", nextAction: "y", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }] }, ticketSteward);
     expect(r).toMatchObject({ error: true, text: expect.stringMatching(/opsTickets is for an ops steward's report/u) });
+  });
+});
+
+describe("dependency stewards", () => {
+  const DEPS_TARGET = "dependabot/acme/web";
+
+  const alert = (over: Record<string, unknown> = {}) => ({
+    id: "acme/web#4",
+    repo: "acme/web",
+    number: 4,
+    severity: "high",
+    package: "lodash",
+    ecosystem: "npm",
+    manifestPath: "package-lock.json",
+    state: "open",
+    ghsaId: "GHSA-xxxx-yyyy-zzzz",
+    fixedVersion: "4.17.21",
+    summary: "Prototype pollution",
+    url: "https://github.com/acme/web/security/dependabot/4",
+    createdAt: "2026-10-01T00:00:00Z",
+    updatedAt: "2026-10-01T00:00:00Z",
+    ...over,
+  });
+
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}) {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ...project });
+    t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.dependabotAlerts.set("acme/web", alerts);
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = () => t.spawns.find((x) => String(x.title).startsWith("Deps watch"));
+    const wakes = () => {
+      const id = steward()?.id;
+      return id === undefined ? [] : [String(steward()!.prompt), ...t.sends.filter((x) => x.threadId === id).map((x) => x.text)];
+    };
+    return { t, steward, wakes };
+  }
+
+  it("watches every repo for alerts, with the SLA, priority and batch plan in the wake", async () => {
+    const { t, steward, wakes } = await watching();
+    expect(await t.list()).toMatchObject([{ key: DEPS_TARGET, kind: "ops", threadId: steward()!.id, ended: false }]);
+    expect(steward()).toMatchObject({ title: "Deps watch: acme/web" });
+    // The interest names the repo as a dependabot lease, separate from its repo lease.
+    const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!.input as { units: string[]; dependabot: string[] };
+    expect(interest.units).toEqual(["acme/web"]);
+    expect(interest.dependabot).toEqual(["acme/web"]);
+
+    const first = wakes()[0]!;
+    expect(first).toMatch(/^# Deps watch: dependabot\/acme\/web/u);
+    expect(first).toMatch(/You have just been made the dependency steward/u);
+    expect(first).toContain("#### acme/web#4");
+    expect(first).toMatch(/### New: no ticket yet/u);
+    expect(first).toMatch(/\*\*high\*\* priority high, due 2026-10-15/u);
+    expect(first).toMatch(/`lodash` \(npm\) — package-lock.json — GHSA-xxxx-yyyy-zzzz/u);
+    expect(first).toMatch(/Fixed in 4\.17\.21/u);
+    expect(first).toMatch(/This severity gets its own ticket\./u);
+    expect(first).toMatch(/File tickets in the Linear team ENG/u);
+
+    // It files and reports, and the fingerprint map records the ticket.
+    const ops = steward()!.id;
+    const report = await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "ENG-50", did: "filed" }] }, ops);
+    expect(report).toMatchObject({ error: false });
+    expect(t.hooks.store.fingerprint("p1", "acme/web#4")).toMatchObject({ ticketKey: "ENG-50", severity: "high", ecosystem: "npm" });
+  });
+
+  it("joins a second low alert to the open ticket and tightens its due date for a medium one", async () => {
+    const { t, steward, wakes } = await watching([alert({ number: 4, severity: "low", ghsaId: "GHSA-low-1" })]);
+    const ops = steward()!.id;
+    expect(wakes()[0]).toMatch(/### New: no ticket yet/u);
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "ENG-50", did: "filed" }] }, ops)).error).toBe(false);
+
+    // A second low alert: the open ticket's due date is inside its deadline, so it joins.
+    t.advance(86_400_000);
+    t.dependabotAlerts.set("acme/web", [alert({ number: 4, severity: "low", ghsaId: "GHSA-low-1" }), alert({ number: 5, severity: "low", ghsaId: "GHSA-low-2", package: "minimist" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const joined = wakes().at(-1)!;
+    expect(joined).toContain("#### acme/web#5");
+    expect(joined).toMatch(/Batch: join the open ticket ENG-50/u);
+    expect(joined).not.toMatch(/Batch: tighten/u);
+
+    // A medium alert is more urgent than the low ticket's due date, so it tightens it.
+    t.advance(86_400_000);
+    t.dependabotAlerts.set("acme/web", [alert({ number: 4, severity: "low", ghsaId: "GHSA-low-1" }), alert({ number: 6, severity: "medium", ghsaId: "GHSA-med", package: "axios" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const tightened = wakes().at(-1)!;
+    expect(tightened).toContain("#### acme/web#6");
+    expect(tightened).toMatch(/Batch: tighten the open ticket ENG-50's due date to no later than \d{4}-\d{2}-\d{2}/u);
+
+    // Once the ticket is resolved, a new low alert files a new one instead of joining it.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    t.advance(86_400_000);
+    t.dependabotAlerts.set("acme/web", [alert({ number: 7, severity: "low", ghsaId: "GHSA-low-3", package: "tar" })]);
+    await t.hooks.sweep();
+    await t.flush();
+    const afterDone = wakes().at(-1)!;
+    expect(afterDone).toContain("#### acme/web#7");
+    expect(afterDone).toMatch(/Batch: no open ticket for this repo and ecosystem; file a new one\./u);
+    expect(afterDone).not.toMatch(/Batch: join the open ticket ENG-50/u);
+  });
+
+  it("suppresses the escalation only for the severities deps.autoAdopt names", async () => {
+    const adopted = await watching();
+    expect(adopted.wakes()[0]).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+    expect(adopted.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
+
+    const escalate = await watching([alert({ number: 4, severity: "high" })], { deps: { autoAdopt: [] } });
+    expect(escalate.wakes()[0]).not.toMatch(/deps\.autoAdopt:/u);
+    expect(escalate.wakes()[0]).toMatch(/a severity it does not name\s+raises one decision escalation/u);
+  });
+
+  it("wakes on a fixed alert so its ticket is trimmed, and rings on a dependabot_alert doorbell", async () => {
+    const { t, steward, wakes } = await watching();
+    const ops = steward()!.id;
+    expect((await t.tool("steward_report", { phase: "watching", summary: "Filed ENG-50.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: "acme/web#4", ticket: "ENG-50", did: "filed" }] }, ops)).error).toBe(false);
+    const before = wakes().length;
+
+    // Fixed: the alert is gone from the open list, and the wake says so.
+    t.dependabotAlerts.set("acme/web", []);
+    await t.ring("github", "acme/web#4");
+    expect(wakes()).toHaveLength(before + 1);
+    const trimmed = wakes().at(-1)!;
+    expect(trimmed).toMatch(/No longer open: acme\/web#4 \(ENG-50\)/u);
+    expect(trimmed).toMatch(/\*\*No open alerts\.\*\*/u);
+
+    // A doorbell for an alert in the watched repo wakes the dependency steward, even with nothing new.
+    t.dependabotAlerts.set("acme/web", [alert({ number: 7, severity: "critical", ghsaId: "GHSA-crit", package: "tar" })]);
+    await t.ring("github", "acme/web#7");
+    expect(wakes().at(-1)).toContain("#### acme/web#7");
+    expect(wakes().at(-1)).toMatch(/\*\*critical\*\* priority urgent/u);
+    expect(wakes().at(-1)).toMatch(/deps\.autoAdopt: a ticket you file for a critical or high alert is adopted at once/u);
+  });
+
+  it("adopts a dependabot[bot] pull request under deps-prs", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: [] }));
+    await t.hooks.sweep();
+    await t.flush();
+    const pr = t.spawns.find((x) => x.title === "acme/web#9: Add login retry");
+    expect(pr).toBeDefined();
+    const prompt = String(pr!.prompt);
+    expect(prompt).toMatch(/playbook deps-prs@/u);
+    expect(prompt).toMatch(/You steward one Dependabot version-update pull request/u);
+    expect(prompt).toMatch(/never merge it: you adopt it, review it, and escalate it for a\s+human merge/u);
+  });
+
+  it("ends a deps-prs binding when the playbook disappears rather than falling back to a merge-capable one", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: [] }));
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "acme/web#9", kind: "pr", ended: false })]));
+
+    delete t.files[playbookPath("deps-prs")];
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "acme/web#9", kind: "pr", ended: true })]));
+  });
+
+  it("checks the deps SLA, batch and autoAdopt, and says which repos the gh login cannot read", async () => {
+    const { t } = await watching();
+    const check = await t.harness.behavior.runCli(["check"], { projectId: "p1" });
+    expect(check.stdout).toMatch(/deps: sla critical=asap high=1d medium=7d low=30d; batch medium=7d low=30d; autoAdopt critical, high/u);
+    expect(check.stdout).toMatch(/deps-alerts: deps-alerts@/u);
+    expect(check.stdout).toMatch(/deps-prs: deps-prs@/u);
+    expect(check.stdout).toMatch(/deps: watching 1 repo for alerts: acme\/web/u);
   });
 });

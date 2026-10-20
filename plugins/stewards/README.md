@@ -40,6 +40,21 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   same; the developer's own rights are broad, so that is a convention, not a
   wall. Until kubectl can read a target, its binding waits and `bb stewards
   check` says "cannot read the target". DESIGN.md §18.
+- **Dependency stewards.** GitHub scans; the stewards turn Dependabot alerts
+  into tickets. Every repo in `repos.json` not in `github.exclude` (or the
+  explicit `{ kind: "dependabot", repo }` targets in `ops.targets`) gets an
+  `ops` binding that runs `deps-alerts` and is woken by the
+  `dependabot_alert` doorbell; the github plugin reads the alerts with the
+  developer's token and leases each repo as a `dependabot_repo` (a `repo`
+  lease does not receive alert doorbells). Severity sets the Linear priority
+  and a due date from `deps.sla`; critical and high get their own ticket,
+  medium and low coalesce into one open ticket per repo per ecosystem, and a
+  new alert joins or tightens it. A fixed or dismissed alert trims or closes
+  its ticket, and the nightly pass re-lists open alerts as the backstop. A
+  `dependabot[bot]` version-update pull request is adopted under `deps-prs`,
+  reviewed, and escalated for a human merge; it is never merged. Reading
+  alerts needs the token's alert access; a server whose login cannot read
+  them skips the targets, and `bb stewards check` says which. DESIGN.md §19.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
@@ -198,6 +213,8 @@ stewards/
     github-prs.md
     github-reviews.md
     ops-watch.md        no phases; ## New, ## Recurring and ## Returned sections
+    deps-alerts.md      the Dependabot alert side: file, batch, tighten, close
+    deps-prs.md         adopts dependabot[bot] pull requests; escalates, never merges
 ```
 
 `bb stewards init` writes starting points ([templates.ts](templates.ts));
@@ -212,7 +229,16 @@ first of `linear.teams` by default, and it must be one of them) and
 `context` (the kubeconfig context kubectl uses; the machine's current one
 when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
 tickets the ops steward labels for a steward itself when it files them).
-`ops-watch.md` is read only when `ops.targets` lists something.
+`ops-watch.md` is read only when `ops.targets` lists a k8s namespace.
+
+The `deps` object is the dependency watch: `sla` (a duration or `asap` per
+severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
+window a medium or low alert may wait for company), and `autoAdopt` (the
+severities whose tickets are labelled and moved to Todo when filed).
+`deps-alerts.md` and `deps-prs.md` are optional: a project that has not
+written them runs no dependency watch. `bb stewards init` writes them, and
+`bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`
+and reports each repo whose alerts the `gh` login cannot read.
 
 Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` for `ops`), `phases` (state → `{ stage,

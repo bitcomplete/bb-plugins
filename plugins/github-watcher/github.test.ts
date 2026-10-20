@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { parseDependabotAlerts, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -260,5 +260,51 @@ describe("repositories", () => {
     });
     expect(parseOpenPulls(page(false))!.next).toBeNull();
     expect(parseOpenPulls({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] })).toBeNull();
+  });
+});
+
+describe("Dependabot alerts", () => {
+  const node = (over: Record<string, unknown> = {}) => ({
+    number: 4,
+    state: "open",
+    dependency: { package: { ecosystem: "npm", name: "lodash" }, manifest_path: "package-lock.json" },
+    security_advisory: { ghsa_id: "GHSA-xxxx-yyyy-zzzz", severity: "high", summary: "Prototype pollution" },
+    security_vulnerability: { severity: "high", first_patched_version: { identifier: "4.17.21" } },
+    html_url: "https://github.com/Acme/Widgets/security/dependabot/4",
+    url: "https://api.github.com/repos/Acme/Widgets/dependabot/alerts/4",
+    created_at: "2026-10-01T00:00:00Z",
+    updated_at: "2026-10-02T00:00:00Z",
+    ...over,
+  });
+
+  it("reads a page as the shared contract wants it, with the alert's own number", () => {
+    expect(parseDependabotAlerts([node()], "Acme/Widgets")).toEqual([
+      {
+        id: "Acme/Widgets#4",
+        repo: "Acme/Widgets",
+        number: 4,
+        severity: "high",
+        package: "lodash",
+        ecosystem: "npm",
+        manifestPath: "package-lock.json",
+        state: "open",
+        ghsaId: "GHSA-xxxx-yyyy-zzzz",
+        fixedVersion: "4.17.21",
+        summary: "Prototype pollution",
+        url: "https://github.com/Acme/Widgets/security/dependabot/4",
+        createdAt: "2026-10-01T00:00:00Z",
+        updatedAt: "2026-10-02T00:00:00Z",
+      },
+    ]);
+  });
+
+  it("falls back to the vulnerability's severity, and to low for anything unexpected, and tolerates a bare alert", () => {
+    const bare = parseDependabotAlerts([node({ dependency: null, security_advisory: null, security_vulnerability: { severity: "medium", first_patched_version: null } })], "Acme/Widgets")[0]!;
+    expect(bare).toMatchObject({ severity: "medium", package: "(unknown)", ecosystem: "unknown", ghsaId: null, fixedVersion: null });
+    expect(parseDependabotAlerts([node({ security_advisory: { severity: "banana" } })], "Acme/Widgets")[0]!.severity).toBe("low");
+  });
+
+  it("throws on anything that is not an alert list", () => {
+    expect(() => parseDependabotAlerts({ message: "Not Found" }, "Acme/Widgets")).toThrow(/Dependabot alert list/u);
   });
 });

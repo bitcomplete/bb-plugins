@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isTerminal, opsTeam, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
+import { depsTargets, isTerminal, k8sTargets, opsTeam, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
+import { DEPS_ALERTS, DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
   it("parses the template with defaults filled in", () => {
@@ -27,6 +27,25 @@ describe("the project file", () => {
     if (!repo.ok) expect(repo.error).toMatch(/github\.exclude\.0: a repo such as acme\/web/u);
     else expect.fail("a URL is not owner/repo");
   });
+
+  it("fills the dependency watch's SLA, batch and autoAdopt defaults, and takes explicit values", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.deps).toEqual({ sla: { critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }, batch: { medium: 7 * 86_400_000, low: 30 * 86_400_000 }, autoAdopt: ["critical", "high"] });
+
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, deps: { sla: { high: "2d" }, batch: { medium: "3d" }, autoAdopt: ["critical"] } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.deps.sla).toEqual({ critical: "asap", high: 2 * 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 });
+    expect(explicit.value.deps.batch).toEqual({ medium: 3 * 86_400_000, low: 30 * 86_400_000 });
+    expect(explicit.value.deps.autoAdopt).toEqual(["critical"]);
+
+    const badSeverity = parseProjectFile(JSON.stringify({ version: 1, deps: { autoAdopt: ["catastrophic"] } }));
+    expect(badSeverity).toMatchObject({ ok: false });
+    if (!badSeverity.ok) expect(badSeverity.error).toMatch(/deps\.autoAdopt\.0/u);
+    const badDuration = parseProjectFile(JSON.stringify({ version: 1, deps: { sla: { high: "soon" } } }));
+    expect(badDuration).toMatchObject({ ok: false });
+    if (!badDuration.ok) expect(badDuration.error).toMatch(/deps\.sla\.high/u);
+  });
 });
 
 describe("ops in the project file", () => {
@@ -49,6 +68,20 @@ describe("ops in the project file", () => {
     const r = file({ targets: [{ kind: "k8s-namespace", name: "prod" }] });
     expect(r.ok && opsTeam(r.value)).toBe("ENG");
     expect(r.ok && r.value.ops.autoAdopt).toEqual([]);
+  });
+
+  it("takes a dependabot target, and derives deps targets from the repo set when none is listed", () => {
+    const r = file({ targets: [{ kind: "dependabot", repo: "acme/web" }] });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.ops.targets).toEqual([{ kind: "dependabot", repo: "acme/web" }]);
+    expect(depsTargets(r.value, ["acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }]);
+    expect(k8sTargets(r.value)).toEqual([]);
+    // No explicit dependabot target: every repo in the set.
+    const d = file({ targets: [{ kind: "k8s-namespace", name: "prod" }] });
+    if (!d.ok) throw new Error(d.error);
+    expect(depsTargets(d.value, ["acme/web", "acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }, { kind: "dependabot", repo: "acme/other" }]);
+    expect(k8sTargets(d.value)).toEqual([{ kind: "k8s-namespace", name: "prod" }]);
+    expect(error({ targets: [{ kind: "dependabot", repo: "not a repo" }] })).toMatch(/ops\.targets\.0\.repo/u);
   });
 
   it("refuses what would watch nothing or file where nobody stewards", () => {
@@ -147,12 +180,37 @@ describe("the ops playbook", () => {
     const phased = OPS_WATCH.replace("may:", "phases:\n  open: {}\nmay:");
     expect(parsePlaybook(phased, "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook has no phases/u) });
     expect(parsePlaybook(OPS_WATCH.replace("may:", "terminal: [Done]\nmay:"), "ops-watch")).toMatchObject({ ok: false });
-    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook reads k8s/u) });
+    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook watches k8s or github/u) });
     expect(parsePlaybook(GITHUB_PRS.replace("terminal: [merged, closed]\n", ""), "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/terminal: name at least one state/u) });
     // A ticket, pr or review playbook still needs its phases, as before ops.
     const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");
     expect(noPhases).not.toMatch(/phases:/u);
     expect(parsePlaybook(noPhases, "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/phases: map the entity's states to stages/u) });
+  });
+});
+
+describe("the dependency playbooks", () => {
+  it("parses deps-alerts as an ops playbook and deps-prs as a pr playbook", () => {
+    const alerts = parsePlaybook(DEPS_ALERTS, "deps-alerts");
+    if (!alerts.ok) throw new Error(alerts.error);
+    expect(alerts.value).toMatchObject({ kind: "ops", source: "github", phases: {}, terminal: [], ready: null });
+    expect(phaseInstructions(alerts.value, "new")).toMatch(/File one ticket per problem/u);
+    expect(phaseInstructions(alerts.value, "recurring")).toMatch(/File nothing new/u);
+    expect(alerts.value.general).toMatch(/Fingerprint: `<repo>#<alert number>`/u);
+    expect(alerts.value.general).toMatch(/batch plan/u);
+
+    const prs = parsePlaybook(DEPS_PRS, "deps-prs");
+    if (!prs.ok) throw new Error(prs.error);
+    expect(prs.value).toMatchObject({ kind: "pr", source: "github", terminal: ["merged", "closed"] });
+    expect(prs.value.general).toMatch(/never merge/u);
+    expect(prs.value.general).toMatch(/patch or minor bump whose checks are green is escalated for a\s+human merge/u);
+    expect(prs.value.general).toMatch(/major bump/u);
+    expect(prs.value.general).toMatch(/owner-reviewed/u);
+    expect(prs.value.skipAuthors).toEqual(expect.arrayContaining(["dependabot[bot]"]));
+  });
+
+  it("keeps the deps playbooks in the init templates", () => {
+    expect(projectFileTemplate(["ENG"])).toContain('"deps"');
   });
 });
 

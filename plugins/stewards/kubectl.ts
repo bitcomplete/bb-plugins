@@ -9,7 +9,7 @@
 // broad, so this and the playbook's `may` list are what keep the ops steward
 // read-only (DESIGN.md §11, §18). A real wall, such as a read-only identity,
 // would slot in behind the same function.
-import { deploymentsOf, eventsOf, findingsOf, logTail, otherWarnings, podsOf, type OpsTarget, type RawLook } from "./ops.js";
+import { deploymentsOf, eventsOf, findingsOf, logTail, otherWarnings, podsOf, type K8sTarget, type RawLook } from "./ops.js";
 
 /** What the ops kind may ask kubectl to do. Nothing else is run. */
 export const KUBECTL_VERBS = ["get", "describe", "logs", "auth can-i"] as const;
@@ -50,8 +50,8 @@ export type OpsAccess = {
 
 export interface OpsReader {
   /** One look at a target. Throws when its pods cannot be listed: then there is nothing to look at. */
-  look(target: OpsTarget, at: { now: number; since: number }): Promise<RawLook>;
-  access(target: OpsTarget): Promise<OpsAccess>;
+  look(target: K8sTarget, at: { now: number; since: number }): Promise<RawLook>;
+  access(target: K8sTarget): Promise<OpsAccess>;
 }
 
 const REQUEST_TIMEOUT = "--request-timeout=20s";

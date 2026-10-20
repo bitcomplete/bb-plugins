@@ -405,10 +405,10 @@ describe("tools", () => {
     expect(linear.calls.at(-1)!.body!.variables).toEqual({ id: "uuid-1", input: { stateId: "s-done", assigneeId: "u1" } });
 
     // Handing it back: unassign, relabel, reprioritize. Labels are the issue's current set, minus removed, plus added.
-    expect(text(await tool("linear_update_issue", { key: "ENG-123", assignee: "Nobody", removeLabels: ["BUILD-READY"], addLabels: ["agent", "workspace"], priority: "high" }))).toBe(
-      "ENG-123: unassigned; labels bug, agent, ws; priority high.",
+    expect(text(await tool("linear_update_issue", { key: "ENG-123", assignee: "Nobody", removeLabels: ["BUILD-READY"], addLabels: ["agent", "workspace"], priority: "high", dueDate: "2026-10-20" }))).toBe(
+      "ENG-123: unassigned; labels bug, agent, ws; priority high; due 2026-10-20.",
     );
-    expect(lastInput).toEqual({ assigneeId: null, labelIds: ["l-bug", "l-agent", "l-ws"], priority: 2 });
+    expect(lastInput).toEqual({ assigneeId: null, labelIds: ["l-bug", "l-agent", "l-ws"], priority: 2, dueDate: "2026-10-20" });
 
     // A person by email.
     expect(text(await tool("linear_update_issue", { key: "ENG-123", assignee: "bob@acme.test" }))).toBe("ENG-123: assigned to Bob.");
@@ -450,11 +450,11 @@ describe("tools", () => {
       },
     });
 
-    const out = text(await tool("linear_create_issue", { team: "eng", title: "Add retries", description: "Calls fail once in a while.", state: "todo", labels: ["bug", "infra"], assignee: "me", priority: "high", parent: "ENG-123" }));
+    const out = text(await tool("linear_create_issue", { team: "eng", title: "Add retries", description: "Calls fail once in a while.", state: "todo", labels: ["bug", "infra"], assignee: "me", priority: "high", dueDate: "2026-11-01", parent: "ENG-123" }));
     expect(out).toBe("Filed ENG-124: Add retries\nhttps://linear.app/acme/issue/ENG-124");
     const mutation = linear.calls.find((c) => c.body?.query.startsWith("mutation($input: IssueCreateInput!)"))!;
     const input = mutation.body!.variables!.input as Record<string, unknown>;
-    expect(input).toMatchObject({ teamId: "t-eng", title: "Add retries", stateId: "s-todo", labelIds: ["l-bug", "l-infra"], assigneeId: "u1", priority: 2, parentId: "uuid-1" });
+    expect(input).toMatchObject({ teamId: "t-eng", title: "Add retries", stateId: "s-todo", labelIds: ["l-bug", "l-infra"], assigneeId: "u1", priority: 2, dueDate: "2026-11-01", parentId: "uuid-1" });
     expect(input.description).toMatch(/^Calls fail once in a while\.\n\n_— from bb thread .+_$/u);
 
     // Without a description the signature is the description.

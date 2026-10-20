@@ -10,6 +10,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
+import { depsLookSchema, type DepsLook } from "./deps.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
@@ -155,6 +156,13 @@ export const MIGRATIONS = [
      last_commented_at INTEGER,
      PRIMARY KEY (project_id, fingerprint)
    )`,
+  // A Dependabot alert binding's last look at its repository: the open alerts,
+  // classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN deps_look TEXT`,
+  // A dependency fingerprint's severity and ecosystem, so a new medium or low
+  // alert can be batched against the open ticket for its repo and ecosystem.
+  `ALTER TABLE ops_fingerprints ADD COLUMN severity TEXT`,
+  `ALTER TABLE ops_fingerprints ADD COLUMN ecosystem TEXT`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -264,6 +272,8 @@ export type Binding = {
   manualDetach: boolean;
   /** An ops binding's last look; null for every other kind. */
   opsLook: OpsLook | null;
+  /** A Dependabot alert binding's last look; null for every other kind. */
+  depsLook: DepsLook | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -315,6 +325,7 @@ function rowToBinding(r: BindingRow): Binding {
     followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
+    depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -356,6 +367,7 @@ const COLUMNS = {
   followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
   opsLook: "ops_look",
+  depsLook: "deps_look",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -443,7 +455,7 @@ export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
 
 /** One problem an ops steward has seen, and the ticket it is tracked under. */
-export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null };
+export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null; severity: string | null; ecosystem: string | null };
 
 /** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
 export type TicketAction = "filed" | "commented" | "reopened";
@@ -505,8 +517,9 @@ export function createStore(db: Database.Database, now: () => number) {
   const getFingerprint = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE project_id = ? AND fingerprint = ?");
   const fingerprintsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE binding_id = ? ORDER BY first_seen_at");
   const sight = db.prepare(
-    `INSERT INTO ops_fingerprints (project_id, fingerprint, binding_id, summary, first_seen_at, last_seen_at) VALUES (@project_id, @fingerprint, @binding_id, @summary, @at, @at)
-     ON CONFLICT (project_id, fingerprint) DO UPDATE SET binding_id = @binding_id, summary = @summary, last_seen_at = @at, seen_count = seen_count + 1`,
+    `INSERT INTO ops_fingerprints (project_id, fingerprint, binding_id, summary, severity, ecosystem, first_seen_at, last_seen_at) VALUES (@project_id, @fingerprint, @binding_id, @summary, @severity, @ecosystem, @at, @at)
+     ON CONFLICT (project_id, fingerprint) DO UPDATE SET binding_id = @binding_id, summary = @summary, last_seen_at = @at, seen_count = seen_count + 1,
+       severity = COALESCE(@severity, severity), ecosystem = COALESCE(@ecosystem, ecosystem)`,
   );
   const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
   const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
@@ -590,6 +603,8 @@ export function createStore(db: Database.Database, now: () => number) {
     seenCount: Number(r.seen_count),
     filedAt: r.filed_at === null ? null : Number(r.filed_at),
     lastCommentedAt: r.last_commented_at === null ? null : Number(r.last_commented_at),
+    severity: r.severity === null || r.severity === undefined ? null : String(r.severity),
+    ecosystem: r.ecosystem === null || r.ecosystem === undefined ? null : String(r.ecosystem),
   });
   const toProject = (r: Record<string, unknown>): ProjectStewardRow => ({
     projectId: String(r.project_id),
@@ -872,12 +887,12 @@ export function createStore(db: Database.Database, now: () => number) {
       return fingerprintsFor.all(bindingId).map(toFingerprint);
     },
     /** Record that a look saw these problems: new ones enter the map with no ticket, known ones count another sighting. */
-    sight(projectId: string, bindingId: string, seen: Array<{ fingerprint: string; summary: string }>): Map<string, Fingerprint> {
+    sight(projectId: string, bindingId: string, seen: Array<{ fingerprint: string; summary: string; severity?: string | null; ecosystem?: string | null }>): Map<string, Fingerprint> {
       return db.transaction(() => {
         const at = now();
         const out = new Map<string, Fingerprint>();
         for (const s of seen) {
-          sight.run({ project_id: projectId, fingerprint: s.fingerprint, binding_id: bindingId, summary: s.summary, at });
+          sight.run({ project_id: projectId, fingerprint: s.fingerprint, binding_id: bindingId, summary: s.summary, severity: s.severity ?? null, ecosystem: s.ecosystem ?? null, at });
           out.set(s.fingerprint, toFingerprint(getFingerprint.get(projectId, s.fingerprint)!));
         }
         return out;
