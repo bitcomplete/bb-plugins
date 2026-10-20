@@ -21,7 +21,7 @@ import {
   revokeToken,
   type PendingConnect,
 } from "./connect.js";
-import { createIncusClient, type IncusClient, type IncusConfig } from "./incus.js";
+import { createIncusClient, type IncusClient, type IncusConfig, type Instance, type ProjectState } from "./incus.js";
 import {
   LOGOUT_COMMAND,
   parseTailscaleStatus,
@@ -60,6 +60,215 @@ const machineSummarySchema = z.object({
   status: z.string(),
 });
 
+// The devbox profile caps a machine at four cores unless it says otherwise.
+const DEFAULT_CORES = 4;
+const USAGE_TIMEOUT_MS = 10_000;
+
+const projectResourceSchema = z.object({ limit: z.number(), usage: z.number() });
+
+const usageRowSchema = z.object({
+  name: z.string(),
+  bb: z.boolean(),
+  status: z.string(),
+  // null until a second sample exists, or after a restart/counter reset.
+  cpuPercent: z.number().nullable(),
+  cores: z.number(),
+  memoryUsed: z.number().nullable(),
+  memoryTotal: z.number().nullable(),
+  // "state" when Incus reported it, "limit" when limits.memory stood in.
+  memoryTotalSource: z.enum(["state", "limit"]).nullable(),
+  diskUsed: z.number().nullable(),
+  diskTotal: z.number().nullable(),
+  networkIn: z.number(),
+  networkOut: z.number(),
+  uptimeSeconds: z.number().nullable(),
+  processes: z.number().nullable(),
+});
+export type UsageRow = z.infer<typeof usageRowSchema>;
+
+const usageTotalsSchema = z.object({
+  cpu: projectResourceSchema.nullable(),
+  memory: projectResourceSchema.nullable(),
+  disk: projectResourceSchema.nullable(),
+  instances: projectResourceSchema.nullable(),
+});
+export type UsageTotals = z.infer<typeof usageTotalsSchema>;
+
+export interface UsageResult {
+  connected: boolean;
+  project: string | null;
+  instances: UsageRow[];
+  totals: UsageTotals | null;
+}
+
+export interface CpuSample {
+  usage: number;
+  at: number;
+}
+
+// limits.cpu is a count ("4"), a cpuset ("0-3") or a list ("0,2,3").
+export function parseCores(value: string | undefined): number {
+  const text = value?.trim() ?? "";
+  if (/^\d+$/u.test(text)) {
+    const count = Number(text);
+    return count > 0 ? count : DEFAULT_CORES;
+  }
+  let count = 0;
+  for (const part of text.split(",")) {
+    const range = /^(\d+)-(\d+)$/u.exec(part.trim());
+    if (range !== null) {
+      const from = Number(range[1]);
+      const to = Number(range[2]);
+      if (to >= from) count += to - from + 1;
+    } else if (/^\d+$/u.test(part.trim())) {
+      count += 1;
+    }
+  }
+  return count > 0 ? count : DEFAULT_CORES;
+}
+
+const MEMORY_UNITS: Record<string, number> = {
+  B: 1,
+  KB: 1000,
+  MB: 1000 ** 2,
+  GB: 1000 ** 3,
+  TB: 1000 ** 4,
+  KIB: 1024,
+  MIB: 1024 ** 2,
+  GIB: 1024 ** 3,
+  TIB: 1024 ** 4,
+};
+
+// Parses the byte quantities Incus accepts for limits.memory ("16GiB", "512MB",
+// or a plain byte count). Returns null for anything else.
+export function parseMemoryBytes(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const match = /^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$/u.exec(value.trim());
+  if (match === null) return null;
+  const amount = Number(match[1]);
+  const unit = (match[2] ?? "B").toUpperCase();
+  const factor = MEMORY_UNITS[unit];
+  if (!Number.isFinite(amount) || amount <= 0 || factor === undefined) return null;
+  return Math.round(amount * factor);
+}
+
+// Incus can report the host's memory in state.memory.total when the instance
+// limit is a soft cap (the profile sets limits.memory: 16GiB). When the
+// reported total exceeds the configured limit, the limit is the truth.
+export function chooseMemoryTotal(
+  stateTotal: number | null,
+  limitBytes: number | null,
+): { total: number | null; source: "state" | "limit" | null } {
+  if (limitBytes !== null && (stateTotal === null || stateTotal > limitBytes)) return { total: limitBytes, source: "limit" };
+  if (stateTotal !== null) return { total: stateTotal, source: "state" };
+  return { total: null, source: null };
+}
+
+function toResource(resource: { limit?: number; usage?: number } | undefined): z.infer<typeof projectResourceSchema> | null {
+  if (resource === undefined || typeof resource.limit !== "number" || typeof resource.usage !== "number") return null;
+  return { limit: resource.limit, usage: resource.usage };
+}
+
+// Turns the project state into the four rows the page shows, labelled
+// "allocated": Incus sums the instances' configured limits here, not live use.
+export function projectTotals(state: ProjectState) {
+  return {
+    cpu: toResource(state.cpu),
+    memory: toResource(state.memory),
+    disk: toResource(state.disk),
+    instances: toResource(state.instances),
+  };
+}
+
+// Derives one row per instance from a state listing. CPU percent is the CPU
+// time used between the previous sample and this one, over wall-clock time and
+// the instance's core count; it is null on the first sample and when the
+// counter goes backwards (a restart). Stopped instances contribute disk only.
+// `samples` is the in-memory previous sample per instance and is updated here.
+export function deriveUsage(
+  instances: Instance[],
+  bbNames: ReadonlySet<string>,
+  samples: Map<string, CpuSample>,
+  now: number,
+): UsageRow[] {
+  const rows: UsageRow[] = [];
+  for (const instance of instances) {
+    const state = instance.state;
+    const status = state?.status ?? instance.status;
+    const running = status === "Running";
+    const cores = parseCores(instance.config["limits.cpu"]);
+    const disk = state?.disk?.root;
+    let cpuPercent: number | null = null;
+    let memoryUsed: number | null = null;
+    let memoryTotal: number | null = null;
+    let memoryTotalSource: "state" | "limit" | null = null;
+    let networkIn = 0;
+    let networkOut = 0;
+    let uptimeSeconds: number | null = null;
+    let processes: number | null = null;
+
+    if (running) {
+      const usage = state?.cpu?.usage;
+      if (typeof usage === "number" && Number.isFinite(usage)) {
+        const previous = samples.get(instance.name);
+        if (previous !== undefined && usage >= previous.usage && now > previous.at) {
+          const cpuSeconds = (usage - previous.usage) / 1e9;
+          const wallSeconds = (now - previous.at) / 1000;
+          // Capped at 100% of the allocated cores; a lower clamp guards a
+          // counter that advanced while wall time did not.
+          cpuPercent = Math.max(0, Math.min(100, (cpuSeconds / wallSeconds / cores) * 100));
+        }
+        samples.set(instance.name, { usage, at: now });
+      } else {
+        samples.delete(instance.name);
+      }
+
+      const memory = state?.memory;
+      const stateTotal = typeof memory?.total === "number" && Number.isFinite(memory.total) ? memory.total : null;
+      const chosen = chooseMemoryTotal(stateTotal, parseMemoryBytes(instance.config["limits.memory"]));
+      memoryTotal = chosen.total;
+      memoryTotalSource = chosen.source;
+      memoryUsed = typeof memory?.usage === "number" && Number.isFinite(memory.usage) ? memory.usage : null;
+
+      for (const iface of Object.values(state?.network ?? {})) {
+        if (typeof iface?.counters?.bytes_received === "number") networkIn += iface.counters.bytes_received;
+        if (typeof iface?.counters?.bytes_sent === "number") networkOut += iface.counters.bytes_sent;
+      }
+      if (typeof state?.processes === "number") processes = state.processes;
+      if (typeof state?.started_at === "string") {
+        const started = Date.parse(state.started_at);
+        if (Number.isFinite(started) && started <= now) uptimeSeconds = Math.round((now - started) / 1000);
+      }
+    } else {
+      samples.delete(instance.name);
+    }
+
+    rows.push({
+      name: instance.name,
+      bb: instance.config[KEY_CONFIG] !== undefined || bbNames.has(instance.name),
+      status,
+      cpuPercent,
+      cores,
+      memoryUsed,
+      memoryTotal,
+      memoryTotalSource,
+      diskUsed: typeof disk?.usage === "number" ? disk.usage : null,
+      diskTotal: typeof disk?.total === "number" ? disk.total : null,
+      networkIn,
+      networkOut,
+      uptimeSeconds,
+      processes,
+    });
+  }
+  // Drop samples for instances that left the listing, so the map does not
+  // grow by one name per instance ever seen.
+  const present = new Set(instances.map((instance) => instance.name));
+  for (const name of samples.keys()) {
+    if (!present.has(name)) samples.delete(name);
+  }
+  return rows;
+}
+
 export const rpcContract = defineRpcContract({
   status: {
     input: z.null(),
@@ -85,6 +294,17 @@ export const rpcContract = defineRpcContract({
   disconnect: {
     input: z.null(),
     output: z.object({ ok: z.boolean() }),
+  },
+  // Live usage for every instance in the project, plus the project's
+  // allocated caps. Read-only; the page polls it while open.
+  usage: {
+    input: z.null(),
+    output: z.object({
+      connected: z.boolean(),
+      project: z.string().nullable(),
+      instances: z.array(usageRowSchema),
+      totals: usageTotalsSchema.nullable(),
+    }),
   },
 });
 
@@ -224,6 +444,10 @@ export function createDevboxProviderPlugin(deps: DevboxProviderDeps): (bb: BbPlu
   return async (bb) => {
     const settings = bb.settings.define(SETTING_DESCRIPTORS);
 
+    // Previous CPU counter per instance, for the delta between polls. In
+    // memory only: a restart resets it, which just costs one sample.
+    const cpuSamples = new Map<string, CpuSample>();
+
     // ---- the connection ---------------------------------------------------
 
     const pendingKey = (state: string) => `connect/pending/${state}`;
@@ -338,8 +562,36 @@ export function createDevboxProviderPlugin(deps: DevboxProviderDeps): (bb: BbPlu
         }
         await settings.experimental_set({ token: null });
         await bb.storage.kv.delete(CONNECTION_KEY);
+        cpuSamples.clear();
         bb.realtime.publish(CONNECTION_CHANGED, { connected: false });
         return { ok: true };
+      },
+      async usage() {
+        const cfg = await settings.get();
+        if ((cfg.token?.trim() ?? "") === "") {
+          return { connected: false, project: null, instances: [], totals: null };
+        }
+        const signal = AbortSignal.timeout(USAGE_TIMEOUT_MS);
+        const { incus, project } = await connection(signal);
+        const [instances, projectState, hosts] = await Promise.all([
+          incus.listInstancesWithState(signal),
+          // A project-state problem (an endpoint the restricted cert cannot
+          // read, a shape change) must not take the per-machine cards down.
+          incus.getProjectState(signal).catch((error: unknown) => {
+            bb.log.warn(`could not read devbox project state: ${errorMessage(error)}`);
+            return null;
+          }),
+          bb.sdk.hosts.list(),
+        ]);
+        const bbNames = new Set(
+          hosts.filter((host) => host.machineProviderId === PROVIDER_ID).map((host) => host.name),
+        );
+        return {
+          connected: true,
+          project,
+          instances: deriveUsage(instances, bbNames, cpuSamples, deps.now()),
+          totals: projectState === null ? null : projectTotals(projectState),
+        };
       },
     });
 

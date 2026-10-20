@@ -42,6 +42,26 @@ bb (this plugin) ──Bearer──▶ devbox-gate :8081 (in-cluster) ──your
 
 Machines persist (`ephemeral: false`); nothing suspends them on its own.
 
+## Usage dashboard
+
+**Devbox machines** in the sidebar shows live usage for every instance in
+the connected project, including ones created outside bb (CLI-created
+instances are marked as such by their absence of a bb badge). Each card has
+CPU (with a sparkline), memory, disk, network in/out and uptime, and the
+page marks machines bb manages. The page reads Incus through the same
+connection token the rest of the plugin uses; it polls about every 5 seconds
+while open and stops when you leave it. Project totals are labelled
+**Allocated** because Incus reports the sum of the instances' configured
+limits there, not live usage. Nothing is stored on the server: the
+sparklines are an in-memory ring buffer that starts empty each visit.
+
+CPU percent needs two samples, so the first poll after the server restarts
+(or after an instance restarts) shows no percentage until the next one. A
+stopped instance reports disk only. The memory total falls back to the
+instance's `limits.memory` when Incus reports host memory; an instance with
+no `limits.memory` set has nothing to fall back to and reports whatever
+Incus returns.
+
 ## Settings
 
 | Setting | Default | Meaning |
