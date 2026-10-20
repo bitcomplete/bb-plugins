@@ -22,6 +22,11 @@ updates:
     groups:
       npm:
         patterns: ["*"]
+    # The plugins run against the SDK bundled in bb-server's bb (BB_REF in
+    # bb-gate's docker/bb-server/Dockerfile), not their own copy, so the SDK
+    # moves by hand with BB_REF; a newer one typechecks APIs servers lack.
+    ignore:
+      - dependency-name: "@get-bb/plugin-sdk"
 
   - package-ecosystem: github-actions
     directory: "/"
