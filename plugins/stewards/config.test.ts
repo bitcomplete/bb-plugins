@@ -88,6 +88,17 @@ describe("playbooks", () => {
     expect(phaseInstructions(reviews.value, "open")).toMatch(/escalated as a `decision`/u);
   });
 
+  it("tells the PR playbooks that an approval survives small follow-ups and when a human must approve", () => {
+    const prs = parsePlaybook(GITHUB_PRS, "github-prs");
+    if (!prs.ok) throw new Error(prs.error);
+    expect(phaseInstructions(prs.value, "open")).toMatch(/small follow-up push after an approval/u);
+    expect(phaseInstructions(prs.value, "open")).toMatch(/needs the owner's approval/u);
+    const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!reviews.ok) throw new Error(reviews.error);
+    expect(reviews.value.general).toMatch(/short check of the new commits/u);
+    expect(reviews.value.general).toMatch(/then a human approves/u);
+  });
+
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
     const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!parsed.ok) throw new Error(parsed.error);

@@ -831,7 +831,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 | kind | filed by | link | done when | one-click action |
 | -- | -- | -- | -- | -- |
 | `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me` | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
-| `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's marker on the head is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
+| `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the question record's text box) |
 | `provide-secret` | steward, with the variable name and purpose | the worker thread | the worker's `bb secret request` completes | **Provide**: opens the worker thread named in the item, or wakes the steward to start the worker that will request it |
@@ -840,7 +840,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 The rules that hold:
 
 - **One gate function.** `prGate` in `reconcile.ts` is the build-tickets lane
-  gate: the reviewer's latest marker names the current head with `approved`,
+  gate: the reviewer's latest marker has verdict `approved`,
   every check has passed, and, in the owner-reviewed lane, the owner has
   approved — an unsigned approving comment or an APPROVED review by the
   connected user; a signed comment is a thread's, never the owner's. The merge

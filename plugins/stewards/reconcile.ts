@@ -272,10 +272,14 @@ export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: 
 
 /**
  * The lane gate from the build-tickets skill, in one place: the reviewer's
- * latest marker names the current head with verdict `approved`, every check has
- * passed, and, in the owner-reviewed lane, the owner has approved. It is used
- * by the merge button, by the item the plugin files, and by the wake text that
- * tells a steward whether a pull request's gate is met.
+ * latest marker has verdict `approved`, every check has passed, and, in the
+ * owner-reviewed lane, the owner has approved. The marker need not name the
+ * current head: an approval is of the pull request, not of a commit, so it
+ * survives a rebase, a merge of the base branch and the worker's own small
+ * follow-ups; only a later marker with another verdict, or checks failing on
+ * the current head, closes the gate. It is used by the merge button, by the
+ * item the plugin files, and by the wake text that tells a steward whether a
+ * pull request's gate is met.
  */
 export type PrGate = {
   headSha: string | null;
@@ -288,11 +292,9 @@ export type PrGate = {
   gateMet: boolean;
   /** What is missing, in words; null when the gate is met. */
   missing: string | null;
-  /** The plugin's `approve-pr` condition: owner lane, marker approved on the head, checks green, no owner approval yet. */
+  /** The plugin's `approve-pr` condition: owner lane, marker approved, checks green, no owner approval yet. */
   needsOwnerApproval: boolean;
 };
-
-const short = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
 
 export function prGate(entity: EntitySnapshot): PrGate {
   const pull = entity.pull;
@@ -302,8 +304,7 @@ export function prGate(entity: EntitySnapshot): PrGate {
   const checksState = pull?.checks?.state ?? null;
   const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
   const owner = ownerApproval(entity);
-  const markerOnHead = marker !== null && headSha !== null && marker.sha === headSha;
-  const markerApproved = markerOnHead && marker.verdict === "approved";
+  const markerApproved = marker !== null && marker.verdict === "approved";
   const ownerLane = lane === "owner-reviewed";
   const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || owner.approved);
   const missing = gateMet
@@ -312,15 +313,13 @@ export function prGate(entity: EntitySnapshot): PrGate {
       ? "not a pull request"
       : marker === null
         ? "no reviewer round yet"
-        : !markerOnHead
-          ? `reviewer round ${marker.round} is on ${short(marker.sha)}; the head is ${short(headSha)}`
-          : marker.verdict !== "approved"
-            ? `reviewer verdict: ${marker.verdict}`
-            : !checksGreen
-              ? `checks ${checksState ?? "not run"}`
-              : ownerLane && !owner.approved
-                ? "owner approval needed"
-                : "not met";
+        : marker.verdict !== "approved"
+          ? `reviewer verdict: ${marker.verdict}`
+          : !checksGreen
+            ? `checks ${checksState ?? "not run"}`
+            : ownerLane && !owner.approved
+              ? "owner approval needed"
+              : "not met";
   return {
     headSha,
     marker,

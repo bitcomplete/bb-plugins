@@ -83,6 +83,27 @@ Two tools are yours; everything else you do with the tools every thread has.
   approved by the project steward unless the playbook says the user. Once
   you report the checklist met, the plugin asks the approver itself (an
   `approval` escalation): wait for it, and do not escalate for it.
+- **An approval is of the pull request, not of a commit** (default; the
+  project's guidance overrides it). Once the owner or the reviewer approves,
+  a small follow-up push needs no fresh approval and no new full round:
+  addressing a non-blocking comment (including the change the approval asked
+  for, "LGTM once X"), wording, docs, tests, lint or type fixes, and
+  rebasing onto or merging the base branch. A fresh approval is needed when,
+  against the approved commit, a push changes behaviour beyond what was
+  approved, adds scope, or brings in something the project's guidance says
+  needs the approver; judge it from `git diff <approved-sha> <head>`
+  (`git range-diff` across a rebase) and ask when unsure. The merge comment
+  names the approved commit and, when newer commits landed after it, says in
+  a line what they changed. A review steward treats a small follow-up push
+  to a pull request it already approved as a short check of the new commits,
+  not a full round, and does not turn the approval into a new verdict.
+- **When a human must approve** (default; the project's guidance overrides
+  it). A change that significantly modifies or removes existing behaviour,
+  or is risky in kind — a cross-repo contract, auth, a migration, a secret,
+  production infrastructure, or one of the project's `bigDecisions` — is
+  approved by the user before it merges. Strictly additive changes and
+  tweaks are not, and that a change needs a deploy or restart is not, on its
+  own, a reason.
 - **Waiting on the user is a needs item.** A `blockedOn` that names the
   project steward or the user reaches nobody; with no open escalation it is
   flagged in `bb stewards list` and the digest. A `blockedOn` naming the

@@ -353,6 +353,24 @@ describe("the pull request gate (build-tickets)", () => {
     expect(gate).toMatchObject({ lane: "no-review", checksGreen: true, ownerApproved: false, gateMet: true, needsOwnerApproval: false, missing: null });
   });
 
+  it("honours an approved marker on an earlier sha, in both lanes, until a later verdict or failing checks", () => {
+    const earlier = "bbbbbbb2";
+    // Approved on A with the head at B: the no-review gate is met, and the owner lane waits only on the owner.
+    const met = prGate(pull({ comments: [marker(earlier, "approved", "no-review")] }, green));
+    expect(met).toMatchObject({ lane: "no-review", checksGreen: true, gateMet: true, needsOwnerApproval: false, missing: null });
+    expect(met.marker?.sha).toBe(earlier);
+    expect(met.headSha).toBe(head);
+    const waiting = prGate(pull({ comments: [marker(earlier, "approved", "owner-reviewed")] }, green));
+    expect(waiting).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    const approved = prGate(pull({ comments: [marker(earlier, "approved", "owner-reviewed"), owner("LGTM")] }, green));
+    expect(approved).toMatchObject({ gateMet: true, needsOwnerApproval: false });
+    // The latest marker wins: a later changes-requested on any sha blocks the gate.
+    const later = comment({ id: "m-later", author: "trotterdylan", body: "<!-- bb-review round=2 sha=ccccccc3 verdict=changes-requested lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
+    expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review"), later] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
+    // Checks failing on the head close it whatever the marker says.
+    expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review")] }, { checks: { state: "failure", failing: ["ci"] } })).missing).toMatch(/checks failure/u);
+  });
+
   it("waits on the owner in the owner-reviewed lane, and closes once they approve", () => {
     const waiting = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green));
     expect(waiting).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
@@ -360,8 +378,7 @@ describe("the pull request gate (build-tickets)", () => {
     expect(approved).toMatchObject({ gateMet: true, ownerApproved: true, needsOwnerApproval: false });
   });
 
-  it("is not met while the marker is on another sha, the verdict is not approved, or checks are not green", () => {
-    expect(prGate(pull({ comments: [marker("bbbbbbb2", "approved", "no-review")] }, green)).missing).toMatch(/reviewer round 1 is on bbbbbbb; the head is aaaaaaa/u);
+  it("is not met when the verdict is not approved, checks are not green, or there is no round", () => {
     expect(prGate(pull({ comments: [marker(head, "changes-requested", "no-review")] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
     expect(prGate(pull({ comments: [marker(head, "approved", "no-review")] }, { checks: { state: "pending", failing: [] } })).missing).toMatch(/checks pending/u);
     expect(prGate(pull({ comments: [] })).missing).toMatch(/no reviewer round/u);
