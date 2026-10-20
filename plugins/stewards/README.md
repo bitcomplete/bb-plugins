@@ -78,6 +78,20 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   once it holds more than **Compact a steward above this many context
   tokens** (120,000 by default; 0 leaves it to the provider), and before a
   wake that would push it over.
+- **The invariants reach turns that are not wakes too.** A plain message, a
+  `bb thread tell`, a child notice and the first turn after compaction are
+  not wakes the plugin composed. On every turn the SDK resolves a
+  per-thread system context, and the plugin injects the brief there: thread
+  id, the playbook's allowed actions, the ready gate, the exact worker
+  spawn command, the standing rules and "end with `steward_report`". It is
+  system context, not transcript, so compaction cannot lose it. Every wake
+  also names the durable commands: `bb stewards brief [<binding>]` prints
+  the whole brief, and `bb stewards spawn-flags [<binding>]` prints the
+  runnable `bb thread spawn …` command from `models.worker` and the project
+  environment. A worker whose provider, model, reasoning level or
+  environment provider differs from the playbook's is stopped in the
+  `thread.created` handler, and the steward's next wake says why and gives
+  the right command. DESIGN.md §6.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a

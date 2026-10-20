@@ -70,11 +70,18 @@ import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
 export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
+
+/**
+ * The per-turn system context the SDK injects is truncated at 4096 characters;
+ * build the brief to a little under that so its wrapper and the head and tail
+ * the clip keeps always fit.
+ */
+export const BRIEF_MAX_CHARS = 3800;
 
 /**
  * What thread-briefs is asked to leave alone, seeded into this plugin's
@@ -889,7 +896,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * then fails every spawn with "Local host daemon is not initialized".
      * A connected machine is preferred, then the default source. Null when the
      * project has no checkout bb knows of, and core's default is all there is.
+     *
+     * The last answer is cached for the synchronous per-turn brief, which
+     * cannot await this.
      */
+    const projectHostCache = new Map<string, string | null>();
     async function projectHost(projectId: string): Promise<string | null> {
       try {
         const [project, hosts] = await Promise.all([bb.sdk.projects.get({ projectId }), bb.sdk.hosts.list().catch(() => [])]);
@@ -900,9 +911,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           sources.find((source) => connected.has(source.hostId)) ??
           sources.find((source) => source.isDefault) ??
           sources[0];
+        projectHostCache.set(projectId, pick?.hostId ?? null);
         return pick?.hostId ?? null;
       } catch (error) {
         bb.log.warn(`stewards: could not find the machine for ${projectId} (${errorMessage(error)}); leaving it to bb's default`);
+        projectHostCache.set(projectId, null);
         return null;
       }
     }
@@ -2697,6 +2710,59 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // lifecycle owner rather than a tool of their own. A thread an older
     // steward made a child is still recognized by its parent.
 
+    /**
+     * The post-spawn safety net: a worker whose provider, model, reasoning
+     * level or environment provider differs from the playbook's worker model
+     * and the project's environment was started wrong — by a compacted
+     * steward, a hand-run command or an old wake. Stop it, note why on the
+     * binding with the command that would have been right, and wake the
+     * steward. A worker recognized by lifecycle owner or, for older stewards,
+     * by parent both come through here.
+     */
+    async function validateWorkerSpawn(thread: { id: string; providerId: string }, owner: Binding): Promise<void> {
+      const config = await loadConfig(owner.projectId);
+      const playbook = config === null ? null : bindingPlaybook(config, owner);
+      if (playbook === null || playbook.kind === "ops") return;
+      const expected = workerModel(owner, playbook);
+      if (expected === null) return;
+      const hostId = await projectHost(owner.projectId);
+      const expectedEnv = hostId === null ? null : MULTI_REPO_ENVIRONMENT_PROVIDER_ID;
+      // undefined means "could not read it": validate what is known, never
+      // stop a worker over a fact the plugin could not observe.
+      let actualModel: string | null = null;
+      let actualReasoning: string | null = null;
+      try {
+        const options = await bb.sdk.threads.defaultExecutionOptions({ threadId: thread.id });
+        actualModel = options?.model ?? null;
+        actualReasoning = options?.reasoningLevel ?? null;
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the model of worker ${thread.id} (${errorMessage(error)}); not validating it`);
+      }
+      let actualEnv: string | null | undefined;
+      try {
+        const info = (await bb.sdk.threads.get({ threadId: thread.id, include: "environment" })) as { environment?: { environmentProviderId?: string | null } | null };
+        // No environment attached yet is "unknown", not "none".
+        actualEnv = info.environment == null ? undefined : (info.environment.environmentProviderId ?? null);
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the environment of worker ${thread.id} (${errorMessage(error)}); not validating it`);
+      }
+      const problems: string[] = [];
+      if (thread.providerId !== expected.providerId) problems.push(`provider ${thread.providerId === "" ? "(none)" : thread.providerId} instead of ${expected.providerId}`);
+      if (actualModel !== null && expected.model !== null && actualModel !== expected.model) problems.push(`model ${actualModel} instead of ${expected.model}`);
+      if (actualReasoning !== null && expected.reasoningLevel !== null && actualReasoning !== expected.reasoningLevel) problems.push(`reasoning level ${actualReasoning} instead of ${expected.reasoningLevel}`);
+      if (actualEnv !== undefined && expectedEnv !== null && actualEnv !== expectedEnv) problems.push(`environment provider ${actualEnv ?? "(none)"} instead of ${expectedEnv}`);
+      if (problems.length === 0) return;
+      const flags = [environmentFlags(hostId), workerFlags(expected)].filter((f) => f !== "").join(" ");
+      store.setWorker(thread.id, "stopped", `Started with the wrong ${problems.join(", ")}; stopped.`);
+      await quietly(`stop mis-spawned worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
+      bb.log.warn(`stewards: stopped worker ${thread.id}: ${problems.join(", ")}`);
+      store.note(
+        owner.id,
+        `Worker ${thread.id} was started with the wrong ${problems.join(", ")} and was stopped. Start it again with:\n    ${spawnCommand({ projectId: owner.projectId, entityKey: owner.entityKey, workerFlags: flags })}`,
+      );
+      scheduleReconcile(owner.id);
+    }
+
     bb.events.on("thread.created", async ({ thread }) => {
       // Stewards this plugin spawned (a promoted child under its parent) are not workers.
       if (thread.originPluginId === bb.pluginId) return;
@@ -2705,7 +2771,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const limit = (await settings.get()).workerSpawnsPerHour;
       const runaway = store.spawnsSince(owner.id, now() - 3_600_000) >= limit;
       store.addWorker(thread.id, owner.id, thread.title ?? thread.titleFallback ?? thread.id);
-      if (!runaway) return;
+      if (!runaway) {
+        await validateWorkerSpawn(thread, owner);
+        return;
+      }
       // The runaway guard: not a budget, a stop for a looping steward.
       store.setWorker(thread.id, "stopped", null);
       await quietly(`stop runaway worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
@@ -3479,6 +3548,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           "Delegate code to workers (`bb thread spawn`, as each wake shows). Sign what you write on GitHub: with gh, end it with " +
           `${JSON.stringify(signatureLine(context.thread.id))}. The linear_ tools sign for you, so add no signature to what you pass them. Read the stewards skill for the protocol.`,
       };
+    });
+
+    /**
+     * The invariants on every turn, not only in a wake. The SDK's per-thread
+     * system context (`contributeInstructions`) is resolved at thread.start and
+     * turn.submit, so a steward whose transcript was compacted — or which a
+     * plain message, a `bb thread tell` or a child notice wakes — still gets
+     * its thread id, allowed actions, the spawn command, the standing rules
+     * and the pointer at `bb stewards brief`. The role's own instructions stay
+     * in `configure`; this carries the live binding state, which is why the
+     * brief is built here and not in the skill.
+     */
+    bb.agents.contributeInstructions(({ threadId }) => {
+      const project = store.projectByThread(threadId);
+      if (project !== null) {
+        return [
+          "Your context may have been compacted. You are the project steward; the record, not memory, is what you decide from.",
+          `Your thread id is ${threadId}. Read status with \`bb stewards list\` and \`bb stewards show <key>\`; steer with steward_update. End the nightly wake with the morning digest.`,
+        ].join("\n");
+      }
+      const b = store.byThread(threadId);
+      if (b === null || b.endedAt !== null) return null;
+      const config = configs.get(b.projectId)?.value ?? null;
+      const playbook = config === null ? null : bindingPlaybook(config, b);
+      if (playbook === null) {
+        return [
+          `Your context may have been compacted. Your thread id is ${threadId}, and you steward ${b.entityKey} (binding ${b.id}).`,
+          "The project's playbook could not be read; run `bb stewards brief` and `bb stewards check` before acting.",
+        ].join("\n");
+      }
+      const hostId = projectHostCache.get(b.projectId) ?? null;
+      const flags = [environmentFlags(hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
+      const gate = gateState(playbook, b.ready, b.ready.approval?.specHash ?? "");
+      return formatBrief(
+        { binding: b, playbook, gate, workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
+        BRIEF_MAX_CHARS,
+      );
     });
 
     const toolError = (error: unknown) => ({ content: [{ type: "text" as const, text: errorMessage(error) }], isError: true });
@@ -4350,6 +4456,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return b;
     }
 
+    /** The binding `brief`/`spawn-flags` acts on: the positional, or the invoking thread's own. */
+    function bindingFromCli(positional: string | undefined, option: string | undefined, ctx: { threadId?: string; projectId?: string }): Binding {
+      if (positional !== undefined && positional !== "") return bindingOrThrow(positional, option ?? ctx.projectId);
+      const own = ctx.threadId === undefined ? null : store.byThread(ctx.threadId);
+      if (own === null)
+        throw new PluginCliError("This thread is not the steward of a binding; pass one (an entity key or binding id).", {
+          code: "no_binding",
+          hint: "bb stewards list shows the project's bindings.",
+        });
+      return own;
+    }
+
+    /** The worker spawn flags for a binding: the project's environment first, then the playbook's worker model. */
+    async function workerFlagsFor(b: Binding, playbook: Playbook): Promise<string> {
+      return [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
+    }
+
     async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
@@ -4470,6 +4593,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               }
               lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance, merge the guidance branch, then run bb stewards check.");
               return { exitCode: 0, stdout: lines.join("\n") };
+            },
+          }),
+
+          brief: cliCommand({
+            summary: "A steward's invariants: thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules, and the worker spawn command",
+            description:
+              "Run this on any turn that is not a wake, and after your context was compacted. It defaults to the binding of the invoking thread. The plugin also injects a bounded form of it as per-turn system context, so it survives compaction.",
+            positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
+              const config = await loadConfig(b.projectId);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
+              if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
+              const gate = gateState(playbook, b.ready, b.ready.approval?.specHash ?? "");
+              return {
+                exitCode: 0,
+                stdout: formatBrief({ binding: b, playbook, gate, workerFlags: await workerFlagsFor(b, playbook), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
+              };
+            },
+          }),
+
+          "spawn-flags": cliCommand({
+            summary: "The full runnable `bb thread spawn` command for a steward's workers, from the playbook's worker model and the project environment",
+            description: "Use these flags as they are: they are the playbook's, not the steward's to choose. Defaults to the binding of the invoking thread.",
+            positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
+              const config = await loadConfig(b.projectId);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
+              if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
+              return { exitCode: 0, stdout: spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: await workerFlagsFor(b, playbook) }) };
             },
           }),
 
