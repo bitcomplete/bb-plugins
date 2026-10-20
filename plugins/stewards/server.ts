@@ -3428,10 +3428,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
               // Write on the thread's machine, else the project's: left to core, the
               // write lands on the server's own daemon, which bb-gate's servers lack.
-              const hostId =
-                (ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null)) ??
-                (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ??
-                undefined;
+              const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
+              const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
               const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {

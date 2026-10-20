@@ -1519,7 +1519,8 @@ export default async function plugin(bb: BbPluginApi) {
         const result = await client.systemOne({ state: state as never, questions: built }, { signal });
         return {
           answers: result.answers as unknown as Record<string, JevAnswer>,
-          usage: result.usage,
+          // The SDK reports a count it could not read as null; enrich counts it as none.
+          usage: { input_tokens: result.usage.input_tokens ?? 0, output_tokens: result.usage.output_tokens ?? 0 },
         };
       },
     };

@@ -23,12 +23,12 @@
   },
   "dependencies": {
     "esbuild": "0.28.2",
-    "monaco-editor": "0.56.0",
-    "zod": "4.6.5"
+    "monaco-editor": "0.57.0",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.5.29",
-    "@types/node": "22.20.5",
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/node": "26.6.5",
     "@types/react": "19.3.0",
     "typescript": "5.9.3"
   },
