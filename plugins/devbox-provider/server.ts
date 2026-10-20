@@ -260,6 +260,12 @@ export function deriveUsage(
       processes,
     });
   }
+  // Drop samples for instances that left the listing, so the map does not
+  // grow by one name per instance ever seen.
+  const present = new Set(instances.map((instance) => instance.name));
+  for (const name of samples.keys()) {
+    if (!present.has(name)) samples.delete(name);
+  }
   return rows;
 }
 
@@ -569,7 +575,12 @@ export function createDevboxProviderPlugin(deps: DevboxProviderDeps): (bb: BbPlu
         const { incus, project } = await connection(signal);
         const [instances, projectState, hosts] = await Promise.all([
           incus.listInstancesWithState(signal),
-          incus.getProjectState(signal),
+          // A project-state problem (an endpoint the restricted cert cannot
+          // read, a shape change) must not take the per-machine cards down.
+          incus.getProjectState(signal).catch((error: unknown) => {
+            bb.log.warn(`could not read devbox project state: ${errorMessage(error)}`);
+            return null;
+          }),
           bb.sdk.hosts.list(),
         ]);
         const bbNames = new Set(
@@ -579,7 +590,7 @@ export function createDevboxProviderPlugin(deps: DevboxProviderDeps): (bb: BbPlu
           connected: true,
           project,
           instances: deriveUsage(instances, bbNames, cpuSamples, deps.now()),
-          totals: projectTotals(projectState),
+          totals: projectState === null ? null : projectTotals(projectState),
         };
       },
     });

@@ -308,12 +308,14 @@ function MachineCard({ row, cpuHistory, memHistory }: { row: UsageRow; cpuHistor
 
       <Meter used={row.diskUsed} total={row.diskTotal} label="Disk" />
 
-      <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        <span>Net ↓ {formatBytes(row.networkIn)}</span>
-        <span>Net ↑ {formatBytes(row.networkOut)}</span>
-        {!stopped ? <span>Up {formatUptime(row.uptimeSeconds)}</span> : null}
-        {!stopped && row.processes !== null ? <span>{row.processes} proc</span> : null}
-      </div>
+      {!stopped ? (
+        <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span>Net ↓ {formatBytes(row.networkIn)}</span>
+          <span>Net ↑ {formatBytes(row.networkOut)}</span>
+          <span>Up {formatUptime(row.uptimeSeconds)}</span>
+          {row.processes !== null ? <span>{row.processes} proc</span> : null}
+        </div>
+      ) : null}
     </div>
   );
 }

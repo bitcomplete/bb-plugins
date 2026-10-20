@@ -57,7 +57,10 @@ sparklines are an in-memory ring buffer that starts empty each visit.
 
 CPU percent needs two samples, so the first poll after the server restarts
 (or after an instance restarts) shows no percentage until the next one. A
-stopped instance reports disk only.
+stopped instance reports disk only. The memory total falls back to the
+instance's `limits.memory` when Incus reports host memory; an instance with
+no `limits.memory` set has nothing to fall back to and reports whatever
+Incus returns.
 
 ## Settings
 

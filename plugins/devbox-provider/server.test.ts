@@ -428,6 +428,12 @@ describe("usage derivation", () => {
     const rows = deriveUsage([byKey, byHost, foreign], new Set(["box"]), new Map(), 1_000_000);
     expect(rows.map((row) => row.bb)).toEqual([true, true, false]);
   });
+
+  it("prunes samples for instances that left the listing", () => {
+    const samples = new Map([["gone", { usage: 1, at: 1 }]]);
+    deriveUsage([instance({ name: "kept" })], new Set(), samples, 2);
+    expect(samples.has("gone")).toBe(false);
+  });
 });
 
 describe("usage rpc", () => {
@@ -479,5 +485,19 @@ describe("usage rpc", () => {
       disk: { limit: 250 * 1024 ** 3, usage: 40 * 1024 ** 3 },
       instances: { limit: 6, usage: 2 },
     });
+  });
+
+  it("still returns the rows when the project state read fails", async () => {
+    const { harness, incus } = await setup({ token: "dbx_abc" });
+    incus.instances.set("mine", {
+      name: "mine",
+      status: "Running",
+      config: { [KEY_CONFIG]: "k" },
+      state: { status: "Running", disk: { root: { usage: 1, total: 2 } } },
+    });
+    vi.mocked(incus.client.getProjectState).mockRejectedValueOnce(new Error("forbidden"));
+    const result = (await harness.callRpc("usage", null)) as { instances: unknown[]; totals: unknown };
+    expect(result.instances).toHaveLength(1);
+    expect(result.totals).toBeNull();
   });
 });
