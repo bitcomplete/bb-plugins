@@ -81,7 +81,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a
-  spec). Everything else is the tools every thread has: `linear_*`, `gh`,
+  spec).
+- **Scheduling.** Two tickets changing the same files at once end in a
+  rebase for whichever merges second, so the project steward sequences
+  them. Each steward reports the repo-relative paths its work changes
+  (`steward_report { touches }`); two bindings overlap when a touch of one
+  is, or is inside, a touch of the other. When a ticket's ready gate passes
+  while another binding is building or reviewing on the same paths, the
+  plugin files a `schedule` escalation with the project steward, like the
+  approval request, and the ticket steward is told to start no workers
+  until it is decided. The project steward holds the ticket behind that
+  work (`steward_update { hold, behind: [keys] }`, which closes the request)
+  or lets it start (guidance + resolve, not asked again until a new overlap
+  appears). A hold placed `behind` lifts itself once every binding named
+  has merged its pull requests or ended: the held steward is woken with a
+  note to rebase, and the project steward is told. Work whose pull requests
+  have all merged no longer counts as in flight. `bb stewards show` prints
+  what a binding touches and overlaps; the project steward's wake lists
+  both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
   children of a steward thread.
 - **Lifecycle.** A terminal state gets a wrap-up turn with its workers

@@ -93,10 +93,15 @@ Specify the ticket against the ready checklist. Work out what you can —
 acceptance criteria, affected repos, a plan — from the code and the project's
 docs, and post it as spec comments. Ask only what you cannot work out, as a
 decision escalation, one question at a time. Report the checklist on every
-turn. When it is all met and the ticket is substantial, the plugin asks the
-project steward to approve the spec: wait for it, and do not escalate for
-it. Otherwise, or once approved, move the ticket to In Progress. A new spec
-needs approval again, and is asked for the same way.
+turn, and the paths the work changes (steward_report touches, repo directory
+first) as soon as the spec names them. When it is all met and the ticket is
+substantial, the plugin asks the project steward to approve the spec: wait
+for it, and do not escalate for it. When the gate passes but the wake says
+scheduling is with the project steward (the paths overlap work in flight),
+wait for that too: it holds you behind that work, and the hold lifts itself
+when the work lands, or it tells you to start. Otherwise, or once approved
+and scheduled, move the ticket to In Progress. A new spec needs approval
+again, and is asked for the same way.
 
 If the plan is several slices, file sub-issues. Promote one (label it) only
 when it fits the promote rule; otherwise your workers do it here.
@@ -104,7 +109,9 @@ when it fits the promote rule; otherwise your workers do it here.
 ## In Progress
 
 If the ready gate has not passed, start no workers: escalate a conflict and
-wait. Otherwise start one worker per pull request with a precise task: the
+wait. If scheduling is with the project steward or the binding is held, start
+no workers either; you are woken when it decides or the hold lifts. Otherwise
+start one worker per pull request with a precise task: the
 repo, the branch, the acceptance criteria, and "open a draft pull request,
 link it to the ticket, and stop when checks pass". When the pull requests are
 ready, request review and move the ticket to In Review.

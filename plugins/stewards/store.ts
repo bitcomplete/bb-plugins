@@ -163,6 +163,12 @@ export const MIGRATIONS = [
   // alert can be batched against the open ticket for its repo and ecosystem.
   `ALTER TABLE ops_fingerprints ADD COLUMN severity TEXT`,
   `ALTER TABLE ops_fingerprints ADD COLUMN ecosystem TEXT`,
+  // Scheduling: the paths a binding's work changes (steward_report touches), the open
+  // bindings a hold waits behind (steward_update hold + behind), and the conflicts
+  // the project steward was last asked to schedule it against.
+  `ALTER TABLE bindings ADD COLUMN touches TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN hold_behind TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN schedule_asked TEXT NOT NULL DEFAULT '[]'`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -245,6 +251,12 @@ export type Binding = {
   ready: ReadyState;
   priority: string | null;
   hold: string | null;
+  /** The repo-relative paths this binding's work changes, as reported; what scheduling compares. */
+  touches: string[];
+  /** Entity keys of the bindings this hold waits behind: the hold lifts itself when every one has merged its pull requests or ended. */
+  holdBehind: string[];
+  /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
+  scheduleAsked: string[];
   modelSteward: string | null;
   modelWorker: string | null;
   status: StatusRecord | null;
@@ -305,6 +317,9 @@ function rowToBinding(r: BindingRow): Binding {
     ready: json(readyStateSchema, str("ready"), readyDefault()),
     priority: str("priority"),
     hold: str("hold"),
+    touches: json(z.array(z.string()), str("touches"), []),
+    holdBehind: json(z.array(z.string()), str("hold_behind"), []),
+    scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
     modelSteward: str("model_steward"),
     modelWorker: str("model_worker"),
     status: json(statusRecordSchema.nullable(), str("status"), null),
@@ -347,6 +362,9 @@ const COLUMNS = {
   ready: "ready",
   priority: "priority",
   hold: "hold",
+  touches: "touches",
+  holdBehind: "hold_behind",
+  scheduleAsked: "schedule_asked",
   modelSteward: "model_steward",
   modelWorker: "model_worker",
   status: "status",
