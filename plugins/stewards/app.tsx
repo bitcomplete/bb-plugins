@@ -386,7 +386,7 @@ function BoardPage({ subPath }: { subPath: string }) {
 
 function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
   const now = Date.now();
-  const waiting = b.questions.length + b.withUser.length;
+  const waiting = b.questions.length + b.withUser.length + b.needs.length;
   return (
     <>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -437,6 +437,9 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
                   ) : null}
                 </p>
               </li>
+            ))}
+            {b.needs.map((n) => (
+              <NeedRow key={n.id} need={n} now={now} onDone={refetch} />
             ))}
           </List>
         )}
@@ -519,6 +522,84 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         )}
       </Section>
     </>
+  );
+}
+
+/**
+ * One "needs you" item with its buttons. A button is offered only when the
+ * server can verify the item's preconditions now; otherwise the item says why
+ * it is not actionable yet. Every action runs on the server, as the user.
+ */
+function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: number; onDone: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const [note, setNote] = useState("");
+  const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  const act = (action: "approve" | "decline" | "done" | "merge" | "provide") => {
+    setState("running");
+    rpc.call("stewardsNeedAction", { needId: n.id, action, note: note.trim() === "" ? null : note.trim() }).then(
+      (r) => {
+        if (!r.ok) return setState({ error: r.message });
+        onDone();
+        if (r.threadId !== null && r.threadId !== undefined) navigate.toThread(r.threadId);
+      },
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
+  return (
+    <li className="flex flex-col gap-2 p-3">
+      <p className="flex flex-wrap items-center gap-2">
+        <EntityLink entityKey={n.key} url={n.url} />
+        <Badge tone="bad">{n.kind}</Badge>
+        <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
+      </p>
+      <p>{n.what}</p>
+      {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
+      {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+      {takesNote ? (
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          rows={1}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "decide" ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          aria-label={`Note for: ${n.what}`}
+          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        {n.kind === "approve-spec" ? (
+          <>
+            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
+              Approve
+            </button>
+            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => act("decline")}>
+              Decline
+            </button>
+          </>
+        ) : n.kind === "approve-pr" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
+            Approve
+          </button>
+        ) : n.kind === "merge" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("merge")}>
+            Merge
+          </button>
+        ) : n.kind === "provide-secret" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
+            Provide
+          </button>
+        ) : (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
+            Done
+          </button>
+        )}
+        {n.threadId !== null ? <ThreadLink threadId={n.threadId}>Open the worker</ThreadLink> : null}
+        {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
+      </div>
+    </li>
   );
 }
 

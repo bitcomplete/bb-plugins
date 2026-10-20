@@ -8,33 +8,88 @@
 import { createHash } from "node:crypto";
 import { isTerminal, phaseOf, type Playbook } from "./config.js";
 import type { EntitySnapshot, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, ReadyState } from "./store.js";
+import type { Binding, Escalation, Need, Observed, ReadyState, Worker } from "./store.js";
 
 /**
  * One line of "what changed", and whether it alone makes a judgment turn due.
  * `own` marks the steward's own doing (its signed description edit), which is
  * news to nobody above it.
  */
-export type Change = { text: string; actionable: boolean; own?: boolean };
-
-/** A spec comment is one of the steward's own signed comments that starts by saying so. */
-export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null): boolean =>
-  stewardThreadId !== null && c.signedBy === stewardThreadId && /^\s*(\*\*)?spec\b/iu.test(c.body);
+export type Change = { text: string; actionable: boolean; own?: boolean; byUser?: boolean };
 
 /**
- * What an approval is pinned to: the description and the steward's spec
- * comments. Any change to either changes the hash. The signature line is
- * left out of the description, so the steward's own signed edit hashes the
- * same as the text it wrote.
+ * A worker is in flight from its spawn until it is stopped, failed or
+ * archived. Its turn ending is a pause, not a finish: a worker waits on its
+ * reviewer, is woken again, and pushes again. Own-pull-request activity is
+ * the worker's while any worker of the binding is in flight (criterion 1).
+ */
+export const workerInFlight = (w: Pick<Worker, "status">): boolean => w.status === "running" || w.status === "finished";
+export const anyWorkerInFlight = (workers: readonly Pick<Worker, "status">[]): boolean => workers.some(workerInFlight);
+
+/** A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the first line of a comment. */
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string };
+
+const REVIEW_MARKER = /^<!--\s*bb-review\s+round=(\d+)\s+sha=(\S+)\s+verdict=(\S+)\s+lane=(\S+)\s*-->/u;
+
+/** The reviewer's marker on a comment, or null for any other comment. */
+export function reviewMarker(body: string): ReviewMarker | null {
+  const first = body.split("\n", 1)[0]!.trim();
+  const m = REVIEW_MARKER.exec(first);
+  return m === null ? null : { round: Number(m[1]), sha: m[2]!, verdict: m[3]!, lane: m[4]! };
+}
+
+/** The newest reviewer marker in a comment list, by comment time. */
+export function latestReviewMarker(comments: readonly SnapshotComment[]): ReviewMarker | null {
+  let at = "";
+  let latest: ReviewMarker | null = null;
+  for (const c of comments) {
+    const m = reviewMarker(c.body);
+    if (m !== null && c.createdAt >= at) {
+      at = c.createdAt;
+      latest = m;
+    }
+  }
+  return latest;
+}
+
+/**
+ * A change in the lane a reviewer's rounds are in: the one thing about a
+ * `bb-review` marker the steward hears while a worker is in flight.
+ */
+export function markerLaneChange(before: readonly SnapshotComment[], after: readonly SnapshotComment[]): { from: string; to: string } | null {
+  const b = latestReviewMarker(before);
+  const a = latestReviewMarker(after);
+  if (b === null || a === null || b.lane === a.lane) return null;
+  return { from: b.lane, to: a.lane };
+}
+
+
+/**
+ * A spec comment is a signed comment that starts by saying so. The steward's
+ * own count, and so do the user's: a thread the user runs themselves is
+ * treated as the user's own words (an amendment carries its own approval
+ * when the approver is `me`). `isUserThread` says whether a signing thread is
+ * the user's rather than a steward, worker or the project steward; without it
+ * only the steward's own comments count.
+ */
+export const isSpecComment = (c: SnapshotComment, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): boolean =>
+  c.signedBy !== null && /^\s*(\*\*)?spec\b/iu.test(c.body) && (c.signedBy === stewardThreadId || (isUserThread?.(c.signedBy) ?? false));
+
+/**
+ * What an approval is pinned to: the description and the spec comments. The
+ * steward's own and the user's (a thread the user runs) both count. Any
+ * change to either changes the hash. The signature line is left out of the
+ * description, so the steward's own signed edit hashes the same as the text
+ * it wrote.
  */
 const DESCRIPTION_SIGNATURE = /\s*_— from bb thread ([A-Za-z0-9_-]+)_\s*$/u;
 
 /** The thread that signed the description, when its last edit was signed. */
 export const descriptionSignedBy = (entity: EntitySnapshot): string | null => DESCRIPTION_SIGNATURE.exec(entity.description ?? "")?.[1] ?? null;
 
-export function specHash(entity: EntitySnapshot, stewardThreadId: string | null): string {
+export function specHash(entity: EntitySnapshot, stewardThreadId: string | null, isUserThread?: (threadId: string) => boolean): string {
   const description = (entity.description ?? "").replace(DESCRIPTION_SIGNATURE, "").trim();
-  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId)).map((c) => `${c.id}\n${c.body}`);
+  const specs = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).map((c) => `${c.id}\n${c.body}`);
   return createHash("sha256").update([description, ...specs].join("\n\u0000\n")).digest("hex").slice(0, 16);
 }
 
@@ -60,13 +115,15 @@ const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.des
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
 /**
- * Whose pull request events are the steward's own work in progress. While one
- * of its workers is running, the worker pushes, edits the description, posts
- * as the viewer (every thread acts as the developer, signed or not) and waits
- * for checks; none of that is news to the steward, which hears from the
- * worker when it finishes. People and terminal states still wake it.
+ * Whose pull request events are the steward's own work in progress. While any
+ * worker of the binding is in flight (criterion 1: from its spawn until it
+ * finishes, not only while its turn runs), the worker pushes, edits the
+ * description, posts as the viewer (every thread acts as the developer,
+ * signed or not) and waits for checks; none of that is news to the steward,
+ * which hears from the worker when it finishes. People and terminal states
+ * still wake it.
  */
-type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerRunning: boolean };
+type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerInFlight: boolean; userThread?: (threadId: string) => boolean };
 
 /**
  * The changes between two observations of one entity, each marked whether it
@@ -87,14 +144,20 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
     // rewriting a description it signed earlier usually keeps the line.
     const signer = descriptionSignedBy(after);
     const own = signer !== null && ctx.own.has(signer) && descriptionSignedBy(before) !== signer;
-    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerRunning && after.pull !== null), ...(own ? { own } : {}) });
+    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerInFlight && after.pull !== null), ...(own ? { own } : {}) });
   }
 
   // A spec comment the steward just posted is its own doing; it only matters
   // once an approval is pinned to the spec it changes.
-  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId)).map((c) => c.id));
-  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId) && !beforeSpecs.has(c.id));
-  if (addedSpecs.length > 0) changes.push({ text: `${p}Spec comment${addedSpecs.length === 1 ? "" : "s"} added`, actionable: ctx.approved });
+  const beforeSpecs = new Set(before.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread)).map((c) => c.id));
+  const addedSpecs = after.comments.filter((c) => isSpecComment(c, ctx.stewardThreadId, ctx.userThread) && !beforeSpecs.has(c.id));
+  if (addedSpecs.length > 0) {
+    const byUser = addedSpecs.some((c) => c.signedBy !== null && (ctx.userThread?.(c.signedBy) ?? false));
+    // A spec comment the user wrote is news on its own: it carries its own
+    // approval when the approver is `me`, and when it is the project steward
+    // the steward should know the user authored it, not wait on them.
+    changes.push({ text: `${p}Spec comment${addedSpecs.length === 1 ? "" : "s"} added${byUser ? " by the user" : ""}`, actionable: ctx.approved || byUser, ...(byUser ? { byUser } : {}) });
+  }
 
   const beforeChildren = new Map(before.children.map((c) => [c.id, c]));
   for (const child of after.children) {
@@ -126,7 +189,7 @@ function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContex
   const bChecks = b.checks?.state ?? null;
   const aChecks = a.checks?.state ?? null;
   if (aChecks !== null && SETTLED.has(aChecks) && (bChecks !== aChecks || !same(b.checks?.failing ?? [], a.checks?.failing ?? []))) {
-    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerRunning });
+    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerInFlight });
   }
   const seen = new Set(b.reviews.map((r) => `${r.author}|${r.submittedAt}|${r.state}`));
   for (const r of a.reviews) {
@@ -147,10 +210,11 @@ export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comm
 
 /**
  * Every change between two observations: the entity, then each linked pull
- * request. `workerRunning` quiets the steward's own work on pull requests
- * (see DiffContext).
+ * request. `workerInFlight` quiets the steward's own work on pull requests
+ * (see DiffContext), including the reviewer's `bb-review` markers, except a
+ * change of lane (criterion 3).
  */
-export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerRunning: boolean }): Change[] {
+export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerInFlight: boolean; userThread?: (threadId: string) => boolean }): Change[] {
   const viewer = after.entity.viewer;
   const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer });
   const beforePulls = new Map(before.pulls.map((p) => [p.key.toLowerCase(), p]));
@@ -163,15 +227,180 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
   // Comments are compared with what the steward was last shown, not with the
   // last ring, so a comment that arrived while the binding was held is still
   // news at the next turn.
+  const beforeByKey = new Map<string, EntitySnapshot>([[before.entity.key.toLowerCase(), before.entity], ...before.pulls.map((p) => [p.key.toLowerCase(), p] as const)]);
   for (const e of [after.entity, ...after.pulls]) {
+    const prefix = e === after.entity ? "" : `${e.key}: `;
     const fresh = newHumanComments(e, ctx.cursor, ctx.own);
-    // On a pull request a running worker owns, the viewer's comments are the
-    // worker's and its reviewers': they post as the developer, often unsigned.
-    const ownWork = ctx.workerRunning && e.pull !== null;
-    const people = ownWork ? fresh.filter((c) => lc(c.author) !== lc(e.viewer)) : fresh;
-    if (fresh.length > 0) changes.push({ text: commentNews(e === after.entity ? "" : `${e.key}: `, fresh), actionable: people.length > 0 });
+    // On a pull request a worker owns, the viewer's comments are the worker's
+    // and its reviewers': they post as the developer, often unsigned. The
+    // reviewer's markers are the worker's business too, whoever posts them;
+    // a round that changes the lane is not.
+    const ownWork = ctx.workerInFlight && e.pull !== null;
+    const people = ownWork ? fresh.filter((c) => reviewMarker(c.body) === null && lc(c.author) !== lc(e.viewer)) : fresh;
+    if (fresh.length > 0) changes.push({ text: commentNews(prefix, fresh), actionable: people.length > 0 });
+    if (ownWork) {
+      const lane = markerLaneChange(beforeByKey.get(e.key.toLowerCase())?.comments ?? [], e.comments);
+      if (lane !== null) changes.push({ text: `${prefix}Review lane: ${lane.from} → ${lane.to}`, actionable: true });
+    }
   }
   return changes;
+}
+
+// ---- the merge gate -------------------------------------------------------------------
+
+/**
+ * Whether the owner has approved a pull request: an unsigned approving comment
+ * by the connected user, or an APPROVED review from them. A signed comment is
+ * a thread's (the reviewer's marker, a worker's), never the owner's.
+ */
+export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: string | null } {
+  const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
+  if (viewer === null) return { approved: false, at: null };
+  let at: string | null = null;
+  for (const c of entity.comments) {
+    if (c.signedBy !== null || c.author.toLowerCase() !== viewer) continue;
+    if (classifyApproval(c.body) !== "approve") continue;
+    if (at === null || c.createdAt > at) at = c.createdAt;
+  }
+  for (const r of entity.pull?.reviews ?? []) {
+    if (r.author.toLowerCase() !== viewer || r.state.toLowerCase() !== "approved") continue;
+    const when = r.submittedAt ?? "";
+    if (at === null || when > at) at = when;
+  }
+  return { approved: at !== null, at };
+}
+
+/**
+ * The lane gate from the build-tickets skill, in one place: the reviewer's
+ * latest marker names the current head with verdict `approved`, every check has
+ * passed, and, in the owner-reviewed lane, the owner has approved. It is used
+ * by the merge button, by the item the plugin files, and by the wake text that
+ * tells a steward whether a pull request's gate is met.
+ */
+export type PrGate = {
+  headSha: string | null;
+  marker: ReviewMarker | null;
+  lane: string | null;
+  checksGreen: boolean;
+  checksState: string | null;
+  ownerApproved: boolean;
+  ownerApprovalAt: string | null;
+  gateMet: boolean;
+  /** What is missing, in words; null when the gate is met. */
+  missing: string | null;
+  /** The plugin's `approve-pr` condition: owner lane, marker approved on the head, checks green, no owner approval yet. */
+  needsOwnerApproval: boolean;
+};
+
+const short = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
+
+export function prGate(entity: EntitySnapshot): PrGate {
+  const pull = entity.pull;
+  const headSha = pull?.headSha ?? null;
+  const marker = latestReviewMarker(entity.comments);
+  const lane = marker?.lane ?? null;
+  const checksState = pull?.checks?.state ?? null;
+  const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
+  const owner = ownerApproval(entity);
+  const markerOnHead = marker !== null && headSha !== null && marker.sha === headSha;
+  const markerApproved = markerOnHead && marker.verdict === "approved";
+  const ownerLane = lane === "owner-reviewed";
+  const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || owner.approved);
+  const missing = gateMet
+    ? null
+    : pull === null
+      ? "not a pull request"
+      : marker === null
+        ? "no reviewer round yet"
+        : !markerOnHead
+          ? `reviewer round ${marker.round} is on ${short(marker.sha)}; the head is ${short(headSha)}`
+          : marker.verdict !== "approved"
+            ? `reviewer verdict: ${marker.verdict}`
+            : !checksGreen
+              ? `checks ${checksState ?? "not run"}`
+              : ownerLane && !owner.approved
+                ? "owner approval needed"
+                : "not met";
+  return {
+    headSha,
+    marker,
+    lane,
+    checksGreen,
+    checksState,
+    ownerApproved: owner.approved,
+    ownerApprovalAt: owner.at,
+    gateMet,
+    missing,
+    needsOwnerApproval: ownerLane && markerApproved && checksGreen && !owner.approved,
+  };
+}
+
+/**
+ * A `blockedOn` that names the user, the owner or a human. A status record
+ * naming one of them without an open `needs` item is refused: the item is what
+ * puts the ask on the Stewards page.
+ */
+export function namesUserAsBlocker(text: string): boolean {
+  return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
+}
+
+// ---- approval words -------------------------------------------------------------------
+
+/**
+ * How a piece of text answers an approval request. Explicit approval words
+ * approve; explicit refusal words decline; anything else is ambiguous and is
+ * the project steward's to interpret. The page answer uses all three; a
+ * project steward's own guidance + resolve is a decision, so anything that
+ * does not approve declines (as before).
+ */
+export type ApprovalVerdict = "approve" | "decline" | "ambiguous";
+
+const NEGATED_APPROVE = /(?:^|[^\p{L}\p{N}])(?:not|never|cannot|do\s+not|[a-z]+n['’]t)\s+(?:\w+\s+){0,2}?(?:approv\w*|ship|lgtm|go\s+ahead|looks?\s+good|sign\s*off|yes)(?:[^\p{L}\p{N}]|$)/iu;
+const REFUSAL = /(?:^|[^\p{L}\p{N}])(?:reject(?:ed)?|declin(?:e|ed)|hold\s+off)(?:[^\p{L}\p{N}]|$)/iu;
+const APPROVE_WORDS = /(?:^|[^\p{L}\p{N}])(?:lgtm|approv(?:e|es|ed|al)|ship\s*it|go\s*ahead|looks?\s+good|sign(?:ed)?\s*off|:shipit:|yes|yep|yeah)(?:[^\p{L}\p{N}]|$)/iu;
+const DECLINE_WORDS = /(?:^|[^\p{L}\p{N}])(?:no|nope|don'?t|do\s+not|not\s+yet|changes?\s+(?:are\s+)?(?:needed|requested)|needs?\s+changes?)(?:[^\p{L}\p{N}]|$)/iu;
+
+/**
+ * A clear refusal first, so "not approved" and "don't ship it" decline rather
+ * than matching the approval word inside them; then approval words, so
+ * "LGTM, no concerns" and "ship it, no further changes needed" approve; then
+ * a bare no or a request for changes declines; anything else is ambiguous.
+ */
+export function classifyApproval(text: string | null | undefined): ApprovalVerdict {
+  const flat = (text ?? "").replace(/\s+/gu, " ").trim();
+  if (flat === "") return "ambiguous";
+  if (NEGATED_APPROVE.test(flat) || REFUSAL.test(flat)) return "decline";
+  if (APPROVE_WORDS.test(flat)) return "approve";
+  if (DECLINE_WORDS.test(flat)) return "decline";
+  return "ambiguous";
+}
+
+/**
+ * A steward that asks for an approval that is already open. The plugin files
+ * the request and lists it on the Stewards page, so the playbook says not to
+ * ask the user again; a report whose next action is to ask them anyway is a
+ * violation `bb stewards show` points at. Only an imperative next action
+ * counts, so merely waiting on the request is not flagged.
+ */
+export function asksForOpenApproval(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
+  if (status === null || (!open.some((x) => x.kind === "approval") && !needs.some((n) => n.kind === "approve-spec"))) return null;
+  const next = status.nextAction.trim();
+  if (!/^(?:ask|asks|asking|request|requests|requesting|remind|reminds|reminding|tell|tells|telling|prompt|prompts|prompting)\b/iu.test(next)) return null;
+  if (!/\b(?:approv\w*|lgtm|sign[- ]?off)\b/iu.test(next)) return null;
+  if (!/\b(?:user|you|your)\b/iu.test(next)) return null;
+  return "asks for an approval that is already open";
+}
+
+/**
+ * Whether to compact a steward's context: it already holds more than the
+ * limit, or the wake about to be sent would push it over (criterion 4).
+ * Tokens are estimated from the wake's characters; the provider's reading is
+ * exact. A non-positive limit leaves compaction to the provider.
+ */
+export const CHARS_PER_TOKEN = 4;
+export function compactDue(usedTokens: number | null, limit: number, incomingChars = 0): boolean {
+  if (!(limit > 0) || usedTokens === null) return false;
+  return usedTokens > limit || usedTokens + Math.ceil(incomingChars / CHARS_PER_TOKEN) > limit;
 }
 
 // ---- the ready gate ------------------------------------------------------------------
@@ -250,8 +479,8 @@ export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.c
  * A status that says it waits on the project steward or the user while
  * none of its escalations is open: a wait nobody above it hears about.
  */
-export function unheardWait(status: Binding["status"], open: readonly Escalation[]): string | null {
-  if (status === null || status.blockedOn === null || open.length > 0) return null;
+export function unheardWait(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
+  if (status === null || status.blockedOn === null || open.length > 0 || needs.length > 0) return null;
   if (/project steward/iu.test(status.blockedOn)) return "waits on the project steward, with no open escalation";
   if (/\buser\b/iu.test(status.blockedOn)) return "waits on the user, with no open escalation";
   return null;

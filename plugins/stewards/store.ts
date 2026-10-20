@@ -10,6 +10,7 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
+import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -120,6 +121,40 @@ export const MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN delivered_at INTEGER`,
   // Escalations open before delivery was recorded were all delivered already.
   `UPDATE escalations SET delivered_at = created_at WHERE status = 'open' AND delivered_at IS NULL`,
+  // "Needs you" items: one structured thing the user (or the page's buttons) must
+  // do for a binding. Deduplicated per (binding, kind, url) while open.
+  `CREATE TABLE IF NOT EXISTS needs (
+     id TEXT PRIMARY KEY,
+     binding_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     url TEXT NOT NULL DEFAULT '',
+     what TEXT NOT NULL,
+     how TEXT,
+     data TEXT NOT NULL DEFAULT '{}',
+     filed_by TEXT NOT NULL DEFAULT 'steward',
+     status TEXT NOT NULL DEFAULT 'open',
+     resolution TEXT,
+     created_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS needs_binding ON needs (binding_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS needs_open_key ON needs (binding_id, kind, url) WHERE status = 'open'`,
+  // An ops binding's last look at its target: what it found, classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN ops_look TEXT`,
+  // The fingerprint map: one problem an ops steward has seen, and the Linear ticket it was filed or commented on under.
+  `CREATE TABLE IF NOT EXISTS ops_fingerprints (
+     project_id TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     binding_id TEXT NOT NULL,
+     summary TEXT NOT NULL,
+     ticket_key TEXT,
+     first_seen_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL,
+     seen_count INTEGER NOT NULL DEFAULT 1,
+     filed_at INTEGER,
+     last_commented_at INTEGER,
+     PRIMARY KEY (project_id, fingerprint)
+   )`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -180,10 +215,13 @@ function json<T>(schema: z.ZodType<T>, raw: string | null, fallback: T): T {
 
 // ---- bindings --------------------------------------------------------------------------
 
+/** Where a binding's entity lives: a source plugin's, or "ops" for a watch target, which the plugin reads itself. */
+export type BindingSource = Source | "ops";
+
 export type Binding = {
   id: string;
   projectId: string;
-  source: Source;
+  source: BindingSource;
   entityId: string;
   entityKey: string;
   url: string | null;
@@ -224,6 +262,8 @@ export type Binding = {
   /** When follow-through runs out, whatever the steward says: set when it is first declared. */
   followThroughUntil: number | null;
   manualDetach: boolean;
+  /** An ops binding's last look; null for every other kind. */
+  opsLook: OpsLook | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -239,7 +279,7 @@ function rowToBinding(r: BindingRow): Binding {
   return {
     id: r.id,
     projectId: String(r.project_id),
-    source: String(r.source) as Source,
+    source: String(r.source) as BindingSource,
     entityId: String(r.entity_id),
     entityKey: String(r.entity_key),
     url: str("url"),
@@ -274,6 +314,7 @@ function rowToBinding(r: BindingRow): Binding {
     followThrough: str("follow_through"),
     followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
+    opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -314,6 +355,7 @@ const COLUMNS = {
   followThrough: "follow_through",
   followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
+  opsLook: "ops_look",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -370,8 +412,41 @@ export type Question = {
   resolvedAt: number | null;
 };
 
+/** The kinds of thing that can wait on the user, from the ticket's table. */
+export const NEEDS_KINDS = ["approve-spec", "approve-pr", "merge", "decide", "provide-secret", "configure"] as const;
+export type NeedKind = (typeof NEEDS_KINDS)[number];
+
+/**
+ * One "needs you" item: a structured thing the user must do, filed by the
+ * plugin from a snapshot or by a steward through `steward_report`. `url` is the
+ * link (the ticket, the pull request, the external page); with `kind` it is the
+ * dedupe key. `data` carries kind-specific fields (the pull request sha, the
+ * secret's variable name, the worker thread to open).
+ */
+export type Need = {
+  id: string;
+  bindingId: string;
+  kind: NeedKind;
+  url: string;
+  what: string;
+  how: string | null;
+  data: Record<string, unknown>;
+  /** Who filed it: "plugin", "steward", "project" or "user". */
+  filedBy: string;
+  status: "open" | "done";
+  resolution: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
+
+/** One problem an ops steward has seen, and the ticket it is tracked under. */
+export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null };
+
+/** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
+export type TicketAction = "filed" | "commented" | "reopened";
 
 export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null };
 
@@ -427,6 +502,15 @@ export function createStore(db: Database.Database, now: () => number) {
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
   const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
 
+  const getFingerprint = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE project_id = ? AND fingerprint = ?");
+  const fingerprintsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE binding_id = ? ORDER BY first_seen_at");
+  const sight = db.prepare(
+    `INSERT INTO ops_fingerprints (project_id, fingerprint, binding_id, summary, first_seen_at, last_seen_at) VALUES (@project_id, @fingerprint, @binding_id, @summary, @at, @at)
+     ON CONFLICT (project_id, fingerprint) DO UPDATE SET binding_id = @binding_id, summary = @summary, last_seen_at = @at, seen_count = seen_count + 1`,
+  );
+  const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
+  const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
+
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
   const upsertProject = db.prepare("INSERT INTO project_stewards (project_id) VALUES (?) ON CONFLICT (project_id) DO NOTHING");
@@ -458,6 +542,34 @@ export function createStore(db: Database.Database, now: () => number) {
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
   });
+  const insertNeed = db.prepare(
+    "INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, created_at) VALUES (@id, @binding_id, @kind, @url, @what, @how, @data, @filed_by, @created_at)",
+  );
+  const getNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE id = ?");
+  const openNeedByKey = db.prepare<[string, string, string], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open' LIMIT 1");
+  const needsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND (? = 1 OR status = 'open') ORDER BY created_at");
+  const openNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.status = 'open' ORDER BY n.created_at");
+  const allNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? ORDER BY n.created_at");
+  const updateNeed = db.prepare("UPDATE needs SET what = ?, how = ?, data = ? WHERE id = ?");
+  const closeNeedStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
+  const closeNeedKindStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND status = 'open'");
+  const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
+
+  const toNeed = (r: Record<string, unknown>): Need => ({
+    id: String(r.id),
+    bindingId: String(r.binding_id),
+    kind: String(r.kind) as NeedKind,
+    url: String(r.url ?? ""),
+    what: String(r.what),
+    how: r.how === null || r.how === undefined ? null : String(r.how),
+    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
+    filedBy: String(r.filed_by ?? "steward"),
+    status: String(r.status) as "open" | "done",
+    resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
+    createdAt: Number(r.created_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
   const toWorker = (r: Record<string, unknown>): Worker => ({
     threadId: String(r.thread_id),
     bindingId: String(r.binding_id),
@@ -466,6 +578,18 @@ export function createStore(db: Database.Database, now: () => number) {
     result: r.result === null ? null : String(r.result),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
+  });
+  const toFingerprint = (r: Record<string, unknown>): Fingerprint => ({
+    projectId: String(r.project_id),
+    fingerprint: String(r.fingerprint),
+    bindingId: String(r.binding_id),
+    summary: String(r.summary),
+    ticketKey: r.ticket_key === null ? null : String(r.ticket_key),
+    firstSeenAt: Number(r.first_seen_at),
+    lastSeenAt: Number(r.last_seen_at),
+    seenCount: Number(r.seen_count),
+    filedAt: r.filed_at === null ? null : Number(r.filed_at),
+    lastCommentedAt: r.last_commented_at === null ? null : Number(r.last_commented_at),
   });
   const toProject = (r: Record<string, unknown>): ProjectStewardRow => ({
     projectId: String(r.project_id),
@@ -502,7 +626,7 @@ export function createStore(db: Database.Database, now: () => number) {
       const r = getBinding.get(id);
       return r === undefined ? null : rowToBinding(r);
     },
-    byEntity(source: Source, entityId: string): Binding | null {
+    byEntity(source: BindingSource, entityId: string): Binding | null {
       const r = byEntity.get(source, entityId);
       return r === undefined ? null : rowToBinding(r);
     },
@@ -570,6 +694,28 @@ export function createStore(db: Database.Database, now: () => number) {
       if (last !== undefined && last.text === text && last.by === by && now() - last.at < GUIDANCE_DEDUPE_MS) return false;
       patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
       return true;
+    },
+    /**
+     * Record an approval on the gate and resolve the binding's open approval
+     * escalations, in one transaction: answering an approval request approves
+     * the current spec and closes the request together.
+     */
+    approve(bindingId: string, approval: NonNullable<ReadyState["approval"]>, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+        closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
+    },
+    /** Remember the current spec as declined and close its approval request, in one transaction. */
+    decline(bindingId: string, specHash: string, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
+        closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
     },
 
     // escalations
@@ -649,6 +795,55 @@ export function createStore(db: Database.Database, now: () => number) {
         return true;
       })();
     },
+    /**
+     * Close an open question with its answer, leaving the escalation it was
+     * forwarded for open. Used when the user's answer is ambiguous: the
+     * project steward, not the plugin, decides what it means.
+     */
+    answerQuestionOnly(id: string, answer: string, by: string): boolean {
+      return answerQuestion.run(answer, by, now(), id).changes > 0;
+    },
+
+    // needs: what waits on the user
+    need(id: string): Need | null {
+      const r = getNeed.get(id);
+      return r === undefined ? null : toNeed(r);
+    },
+    needs(bindingId: string, includeDone = false): Need[] {
+      return needsFor.all(bindingId, includeDone ? 1 : 0).map(toNeed);
+    },
+    openNeeds(bindingId: string): Need[] {
+      return needsFor.all(bindingId, 0).map(toNeed);
+    },
+    openNeedsForProject(projectId: string): Need[] {
+      return openNeedsForProject.all(projectId).map(toNeed);
+    },
+    allNeedsForProject(projectId: string): Need[] {
+      return allNeedsForProject.all(projectId).map(toNeed);
+    },
+    /**
+     * File a need, deduplicated by (binding, kind, url) while open: a steward
+     * that re-reports one updates the wording rather than adding a row.
+     */
+    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+      const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
+      if (existing !== undefined) {
+        updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        return toNeed(getNeed.get(String(existing.id))!);
+      }
+      const id = newId("need");
+      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      return toNeed(getNeed.get(id)!);
+    },
+    closeNeed(id: string, resolution: string): boolean {
+      return closeNeedStmt.run(resolution, now(), id).changes > 0;
+    },
+    closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
+      return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
+    },
+    closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
+      return closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
+    },
 
     // workers
     addWorker(threadId: string, bindingId: string, title: string): void {
@@ -666,6 +861,39 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+    },
+
+    // the fingerprint map
+    fingerprint(projectId: string, fingerprint: string): Fingerprint | null {
+      const r = getFingerprint.get(projectId, fingerprint);
+      return r === undefined ? null : toFingerprint(r);
+    },
+    fingerprints(bindingId: string): Fingerprint[] {
+      return fingerprintsFor.all(bindingId).map(toFingerprint);
+    },
+    /** Record that a look saw these problems: new ones enter the map with no ticket, known ones count another sighting. */
+    sight(projectId: string, bindingId: string, seen: Array<{ fingerprint: string; summary: string }>): Map<string, Fingerprint> {
+      return db.transaction(() => {
+        const at = now();
+        const out = new Map<string, Fingerprint>();
+        for (const s of seen) {
+          sight.run({ project_id: projectId, fingerprint: s.fingerprint, binding_id: bindingId, summary: s.summary, at });
+          out.set(s.fingerprint, toFingerprint(getFingerprint.get(projectId, s.fingerprint)!));
+        }
+        return out;
+      })();
+    },
+    /**
+     * Record what a steward did about a problem. Filing or reopening points
+     * the fingerprint at that ticket, so its next sighting is a comment there
+     * and nothing new; a comment counts as the latest word on it. False when
+     * the map has no such fingerprint.
+     */
+    recordTicket(projectId: string, fingerprint: string, ticketKey: string, did: TicketAction): boolean {
+      const at = now();
+      const key = ticketKey.toUpperCase();
+      const changed = did === "commented" ? setCommented.run(key, at, projectId, fingerprint) : setTicket.run(key, at, at, projectId, fingerprint);
+      return changed.changes > 0;
     },
 
     // project stewards

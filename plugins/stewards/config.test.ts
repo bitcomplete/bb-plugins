@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isTerminal, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, projectFileTemplate } from "./templates.js";
+import { isTerminal, opsTeam, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
+import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
   it("parses the template with defaults filled in", () => {
@@ -13,6 +13,8 @@ describe("the project file", () => {
     expect(parsed.value.projectSteward.model).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
     expect(parsed.value.reviews.enabled).toBe(true);
     expect(parsed.value.github.exclude).toEqual([]);
+    expect(parsed.value.ops).toEqual({ targets: [], autoAdopt: [] });
+    expect(usesKind(parsed.value, "ops")).toBe(false);
   });
 
   it("names the file and the field in errors", () => {
@@ -27,12 +29,63 @@ describe("the project file", () => {
   });
 });
 
+describe("ops in the project file", () => {
+  const file = (ops: unknown, teams = ["ENG", "OPS"]) => parseProjectFile(JSON.stringify({ version: 1, linear: { teams }, ops }));
+  const error = (ops: unknown, teams?: string[]) => {
+    const r = file(ops, teams);
+    if (r.ok) expect.fail(`accepted ${JSON.stringify(ops)}`);
+    return r.error;
+  };
+
+  it("takes namespace targets, a team and the priorities to adopt at once", () => {
+    const r = file({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "ops", autoAdopt: ["urgent"] });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "OPS", autoAdopt: ["urgent"] });
+    expect(usesKind(r.value, "ops")).toBe(true);
+    expect(opsTeam(r.value)).toBe("OPS");
+  });
+
+  it("files in the first Linear team when no team is named", () => {
+    const r = file({ targets: [{ kind: "k8s-namespace", name: "prod" }] });
+    expect(r.ok && opsTeam(r.value)).toBe("ENG");
+    expect(r.ok && r.value.ops.autoAdopt).toEqual([]);
+  });
+
+  it("refuses what would watch nothing or file where nobody stewards", () => {
+    expect(error({ targets: [{ kind: "k8s-namespace", name: "Prod_1" }] })).toMatch(/ops\.targets\.0\.name: a namespace name/u);
+    expect(error({ targets: [{ kind: "pod", name: "prod" }] })).toMatch(/ops\.targets\.0\.kind/u);
+    expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }, { kind: "k8s-namespace", name: "prod" }] })).toMatch(/ops\.targets\.1: k8s-namespace\/prod is listed twice/u);
+    expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }], team: "SALES" })).toMatch(/ops\.team: SALES is not one of linear\.teams/u);
+    expect(error({ targets: [{ kind: "k8s-namespace", name: "prod" }] }, [])).toMatch(/ops needs a Linear team/u);
+    expect(error({ targets: [], autoAdopt: ["critical"] })).toMatch(/ops\.autoAdopt\.0/u);
+    expect(error({ targets: [], watch: true })).toMatch(/ops/u);
+    // No targets, no team needed.
+    expect(file({ targets: [] }, []).ok).toBe(true);
+  });
+});
+
 describe("playbooks", () => {
-  it("parses the three defaults", () => {
-    for (const [name, text] of [["linear-tickets", LINEAR_TICKETS], ["github-prs", GITHUB_PRS], ["github-reviews", GITHUB_REVIEWS]] as const) {
+  it("parses the four defaults", () => {
+    for (const [name, text] of [["linear-tickets", LINEAR_TICKETS], ["github-prs", GITHUB_PRS], ["github-reviews", GITHUB_REVIEWS], ["ops-watch", OPS_WATCH]] as const) {
       const parsed = parsePlaybook(text, name);
       expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
     }
+  });
+
+  it("tells the default playbooks to get credentials through bb secret request and to escalate build-time blockers", () => {
+    const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!linear.ok) throw new Error(linear.error);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/bb secret request/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/changes what the ticket needs/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/escalated as a `decision`/u);
+    expect(phaseInstructions(linear.value, "In Review")).toMatch(/escalated as a `decision`/u);
+    const prs = parsePlaybook(GITHUB_PRS, "github-prs");
+    if (!prs.ok) throw new Error(prs.error);
+    expect(phaseInstructions(prs.value, "draft")).toMatch(/escalated as a `decision`/u);
+    expect(phaseInstructions(prs.value, "open")).toMatch(/escalated as a `decision`/u);
+    const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
+    if (!reviews.ok) throw new Error(reviews.error);
+    expect(phaseInstructions(reviews.value, "open")).toMatch(/escalated as a `decision`/u);
   });
 
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
@@ -64,6 +117,31 @@ describe("playbooks", () => {
     if (!r.ok) expect(r.error).toMatch(/needs a ready gate/u);
     const overlap = GITHUB_PRS.replace("terminal: [merged, closed]", "terminal: [merged, closed, open]");
     expect(parsePlaybook(overlap, "github-prs")).toMatchObject({ ok: false });
+  });
+});
+
+describe("the ops playbook", () => {
+  it("has no phases or terminal states, sections for what a look found, and a may list of read-only kubectl, filing, commenting and escalating", () => {
+    const parsed = parsePlaybook(OPS_WATCH, "ops-watch");
+    if (!parsed.ok) throw new Error(parsed.error);
+    const p = parsed.value;
+    expect(p).toMatchObject({ kind: "ops", source: "k8s", phases: {}, terminal: [], ready: null, may: ["kubectl get", "kubectl describe", "kubectl logs", "kubectl auth can-i", "file-ticket", "comment", "escalate"], requeueDefaultMs: 3_600_000 });
+    expect(phaseInstructions(p, "new")).toMatch(/File one ticket per problem/u);
+    expect(phaseInstructions(p, "recurring")).toMatch(/File nothing new/u);
+    expect(phaseInstructions(p, "returned")).toMatch(/reopened/u);
+    expect(p.general).toMatch(/Fingerprint: `<fingerprint>`/u);
+  });
+
+  it("refuses entity state on an ops playbook, the wrong source, and a non-ops playbook with nothing terminal", () => {
+    const phased = OPS_WATCH.replace("may:", "phases:\n  open: {}\nmay:");
+    expect(parsePlaybook(phased, "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook has no phases/u) });
+    expect(parsePlaybook(OPS_WATCH.replace("may:", "terminal: [Done]\nmay:"), "ops-watch")).toMatchObject({ ok: false });
+    expect(parsePlaybook(OPS_WATCH.replace("source: k8s", "source: linear"), "ops-watch")).toMatchObject({ ok: false, error: expect.stringMatching(/an ops playbook reads k8s/u) });
+    expect(parsePlaybook(GITHUB_PRS.replace("terminal: [merged, closed]\n", ""), "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/terminal: name at least one state/u) });
+    // A ticket, pr or review playbook still needs its phases, as before ops.
+    const noPhases = GITHUB_PRS.replace(/phases:\n(?: {2}.*\n)+/u, "");
+    expect(noPhases).not.toMatch(/phases:/u);
+    expect(parsePlaybook(noPhases, "github-prs")).toMatchObject({ ok: false, error: expect.stringMatching(/phases: map the entity's states to stages/u) });
   });
 });
 

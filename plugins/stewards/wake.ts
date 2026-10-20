@@ -7,12 +7,31 @@
 // transcript stop being the source of truth.
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
-import { newHumanComments, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
+import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Observed, Question, Worker } from "./store.js";
+import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
+
+/**
+ * What a steward must never ask for: an open escalation or approval request is
+ * already on the user's Stewards page, and repeating it in a reply is noise.
+ */
+const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. Do not ask for them in your reply.";
+
+/**
+ * The rules that hold on every wake, whatever the playbook: the generic things
+ * a steward got wrong without them. They mirror the `stewards` skill and the
+ * default playbooks, so a change here belongs there too.
+ */
+const STANDING_RULES = [
+  "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
+  "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
+  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing `provide-secret` item for it, and the worker takes the value.",
+  "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up.",
+];
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
@@ -20,6 +39,35 @@ const RESULT_CHARS = 1500;
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters)`);
 const quote = (text: string) => text.split("\n").map((l) => `> ${l}`).join("\n");
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
+const oneLine = (text: string, max = 400) => {
+  const flat = text.replace(/\s+/gu, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+};
+
+/**
+ * The question a worker's final message ended with, or null when it asked
+ * nothing. The last line that asks is the one the steward must answer; the
+ * whole message is already quoted in the snapshot. Only the last few lines are
+ * scanned, so a question raised earlier in a long message and left behind is
+ * not surfaced as open.
+ */
+export function workerQuestion(result: string | null): string | null {
+  if (result === null) return null;
+  const lines = result.split("\n").map((l) => l.trim()).filter((l) => l !== "");
+  const from = Math.max(0, lines.length - 3);
+  for (let i = lines.length - 1; i >= from; i--) {
+    if (lines[i]!.includes("?")) return oneLine(lines[i]!);
+  }
+  return null;
+}
+
+/** One worker's question, first under What changed, with how to answer it. */
+function workerQuestionLines(q: WorkerQuestion): string[] {
+  const asked = `- **Worker ${q.threadId} asked:** ${q.question}`;
+  if (q.state === "gone") return [asked, `  Its thread is gone, so \`bb thread tell\` cannot reach it: start a fresh worker to answer it, before anything else.`];
+  if (q.state === "revived") return [asked, `  It had been archived and is back now: answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+  return [asked, `  Answer it with \`bb thread tell ${q.threadId} <answer>\`, or escalate it, before anything else.`];
+}
 
 /**
  * Join a message's three parts within WAKE_MAX_CHARS, cutting the middle
@@ -73,6 +121,9 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
 
+/** A worker's final message that asked something, to answer before anything else. */
+export type WorkerQuestion = { threadId: string; question: string; state: "live" | "revived" | "gone" };
+
 export type WakeInput = {
   reason: WakeReason;
   binding: Binding;
@@ -83,10 +134,14 @@ export type WakeInput = {
   escalations: Escalation[];
   routedToMe: Array<{ escalation: Escalation; from: Binding }>;
   workers: Worker[];
+  /** Questions workers ended their last turn with; rendered ahead of other changes. */
+  workerQuestions: WorkerQuestion[];
   children: ChildView[];
   /** The worker model, as `bb thread spawn` flags. */
   workerFlags: string;
   changes: string[];
+  /** The binding's open "needs you" items, on the Stewards page. */
+  needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
   /** The project's adoption label. */
@@ -116,6 +171,8 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
+    const gate = prGate(e);
+    lines.push(`- Lane gate: ${gate.gateMet ? "met" : `not met — ${gate.missing}`}${gate.lane === null ? "" : ` (lane ${gate.lane})`}`);
     const latest = new Map<string, string>();
     for (const r of p.reviews) latest.set(r.author, `${r.state}${r.commit === null ? "" : ` at ${r.commit.slice(0, 7)}`}`);
     if (latest.size > 0) lines.push(`- Latest reviews: ${[...latest].map(([a, s]) => `${a} ${s}`).join("; ")}`);
@@ -148,8 +205,8 @@ function gateLines(input: WakeInput): string[] {
         ? ` It is asked for automatically once the checklist is met; do not escalate for it.`
         : ""
       : request.route === "me"
-        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it.`;
+        ? ` Requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`
+        : ` Requested from the project steward (${request.id}): wait for it; do not escalate for it. ${OPEN_REQUESTS_NOTE} Do not ask the user again; it is listed on the Stewards page.`;
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
@@ -188,9 +245,22 @@ export function formatWake(input: WakeInput): string {
     "    EOF",
     "",
     "Follow it up with `bb thread tell <id> <message>`. You are woken when a worker finishes, with its final message.",
+    "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
+    "",
+    "**Standing rules.**",
+    "",
+    ...STANDING_RULES,
   );
 
   out.push("", "## 2. Ready gate", "", ...gateLines(input));
+
+  const needs = input.needs ?? [];
+  out.push("", "## Waiting on you", "");
+  if (needs.length === 0) out.push("Nothing is filed for the user.");
+  else {
+    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${n.how === null ? "" : `\n  ${n.how}`}`);
+    out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
+  }
 
   out.push("", "## 3. Guidance, priority and holds", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
@@ -224,17 +294,113 @@ export function formatWake(input: WakeInput): string {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
     }
+    out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
 
   const snapshot = out.splice(0);
   out.push("", "## 5. What changed since your last turn", "");
-  if (input.changes.length === 0) out.push("Nothing actionable; this is a scheduled look.");
+  for (const q of input.workerQuestions) out.push(...workerQuestionLines(q));
+  if (input.changes.length === 0 && input.workerQuestions.length === 0) out.push("Nothing actionable; this is a scheduled look.");
   for (const c of input.changes) out.push(`- ${c}`);
 
   out.push(
     "",
     "---",
     `Before acting, look for evidence that you already did it (a signed comment, a worker, an open pull request, a review). End your turn with steward_report; requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+  );
+  return fit(head, snapshot, out);
+}
+
+export type OpsWakeInput = {
+  reason: WakeReason;
+  binding: Binding;
+  playbook: Playbook;
+  look: OpsLook;
+  /** The Linear team tickets are filed in. */
+  team: string | null;
+  label: string;
+  /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
+  autoAdopt: string[];
+  escalations: Escalation[];
+  changes: string[];
+};
+
+const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
+  adopted: "You have just been made the ops steward for this target. Read everything below, then act on what the look found.",
+  reopen: "This target is configured again and its binding has resumed. Re-read everything below as if new.",
+  nightly: "This is the nightly reconcile pass: check that every problem below is filed, and report.",
+};
+
+const CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
+
+function findingLines(f: OpsFinding, look: OpsLook): string[] {
+  const lines = [`#### ${f.fingerprint}`, ""];
+  const ticket = f.ticket === null ? "" : ` · ticket ${f.ticket}${f.ticketState === null ? "" : ` (${f.ticketState})`}${f.lastCommentedAt === null ? "" : `, your last word on it ${iso(f.lastCommentedAt)}`}`;
+  lines.push(`- ${f.summary}`);
+  lines.push(`- Workload ${f.workload}; pod${f.pods.length === 1 ? "" : "s"} ${f.pods.join(", ")}${f.container === null ? "" : `; container ${f.container}`}; first seen ${iso(f.firstSeenAt)}${ticket}`);
+  if (f.events.length > 0) lines.push("- Warning events, newest first:", ...f.events.map((e) => `  - ${e}`));
+  if (f.logs !== null) lines.push(`- Last log lines${f.previous ? " of the run that ended" : ""}:`, "", "```", ...(f.logs.length === 0 ? ["(empty)"] : f.logs), "```");
+  else if (f.container !== null) lines.push(look.logs === "not granted" ? "- Logs: kubectl may not read them here. Diagnose from status and events, and say so in the ticket." : "- Logs: not read.");
+  return [...lines, ""];
+}
+
+/** An ops binding's wake: instructions, steering, the look, what changed. */
+export function formatOpsWake(input: OpsWakeInput): string {
+  const { binding, playbook, look } = input;
+  const out: string[] = [];
+  out.push(`# Ops watch: ${look.target}`);
+  out.push(`Binding ${binding.id} · ops · playbook ${playbook.name}@${playbook.version} · looked ${iso(look.at)}`);
+  out.push("", `${binding.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${binding.threadId}.`} Use it wherever you name yourself, and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`);
+  const special = OPS_LIFECYCLE[input.reason];
+  if (special !== undefined) out.push("", `**${special}**`);
+
+  out.push("", "## 1. Instructions");
+  if (playbook.general !== "") out.push("", playbook.general);
+  const present = FINDING_CLASSES.filter((c) => look.findings.some((f) => f.class === c));
+  for (const c of present) {
+    const section = phaseInstructions(playbook, c);
+    if (section !== null) out.push("", `### ${c.charAt(0).toUpperCase()}${c.slice(1)}`, "", section);
+  }
+  out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
+  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
+  if (input.autoAdopt.length > 0) {
+    out.push(
+      `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,
+    );
+  }
+
+  out.push("", "## 2. Guidance, priority and holds", "");
+  if (binding.guidance.length === 0) out.push("No standing guidance.");
+  for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
+  out.push(`- Priority: ${binding.priority ?? "normal"}`);
+  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+
+  const head = out.splice(0);
+  out.push("", "## 3. The look", "");
+  out.push(`- ${look.pods} pod${look.pods === 1 ? "" : "s"}, ${look.healthy} healthy; logs: ${look.logs === "read" ? "read where a finding needed them" : look.logs === "not granted" ? "not granted on this target" : "none needed"}`);
+  if (look.deployments.length > 0) out.push(`- Deployments: ${look.deployments.map((d) => `${d.name} ${d.ready}/${d.desired}`).join(", ")}`);
+  for (const n of look.notes) out.push(`- ${n}`);
+  if (look.findings.length === 0) out.push("", "**All healthy: nothing is failing.** There is nothing to file or comment on: report that with steward_report (actor other) and end the turn.");
+  for (const c of present) {
+    out.push("", `### ${CLASS_TITLES[c]}`, "");
+    for (const f of look.findings.filter((x) => x.class === c)) out.push(...findingLines(f, look));
+  }
+  if (look.warnings.length > 0) out.push("", "### Other warning events", "", ...look.warnings.map((w) => `- ${w}`));
+  const open = input.escalations.filter((x) => x.status === "open");
+  if (open.length > 0) {
+    out.push("", "### Open escalations", "");
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+  }
+
+  const snapshot = out.splice(0);
+  out.push("", "## 4. What changed since your last turn", "");
+  if (input.changes.length === 0) out.push("Nothing new; this is a scheduled look.");
+  for (const c of input.changes) out.push(`- ${c}`);
+  out.push(
+    "",
+    "---",
+    "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
   );
   return fit(head, snapshot, out);
 }
@@ -252,10 +418,14 @@ export function formatProjectWake(input: {
   bigDecisions: string[];
   /** Questions open with the user, from the record, with the binding each is about. */
   questions?: Array<{ question: Question; about: Binding | null }>;
+  /** Open `needs` items, with the binding each is about. */
+  needs?: Array<{ need: Need; binding: Binding }>;
   /** With digestDue: the records the digest is written from. */
   records?: DigestRecords;
   /** The project's nightly time zone, which dates are given in; UTC when absent. */
   timeZone?: string;
+  /** The adoption label, for adopting what an ops steward filed. */
+  label?: string;
 }): string {
   const day = dayIn(input.timeZone ?? "UTC");
   const out: string[] = [`# Project steward: ${input.reason}`, ""];
@@ -275,9 +445,15 @@ export function formatProjectWake(input: {
       ...input.bigDecisions.map((d) => `- ${d}`),
       "",
     );
+    if (input.routed.some((r) => r.from.kind === "ops")) {
+      out.push(
+        `An escalation from an ops steward is a ticket it filed about production, with a priority and a recommendation. Adopt it when the project's guidance says the problem is worth working: add the label \`${input.label ?? "bb-managed"}\` and move it to Todo (linear_update_issue), and a ticket steward picks it up; then resolve the escalation with guidance saying so. Otherwise decline: resolve it with guidance giving the reason.`,
+        "",
+      );
+    }
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
       out.push(
-        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, which closes the request; or decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
         "",
       );
     }
@@ -300,6 +476,12 @@ export function formatProjectWake(input: {
       'This is the record: do not ask one of these again, and do not tell the user one is open once it is gone from this list. When the user answers one — here, on the stewards page, or anywhere else — close it with steward_update { resolve: "<question id>", answer }; for a forwarded escalation that also resolves the escalation, and the reverse.',
       "",
     );
+  }
+  const needs = input.needs ?? [];
+  if (needs.length > 0) {
+    out.push("## Needs you", "");
+    for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`);
+    out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
   }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
@@ -422,10 +604,6 @@ export function formatSessionWake(input: {
 
 /** The calendar date of a moment in a time zone, so "asked" and "since" match the user's day. */
 const dayIn = (timeZone: string) => (ms: number) => localParts(ms, timeZone).date;
-const oneLine = (text: string, max = 400) => {
-  const flat = text.replace(/\s+/gu, " ").trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
-};
 const PREVIOUS_DIGEST_CHARS = 6000;
 const RECORD_LINES = 50;
 
@@ -443,6 +621,8 @@ export type DigestRecords = {
   answered: Question[];
   /** Open escalations with the user: forwarded ones and approval requests. */
   withUser: Array<{ escalation: Escalation; from: Binding }>;
+  /** Open `needs` items filed by the plugin or a steward, for the digest. */
+  needs?: Array<{ need: Need; binding: Binding }>;
   /** Open `stuck` escalations, wherever they are. */
   stuck: Array<{ escalation: Escalation; from: Binding }>;
   /** Open bindings on hold. */
@@ -484,6 +664,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
   const asked = new Set(questions.map(({ question: q }) => q.escalationId).filter((id) => id !== null));
   const waiting = [
     ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}`),
+    ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`),
     ...r.withUser
       .filter(({ escalation: x }) => !asked.has(x.id))
       .map(({ escalation: x, from }) =>

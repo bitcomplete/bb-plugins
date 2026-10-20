@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, resolveChecklistItem, specHash, stuckDue, unheardWait } from "./reconcile.js";
+import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -16,7 +16,7 @@ const reviews = (() => {
   return p.value;
 })();
 
-const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerRunning: false };
+const ctx = { own: new Set(["thr_s", "thr_w"]), stewardThreadId: "thr_s", approved: false, cursor: "2026-10-01T12:00:00Z", workerInFlight: false };
 const actionable = (cs: Array<{ text: string; actionable: boolean }>) => cs.filter((c) => c.actionable).map((c) => c.text);
 
 describe("what changed", () => {
@@ -63,7 +63,7 @@ describe("what changed", () => {
   it("while a worker runs, its own work on a pull request is not news, and people still are", () => {
     // HUB-183 on bithub: the worker pushes, edits the description, posts as
     // the viewer (unsigned, and its reviewer too) and waits for checks.
-    const running = { ...ctx, workerRunning: true };
+    const running = { ...ctx, workerInFlight: true };
     const before = { entity: issue(), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
     const busy = {
       entity: issue(),
@@ -107,6 +107,74 @@ describe("what changed", () => {
   });
 });
 
+describe("a worker in flight between its turns (BB-11)", () => {
+  const worker = (status: "running" | "finished" | "failed" | "stopped") => ({ status });
+
+  it("counts a worker in flight from spawn until it is stopped, failed or archived", () => {
+    expect(workerInFlight(worker("running"))).toBe(true);
+    // Its turn ending is a pause, not a finish: it is woken again to push.
+    expect(workerInFlight(worker("finished"))).toBe(true);
+    expect(workerInFlight(worker("failed"))).toBe(false);
+    expect(workerInFlight(worker("stopped"))).toBe(false);
+    expect(anyWorkerInFlight([worker("stopped"), worker("finished")])).toBe(true);
+    expect(anyWorkerInFlight([worker("stopped"), worker("failed")])).toBe(false);
+    expect(anyWorkerInFlight([])).toBe(false);
+  });
+
+  it("keeps the reviewer's marker comments for the worker, and wakes on a lane change", () => {
+    const marker = (round: number, lane: string) => comment({ id: `m${round}`, author: "jane", body: `<!-- bb-review round=${round} sha=abc${round} verdict=approved lane=${lane} -->\n\nLGTM.`, createdAt: `2026-10-02T0${round}:00:00Z` });
+    expect(reviewMarker(marker(1, "no-review").body)).toEqual({ round: 1, sha: "abc1", verdict: "approved", lane: "no-review" });
+    expect(reviewMarker("just a comment")).toBeNull();
+    // A marker is a marker only on the first line.
+    expect(reviewMarker("Hello\n<!-- bb-review round=1 sha=abc verdict=approved lane=no-review -->")).toBeNull();
+
+    const before = { entity: pull({ author: "jane" }), pulls: [] };
+    const after = { entity: pull({ author: "jane", comments: [marker(1, "no-review")] }), pulls: [] };
+    // In flight, the round is the worker's business.
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // A round that changes the lane is not.
+    const changed = { entity: pull({ author: "jane", comments: [marker(1, "no-review"), marker(2, "owner-reviewed")] }), pulls: [] };
+    expect(actionable(diffObserved(after, changed, { ...ctx, workerInFlight: true }))).toEqual(["Review lane: no-review → owner-reviewed"]);
+    expect(markerLaneChange(after.entity.comments, changed.entity.comments)).toEqual({ from: "no-review", to: "owner-reviewed" });
+    // Once no worker is in flight, the same markers are ordinary comment news.
+    expect(actionable(diffObserved(before, after, ctx))).toEqual(["1 new comment from jane"]);
+  });
+
+  it("covers the BB-11 sequence: a worker's own PR activity stays quiet until it finishes", () => {
+    // Worker spawns, goes idle waiting (still in flight), the reviewer posts,
+    // checks finish, the worker pushes; only the finish is actionable.
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    const before = { entity: issue({ state: "In Progress", stateType: "started", ...linked }), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
+    // Its turn ended to wait, so its status is `finished`; it is still in flight.
+    expect(anyWorkerInFlight([worker("finished")])).toBe(true);
+    const reviewed = {
+      entity: issue({ state: "In Progress", stateType: "started", ...linked }),
+      pulls: [pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->", createdAt: "2026-10-02T00:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } })],
+    };
+    expect(actionable(diffObserved(before, reviewed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // The worker pushes (woken again), still in flight.
+    const pushed = { entity: reviewed.entity, pulls: [pull({ author: "jane", comments: reviewed.pulls[0]!.comments }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } })] };
+    expect(actionable(diffObserved(reviewed, pushed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    // Nothing was actionable while it was in flight, so the steward is woken
+    // once, at the finish, with all of it as quiet notes.
+    const changes = diffObserved(before, pushed, { ...ctx, workerInFlight: anyWorkerInFlight([worker("stopped")]) });
+    expect(actionable(changes)).toEqual(["acme/web#7: Checks finished: success", "acme/web#7: 1 new comment from jane"]);
+    expect(changes.map((c) => c.text)).toContain("acme/web#7: Pushed bbbbbbb by jane");
+  });
+
+  it("compacts when the transcript is over the limit or the wake would push it over", () => {
+    expect(compactDue(null, 120_000, 0)).toBe(false);
+    expect(compactDue(90_000, 120_000, 0)).toBe(false);
+    expect(compactDue(121_000, 120_000, 0)).toBe(true);
+    // A 115k-token steward and a 30k-character wake (the wake cap) overshoot.
+    expect(compactDue(115_000, 120_000, 30_000)).toBe(true);
+    expect(compactDue(90_000, 120_000, 30_000)).toBe(false);
+    expect(compactDue(90_000, 120_000, 1_000)).toBe(false);
+    // 0 leaves compaction to the provider.
+    expect(compactDue(1_000_000, 0, 1_000_000)).toBe(false);
+  });
+});
+
 describe("waits nobody hears", () => {
   const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
   const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null }];
@@ -125,6 +193,28 @@ describe("waits nobody hears", () => {
     expect(own(issue(), signed("New scope."))).toMatchObject({ own: true, actionable: true });
     expect(own(signed("New scope."), signed("Newer scope, by hand.")).own).toBeUndefined();
     expect(own(issue(), issue({ description: "By hand." })).own).toBeUndefined();
+  });
+});
+
+describe("approval words", () => {
+  it("tells approval, refusal and ambiguity apart", () => {
+    for (const text of ["LGTM", "Approved", "approved, it is fully specified", "ship it", "go ahead", "Looks good", "yes", "signed off"]) expect(classifyApproval(text), text).toBe("approve");
+    // Approving words with a bare "no" beside them still approve.
+    for (const text of ["LGTM, no concerns from me", "Ship it, no further changes needed", "Approved, no notes"]) expect(classifyApproval(text), text).toBe("approve");
+    for (const text of ["no", "No.", "not approved", "don't ship it", "declined", "reject", "changes needed", "don't", "do not approve", "No, not yet", "won't approve until the migration is named", "can't approve without SSO", "cannot approve this spec yet", "shouldn't approve until naming is fixed", "never approve this as-is"]) expect(classifyApproval(text), text).toBe("decline");
+    // A word ending in "nt" is not a contraction: wanting to approve approves.
+    expect(classifyApproval("I want to approve")).toBe("approve");
+    for (const text of ["", "maybe", "name the migration in the spec", "what about SSO?"]) expect(classifyApproval(text), text).toBe("ambiguous");
+  });
+
+  it("flags a report that asks for an approval already open, and only that", () => {
+    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "me" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+    const open = [{ kind: "approval" } as never];
+    expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), open)).toMatch(/already open/u);
+    // Waiting on the request, or on the project steward, is not asking again.
+    expect(asksForOpenApproval(status("Spec posted.", "Wait for the project steward's approval"), open)).toBeNull();
+    expect(asksForOpenApproval(status("Approval requested from the user; waiting.", "Wait for the user to approve the spec"), open)).toBeNull();
+    expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), [])).toBeNull();
   });
 });
 
@@ -188,6 +278,22 @@ describe("the ready gate", () => {
     expect(specHash(issue({ comments: [comment({ body: "Spec: mine" })] }), "thr_s")).toBe(hash);
     expect(specHash(issue({ description: "Users cannot log in.\n\n_— from bb thread thr_s_" }), "thr_s")).toBe(hash);
   });
+
+  it("counts a spec comment the user wrote, and tells it apart from the steward's", () => {
+    const base = specHash(issue(), "thr_s");
+    const user = (tid: string) => tid === "thr_user";
+    const amended = issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_user", createdAt: "2026-10-14T16:00:00Z" })] });
+    // Without the predicate the signing thread is unknown, so it is not spec.
+    expect(specHash(amended, "thr_s")).toBe(base);
+    expect(specHash(amended, "thr_s", user)).not.toBe(base);
+  });
+
+  it("marks a spec comment the user wrote as the user's, and wakes for it", () => {
+    const before = { entity: issue(), pulls: [] };
+    const after = { entity: issue({ comments: [comment({ id: "u1", author: "Jane", body: "**Spec:** narrower scope", signedBy: "thr_user" })] }), pulls: [] };
+    const changes = diffObserved(before, after, { ...ctx, userThread: (tid) => tid === "thr_user" });
+    expect(changes).toContainEqual({ text: "Spec comment added by the user", actionable: true, byUser: true });
+  });
 });
 
 describe("lifecycle", () => {
@@ -232,5 +338,49 @@ describe("the stuck backstop", () => {
     expect(stuckDue(b, tickets, [], 3 * 86_400_000)).toBe(2 * 86_400_000);
     expect(stuckDue({ ...b, phase: "Todo" }, tickets, [], 30 * 86_400_000)).toBeNull();
     expect(stuckDue(b, tickets, [{ kind: "stuck" } as never], 3 * 86_400_000)).toBeNull();
+  });
+});
+
+describe("the pull request gate (build-tickets)", () => {
+  const head = "aaaaaaa1";
+  const marker = (sha: string, verdict: string, lane: string) =>
+    comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+  const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const green = { checks: { state: "success", failing: [] } };
+
+  it("is met with the reviewer's approval on the head and green checks in the no-review lane", () => {
+    const gate = prGate(pull({ comments: [marker(head, "approved", "no-review")] }, green));
+    expect(gate).toMatchObject({ lane: "no-review", checksGreen: true, ownerApproved: false, gateMet: true, needsOwnerApproval: false, missing: null });
+  });
+
+  it("waits on the owner in the owner-reviewed lane, and closes once they approve", () => {
+    const waiting = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green));
+    expect(waiting).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    const approved = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green));
+    expect(approved).toMatchObject({ gateMet: true, ownerApproved: true, needsOwnerApproval: false });
+  });
+
+  it("is not met while the marker is on another sha, the verdict is not approved, or checks are not green", () => {
+    expect(prGate(pull({ comments: [marker("bbbbbbb2", "approved", "no-review")] }, green)).missing).toMatch(/reviewer round 1 is on bbbbbbb; the head is aaaaaaa/u);
+    expect(prGate(pull({ comments: [marker(head, "changes-requested", "no-review")] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
+    expect(prGate(pull({ comments: [marker(head, "approved", "no-review")] }, { checks: { state: "pending", failing: [] } })).missing).toMatch(/checks pending/u);
+    expect(prGate(pull({ comments: [] })).missing).toMatch(/no reviewer round/u);
+  });
+
+  it("takes an APPROVED review by the connected user, but never a signed comment", () => {
+    const review = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: "2026-10-14T17:00:00Z", commit: head }] });
+    expect(ownerApproval(review)).toMatchObject({ approved: true });
+    const signed = pull({ comments: [marker(head, "approved", "owner-reviewed"), comment({ author: "jane", body: "LGTM", signedBy: "thr_w" })] }, green);
+    expect(ownerApproval(signed).approved).toBe(false);
+  });
+});
+
+describe("a blockedOn naming the user", () => {
+  it("is refused without an item and allowed with one", () => {
+    expect(namesUserAsBlocker("the user's answer on scope")).toBe(true);
+    expect(namesUserAsBlocker("the owner's approval")).toBe(true);
+    expect(namesUserAsBlocker("a human has to install it")).toBe(true);
+    expect(namesUserAsBlocker("the project steward's call")).toBe(false);
+    expect(namesUserAsBlocker("sam's review")).toBe(false);
   });
 });
