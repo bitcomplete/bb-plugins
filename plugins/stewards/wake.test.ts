@@ -1,7 +1,11 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
+import { parsePlaybook } from "./config.js";
+import { comment, issue, pull } from "./fixtures.js";
+import { gateState } from "./reconcile.js";
 import { MIGRATIONS, createStore } from "./store.js";
-import { formatProjectWake, type DigestRecords } from "./wake.js";
+import { LINEAR_TICKETS } from "./templates.js";
+import { formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
 const DAY = 86_400_000;
@@ -15,6 +19,90 @@ function world() {
 }
 
 const status = (summary: string) => ({ phase: "In Progress", summary, nextAction: "Open the PR", actor: "steward" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T });
+
+function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
+  const { s, bind } = world();
+  const binding = over.binding ?? bind("ENG-12");
+  const parsed = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+  if (!parsed.ok) throw new Error(parsed.error);
+  const playbook = parsed.value;
+  return {
+    reason: "changed",
+    binding,
+    playbook,
+    observed: { entity: issue(), pulls: [] },
+    gate: gateState(playbook, binding.ready, ""),
+    escalations: [],
+    routedToMe: [],
+    workers: [],
+    workerQuestions: [],
+    children: [],
+    workerFlags: "--provider claude-code --model claude-opus-5-5 --reasoning-level high",
+    changes: [],
+    own: new Set(),
+    label: "bb-managed",
+    now: T,
+    ...over,
+  };
+}
+
+describe("a steward's wake", () => {
+  it("carries the standing rules: credentials as provide-secret needs, one ask, and build-time decisions", () => {
+    const wake = formatWake(wakeInput());
+    expect(wake).toContain("provide-secret");
+    expect(wake).toContain("writeEnv");
+    expect(wake).toMatch(/never paste a secret/iu);
+    expect(wake).toContain("One ask per reply");
+    expect(wake).toContain("escalated as a `decision` in the same turn");
+  });
+
+  it("names the worker and reviewer models as flags that are not the steward's to choose", () => {
+    const wake = formatWake(wakeInput());
+    expect(wake).toContain("--provider claude-code --model claude-opus-5-5 --reasoning-level high");
+    expect(wake).toContain("your workers' and reviewers' models");
+    expect(wake).toContain("not yours to choose");
+  });
+
+  it("lists an open escalation and approval request as on the Stewards page, not to be asked again", () => {
+    const { s, bind } = world();
+    const binding = bind("ENG-12");
+    const decision = s.escalate({ bindingId: binding.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null });
+    const approval = s.escalate({ bindingId: binding.id, kind: "approval", question: "Approve the spec?", meanwhile: "Waiting.", route: "me", recommendation: null });
+    const wake = formatWake(wakeInput({ binding, escalations: [decision, approval] }));
+    const note = "These are listed for the user on the Stewards page. Do not ask for them in your reply.";
+    // Once under the open escalations, once with the approval request in the gate.
+    expect(wake.split(note)).toHaveLength(3);
+    expect(wake).toContain("counts like a missed report toward `stuck`");
+  });
+
+  it("names the reviewer's sha and the head when the approval is on an earlier commit", () => {
+    const marker = comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=bbbbbbb2 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-18T04:00:00Z" });
+    const entity = pull({ comments: [marker] }, { headSha: "aaaaaaa1", checks: { state: "success", failing: [] } });
+    const wake = formatWake(wakeInput({ observed: { entity, pulls: [] } }));
+    expect(wake).toContain("- Lane gate: met (reviewer approved bbbbbbb, head aaaaaaa, checks green, lane no-review)");
+  });
+
+  it("takes a worker's closing question, but not one it resolved later in the message", () => {
+    expect(workerQuestion("Pushed the fix.\nShould I bring the reviewer back?")).toBe("Should I bring the reviewer back?");
+    // A question buried above the last few lines is not what the message ended with.
+    expect(workerQuestion("Should I open a follow-up?\nNever mind, I did it.\nPushed.\nDone and verified.")).toBeNull();
+    expect(workerQuestion("No question here.")).toBeNull();
+    expect(workerQuestion(null)).toBeNull();
+  });
+
+  it("names a worker's question ahead of every other change, with how to answer", () => {
+    const wake = formatWake(
+      wakeInput({
+        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T }],
+        workerQuestions: [{ threadId: "thr_w1", question: "Should I bring the reviewer back?", state: "live" }],
+        changes: ["1 new comment from Sam"],
+      }),
+    );
+    expect(wake).toContain("- **Worker thr_w1 asked:** Should I bring the reviewer back?");
+    expect(wake).toContain("Answer it with `bb thread tell thr_w1 <answer>`, or escalate it, before anything else.");
+    expect(wake.indexOf("Worker thr_w1 asked:")).toBeLessThan(wake.indexOf("1 new comment from Sam"));
+  });
+});
 
 describe("the nightly prompt", () => {
   it("is assembled from the records: previous digest with its date, open questions, what moved, waiting on you, stuck", () => {

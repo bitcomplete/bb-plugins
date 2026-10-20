@@ -57,3 +57,43 @@ export const comment = (over: Partial<SnapshotComment> = {}): SnapshotComment =>
   signedBy: null,
   ...over,
 });
+
+/** A Deployment's pod as the Kubernetes API lists it, its one container in a crash loop. */
+export const crashingPod = (name = "bb-gate-router-6d4f9c7b8-x2k4q", over: { restarts?: number; exitCode?: number; finishedAt?: string } = {}) => ({
+  metadata: {
+    name,
+    labels: { app: "bb-gate-router", "pod-template-hash": "6d4f9c7b8" },
+    ownerReferences: [{ kind: "ReplicaSet", name: "bb-gate-router-6d4f9c7b8", controller: true }],
+  },
+  status: {
+    phase: "Running",
+    conditions: [{ type: "Ready", status: "False", lastTransitionTime: "2026-10-14T14:00:00Z" }],
+    containerStatuses: [
+      {
+        name: "router",
+        ready: false,
+        restartCount: over.restarts ?? 7,
+        state: { waiting: { reason: "CrashLoopBackOff", message: "back-off 5m0s restarting failed container" } },
+        lastState: { terminated: { reason: "Error", exitCode: over.exitCode ?? 1, finishedAt: over.finishedAt ?? "2026-10-14T14:55:00Z" } },
+      },
+    ],
+  },
+});
+
+export const healthyPod = (name = "bb-gate-hooks-7f8d9-abcde") => ({
+  metadata: { name, labels: { "pod-template-hash": "7f8d9" }, ownerReferences: [{ kind: "ReplicaSet", name: "bb-gate-hooks-7f8d9", controller: true }] },
+  status: {
+    phase: "Running",
+    conditions: [{ type: "Ready", status: "True", lastTransitionTime: "2026-10-14T10:00:00Z" }],
+    containerStatuses: [{ name: "hooks", ready: true, restartCount: 0, state: { running: { startedAt: "2026-10-14T10:00:00Z" } }, lastState: {} }],
+  },
+});
+
+export const warningEvent = (pod: string, reason = "BackOff", message = "Back-off restarting failed container router") => ({
+  involvedObject: { kind: "Pod", name: pod },
+  type: "Warning",
+  reason,
+  message,
+  count: 12,
+  lastTimestamp: "2026-10-14T14:58:00Z",
+});

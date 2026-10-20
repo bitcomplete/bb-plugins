@@ -386,7 +386,12 @@ function BoardPage({ subPath }: { subPath: string }) {
 
 function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
   const now = Date.now();
-  const waiting = b.questions.length + b.withUser.length;
+  // An escalation a need answers is shown as that need's row, not as the raw
+  // escalation: a forwarded approval is answered with Approve/Decline, not by
+  // "approve or decline in its steward's thread".
+  const covered = new Set(b.needs.map((n) => n.escalationId).filter((id): id is string => id !== null));
+  const withUser = b.withUser.filter((x) => !covered.has(x.id));
+  const waiting = b.questions.length + withUser.length + b.needs.length;
   return (
     <>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -412,7 +417,7 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
             {b.questions.map((q) => (
               <QuestionRow key={q.id} question={q} now={now} onClosed={refetch} />
             ))}
-            {b.withUser.map((x) => (
+            {withUser.map((x) => (
               <li key={x.id} className="flex flex-col gap-1 p-3">
                 <p className="flex flex-wrap items-center gap-2">
                   <EntityLink entityKey={x.key} url={x.url} />
@@ -435,6 +440,33 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
                       <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
                     </>
                   ) : null}
+                </p>
+              </li>
+            ))}
+            {b.needs.map((n) => (
+              <NeedRow key={n.id} need={n} now={now} onDone={refetch} />
+            ))}
+          </List>
+        )}
+      </Section>
+
+      <Section title="Lessons" count={b.lessons.length}>
+        {b.lessons.length === 0 ? (
+          <None>No lessons are waiting to be landed.</None>
+        ) : (
+          <List>
+            {b.lessons.map((l) => (
+              <li key={l.id} className="flex flex-col gap-1 p-3">
+                <p className="flex flex-wrap items-center gap-2">
+                  <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
+                  <span className="font-medium">{l.file}</span>
+                  {l.key !== null ? <EntityLink entityKey={l.key} url={null} /> : null}
+                  <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
+                </p>
+                <p>{l.text}</p>
+                <p className="text-xs text-muted-foreground">
+                  {l.scope === "boundary" ? "Waiting on your Merge or Drop above." : "The project steward applies, commits and self-merges this."}
+                  {l.note !== null ? ` Last attempt: ${l.note}` : ""}
                 </p>
               </li>
             ))}
@@ -522,13 +554,126 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
   );
 }
 
+/**
+ * One "needs you" item with its buttons. A button is offered only when the
+ * server can verify the item's preconditions now; otherwise the item says why
+ * it is not actionable yet. Every action runs on the server, as the user.
+ */
+function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: number; onDone: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const [note, setNote] = useState("");
+  // With choices, the text box answers a choice's note until Other… turns it
+  // into the free-text answer.
+  const [other, setOther] = useState(false);
+  const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  const act = (action: "approve" | "decline" | "done" | "merge" | "provide" | "choose", choice?: string) => {
+    setState("running");
+    rpc
+      .call("stewardsNeedAction", { needId: n.id, action, note: note.trim() === "" ? null : note.trim(), ...(choice === undefined ? {} : { choice }) })
+      .then(
+        (r) => {
+          if (!r.ok) return setState({ error: r.message });
+          onDone();
+          if (r.threadId !== null && r.threadId !== undefined) navigate.toThread(r.threadId);
+        },
+        (e: unknown) => setState({ error: message(e) }),
+      );
+  };
+  const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
+  const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
+  const choices = n.kind === "decide" ? n.choices : [];
+  // A lesson's Merge/Drop are its only choices: no free-text "Other…".
+  const lesson = n.lessonId !== null;
+  const freeText = choices.length === 0 || other;
+  return (
+    <li className="flex flex-col gap-2 p-3">
+      <p className="flex flex-wrap items-center gap-2">
+        <EntityLink entityKey={n.key} url={n.url} />
+        <Badge tone="bad">{n.kind}</Badge>
+        <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
+      </p>
+      <p>{n.what}</p>
+      {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
+      {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
+      {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+      {takesNote && !lesson ? (
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          rows={1}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : freeText ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          aria-label={`Note for: ${n.what}`}
+          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        {n.kind === "approve-spec" ? (
+          <>
+            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
+              Approve
+            </button>
+            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => act("decline")}>
+              Decline
+            </button>
+          </>
+        ) : n.kind === "approve-pr" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
+            Approve
+          </button>
+        ) : n.kind === "merge" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("merge")}>
+            Merge
+          </button>
+        ) : n.kind === "provide-secret" ? (
+          <>
+            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
+              Provide
+            </button>
+            <button type="button" disabled={state === "running"} className={secondary} onClick={() => act("done")}>
+              Done
+            </button>
+          </>
+        ) : n.kind === "configure" ? (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
+            Done
+          </button>
+        ) : choices.length > 0 && !other ? (
+          <>
+            {choices.map((choice) => (
+              <button key={choice} type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("choose", choice)}>
+                {choice}
+              </button>
+            ))}
+            {lesson ? null : (
+              <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => setOther(true)}>
+                Other…
+              </button>
+            )}
+          </>
+        ) : (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
+            Answer
+          </button>
+        )}
+        {n.threadId !== null ? <ThreadLink threadId={n.threadId}>{n.kind === "provide-secret" ? "Open the requester" : "Open the worker"}</ThreadLink> : null}
+        {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
+      </div>
+    </li>
+  );
+}
+
 function QuestionRow({ question: q, now, onClosed }: { question: Board["questions"][number]; now: number; onClosed: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [answer, setAnswer] = useState("");
+  // With choices, the text box is the choice's note until Other… turns it
+  // into the free-text answer.
+  const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "closing" | { error: string }>("idle");
-  const close = () => {
+  const close = (choice?: string) => {
     setState("closing");
-    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim() }).then(
+    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim(), ...(choice === undefined ? {} : { choice }) }).then(
       (r) => {
         if (r.ok) onClosed();
         else setState({ error: r.message });
@@ -536,6 +681,7 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
       (e: unknown) => setState({ error: message(e) }),
     );
   };
+  const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
     <li className="flex flex-col gap-2 p-3">
       <p className="flex flex-wrap items-center gap-2">
@@ -550,13 +696,26 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
           value={answer}
           onChange={(e) => setAnswer(e.target.value)}
           rows={1}
-          placeholder="Your answer (optional)"
+          placeholder={q.choices.length > 0 && !other ? "Note (optional)" : "Your answer (optional)"}
           aria-label={`Answer to: ${q.question}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
-        <button type="button" disabled={state === "closing"} className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50" onClick={close}>
-          {state === "closing" ? "Closing…" : answer.trim() === "" ? "Close" : "Answer and close"}
-        </button>
+        {q.choices.length > 0 && !other ? (
+          <>
+            {q.choices.map((choice) => (
+              <button key={choice} type="button" disabled={state === "closing"} className={button} onClick={() => close(choice)}>
+                {choice}
+              </button>
+            ))}
+            <button type="button" disabled={state === "closing"} className={button} onClick={() => setOther(true)}>
+              Other…
+            </button>
+          </>
+        ) : (
+          <button type="button" disabled={state === "closing"} className={button} onClick={() => close()}>
+            {state === "closing" ? "Closing…" : "Answer"}
+          </button>
+        )}
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
     </li>

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createHooksLoop, HooksRequestError, readSse, SseParser, StreamIdleError, subscribe, type Lease, type Rejection } from "./hooks-client.js";
+import { createHooksLoop, HooksRequestError, postActivity, readSse, SseParser, StreamIdleError, subscribe, type IdentifyResponse, type Lease, type Rejection, type SessionEvent } from "./hooks-client.js";
 
 const BASE = "http://hooks.test:8081";
 const MINUTE = 60_000;
@@ -10,10 +10,15 @@ function fakeHooks() {
   type Stream = { send(text: string): void; end(): void; closed: boolean };
   const streams: Stream[] = [];
   const subscribes: Array<{ connection: string; source: string; token: string; watches: Array<{ kind: string; id: string }> }> = [];
+  const identifies: Array<{ connection: string; source: string; token: string; teams: string[] }> = [];
+  const replies: Array<{ url: string; body: Record<string, unknown>; headers: Record<string, string> }> = [];
   const state = {
     eventsStatus: 200,
     silent: false,
     answer: (body: (typeof subscribes)[number]): Response => Response.json({ leases: body.watches.map((w) => ({ ...w, unit: "team-1", expiresAt: "2026-10-10T18:00:00Z" })), rejected: [] }),
+    /** Null: the service predates agent sessions and has no /v1/identify. */
+    identify: ((body: (typeof identifies)[number]): Response => Response.json({ user: { id: "u1", name: "Jane" }, teams: body.teams, rejected: [], expiresAt: "2026-10-10T18:00:00Z" })) as ((body: (typeof identifies)[number]) => Response) | null,
+    reply: (): Response => Response.json({ activity: "act-1" }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
@@ -52,12 +57,35 @@ function fakeHooks() {
       subscribes.push(body);
       return state.answer(body);
     }
+    if (u === `${BASE}/v1/identify` && state.identify !== null) {
+      const body = JSON.parse(String(init?.body)) as (typeof identifies)[number];
+      identifies.push(body);
+      return state.identify(body);
+    }
+    if (u.startsWith(`${BASE}/v1/linear/sessions/`)) {
+      replies.push({ url: u, body: JSON.parse(String(init?.body)) as Record<string, unknown>, headers: { ...(init?.headers as Record<string, string>) } });
+      return state.reply();
+    }
     return new Response("not found", { status: 404 });
   }) as unknown as typeof fetch;
   const hello = (connection: string, leaseSeconds = 3600) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds })}\n\n`;
   const doorbell = (id: string, over: Record<string, unknown> = {}) =>
     `id: 1\nevent: doorbell\ndata: ${JSON.stringify({ source: "linear", kind: "issue", id, unit: "team-1", action: "update", at: "2026-10-10T17:02:11Z", ...over })}\n\n`;
-  return { fetchImpl, streams, subscribes, state, hello, doorbell, last: () => streams.at(-1)! };
+  const session = (over: Record<string, unknown> = {}) =>
+    `id: 2\nevent: session\ndata: ${JSON.stringify({
+      source: "linear",
+      session: "sess-1",
+      action: "created",
+      issue: { id: "i-1", identifier: "ENG-1", team: "t-eng", teamKey: "ENG" },
+      asker: { id: "u2", name: "Carol" },
+      owner: { id: "u1", name: "Jane" },
+      fromOwner: false,
+      routedAs: "assignee",
+      comment: { text: "@bb build this", untrusted: true },
+      at: "2026-10-10T17:02:11Z",
+      ...over,
+    })}\n\n`;
+  return { fetchImpl, streams, subscribes, identifies, replies, state, hello, doorbell, session, last: () => streams.at(-1)! };
 }
 
 describe("SSE parsing", () => {
@@ -160,8 +188,13 @@ describe("the loop", () => {
     await vi.advanceTimersByTimeAsync(ms);
   };
 
-  function start(hooks: ReturnType<typeof fakeHooks>, over: { leases?: () => Lease[]; token?: (account?: string) => Promise<string>; idleMs?: number } = {}) {
+  function start(
+    hooks: ReturnType<typeof fakeHooks>,
+    over: { leases?: () => Lease[]; token?: (account?: string) => Promise<string>; idleMs?: number; identity?: () => { account?: string; teams: string[] } | null } = {},
+  ) {
     const logs: string[] = [];
+    const sessions: SessionEvent[] = [];
+    const identities: IdentifyResponse[] = [];
     const sweeps: string[] = [];
     const doorbells: string[] = [];
     const units: Array<string | null> = [];
@@ -195,11 +228,14 @@ describe("the loop", () => {
       sweep: async (reason) => {
         sweeps.push(reason);
       },
+      ...(over.identity === undefined ? {} : { identity: over.identity }),
+      onIdentified: (who) => void identities.push(who),
+      onSession: (event) => void sessions.push(event),
       timing: { backoffMinMs: 1000, backoffMaxMs: 8000, ...(over.idleMs === undefined ? {} : { idleMs: over.idleMs }) },
     });
     const controller = new AbortController();
     const done = loop.run(controller.signal);
-    return { loop, logs, sweeps, doorbells, units, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
+    return { loop, logs, sweeps, doorbells, units, rejected, sessions, identities, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
   }
 
   it("subscribes every watch on hello with the current token, sweeps, then rings on doorbells for issues only", async () => {
@@ -477,5 +513,119 @@ describe("the loop", () => {
     expect(s.logs.some((l) => l.startsWith("warn") && l.includes("Connect Linear again"))).toBe(true);
     s.controller.abort();
     await s.done;
+  });
+
+  describe("agent sessions", () => {
+    it("identifies on hello and at every renewal with the current token and the teams, never logging the token", async () => {
+      const hooks = fakeHooks();
+      let teams = ["t-eng"];
+      const s = start(hooks, { identity: () => ({ teams }) });
+      await tick();
+      hooks.last().send(hooks.hello("c_1", 600));
+      await tick();
+      expect(hooks.identifies).toEqual([{ connection: "c_1", source: "linear", token: "tok-1", teams: ["t-eng"] }]);
+      expect(s.identities.map((i) => i.user.name)).toEqual(["Jane"]);
+
+      // The teams changed: identify again now, replacing the set.
+      teams = ["t-eng", "t-ops"];
+      await s.loop.reidentify();
+      expect(hooks.identifies.at(-1)).toMatchObject({ connection: "c_1", teams: ["t-eng", "t-ops"] });
+
+      s.setToken("tok-2");
+      await tick(300_000);
+      expect(hooks.identifies.at(-1)).toMatchObject({ token: "tok-2" });
+      expect(hooks.identifies).toHaveLength(3);
+      expect(s.logs.join("\n")).not.toMatch(/tok-/u);
+      s.controller.abort();
+      await s.done;
+    });
+
+    it("refreshes the token once when Linear refused it, and identifies nobody when there is no identity", async () => {
+      const hooks = fakeHooks();
+      hooks.state.identify = (body) => (body.token === "tok-1" ? new Response("token refused", { status: 401 }) : Response.json({ user: { id: "u1", name: "Jane" }, teams: [], rejected: [] }));
+      const s = start(hooks, { identity: () => ({ teams: [] }) });
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      await tick();
+      expect(hooks.identifies.map((i) => i.token)).toEqual(["tok-1", "tok-fresh-1"]);
+      expect(s.identities).toHaveLength(1);
+      s.controller.abort();
+      await s.done;
+
+      const none = fakeHooks();
+      const t = start(none, { identity: () => null });
+      await tick();
+      none.last().send(none.hello("c_2"));
+      await tick();
+      expect(none.identifies).toEqual([]);
+      expect(none.subscribes).toHaveLength(1);
+      t.controller.abort();
+      await t.done;
+    });
+
+    it("keeps the watches on a service without /v1/identify, saying so once", async () => {
+      const hooks = fakeHooks();
+      hooks.state.identify = null;
+      const s = start(hooks, { identity: () => ({ teams: [] }) });
+      await tick();
+      hooks.last().send(hooks.hello("c_1", 600));
+      await tick();
+      await tick(300_000);
+      expect(hooks.subscribes).toHaveLength(2);
+      expect(s.loop.connected).toBe(true);
+      expect(s.logs.filter((l) => l.includes("no /v1/identify"))).toHaveLength(1);
+      expect(s.sweeps).toEqual(["connected"]);
+      s.controller.abort();
+      await s.done;
+    });
+
+    it("hands session events on, parsed, and drops ones it cannot read", async () => {
+      const hooks = fakeHooks();
+      const s = start(hooks);
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      hooks.last().send(hooks.session());
+      hooks.last().send(hooks.session({ action: "stopped" }));
+      hooks.last().send("event: session\ndata: not json\n\n");
+      hooks.last().send(hooks.session({ session: "sess-2", action: "prompted", fromOwner: true, asker: { id: "u1", name: "Jane" }, comment: { text: "yes", untrusted: false } }));
+      await tick();
+      expect(s.sessions.map((e) => [e.session, e.action, e.issue.identifier, e.comment.untrusted])).toEqual([
+        ["sess-1", "created", "ENG-1", true],
+        ["sess-2", "prompted", "ENG-1", false],
+      ]);
+      expect(s.logs.filter((l) => l.includes("does not understand"))).toHaveLength(1);
+      expect(s.doorbells).toEqual([]);
+      s.controller.abort();
+      await s.done;
+    });
+
+    it("replies over the current connection with no token, and refuses without one", async () => {
+      const hooks = fakeHooks();
+      const s = start(hooks);
+      await expect(s.loop.reply("sess-1", { kind: "response", body: "Done." }, new AbortController().signal)).rejects.toThrow(/not connected to bb-gate-hooks/u);
+      await tick();
+      hooks.last().send(hooks.hello("c_1"));
+      await tick();
+      expect(await s.loop.reply("sess/1", { kind: "elicitation", body: "Confirm?", externalUrl: "https://bb.example/t" }, new AbortController().signal)).toMatchObject({ activity: "act-1" });
+      expect(hooks.replies).toEqual([
+        { url: `${BASE}/v1/linear/sessions/sess%2F1/activity`, body: { connection: "c_1", kind: "elicitation", body: "Confirm?", externalUrl: "https://bb.example/t" }, headers: expect.not.objectContaining({ authorization: expect.anything() }) },
+      ]);
+      expect(JSON.stringify(hooks.replies)).not.toMatch(/tok-/u);
+
+      hooks.state.reply = () => Response.json({ error: "not-routed" }, { status: 403 });
+      const refused = await s.loop.reply("sess-1", { kind: "response", body: "x" }, new AbortController().signal).catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(HooksRequestError);
+      expect((refused as HooksRequestError).code).toBe("not-routed");
+      s.controller.abort();
+      await s.done;
+    });
+  });
+});
+
+describe("postActivity", () => {
+  it("leaves out an absent external link", async () => {
+    const hooks = fakeHooks();
+    await postActivity(hooks.fetchImpl, BASE, "c_1", "sess-1", { kind: "error", body: "No." }, new AbortController().signal);
+    expect(hooks.replies[0]!.body).toEqual({ connection: "c_1", kind: "error", body: "No." });
   });
 });

@@ -7,6 +7,8 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { SENTRY_SLUG, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { DEPENDABOT_SEVERITIES } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
@@ -83,10 +85,14 @@ export const DEFAULT_BIG_DECISIONS = [
 
 const clock = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, 'a time such as "01:00"');
 
-export const KINDS = ["ticket", "pr", "review"] as const;
+export const KINDS = ["ticket", "pr", "review", "ops"] as const;
 export type BindingKind = (typeof KINDS)[number];
 
-export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-tickets", pr: "github-prs", review: "github-reviews" };
+export const DEFAULT_PLAYBOOKS: Record<BindingKind, string> = { ticket: "linear-tickets", pr: "github-prs", review: "github-reviews", ops: "ops-watch" };
+
+/** The playbooks the dependency watch uses: one for alert targets, one for the bot's pull requests. */
+export const DEPS_ALERTS_PLAYBOOK = "deps-alerts";
+export const DEPS_PRS_PLAYBOOK = "deps-prs";
 
 const playbookName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "a playbook name: lowercase letters, digits and dashes");
 
@@ -99,10 +105,60 @@ function validTimezone(tz: string): boolean {
   }
 }
 
+const teamKey = z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase());
+
+/** Linear's priorities, as `ops.autoAdopt` names them. */
+export const LINEAR_PRIORITIES = ["urgent", "high", "medium", "low"] as const;
+
+const k8sNamespaceTargetSchema = z
+  .object({
+    kind: z.literal("k8s-namespace"),
+    name: z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production"),
+  })
+  .strict();
+
+/** A repository whose Dependabot alerts an ops steward watches. */
+export const dependabotRepoSchema = z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as acme/web");
+
+const dependabotTargetSchema = z.object({ kind: z.literal("dependabot"), repo: dependabotRepoSchema }).strict();
+
+/** A Sentry slug as Sentry spells it in URLs; upper case is folded, since Sentry's are always lower. */
+const sentrySlug = z.string().trim().toLowerCase().regex(SENTRY_SLUG, "a Sentry slug such as acme or web-api");
+
+/** A Sentry project whose issues an ops steward watches, read with the plugin's Sentry token. */
+const sentryProjectTargetSchema = z.object({ kind: z.literal("sentry-project"), org: sentrySlug, project: sentrySlug }).strict();
+
+const opsTargetSchema = z.discriminatedUnion("kind", [k8sNamespaceTargetSchema, dependabotTargetSchema, sentryProjectTargetSchema]);
+
+/** The per-severity SLA and batch window for Dependabot alerts. */
+const slaValueSchema = z.union([z.literal("asap"), durationSchema]);
+
+export const depsSchema = z
+  .object({
+    sla: z
+      .object({
+        critical: slaValueSchema.default("asap"),
+        high: slaValueSchema.default(86_400_000),
+        medium: slaValueSchema.default(7 * 86_400_000),
+        low: slaValueSchema.default(30 * 86_400_000),
+      })
+      .strict()
+      .default({ critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }),
+    batch: z
+      .object({ medium: durationSchema.default(7 * 86_400_000), low: durationSchema.default(30 * 86_400_000) })
+      .strict()
+      .default({ medium: 7 * 86_400_000, low: 30 * 86_400_000 }),
+    /** Severities whose tickets are labelled and moved to Todo when filed, without an escalation. */
+    autoAdopt: z.array(z.enum(DEPENDABOT_SEVERITIES)).max(4).default(["critical", "high"]),
+  })
+  .strict()
+  .default({ sla: { critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }, batch: { medium: 7 * 86_400_000, low: 30 * 86_400_000 }, autoAdopt: ["critical", "high"] });
+export type DepsConfig = z.infer<typeof depsSchema>;
+
 export const projectFileSchema = z
   .object({
     version: z.literal(1),
-    linear: z.object({ teams: z.array(z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*$/u, "a team key such as ENG").transform((s) => s.toUpperCase())).max(50).default([]) }).strict().default({ teams: [] }),
+    linear: z.object({ teams: z.array(teamKey).max(50).default([]) }).strict().default({ teams: [] }),
     /**
      * GitHub repos are the project's repos.json; these are left out of it,
      * for repos in the workspace that stewards should not manage.
@@ -121,8 +177,18 @@ export const projectFileSchema = z
       .strict()
       .default({ at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 }),
     projectSteward: z.object({ model: modelSpecSchema.optional() }).strict().default({}),
-    /** Which playbook governs each kind of binding. */
-    playbooks: z.object({ ticket: playbookName.optional(), pr: playbookName.optional(), review: playbookName.optional() }).strict().default({}),
+    /** Which playbook governs each kind of binding, and the two the dependency watch uses. */
+    playbooks: z
+      .object({
+        ticket: playbookName.optional(),
+        pr: playbookName.optional(),
+        review: playbookName.optional(),
+        ops: playbookName.optional(),
+        [DEPS_ALERTS_PLAYBOOK]: playbookName.optional(),
+        [DEPS_PRS_PLAYBOOK]: playbookName.optional(),
+      })
+      .strict()
+      .default({}),
     /** Reviews: on unless turned off. */
     reviews: z.object({ enabled: z.boolean().default(true) }).strict().default({ enabled: true }),
     adoption: z.object({ perPass: z.number().int().min(1).max(100).default(10) }).strict().default({ perPass: 10 }),
@@ -131,8 +197,40 @@ export const projectFileSchema = z
      * stewards and the project steward, from the project's own guidance.
      */
     bigDecisions: z.array(z.string().trim().min(1).max(300)).max(30).default(DEFAULT_BIG_DECISIONS),
+    /**
+     * Production to watch: one ops binding per target, which files a Linear
+     * ticket for each problem it finds and escalates it to the project
+     * steward. `team` is where tickets are filed (the first of linear.teams
+     * when left out); `context` is the kubeconfig context kubectl reads it
+     * with; `autoAdopt` names the priorities whose tickets are labelled for
+     * a steward when filed, without asking.
+     */
+    ops: z
+      .object({
+        targets: z.array(opsTargetSchema).max(10).default([]),
+        team: teamKey.optional(),
+        /** The kubeconfig context kubectl uses on the developer's machine; its current context when left out. */
+        context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
+        autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
+      })
+      .strict()
+      .default({ targets: [], autoAdopt: [] }),
+    /** The dependency watch: per-severity SLA, the batch window, and what auto-adopts. */
+    deps: depsSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((file, ctx) => {
+    const seen = new Set<string>();
+    file.ops.targets.forEach((t, i) => {
+      const key = t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : t.kind === "dependabot" ? `${t.kind}/${t.repo.toLowerCase()}` : `${t.kind}/${t.org}/${t.project}`;
+      if (seen.has(key)) ctx.addIssue({ code: "custom", path: ["ops", "targets", i], message: `${key} is listed twice` });
+      seen.add(key);
+    });
+    if (file.ops.targets.length === 0) return;
+    // A ticket filed outside the project's teams is never adopted, so the project steward could not act on it.
+    if (file.ops.team === undefined && file.linear.teams.length === 0) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: "ops needs a Linear team to file tickets in: set ops.team or linear.teams" });
+    if (file.ops.team !== undefined && !file.linear.teams.includes(file.ops.team)) ctx.addIssue({ code: "custom", path: ["ops", "team"], message: `${file.ops.team} is not one of linear.teams, so a ticket filed there would never be stewarded` });
+  });
 export type ProjectFile = z.infer<typeof projectFileSchema>;
 
 export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -154,6 +252,34 @@ export function parseProjectFile(text: string): Parsed<ProjectFile> {
 
 export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string => project.playbooks[kind] ?? DEFAULT_PLAYBOOKS[kind];
 
+/** Whether a project uses a kind of binding at all: reviews can be turned off, and ops needs a target. */
+export const usesKind = (project: ProjectFile, kind: BindingKind): boolean => (kind === "review" ? project.reviews.enabled : kind === "ops" ? project.ops.targets.length > 0 : true);
+
+export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
+
+/** The k8s namespaces to watch, which are read with kubectl. */
+export const k8sTargets = (project: ProjectFile): K8sTarget[] => project.ops.targets.filter((t): t is K8sTarget => t.kind === "k8s-namespace");
+
+/** The Sentry projects to watch, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
+export const sentryTargets = (project: ProjectFile): SentryTarget[] => project.ops.targets.filter((t): t is SentryTarget => t.kind === "sentry-project");
+
+/**
+ * The Dependabot alert targets: the project file's explicit `dependabot`
+ * targets, or every repo in `repos.json` not in `github.exclude` when it
+ * lists none. `repos` is the project's derived repo set.
+ */
+export function depsTargets(project: ProjectFile, repos: readonly string[]): DependabotTarget[] {
+  const explicit = project.ops.targets.filter((t): t is DependabotTarget => t.kind === "dependabot").map((t) => t.repo);
+  return (explicit.length > 0 ? explicit : [...repos]).map((repo) => ({ kind: "dependabot" as const, repo }));
+}
+
+/** The playbook a binding runs under: the deps-alerts one for a Dependabot target, else its kind's. */
+export const depsAlertsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_ALERTS_PLAYBOOK] ?? DEPS_ALERTS_PLAYBOOK;
+export const depsPrsPlaybookName = (project: ProjectFile): string => project.playbooks[DEPS_PRS_PLAYBOOK] ?? DEPS_PRS_PLAYBOOK;
+
+/** The Linear team an ops steward files in. */
+export const opsTeam = (project: ProjectFile): string | null => project.ops.team ?? project.linear.teams[0] ?? null;
+
 // ---- playbooks ---------------------------------------------------------------------
 
 export const STAGES = ["spec", "build", "review"] as const;
@@ -161,8 +287,8 @@ export type Stage = (typeof STAGES)[number];
 
 /** What a steward raises. */
 export const ESCALATION_KINDS = ["blocked", "decision", "scope", "conflict", "stuck"] as const;
-/** Those, and the plugin's own: a ready gate waiting on its approver. */
-export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval";
+/** Those, and the plugin's own: a ready gate waiting on its approver, and a ready ticket waiting to be scheduled against work already under way. */
+export type EscalationKind = (typeof ESCALATION_KINDS)[number] | "approval" | "schedule";
 
 const phaseSchema = z
   .object({
@@ -185,13 +311,18 @@ export type ReadyConfig = z.infer<typeof readySchema>;
 /** The default cap on follow-through: a deploy and its verification, with room to spare. */
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
 
+export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
+const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };
+
 export const frontMatterSchema = z
   .object({
     name: playbookName,
     kind: z.enum(KINDS),
-    source: z.enum(["linear", "github"]),
-    phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})),
-    terminal: z.array(z.string().trim().min(1).max(100)).min(1),
+    /** Where the entity lives; an ops playbook watches k8s, and has no entity state. */
+    source: z.enum(PLAYBOOK_SOURCES),
+    /** Required for every kind but ops, which has none. */
+    phases: z.record(z.string().trim().min(1).max(100), phaseSchema.nullable().transform((p) => p ?? {})).optional(),
+    terminal: z.array(z.string().trim().min(1).max(100)).default([]),
     ready: readySchema.optional(),
     promote: z.string().trim().max(1000).optional(),
     /** What the steward may do on the entity. Policy the wake states, not a wall. */
@@ -208,7 +339,7 @@ export const frontMatterSchema = z
 export type Playbook = {
   name: string;
   kind: BindingKind;
-  source: "linear" | "github";
+  source: (typeof PLAYBOOK_SOURCES)[number];
   phases: Record<string, { stage?: Stage; stuck?: number }>;
   terminal: string[];
   ready: ReadyConfig | null;
@@ -242,12 +373,31 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
   if (!parsed.success) return { ok: false, error: `${file}: ${zodMessage(parsed.error)}` };
   const fm = parsed.data;
   if (fm.name !== expectedName) return { ok: false, error: `${file} names itself ${JSON.stringify(fm.name)}; the file name says ${JSON.stringify(expectedName)}` };
-  const expectedSource = fm.kind === "ticket" ? "linear" : "github";
-  if (fm.source !== expectedSource) return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
-  const lowerPhases = new Set(Object.keys(fm.phases).map((p) => p.toLowerCase()));
+  const expectedSource = SOURCE_OF[fm.kind];
+  if (fm.kind === "ops") {
+    // An ops binding watches a target, not an entity in a source plugin: a
+    // Kubernetes namespace reads k8s, a Dependabot alert target reads
+    // github, and a Sentry project reads sentry. The playbook says which so
+    // its sections can be about the right thing; any is valid, and the
+    // ops-watch playbook serves k8s and Sentry targets alike.
+    if (fm.source === "linear") return { ok: false, error: `${file}: an ops playbook watches k8s, sentry or github, not ${fm.source}` };
+  } else if (fm.source !== expectedSource) {
+    return { ok: false, error: `${file}: a ${fm.kind} playbook reads ${expectedSource}, not ${fm.source}` };
+  }
+  if (fm.kind === "ops") {
+    // An ops binding watches a target for as long as it is configured: no state to key phases on, and nothing terminal.
+    if (Object.keys(fm.phases ?? {}).length > 0 || fm.terminal.length > 0 || fm.ready !== undefined || fm.promote !== undefined) {
+      return { ok: false, error: `${file}: an ops playbook has no phases, terminal states, ready gate or promote rule: it watches a target, not an entity` };
+    }
+  } else {
+    if (fm.phases === undefined) return { ok: false, error: `${file}: phases: map the entity's states to stages` };
+    if (fm.terminal.length === 0) return { ok: false, error: `${file}: terminal: name at least one state that ends the binding` };
+  }
+  const phases = fm.phases ?? {};
+  const lowerPhases = new Set(Object.keys(phases).map((p) => p.toLowerCase()));
   const overlap = fm.terminal.filter((t) => lowerPhases.has(t.toLowerCase()));
   if (overlap.length > 0) return { ok: false, error: `${file}: ${overlap.join(", ")} cannot be both a phase and terminal` };
-  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(fm.phases).some((p) => p.stage === "build")) {
+  if (fm.ready === undefined && fm.kind === "ticket" && Object.values(phases).some((p) => p.stage === "build")) {
     return { ok: false, error: `${file}: a ticket playbook with a build stage needs a ready gate` };
   }
 
@@ -258,7 +408,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       name: fm.name,
       kind: fm.kind,
       source: fm.source,
-      phases: fm.phases,
+      phases,
       terminal: fm.terminal,
       ready: fm.ready ?? null,
       promote: fm.promote ?? null,

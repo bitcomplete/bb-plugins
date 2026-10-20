@@ -3,25 +3,24 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import vm from "node:vm";
 import { JSDOM } from "jsdom";
-import ts from "typescript";
+import { transform } from "esbuild";
 
-const source = ts.transpileModule(await readFile(new URL("./image-copy.ts", import.meta.url), "utf8"), {
-  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-}).outputText;
+const source = (await transform(await readFile(new URL("./image-copy.ts", import.meta.url), "utf8"), { loader: "ts", format: "cjs", target: "es2022" })).code;
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function fixture(write = async () => {}) {
   const dom = new JSDOM('<body><a href="https://example.test/outside.png">Outside chat</a><div data-message-column><a href="https://example.test/one.png">Graph one<svg data-icon="ExternalLink"></svg></a><a href="https://example.test/two.png">Graph two<svg data-icon="ExternalLink"></svg></a><a href="https://example.test/results.md">Results</a><img data-markdown-image src="https://example.test/inline.png"><button class="cursor-zoom-in"><img></button></div></body>');
   const { document, MutationObserver, AbortController, navigator } = dom.window;
   Object.defineProperty(navigator, "clipboard", { value: { write }, configurable: true });
-  const exports = {};
+  const module = { exports: {} };
   const fetches = [];
   const png = new Blob(["image pixels"], { type: "image/png" });
   vm.runInNewContext(source, {
-    document, MutationObserver, navigator, exports, URL, Blob, atob,
+    document, MutationObserver, navigator, module, URL, Blob, atob,
     ClipboardItem: class { constructor(data) { this.data = data; } },
     fetch: async (src) => { fetches.push(src); return { ok: true, blob: async () => png }; },
   });
+  const { exports } = module;
   const controller = new AbortController();
   const dispose = exports.mountImageCopyButtons({ signal: controller.signal });
   return { dom, document, navigator, controller, dispose, fetches, png, exports };

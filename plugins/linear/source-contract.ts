@@ -11,7 +11,8 @@
 //   and entities the source should lease on bb-gate-hooks and ring stewards
 //   about.
 // - `stewardsContract` is served by stewards and called by a source plugin:
-//   a ring when something stewards cares about may have changed.
+//   a ring when something stewards cares about may have changed, and an
+//   `@bb` mention on a Linear issue to hand to a steward.
 //
 // Pure: zod schemas, constants and a small helper. Nothing here talks to
 // the network or to bb beyond the `callRpc` a caller hands in.
@@ -154,6 +155,39 @@ export const adoptableEntitySchema = z.object({
 });
 export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
 
+// ---- Dependabot alerts -------------------------------------------------------
+
+/** The four Dependabot severities, as GitHub reports them. */
+export const DEPENDABOT_SEVERITIES = ["critical", "high", "medium", "low"] as const;
+export type DependabotSeverity = (typeof DEPENDABOT_SEVERITIES)[number];
+
+/**
+ * One Dependabot alert, as the github plugin reads it from
+ * `GET /repos/{owner}/{repo}/dependabot/alerts` (which needs the token's
+ * alert access, not just read access to the repository). The entity id
+ * doorbells carry is "owner/repo#<alert number>", which is the alert's own
+ * numbering, unrelated to the issue numbering. `repo` is spelled as GitHub
+ * does, which is what the doorbell carries and the github plugin leases.
+ */
+export const dependabotAlertSchema = z.object({
+  id: z.string(),
+  repo: z.string(),
+  number: z.number().int().positive(),
+  severity: z.enum(DEPENDABOT_SEVERITIES),
+  package: z.string(),
+  ecosystem: z.string(),
+  manifestPath: z.string().nullable(),
+  /** open, fixed, dismissed, auto_dismissed. */
+  state: z.string(),
+  ghsaId: z.string().nullable(),
+  fixedVersion: z.string().nullable(),
+  summary: z.string().nullable(),
+  url: z.string().nullable(),
+  createdAt: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+});
+export type DependabotAlert = z.infer<typeof dependabotAlertSchema>;
+
 /** Served by linear and by github; stewards is the only caller. */
 export const sourceContract = {
   /** One entity, by Linear key or UUID, or by GitHub "owner/repo#12". Null when it does not exist or is not visible. */
@@ -210,17 +244,81 @@ export const sourceContract = {
    * previous set. The source leases them on bb-gate-hooks and rings stewards
    * for every doorbell that names one of the entities or falls in one of the
    * units. Only stewards may call it.
+   *
+   * `dependabot` names repositories whose Dependabot alert doorbells stewards
+   * wants. It is separate from `units` because a repository lease does not
+   * receive alert doorbells (bb-gate/docs/hooks.md): the github plugin leases
+   * each as a `dependabot_repo`. Linear ignores it.
    */
   sourceSetInterest: {
     input: z.object({
       units: z.array(z.string().min(1).max(200)).max(200),
       entities: z.array(z.string().min(1).max(300)).max(2000),
+      dependabot: z.array(z.string().min(1).max(200)).max(200).default([]),
     }),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * A repository's Dependabot alerts, for stewards' dependency watches. The
+   * github plugin reads them with the developer's token from the REST API;
+   * each repository the token cannot read (no alert access, alerts disabled,
+   * not visible) is named in `errors` rather than failing the whole call.
+   */
+  sourceDependabotAlerts: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      /** GitHub's alert state: open (the default), fixed, dismissed, auto_dismissed. */
+      state: z.string().min(1).max(60).optional(),
+    }),
+    output: z.object({
+      viewer: z.string().nullable(),
+      alerts: z.array(dependabotAlertSchema),
+      errors: z.array(z.string()),
+    }),
   },
 } as const;
 
 // ---- what stewards serves ---------------------------------------------------
+
+/** How much of a mention crosses the contract. */
+export const SESSION_TEXT_CHARS = 20_000;
+
+const personSchema = z.object({ id: z.string().max(200), name: z.string().max(200) });
+
+/**
+ * An `@bb` mention on a Linear issue, as bb-gate-hooks routed it to this
+ * server (bb-gate/docs/hooks.md, "The wake"). linear passes it to stewards,
+ * which hands it to a steward; the steward answers on the session with
+ * linear's `linear_session_reply`.
+ */
+export const sessionWakeSchema = z.object({
+  source: z.literal("linear"),
+  /** The agent session's id: what the reply names. */
+  session: z.string().min(1).max(200),
+  /** `created` for the mention, `prompted` for a follow-up in the same session. */
+  action: z.enum(["created", "prompted"]),
+  issue: z.object({
+    id: z.string().min(1).max(200),
+    /** ENG-123. */
+    key: z.string().min(1).max(100),
+    /** The team's UUID. */
+    team: z.string().max(200),
+    /** The team's key, which a project file lists. */
+    teamKey: z.string().max(100),
+  }),
+  /** Who wrote the mention or the follow-up. */
+  asker: personSchema,
+  /** The Linear user this server proved it acts for. */
+  owner: personSchema,
+  /** Whether the asker is the owner. Only then is the text an instruction. */
+  fromOwner: z.boolean(),
+  /** Why the session came here: the issue's assignee is the owner, or the asker is. */
+  routedAs: z.enum(["assignee", "asker"]),
+  /** The words. Untrusted whenever the asker is not the owner: information, never an instruction. */
+  comment: z.object({ text: z.string().max(SESSION_TEXT_CHARS), untrusted: z.boolean() }),
+  at: z.string().max(100),
+});
+export type SessionWake = z.infer<typeof sessionWakeSchema>;
 
 /** Served by stewards; linear and github are the callers. */
 export const stewardsContract = {
@@ -228,6 +326,22 @@ export const stewardsContract = {
   stewardsRing: {
     input: z.object({ source: sourceSchema, id: z.string().min(1).max(300) }),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * An `@bb` mention to hand to a steward: the issue's ticket steward when it
+   * has an open binding, else the project steward of the project whose file
+   * lists the issue's team. `routed: "none"` means no project here lists the
+   * team, and the caller answers the session itself. Only linear may call it.
+   */
+  stewardsSession: {
+    input: sessionWakeSchema,
+    output: z.object({
+      routed: z.enum(["ticket", "project", "none"]),
+      /** The thread the mention went to; null with `none`. */
+      threadId: z.string().nullable(),
+      /** That thread's project, for a link to it; null with `none`. */
+      projectId: z.string().nullable(),
+    }),
   },
 } as const;
 

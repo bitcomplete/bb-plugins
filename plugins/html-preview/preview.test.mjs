@@ -3,16 +3,15 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import vm from "node:vm";
 import { JSDOM } from "jsdom";
-import ts from "typescript";
+import { transform } from "esbuild";
 
 test("HTML toolbar renders from source, survives file changes, and cleans up", async () => {
   const dom = new JSDOM('<body><div id="toolbar"><div><button aria-label="Open in editor">Open</button></div><div><div role="tablist" aria-label="HTML view mode"><button>Preview</button><button>Raw</button></div></div></div></body>');
   try {
     const { document, MutationObserver, AbortController } = dom.window;
-    const exports = {};
-    vm.runInNewContext(ts.transpileModule(await readFile(new URL("./preview.ts", import.meta.url), "utf8"), {
-      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-    }).outputText, { document, MutationObserver, exports });
+    const module = { exports: {} };
+    vm.runInNewContext((await transform(await readFile(new URL("./preview.ts", import.meta.url), "utf8"), { loader: "ts", format: "cjs", target: "es2022" })).code, { document, MutationObserver, module });
+    const { exports } = module;
     const controller = new AbortController();
     const dispose = exports.mountPreviewButtons({ signal: controller.signal });
     const tabs = document.querySelector('[role="tablist"]');

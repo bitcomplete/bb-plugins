@@ -10,6 +10,9 @@ import type Database from "better-sqlite3";
 import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
+import { depsLookSchema, type DepsLook } from "./deps.js";
+import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
+import { sentryLookSchema, type SentryLook } from "./sentry.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -120,6 +123,91 @@ export const MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN delivered_at INTEGER`,
   // Escalations open before delivery was recorded were all delivered already.
   `UPDATE escalations SET delivered_at = created_at WHERE status = 'open' AND delivered_at IS NULL`,
+  // "Needs you" items: one structured thing the user (or the page's buttons) must
+  // do for a binding. Deduplicated per (binding, kind, url) while open.
+  `CREATE TABLE IF NOT EXISTS needs (
+     id TEXT PRIMARY KEY,
+     binding_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     url TEXT NOT NULL DEFAULT '',
+     what TEXT NOT NULL,
+     how TEXT,
+     data TEXT NOT NULL DEFAULT '{}',
+     filed_by TEXT NOT NULL DEFAULT 'steward',
+     status TEXT NOT NULL DEFAULT 'open',
+     resolution TEXT,
+     created_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS needs_binding ON needs (binding_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS needs_open_key ON needs (binding_id, kind, url) WHERE status = 'open'`,
+  // An ops binding's last look at its target: what it found, classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN ops_look TEXT`,
+  // The fingerprint map: one problem an ops steward has seen, and the Linear ticket it was filed or commented on under.
+  `CREATE TABLE IF NOT EXISTS ops_fingerprints (
+     project_id TEXT NOT NULL,
+     fingerprint TEXT NOT NULL,
+     binding_id TEXT NOT NULL,
+     summary TEXT NOT NULL,
+     ticket_key TEXT,
+     first_seen_at INTEGER NOT NULL,
+     last_seen_at INTEGER NOT NULL,
+     seen_count INTEGER NOT NULL DEFAULT 1,
+     filed_at INTEGER,
+     last_commented_at INTEGER,
+     PRIMARY KEY (project_id, fingerprint)
+   )`,
+  // A Dependabot alert binding's last look at its repository: the open alerts,
+  // classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN deps_look TEXT`,
+  // A dependency fingerprint's severity and ecosystem, so a new medium or low
+  // alert can be batched against the open ticket for its repo and ecosystem.
+  `ALTER TABLE ops_fingerprints ADD COLUMN severity TEXT`,
+  `ALTER TABLE ops_fingerprints ADD COLUMN ecosystem TEXT`,
+  // Scheduling: the paths a binding's work changes (steward_report touches), the open
+  // bindings a hold waits behind (steward_update hold + behind), and the conflicts
+  // the project steward was last asked to schedule it against.
+  `ALTER TABLE bindings ADD COLUMN touches TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN hold_behind TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE bindings ADD COLUMN schedule_asked TEXT NOT NULL DEFAULT '[]'`,
+  // A ticket whose gate has passed and that nothing holds or schedules: about to start, so it counts as in flight before Linear says so.
+  `ALTER TABLE bindings ADD COLUMN cleared_to_start INTEGER NOT NULL DEFAULT 0`,
+  // Fixed choices on a decide item's escalation and on the question a forwarded one makes: short labels, JSON, so the page can offer a button each (BB-20).
+  `ALTER TABLE escalations ADD COLUMN choices TEXT`,
+  `ALTER TABLE questions ADD COLUMN choices TEXT`,
+  // A Sentry project binding's last look: the issues new, regressed or rung
+  // since the look before, classified against the fingerprint map.
+  `ALTER TABLE bindings ADD COLUMN sentry_look TEXT`,
+  // A general rule the project steward drew from an escalation or its own
+  // judgement, waiting to be made permanent in `.bb`. `procedure` lessons are
+  // self-merged by the project steward; `boundary` ones change its own
+  // escalation boundary and go to the user. `note` is the last refusal or
+  // explanation, shown in the nightly prompt.
+  `CREATE TABLE IF NOT EXISTS lessons (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL,
+     binding_id TEXT,
+     escalation_id TEXT,
+     file TEXT NOT NULL,
+     text TEXT NOT NULL,
+     scope TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     branch TEXT,
+     merge_sha TEXT,
+     note TEXT,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS lessons_project ON lessons (project_id, status)`,
+  // The requester thread the plugin spawned for an open provide-secret need
+  // (BB-22). `bb stewards secret import` accepts only this thread, only while
+  // the need is open, and only for the need's own `setting`.
+  `CREATE TABLE IF NOT EXISTS secret_requesters (
+     thread_id TEXT PRIMARY KEY,
+     need_id TEXT NOT NULL,
+     created_at INTEGER NOT NULL
+   )`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -180,10 +268,13 @@ function json<T>(schema: z.ZodType<T>, raw: string | null, fallback: T): T {
 
 // ---- bindings --------------------------------------------------------------------------
 
+/** Where a binding's entity lives: a source plugin's, or "ops" for a watch target, which the plugin reads itself. */
+export type BindingSource = Source | "ops";
+
 export type Binding = {
   id: string;
   projectId: string;
-  source: Source;
+  source: BindingSource;
   entityId: string;
   entityKey: string;
   url: string | null;
@@ -199,6 +290,14 @@ export type Binding = {
   ready: ReadyState;
   priority: string | null;
   hold: string | null;
+  /** The repo-relative paths this binding's work changes, as reported; what scheduling compares. */
+  touches: string[];
+  /** Entity keys of the bindings this hold waits behind: the hold lifts itself when every one has merged its pull requests or ended. */
+  holdBehind: string[];
+  /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
+  scheduleAsked: string[];
+  /** The gate has passed and nothing holds or schedules it: it is starting, whatever Linear still says, so others schedule against it. */
+  clearedToStart: boolean;
   modelSteward: string | null;
   modelWorker: string | null;
   status: StatusRecord | null;
@@ -224,6 +323,12 @@ export type Binding = {
   /** When follow-through runs out, whatever the steward says: set when it is first declared. */
   followThroughUntil: number | null;
   manualDetach: boolean;
+  /** An ops binding's last look; null for every other kind. */
+  opsLook: OpsLook | null;
+  /** A Dependabot alert binding's last look; null for every other kind. */
+  depsLook: DepsLook | null;
+  /** A Sentry project binding's last look; null for every other kind. */
+  sentryLook: SentryLook | null;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -239,7 +344,7 @@ function rowToBinding(r: BindingRow): Binding {
   return {
     id: r.id,
     projectId: String(r.project_id),
-    source: String(r.source) as Source,
+    source: String(r.source) as BindingSource,
     entityId: String(r.entity_id),
     entityKey: String(r.entity_key),
     url: str("url"),
@@ -255,6 +360,10 @@ function rowToBinding(r: BindingRow): Binding {
     ready: json(readyStateSchema, str("ready"), readyDefault()),
     priority: str("priority"),
     hold: str("hold"),
+    touches: json(z.array(z.string()), str("touches"), []),
+    holdBehind: json(z.array(z.string()), str("hold_behind"), []),
+    scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
+    clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
     modelWorker: str("model_worker"),
     status: json(statusRecordSchema.nullable(), str("status"), null),
@@ -274,6 +383,9 @@ function rowToBinding(r: BindingRow): Binding {
     followThrough: str("follow_through"),
     followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
+    opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
+    depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
+    sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -295,6 +407,10 @@ const COLUMNS = {
   ready: "ready",
   priority: "priority",
   hold: "hold",
+  touches: "touches",
+  holdBehind: "hold_behind",
+  scheduleAsked: "schedule_asked",
+  clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",
   modelWorker: "model_worker",
   status: "status",
@@ -314,6 +430,9 @@ const COLUMNS = {
   followThrough: "follow_through",
   followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
+  opsLook: "ops_look",
+  depsLook: "deps_look",
+  sentryLook: "sentry_look",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
@@ -341,6 +460,8 @@ export type Escalation = {
   meanwhile: string;
   route: EscalationRoute;
   recommendation: string | null;
+  /** Fixed choices the user picks from, when the escalation offers any. */
+  choices: string[];
   status: "open" | "resolved";
   resolution: string | null;
   createdAt: number;
@@ -362,6 +483,8 @@ export type Question = {
   escalationId: string | null;
   question: string;
   context: string | null;
+  /** Fixed choices the user picks from, when the question offers any. */
+  choices: string[];
   status: "open" | "answered";
   answer: string | null;
   /** The thread that recorded the answer, or "user" from the page. */
@@ -370,8 +493,84 @@ export type Question = {
   resolvedAt: number | null;
 };
 
+/** The kinds of thing that can wait on the user, from the ticket's table. */
+export const NEEDS_KINDS = ["approve-spec", "approve-pr", "merge", "decide", "provide-secret", "configure"] as const;
+export type NeedKind = (typeof NEEDS_KINDS)[number];
+
+/**
+ * One "needs you" item: a structured thing the user must do, filed by the
+ * plugin from a snapshot or by a steward through `steward_report`. `url` is the
+ * link (the ticket, the pull request, the external page); with `kind` it is the
+ * dedupe key. `data` carries kind-specific fields (the pull request sha, the
+ * secret's variable name, purpose, `writeEnv` dotenv path or `setting`, and the
+ * worker thread to open).
+ */
+export type Need = {
+  id: string;
+  bindingId: string;
+  kind: NeedKind;
+  url: string;
+  what: string;
+  how: string | null;
+  data: Record<string, unknown>;
+  /** Who filed it: "plugin", "steward", "project" or "user". */
+  filedBy: string;
+  status: "open" | "done";
+  resolution: string | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+
+/** The fixed choices a need's `data` carries, whatever else it holds. */
+export function needChoices(n: Pick<Need, "data">): string[] {
+  const parsed = z.array(z.string()).safeParse(n.data.choices);
+  return parsed.success ? parsed.data : [];
+}
+
+/**
+ * A lesson: a general rule the project steward drew from an escalation or its
+ * own judgement. `procedure` restates what it may already decide and it lands
+ * itself at `.bb` HEAD; `boundary` would change its own escalation boundary
+ * (credentials and reach, who may direct a server, irreversible production
+ * steps) and only the user may merge it. Every lesson keeps the binding and
+ * escalation it came from.
+ */
+export const LESSON_SCOPES = ["procedure", "boundary"] as const;
+export type LessonScope = (typeof LESSON_SCOPES)[number];
+export type LessonStatus = "pending" | "merged" | "dropped";
+export type Lesson = {
+  id: string;
+  projectId: string;
+  bindingId: string | null;
+  escalationId: string | null;
+  /** The `.bb` file the text belongs in, repo-relative. */
+  file: string;
+  /** The wording as it should read in the file. */
+  text: string;
+  scope: LessonScope;
+  status: LessonStatus;
+  /** The `guidance-<thread>` branch carrying it, once published. */
+  branch: string | null;
+  /** The canonical `.bb` commit it landed at, once merged. */
+  mergeSha: string | null;
+  /** The last refusal or explanation from a merge attempt, for the nightly prompt. */
+  note: string | null;
+  createdAt: number;
+  updatedAt: number;
+  resolvedAt: number | null;
+};
+
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
+
+/** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
+export type SecretRequester = { threadId: string; needId: string; createdAt: number };
+
+/** One problem an ops steward has seen, and the ticket it is tracked under. */
+export type Fingerprint = FingerprintRow & { projectId: string; bindingId: string; summary: string; lastSeenAt: number; seenCount: number; filedAt: number | null; severity: string | null; ecosystem: string | null };
+
+/** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
+export type TicketAction = "filed" | "commented" | "reopened";
 
 export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null };
 
@@ -399,7 +598,7 @@ export function createStore(db: Database.Database, now: () => number) {
   );
 
   const insertEscalation = db.prepare(
-    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, created_at) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @created_at)",
+    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, choices, created_at) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @choices, @created_at)",
   );
   const getEscalation = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ?");
   const openEscalations = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND status = 'open' ORDER BY created_at");
@@ -412,7 +611,7 @@ export function createStore(db: Database.Database, now: () => number) {
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
   const insertQuestion = db.prepare(
-    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @created_at)",
+    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, choices, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @choices, @created_at)",
   );
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE id = ?");
   const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'open' ORDER BY created_at");
@@ -426,6 +625,20 @@ export function createStore(db: Database.Database, now: () => number) {
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
   const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
+  const insertSecretRequester = db.prepare("INSERT OR REPLACE INTO secret_requesters (thread_id, need_id, created_at) VALUES (?, ?, ?)");
+  const getSecretRequester = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE thread_id = ?");
+  const getSecretRequesterForNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE need_id = ? ORDER BY created_at DESC LIMIT 1");
+  const deleteSecretRequester = db.prepare("DELETE FROM secret_requesters WHERE thread_id = ?");
+
+  const getFingerprint = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE project_id = ? AND fingerprint = ?");
+  const fingerprintsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM ops_fingerprints WHERE binding_id = ? ORDER BY first_seen_at");
+  const sight = db.prepare(
+    `INSERT INTO ops_fingerprints (project_id, fingerprint, binding_id, summary, severity, ecosystem, first_seen_at, last_seen_at) VALUES (@project_id, @fingerprint, @binding_id, @summary, @severity, @ecosystem, @at, @at)
+     ON CONFLICT (project_id, fingerprint) DO UPDATE SET binding_id = @binding_id, summary = @summary, last_seen_at = @at, seen_count = seen_count + 1,
+       severity = COALESCE(@severity, severity), ecosystem = COALESCE(@ecosystem, ecosystem)`,
+  );
+  const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
+  const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
 
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
@@ -439,6 +652,7 @@ export function createStore(db: Database.Database, now: () => number) {
     meanwhile: String(r.meanwhile),
     route: String(r.route) as EscalationRoute,
     recommendation: r.recommendation === null ? null : String(r.recommendation),
+    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
     status: String(r.status) as "open" | "resolved",
     resolution: r.resolution === null ? null : String(r.resolution),
     createdAt: Number(r.created_at),
@@ -452,12 +666,53 @@ export function createStore(db: Database.Database, now: () => number) {
     escalationId: r.escalation_id === null ? null : String(r.escalation_id),
     question: String(r.question),
     context: r.context === null ? null : String(r.context),
+    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
     status: String(r.status) as "open" | "answered",
     answer: r.answer === null ? null : String(r.answer),
     answeredBy: r.answered_by === null ? null : String(r.answered_by),
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
   });
+  const insertNeed = db.prepare(
+    "INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, created_at) VALUES (@id, @binding_id, @kind, @url, @what, @how, @data, @filed_by, @created_at)",
+  );
+  const getNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE id = ?");
+  const openNeedByKey = db.prepare<[string, string, string], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open' LIMIT 1");
+  const needsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM needs WHERE binding_id = ? AND (? = 1 OR status = 'open') ORDER BY created_at");
+  const openNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.status = 'open' ORDER BY n.created_at");
+  const allNeedsForProject = db.prepare<[string], Record<string, unknown>>("SELECT n.* FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? ORDER BY n.created_at");
+  const updateNeed = db.prepare("UPDATE needs SET what = ?, how = ?, data = ? WHERE id = ?");
+  const closeNeedStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
+  const closeNeedKindStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND status = 'open'");
+  const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
+
+  const insertLesson = db.prepare(
+    "INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, branch, created_at, updated_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @file, @text, @scope, @branch, @created_at, @updated_at)",
+  );
+  const getLesson = db.prepare<[string], Record<string, unknown>>("SELECT * FROM lessons WHERE id = ?");
+  const lessonsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND (? = 1 OR status = 'pending') ORDER BY created_at");
+  const mergedLessonsSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND status = 'merged' AND resolved_at >= ? ORDER BY resolved_at");
+  const setLessonBranchStmt = db.prepare("UPDATE lessons SET branch = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
+  const setLessonNoteStmt = db.prepare("UPDATE lessons SET note = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
+  const resolveLessonStmt = db.prepare(
+    "UPDATE lessons SET status = ?, merge_sha = COALESCE(?, merge_sha), branch = COALESCE(?, branch), note = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?) WHERE id = ?",
+  );
+
+  const toNeed = (r: Record<string, unknown>): Need => ({
+    id: String(r.id),
+    bindingId: String(r.binding_id),
+    kind: String(r.kind) as NeedKind,
+    url: String(r.url ?? ""),
+    what: String(r.what),
+    how: r.how === null || r.how === undefined ? null : String(r.how),
+    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
+    filedBy: String(r.filed_by ?? "steward"),
+    status: String(r.status) as "open" | "done",
+    resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
+    createdAt: Number(r.created_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
   const toWorker = (r: Record<string, unknown>): Worker => ({
     threadId: String(r.thread_id),
     bindingId: String(r.binding_id),
@@ -466,6 +721,25 @@ export function createStore(db: Database.Database, now: () => number) {
     result: r.result === null ? null : String(r.result),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
+  });
+  const toSecretRequester = (r: Record<string, unknown>): SecretRequester => ({
+    threadId: String(r.thread_id),
+    needId: String(r.need_id),
+    createdAt: Number(r.created_at),
+  });
+  const toFingerprint = (r: Record<string, unknown>): Fingerprint => ({
+    projectId: String(r.project_id),
+    fingerprint: String(r.fingerprint),
+    bindingId: String(r.binding_id),
+    summary: String(r.summary),
+    ticketKey: r.ticket_key === null ? null : String(r.ticket_key),
+    firstSeenAt: Number(r.first_seen_at),
+    lastSeenAt: Number(r.last_seen_at),
+    seenCount: Number(r.seen_count),
+    filedAt: r.filed_at === null ? null : Number(r.filed_at),
+    lastCommentedAt: r.last_commented_at === null ? null : Number(r.last_commented_at),
+    severity: r.severity === null || r.severity === undefined ? null : String(r.severity),
+    ecosystem: r.ecosystem === null || r.ecosystem === undefined ? null : String(r.ecosystem),
   });
   const toProject = (r: Record<string, unknown>): ProjectStewardRow => ({
     projectId: String(r.project_id),
@@ -476,6 +750,22 @@ export function createStore(db: Database.Database, now: () => number) {
     digestPending: Number(r.digest_pending) === 1,
     title: r.title === null || r.title === undefined ? null : String(r.title),
     sectionId: r.section_id === null || r.section_id === undefined ? null : String(r.section_id),
+  });
+  const toLesson = (r: Record<string, unknown>): Lesson => ({
+    id: String(r.id),
+    projectId: String(r.project_id),
+    bindingId: r.binding_id === null || r.binding_id === undefined ? null : String(r.binding_id),
+    escalationId: r.escalation_id === null || r.escalation_id === undefined ? null : String(r.escalation_id),
+    file: String(r.file),
+    text: String(r.text),
+    scope: String(r.scope) as LessonScope,
+    status: String(r.status) as LessonStatus,
+    branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
+    mergeSha: r.merge_sha === null || r.merge_sha === undefined ? null : String(r.merge_sha),
+    note: r.note === null || r.note === undefined ? null : String(r.note),
+    createdAt: Number(r.created_at),
+    updatedAt: Number(r.updated_at),
+    resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
   });
 
   /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
@@ -502,7 +792,7 @@ export function createStore(db: Database.Database, now: () => number) {
       const r = getBinding.get(id);
       return r === undefined ? null : rowToBinding(r);
     },
-    byEntity(source: Source, entityId: string): Binding | null {
+    byEntity(source: BindingSource, entityId: string): Binding | null {
       const r = byEntity.get(source, entityId);
       return r === undefined ? null : rowToBinding(r);
     },
@@ -571,11 +861,33 @@ export function createStore(db: Database.Database, now: () => number) {
       patch(id, { guidance: [...b.guidance, { at: now(), text, by }].slice(-50) });
       return true;
     },
+    /**
+     * Record an approval on the gate and resolve the binding's open approval
+     * escalations, in one transaction: answering an approval request approves
+     * the current spec and closes the request together.
+     */
+    approve(bindingId: string, approval: NonNullable<ReadyState["approval"]>, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+        closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
+    },
+    /** Remember the current spec as declined and close its approval request, in one transaction. */
+    decline(bindingId: string, specHash: string, resolution: string, by: string): void {
+      db.transaction(() => {
+        const b = rowToBinding(getBinding.get(bindingId)!);
+        patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
+        closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+      })();
+    },
 
     // escalations
-    escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null }): Escalation {
+    escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null; choices?: string[] }): Escalation {
       const id = newId("esc");
-      insertEscalation.run({ id, binding_id: fields.bindingId, kind: fields.kind, question: fields.question, meanwhile: fields.meanwhile, route: fields.route, recommendation: fields.recommendation, created_at: now() });
+      insertEscalation.run({ id, binding_id: fields.bindingId, kind: fields.kind, question: fields.question, meanwhile: fields.meanwhile, route: fields.route, recommendation: fields.recommendation, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -624,9 +936,9 @@ export function createStore(db: Database.Database, now: () => number) {
     },
 
     // questions to the user
-    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null }): Question {
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[] }): Question {
       const id = newId("qst");
-      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, created_at: now() });
+      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
       return toQuestion(getQuestion.get(id)!);
     },
     question(id: string): Question | null {
@@ -639,15 +951,69 @@ export function createStore(db: Database.Database, now: () => number) {
     answeredSince(projectId: string, since: number): Question[] {
       return answeredSince.all(projectId, since).map(toQuestion);
     },
-    /** Close an open question with its answer, and resolve the escalation it was forwarded for, if any. */
-    answer(id: string, answer: string, by: string): boolean {
+    /**
+     * Close an open question with its answer, and resolve the escalation it was
+     * forwarded for, if any. `resolution` is what the escalation records when
+     * the two differ, as a choice does: the question says "Chose: X" while the
+     * escalation takes the choice as guidance.
+     */
+    answer(id: string, answer: string, by: string, resolution = answer): boolean {
       return db.transaction(() => {
         const at = now();
         if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
         const q = toQuestion(getQuestion.get(id)!);
-        if (q.escalationId !== null) resolveEscalation.run(answer, at, q.escalationId);
+        if (q.escalationId !== null) resolveEscalation.run(resolution, at, q.escalationId);
         return true;
       })();
+    },
+    /**
+     * Close an open question with its answer, leaving the escalation it was
+     * forwarded for open. Used when the user's answer is ambiguous: the
+     * project steward, not the plugin, decides what it means.
+     */
+    answerQuestionOnly(id: string, answer: string, by: string): boolean {
+      return answerQuestion.run(answer, by, now(), id).changes > 0;
+    },
+
+    // needs: what waits on the user
+    need(id: string): Need | null {
+      const r = getNeed.get(id);
+      return r === undefined ? null : toNeed(r);
+    },
+    needs(bindingId: string, includeDone = false): Need[] {
+      return needsFor.all(bindingId, includeDone ? 1 : 0).map(toNeed);
+    },
+    openNeeds(bindingId: string): Need[] {
+      return needsFor.all(bindingId, 0).map(toNeed);
+    },
+    openNeedsForProject(projectId: string): Need[] {
+      return openNeedsForProject.all(projectId).map(toNeed);
+    },
+    allNeedsForProject(projectId: string): Need[] {
+      return allNeedsForProject.all(projectId).map(toNeed);
+    },
+    /**
+     * File a need, deduplicated by (binding, kind, url) while open: a steward
+     * that re-reports one updates the wording rather than adding a row.
+     */
+    fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+      const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
+      if (existing !== undefined) {
+        updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        return toNeed(getNeed.get(String(existing.id))!);
+      }
+      const id = newId("need");
+      insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      return toNeed(getNeed.get(id)!);
+    },
+    closeNeed(id: string, resolution: string): boolean {
+      return closeNeedStmt.run(resolution, now(), id).changes > 0;
+    },
+    closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
+      return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
+    },
+    closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
+      return closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
     },
 
     // workers
@@ -666,6 +1032,109 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+    },
+
+    // provide-secret requester threads (BB-22)
+    setSecretRequester(threadId: string, needId: string): void {
+      insertSecretRequester.run(threadId, needId, now());
+    },
+    secretRequester(threadId: string): SecretRequester | null {
+      const r = getSecretRequester.get(threadId);
+      return r === undefined ? null : toSecretRequester(r);
+    },
+    secretRequesterForNeed(needId: string): SecretRequester | null {
+      const r = getSecretRequesterForNeed.get(needId);
+      return r === undefined ? null : toSecretRequester(r);
+    },
+    clearSecretRequester(threadId: string): void {
+      deleteSecretRequester.run(threadId);
+    },
+
+    // the fingerprint map
+    fingerprint(projectId: string, fingerprint: string): Fingerprint | null {
+      const r = getFingerprint.get(projectId, fingerprint);
+      return r === undefined ? null : toFingerprint(r);
+    },
+    fingerprints(bindingId: string): Fingerprint[] {
+      return fingerprintsFor.all(bindingId).map(toFingerprint);
+    },
+    /** Record that a look saw these problems: new ones enter the map with no ticket, known ones count another sighting. */
+    sight(projectId: string, bindingId: string, seen: Array<{ fingerprint: string; summary: string; severity?: string | null; ecosystem?: string | null }>): Map<string, Fingerprint> {
+      return db.transaction(() => {
+        const at = now();
+        const out = new Map<string, Fingerprint>();
+        for (const s of seen) {
+          sight.run({ project_id: projectId, fingerprint: s.fingerprint, binding_id: bindingId, summary: s.summary, severity: s.severity ?? null, ecosystem: s.ecosystem ?? null, at });
+          out.set(s.fingerprint, toFingerprint(getFingerprint.get(projectId, s.fingerprint)!));
+        }
+        return out;
+      })();
+    },
+    /**
+     * Record what a steward did about a problem. Filing or reopening points
+     * the fingerprint at that ticket, so its next sighting is a comment there
+     * and nothing new; a comment counts as the latest word on it. False when
+     * the map has no such fingerprint.
+     */
+    recordTicket(projectId: string, fingerprint: string, ticketKey: string, did: TicketAction): boolean {
+      const at = now();
+      const key = ticketKey.toUpperCase();
+      const changed = did === "commented" ? setCommented.run(key, at, projectId, fingerprint) : setTicket.run(key, at, at, projectId, fingerprint);
+      return changed.changes > 0;
+    },
+
+    // lessons: the project steward's general judgements, made permanent in `.bb`
+    /**
+     * Record a lesson, pending until its text is found at `.bb` HEAD or the
+     * user drops it. `branch` is the guidance branch it will be published on,
+     * computed from the project steward's thread when it has one.
+     */
+    addLesson(fields: { projectId: string; bindingId: string | null; escalationId: string | null; file: string; text: string; scope: LessonScope; branch: string | null }): Lesson {
+      const id = newId("lsn");
+      const at = now();
+      insertLesson.run({
+        id,
+        project_id: fields.projectId,
+        binding_id: fields.bindingId,
+        escalation_id: fields.escalationId,
+        file: fields.file,
+        text: fields.text,
+        scope: fields.scope,
+        branch: fields.branch,
+        created_at: at,
+        updated_at: at,
+      });
+      return toLesson(getLesson.get(id)!);
+    },
+    lesson(id: string): Lesson | null {
+      const r = getLesson.get(id);
+      return r === undefined ? null : toLesson(r);
+    },
+    /** A project's lessons: the pending ones by default, every one with `includeResolved`. */
+    lessons(projectId: string, includeResolved = false): Lesson[] {
+      return lessonsFor.all(projectId, includeResolved ? 1 : 0).map(toLesson);
+    },
+    /** Lessons that reached `.bb` HEAD in the window, for the digest. */
+    mergedLessonsSince(projectId: string, since: number): Lesson[] {
+      return mergedLessonsSince.all(projectId, since).map(toLesson);
+    },
+    /** Remember the guidance branch a lesson is published on. */
+    setLessonBranch(id: string, branch: string): void {
+      setLessonBranchStmt.run(branch, now(), id);
+    },
+    /** Record the last refusal or explanation from a merge attempt, for the prompt. */
+    noteLesson(id: string, note: string | null): void {
+      setLessonNoteStmt.run(note, now(), id);
+    },
+    /** Mark a lesson merged, keeping any sha and branch already recorded. */
+    markLessonMerged(id: string, sha: string | null, branch: string | null, note: string | null = null): void {
+      const at = now();
+      resolveLessonStmt.run("merged", sha, branch, note, at, at, id);
+    },
+    /** Mark a lesson dropped by the user or the project steward. */
+    markLessonDropped(id: string, note: string | null = null): void {
+      const at = now();
+      resolveLessonStmt.run("dropped", null, null, note, at, at, id);
     },
 
     // project stewards

@@ -1,7 +1,8 @@
 # Stewards
 
 Give a Linear ticket or a GitHub pull request **a long-lived thread that
-manages it until it is done**. The thread, a **steward**, acts on the entity
+manages it until it is done**, and production a thread that watches it and
+files what goes wrong. The thread, a **steward**, acts on the entity
 as you, by a playbook the project keeps in `.bb`, and you steer it only from
 bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 
@@ -17,18 +18,57 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   on bithub that was 88 of the project steward's 96 turns. A project's
   stewards share one sidebar section, named after the project, with each
   steward's workers nested under it; see DESIGN.md §15.
+- **Ops stewards.** Each target in the project file's `ops.targets` (a
+  Kubernetes namespace or a Sentry project) gets an `ops` steward, reporting to the project
+  steward, for as long as it is listed. The plugin looks at the target with
+  `kubectl` on the project's machine, the developer's own, as them (through
+  its host entry, [host.ts](host.ts), and [kubectl.ts](kubectl.ts)): pods,
+  Warning events, Deployments, and a failing container's last log lines.
+  It names each
+  problem by a fingerprint (workload, container, error signature;
+  [ops.ts](ops.ts)) and keeps a fingerprint → Linear ticket map. A new
+  problem, or one back after its ticket was resolved, wakes the steward at
+  once. Every requeue (`requeue-default`, 1h in the template) is a turn
+  whatever the look found: a problem still failing under its open ticket is
+  a comment there and nothing new filed, and a healthy look is a short
+  "all healthy" report. The steward
+  files one ticket per problem and escalates a `decision` to the project
+  steward ("Filed BB-N (high), recommend adopting"); the project steward
+  adopts with the label and Todo, the ordinary path. Every kubectl call the
+  plugin makes passes one gate that allows only `get`, `describe`, `logs`
+  and `auth can-i`, and the playbook's `may` list holds the steward to the
+  same; the developer's own rights are broad, so that is a convention, not a
+  wall. Until kubectl can read a target, its binding waits and `bb stewards
+  check` says "cannot read the target". DESIGN.md §18.
+- **Dependency stewards.** GitHub scans; the stewards turn Dependabot alerts
+  into tickets. Every repo in `repos.json` not in `github.exclude` (or the
+  explicit `{ kind: "dependabot", repo }` targets in `ops.targets`) gets an
+  `ops` binding that runs `deps-alerts` and is woken by the
+  `dependabot_alert` doorbell; the github plugin reads the alerts with the
+  developer's token and leases each repo as a `dependabot_repo` (a `repo`
+  lease does not receive alert doorbells). Severity sets the Linear priority
+  and a due date from `deps.sla`; critical and high get their own ticket,
+  medium and low coalesce into one open ticket per repo per ecosystem, and a
+  new alert joins or tightens it. A fixed or dismissed alert trims or closes
+  its ticket, and the nightly pass re-lists open alerts as the backstop. A
+  `dependabot[bot]` version-update pull request is adopted under `deps-prs`,
+  reviewed, and escalated for a human merge; it is never merged. Reading
+  alerts needs the token's alert access; a server whose login cannot read
+  them skips the targets, and `bb stewards check` says which. DESIGN.md §19.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the
   project's teams and repos and for every bound entity, and ring this plugin
   on a doorbell. A ring is debounced, the entity is snapshotted, compared with
   the last observation, and the steward is woken only for an actionable
   change: a phase change, a human comment, a review, checks finishing,
   someone else's push, a worker finishing, guidance, an approval, a spec
-  change, or its requeue time. While one of its workers is running, the
-  worker's own work on a pull request — checks finishing, description
-  edits, pushes and comments from your account, which every thread posts
-  as — is not a reason to wake. Everything not actionable is kept as a
-  quiet note and shown in "What changed" at the next turn something else
-  makes due.
+  change, or its requeue time. While any worker of the binding is in flight
+  — from its spawn until it is stopped, failed or archived, across the idle
+  between its turns — the worker's own work on a pull request (checks
+  finishing, description edits, pushes and comments from your account, which
+  every thread posts as, and the reviewer's `bb-review` markers) is not a
+  reason to wake; a reviewer round that changes the lane is. Everything not
+  actionable is kept as a quiet note and shown in "What changed" at the next
+  turn something else makes due.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
   woken turn ends with `steward_report`, the status record. A wake past
@@ -36,11 +76,35 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   a wake carries what the steward needs, its transcript can go: after a
   steward's or the project steward's turn, the plugin compacts its context
   once it holds more than **Compact a steward above this many context
-  tokens** (120,000 by default; 0 leaves it to the provider).
+  tokens** (120,000 by default; 0 leaves it to the provider), and before a
+  wake that would push it over.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a
-  spec). Everything else is the tools every thread has: `linear_*`, `gh`,
+  spec).
+- **Scheduling.** Two tickets changing the same files at once end in a
+  rebase for whichever merges second, so the project steward sequences
+  them. Each steward reports the repo-relative paths its work changes
+  (`steward_report { touches }`); two bindings overlap when a touch of one
+  is, or is inside, a touch of the other. When a ticket's ready gate passes
+  while another binding is building or reviewing on the same paths, the
+  plugin files a `schedule` escalation with the project steward, like the
+  approval request, and the ticket steward is told to start no workers
+  until it is decided. The project steward holds the ticket behind that
+  work (`steward_update { hold, behind: [keys] }`, which closes the request)
+  or lets it start (guidance + resolve, not asked again until a new overlap
+  appears). A hold placed `behind` lifts itself once every binding named
+  has merged its pull requests or ended: the held steward is woken with a
+  note to rebase, and the project steward is told. A binding reaching a
+  terminal state, or detached, releases what waits behind it as its ending
+  begins, so a steward that follows through for hours holds nobody up. A
+  hold that would form a cycle is refused. Work whose pull requests have all
+  merged no longer counts as in flight; a ticket whose gate has passed with
+  nothing holding or scheduling it counts as in flight already, so two
+  tickets going ready in the same minute schedule against each other rather
+  than racing to In Progress. `bb stewards show` prints
+  what a binding touches and overlaps; the project steward's wake lists
+  both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
   children of a steward thread.
 - **Lifecycle.** A terminal state gets a wrap-up turn with its workers
@@ -84,24 +148,69 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   unless a playbook says `approval: me`. The plugin asks for that approval
   itself: whenever a ready gate's checklist is met, the ticket is
   substantial and the current spec has no approval, it files an `approval`
-  escalation with the approver (the project steward, or the user in the
-  steward's thread), whatever the steward's report says, and closes it once
-  approved or no longer needed. A request the approver declines is not made
-  again until the spec changes. When the entity changes while one of its
+  escalation with the project steward, or an `approve-spec` item on the
+  Stewards page when the approver is the user (`approval: me`), whatever
+  the steward's report says, and closes it once approved or no longer
+  needed. When the project steward forwards an `approval` escalation to
+  you, the plugin files the same `approve-spec` item and keeps the
+  escalation open, linked to it, so a forwarded approval is answered with
+  Approve/Decline exactly as `approval: me` is; a forwarded `decision`
+  stays a question. An approval is recorded from the approver's
+  words wherever they are: the project steward's guidance that resolves the
+  request, the user's answer on the Stewards page, their message in the
+  steward's thread, or their unsigned approving comment on the entity. A
+  page answer that is neither an approval nor a clear refusal goes back to
+  the project steward to interpret, rather than being remembered as a
+  decline. A spec comment the user writes from their own thread counts
+  toward the spec and, with `approval: me`, is its own approval. A request
+  the approver declines is not made again until the spec changes, and while
+  one is open the steward is told not to ask the user again: the request is
+  on the Stewards page, and a report that asks anyway shows as a playbook
+  violation in `bb stewards show`. When the entity changes while one of its
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open
-  escalation is flagged in `bb stewards list` and the digest.
+  escalation or needs item is flagged in `bb stewards list` and the digest.
+- **"Needs you" items** are the structured things only the user can do: an
+  `approve-spec`, an `approve-pr` or a `merge` the plugin files from the
+  snapshot, and a `configure`, `provide-secret` or `decide` a steward files
+  through `steward_report { needs }`. They are deduplicated by (binding,
+  kind, url) while open, listed under "Waiting on you" on the Stewards page
+  with a link and a button each, in the digest, and by `bb stewards needs`.
+  The buttons run on the server as the connected user, unsigned: Approve
+  posts the "Approved <sha> from the Stewards page" comment, Merge re-checks
+  the lane gate and squash-merges through the server's `gh` login, and every
+  action wakes the binding's steward with the closure under "What changed".
+  A button is shown only while the server can verify its preconditions;
+  otherwise the item says why not. `bb stewards done <id>` closes one from a
+  thread. A `decide` item or a forwarded decision question may carry fixed
+  `choices` (two to six short labels): the page then shows one button per
+  choice, a note field and **Other…** instead of a free-text **Answer**, and
+  a choice is saved as guidance. `bb stewards done <id> --choice <label>`
+  records the same from a thread. A `blockedOn` naming the user, the owner
+  or a human is refused unless an open needs item says so.
+- **Lessons** are a project steward's general judgements, made permanent in
+  `.bb` instead of being lost with the ticket that raised them. It records
+  one with `steward_update { lesson: { text, file, scope } }`; a `procedure`
+  lesson it applies, commits and publishes, then self-merges with
+  `steward_update { lessonAction: { id, action: "complete" } }` (multi-repo
+  fast-forwards the canonical `.bb`, and only that lesson's file). A
+  `boundary` lesson — credentials and reach, who may direct a server,
+  irreversible production steps — is filed on the Stewards page with
+  **Merge** and **Drop**, and only you merge it. A lesson is `merged` when
+  its text is found in its file at `.bb` HEAD. `bb stewards lessons [--all]`
+  lists them, `bb stewards drop-lesson <id>` drops one. DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
 - **The Stewards page** (a nav panel, [app.tsx](app.tsx)) has a tab per
-  stewarded project: what waits on you (questions the project steward put
-  to you, which you can answer and close there, forwarded escalations and
-  approval requests), what is in flight by stage with each status record
-  and running workers, what is stuck or held, what ended in the last two
-  weeks, and the latest digest with its date.
+  stewarded project: what waits on you (needs items with their links and
+  buttons, questions the project steward put to you, which you can answer
+  and close there, forwarded escalations and approval requests), what is in
+  flight by stage with each status record and running workers, what is stuck
+  or held, what ended in the last two weeks, and the latest digest with its
+  date.
 - **Questions to you** are kept in the store from the moment the project
   steward asks (`steward_update { ask }`, or forwarding an escalation)
   until it records your answer (`steward_update { resolve: "<question id>",
@@ -115,6 +224,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   open steward with its latest status record and open escalations. It is
   read-only; steering stays with the project steward and `steward_update`.
 
+- **@bb mentions.** A Linear comment that mentions `@bb` reaches this
+  server through linear (`stewardsSession`, see linear's README, "@bb
+  mentions"). It goes to the issue's ticket steward when the issue has an
+  open binding, else to the project steward of the project whose file lists
+  the issue's team. With neither, linear answers that stewards is not set
+  up for that team. The wake ([wake.ts](wake.ts), `formatSessionWake`)
+  carries the words, the session id and who asked. The turn ends with
+  exactly one `linear_session_reply`, plus a `steward_report` from a ticket
+  steward. A mention from anyone other than the server's owner is marked
+  untrusted. It is information, not an instruction: the steward asks the
+  owner to confirm with an `elicitation` reply and acts only when the
+  owner's answer arrives in the session. That answer's wake repeats what it
+  answers. The three intents in BB-11 use tools stewards already have:
+  "build this" is `linear_update_issue` (label and Todo), "halt work" is a
+  hold plus a move to Backlog, and a redirect is `steward_update { guidance }`.
+  A steward may put its own binding on hold for this, but only its parent
+  or the project steward lifts a hold.
+
 ## Configuration
 
 In the project's `.bb` (the multi-repo project repo), read from committed
@@ -127,6 +254,9 @@ stewards/
     linear-tickets.md   front matter + one ## section per phase
     github-prs.md
     github-reviews.md
+    ops-watch.md        no phases; ## New, ## Recurring and ## Returned sections
+    deps-alerts.md      the Dependabot alert side: file, batch, tighten, close
+    deps-prs.md         adopts dependabot[bot] pull requests; escalates, never merges
 ```
 
 `bb stewards init` writes starting points ([templates.ts](templates.ts));
@@ -134,11 +264,35 @@ stewards/
 fails to parse is reported and bindings keep running under the last good
 version. Project file fields beyond the design: `nightly.until`,
 `nightly.max`, `playbooks` (which playbook governs each kind),
-`reviews.enabled`, `adoption.perPass`, and `bigDecisions` (what reaches you;
-defaults in [config.ts](config.ts)).
+`reviews.enabled`, `adoption.perPass`, `bigDecisions` (what reaches you;
+defaults in [config.ts](config.ts)), and `ops`: `targets` (`{ kind:
+"k8s-namespace", name }`, at most ten), `team` (where tickets are filed; the
+first of `linear.teams` by default, and it must be one of them) and
+`context` (the kubeconfig context kubectl uses; the machine's current one
+when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
+tickets the ops steward labels for a steward itself when it files them).
+A `{ kind: "sentry-project", org, project }` target watches a Sentry
+project with the plugin's **Sentry token** setting (a user auth token with
+`project:read` and `event:read`; `Sentry API` for a self-hosted server),
+rung by bb-gate-hooks the moment an issue is created or regresses and
+backed by the same periodic look; the Sentry issue id is the fingerprint,
+and the wake carries the issue's title, culprit, permalink, counts and
+latest stack trace ([sentry.ts](sentry.ts), DESIGN.md §18).
+`ops-watch.md` is read only when `ops.targets` lists a k8s namespace or a
+Sentry project.
 
-Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`), `source`,
-`phases` (state → `{ stage, stuck }`), `terminal`, `ready` (`checklist`,
+The `deps` object is the dependency watch: `sla` (a duration or `asap` per
+severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
+window a medium or low alert may wait for company), and `autoAdopt` (the
+severities whose tickets are labelled and moved to Todo when filed).
+`deps-alerts.md` and `deps-prs.md` are optional: a project that has not
+written them runs no dependency watch. `bb stewards init` writes them, and
+`bb stewards check` validates `deps.sla`, `deps.batch` and `deps.autoAdopt`
+and reports each repo whose alerts the `gh` login cannot read.
+
+Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
+`source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
+stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as
 `provider/model/level`; `claude` means `claude-code`; the model may hold
@@ -159,14 +313,17 @@ None beyond the playbook's word. A steward acts with the user's credentials
 and a shell; its `may` list and the ready gate are stated in every wake, and
 everything it writes is signed with its thread, so what it did is visible
 afterwards. The runaway guard is the one hard stop. GitHub writes go through
-`gh`; there are no write tools to check.
+`gh`; there are no write tools to check. Ops stewards are no exception:
+kubectl acts as the developer, and only the plugin's verb gate and the
+playbook keep the steward to reading.
 
 ## The contract with linear and github-watcher
 
 [source-contract.ts](source-contract.ts) is copied byte for byte into
 `plugins/linear` and `plugins/github-watcher`; `contract.test.ts` fails when the
 copies drift. Sources serve `sourceSnapshot`, `sourceValidate`,
-`sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`.
+`sourceAdoptable` and `sourceSetInterest`; stewards serves `stewardsRing`,
+and `stewardsSession` for linear's `@bb` mentions.
 
 ## Develop
 
@@ -180,4 +337,7 @@ bb plugin build
 Deployment needs this directory added to bb-gate's
 `docker/bb-server/Dockerfile` (the sparse checkout, the `mv`, and
 `BB_PLUGIN_DIRS`), and multi-repo, linear and github-watcher at versions that serve
-the contract.
+the contract. Ops stewards need `kubectl` on the project's machine, with a
+kubeconfig that reaches the cluster as the developer (for bc-prod, the
+Tailscale API proxy: the machine on the tailnet as its developer, not a
+tagged node). The plugin's host entry runs it there.

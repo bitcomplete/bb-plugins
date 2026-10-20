@@ -17,27 +17,42 @@ import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
   DEFAULT_PLAYBOOKS,
+  DEPS_ALERTS_PLAYBOOK,
+  DEPS_PRS_PLAYBOOK,
   ESCALATION_KINDS,
   KINDS,
   PROJECT_FILE,
+  depsAlertsPlaybookName,
+  depsPrsPlaybookName,
+  depsTargets,
   durationSchema,
   formatDuration,
   isTerminal,
+  k8sTargets,
   modelSpecSchema,
+  opsTeam,
   parsePlaybook,
   parseProjectFile,
   playbookNameFor,
   playbookPath,
   playbookStates,
+  sentryTargets,
   STAGES,
+  usesKind,
   type BindingKind,
   type EscalationKind,
   type ModelSpec,
   type Playbook,
   type ProjectFile,
 } from "./config.js";
+import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
+import { hostContract } from "./host-contract.js";
+import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
+import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { advanced, approvalWanted, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, lifecycle, newestCommentAt, phaseAndStage, resolveChecklistItem, specHash, stuckDue, unheardWait, type Change } from "./reconcile.js";
+import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
+import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -45,12 +60,17 @@ import {
   signatureLine,
   sourceContract,
   stewardsContract,
+  type DependabotAlert,
+  type DependabotSeverity,
   type EntitySnapshot,
+  type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, createStore, type Binding, type Escalation, type EscalationRoute, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
+import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatProjectWake, formatWake, type DigestRecords, type WakeReason } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -106,6 +126,14 @@ export const DEFAULT_TIMING: Timing = {
 export interface StewardsDeps {
   now: () => number;
   timing?: Partial<Timing>;
+  /** Runs kubectl for ops bindings: on the project's machine, through the host entry, by default. */
+  kubectl?: (args: string[], where: { projectId: string; hostId: string | null }) => Promise<KubectlResult>;
+  /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
+  github?: GithubWriter;
+  /** What reads Sentry and subscribes to bb-gate-hooks for it; global fetch by default. */
+  fetch?: typeof fetch;
+  /** Where BB_HOOKS_URL is read from; the process environment by default. */
+  env?: Record<string, string | undefined>;
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -125,6 +153,20 @@ const readFilesOutput = z
   .loose();
 const repoSetOutput = z.object({ repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()), error: z.string().nullable() }).loose();
 
+/** multi-repo's answer to a lesson merge, loose like the reads above. */
+const mergeGuidanceOutput = z.object({ ok: z.boolean(), sha: z.string().nullable(), branch: z.string().nullable(), message: z.string() }).loose();
+
+/**
+ * The `guidance-<thread>` ref a thread's `.bb` commits are published on.
+ * Duplicated from multi-repo's `guidanceRef` because it is a contract between
+ * the two: `workspace_publish_guidance` computes it from the calling thread,
+ * and a lesson records it before the merge so the page can name it.
+ */
+export const lessonBranchFor = (threadId: string): string => `refs/heads/guidance-${threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60)}`;
+
+/** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
+const normalizeLessonText = (text: string) => text.replace(/\s+/gu, " ").trim();
+
 /** The steward's own surface for the app and the CLI. Cross-plugin methods are in source-contract.ts. */
 export const rpcContract = defineRpcContract({
   ...stewardsContract,
@@ -143,6 +185,7 @@ export const rpcContract = defineRpcContract({
           nextAction: z.string().nullable(),
           actor: z.string().nullable(),
           escalations: z.number(),
+          needs: z.number(),
           ended: z.boolean(),
         }),
       ),
@@ -214,11 +257,53 @@ export const rpcContract = defineRpcContract({
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
           questions: z.array(
-            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
+            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), choices: z.array(z.string()), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
           ),
           /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
           withUser: z.array(
             z.object({ id: z.string(), kind: z.string(), question: z.string(), recommendation: z.string().nullable(), key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), createdAt: z.number() }),
+          ),
+          /** "Needs you" items: links and the one-click action each supports. */
+          needs: z.array(
+            z.object({
+              id: z.string(),
+              bindingId: z.string(),
+              key: z.string(),
+              kind: z.string(),
+              url: z.string().nullable(),
+              /** The escalation this item answers, when the project steward forwarded one. */
+              escalationId: z.string().nullable(),
+              /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
+              choices: z.array(z.string()),
+              /** The lesson a `decide` item is about, when it is a boundary lesson; null otherwise. */
+              lessonId: z.string().nullable(),
+              what: z.string(),
+              how: z.string().nullable(),
+              /** For a provide-secret item: where the value goes, in words. */
+              destination: z.string().nullable(),
+              threadId: z.string().nullable(),
+              createdAt: z.number(),
+              /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
+              actionable: z.boolean(),
+              why: z.string().nullable(),
+            }),
+          ),
+          /** Pending lessons: general rules the project steward has recorded and not yet landed. */
+          lessons: z.array(
+            z.object({
+              id: z.string(),
+              bindingId: z.string().nullable(),
+              key: z.string().nullable(),
+              file: z.string(),
+              text: z.string(),
+              scope: z.string(),
+              status: z.string(),
+              branch: z.string().nullable(),
+              mergeSha: z.string().nullable(),
+              note: z.string().nullable(),
+              escalationId: z.string().nullable(),
+              createdAt: z.number(),
+            }),
           ),
           stewards: z.array(
             z.object({
@@ -245,10 +330,24 @@ export const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
-  // The user closes a question from the page, with or without an answer.
+  // The user closes a question from the page, with or without an answer, or
+  // picks one of its fixed choices.
   stewardsAnswerQuestion: {
-    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable() }),
+    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable().optional(), choice: z.string().trim().min(1).max(100).nullable().optional() }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
+  },
+  // The user presses a button on a "needs you" item: approve or decline a spec,
+  // approve a pull request, merge one, mark a configure step done, or provide a
+  // secret. It runs as the connected user, unsigned.
+  stewardsNeedAction: {
+    input: z.object({
+      needId: z.string().min(1).max(100),
+      action: z.enum(["approve", "decline", "done", "merge", "provide", "choose"]),
+      note: z.string().trim().max(4000).nullable().optional(),
+      /** With action `choose`: the label, which must be one of the item's choices. */
+      choice: z.string().trim().min(1).max(100).nullable().optional(),
+    }),
+    output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
   },
 });
 
@@ -259,6 +358,10 @@ type ProjectConfig = {
   projectId: string;
   file: ProjectFile;
   playbooks: Partial<Record<BindingKind, Playbook>>;
+  /** The dependency watch's alert playbook, when it parses. */
+  depsAlerts: Playbook | null;
+  /** The Dependabot pull request playbook, when it parses. */
+  depsPrs: Playbook | null;
   /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
   repos: string[];
   /** What is wrong with the configuration, in sentences; bindings keep running under the last good playbook. */
@@ -268,30 +371,162 @@ type ProjectConfig = {
 
 const PRIORITY_ORDER: Record<string, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
 
+/** Authors whose pull requests the dependency watch adopts under deps-prs. */
+export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
+
+/**
+ * Fixed choices on a `decide` need or an escalation: two to six short,
+ * distinct labels, so the page can show one button each. Never a
+ * multi-select.
+ */
+export const choicesSchema = z
+  .array(z.string().trim().min(1).max(60))
+  .min(2)
+  .max(6)
+  .refine((labels) => new Set(labels).size === labels.length, "choices must be distinct");
+
+/**
+ * The dotenv value `bb secret request` wrote for one variable, or null. The
+ * file is read on the invoking thread's host through `bb.sdk.files`; only the
+ * named variable's value is returned, and the value is never logged.
+ */
+export function parseDotenvValue(content: string, name: string): string | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const pattern = new RegExp(`^\\s*(?:export\\s+)?${escaped}\\s*=\\s*(.*)$`, "u");
+  for (const line of content.split(/\r?\n/u)) {
+    const match = pattern.exec(line);
+    if (match === null) continue;
+    return unquoteDotenvValue(stripDotenvComment((match[1] ?? "").trim()));
+  }
+  return null;
+}
+
+function stripDotenvComment(raw: string): string {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote === '"' && ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = quote === ch ? null : (quote ?? ch);
+      continue;
+    }
+    if (ch === "#" && quote === null && i > 0 && /\s/u.test(raw[i - 1] ?? "")) return raw.slice(0, i).trimEnd();
+  }
+  return raw;
+}
+
+function unquoteDotenvValue(raw: string): string {
+  if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1);
+  if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+    return raw
+      .slice(1, -1)
+      .replace(/\\n/gu, "\n")
+      .replace(/\\r/gu, "\r")
+      .replace(/\\"/gu, '"')
+      .replace(/\\\\/gu, "\\");
+  }
+  return raw;
+}
+
+/** Where a provide-secret item's value goes, for the page and the requester prompt. */
+export function secretDestination(need: Pick<Need, "data">): string | null {
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  if (setting !== null) return `the stewards setting ${setting}`;
+  const writeEnv = typeof need.data.writeEnv === "string" && need.data.writeEnv.trim() !== "" ? need.data.writeEnv.trim() : null;
+  if (writeEnv !== null) return `the dotenv ${writeEnv}`;
+  return "a dotenv on this machine";
+}
+
+/** The env var a provide-secret item's dotenv holds: `variable`, else the setting name in SCREAMING_SNAKE_CASE. */
+export function secretVariable(need: Pick<Need, "what" | "data">): string {
+  const variable = typeof need.data.variable === "string" && need.data.variable.trim() !== "" ? need.data.variable.trim() : null;
+  if (variable !== null) return variable;
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  if (setting !== null) return setting.replace(/([a-z0-9])([A-Z])/gu, "$1_$2").replace(/[^A-Za-z0-9_]/gu, "_").toUpperCase();
+  return need.what.trim();
+}
+
+/**
+ * The fixed prompt the plugin gives the requester thread it spawns for a
+ * provide-secret need. The form opens in that thread's first turn; the value
+ * never reaches the agent, argv, logs or the timeline. The prompt says what to
+ * report when the request fails, so the steward is told.
+ */
+export function requesterPrompt(b: Pick<Binding, "entityKey">, need: Pick<Need, "what" | "data">, writeEnv: string): string {
+  const variable = secretVariable(need);
+  const rawPurpose = typeof need.data.purpose === "string" && need.data.purpose.trim() !== "" ? need.data.purpose.trim() : `the value ${b.entityKey} needs`;
+  const purpose = rawPurpose.replace(/\s+/gu, " ");
+  const setting = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+  const lines = [
+    `You are a one-task requester thread started by the stewards plugin for ${b.entityKey}. The user is waiting to enter a secret through bb's secure form. Do only this; do not explore the workspace or do anything else.`,
+    "",
+    "Run this command and wait for the user to submit the form in this thread:",
+    "",
+    `    bb secret request ${variable} --purpose ${JSON.stringify(purpose)} --write-env ${JSON.stringify(writeEnv)}`,
+  ];
+  if (setting !== null) {
+    lines.push("", "Then, once it succeeds, run:", "", `    bb stewards secret import --from ${JSON.stringify(writeEnv)} --setting ${setting}`);
+  }
+  lines.push(
+    "",
+    "The form is masked; the value never reaches you, argv, logs or the timeline. Never read, echo or cat the dotenv file. When it succeeds, reply with one short line saying the secret was provided.",
+    "If the request fails or is cancelled, reply with one line saying what failed (the error code or message). Do not retry more than once, and never paste any value.",
+  );
+  return lines.join("\n");
+}
+
+export const STEWARDS_SETTINGS = {
+  paused: {
+    type: "boolean",
+    label: "Pause stewards",
+    description: "No steward is woken and nothing new is adopted while this is on. Changes still queue up and are delivered when it is turned off.",
+    default: false,
+  },
+  workerSpawnsPerHour: {
+    type: "number",
+    label: "Worker spawns per binding per hour",
+    description: "The runaway guard: a steward that tries to start more workers than this in an hour is refused. Not a budget.",
+    default: 6,
+  },
+  compactAboveTokens: {
+    type: "number",
+    label: "Compact a steward above this many context tokens",
+    description: "After a steward's or the project steward's turn, and before a wake that would push it over, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
+    default: 120_000,
+  },
+  sentryToken: {
+    type: "string",
+    secret: true,
+    label: "Sentry token",
+    description: `A Sentry user auth token with the scopes ${TOKEN_SCOPES.join(" and ")}, for the ops stewards of sentry-project targets: the plugin reads each project's issues with it and proves its bb-gate-hooks leases with it. Created at Settings → Account → API → Auth Tokens in Sentry.`,
+  },
+  sentryApiUrl: {
+    type: "string",
+    label: "Sentry API",
+    description: "Where Sentry is read; change it for a self-hosted Sentry.",
+    default: SENTRY_API_URL,
+  },
+} as const;
+
+/** The declared settings a provide-secret need may name: only `secret: true` fields are accepted. */
+export const SECRET_SETTING_NAMES = new Set(Object.entries(STEWARDS_SETTINGS).filter(([, descriptor]) => "secret" in descriptor && descriptor.secret === true).map(([name]) => name));
+
 export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
     const timing: Timing = { ...DEFAULT_TIMING, ...deps.timing };
     const now = deps.now;
-    const settings = bb.settings.define({
-      paused: {
-        type: "boolean",
-        label: "Pause stewards",
-        description: "No steward is woken and nothing new is adopted while this is on. Changes still queue up and are delivered when it is turned off.",
-        default: false,
-      },
-      workerSpawnsPerHour: {
-        type: "number",
-        label: "Worker spawns per binding per hour",
-        description: "The runaway guard: a steward that tries to start more workers than this in an hour is refused. Not a budget.",
-        default: 6,
-      },
-      compactAboveTokens: {
-        type: "number",
-        label: "Compact a steward above this many context tokens",
-        description: "After a steward's or the project steward's turn, its context is compacted when it holds more than this. Every wake is self-contained, so little is lost. 0 leaves compaction to the provider.",
-        default: 120_000,
-      },
-    });
+    const github = deps.github ?? createGhWriter();
+    const settings = bb.settings.define(STEWARDS_SETTINGS);
+    const fetchImpl = deps.fetch ?? globalThis.fetch;
+    const env = deps.env ?? process.env;
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
@@ -393,9 +628,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         file = lastParsed.value;
       }
 
-      const kinds = KINDS.filter((k) => k !== "review" || file.reviews.enabled);
+      const kinds = KINDS.filter((k) => usesKind(file, k));
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
-      const texts = await readFiles(projectId, [...new Set(names.values())].map(playbookPath));
+      const depsAlertsName = depsAlertsPlaybookName(file);
+      const depsPrsName = depsPrsPlaybookName(file);
+      const texts = await readFiles(projectId, [...new Set([...names.values(), depsAlertsName, depsPrsName])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       for (const [kind, name] of names) {
         const text = texts.get(playbookPath(name)) ?? null;
@@ -416,6 +653,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
 
+      /**
+       * The dependency watch's two playbooks. They are optional: a project that
+       * has not written them runs no dependency watch, which is how the feature
+       * is off before `bb stewards init` writes them. One that is present but
+       * does not parse is a problem, like any other playbook.
+       */
+      const loadOptional = async (name: string): Promise<Playbook | null> => {
+        const text = texts.get(playbookPath(name)) ?? null;
+        if (text === null) return null;
+        const goodKey = `good/${projectId}/playbook/${name}`;
+        let result = parsePlaybook(text, name);
+        if (result.ok) {
+          await bb.storage.kv.set(goodKey, text);
+          return result.value;
+        }
+        problems.push(result.error);
+        const last = await bb.storage.kv.get<string>(goodKey);
+        const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
+        if (lastParsed !== null && lastParsed.ok) {
+          problems.push(`${name} keeps running under the last good version (${lastParsed.value.version}).`);
+          return lastParsed.value;
+        }
+        return null;
+      };
+      const depsAlerts = await loadOptional(depsAlertsName);
+      const depsPrs = await loadOptional(depsPrsName);
+
       let repos: string[] = [];
       try {
         const set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
@@ -429,7 +693,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       } catch (error) {
         problems.push(`could not read the repo set: ${errorMessage(error)}`);
       }
-      return { projectId, file, playbooks, repos, problems, loadedAt: now() };
+      return { projectId, file, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
     }
 
     /** Every project with a stewards configuration. */
@@ -444,6 +708,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     const playbookFor = (config: ProjectConfig, kind: BindingKind) => config.playbooks[kind] ?? null;
+
+    /**
+     * The playbook a binding runs under. A Dependabot alert target uses the
+     * deps-alerts playbook; a pull request the dependency watch adopted uses
+     * deps-prs; everything else uses its kind's playbook.
+     */
+    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId">): Playbook | null {
+      if (b.kind === "ops") {
+        const target = parseOpsTargetKey(b.entityId);
+        if (target?.kind === "dependabot") return config.depsAlerts;
+      }
+      if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file)) return config.depsPrs;
+      return playbookFor(config, b.kind);
+    }
 
     // ---- the sources ---------------------------------------------------------------------
 
@@ -493,10 +771,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function sendInterest(): Promise<void> {
       const projects = [...configs.values()].map((c) => c.value).filter((c): c is ProjectConfig => c !== null);
       const open = store.open();
-      const sets: Record<Source, { units: string[]; entities: string[] }> = {
+      const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[] }> = {
         linear: {
           units: [...new Set(projects.flatMap((p) => p.file.linear.teams))].sort(),
           entities: [...new Set(open.filter((b) => b.source === "linear").map((b) => b.entityId))].sort(),
+          dependabot: [],
         },
         github: {
           units: [...new Set(projects.flatMap((p) => p.repos))].sort(),
@@ -506,6 +785,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...open.flatMap((b) => leasedPulls(b)),
             ]),
           ].sort(),
+          // Every repo the project watches for Dependabot alerts. A server
+          // whose gh login cannot read alerts has each lease refused as
+          // `forbidden`, which it skips; stewards check says so.
+          dependabot: [...new Set(projects.flatMap((p) => (p.depsAlerts === null ? [] : depsTargets(p.file, p.repos).map((t) => t.repo))))].sort(),
         },
       };
       for (const source of ["linear", "github"] as const) {
@@ -817,7 +1100,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         projectId: b.projectId,
         ...(sectionId === null ? {} : { sectionId }),
         prompt,
-        title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : `${b.entityKey}: ${b.title ?? ""}`.trim(),
+        title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : b.kind === "ops" ? (b.title ?? `Ops watch: ${b.entityKey}`) : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...modelArgs(stewardModel(b, playbook)),
         pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: STEWARD_BRIEFS },
       };
@@ -837,7 +1120,85 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return thread.id;
     }
 
+    /**
+     * The dotenv the requester writes for a provide-secret need. The need's
+     * own `writeEnv` wins; a stewards setting always uses the requester's
+     * temporary storage; otherwise the named worker's thread storage, so the
+     * value lands where the worker reads it.
+     */
+    async function requesterWriteEnv(need: Need, requesterHostId: string | null): Promise<string> {
+      const named = typeof need.data.writeEnv === "string" && need.data.writeEnv.trim() !== "" ? need.data.writeEnv.trim() : null;
+      if (named !== null) return named;
+      if (typeof need.data.setting === "string" && need.data.setting.trim() !== "") return "$BB_THREAD_STORAGE/.secrets.env";
+      const workerThreadId = typeof need.data.workerThreadId === "string" ? need.data.workerThreadId : null;
+      if (workerThreadId !== null) {
+        try {
+          const location = await bb.sdk.threads.storageLocation({ threadId: workerThreadId });
+          if (typeof location.storageRootPath === "string" && location.storageRootPath !== "") {
+            // Only write another thread's storage when it is on the requester's
+            // own machine; a cross-host path is not the requester's to write.
+            if (requesterHostId === null || location.hostId === requesterHostId) return `${location.storageRootPath.replace(/\/$/u, "")}/.secrets.env`;
+            bb.log.warn(`stewards: worker ${workerThreadId} is on ${location.hostId}, not the requester's ${requesterHostId}; writing the requester's own storage`);
+          }
+        } catch (error) {
+          bb.log.warn(`stewards: could not resolve worker ${workerThreadId}'s storage (${errorMessage(error)}); using the requester's own`);
+        }
+      }
+      return "$BB_THREAD_STORAGE/.secrets.env";
+    }
+
+    /**
+     * Spawn the fixed-prompt requester thread for an open provide-secret need,
+     * on the same machine and with the same model the binding's workers use. It
+     * is recorded as a worker so the steward is told when it finishes, and
+     * bound to the need so `bb stewards secret import` accepts only it.
+     */
+    async function spawnRequester(b: Binding, need: Need): Promise<string> {
+      const config = await loadConfig(b.projectId);
+      const playbook = config === null ? null : bindingPlaybook(config, b);
+      const model = playbook === null ? parseModel(b.modelWorker) : workerModel(b, playbook);
+      const hostId = await projectHost(b.projectId);
+      const writeEnv = await requesterWriteEnv(need, hostId);
+      const variable = secretVariable(need);
+      const title = `Provide ${variable} for ${b.entityKey}`;
+      const sectionId = await projectSection(b.projectId);
+      const thread = await bb.sdk.threads.spawn({
+        projectId: b.projectId,
+        environment: freshEnvironment(hostId),
+        prompt: requesterPrompt(b, need, writeEnv),
+        title,
+        ...modelArgs(model),
+        ...(sectionId === null ? {} : { sectionId }),
+        pluginMetadata: { role: "requester", bindingId: b.id, needId: need.id },
+      });
+      store.setSecretRequester(thread.id, need.id);
+      store.addWorker(thread.id, b.id, title);
+      bb.log.info(`stewards: started a requester thread for ${b.entityKey}'s ${variable} (${thread.id})`);
+      return thread.id;
+    }
+
+    /** Close the provide-secret need a requester was spawned for, once it has finished. */
+    function closeRequesterNeed(threadId: string): void {
+      const requester = store.secretRequester(threadId);
+      if (requester === null) return;
+      const need = store.need(requester.needId);
+      if (need === null || need.status !== "open") return;
+      store.closeNeed(need.id, "The requester thread finished; the secret was provided through bb's secure form.");
+    }
+
     // ---- the reconcile loop ------------------------------------------------------------------
+
+    /**
+     * A thread the plugin does not know as a steward, a worker or the project
+     * steward is one the user runs themselves. Its signed comments count as
+     * the user's own words, including for the spec (criterion 4).
+     */
+    function isUserThread(threadId: string): boolean {
+      return store.byThread(threadId) === null && store.worker(threadId) === null && store.projectByThread(threadId) === null;
+    }
+
+    /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
+    const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, isUserThread);
 
     const ownThreads = (b: Binding) => new Set([b.threadId, ...store.workers(b.id).map((w) => w.threadId)].filter((t): t is string => t !== null));
 
@@ -845,9 +1206,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return store.children(b.id).flatMap((child) => store.openEscalations(child.id).filter((x) => x.route === "parent").map((escalation) => ({ escalation, from: child })));
     }
 
+    /** Send a wake, spawning the steward's thread on the first; false when nothing was delivered. */
+    async function deliverWake(b: Binding, config: ProjectConfig, playbook: Playbook, text: string): Promise<boolean> {
+      if (b.threadId === null) {
+        await spawnSteward(b, config, playbook, text);
+        return true;
+      }
+      // A wake can be the thing that pushes the transcript over the limit;
+      // compact first (criterion 4). If compaction makes the thread busy,
+      // sendTo queues the wake for the next idle.
+      await compactIfLarge(b.threadId, text.length);
+      const sent = await sendTo(b.threadId, text);
+      if (sent === "gone") {
+        // The user deleted the thread: that is a detach they meant.
+        store.patch(b.id, { endedAt: now(), endReason: "deleted", manualDetach: true });
+        pushInterest();
+        return false;
+      }
+      return sent === "sent";
+    }
+
     /** Wake the steward, spawning its thread on the first wake. */
     async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<void> {
-      const gate = gateState(playbook, b.ready, specHash(observed.entity, b.threadId));
+      const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
+      const workerQuestions = await collectWorkerQuestions(b);
       const text = formatWake({
         reason,
         binding: b,
@@ -857,25 +1239,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations: store.openEscalations(b.id),
         routedToMe: routedTo(b),
         workers: store.workers(b.id),
+        workerQuestions,
         children: store.children(b.id).map((c) => ({ binding: c, openEscalations: store.openEscalations(c.id) })),
         workerFlags: [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
         changes,
+        needs: store.openNeeds(b.id),
         own: ownThreads(b),
         label: config.file.label,
+        conflicts: conflictsOf(b, store.open(b.projectId)),
         now: now(),
       });
-      if (b.threadId === null) {
-        await spawnSteward(b, config, playbook, text);
-      } else {
-        const sent = await sendTo(b.threadId, text);
-        if (sent === "gone") {
-          // The user deleted the thread: that is a detach they meant.
-          store.patch(b.id, { endedAt: now(), endReason: "deleted", manualDetach: true });
-          pushInterest();
-          return;
-        }
-        if (sent === "failed") return;
-      }
+      if (!(await deliverWake(b, config, playbook, text))) return;
       const cursor = newestCommentAt(observed);
       store.patch(b.id, {
         awaitingReport: true,
@@ -912,8 +1286,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b === null) return;
       const config = await loadConfig(b.projectId);
       if (config === null) return;
-      const playbook = playbookFor(config, b.kind);
-      if (playbook === null) return;
+      const playbook = bindingPlaybook(config, b);
+      if (playbook === null) {
+        // A dependency bot's pull request runs under deps-prs only. With the
+        // playbook gone, the binding ends rather than falling back to a
+        // merge-capable playbook the ticket says must never merge.
+        if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file) && b.endedAt === null) await finishEnding(b, "unconfigured");
+        return;
+      }
+      if (b.source === "ops") {
+        await reconcileOps(b, config, playbook, force);
+        return;
+      }
 
       let entity: EntitySnapshot | null;
       try {
@@ -929,10 +1313,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
       const prev = b.lastSnapshot;
 
-      const life = lifecycle(b, playbook, entity, config.file.label);
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file) });
       let reason: WakeReason | null = force;
       if (life.kind === "stay-ended") {
-        const labelled = b.kind === "review" || hasLabel(entity, config.file.label);
+        const labelled = b.kind === "review" || b.playbook === depsPrsPlaybookName(config.file) || hasLabel(entity, config.file.label);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
         return;
       }
@@ -961,7 +1345,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       const { phase, stage } = phaseAndStage(playbook, entity.state);
-      const currentSpec = specHash(entity, b.threadId);
+      const currentSpec = specHashFor(b, entity);
       const changes: Change[] = [];
       let ready = b.ready;
       const approval = playbook.ready?.approval;
@@ -969,9 +1353,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
         changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
       }
-      const workerRunning = store.workers(b.id).some((w) => w.status === "running");
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerRunning });
+      const workerInFlight = anyWorkerInFlight(store.workers(b.id));
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userThread: isUserThread });
       changes.push(...fresh);
+      // Criterion 4: a spec comment the user wrote from their own thread is
+      // the user's own words. With approval: me it carries its own approval,
+      // pinned to the spec it just changed, whether or not an earlier
+      // approval has gone stale.
+      if (approval === "me" && (ready.approval === null || ready.approval.specHash !== currentSpec) && fresh.some((c) => c.byUser === true)) {
+        ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "user" }, voidedAt: null, declinedSpecHash: null };
+        changes.push({ text: "The user's spec comment approves the spec (approval: me)", actionable: true });
+      }
       // Only an entry into build from spec: review → build is the worker's
       // normal loop, and an unreported checklist is not an unmet one.
       if (stage === "build" && b.stage === "spec" && prev !== null && gateKnownUnmet(playbook, ready, currentSpec)) {
@@ -994,6 +1386,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      await syncNeeds(b, observed, playbook, workerInFlight);
+      // The work this binding was holding others behind has landed: lift them.
+      if (allPullsMerged(b, observed) && (prev === null || !allPullsMerged(b, prev))) await releaseBehind(b, "merged its pull requests");
+      const scheduling = await syncScheduleRequest(b, playbook);
       /**
        * Keep news for the next turn: what is actionable as a reason for it, the
        * rest as quiet notes. A quiet comment count is not kept: the next wake
@@ -1013,9 +1409,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // No turn is coming to report the gate, so look at it here: a gate
         // left waiting on its approver (a report from before this check, a
         // request declined, then the spec changed) is asked for now.
-        if (!b.awaitingReport && (await syncApprovalRequest(b, playbook)) !== null) await wakeProject(b.projectId, `approval requested for ${b.entityKey}`, { digestDue: false });
+        const approvalAsked = !b.awaitingReport && (await syncApprovalRequest(b, playbook)) !== null;
+        const asked = [approvalAsked ? `approval requested for ${b.entityKey}` : null, scheduling === null ? null : `scheduling requested for ${b.entityKey}`].filter((r) => r !== null);
+        if (asked.length > 0) await wakeProject(b.projectId, asked.join(" and "), { digestDue: false });
         return;
       }
+      if (scheduling !== null) await wakeProject(b.projectId, `scheduling requested for ${b.entityKey}`, { digestDue: false });
       const lines = [...new Set(changes.map((c) => c.text))];
 
       // Not now: keep the news as notes, delivered at the next turn. A held
@@ -1030,11 +1429,583 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await wake(b, config, playbook, observed, lines, reason ?? (followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"));
     }
 
+    // ---- ops bindings ----------------------------------------------------------------------------
+    //
+    // An ops binding watches a target the project file lists rather than an
+    // entity in a source plugin. The plugin looks with kubectl on the
+    // project's machine (kubectl.ts, host.ts), compares what it saw with the
+    // fingerprint map, and wakes the steward with the look: at once for a
+    // problem that is new or back after its ticket was resolved, and at every
+    // requeue whatever it finds, so a problem still failing under its open
+    // ticket is one comment per interval and a healthy look is one short
+    // "all healthy" report. A sweep's look between requeues that finds
+    // nothing new is recorded and wakes nobody.
+
+    // Made on first use: only a project with ops targets needs its host entry.
+    let hostClient: ReturnType<typeof bb.hosts.experimental_client<typeof hostContract>> | null = null;
+    const KUBECTL_TIMEOUT_MS = 30_000;
+
+    /**
+     * Every kubectl call goes through here, and only get, describe, logs and
+     * auth can-i pass (kubectlRefusal; host.ts checks again). It runs on the
+     * project's machine, the developer's own, where kubectl reaches the
+     * cluster as them. Where a stricter wall comes later, it goes here.
+     */
+    async function runKubectl(projectId: string, args: string[]): Promise<KubectlResult> {
+      const refused = kubectlRefusal(args);
+      if (refused !== null) throw new Error(refused);
+      const hostId = await projectHost(projectId);
+      if (deps.kubectl !== undefined) return deps.kubectl(args, { projectId, hostId });
+      if (hostId === null) throw new Error("the project has no machine bb can reach to run kubectl on");
+      hostClient ??= bb.hosts.experimental_client({ contract: hostContract });
+      return hostClient.call("opsKubectl", { args, timeoutMs: KUBECTL_TIMEOUT_MS }, { hostId, timeoutMs: KUBECTL_TIMEOUT_MS + 10_000 });
+    }
+
+    const opsReaderFor = (config: ProjectConfig): OpsReader =>
+      createKubectlReader((args) => runKubectl(config.projectId, args), config.file.ops.context === undefined ? {} : { context: config.file.ops.context });
+
+    /** The states of the tickets a look's problems are filed under, read through linear; null for one that cannot be read. */
+    async function ticketStates(keys: string[]): Promise<Map<string, TicketState>> {
+      const out = new Map<string, TicketState>();
+      for (const key of [...new Set(keys)].slice(0, 20)) {
+        const e = await snapshot("linear", key).catch(() => null);
+        out.set(key, e === null ? null : { state: e.state, stateType: e.stateType });
+      }
+      return out;
+    }
+
+    /** Every ops target a project watches: the k8s namespaces, the Sentry projects and the Dependabot repositories. */
+    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...k8sTargets(config.file), ...sentryTargets(config.file), ...depsTargets(config.file, config.repos)];
+
+    /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
+    async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
+      const at = now();
+      const since = b.opsLook !== null && b.opsLook.error === null ? b.opsLook.at : at - playbook.requeueDefaultMs;
+      try {
+        const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
+        const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
+        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        return { ...rest, at, target: opsTargetKey(target), error: null, findings: classify(sightings, rows, tickets, at) };
+      } catch (error) {
+        return { at, target: opsTargetKey(target), error: errorMessage(error), pods: 0, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [] };
+      }
+    }
+
+    /**
+     * The open tickets a new medium or low alert may join, one per repo and
+     * ecosystem: grouped from the fingerprint map by ticket, each with the
+     * tightest deadline among its alerts. Only batchable (medium and low)
+     * fingerprints count, since critical and high never coalesce, and a
+     * ticket that is completed or canceled is not open: a new alert for its
+     * repo and ecosystem files a new ticket rather than commenting on a
+     * resolved one. A ticket whose state cannot be read counts as open, as
+     * in `classify`.
+     */
+    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"], tickets: ReadonlyMap<string, TicketState>): DepsTicket[] {
+      const byTicket = new Map<string, DepsTicket>();
+      for (const r of rows) {
+        if (r.ticketKey === null || r.severity === null || r.ecosystem === null) continue;
+        if (!isBatchable(r.severity as DependabotSeverity)) continue;
+        const state = tickets.get(r.ticketKey) ?? null;
+        if (state !== null && (state.stateType === "completed" || state.stateType === "canceled")) continue;
+        const repo = repoOfFingerprint(r.fingerprint);
+        if (repo === null) continue;
+        const dueAt = deadlineAt(r.severity as DependabotSeverity, sla, r.firstSeenAt);
+        const ticket = byTicket.get(r.ticketKey);
+        if (ticket === undefined) byTicket.set(r.ticketKey, { ticketKey: r.ticketKey, repo, ecosystem: r.ecosystem, dueAt });
+        else ticket.dueAt = Math.min(ticket.dueAt, dueAt);
+      }
+      return [...byTicket.values()];
+    }
+
+    /** One look at a Dependabot alert target: the repository's open alerts, classified and batched. */
+    async function lookAtDeps(b: Binding, config: ProjectConfig, target: DependabotTarget): Promise<DepsLook> {
+      const at = now();
+      try {
+        const out = await sourceRpc("github", "sourceDependabotAlerts", { units: [target.repo], state: "open" }, sourceContract.sourceDependabotAlerts.output);
+        const alerts: DependabotAlert[] = out.alerts;
+        const rows = store.sight(
+          b.projectId,
+          b.id,
+          alerts.map((a) => {
+            const s = sightingOf(a);
+            return { fingerprint: s.fingerprint, summary: s.summary, severity: s.severity, ecosystem: s.ecosystem };
+          }),
+        );
+        // Every fingerprint row, not just this look's: a batched ticket that
+        // is no longer in the open alerts still has rows, and whether it is
+        // open decides if a new medium or low alert may join it.
+        const allRows = store.fingerprints(b.id);
+        const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
+        const tickets = await ticketStates([...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const findings = classify(sightings, rows, tickets, at);
+        const open = openBatchedTickets(allRows, config.file.deps.sla, tickets);
+        const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
+        const depsFindings: DepsFinding[] = [];
+        for (const f of findings) {
+          const a = byFingerprint.get(f.fingerprint);
+          if (a === undefined) continue;
+          const firstSeenAt = rows.get(f.fingerprint)?.firstSeenAt ?? at;
+          const dueAt = deadlineAt(a.severity, config.file.deps.sla, firstSeenAt);
+          depsFindings.push({
+            fingerprint: f.fingerprint,
+            alertNumber: a.number,
+            severity: a.severity,
+            package: a.package,
+            ecosystem: a.ecosystem,
+            manifestPath: a.manifestPath,
+            ghsaId: a.ghsaId,
+            fixedVersion: a.fixedVersion,
+            summary: a.summary ?? f.summary,
+            state: a.state,
+            url: a.url,
+            dueAt,
+            priority: priorityFor(a.severity),
+            class: f.class,
+            ticket: f.ticket,
+            ticketState: f.ticketState,
+            firstSeenAt,
+            lastCommentedAt: f.lastCommentedAt,
+            batch: batchAlert(a, dueAt, open),
+          });
+        }
+        return { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings };
+      } catch (error) {
+        return { at, target: opsTargetKey(target), error: errorMessage(error), viewer: null, alerts: [] };
+      }
+    }
+
+    /** What changed between two dependency looks, as the mechanical tier weighs it. */
+    function depsChanges(before: DepsLook | null, after: DepsLook, ticketFor: (fingerprint: string) => string | null): Change[] {
+      if (after.error !== null) return before === null || before.error === null ? [{ text: `Cannot read ${after.target}: ${after.error}`, actionable: false }] : [];
+      const changes: Change[] = [];
+      if (before !== null && before.error !== null) changes.push({ text: `${after.target} is readable again`, actionable: false });
+      const was = new Map((before?.alerts ?? []).map((a) => [a.fingerprint, a]));
+      for (const a of after.alerts) {
+        const prev = was.get(a.fingerprint);
+        if (a.class === "new" && (prev === undefined || prev.class !== "new")) changes.push({ text: `New alert: ${a.fingerprint} — ${a.summary}`, actionable: true });
+        else if (a.class === "returned" && prev?.class !== "returned") changes.push({ text: `Back after ${a.ticket} was resolved (${a.ticketState ?? "closed"}): ${a.fingerprint}`, actionable: true });
+        else if (a.class === "recurring" && prev === undefined) changes.push({ text: `Seen again under ${a.ticket}: ${a.fingerprint}`, actionable: false });
+      }
+      const current = new Set(after.alerts.map((a) => a.fingerprint));
+      for (const a of was.values()) {
+        if (current.has(a.fingerprint)) continue;
+        const ticket = a.ticket ?? ticketFor(a.fingerprint);
+        changes.push({ text: `No longer open: ${a.fingerprint}${ticket === null ? "" : ` (${ticket})`}`, actionable: true });
+      }
+      return changes;
+    }
+
+    async function reconcileOps(b: Binding, config: ProjectConfig, playbook: Playbook, force: WakeReason | null): Promise<void> {
+      if (b.endedAt !== null || b.ending !== null) return;
+      const target = parseOpsTargetKey(b.entityId);
+      // A target no longer listed is ended by the sweep.
+      if (target === null || !allOpsTargets(config).some((t) => opsTargetKey(t) === b.entityId)) return;
+      if (target.kind === "dependabot") {
+        await reconcileDeps(b, config, playbook, target, force);
+        return;
+      }
+      if (target.kind === "sentry-project") {
+        await reconcileSentry(b, config, playbook, target, force);
+        return;
+      }
+      const before = b.opsLook;
+      const look = await lookAt(b, config, target, playbook);
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      // The next look is due a requeue from now, whether or not this one wakes anyone.
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { opsLook: look, requeueAt });
+      if (look.error !== null) {
+        // Nothing to wake the steward with until kubectl can read the target; `bb stewards check` says why.
+        if (before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
+        return;
+      }
+
+      const changes = lookChanges(before, look);
+      if (requeueCame) changes.push({ text: look.findings.length > 0 ? "Requeue time came, with problems still failing" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      // A steward that has never been woken is due its first turn as soon as the target can be read.
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const text = formatOpsWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        team: opsTeam(config.file),
+        label: config.file.label,
+        autoAdopt: config.file.ops.autoAdopt,
+        escalations: store.openEscalations(b.id),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      if (!(await deliverWake(b, config, playbook, text))) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+    }
+
+    /** The same turn for a Dependabot alert target: re-list the open alerts and wake on what changed. */
+    async function reconcileDeps(b: Binding, config: ProjectConfig, playbook: Playbook, target: DependabotTarget, force: WakeReason | null): Promise<void> {
+      const before = b.depsLook;
+      const look = await lookAtDeps(b, config, target);
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { depsLook: look, requeueAt });
+      if (look.error !== null) {
+        if (before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
+        return;
+      }
+
+      const changes = depsChanges(before, look, (fp) => store.fingerprint(b.projectId, fp)?.ticketKey ?? null);
+      if (requeueCame) changes.push({ text: look.alerts.length > 0 ? "Requeue time came, with alerts still open" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const text = formatDepsWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        team: opsTeam(config.file),
+        label: config.file.label,
+        autoAdopt: config.file.deps.autoAdopt,
+        timeZone: config.file.nightly.timezone,
+        escalations: store.openEscalations(b.id),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      if (!(await deliverWake(b, config, playbook, text))) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+    }
+
+    // ---- Sentry targets ----------------------------------------------------------------------------
+    //
+    // A sentry-project target is read with the plugin's own Sentry token (a
+    // secret setting), not through a source plugin: there is no sentry plugin,
+    // and the source contract has no use for one. bb-gate-hooks rings the
+    // binding the moment Sentry sees a new issue or a regression (the loop
+    // below holds a `project` lease per target and an `issue` lease per issue
+    // with a ticket); the look at every sweep and requeue is the backstop
+    // when hooks are down, listing what is new or regressed since the last
+    // look. The Sentry issue id is the fingerprint.
+
+    const sentryToken = async (): Promise<string | null> => {
+      const value = (await settings.get()).sentryToken;
+      const token = typeof value === "string" ? value.trim() : "";
+      return token === "" ? null : token;
+    };
+    const sentryReader = async (): Promise<SentryReader> => {
+      const value = (await settings.get()).sentryApiUrl;
+      const apiUrl = typeof value === "string" && value.trim() !== "" ? value.trim() : SENTRY_API_URL;
+      return createSentryReader(fetchImpl, { apiUrl, token: sentryToken });
+    };
+    /** Issue ids doorbells named since each binding's last look. */
+    const sentryRung = new Map<string, Set<string>>();
+    /** At most this many rung issues are read one by one when the list does not carry them. */
+    const RUNG_PER_LOOK = 10;
+    /** An issue with a ticket is leased while it was seen within this long. */
+    const ISSUE_LEASE_WINDOW_MS = 30 * 86_400_000;
+
+    const openSentryBindings = (): Array<{ binding: Binding; target: SentryTarget }> =>
+      store
+        .open()
+        .filter((b) => b.kind === "ops")
+        .flatMap((b) => {
+          const target = parseOpsTargetKey(b.entityId);
+          return target?.kind === "sentry-project" ? [{ binding: b, target }] : [];
+        });
+
+    /** One look at a Sentry project: the issues new, regressed, rung or still firing since the last look, classified against the fingerprint map. */
+    async function lookAtSentry(b: Binding, target: SentryTarget, playbook: Playbook): Promise<SentryLook> {
+      const at = now();
+      const key = opsTargetKey(target);
+      const since = b.sentryLook !== null && b.sentryLook.error === null ? b.sentryLook.at : at - playbook.requeueDefaultMs;
+      const rung = sentryRung.get(b.id) ?? new Set<string>();
+      const notes: string[] = [];
+      try {
+        const reader = await sentryReader();
+        const issues = await reader.issues(target);
+        const byId = new Set(issues.map((i) => i.id));
+        // A rung issue the list does not carry (older activity, or more than a page away) is read by itself.
+        for (const id of [...rung].filter((x) => !byId.has(x)).slice(0, RUNG_PER_LOOK)) {
+          try {
+            const issue = await reader.issue(id);
+            // Gone (resolved, or not this token's to see), or another organization's project with the same slug.
+            if (issue === null || (issue.project !== null && issue.project !== target.project) || !issueInOrg(issue, target.org)) continue;
+            issues.push(issue);
+          } catch (error) {
+            notes.push(`Issue ${id}, which Sentry rang for, could not be read (${errorMessage(error)})`);
+          }
+        }
+        const known = new Set(store.fingerprints(b.id).map((r) => r.fingerprint));
+        const sightings = sentrySightings(issues, { since }, rung, known);
+        sentryRung.delete(b.id);
+        const rows = store.sight(
+          b.projectId,
+          b.id,
+          sightings.map((s) => ({ fingerprint: s.fingerprint, summary: sentrySummary(s.issue) })),
+        );
+        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const asSightings: Sighting[] = sightings.map((s) => ({ fingerprint: s.fingerprint, workload: s.issue.shortId, pods: [], container: null, signature: s.reasons[0] ?? "ongoing", summary: sentrySummary(s.issue), restarts: 0, events: [], logs: null, previous: false }));
+        const classified = classify(asSightings, rows, tickets, at);
+        const findings: SentryFinding[] = [];
+        let eventsRead = 0;
+        for (const [i, s] of sightings.entries()) {
+          const c = classified[i]!;
+          let event: SentryFinding["event"] = null;
+          if (eventsRead < EVENTS_PER_LOOK) {
+            eventsRead += 1;
+            try {
+              event = await reader.latestEvent(s.issue.id);
+            } catch (error) {
+              notes.push(`The latest event of ${s.issue.shortId} could not be read (${errorMessage(error)})`);
+            }
+          }
+          const { issue } = s;
+          findings.push({
+            fingerprint: s.fingerprint,
+            shortId: issue.shortId,
+            title: issue.title,
+            culprit: issue.culprit,
+            permalink: issue.permalink,
+            level: issue.level,
+            substatus: issue.substatus,
+            count: issue.count,
+            userCount: issue.userCount,
+            firstSeen: issue.firstSeen,
+            lastSeen: issue.lastSeen,
+            reasons: s.reasons,
+            event,
+            class: c.class,
+            ticket: c.ticket,
+            ticketState: c.ticketState,
+            firstSeenAt: c.firstSeenAt,
+            lastCommentedAt: c.lastCommentedAt,
+          });
+        }
+        const covered = new Set(findings.map((f) => f.fingerprint));
+        const unresolved = issues.filter((i) => i.status === "unresolved");
+        const recent = unresolved.filter((i) => !covered.has(i.id)).slice(0, RECENT_PER_LOOK).map(recentLine);
+        return { at, target: key, error: null, unresolved: unresolved.length, recent, notes, findings };
+      } catch (error) {
+        return emptySentryLook(at, key, errorMessage(error));
+      }
+    }
+
+    /**
+     * The same turn for a Sentry project: look, compare with the last look,
+     * and wake on what changed. A look that fails for want of a token wakes
+     * the steward once, so it files the provide-secret need; any other
+     * failure is logged, and `bb stewards check` says why.
+     */
+    async function reconcileSentry(b: Binding, config: ProjectConfig, playbook: Playbook, target: SentryTarget, force: WakeReason | null): Promise<void> {
+      const before = b.sentryLook;
+      const look = await lookAtSentry(b, target, playbook);
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { sentryLook: look, requeueAt });
+      if (look.error !== null && before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
+      if (look.error !== null && look.error !== NO_TOKEN) return;
+
+      const changes = sentryChanges(before, look, playbook.requeueDefaultMs);
+      if (requeueCame && look.error === null) changes.push({ text: look.findings.length > 0 ? "Requeue time came, with issues to act on" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      // A steward that has never been woken is due its first turn as soon as the project can be read, or the need for a token can be filed.
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const text = formatSentryWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        team: opsTeam(config.file),
+        label: config.file.label,
+        autoAdopt: config.file.ops.autoAdopt,
+        escalations: store.openEscalations(b.id),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      if (!(await deliverWake(b, config, playbook, text))) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+    }
+
+    // The subscriber: one stream to bb-gate-hooks for the `sentry` source,
+    // proven with the plugin's token (bb-gate/docs/hooks.md, "Sentry"). A
+    // project lease is sent as org/slug and leased under the slug, which is
+    // what a doorbell carries as its unit; an issue lease is the issue id.
+    // Without BB_HOOKS_URL, or without a token, nothing is leased and the
+    // sweeps carry the watch.
+    const hooksUrl = env[HOOKS_URL_ENV]?.trim() ?? "";
+    /** The leases bb-gate-hooks refused at the last renewal, by `<kind> <id>`, for `bb stewards check`. */
+    let sentryRefused = new Map<string, string>();
+
+    function sentryLeases(): Lease[] {
+      const seen = new Set<string>();
+      const out: Lease[] = [];
+      const add = (kind: Lease["kind"], id: string) => {
+        const k = `${kind} ${id}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push({ kind, id });
+      };
+      for (const c of configs.values()) {
+        if (c.value === null) continue;
+        for (const t of sentryTargets(c.value.file)) add("project", `${t.org}/${t.project}`);
+      }
+      const recent = now() - ISSUE_LEASE_WINDOW_MS;
+      for (const { binding } of openSentryBindings()) {
+        for (const r of store.fingerprints(binding.id)) if (r.ticketKey !== null && r.lastSeenAt >= recent) add("issue", r.fingerprint);
+      }
+      return out;
+    }
+
+    /** A Sentry doorbell: the issue id, and the project slug when the service named one. Every binding it concerns looks. */
+    function onSentryDoorbell(id: string, unit: string | null): void {
+      for (const { binding, target } of openSentryBindings()) {
+        const byUnit = unit !== null && unit === target.project;
+        const byIssue = store.fingerprint(binding.projectId, id)?.bindingId === binding.id;
+        if (!byUnit && !byIssue) continue;
+        const rung = sentryRung.get(binding.id) ?? new Set<string>();
+        rung.add(id);
+        sentryRung.set(binding.id, rung);
+        scheduleReconcile(binding.id);
+      }
+    }
+
+    const sentryHooks = createHooksLoop({
+      fetch: fetchImpl,
+      baseUrl: hooksUrl,
+      now,
+      log: bb.log,
+      token: sentryToken,
+      watchIds: sentryLeases,
+      onDoorbell: (kind, id, unit) => {
+        if (kind === "issue") onSentryDoorbell(id, unit);
+      },
+      async onRejected(rejected: Rejection[]) {
+        sentryRefused = new Map(rejected.map((r) => [`${r.kind} ${r.id}`, r.reason]));
+        for (const r of rejected) bb.log.warn(`stewards: bb-gate-hooks refused a Sentry ${r.kind} lease on ${r.id} (${r.reason}); only the periodic look sees it`);
+      },
+      async sweep() {
+        // Coverage cannot be proven: every Sentry binding looks for itself.
+        for (const { binding } of openSentryBindings()) scheduleReconcile(binding.id);
+      },
+    });
+    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && sentryTargets(c.value.file).length > 0);
+
+    /**
+     * One ops binding per configured target. A target taken out of the
+     * project file ends its binding; put back, the same binding and thread
+     * resume. One detached by hand stays ended while its target is listed,
+     * as a ticket stays detached while it keeps its label. The Dependabot
+     * targets come from the project's repos (or its explicit dependabot
+     * targets) and run the deps-alerts playbook.
+     */
+    async function syncOpsBindings(config: ProjectConfig): Promise<void> {
+      const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
+      const opsPlaybook = playbookFor(config, "ops");
+      if (opsPlaybook !== null) for (const target of [...k8sTargets(config.file), ...sentryTargets(config.file)]) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
+      if (config.depsAlerts !== null) for (const target of depsTargets(config.file, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
+      const existing = store.all(config.projectId).filter((b) => b.kind === "ops");
+      for (const b of existing) {
+        if (wanted.has(b.entityId)) continue;
+        if (b.endedAt === null) {
+          await serial(`b:${b.id}`, async () => {
+            const fresh = store.binding(b.id);
+            if (fresh !== null && fresh.endedAt === null) await finishEnding(fresh, "unconfigured");
+          });
+        } else if (b.manualDetach) store.patch(b.id, { manualDetach: false });
+      }
+      if ((await settings.get()).paused) return;
+      for (const [key, { target, playbook }] of wanted) {
+        const b = existing.find((x) => x.entityId === key);
+        if (b === undefined) {
+          let created: Binding;
+          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : target.kind === "dependabot" ? `Deps watch: ${target.repo}` : `Sentry watch: ${target.org}/${target.project}`;
+          try {
+            created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
+          } catch {
+            continue; // made concurrently
+          }
+          bb.log.info(`stewards: watching ${key} with an ops binding (${playbook.name})`);
+          // A Sentry project is leased as soon as it is watched; the next renewal would otherwise be up to half a lease away.
+          if (target.kind === "sentry-project") sentryHooks.added("project", `${target.org}/${target.project}`).catch((error: unknown) => bb.log.warn(`stewards: could not lease ${key} right away: ${errorMessage(error)}`));
+          await serial(`b:${created.id}`, () => reconcileBinding(created.id, "adopted"));
+        } else if (b.endedAt !== null && !b.manualDetach) {
+          await serial(`b:${b.id}`, async () => {
+            const fresh = store.binding(b.id);
+            if (fresh === null || fresh.endedAt === null) return;
+            await reopen(fresh, `${key} is configured again`);
+            await reconcileBinding(b.id, "reopen");
+          });
+        }
+      }
+    }
+
     // ---- lifecycle -------------------------------------------------------------------------------
 
     async function stopWorkers(b: Binding): Promise<void> {
       for (const w of store.workers(b.id)) {
-        if (w.status !== "running") continue;
+        if (!workerInFlight(w)) continue;
         store.setWorker(w.threadId, "stopped", w.result);
         await quietly(`stop worker ${w.threadId}`, () => bb.sdk.threads.stop({ threadId: w.threadId }));
       }
@@ -1048,7 +2019,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * watch, production to verify); they are stopped when it ends.
      */
     async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
-      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed });
+      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
+      // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
+      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : "was detached");
       if (kind === "detach") await stopWorkers(b);
       bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : "was detached"}; one last turn`);
       if (b.threadId === null) {
@@ -1074,10 +2047,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
       for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.");
+      await releaseBehind(b, `ended (${reason})`);
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
-      if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
-        await quietly(`archive ${b.entityKey}'s steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+      if (info !== null && info.deletedAt === null && info.archivedAt === null) {
+        if (busy(info.status)) {
+          // Its wrap-up turn is still running (the ending came from another
+          // idle, or timed out): the idle that ends that turn archives it.
+          store.patch(b.id, { archiveWhenIdle: true });
+          bb.log.info(`stewards: ${b.entityKey}'s steward is still in its last turn; archiving it when that ends`);
+        } else {
+          await quietly(`archive ${b.entityKey}'s steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+        }
       }
       // Parent ends first: promoted children still open move up a level.
       const up = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
@@ -1123,7 +2104,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
 
     /** Which kind of binding an entity wants in this project, or null for none. */
-    function adoptionKind(config: ProjectConfig, e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean }, viewer: string | null): BindingKind | null {
+    function adoptionKind(config: ProjectConfig, e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string }, viewer: string | null): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
       if (e.source === "linear") {
         const playbook = playbookFor(config, "ticket");
@@ -1134,6 +2115,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const playbook = playbookFor(config, "pr");
         return playbook !== null && !isTerminal(playbook, e.state) ? "pr" : null;
       }
+      // The dependency watch adopts the bot's version-update pull requests in
+      // the repos it watches, whether or not they are labelled. deps-prs
+      // reviews them and escalates for a human merge; it never merges.
+      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && depsTargets(config.file, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
       const review = playbookFor(config, "review");
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;
@@ -1161,7 +2146,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (store.byEntity(entity.source, entity.id) !== null) return null;
       const kind = adoptionKind(config, { ...entity, draft: entity.pull?.draft ?? false }, entity.viewer);
       if (kind === null) return null;
-      const playbook = playbookFor(config, kind)!;
+      const depBot = kind === "pr" && entity.author !== null && DEPENDENCY_BOTS.has(lc(entity.author));
+      const playbook = (depBot ? config.depsPrs : null) ?? playbookFor(config, kind);
+      if (playbook === null) return null;
       const parent = kind === "ticket" ? await managedAncestor(entity) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       let b: Binding;
@@ -1198,6 +2185,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bound = store.byEntity(source, id);
       if (bound !== null) scheduleReconcile(bound.id);
       if (source === "github") {
+        // A Dependabot alert doorbell names the alert, not the repository's
+        // ops binding; wake that repository's dependency watch. An id with a
+        // github binding is an issue or pull request, not an alert.
+        const repo = bound === null ? repoOfFingerprint(id) : null;
+        if (repo !== null) {
+          const deps = store.byEntity("ops", opsTargetKey({ kind: "dependabot", repo }));
+          if (deps !== null && deps.endedAt === null) scheduleReconcile(deps.id);
+        }
         for (const t of store.open()) {
           if (t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id))) scheduleReconcile(t.id);
         }
@@ -1258,22 +2253,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (threadId === null) return;
       const records = opts.digestDue ? digestRecords(projectId) : undefined;
       if (opts.digestDue) store.patchProject(projectId, { digestPending: true });
+      const info = await threadInfo(threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null) return;
+      if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
       // Read as of the send, so an escalation resolved meanwhile is left out,
       // and marked delivered in the same step, so a prompt sent right after
       // lists it as still open rather than new. The text is built before the
       // mark, so a throw while building it leaves nothing marked.
-      const delivered = { ids: [] as string[], at: 0 };
-      const sent = await sendTo(threadId, () => {
-        const open = store.open(projectId);
-        const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
-        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
-        const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
-        const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
-        const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, timeZone: config.file.nightly.timezone, ...(records === undefined ? {} : { records }) });
-        delivered.ids = routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id);
-        delivered.at = store.markDelivered(delivered.ids);
-        return text;
-      });
+      const open = store.open(projectId);
+      const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval").map((escalation) => ({ escalation, from: b })));
+      const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
+      const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
+      const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, needs, lessons: store.lessons(projectId), timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
+      delivered.at = store.markDelivered(delivered.ids);
+      // A wake can be the thing that pushes the transcript over the limit.
+      await compactIfLarge(threadId, text.length);
+      const sent = await send(threadId, text);
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
     }
 
@@ -1291,9 +2289,98 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
         withUser: openWith((x) => x.route === "me"),
+        needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
+        lessonsMerged: store.mergedLessonsSince(projectId, since),
       };
+    }
+
+    // ---- lessons -------------------------------------------------------------------------------
+    //
+    // A lesson is a general rule the project steward drew from an escalation
+    // or its own judgement. It is pending until its text is found at `.bb`
+    // HEAD. A `procedure` lesson the project steward applies and publishes is
+    // self-merged through multi-repo; a `boundary` one changes its own
+    // escalation boundary and is filed for the user with Merge/Drop, never
+    // merged by the plugin.
+
+    /** Close the open Merge/Drop item for a boundary lesson, if one is filed. */
+    function closeLessonNeed(lesson: Lesson, resolution: string): void {
+      if (lesson.bindingId === null) return;
+      store.closeNeedByKey(lesson.bindingId, "decide", lesson.id, resolution);
+    }
+
+    /** Self-merge a procedure lesson, or file a boundary one for the user. */
+    async function completeLesson(lesson: Lesson, action: "complete" | "drop"): Promise<string> {
+      if (action === "drop") {
+        store.markLessonDropped(lesson.id, "Dropped by the project steward.");
+        closeLessonNeed(lesson, "Dropped by the project steward.");
+        return "dropped";
+      }
+      const threadId = store.project(lesson.projectId).threadId;
+      if (lesson.scope === "boundary") {
+        if (lesson.bindingId === null) return "a boundary lesson needs the binding it came from; record it with binding.";
+        const branch = lesson.branch ?? (threadId === null ? null : lessonBranchFor(threadId));
+        if (branch !== null) store.setLessonBranch(lesson.id, branch);
+        store.fileNeed({
+          bindingId: lesson.bindingId,
+          kind: "decide",
+          url: lesson.id,
+          what: `Merge or drop the boundary lesson for ${lesson.file}`,
+          how: [
+            "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
+            "",
+            `> ${lesson.text}`,
+            "",
+            `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
+            "Merge fast-forwards the canonical `.bb`; Drop discards it.",
+          ].join("\n"),
+          data: { lessonId: lesson.id, branch, file: lesson.file, choices: ["Merge", "Drop"] },
+          filedBy: "project",
+        });
+        return `boundary lesson; Merge/Drop filed for the user${branch === null ? "" : ` on ${branch}`}`;
+      }
+      if (threadId === null) {
+        store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing has been published.");
+        return "no project steward thread";
+      }
+      const result = await mergeLesson(lesson.projectId, threadId, lesson);
+      if (!result.ok) {
+        store.noteLesson(lesson.id, result.message);
+        return `merge refused: ${result.message}`;
+      }
+      store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch);
+      return `merged at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
+    }
+
+    /** Fast-forward the canonical `.bb` to a lesson's published branch, through multi-repo. */
+    async function mergeLesson(projectId: string, threadId: string, lesson: Lesson): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
+      try {
+        return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text: lesson.text }, mergeGuidanceOutput);
+      } catch (error) {
+        return { ok: false, sha: null, branch: lesson.branch, message: errorMessage(error) };
+      }
+    }
+
+    /** Each pass, a lesson whose text is already at `.bb` HEAD is merged, however it got there. */
+    async function reconcileLessons(config: ProjectConfig): Promise<void> {
+      const pending = store.lessons(config.projectId);
+      if (pending.length === 0) return;
+      for (const lesson of pending) {
+        // One lesson's file being unreadable — a bad path, a transient read
+        // failure — must not stop every other lesson being checked.
+        let content: string | null = null;
+        try {
+          content = (await readFiles(config.projectId, [lesson.file])).get(lesson.file) ?? null;
+        } catch (error) {
+          bb.log.warn(`stewards: could not read lesson ${lesson.id}'s file ${lesson.file}: ${errorMessage(error)}`);
+          continue;
+        }
+        if (content !== null && normalizeLessonText(content).includes(normalizeLessonText(lesson.text))) {
+          store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch);
+        }
+      }
     }
 
     /** Where an escalation goes next, above where it is. */
@@ -1332,8 +2419,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function syncApprovalRequest(b: Binding, playbook: Playbook): Promise<Escalation | null> {
       const mode = playbook.ready?.approval ?? null;
       if (mode === null || typeof mode === "object" || b.lastSnapshot === null) return null;
+      // `approval: me` is the user's, and is filed as an `approve-spec` need by
+      // syncNeeds; the escalation below is only for the project steward.
+      if (mode === "me") return null;
       const open = store.openEscalations(b.id).filter((x) => x.kind === "approval");
-      const current = specHash(b.lastSnapshot.entity, b.threadId);
+      const current = specHashFor(b, b.lastSnapshot.entity);
       const gate = gateState(playbook, b.ready, current);
       const wanted = approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
       if (!wanted) {
@@ -1342,7 +2432,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return null;
       }
       if (open.length > 0) return null;
-      const by = mode === "project" ? "the project steward" : "the user";
       const x = store.escalate({
         bindingId: b.id,
         kind: "approval",
@@ -1350,11 +2439,228 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           `Approve ${b.entityKey}'s spec${b.title === null ? "" : ` (${b.title})`}? The ready checklist is met and the ticket is ${b.ready.substantial === null ? "not yet judged, so treated as substantial" : "substantial"}${b.ready.why === null ? "" : ` (${b.ready.why})`}; ` +
           (gate.approvalStale ? "the spec has changed since its last approval." : "the current spec has no approval."),
         meanwhile: "Waiting: no implementation workers start until it is approved.",
-        route: mode === "project" ? "project" : "me",
+        route: "project",
         recommendation: null,
       });
-      bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on ${by}; asked for approval (${x.id})`);
-      return x.route === "project" ? x : null;
+      bb.log.info(`stewards: ${b.entityKey}'s ready gate waits on the project steward; asked for approval (${x.id})`);
+      return x;
+    }
+
+    /**
+     * Keep the scheduling request in step with the world. A ticket whose ready
+     * gate has passed, with no worker running yet, that touches what another
+     * binding is already building or reviewing, is the project steward's to
+     * schedule: one `schedule` escalation is open with it, naming the overlap.
+     * It is the plugin's, like the approval request, so the ticket steward
+     * waits rather than starting a worker into a rebase. The project steward
+     * either holds the ticket behind that work (`steward_update { hold, behind }`,
+     * which resolves the request and lifts itself when the work lands) or lets
+     * it start (guidance + resolve). A decided request is not made again for
+     * the same bindings; a new overlap asks again.
+     *
+     * Returns a request just filed, for the caller to wake the project steward.
+     */
+    async function syncScheduleRequest(b: Binding, playbook: Playbook): Promise<Escalation | null> {
+      const open = store.openEscalations(b.id).filter((x) => x.kind === "schedule");
+      // Cleared: the gate has passed and nothing holds or schedules it, so it
+      // is starting now, and the next ticket to pass its gate, before Linear
+      // shows this one In Progress, schedules against it rather than racing it.
+      const cleared = (v: boolean) => {
+        if (b.clearedToStart !== v) store.patch(b.id, { clearedToStart: v });
+      };
+      const withdraw = (why: string, startable: boolean) => {
+        for (const x of open) store.resolve(x.id, why);
+        cleared(startable);
+        return null;
+      };
+      if (b.kind !== "ticket" || b.endedAt !== null || b.ending !== null || b.lastSnapshot === null) return withdraw("Withdrawn.", false);
+      if (b.hold !== null) return withdraw("Held.", false);
+      const gate = gateState(playbook, b.ready, specHashFor(b, b.lastSnapshot.entity));
+      if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
+      if (b.stage === "review" || store.workers(b.id).some((w) => w.status === "running")) return withdraw("Withdrawn: the work has started.", true);
+      const conflicts = conflictsOf(b, store.open(b.projectId));
+      if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.", true);
+      const keys = conflicts.map((c) => c.with.entityKey);
+      if (open.length > 0) {
+        cleared(false);
+        return null;
+      }
+      if (keys.every((k) => b.scheduleAsked.includes(k))) {
+        cleared(true);
+        return null;
+      }
+      cleared(false);
+      store.patch(b.id, { scheduleAsked: keys });
+      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ");
+      const x = store.escalate({
+        bindingId: b.id,
+        kind: "schedule",
+        question:
+          `Schedule ${b.entityKey}${b.title === null ? "" : ` (${b.title})`}? Its ready gate has passed, and it touches what is already being changed by ${overlap}. ` +
+          `Hold it behind that work with steward_update { binding: "${b.entityKey}", hold: "<why>", behind: [${keys.map((k) => JSON.stringify(k)).join(", ")}] }, and it starts by itself once ${keys.length === 1 ? "that ticket's pull requests merge or it ends" : "their pull requests merge or they end"}; or let it start now with steward_update { binding: "${b.entityKey}", guidance: "Start now: <why>", resolve: "<this escalation>" }.`,
+        meanwhile: "Waiting: no implementation workers start until it is scheduled.",
+        route: "project",
+        recommendation: null,
+      });
+      bb.log.info(`stewards: ${b.entityKey} overlaps ${keys.join(", ")}; asked the project steward to schedule it (${x.id})`);
+      return x;
+    }
+
+    /**
+     * The work `b` was holding others behind has landed (`how`: its pull
+     * requests merged, or it ended): take it off every hold that waits behind
+     * it, lift the holds with nothing left to wait for, wake those stewards,
+     * and tell the project steward. A lifted binding that now overlaps other
+     * work asks to be scheduled again on its next look.
+     */
+    async function releaseBehind(b: Binding, how: string): Promise<void> {
+      const key = lc(b.entityKey);
+      const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
+      if (waiting.length === 0) return;
+      const lifted: string[] = [];
+      for (const h of waiting) {
+        const rest = h.holdBehind.filter((k) => lc(k) !== key);
+        if (rest.length > 0) {
+          store.patch(h.id, { holdBehind: rest });
+          store.note(h.id, `${b.entityKey} ${how}; your hold stays until ${rest.join(", ")} ${rest.length === 1 ? "does" : "do"} too.`, true);
+          continue;
+        }
+        store.patch(h.id, { hold: null, holdBehind: [] });
+        store.note(h.id, `Hold lifted: ${b.entityKey}, which it waited behind, ${how}. Rebase anything already branched before building on.`);
+        lifted.push(h.entityKey);
+        scheduleReconcile(h.id);
+      }
+      bb.log.info(`stewards: ${b.entityKey} ${how}; ${lifted.length === 0 ? "nothing lifted" : `lifted the hold on ${lifted.join(", ")}`}`);
+      if (lifted.length > 0) await wakeProject(b.projectId, `${b.entityKey} ${how}`, { digestDue: false, notes: [`Lifted the hold on ${lifted.join(", ")}: ${b.entityKey}, which ${lifted.length === 1 ? "it" : "they"} waited behind, ${how}. Each is woken; one that still overlaps other work asks you to schedule it again.`] });
+    }
+
+    const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
+
+    /** Every pull request a binding observes: a pr binding's own entity, and a ticket's linked pulls. */
+    function observedPulls(b: Binding, observed: Observed): EntitySnapshot[] {
+      const own = observed.entity.pull === null ? [] : [observed.entity];
+      return b.kind === "ticket" ? [...own, ...observed.pulls] : own;
+    }
+
+    /**
+     * File or refresh the user's `approve-spec` need for a binding. The plugin
+     * files it when the gate waits and the approver is the user (`approval: me`),
+     * and when the project steward forwards an `approval` escalation to the user:
+     * a forwarded approval is the user's to decide exactly as `approval: me` is.
+     * Deduped by (binding, kind, url), so the escalation that asked for it is
+     * linked in `data.escalationId` rather than a second item filed.
+     */
+    function fileApproveSpecNeed(b: Binding, entity: EntitySnapshot, escalationId: string | null): void {
+      store.fileNeed({
+        bindingId: b.id,
+        kind: "approve-spec",
+        url: b.url ?? "",
+        what: `Approve ${b.entityKey}'s spec`,
+        how: "The ready checklist is met and the ticket is substantial. Approve records the approval on the gate; Decline remembers this spec as declined until it changes.",
+        data: { specHash: specHashFor(b, entity), ...(escalationId === null ? {} : { escalationId }) },
+        filedBy: "plugin",
+      });
+    }
+
+    /**
+     * Approve or decline a binding's spec as the user, in one step: record the
+     * verdict on the gate and close the `approve-spec` need, which resolves the
+     * open `approval` escalations that asked for it (the `steward_update { approve }`
+     * path). Returns the closure for the steward's wake and the escalations that
+     * were with the user, for the project steward's wake. `where` reads as
+     * "on the Stewards page" or "from a thread".
+     */
+    function recordSpecVerdict(b: Binding, action: "approve" | "decline", entity: EntitySnapshot, text: string | null, where: string): { closure: string; forwarded: Escalation[] } {
+      const forwarded = store.openEscalations(b.id).filter((x) => x.kind === "approval" && x.route === "me");
+      const hash = specHashFor(b, entity);
+      const said = text === null ? "" : `: "${text}"`;
+      if (action === "approve") {
+        store.approve(b.id, { at: now(), specHash: hash, by: "user" }, `Approved by the user ${where}${said}`, "user");
+        return { closure: `The user approved ${b.entityKey}'s spec ${where}${text === null ? "" : `: ${text}`}.`, forwarded };
+      }
+      store.decline(b.id, hash, `Declined by the user ${where}${said}`, "user");
+      return { closure: `The user declined ${b.entityKey}'s spec ${where}${text === null ? "" : `: ${text}`}.`, forwarded };
+    }
+
+    /**
+     * The project steward forwarded an escalation to the user, so it holds it
+     * until the user answers. Tell it when the answer lands on the page or from
+     * a thread, naming the closure, so it is not left holding a resolved one.
+     */
+    async function wakeProjectOnForwardedAnswer(b: Binding, closure: string, forwarded: Escalation[]): Promise<void> {
+      if (forwarded.length === 0) return;
+      await wakeProject(b.projectId, `${b.entityKey}'s forwarded escalation was answered`, {
+        digestDue: false,
+        notes: [`${closure} ${forwarded.map((x) => `Escalation ${x.id}`).join(", ")} ${forwarded.length === 1 ? "is" : "are"} resolved.`],
+      });
+    }
+
+    /**
+     * File, refresh and close the plugin's "needs you" items from a snapshot:
+     * `approve-spec` (the user's approval of the ready gate), and, per observed
+     * pull request, `approve-pr` and `merge`. The conditions are recomputed on
+     * every look, so the page only offers a button while it is true.
+     */
+    async function syncNeeds(b: Binding, observed: Observed, playbook: Playbook, workerInFlight: boolean): Promise<void> {
+      const mode = playbook.ready?.approval ?? null;
+      const current = specHashFor(b, observed.entity);
+      const gate = gateState(playbook, b.ready, current);
+      // A forwarded approval escalation is with the user, so the page's
+      // Approve/Decline answers it; `approval: me` is the same wait, filed by
+      // the plugin. Either way the need is the same item, linked to the
+      // escalation when one is open.
+      const forwarded = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.route === "me") ?? null;
+      const wantsSpec = (mode === "me" || forwarded !== null) && approvalWanted(gate) && b.endedAt === null && b.ending === null && b.ready.declinedSpecHash !== current;
+      if (wantsSpec) {
+        fileApproveSpecNeed(b, observed.entity, forwarded?.id ?? null);
+      } else {
+        const why = gate.passed ? "The spec is approved." : !gate.checklistMet ? "Withdrawn: the ready checklist is no longer met." : !gate.approvalNeeded ? "Withdrawn: the ticket is not substantial." : "Withdrawn.";
+        store.closeNeeds(b.id, "approve-spec", why);
+        // The gate no longer waits, so a forwarded request is withdrawn with
+        // it rather than left open for the page's raw-escalation prose row.
+        if (forwarded !== null) store.resolve(forwarded.id, why);
+      }
+
+      for (const pull of observedPulls(b, observed)) {
+        const url = pull.url ?? pull.key;
+        const g = prGate(pull);
+        const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
+        if (closed) {
+          store.closeNeedByKey(b.id, "approve-pr", url, "The pull request is closed.");
+          store.closeNeedByKey(b.id, "merge", url, "The pull request is closed.");
+          continue;
+        }
+        if (g.needsOwnerApproval) {
+          store.fileNeed({
+            bindingId: b.id,
+            kind: "approve-pr",
+            url,
+            what: `Approve ${pull.key} on GitHub`,
+            how: `Post the unsigned comment "Approved ${shortSha(g.headSha)} from the Stewards page" as you; that is what counts as your approval.`,
+            data: { sha: g.headSha },
+            filedBy: "plugin",
+          });
+        } else {
+          store.closeNeedByKey(b.id, "approve-pr", url, g.ownerApproved ? "Owner approval is present." : `${g.missing ?? "The pull request is not waiting for an owner approval."}`);
+        }
+        if (g.gateMet) {
+          // A steward's own merge item (a refused merge) is left alone while a
+          // worker still runs; the plugin files its own only when none does.
+          if (!workerInFlight) {
+            store.fileNeed({
+              bindingId: b.id,
+              kind: "merge",
+              url,
+              what: `Merge ${pull.key}`,
+              how: `The lane gate is met${g.lane === null ? "" : ` (${g.lane})`}. Merge squash-merges through the server's gh login and posts the merge comment.`,
+              data: { sha: g.headSha },
+              filedBy: "plugin",
+            });
+          }
+        } else {
+          store.closeNeedByKey(b.id, "merge", url, `The gate is not met: ${g.missing ?? "unknown"}.`);
+        }
+      }
     }
 
     /**
@@ -1412,6 +2718,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (worker !== null) {
         if (worker.status === "stopped") return;
         store.setWorker(thread.id, "finished", lastAssistantText === null ? null : clip(lastAssistantText, 4000));
+        closeRequesterNeed(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
         store.note(b.id, `Worker "${worker.title}" finished its turn.`);
@@ -1428,7 +2735,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       const b = store.byThread(thread.id);
-      if (b === null || b.endedAt !== null) return;
+      if (b === null) return;
+      if (b.endedAt !== null) {
+        // The binding ended while this turn was running: finishEnding left the
+        // archive to this idle. Once only, so a later turn the owner starts in
+        // the ended steward is not archived under them.
+        if (b.archiveWhenIdle) {
+          store.patch(b.id, { archiveWhenIdle: false });
+          const info = await threadInfo(thread.id).catch(() => null);
+          if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
+            await quietly(`archive ${b.entityKey}'s ended steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+          }
+        }
+        return;
+      }
       if (b.ending !== null) {
         // A steward following through ends when a turn finishes without
         // saying something still remains, or without reporting at all.
@@ -1457,15 +2777,68 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /**
+     * Every thread that belongs to a worker of the binding: the workers
+     * themselves and, recursively, the threads they started (a worker's
+     * reviewer). The plugin records only the workers, so their children are
+     * read from bb.
+     */
+    async function workerThreads(b: Binding): Promise<string[]> {
+      const seen = new Set<string>();
+      const queue = store.workers(b.id).map((w) => w.threadId);
+      while (queue.length > 0) {
+        const id = queue.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const children = await bb.sdk.threads.list({ parentThreadId: id, archived: false, limit: 200 });
+        for (const c of children) queue.push(c.id);
+      }
+      return [...seen];
+    }
+
+    /**
+     * Whether the binding's workers still have work. Any worker in flight
+     * (BB-17: from its spawn until it is stopped, failed or archived, so
+     * `finished` still counts) blocks the archive, and a worker whose thread
+     * is stopped, failed or archived may still have a running or pending
+     * descendant: the build-tickets loop is an idle worker with a running
+     * reviewer, and archiving the steward would archive the worker and,
+     * through it, the reviewer (BB-14). A read failure fails safe: it must not
+     * let the archive proceed over a possibly-running descendant.
+     */
+    async function workersHaveWork(b: Binding): Promise<boolean> {
+      if (anyWorkerInFlight(store.workers(b.id))) return true;
+      let ids: string[];
+      try {
+        ids = await workerThreads(b);
+      } catch (error) {
+        bb.log.warn(`stewards: could not list the threads under ${b.entityKey}'s workers; not archiving: ${errorMessage(error)}`);
+        return true;
+      }
+      for (const id of ids) {
+        let info: ThreadInfo | null;
+        try {
+          info = await threadInfo(id);
+        } catch (error) {
+          bb.log.warn(`stewards: could not read worker thread ${id}; not archiving ${b.entityKey}: ${errorMessage(error)}`);
+          return true;
+        }
+        if (info === null || info.deletedAt !== null || info.archivedAt !== null) continue;
+        if (busy(info.status)) return true;
+      }
+      return false;
+    }
+
+    /**
      * Archive a steward whose wake turn ended waiting on someone else, so the
      * sidebar holds only stewards with something to do. Its binding stays:
-     * the next wake brings it back (sendTo). Not while a worker runs or an
-     * escalation is open, which the user should still see.
+     * the next wake brings it back (sendTo). Not while a worker still has work
+     * (workersHaveWork), or an escalation is open, which the user should still
+     * see.
      */
     async function archiveWaiting(b: Binding): Promise<void> {
       store.patch(b.id, { archiveWhenIdle: false });
       if (b.threadId === null || b.endedAt !== null || b.ending !== null) return;
-      if (store.workers(b.id).some((w) => w.status === "running") || store.openEscalations(b.id).length > 0) return;
+      if ((await workersHaveWork(b)) || store.openEscalations(b.id).length > 0) return;
       const info = await threadInfo(b.threadId).catch(() => null);
       if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) return;
       await quietly(`archive ${b.entityKey}'s waiting steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
@@ -1473,20 +2846,77 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Compact a steward's context once it has grown past the setting, while it
-     * is idle. Every wake carries what the steward needs (DESIGN.md §6), so
-     * its transcript can go; without this a steward's context only grows, and
+     * The questions the binding's workers ended their last turn with. A
+     * finished-but-archived worker is brought back so the steward's
+     * `bb thread tell` can reach it; one whose thread is gone is reported as
+     * gone, needing a fresh worker (BB-14).
+     *
+     * The plugin cannot catch the tell itself: bb rejects a message to an
+     * archived thread (409) before the `message.dispatch` hook runs, so the
+     * worker is brought back here, when its question is surfaced, instead. A
+     * lookup that fails for any reason but not-found is treated as live:
+     * claiming a live worker is gone would tell the steward to spawn a
+     * duplicate, while a tell to a really-gone thread just fails.
+     *
+     * An archived worker is surfaced even though BB-17's `thread.archived`
+     * handler has already flipped its record from `finished` to `stopped`:
+     * archiving is exactly the case that needs reviving, and reviving restores
+     * the record to `finished` so the question stays visible until answered.
+     * A worker stopped on purpose, with its thread still there, is not.
+     */
+    async function collectWorkerQuestions(b: Binding): Promise<WorkerQuestion[]> {
+      const out: WorkerQuestion[] = [];
+      for (const w of store.workers(b.id)) {
+        if (w.status === "running" || w.status === "failed") continue;
+        const question = workerQuestion(w.result);
+        if (question === null) continue;
+        let info: ThreadInfo | null;
+        try {
+          info = await threadInfo(w.threadId);
+        } catch (error) {
+          if (w.status !== "finished") continue;
+          bb.log.warn(`stewards: could not read worker thread ${w.threadId}; treating it as live: ${errorMessage(error)}`);
+          out.push({ threadId: w.threadId, question, state: "live" });
+          continue;
+        }
+        const gone = info === null || info.deletedAt !== null;
+        const archived = info !== null && info.deletedAt === null && info.archivedAt !== null;
+        // A worker stopped on purpose, with its thread still there, is done.
+        if (w.status === "stopped" && !archived && !gone) continue;
+        if (archived) {
+          await quietly(`unarchive worker ${w.threadId}`, () => bb.sdk.threads.unarchive({ threadId: w.threadId }));
+          store.setWorker(w.threadId, "finished", w.result);
+          out.push({ threadId: w.threadId, question, state: "revived" });
+          continue;
+        }
+        if (gone) {
+          out.push({ threadId: w.threadId, question, state: "gone" });
+          continue;
+        }
+        out.push({ threadId: w.threadId, question, state: "live" });
+      }
+      return out;
+    }
+
+    /**
+     * Compact a steward's context once it has grown past the setting, or once
+     * a wake about to be sent would push it over (criterion 4), while it is
+     * idle. Every wake carries what the steward needs (DESIGN.md §6), so its
+     * transcript can go; without this a steward's context only grows, and
      * every later turn reads all of it. A reading already compacted on is not
      * acted on twice, should the provider not report a new one.
      */
     const compactedOn = new Map<string, number>();
-    async function compactIfLarge(threadId: string): Promise<boolean> {
+    async function compactIfLarge(threadId: string, incomingChars = 0): Promise<boolean> {
       const limit = (await settings.get()).compactAboveTokens;
       if (!(limit > 0)) return false;
       try {
         const [usage] = await bb.sdk.threads.events.list({ threadId, types: ["thread/contextWindowUsage/updated"], order: "desc", limit: "1" });
         const used = (usage?.data as { contextWindowUsage?: { usedTokens?: number | null } } | undefined)?.contextWindowUsage?.usedTokens ?? null;
-        if (used === null || used <= limit || compactedOn.get(threadId) === used) return false;
+        if (used === null || !compactDue(used, limit, incomingChars) || compactedOn.get(threadId) === used) return false;
+        // A busy thread cannot be compacted; skip it rather than warn on every wake.
+        const info = await threadInfo(threadId).catch(() => null);
+        if (info === null || info.deletedAt !== null || busy(info.status)) return false;
         compactedOn.set(threadId, used);
         await bb.sdk.threads.compact({ threadId });
         bb.log.info(`stewards: compacted ${threadId} at ${used} context tokens`);
@@ -1506,8 +2936,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     bb.events.on("thread.failed", ({ thread, error }) => {
       const worker = store.worker(thread.id);
-      if (worker === null || worker.status !== "running") return;
+      if (worker === null || !workerInFlight(worker)) return;
       store.setWorker(thread.id, "failed", error);
+      closeRequesterNeed(thread.id);
       store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
       scheduleReconcile(worker.bindingId);
     });
@@ -1518,11 +2949,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // bring it back until it is removed and re-added.
     bb.events.on("thread.archived", ({ thread }) => {
       const worker = store.worker(thread.id);
-      if (worker !== null && worker.status === "running") store.setWorker(thread.id, "stopped", worker.result);
+      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+      // An archived requester can no longer import; drop its binding so the
+      // page's next Provide spawns a fresh one.
+      if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
     });
     bb.events.on("thread.deleted", ({ thread }) => {
       const worker = store.worker(thread.id);
-      if (worker !== null && worker.status === "running") store.setWorker(thread.id, "stopped", worker.result);
+      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
       const b = store.byThread(thread.id);
       if (b === null || b.endedAt !== null) return;
       store.patch(b.id, { threadId: null, endedAt: now(), endReason: "deleted", manualDetach: true, awaitingReport: false, ending: null });
@@ -1531,6 +2965,74 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pushInterest();
     });
 
+    // ---- @bb mentions ----------------------------------------------------------------------------------
+    //
+    // linear hands over a mention bb-gate-hooks routed to this server. It
+    // goes to the issue's ticket steward when the issue has an open binding,
+    // else to the project steward of the project whose file lists the
+    // issue's team; with neither, linear answers the session itself. The
+    // steward answers with linear_session_reply. A request from anyone but
+    // the server's owner waits for the owner to confirm it; it is kept here
+    // so the owner's answer arrives with what it answers.
+
+    const PENDING_KEY = "sessions/pending";
+    const PENDING_TTL_MS = 7 * 86_400_000;
+    /** At most this many requests wait on the owner per session; the oldest go first. */
+    const PENDING_MAX = 5;
+    const pendingItem = z.object({ asker: z.string(), text: z.string(), at: z.string() });
+    const pendingRecord = z.record(z.string(), z.object({ requests: z.array(pendingItem), savedAt: z.number() }));
+    /** Add a request waiting on the owner, or (with null) take every one waiting, which the owner's words answer. */
+    async function updatePending(session: string, add: PendingRequest | null): Promise<PendingRequest[]> {
+      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+      const before = all[session]?.requests ?? [];
+      if (add === null) delete all[session];
+      else all[session] = { requests: [...before, add].slice(-PENDING_MAX), savedAt: now() };
+      for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
+      await bb.storage.kv.set(PENDING_KEY, all);
+      return before;
+    }
+
+    async function onSession(w: SessionWake): Promise<{ routed: "ticket" | "project" | "none"; threadId: string | null; projectId: string | null }> {
+      const trusted = w.fromOwner && !w.comment.untrusted;
+      // Untrusted requests are what the owner's next words may confirm; the
+      // owner's words answer them, so they are taken off.
+      const pending = trusted ? await updatePending(w.session, null) : (await updatePending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at }), []);
+
+      const bound = store.byEntity("linear", w.issue.id);
+      if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
+        const config = await loadConfig(bound.projectId);
+        const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
+        await serial(`b:${bound.id}`, async () => {
+          const b = store.binding(bound.id);
+          if (b === null || b.endedAt !== null || b.threadId === null) return;
+          sent.outcome = await sendTo(b.threadId, formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, pending, label: config?.file.label ?? "bb-managed" }));
+          // A turn like any wake's: it ends with steward_report, and one
+          // waiting on someone else is archived when it is done.
+          if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+        });
+        if (sent.outcome === "sent") {
+          bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward`);
+          return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId };
+        }
+        bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
+      }
+
+      const projects = await stewardedProjects();
+      const config =
+        (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
+        projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
+      if (config === undefined) {
+        bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
+        return { routed: "none", threadId: null, projectId: null };
+      }
+      const threadId = await ensureProjectSteward(config);
+      if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
+      const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, pending, label: config.file.label }));
+      if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
+      bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
+      return { routed: "project", threadId, projectId: config.projectId };
+    }
+
     // ---- the RPC -------------------------------------------------------------------------------------
 
     bb.rpc.register(rpcContract, {
@@ -1538,6 +3040,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
         return { ok: true };
+      },
+      async stewardsSession(input, { experimental_caller: caller }) {
+        if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS.linear) throw new Error("only the linear plugin hands stewards an @bb mention");
+        return onSession(input);
       },
       async stewardsList({ projectId, all }) {
         const rows = all ? store.all(projectId ?? undefined) : store.open(projectId ?? undefined);
@@ -1553,6 +3059,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             nextAction: b.status?.nextAction ?? null,
             actor: b.status?.actor ?? null,
             escalations: store.openEscalations(b.id).length,
+            needs: store.openNeeds(b.id).length,
             ended: b.endedAt !== null,
           })),
         };
@@ -1577,7 +3084,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             playbooks:
               config === null
                 ? []
-                : KINDS.filter((k) => k !== "review" || config.file.reviews.enabled).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
+                : KINDS.filter((k) => usesKind(config.file, k)).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
             problems: config?.problems ?? [],
             nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
             lastNight: row.nightlyDate,
@@ -1623,8 +3130,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const all = store.all(projectId);
         const open = all.filter((b) => b.endedAt === null);
         const questions = store.openQuestions(projectId);
-        const asked = new Set(questions.map((q) => q.escalationId).filter((id) => id !== null));
-        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !asked.has(x.id)).map((x) => ({ x, b })));
+        const needs = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
+        // A question or a need covers the escalation it was made for: the
+        // page's row is the question or the item, never the raw escalation.
+        const covered = new Set([...questions.map((q) => q.escalationId), ...needs.map((n) => n.escalationId)].filter((id): id is string => id !== null));
+        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !covered.has(x.id)).map((x) => ({ x, b })));
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
@@ -1641,16 +3151,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             questions: questions.map((q) => {
               const b = q.bindingId === null ? null : store.binding(q.bindingId);
-              return { id: q.id, question: q.question, context: q.context, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
+              return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
             }),
             withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
+            needs,
+            lessons: store.lessons(projectId).map((l) => {
+              const b = l.bindingId === null ? null : store.binding(l.bindingId);
+              return { id: l.id, bindingId: l.bindingId, key: b?.entityKey ?? null, file: l.file, text: l.text, scope: l.scope, status: l.status, branch: l.branch, mergeSha: l.mergeSha, note: l.note, escalationId: l.escalationId, createdAt: l.createdAt };
+            }),
             stewards: open.map((b) => ({
               key: b.entityKey,
               url: b.url,
               title: b.title,
               kind: b.kind,
               phase: b.phase,
-              stage: b.stage,
+              // Ops bindings have no stage of their own; the page groups them as watching.
+              stage: b.kind === "ops" ? "watch" : b.stage,
               threadId: b.threadId,
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
@@ -1666,15 +3182,66 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           },
         };
       },
-      async stewardsAnswerQuestion({ questionId, answer }, { experimental_caller: caller }) {
+      async stewardsAnswerQuestion({ questionId, answer, choice }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
         const q = store.question(questionId);
         if (q === null || q.status !== "open") return { ok: false, message: "That question is already closed." };
-        const text = answer === null || answer === "" ? null : answer;
+        const text = answer === undefined || answer === null || answer === "" ? null : answer;
         const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+        const b = x === null ? null : store.binding(x.bindingId);
+        // A fixed choice: the label is the answer, saved as guidance, and a
+        // forwarded escalation resolves with that guidance, exactly as
+        // steward_update { guidance, resolve } records it (BB-20).
+        const chosen = choice === undefined || choice === null || choice === "" ? null : choice;
+        if (chosen !== null) {
+          if (q.choices.length === 0) return { ok: false, message: "That question has no choices; answer it in the text box." };
+          if (!q.choices.includes(chosen)) return { ok: false, message: `"${chosen}" is not one of the choices: ${q.choices.join(", ")}.` };
+          const guidance = text === null ? chosen : `${chosen} — ${text}`;
+          store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
+          if (x !== null && b !== null && b.endedAt === null) {
+            store.addGuidance(b.id, guidance, "user");
+            store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
+          }
+          return { ok: true, message: "Closed." };
+        }
+        // Criterion 1: an approval request answered on the page approves or
+        // declines the current spec and closes the request in one
+        // transaction. Ambiguous words are not a decline: the project steward
+        // decides, so the request goes back to it with the answer.
+        if (x !== null && b !== null && b.endedAt === null && x.kind === "approval" && text !== null) {
+          const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          const verdict = classifyApproval(text);
+          if (verdict === "approve" && entity !== null) {
+            store.approve(b.id, { at: now(), specHash: specHashFor(b, entity), by: "user" }, `Approved by the user on the stewards page: "${text}"`, "user");
+            store.addGuidance(b.id, text, "user");
+            store.note(b.id, `Approval ${x.id} was answered by the user on the stewards page: ${text}`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+          }
+          if (verdict === "decline" && entity !== null) {
+            store.decline(b.id, specHashFor(b, entity), `Declined by the user on the stewards page: "${text}"`, "user");
+            store.addGuidance(b.id, text, "user");
+            store.note(b.id, `Approval ${x.id} was declined by the user on the stewards page: ${text}`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Declined; ${b.entityKey}'s steward has been told.` };
+          }
+          // Ambiguous: close the question, keep the escalation, and send it
+          // back to the project steward to interpret.
+          store.answerQuestionOnly(q.id, text, "user");
+          store.addGuidance(b.id, text, "user");
+          store.reroute(x.id, "project", x.recommendation);
+          store.note(b.id, `The user answered approval ${x.id} on the stewards page, but not clearly enough to approve or decline: ${text}`);
+          scheduleReconcile(b.id);
+          await wakeProject(b.projectId, `ambiguous approval answer for ${b.entityKey}`, {
+            digestDue: false,
+            notes: [`The user answered ${b.entityKey}'s approval request on the Stewards page: ${JSON.stringify(text)}. It is not clearly an approval or a decline, so interpret it: approve with steward_update { binding, approve: true }, or decline with explicit words.`, `The escalation ${x.id} is open with you again.`],
+          });
+          return { ok: true, message: `Closed; the project steward will interpret the answer.` };
+        }
         // Closes the escalation it was forwarded for, too.
         store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
-        const b = x === null ? null : store.binding(x.bindingId);
         if (x !== null && b !== null && b.endedAt === null) {
           if (text !== null) store.addGuidance(b.id, text, "user");
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
@@ -1682,6 +3249,172 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
         return { ok: true, message: "Closed." };
+      },
+      // The page's buttons. Each action runs on the server as the connected user
+      // and unsigned, so it counts as a human action; each closes its item and
+      // wakes the binding's steward with the closure under "What changed".
+      async stewardsNeedAction({ needId, action, note, choice }, { experimental_caller: caller }) {
+        if (caller.kind !== "client") throw new Error("needs are actioned by the user, from the stewards page");
+        const need = store.need(needId);
+        if (need === null || need.status !== "open") return { ok: false, message: "That item is already closed." };
+        const b = store.binding(need.bindingId);
+        if (b === null) return { ok: false, message: "That binding is gone." };
+        if (action === "choose" && need.kind !== "decide") return { ok: false, message: `Choices are for a decide item; this is ${need.kind}.` };
+        const text = note === undefined || note === null || note.trim() === "" ? null : note.trim();
+        /** Close the item and wake the steward with what happened. */
+        const after = (closure: string): void => {
+          store.note(b.id, closure);
+          if (text !== null) store.addGuidance(b.id, text, "user");
+          scheduleReconcile(b.id);
+        };
+        const freshPull = async (): Promise<EntitySnapshot | null> => {
+          const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          if (entity === null) return null;
+          const pulls = b.kind === "ticket" ? await linkedPulls(entity) : [];
+          return [entity, ...pulls].find((e) => (e.url ?? e.key) === need.url || e.key === need.url) ?? (entity.pull === null ? null : entity);
+        };
+
+        if (need.kind === "approve-spec") {
+          if (action !== "approve" && action !== "decline") return { ok: false, message: "Approve or decline the spec." };
+          const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+          if (entity === null) return { ok: false, message: "The ticket could not be read; try again." };
+          // The same path `steward_update { approve }` uses: the verdict is
+          // recorded on the gate, the need closes, and the open `approval`
+          // escalations (the forwarded request) are resolved in one step.
+          const { closure, forwarded } = recordSpecVerdict(b, action, entity, text, "on the Stewards page");
+          after(closure);
+          await wakeProjectOnForwardedAnswer(b, closure, forwarded);
+          return { ok: true, message: `${action === "approve" ? "Approved" : "Declined"}; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "approve-pr") {
+          const ref = parsePullRef(need.url);
+          if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
+          const pull = await freshPull();
+          const gate = pull === null ? null : prGate(pull);
+          if (pull === null || gate === null || !gate.needsOwnerApproval) return { ok: false, message: `Not now: ${gate?.missing ?? "the pull request has not been observed yet"}.` };
+          const body = `Approved ${gate.headSha ?? "?"} from the Stewards page`;
+          try {
+            await github.comment(ref.repo, ref.number, body);
+          } catch (error) {
+            return { ok: false, message: `GitHub refused the comment: ${errorMessage(error)}` };
+          }
+          store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
+          after(`The user approved ${pull.key} from the Stewards page: "${body}".`);
+          return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "merge") {
+          const ref = parsePullRef(need.url);
+          if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
+          const pull = await freshPull();
+          const gate = pull === null ? null : prGate(pull);
+          if (pull === null || gate === null || !gate.gateMet) return { ok: false, message: `The gate is not met: ${gate?.missing ?? "the pull request could not be read"}.` };
+          if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
+          const lane = gate.lane ?? "no-review";
+          const summary = `Merged: ${lane} lane, reviewer approved ${shortSha(gate.headSha)}, checks green${gate.ownerApproved ? ", approved by the owner" : ""}.`;
+          try {
+            await github.squashMerge(ref.repo, ref.number, `Merge ${pull.key}`, summary);
+            await github.comment(ref.repo, ref.number, summary).catch(() => undefined);
+          } catch (error) {
+            return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
+          }
+          store.closeNeedByKey(b.id, "merge", need.url, "Merged from the Stewards page.");
+          after(`${pull.key} was merged from the Stewards page. ${summary}`);
+          return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "configure") {
+          if (action !== "done") return { ok: false, message: "Press Done once the step is finished." };
+          store.closeNeedByKey(b.id, "configure", need.url, text === null ? "Done on the Stewards page." : `Done on the Stewards page: ${text}`);
+          after(`The user did ${need.what}${text === null ? "" : `: ${text}`}.`);
+          return { ok: true, message: `Marked done; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "provide-secret") {
+          if (action !== "provide" && action !== "done") return { ok: false, message: "Provide the secret, or mark it done." };
+          const named = typeof need.data.variable === "string" && need.data.variable.trim() !== "" ? need.data.variable.trim() : need.what;
+          // Done is the manual escape hatch: the value was entered another way.
+          if (action === "done") {
+            store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Marked done on the Stewards page." : `Marked done on the Stewards page: ${text}`);
+            after(`The user marked ${named} done on the Stewards page${text === null ? "" : `: ${text}`}; the value was entered another way.`);
+            return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId: null };
+          }
+          // Provide opens bb's secure form in a requester thread the plugin
+          // spawns, so the user never has to prompt one. The need stays open
+          // until the requester finishes, so `bb stewards secret import`
+          // (case B) is accepted while it runs.
+          const existing = store.secretRequesterForNeed(need.id);
+          if (existing !== null) {
+            const info = await threadInfo(existing.threadId).catch(() => null);
+            if (info !== null && info.deletedAt === null && info.archivedAt === null) return { ok: true, message: `The form is already open for ${named}.`, threadId: existing.threadId };
+            store.clearSecretRequester(existing.threadId);
+          }
+          let requesterId: string;
+          try {
+            requesterId = await spawnRequester(b, need);
+          } catch (error) {
+            return { ok: false, message: `Could not start the requester thread: ${errorMessage(error)}` };
+          }
+          store.note(b.id, `Started a requester thread for ${named}; the user is entering it there.`);
+          return { ok: true, message: `Opening the secure form for ${named} in a new thread.`, threadId: requesterId };
+        }
+
+        // A boundary lesson's Merge/Drop. Merge goes through the same
+        // multi-repo fast-forward the project steward's own self-merge uses;
+        // Drop discards it. Neither is a free-text answer.
+        if (need.kind === "decide" && action === "choose" && typeof need.data.lessonId === "string") {
+          const lesson = store.lesson(need.data.lessonId);
+          const label = choice === undefined || choice === null || choice === "" ? null : choice;
+          if (lesson === null || lesson.status !== "pending") {
+            store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
+            return { ok: false, message: "That lesson is already resolved." };
+          }
+          if (label === "Drop") {
+            store.markLessonDropped(lesson.id, "Dropped by the user on the Stewards page.");
+            store.closeNeedByKey(b.id, "decide", need.url, "Dropped on the Stewards page.");
+            after(`The user dropped lesson ${lesson.id} on the Stewards page.`);
+            return { ok: true, message: `Dropped; ${b.entityKey}'s steward has been told.` };
+          }
+          if (label !== "Merge") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Merge, Drop.` };
+          const threadId = store.project(b.projectId).threadId;
+          if (threadId === null) return { ok: false, message: "The project steward has no thread yet; nothing has been published." };
+          const result = await mergeLesson(b.projectId, threadId, lesson);
+          if (!result.ok) {
+            store.noteLesson(lesson.id, result.message);
+            return { ok: false, message: result.message };
+          }
+          store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged by the user on the Stewards page.");
+          store.closeNeedByKey(b.id, "decide", need.url, "Merged on the Stewards page.");
+          after(`The user merged lesson ${lesson.id} (${lesson.file}) on the Stewards page at ${result.sha ?? "?"}.`);
+          return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
+        }
+
+        if (need.kind === "decide" && action === "choose") {
+          const choices = needChoices(need);
+          const label = choice === undefined || choice === null || choice === "" ? null : choice;
+          if (label === null) return { ok: false, message: "Pick one of the choices." };
+          if (choices.length === 0) return { ok: false, message: "That item has no choices; answer it in the text box." };
+          if (!choices.includes(label)) return { ok: false, message: `"${label}" is not one of the choices: ${choices.join(", ")}.` };
+          const guidance = text === null ? label : `${label} — ${text}`;
+          store.closeNeedByKey(b.id, "decide", need.url, `Chose: ${label}${text === null ? "" : ` — ${text}`}`);
+          store.addGuidance(b.id, guidance, "user");
+          store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
+          // A forwarded escalation answered by a choice resolves with the
+          // choice as guidance, exactly as steward_update { guidance, resolve }.
+          const escalationId = typeof need.data.escalationId === "string" ? need.data.escalationId : null;
+          if (escalationId !== null) {
+            const escalation = store.escalation(escalationId);
+            if (escalation !== null && escalation.status === "open") store.answerEscalation(escalationId, guidance, "user");
+          }
+          scheduleReconcile(b.id);
+          return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
+        }
+
+        // `decide` is the question mechanism; a raw item of that kind just closes.
+        store.closeNeedByKey(b.id, need.kind, need.url, text === null ? "Closed on the Stewards page." : `Closed on the Stewards page: ${text}`);
+        after(`${need.kind} item ${need.id} was closed on the Stewards page${text === null ? "" : `: ${text}`}.`);
+        return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
       },
     });
 
@@ -1721,6 +3454,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         };
       }
       const b = role.binding;
+      if (b.kind === "ops") {
+        const sentry = parseOpsTargetKey(b.entityId)?.kind === "sentry-project";
+        return {
+          tools: ["steward_report", "steward_update"],
+          skills: ["stewards"],
+          instructions:
+            `You are the ops steward watching ${JSON.stringify(b.entityKey)} (binding ${b.id}, playbook ${JSON.stringify(b.playbook)}), and your thread id is ${context.thread.id}. ` +
+            (sentry
+              ? "The plugin reads this Sentry project for you with its own token and every wake carries the issues that are new, regressed or rung, with their stack traces; you never change production and start no workers. Your thread holds no Sentry token, so diagnose from the wake and the code in your workspace. "
+              : "The plugin looks at the target for you and every wake carries what it found; you never change production and start no workers. To dig further, run kubectl on the target yourself, but only get, describe, logs and auth can-i: it acts as the user, whose rights are broad. ") +
+            "File and comment on Linear tickets with the linear_ tools, which sign for you; escalate each ticket you file to the project steward with steward_report, as the playbook says. " +
+            "End every turn you were woken for with steward_report, listing in opsTickets every ticket you filed, commented on or reopened. Read the stewards skill for the protocol.",
+        };
+      }
       return {
         tools: ["steward_report", "steward_update"],
         skills: ["stewards"],
@@ -1774,6 +3521,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return false;
     }
 
+    /**
+     * Whether the connected user approved in an unsigned comment on the
+     * entity, after the latest spec comment (criterion 3). `quote` is matched
+     * against the comment's text, so the steward can quote it back.
+     */
+    function userApprovedOnEntity(entity: EntitySnapshot | null, stewardThreadId: string | null, quote: string): boolean {
+      if (entity === null || entity.viewer === null) return false;
+      const viewer = entity.viewer.toLowerCase();
+      const latestSpec = entity.comments.filter((c) => isSpecComment(c, stewardThreadId, isUserThread)).reduce((max, c) => (c.createdAt > max ? c.createdAt : max), "");
+      const want = quote.replace(/\s+/gu, " ").trim().toLowerCase();
+      return entity.comments.some(
+        (c) =>
+          c.signedBy === null &&
+          c.author.toLowerCase() === viewer &&
+          c.createdAt > latestSpec &&
+          classifyApproval(c.body) === "approve" &&
+          c.body.replace(/\s+/gu, " ").toLowerCase().includes(want),
+      );
+    }
+
     bb.agents.registerTool({
       name: "steward_report",
       description:
@@ -1804,11 +3571,36 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .optional()
           .describe("The ready gate as you judge it now: every checklist item from the wake, by its number, met or not, and whether the ticket is substantial."),
         voidApproval: z.boolean().optional().describe("The spec changed materially since approval: void it and ask again."),
+        touches: z
+          .array(z.string().trim().min(1).max(200))
+          .max(40)
+          .optional()
+          .describe('The repo-relative paths this work changes, repo directory first ("bb-plugins/plugins/stewards", "bb-gate/docker/bb-server"); the whole set, replacing what was reported before. The project steward schedules tickets that touch the same paths one after another. Report it once the spec names the affected repos; refine it as pull requests open.'),
+        needs: z
+          .array(
+            z.object({
+              kind: z.enum(NEEDS_KINDS).describe("approve-spec, approve-pr, merge, decide, provide-secret, or configure."),
+              url: z.string().trim().max(500).optional().describe("The link: the entity, the pull request, the external page, or the worker thread."),
+              what: z.string().trim().min(1).max(300).describe("One line saying what the user must do."),
+              how: z.string().trim().max(4000).optional().describe("The steps, in Markdown."),
+              variable: z.string().trim().max(200).optional().describe("provide-secret: the variable name."),
+              purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
+              worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
+              writeEnv: z.string().trim().max(500).optional().describe("provide-secret: the dotenv path the requester writes (case A); defaults to the named worker's thread storage."),
+              setting: z.string().trim().max(200).optional().describe("provide-secret: the stewards plugin secret setting the value goes to (case B); only a declared secret setting is accepted."),
+              page: z.string().trim().max(500).optional().describe("configure: the external page where the step happens."),
+              choices: choicesSchema.optional().describe('decide only: 2-6 short labels the user picks between (["Merge", "Close", "Verify first"]); the page shows one button each, so do not write "reply with your choice" in prose.'),
+            }),
+          )
+          .max(20)
+          .optional()
+          .describe("Things only the user can do. They appear on the Stewards page with their buttons, and are deduplicated by (binding, kind, url), so re-reporting updates the wording."),
         escalate: z
           .object({
             kind: z.enum(ESCALATION_KINDS).describe("blocked, decision, scope (the scope must change), conflict (the entity's state contradicts the playbook), or stuck."),
             question: z.string().trim().min(1).max(1500).describe("One answerable question."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
+            choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
           })
           .optional()
           .describe("Something the project's guidance does not let you decide. It goes to your parent steward, then the project steward; the answer comes back as guidance and wakes you."),
@@ -1819,15 +3611,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(600)
           .optional()
           .describe("Only after a terminal state (a wrap-up or follow-through turn): what remains to finish, such as a worker watching the deploy and verifying it. The binding stays open, its workers keep running, and you are woken as usual. Leave it out once the work is done, and the binding ends after this turn."),
+        opsTickets: z
+          .array(
+            z.object({
+              fingerprint: z.string().trim().min(1).max(400).describe("The problem's fingerprint, as the wake gives it."),
+              ticket: z.string().trim().regex(/^[A-Za-z][A-Za-z0-9]*-\d+$/u, "a Linear key such as OPS-12").describe("The Linear ticket."),
+              did: z.enum(["filed", "commented", "reopened"]),
+            }),
+          )
+          .max(20)
+          .optional()
+          .describe("Ops stewards only: every ticket you filed, commented on or reopened this turn, by fingerprint. The next look then treats the problem as filed under that ticket, so a recurrence is a comment there and nothing new."),
       }),
       async execute(input, { threadId }) {
         try {
           let b = ownBinding(threadId);
+          const opsTickets = input.opsTickets ?? [];
+          if (opsTickets.length > 0) {
+            if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
+            const unknown = opsTickets.filter((t) => store.fingerprint(b.projectId, t.fingerprint) === null).map((t) => JSON.stringify(t.fingerprint));
+            if (unknown.length > 0) {
+              const known = [...(b.opsLook?.findings ?? []), ...(b.sentryLook?.findings ?? []), ...(b.depsLook?.alerts ?? [])].map((f) => `- ${f.fingerprint}`).join("\n");
+              return toolError(new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a fingerprint" : "are not fingerprints"} this project has seen. Use them as the wake gives them${known === "" ? "." : `:\n${known}`}`));
+            }
+          }
           if (input.followThrough !== undefined && b.ending !== "terminal") {
             return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
           }
+          // Fixed choices are for a decision, as a `decide` need is: they are
+          // what a forwarded escalation turns into a question with buttons.
+          if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
+            return toolError(new Error("choices are for a decision escalation: escalate a decision, or file a decide need."));
+          }
           const config = await loadConfig(b.projectId);
-          const playbook = config === null ? null : playbookFor(config, b.kind);
+          const playbook = config === null ? null : bindingPlaybook(config, b);
           // Follow-through has one deadline from when it was first declared; a
           // requeue past it is a requeue at it.
           const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (input.followThrough === undefined ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
@@ -1855,10 +3672,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             };
           }
           if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now() };
+          // A status that waits on the user, the owner or a human has to say so
+          // with an item, not only in prose: the item is what reaches the page.
+          if (input.blockedOn !== undefined && namesUserAsBlocker(input.blockedOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
+            return toolError(
+              new Error(
+                `blockedOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) and it appears on the Stewards page; blockedOn stays for third parties.`,
+              ),
+            );
+          }
+          for (const t of opsTickets) store.recordTicket(b.projectId, t.fingerprint, t.ticket, t.did);
+          // A Sentry issue with a ticket is leased by itself, so its next event rings even outside the project lease.
+          if (opsTickets.length > 0 && parseOpsTargetKey(b.entityId)?.kind === "sentry-project") {
+            sentryHooks.added("issue", ...opsTickets.map((t) => t.fingerprint)).catch((error: unknown) => bb.log.warn(`stewards: could not lease a Sentry issue right away: ${errorMessage(error)}`));
+          }
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null });
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -1888,11 +3719,69 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             awaitingReport: false,
             missedReports: 0,
             ready,
+            ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
-          if (raised !== null && !(raised.route === "project" && requested !== null)) await deliver(b, raised);
-          if (requested !== null) await wakeProject(b.projectId, raised === null ? `approval requested for ${b.entityKey}` : `escalation and approval request from ${b.entityKey}`, { digestDue: false });
+          const scheduling = playbook === null ? null : await syncScheduleRequest(b, playbook);
+          // An `approve-pr` or `merge` item is filed only when the lane gate
+          // can hold it: the page's Approve and Merge buttons are already
+          // guarded this way, and filing one the gate cannot hold would be
+          // closed again by syncNeeds in this same call, silently.
+          const refused: string[] = [];
+          for (const n of input.needs ?? []) {
+            if (n.kind === "approve-pr" || n.kind === "merge") {
+              const url = n.url ?? n.worker ?? b.url ?? "";
+              const wanted = lc(url);
+              const pull = b.lastSnapshot === null ? undefined : observedPulls(b, b.lastSnapshot).find((p) => [p.url, p.key, p.id].some((v) => v !== null && lc(v) === wanted));
+              const gate = pull === undefined ? null : prGate(pull);
+              const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
+              if (!holdable) {
+                refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
+                continue;
+              }
+            }
+            if (n.choices !== undefined && n.kind !== "decide") {
+              refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: choices are for a decide item.`);
+              continue;
+            }
+            if (n.kind === "provide-secret" && n.variable === undefined && n.setting === undefined) {
+              refused.push(`provide-secret for ${n.what} not filed: name the env var with \`variable\`, or a stewards secret setting with \`setting\`.`);
+              continue;
+            }
+            if (n.setting !== undefined) {
+              if (n.kind !== "provide-secret") {
+                refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: setting is for a provide-secret item.`);
+                continue;
+              }
+              if (!SECRET_SETTING_NAMES.has(n.setting)) {
+                refused.push(`provide-secret for ${n.variable ?? n.what} not filed: ${JSON.stringify(n.setting)} is not a secret setting of the stewards plugin (secret settings: ${[...SECRET_SETTING_NAMES].join(", ") || "none"}).`);
+                continue;
+              }
+            }
+            store.fileNeed({
+              bindingId: b.id,
+              kind: n.kind,
+              url: n.url ?? n.worker ?? b.url ?? "",
+              what: n.what,
+              how: n.how ?? null,
+              data: {
+                ...(n.variable === undefined ? {} : { variable: n.variable }),
+                ...(n.purpose === undefined ? {} : { purpose: n.purpose }),
+                ...(n.worker === undefined ? {} : { workerThreadId: n.worker }),
+                ...(n.writeEnv === undefined ? {} : { writeEnv: n.writeEnv }),
+                ...(n.setting === undefined ? {} : { setting: n.setting }),
+                ...(n.page === undefined ? {} : { page: n.page }),
+                ...(n.choices === undefined ? {} : { choices: n.choices }),
+              },
+              filedBy: "steward",
+            });
+          }
+          const refusalNote = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
+          if (playbook !== null && b.lastSnapshot !== null) await syncNeeds(b, b.lastSnapshot, playbook, anyWorkerInFlight(store.workers(b.id)));
+          const requests = [requested === null ? null : "approval", scheduling === null ? null : "scheduling"].filter((r) => r !== null);
+          if (raised !== null && !(raised.route === "project" && requests.length > 0)) await deliver(b, raised);
+          if (requests.length > 0) await wakeProject(b.projectId, raised !== null && raised.route === "project" ? `escalation and ${requests.join(" and ")} request from ${b.entityKey}` : `${requests.join(" and ")} requested for ${b.entityKey}`, { digestDue: false });
           if (moved && b.parentBindingId !== null) {
             const parent = store.binding(b.parentBindingId);
             if (parent !== null && parent.endedAt === null) tell(threadId, parent, `Child ${b.entityKey}: ${status.summary} Next: ${status.nextAction} (${status.actor})`);
@@ -1901,24 +3790,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Where the gate stands after this report, so a miss shows now and not at the next wake.
           let gateNote = "";
           if (input.ready !== undefined && playbook !== null && playbook.ready !== null) {
-            const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHash(b.lastSnapshot.entity, b.threadId));
+            const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHashFor(b, b.lastSnapshot.entity));
             const unmet = gate.unmet.map((item) => playbook.ready!.checklist.indexOf(item) + 1);
             const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
           }
           const request = store.openEscalations(b.id).find((x) => x.kind === "approval");
+          const specNeed = store.openNeeds(b.id).find((n) => n.kind === "approve-spec");
           if (request !== undefined) {
-            gateNote +=
-              request.route === "me"
-                ? ` Approval of the spec is requested from the user (${request.id}): they approve in this thread, and you record it with steward_update { approve: true, quote }.`
-                : ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
+            gateNote += ` Approval of the spec is requested from the project steward (${request.id}); wait for it, and do not escalate for it.`;
+          } else if (specNeed !== undefined) {
+            gateNote += ` Approval of the spec is requested from the user, on the Stewards page (${specNeed.id}): they press Approve or Decline there.`;
           }
+          if (request !== undefined || specNeed !== undefined) {
+            gateNote += " Do not ask the user again; it is listed on the Stewards page.";
+            if (asksForOpenApproval(status, store.openEscalations(b.id), store.openNeeds(b.id)) !== null) gateNote += " This report asks for an approval that is already open: a playbook violation, shown by bb stewards show.";
+          }
+          const schedule = store.openEscalations(b.id).find((x) => x.kind === "schedule");
+          const askedAbout = store.binding(b.id)?.scheduleAsked ?? b.scheduleAsked;
+          if (schedule !== undefined) gateNote += ` Scheduling is with the project steward (${schedule.id}): ${b.entityKey} touches what ${askedAbout.join(", ")} ${askedAbout.length === 1 ? "is" : "are"} already changing. Start no workers and do not move the ticket into a build state until it decides; wait for its guidance or hold.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${refusalNote}${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${refusalNote}${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const archived = archiveWhenIdle && store.openEscalations(b.id).length === 0 ? " Your thread is archived when the turn ends, and comes back on that wake." : "";
-          return `Reported.${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${archived} End the turn now.`;
+          const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
+          return `Reported.${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${archived} End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
@@ -1928,7 +3825,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "steward_update",
       description:
-        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions; a parent steward or the project steward may update the bindings below it, which wakes them. " +
+        "Steer a binding. Save standing guidance (re-sent on every wake); decide an escalation (guidance + resolve) or pass it up (forward + recommendation); set priority or a hold; override the steward or worker model; approve a ticket's spec for the ready gate. A steward updates its own binding with the user's instructions, and may put it on hold but not lift the hold; a parent steward or the project steward may update the bindings below it, which wakes them. " +
         "The project steward also records each question it puts to the user (ask, with or without a binding) and closes it when they answer (resolve with the question id, and answer).",
       presentation: { label: { pending: "Updating a binding", completed: "Updated a binding" } },
       parameters: z.object({
@@ -1943,14 +3840,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           })
           .optional()
           .describe("Project steward only: record a question you are asking the user in your reply, so it is kept until answered. With binding, it is about that binding."),
-        forward: z.string().trim().min(1).max(100).optional().describe("An escalation that reached you and that you should not decide: pass it up. From the project steward it goes to the user — then ask them in your reply."),
+        forward: z.string().trim().min(1).max(100).optional().describe("An escalation that reached you and that you should not decide: pass it up. From the project steward it goes to the user — an approval becomes an Approve/Decline item on the Stewards page, so do not ask in prose; anything else asks them in your reply."),
         recommendation: z.string().trim().max(1500).optional().describe("Your recommendation, when forwarding."),
         priority: z.enum(["urgent", "high", "normal", "low"]).optional(),
         hold: z.string().trim().max(300).optional().describe('Why it is held; "" lifts the hold. A held steward takes no new actions and starts no workers.'),
+        behind: z
+          .array(z.string().trim().min(1).max(100))
+          .max(10)
+          .optional()
+          .describe("With hold: the open bindings (entity keys) this hold waits behind. The hold lifts itself, and the steward is woken, once every one has merged its pull requests or ended. Use it to schedule a ticket after the work it overlaps."),
         stewardModel: modelSpecSchema.optional().describe("The steward thread's model, provider/model/level."),
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
         approve: z.boolean().optional().describe("Approve the ticket's current spec for the ready gate."),
         quote: z.string().trim().min(2).max(500).optional().describe("When approving for the user: their words of approval, quoted exactly from a message they sent in this thread."),
+        lesson: z
+          .object({
+            text: z.string().trim().min(1).max(4000).describe("The rule as it should read in the file."),
+            file: z
+              .string()
+              .trim()
+              .min(1)
+              .max(300)
+              .refine(
+                (f) => !f.startsWith("/") && !f.includes("\\") && !f.includes("\0") && f.split("/").every((s) => s !== ".." && s !== "." && s.length > 0),
+                "a .bb-relative path with no leading /, backslash, NUL, or empty/./.. segment",
+              )
+              .describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
+            scope: z.enum(["procedure", "boundary"]).describe("procedure: playbook wording, sequencing, conventions the steward may already decide, which it self-merges. boundary: credentials and reach, who may direct a server, irreversible production steps — the user decides."),
+          })
+          .optional()
+          .describe("Project steward only: record a general rule drawn from an escalation or your own judgement, so it is made permanent in `.bb` instead of being lost with the ticket. With `binding` and `resolve`, it keeps the binding and escalation it came from. Apply and publish it, then complete it with lessonAction."),
+        lessonAction: z
+          .object({
+            id: z.string().trim().min(1).max(100).describe("The lesson id (lsn_…) from the nightly prompt or `bb stewards lessons`."),
+            action: z.enum(["complete", "drop"]).describe("complete: self-merge a procedure lesson, or file the user's Merge/Drop item for a boundary one. drop: discard it."),
+          })
+          .optional()
+          .describe("Project steward only: finish a pending lesson after applying and publishing it, or drop it."),
       }),
       async execute(input, { threadId }) {
         try {
@@ -1984,6 +3910,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (projectOf === null && (input.ask !== undefined || resolve?.startsWith("qst_") === true)) {
             return toolError(new Error("Only the project steward keeps questions to the user; a steward escalates with steward_report."));
           }
+          if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined)) {
+            return toolError(new Error("Only the project steward records and completes lessons; a steward escalates with steward_report."));
+          }
+          if (input.lessonAction !== undefined) {
+            const lesson = store.lesson(input.lessonAction.id);
+            if (lesson === null || lesson.projectId !== projectOf) return toolError(new Error(`No lesson ${input.lessonAction.id} in this project.`));
+            if (lesson.status !== "pending") return toolError(new Error(`Lesson ${lesson.id} is already ${lesson.status}.`));
+            const outcome = await completeLesson(lesson, input.lessonAction.action);
+            return `${lesson.id}: ${outcome}.`;
+          }
+          /** Record the lesson this call carries, with the binding and escalation it came from. */
+          const recordLesson = (bindingId: string | null, escalationId: string | null): string => {
+            const projectThread = store.project(projectOf!).threadId;
+            const branch = projectThread === null ? null : lessonBranchFor(projectThread);
+            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch });
+            return `lesson ${lesson.id} recorded (${lesson.scope}); apply it to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
+          };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
             if (q === null || q.projectId !== projectOf) return toolError(new Error(`No question ${resolve} in this project.`));
@@ -2014,10 +3957,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const target = bindingRef === undefined ? (projectOf !== null ? null : ownBinding(threadId)) : store.find(bindingRef);
           if (bindingRef !== undefined && target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
           if (target === null) {
-            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.stewardModel, input.workerModel, input.approve, input.quote];
+            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
-            if (closing === null && input.ask === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, or close one."));
-            return `${questionWrites(closing, null).join("; ")}.`;
+            if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
+            const written = questionWrites(closing, null);
+            if (input.lesson !== undefined) {
+              if (input.lesson.scope === "boundary") return toolError(new Error("A boundary lesson must name the binding it came from: pass binding (and resolve) so the user's Merge/Drop item has somewhere to live."));
+              written.push(recordLesson(null, closing?.question.escalationId ?? null));
+            }
+            return `${written.join("; ")}.`;
           }
           if (input.ask !== undefined && target.projectId !== projectOf) return toolError(new Error(`${target.entityKey} is not in this project.`));
           const self = target.threadId === threadId;
@@ -2034,8 +3982,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           let approval: { entity: EntitySnapshot; byUser: boolean } | null = null;
           let resolving: Escalation | null = null;
           if (directs) {
-            if (self && (input.priority !== undefined || input.hold !== undefined || input.stewardModel !== undefined)) {
-              return toolError(new Error("A steward does not set its own priority, hold or model; its parent or the project steward does."));
+            // A steward may put itself on hold (the owner said "halt work on
+            // this" in a Linear mention), but only its parent or the project
+            // steward lifts a hold.
+            if (self && (input.priority !== undefined || input.hold === "" || input.stewardModel !== undefined)) {
+              return toolError(new Error(input.hold === "" ? "A steward does not lift its own hold; its parent or the project steward does. Escalate with steward_report to ask." : "A steward does not set its own priority or model; its parent or the project steward does."));
             }
             if (input.approve === true) {
               const config = await loadConfig(target.projectId);
@@ -2044,43 +3995,88 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (mode === null) return toolError(new Error(`${target.entityKey}'s playbook has no ready gate to approve.`));
               if (typeof mode === "object") return toolError(new Error(`${target.entityKey} is approved by moving it to ${mode["linear-state"]} in Linear.`));
               if (target.lastSnapshot === null) return toolError(new Error("Nothing has been observed for this binding yet."));
+              const entity = (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity;
               const byProject = mode === "project" && isProjectSteward(threadId, target);
-              const byUser = input.quote !== undefined && (await userSaid(threadId, input.quote));
+              // Criterion 3: the user's words may be an unsigned comment on the entity itself, not only a message in this thread.
+              const byUser = input.quote !== undefined && ((await userSaid(threadId, input.quote)) || userApprovedOnEntity(entity, target.threadId, input.quote));
               if (!byProject && !byUser) {
                 return toolError(
                   new Error(
                     mode === "me"
-                      ? "This spec is approved by the user: quote their words from a message they sent in this thread."
+                      ? "This spec is approved by the user: quote their words from a message in this thread, or from their unsigned approving comment on the entity."
                       : "This spec is approved by the project steward (or by the user, quoting their words from this thread). Escalate a decision instead.",
                   ),
                 );
               }
               // Pinned to the spec as it is now, not as last observed: a spec
               // comment posted since the last ring is part of what was read.
-              approval = { entity: (await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser };
+              approval = { entity, byUser };
             }
             if (resolve !== undefined) {
               if (guidance === undefined) return toolError(new Error("Give the answer as guidance when resolving."));
               resolving = store.escalation(resolve);
               if (resolving === null || resolving.bindingId !== target.id) return toolError(new Error(`No escalation ${resolve} on ${target.entityKey}.`));
+              // Criterion 2: the project steward's approving words are the
+              // approval; approve: true is no longer needed as well. Only the
+              // approver the gate names may do it, as with approve: true: the
+              // project steward for mode project, and never a steward's own
+              // words for mode me (there the user's quote is required).
+              if (approval === null && resolving.kind === "approval" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
+                const config = await loadConfig(target.projectId);
+                const playbook = config === null ? null : playbookFor(config, target.kind);
+                if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
+              }
             }
             if (input.stewardModel !== undefined && target.threadId !== null) {
               const info = await threadInfo(target.threadId);
               if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             }
-            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, closing ?? undefined];
-            if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, or ask."));
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
+            if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, ask, or record a lesson."));
+          }
+          const behind: Binding[] = [];
+          if (input.behind !== undefined) {
+            if (input.hold === undefined || input.hold === "") return toolError(new Error("behind goes with a hold: say why it is held, and name the bindings it waits behind."));
+            const missing: string[] = [];
+            for (const k of input.behind) {
+              const other = store.find(k, target.projectId);
+              if (other === null || other.endedAt !== null || other.id === target.id) missing.push(k);
+              else if (!behind.some((x) => x.id === other.id)) behind.push(other);
+            }
+            if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to wait behind: ${missing.join(", ")}.`));
+            // No cycles: a hold behind something that, through its own holds, waits behind this binding would never lift.
+            const waitsOn = (from: Binding, seen = new Set<string>()): string | null => {
+              for (const k of from.holdBehind) {
+                const next = store.find(k, from.projectId);
+                if (next === null || next.endedAt !== null || seen.has(next.id)) continue;
+                if (next.id === target.id) return from.entityKey;
+                seen.add(next.id);
+                const via = waitsOn(next, seen);
+                if (via !== null) return via;
+              }
+              return null;
+            };
+            for (const other of behind) {
+              const via = other.id === target.id ? null : waitsOn(other);
+              if (via !== null) return toolError(new Error(`${target.entityKey} cannot wait behind ${other.entityKey}: ${via} already waits behind ${target.entityKey}, so neither hold would ever lift.`));
+            }
           }
 
           done.push(...questionWrites(closing, target));
+          if (input.lesson !== undefined) done.push(recordLesson(target.id, resolving?.id ?? closing?.question.escalationId ?? null));
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
             store.reroute(forwarding.id, route, recommendation);
-            // Kept as a question to the user too, which closes when the escalation is resolved. Made
-            // before the await below, so the escalation cannot be resolved in between and leave it open.
+            // A forwarded approval is the user's to decide exactly as
+            // `approval: me` is: file the page's `approve-spec` need and keep
+            // the escalation open, linked to it, instead of a free-text
+            // question. A forwarded decision stays a question. Made before the
+            // await below, so the escalation cannot be resolved in between and
+            // leave the need or question open.
+            const approvalToUser = route === "me" && forwarding.kind === "approval";
             const q =
-              route !== "me"
+              approvalToUser || route !== "me"
                 ? null
                 : store.ask({
                     projectId: target.projectId,
@@ -2088,16 +4084,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     escalationId: forwarding.id,
                     question: forwarding.question,
                     context: [`A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                   });
+            if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
             await deliver(target, store.escalation(forwarding.id)!);
-            if (q !== null) done.push(`forwarded ${forwarding.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
+            if (approvalToUser) done.push(`forwarded ${forwarding.id} to the user as an approve-spec item: they press Approve or Decline on the Stewards page, so do not ask them in prose`);
+            else if (q !== null) done.push(`forwarded ${forwarding.id} to the user as question ${q.id}: ask them in your reply, then record their answer with guidance + resolve`);
             else done.push(`forwarded ${forwarding.id} to the project steward`);
           }
           if (!directs) return `${target.entityKey}: ${done.join("; ")}.`;
 
           if (approval !== null) {
             const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHash(approval.entity, target.threadId), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
             done.push(others.length === 0 ? "spec approved" : `spec approved; still open on it: ${others.map((x) => `${x.id} (${x.kind}, with ${x.route}): ${x.question}`).join(" | ")} — resolve any this approval answers`);
@@ -2113,9 +4113,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (resolving !== null) {
             // Already resolved (the binding ended, a retry) is no error: the answer is added to the record.
             const outcome = store.answerEscalation(resolving.id, guidance!, threadId);
-            if (resolving.kind === "approval" && resolving.status === "open" && input.approve !== true && target.lastSnapshot !== null) {
+            if (resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
-              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHash(fresh.lastSnapshot!.entity, fresh.threadId) } });
+              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) } });
             }
             if (resolving.status === "open") done.push(`resolved ${resolving.id}`);
             else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
@@ -2123,10 +4123,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (outcome !== "unchanged") notes.push(`Escalation ${resolving.id} decided: ${guidance}`);
           }
           if (input.priority !== undefined || input.hold !== undefined) {
-            store.patch(target.id, { ...(input.priority === undefined ? {} : { priority: input.priority }), ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold }) });
-            const what = [input.priority === undefined ? null : `priority ${input.priority}`, input.hold === undefined ? null : input.hold === "" ? "hold lifted" : `on hold: ${input.hold}`].filter((s) => s !== null).join("; ");
+            const behindKeys = behind.map((x) => x.entityKey);
+            store.patch(target.id, {
+              ...(input.priority === undefined ? {} : { priority: input.priority }),
+              ...(input.hold === undefined ? {} : { hold: input.hold === "" ? null : input.hold, holdBehind: behindKeys }),
+            });
+            const behindNote = behindKeys.length === 0 ? "" : ` (behind ${behindKeys.join(", ")}: lifts itself once ${behindKeys.length === 1 ? "its pull requests merge or it ends" : "their pull requests merge or they end"})`;
+            const what = [input.priority === undefined ? null : `priority ${input.priority}`, input.hold === undefined ? null : input.hold === "" ? "hold lifted" : `on hold: ${input.hold}${behindNote}`].filter((s) => s !== null).join("; ");
             done.push(what);
             notes.push(`Set by your ${isProjectSteward(threadId, target) ? "project" : "parent"} steward: ${what}`);
+            // A hold answers an open scheduling request. A hold lifted by hand closes it too; the next look asks again if it must.
+            if (input.hold !== undefined) {
+              for (const x of store.openEscalations(target.id).filter((e) => e.kind === "schedule")) store.resolve(x.id, input.hold === "" ? "Hold lifted." : behindKeys.length === 0 ? `Held: ${input.hold}` : `Held behind ${behindKeys.join(", ")}.`);
+            }
           }
           if (input.stewardModel !== undefined && target.threadId !== null) {
             await bb.sdk.threads.update({ threadId: target.threadId, ...(input.stewardModel.model === null ? {} : { model: input.stewardModel.model }), ...(input.stewardModel.reasoningLevel === null ? {} : { reasoningLevel: input.stewardModel.reasoningLevel }) });
@@ -2143,13 +4152,51 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
     });
 
+    /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+      let actionable = true;
+      let why: string | null = null;
+      let threadId: string | null = null;
+      if (n.kind === "approve-pr" || n.kind === "merge") {
+        const observed = b.lastSnapshot;
+        const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
+        const gate = target === null ? null : prGate(target);
+        if (n.kind === "approve-pr") {
+          actionable = gate?.needsOwnerApproval ?? false;
+          why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");
+        } else {
+          const working = anyWorkerInFlight(store.workers(b.id));
+          actionable = (gate?.gateMet ?? false) && !working;
+          why = actionable ? null : working ? "a worker is still running" : (gate?.missing ?? "the pull request has not been observed yet");
+        }
+      } else if (n.kind === "provide-secret") {
+        // Always actionable: the page opens a requester thread and the form
+        // appears in its first turn. Link the thread once one has been spawned.
+        threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
+      }
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
+    }
+
     function formatBindings(rows: Binding[]): string {
       if (rows.length === 0) return "No bindings.";
       return rows
         .map((b) => {
           const s = b.status;
           const open = store.openEscalations(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), unheardWait(s, open)].filter((f) => f !== null);
+          const look = b.opsLook;
+          const sentry = b.sentryLook;
+          const watch =
+            look !== null
+              ? look.error !== null
+                ? `cannot read the target: ${look.error}`
+                : `looked ${iso(look.at)}: ${look.findings.length === 0 ? "nothing failing" : `${look.findings.length} problem(s) failing`}`
+              : sentry === null
+                ? null
+                : sentry.error !== null
+                  ? `cannot read the target: ${sentry.error}`
+                  : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
+          const needs = store.openNeeds(b.id);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
@@ -2171,7 +4218,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const config of projects) {
         if (!(await settings.get()).paused) await adoptionPass(config);
         await keepProjectSteward(config.projectId);
-        const playbooks = config.playbooks;
+        await syncOpsBindings(config);
+        await reconcileLessons(config);
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -2184,8 +4232,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             });
             continue;
           }
-          const playbook = playbooks[b.kind];
-          if (playbook !== undefined) {
+          const playbook = bindingPlaybook(config, b);
+          if (playbook !== null) {
             const limit = stuckDue(b, playbook, store.openEscalations(b.id), now());
             if (limit !== null) await raise(b, "stuck", `${b.entityKey}'s status has not moved in ${formatDuration(limit)} (phase ${b.phase}). What should happen?`, "Carrying on as before.");
           }
@@ -2211,6 +4259,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         bb.log.info(`stewards: nightly pass for ${config.projectId} (${night})`);
         if (!(await settings.get()).paused) await adoptionPass(config);
+        await reconcileLessons(config);
         const order = store
           .open(config.projectId)
           .filter((b) => b.hold === null && b.ending === null)
@@ -2245,6 +4294,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     bb.background.schedule("nightly", "*/5 * * * *", nightlyTick);
+    if (hooksUrl !== "") {
+      // The stream is opened only once a project lists a Sentry target; a
+      // server with none holds no stream for a source it never leases on.
+      bb.background.service("sentry-hooks", {
+        async start(signal) {
+          while (!signal.aborted && !sentryWanted()) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 60_000);
+              signal.addEventListener(
+                "abort",
+                () => {
+                  clearTimeout(timer);
+                  resolve();
+                },
+                { once: true },
+              );
+            });
+          }
+          if (!signal.aborted) await sentryHooks.run(signal);
+        },
+      });
+    }
     bb.background.service("loop", {
       async start(signal) {
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
@@ -2284,10 +4355,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
       const ticket = config.playbooks.ticket;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
-      for (const kind of KINDS) {
+      for (const kind of KINDS.filter((k) => usesKind(config.file, k))) {
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);
       }
+      lines.push(`deps-alerts: ${config.depsAlerts === null ? `no playbook (${depsAlertsPlaybookName(config.file)}); the dependency watch is off` : `${config.depsAlerts.name}@${config.depsAlerts.version}`}`);
+      lines.push(`deps-prs: ${config.depsPrs === null ? `no playbook (${depsPrsPlaybookName(config.file)}); Dependabot pull requests are not adopted` : `${config.depsPrs.name}@${config.depsPrs.version}`}`);
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
@@ -2304,13 +4377,61 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       await validate("linear", config.file.linear.teams, ticket === undefined ? [] : playbookStates(ticket));
       await validate("github", config.repos, []);
+      if (usesKind(config.file, "ops")) {
+        const auto = config.file.ops.autoAdopt;
+        lines.push(`ops: tickets filed in ${opsTeam(config.file) ?? "(no team)"}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
+        const host = await projectHost(projectId);
+        lines.push(`ops: kubectl runs on ${host ?? "no machine"}${config.file.ops.context === undefined ? ", in its current context" : `, in context ${config.file.ops.context}`}`);
+        const reader = opsReaderFor(config);
+        for (const target of k8sTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
+        const sentry = sentryTargets(config.file);
+        if (sentry.length > 0) {
+          if ((await sentryToken()) === null) lines.push(`problem: sentry: ${NO_TOKEN}: set the Sentry token in the stewards plugin's settings (a user auth token with ${TOKEN_SCOPES.join(" and ")})`);
+          const sentryApi = await sentryReader();
+          for (const target of sentry) {
+            const key = opsTargetKey(target);
+            const a = await sentryApi.access(target);
+            lines.push(a.ok ? `sentry: ${key} is readable (${a.name})` : `problem: sentry: cannot read the target ${key}: ${a.error}`);
+            const refused = sentryRefused.get(`project ${target.org}/${target.project}`);
+            if (refused !== undefined) lines.push(`sentry: ${key}: bb-gate-hooks refused its project lease (${refused}); only the periodic look sees it`);
+          }
+          const status = sentryHooks.status();
+          lines.push(hooksUrl === "" ? "sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only" : `sentry: doorbells from bb-gate-hooks: ${status.state}${status.state === "connected" ? (status.leased ? ", leased" : ", not leased") : ""}`);
+        }
+      }
+      const deps = config.file.deps;
+      const slaText = (v: number | "asap") => (v === "asap" ? "asap" : formatDuration(v));
+      lines.push(`deps: sla critical=${slaText(deps.sla.critical)} high=${slaText(deps.sla.high)} medium=${slaText(deps.sla.medium)} low=${slaText(deps.sla.low)}; batch medium=${formatDuration(deps.batch.medium)} low=${formatDuration(deps.batch.low)}; autoAdopt ${deps.autoAdopt.join(", ") || "(none)"}`);
+      const depsRepos = depsTargets(config.file, config.repos);
+      if (config.depsAlerts !== null && depsRepos.length > 0) {
+        lines.push(`deps: watching ${depsRepos.length} repo${depsRepos.length === 1 ? "" : "s"} for alerts: ${depsRepos.map((t) => t.repo).join(", ")}`);
+        try {
+          const out = await sourceRpc("github", "sourceDependabotAlerts", { units: depsRepos.map((t) => t.repo), state: "open" }, sourceContract.sourceDependabotAlerts.output);
+          if (out.viewer !== null) lines.push(`deps: reading alerts as ${out.viewer}`);
+          for (const e of out.errors) lines.push(`deps: skipping ${e}: the gh login cannot read its alerts (a skip, not a problem)`);
+        } catch (error) {
+          lines.push(`problem: deps: could not read alerts: ${errorMessage(error)}`);
+        }
+      }
       return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
+    }
+
+    /** What `bb stewards check` says about one ops target: readable or not, and whether its logs are. */
+    function opsAccessLines(key: string, a: OpsAccess): string[] {
+      if (a.error !== null) return [`problem: ops: cannot read the target ${key}: ${a.error}`];
+      const pods = a.reads.find((r) => r.what === "get pods");
+      if (pods !== undefined && !pods.ok) return [`problem: ops: cannot read the target ${key}: get pods: ${pods.detail ?? "refused"}`];
+      const lines = [`ops: ${key} is readable (${a.reads.filter((r) => r.ok).map((r) => r.what).join(", ")}); logs ${a.logs === true ? "readable" : a.logs === false ? "not readable, so diagnosis is from status and events" : "unknown"}`];
+      for (const r of a.reads.filter((x) => !x.ok)) lines.push(`ops: ${key}: cannot ${r.what} (${r.detail ?? "refused"}); looks go without it`);
+      // Expected: kubectl acts as the developer. Said so nobody mistakes the playbook for a wall.
+      if (a.writes.length > 0) lines.push(`ops: ${key}: this identity may also ${a.writes.join(", ")}; the plugin and the playbook keep to ${KUBECTL_VERBS.join(", ")}`);
+      return lines;
     }
 
     bb.cli.register(
       defineCli({
         name: "stewards",
-        summary: "Long-lived threads that manage labelled Linear tickets and GitHub pull requests",
+        summary: "Long-lived threads that manage labelled Linear tickets and GitHub pull requests, and watch production",
         description: "Configuration lives in the project's .bb (stewards/project.json and stewards/playbooks/), read from committed HEAD through multi-repo.",
         commands: {
           init: cliCommand({
@@ -2336,10 +4457,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (dir === undefined) throw new PluginCliError("No directory: run from a thread or pass --dir.", { code: "no_dir" });
               // Write on the thread's machine, else the project's: left to core, the
               // write lands on the server's own daemon, which bb-gate's servers lack.
-              const hostId =
-                (ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null)) ??
-                (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ??
-                undefined;
+              const threadHost = ctx.threadId === undefined ? null : ((await threadInfo(ctx.threadId))?.environmentHostId ?? null);
+              const hostId = threadHost ?? (ctx.projectId === undefined ? null : await projectHost(ctx.projectId)) ?? undefined;
               const files: Array<[string, string]> = [[PROJECT_FILE, projectFileTemplate(teams)], ...Object.entries(PLAYBOOK_TEMPLATES).map(([name, text]) => [playbookPath(name), text] as [string, string])];
               const lines: string[] = [];
               for (const [rel, content] of files) {
@@ -2354,7 +4473,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           check: cliCommand({
-            summary: "Validate the project file and every playbook against Linear and GitHub",
+            summary: "Validate the project file and every playbook against Linear and GitHub, and that kubectl can read every ops target",
             options: { project: PROJECT_OPTION },
             async run(input, ctx) {
               const result = await check(projectOf(input.options.project, ctx));
@@ -2368,7 +4487,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             async run(input, ctx) {
               const projectId = input.options.project ?? ctx.projectId;
               const rows = input.options.all ? store.all(projectId) : store.open(projectId);
-              return { exitCode: 0, stdout: input.options.json ? JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) : formatBindings(rows) };
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
+              const lessons = projectId === undefined ? [] : store.lessons(projectId);
+              const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
+              return { exitCode: 0, stdout: [formatBindings(rows), ...lessonLines].join("\n") };
+            },
+          }),
+
+          lessons: cliCommand({
+            summary: "Lessons the project steward recorded, and their state",
+            options: { all: { type: "boolean", description: "Include merged and dropped lessons" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = store.lessons(projectId, input.options.all ?? false);
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
+              if (rows.length === 0) return { exitCode: 0, stdout: "No pending lessons." };
+              return {
+                exitCode: 0,
+                stdout: rows
+                  .map((l) => {
+                    const b = l.bindingId === null ? null : store.binding(l.bindingId);
+                    const source = [b === null ? null : `from ${b.entityKey}`, l.escalationId].filter((x) => x !== null).join(", ");
+                    const landed = l.status === "merged" ? `${l.mergeSha === null ? "merged" : `merged at ${l.mergeSha.slice(0, 8)}`}${l.branch === null ? "" : ` on ${l.branch}`}` : l.status;
+                    return `${l.id} — ${landed}, ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
+                  })
+                  .join("\n"),
+              };
+            },
+          }),
+
+          "drop-lesson": cliCommand({
+            summary: "Drop a pending lesson the project steward recorded",
+            positionals: [{ name: "id", description: "The lesson id (lsn_…)", required: true }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const lesson = store.lesson(input.positionals.id);
+              if (lesson === null || lesson.projectId !== projectId) throw new PluginCliError(`No lesson ${input.positionals.id} in this project.`, { code: "lesson_not_found", hint: "bb stewards lessons lists them." });
+              if (lesson.status !== "pending") return { exitCode: 0, stdout: `Lesson ${lesson.id} is already ${lesson.status}.` };
+              store.markLessonDropped(lesson.id, "Dropped with bb stewards drop-lesson.");
+              if (lesson.bindingId !== null) store.closeNeedByKey(lesson.bindingId, "decide", lesson.id, "Dropped with bb stewards drop-lesson.");
+              return { exitCode: 0, stdout: `Dropped ${lesson.id}.` };
             },
           }),
 
@@ -2378,14 +4537,169 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
-              const detail = { binding: b, escalations: store.escalations(b.id), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey) };
+              const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id) };
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(detail) };
               const lines = [formatBindings([b]), "", `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
-              lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
+              if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
+              if (b.kind !== "ops") {
+                const conflicts = conflictsOf(b, store.open(b.projectId));
+                lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
+              }
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
-              for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+              for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+              for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
+              for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
               return { exitCode: 0, stdout: lines.join("\n") };
+            },
+          }),
+
+          needs: cliCommand({
+            summary: "Things waiting on the user: links and the action each supports",
+            description: "The same items as the Stewards page's \"Waiting on you\" section. `done <id>` closes one from a thread.",
+            options: { all: { type: "boolean", description: "Include closed items" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const projectId = projectOf(input.options.project, ctx);
+              const rows = input.options.all ? store.allNeedsForProject(projectId) : store.openNeedsForProject(projectId);
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
+              if (rows.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
+              return {
+                exitCode: 0,
+                stdout: rows
+                  .map((n) => {
+                    const b = store.binding(n.bindingId);
+                    const view = b === null ? null : needView(n, b);
+                    return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                  })
+                  .join("\n"),
+              };
+            },
+          }),
+
+          done: cliCommand({
+            summary: "Close a waiting item from a thread, record a choice, or approve a spec item",
+            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed. With --choice it records the label the user gave in chat, saved as guidance; a forwarded escalation resolves with it. On an `approve-spec` item it records the approval on the gate, resolves the escalation that asked for it, and wakes the steward and the project steward; decline a spec on the Stewards page instead.",
+            positionals: [{ name: "id", description: "The item id (need_…) or question id (qst_…)", required: true }],
+            options: {
+              project: PROJECT_OPTION,
+              choice: { type: "string", description: "A label the user picked, which must be one of the item's choices" },
+              note: { type: "string", description: "An optional note to save with the choice" },
+            },
+            async run(input, ctx) {
+              const id = input.positionals.id;
+              const choice = input.options.choice;
+              const note = input.options.note === undefined || input.options.note.trim() === "" ? null : input.options.note.trim();
+              // A question is the `decide` kind's mechanism; close it the same way.
+              const q = store.question(id);
+              if (q !== null) {
+                if (q.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+                const x = q.escalationId === null ? null : store.escalation(q.escalationId);
+                if (choice !== undefined) {
+                  if (q.choices.length === 0) throw new PluginCliError(`Question ${id} has no choices; close it without --choice.`, { code: "no_choices" });
+                  if (!q.choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${q.choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
+                  const guidance = note === null ? choice : `${choice} — ${note}`;
+                  store.answer(q.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`, "user", guidance);
+                  if (x !== null) {
+                    const b = store.binding(x.bindingId);
+                    if (b !== null) {
+                      store.addGuidance(b.id, guidance, "user");
+                      store.note(b.id, `The user chose ${choice} for ${q.question}${note === null ? "" : `: ${note}`}.`);
+                      scheduleReconcile(b.id);
+                    }
+                  }
+                  return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
+                }
+                const answer = note ?? "Closed from a thread.";
+                store.answer(q.id, answer, "user");
+                if (x !== null) {
+                  const b = store.binding(x.bindingId);
+                  if (b !== null) {
+                    if (note !== null) store.addGuidance(b.id, note, "user");
+                    store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
+                    scheduleReconcile(b.id);
+                  }
+                }
+                return { exitCode: 0, stdout: `Closed ${id}.` };
+              }
+              const n = store.need(id);
+              if (n === null) throw new PluginCliError(`No waiting item ${id}.`, { code: "need_not_found", hint: "bb stewards needs lists them." });
+              if (n.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+              // A boundary lesson's Merge/Drop is not a free-text choice: Merge
+              // runs the multi-repo fast-forward, Drop discards it, and both
+              // close the item and wake the steward.
+              if (n.kind === "decide" && typeof n.data.lessonId === "string") {
+                const lesson = store.lesson(n.data.lessonId);
+                if (lesson === null || lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
+                const label = choice ?? null;
+                if (label !== "Merge" && label !== "Drop") throw new PluginCliError(`Lesson ${lesson.id} is Merge or Drop; pass --choice Merge or --choice Drop.`, { code: "choice_required" });
+                const b = store.binding(n.bindingId);
+                if (label === "Drop") {
+                  store.markLessonDropped(lesson.id, "Dropped from a thread.");
+                  store.closeNeedByKey(n.bindingId, "decide", n.url, "Dropped from a thread.");
+                  if (b !== null) {
+                    store.note(b.id, `The user dropped lesson ${lesson.id} from a thread.`);
+                    scheduleReconcile(b.id);
+                  }
+                  return { exitCode: 0, stdout: `Dropped ${lesson.id}.` };
+                }
+                const threadId = b === null ? null : store.project(b.projectId).threadId;
+                if (threadId === null) throw new PluginCliError("The project steward has no thread yet; nothing has been published.", { code: "no_project_steward" });
+                const result = await mergeLesson(b!.projectId, threadId, lesson);
+                if (!result.ok) {
+                  store.noteLesson(lesson.id, result.message);
+                  throw new PluginCliError(result.message, { code: "merge_refused" });
+                }
+                store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged from a thread.");
+                store.closeNeedByKey(n.bindingId, "decide", n.url, "Merged from a thread.");
+                if (b !== null) {
+                  store.note(b.id, `The user merged lesson ${lesson.id} from a thread at ${result.sha ?? "?"}.`);
+                  scheduleReconcile(b.id);
+                }
+                return { exitCode: 0, stdout: `Merged ${lesson.id}.` };
+              }
+              if (choice !== undefined) {
+                if (n.kind !== "decide") throw new PluginCliError(`Choices are for a decide item; ${id} is ${n.kind}.`, { code: "not_decide" });
+                const choices = needChoices(n);
+                if (choices.length === 0) throw new PluginCliError(`Item ${id} has no choices; close it without --choice.`, { code: "no_choices" });
+                if (!choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
+                const guidance = note === null ? choice : `${choice} — ${note}`;
+                store.closeNeed(n.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`);
+                const b = store.binding(n.bindingId);
+                if (b !== null) {
+                  store.addGuidance(b.id, guidance, "user");
+                  store.note(b.id, `The user chose ${choice} for ${n.what}${note === null ? "" : `: ${note}`}.`);
+                  const escalationId = typeof n.data.escalationId === "string" ? n.data.escalationId : null;
+                  if (escalationId !== null) {
+                    const escalation = store.escalation(escalationId);
+                    if (escalation !== null && escalation.status === "open") store.answerEscalation(escalationId, guidance, "user");
+                  }
+                  scheduleReconcile(b.id);
+                }
+                return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
+              }
+              const b = store.binding(n.bindingId);
+              // An `approve-spec` item is a decision, not a step to tick off:
+              // `done` records the approval through the same path the page's
+              // Approve button and `steward_update { approve }` use, so the
+              // gate, the need and the forwarded escalation move together.
+              // Decline it on the Stewards page.
+              if (b !== null && n.kind === "approve-spec") {
+                // Fresh like the page, so both surfaces pin the same spec.
+                const entity = (b.source === "ops" ? null : await snapshot(b.source, b.entityId).catch(() => null)) ?? b.lastSnapshot?.entity ?? null;
+                if (entity === null) throw new PluginCliError(`Cannot read ${b.entityKey}'s spec to approve it.`, { code: "need_not_readable", hint: "Look at it again with bb stewards pass, then retry." });
+                const { closure, forwarded } = recordSpecVerdict(b, "approve", entity, null, "from a thread");
+                store.note(b.id, closure);
+                scheduleReconcile(b.id);
+                await wakeProjectOnForwardedAnswer(b, closure, forwarded);
+                return { exitCode: 0, stdout: `Approved ${id}; ${b.entityKey}'s steward has been told.` };
+              }
+              store.closeNeed(n.id, note === null ? "Closed from a thread." : `Answered from a thread: ${note}`);
+              if (b !== null) {
+                if (note !== null) store.addGuidance(b.id, note, "user");
+                store.note(b.id, note === null ? `${n.kind} item ${n.id} was closed from a thread.` : `${n.kind} item ${n.id} was answered from a thread: ${note}.`);
+                scheduleReconcile(b.id);
+              }
+              return { exitCode: 0, stdout: `Closed ${id}.` };
             },
           }),
 
@@ -2399,7 +4713,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (b.endedAt !== null) return { exitCode: 0, stdout: `${b.entityKey} has already ended (${b.endReason}).` };
               store.patch(b.id, { manualDetach: true });
               const config = await loadConfig(b.projectId);
-              const playbook = config === null ? null : playbookFor(config, b.kind);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
               await serial(`b:${b.id}`, async () => {
                 const fresh = store.binding(b.id)!;
                 if (config === null || playbook === null || fresh.lastSnapshot === null) await finishEnding(fresh, "detach");
@@ -2433,6 +4747,54 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return { exitCode: 0, stdout: row.digest === null ? "No digest yet." : `${iso(row.digestAt ?? 0)}\n\n${row.digest}` };
             },
           }),
+
+          // Case B of a provide-secret need: a stewards secret setting cannot
+          // be reached by `bb secret request` (which writes a dotenv on the
+          // worker's machine), so the requester thread the plugin spawned
+          // reads that dotenv here and writes the setting. Only that thread,
+          // only while its need is open, and only for the need's own setting.
+          "secret import": cliCommand({
+            summary: "Write a secret from a dotenv into a declared secret setting (requester threads only)",
+            description:
+              "Only the requester thread the plugin spawned for an open provide-secret need may run this, and only for that need's own setting. The dotenv is read through bb.sdk.files on the invoking thread's host, the value is written with the plugin's settings, and the file is deleted. The value never appears in argv, logs, messages or output.",
+            options: {
+              from: { type: "string", required: true, description: "The dotenv file to read, on the invoking thread's host." },
+              setting: { type: "string", required: true, description: "The declared secret setting to write." },
+            },
+            async run(input, ctx) {
+              const from = input.options.from;
+              const setting = input.options.setting;
+              if (ctx.threadId === undefined) throw new PluginCliError("bb stewards secret import must run from a bb thread.", { code: "missing_thread" });
+              const requester = store.secretRequester(ctx.threadId);
+              if (requester === null) throw new PluginCliError("This thread is not a provide-secret requester thread.", { code: "not_requester", hint: "Press Provide on the Stewards page to open one." });
+              const need = store.need(requester.needId);
+              if (need === null || need.kind !== "provide-secret" || need.status !== "open") throw new PluginCliError("That provide-secret item is closed.", { code: "need_closed" });
+              const expected = typeof need.data.setting === "string" && need.data.setting.trim() !== "" ? need.data.setting.trim() : null;
+              if (expected !== setting) throw new PluginCliError(`This item's secret goes to ${JSON.stringify(expected ?? "no setting")}, not ${JSON.stringify(setting)}.`, { code: "wrong_setting" });
+              if (!SECRET_SETTING_NAMES.has(setting)) throw new PluginCliError(`${JSON.stringify(setting)} is not a secret setting of the stewards plugin.`, { code: "not_secret_setting", hint: `Secret settings: ${[...SECRET_SETTING_NAMES].join(", ") || "none"}.` });
+              const variable = secretVariable(need);
+              const info = await threadInfo(ctx.threadId);
+              const hostId = info?.environmentHostId ?? null;
+              if (hostId === null) throw new PluginCliError("The requester thread has no machine to read the file from.", { code: "no_host" });
+              let content: string;
+              try {
+                const result = await bb.sdk.files.read({ hostId, path: from });
+                if (result.contentEncoding !== "utf8") throw new Error("the file is not UTF-8 text");
+                content = result.content;
+              } catch (error) {
+                throw new PluginCliError(`Could not read ${from} on the thread's machine: ${errorMessage(error)}`, { code: "read_failed" });
+              }
+              const value = parseDotenvValue(content, variable);
+              if (value === null || value === "") throw new PluginCliError(`${variable} is not set in ${from}.`, { code: "missing_value" });
+              try {
+                await settings.experimental_set({ [setting]: value } as unknown as Parameters<typeof settings.experimental_set>[0]);
+              } catch {
+                throw new PluginCliError(`Could not write the ${setting} setting; the value was not saved.`, { code: "write_failed" });
+              }
+              await bb.sdk.files.remove({ hostId, path: from }).catch(() => undefined);
+              return { exitCode: 0, stdout: `Imported ${setting}; the dotenv is gone.` };
+            },
+          }),
         },
       }),
     );
@@ -2442,12 +4804,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
-    testHooks.set(bb.pluginId, { sweep, store, db, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined) });
+    testHooks.set(bb.pluginId, { sweep, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void> }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 

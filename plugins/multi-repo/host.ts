@@ -24,6 +24,7 @@ import {
   bootstrapProjectSource,
   cloneProjectSource,
   defaultProjectSourcePath,
+  mergeGuidance,
   projectSourceBranch,
   projectSourceRemote,
   pushGuidance,
@@ -242,6 +243,16 @@ export function createMultiRepoHostEntry() {
           input.projectSourcePath,
           input.workspaceBbPath,
           input.threadId,
+          context.signal,
+        );
+      },
+
+      async mergeGuidance(input, context) {
+        return mergeGuidance(
+          input.projectSourcePath,
+          input.threadId,
+          input.file,
+          input.text,
           context.signal,
         );
       },

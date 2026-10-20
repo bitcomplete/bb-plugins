@@ -18,6 +18,7 @@ import {
   bootstrapProjectSource,
   cloneProjectSource,
   defaultProjectSourcePath,
+  mergeGuidance,
   pushGuidance,
   readCommittedFiles,
   readReposJson,
@@ -463,6 +464,101 @@ describe("the project source", () => {
     const branchHead = await gitLine(canonical, ["rev-parse", "guidance-thr_abc123"]);
     expect(branchHead).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
     expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).not.toBe("learned something\n");
+  });
+});
+
+describe("merging a published lesson branch", () => {
+  /** A canonical `.bb` and a clone of it, both with an identity to commit with. */
+  async function pair() {
+    const canonical = path.join(scratch, "lesson-canonical");
+    await mkdir(canonical, { recursive: true });
+    await bootstrapProjectSource(canonical, EMPTY_REPOS);
+    await gitIn(canonical, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(canonical, ["config", "user.name", "Test"]);
+    const workspaceBb = path.join(scratch, "lesson-workspace");
+    await git(["clone", "--quiet", canonical, workspaceBb]);
+    await gitIn(workspaceBb, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspaceBb, ["config", "user.name", "Test"]);
+    return { canonical, workspaceBb };
+  }
+
+  /** Append `text` to `file` in the workspace and commit it. */
+  async function append(workspaceBb: string, file: string, text: string): Promise<void> {
+    const current = await readFile(path.join(workspaceBb, file), "utf8");
+    await writeFile(path.join(workspaceBb, file), `${current}\n${text}\n`, "utf8");
+    await gitIn(workspaceBb, ["add", "--", file]);
+    await gitIn(workspaceBb, ["commit", "--quiet", "-m", "record a lesson"]);
+  }
+
+  const lesson = "A new column read with SELECT * breaks the previous image.";
+
+  it("fast-forwards the canonical checkout to the lesson's own file, and returns the sha", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result).toMatchObject({ ok: true, branch: "refs/heads/guidance-thr_lesson" });
+    expect(result.sha).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
+    expect(await gitLine(canonical, ["rev-parse", "HEAD"])).toBe(result.sha);
+    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toContain(lesson);
+  });
+
+  it("refuses a dirty canonical checkout and leaves the branch", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+    await writeFile(path.join(canonical, "AGENTS.md"), "half-written by hand\n", "utf8");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/uncommitted changes/u);
+    // The branch is exactly where it was published: nothing was merged.
+    expect(await gitLine(canonical, ["rev-parse", "guidance-thr_lesson"])).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
+    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toBe("half-written by hand\n");
+  });
+
+  it("refuses a non-fast-forward", async () => {
+    const { canonical, workspaceBb } = await pair();
+    // The canonical branch moves on after the workspace branched: the
+    // workspace's commit is no longer a descendant.
+    await writeFile(path.join(canonical, "canonical-only.md"), "moved on\n", "utf8");
+    await gitIn(canonical, ["add", "--", "canonical-only.md"]);
+    await gitIn(canonical, ["commit", "--quiet", "-m", "canonical moves on"]);
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/not a fast-forward/u);
+  });
+
+  it("refuses a commit range that changes anything but the lesson's file", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await append(workspaceBb, "repos.json", "// unrelated\n");
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/changes files other than AGENTS\.md: repos\.json/u);
+  });
+
+  it("refuses a file that does not carry the lesson text", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", "Something else entirely.");
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/does not carry the lesson text/u);
+  });
+
+  it("refuses when nothing has been published", async () => {
+    const { canonical } = await pair();
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/No guidance branch refs\/heads\/guidance-thr_lesson has been published/u);
   });
 });
 
