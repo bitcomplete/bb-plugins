@@ -365,7 +365,7 @@ describe("the pull request gate (build-tickets)", () => {
     const approved = prGate(pull({ comments: [marker(earlier, "approved", "owner-reviewed"), owner("LGTM")] }, green));
     expect(approved).toMatchObject({ gateMet: true, needsOwnerApproval: false });
     // The latest marker wins: a later changes-requested on any sha blocks the gate.
-    const later = comment({ id: "m-later", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=changes-requested lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
+    const later = comment({ id: "m-later", author: "trotterdylan", body: "<!-- bb-review round=2 sha=ccccccc3 verdict=changes-requested lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
     expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review"), later] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
     // Checks failing on the head close it whatever the marker says.
     expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review")] }, { checks: { state: "failure", failing: ["ci"] } })).missing).toMatch(/checks failure/u);
