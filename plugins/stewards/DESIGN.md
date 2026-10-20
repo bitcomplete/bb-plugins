@@ -940,6 +940,18 @@ The rules that hold:
   since as not actionable and says why ("reviewer round 3 pending", "a worker
   is still running"). The merge action re-checks `prGate` against a fresh
   snapshot before it merges.
+- **A `provide-secret` item's import is bound to its requester.** Provide
+  spawns a fixed-prompt requester thread on the binding's machine with its
+  worker model and records the thread id against the need; the need stays open
+  until the requester finishes. `bb stewards secret import` accepts only that
+  thread, only while the need is open, and only for the need's own `setting`; a
+  non-secret setting, another thread, another setting, a file on another host,
+  and any import after the need closes are refused. The limit rests on
+  `ctx.threadId`, the thread id the CLI client posts (the same assumption
+  `bb stewards init` makes about "the thread's" machine): a shell could spoof
+  it, so the import is also confined to a setting the plugin itself declared
+  `secret: true`, and the value is never readable back through the plugin. The
+  value never appears in argv, logs, messages or output.
 - **Every action wakes the steward with the item's closure** under "What
   changed", and the wake lists the binding's open items and says not to ask the
   user about them in prose. Closing an item from the page or with

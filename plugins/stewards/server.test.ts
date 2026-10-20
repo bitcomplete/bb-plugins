@@ -2343,7 +2343,7 @@ describe("needs you items", () => {
     expect(String(requester.prompt)).toContain('--write-env "$BB_THREAD_STORAGE/.secrets.env"');
   });
 
-  it("refuses a provide-secret setting that is not a declared secret setting", async () => {
+  it("refuses a provide-secret setting that is not a declared secret setting, and a need that names no variable", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -2351,10 +2351,42 @@ describe("needs you items", () => {
     const bad = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Bad", variable: "X", purpose: "Y", setting: "paused" }] }, steward);
     expect(bad.error).toBe(false);
     expect(bad.text).toMatch(/is not a secret setting/u);
+    const missing = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "No variable" }] }, steward);
+    expect(missing.error).toBe(false);
+    expect(missing.text).toMatch(/name the env var with `variable`/u);
     const good = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Good", variable: "SENTRY_TOKEN", purpose: "Y", setting: "sentryToken" }] }, steward);
     expect(good.error).toBe(false);
     const b = t.hooks.store.find("ENG-12")!;
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.data.setting === "sentryToken")).toBe(true);
+  });
+
+  it("falls back to the requester's own storage when the named worker is on another machine", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.harness.sdk.stub("threads.storageLocation", async ({ threadId }: { threadId: string }) => ({ hostId: "host_off", storageRootPath: `/storage/${threadId}` }));
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth", worker: "thr_w1" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
+    expect(String(t.spawns.at(-1)!.prompt)).toContain('--write-env "$BB_THREAD_STORAGE/.secrets.env"');
+  });
+
+  it("respawns the requester when the first one was archived", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth" }] }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const first = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { threadId: string };
+    t.threads.get(first.threadId)!.archivedAt = 1;
+    const second = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(second.ok).toBe(true);
+    expect(second.threadId).not.toBe(first.threadId);
+    expect(t.hooks.store.secretRequester(first.threadId)).toBeNull();
   });
 
   it("Case B: a requester imports a dotenv into a declared secret setting, deletes the file, and leaks nothing", async () => {

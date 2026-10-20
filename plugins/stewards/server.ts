@@ -1093,7 +1093,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * temporary storage; otherwise the named worker's thread storage, so the
      * value lands where the worker reads it.
      */
-    async function requesterWriteEnv(need: Need): Promise<string> {
+    async function requesterWriteEnv(need: Need, requesterHostId: string | null): Promise<string> {
       const named = typeof need.data.writeEnv === "string" && need.data.writeEnv.trim() !== "" ? need.data.writeEnv.trim() : null;
       if (named !== null) return named;
       if (typeof need.data.setting === "string" && need.data.setting.trim() !== "") return "$BB_THREAD_STORAGE/.secrets.env";
@@ -1101,7 +1101,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (workerThreadId !== null) {
         try {
           const location = await bb.sdk.threads.storageLocation({ threadId: workerThreadId });
-          if (typeof location.storageRootPath === "string" && location.storageRootPath !== "") return `${location.storageRootPath.replace(/\/$/u, "")}/.secrets.env`;
+          if (typeof location.storageRootPath === "string" && location.storageRootPath !== "") {
+            // Only write another thread's storage when it is on the requester's
+            // own machine; a cross-host path is not the requester's to write.
+            if (requesterHostId === null || location.hostId === requesterHostId) return `${location.storageRootPath.replace(/\/$/u, "")}/.secrets.env`;
+            bb.log.warn(`stewards: worker ${workerThreadId} is on ${location.hostId}, not the requester's ${requesterHostId}; writing the requester's own storage`);
+          }
         } catch (error) {
           bb.log.warn(`stewards: could not resolve worker ${workerThreadId}'s storage (${errorMessage(error)}); using the requester's own`);
         }
@@ -1119,13 +1124,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = await loadConfig(b.projectId);
       const playbook = config === null ? null : bindingPlaybook(config, b);
       const model = playbook === null ? parseModel(b.modelWorker) : workerModel(b, playbook);
-      const writeEnv = await requesterWriteEnv(need);
+      const hostId = await projectHost(b.projectId);
+      const writeEnv = await requesterWriteEnv(need, hostId);
       const variable = secretVariable(need);
       const title = `Provide ${variable} for ${b.entityKey}`;
       const sectionId = await projectSection(b.projectId);
       const thread = await bb.sdk.threads.spawn({
         projectId: b.projectId,
-        environment: freshEnvironment(await projectHost(b.projectId)),
+        environment: freshEnvironment(hostId),
         prompt: requesterPrompt(b, need, writeEnv),
         title,
         ...modelArgs(model),
@@ -2823,6 +2829,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.archived", ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+      // An archived requester can no longer import; drop its binding so the
+      // page's next Provide spawns a fresh one.
+      if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
     });
     bb.events.on("thread.deleted", ({ thread }) => {
       const worker = store.worker(thread.id);
@@ -3213,7 +3222,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const existing = store.secretRequesterForNeed(need.id);
           if (existing !== null) {
             const info = await threadInfo(existing.threadId).catch(() => null);
-            if (info !== null && info.deletedAt === null) return { ok: true, message: `The form is already open for ${named}.`, threadId: existing.threadId };
+            if (info !== null && info.deletedAt === null && info.archivedAt === null) return { ok: true, message: `The form is already open for ${named}.`, threadId: existing.threadId };
             store.clearSecretRequester(existing.threadId);
           }
           let requesterId: string;
@@ -3579,6 +3588,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
             if (n.choices !== undefined && n.kind !== "decide") {
               refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: choices are for a decide item.`);
+              continue;
+            }
+            if (n.kind === "provide-secret" && n.variable === undefined && n.setting === undefined) {
+              refused.push(`provide-secret for ${n.what} not filed: name the env var with \`variable\`, or a stewards secret setting with \`setting\`.`);
               continue;
             }
             if (n.setting !== undefined) {
