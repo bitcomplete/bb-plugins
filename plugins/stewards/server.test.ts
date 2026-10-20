@@ -2155,6 +2155,62 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeDefined();
   });
 
+  it("refuses an approve-pr the gate cannot hold, names the missing step and files nothing (BB-21)", async () => {
+    const t = await withPull([]);
+    const b = t.binding();
+    const report = await t.tool(
+      "steward_report",
+      { ...base, actor: "me", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub" }] },
+      t.steward,
+    );
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/approve-pr for https:\/\/github\.com\/acme\/web\/pull\/7 not filed: no reviewer round yet\./u);
+    expect(report.text).toMatch(/build-tickets review loop first/u);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(false);
+    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toBe("Nothing is waiting on the user.");
+  });
+
+  it("refuses a merge the gate cannot hold, naming the missing step (BB-21)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const report = await t.tool(
+      "steward_report",
+      { ...base, actor: "me", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] },
+      t.steward,
+    );
+    expect(report.error).toBe(false);
+    expect(report.text).toMatch(/merge for https:\/\/github\.com\/acme\/web\/pull\/7 not filed: owner approval needed\./u);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
+  it("files an approve-pr the owner-lane gate holds (BB-21)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const report = await t.tool(
+      "steward_report",
+      { ...base, actor: "me", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub" }] },
+      t.steward,
+    );
+    expect(report.error).toBe(false);
+    expect(report.text).not.toMatch(/not filed/u);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/approve-pr, ENG-12/u);
+  });
+
+  it("records the gate's missing text when sync closes an approve-pr need (BB-21)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
+    // The reviewer's round goes away, so the open item no longer holds; the
+    // closure records what the gate is missing, not the generic line.
+    t.entities.set("acme/web#7", pull({}, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const closed = t.hooks.store.needs(b.id, true).find((n) => n.kind === "approve-pr")!;
+    expect(closed.status).toBe("done");
+    expect(closed.resolution).toMatch(/no reviewer round yet/u);
+    expect(closed.resolution).not.toMatch(/not waiting for an owner approval/u);
+  });
+
   it("files merge only when the gate is met and no worker runs, and the page action merges through gh", async () => {
     const t = await withPull([marker, owner]);
     const b = t.binding();
