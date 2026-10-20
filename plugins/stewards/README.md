@@ -16,8 +16,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   project's **project steward**, through its binding — not as a child
   thread: bb wakes a parent thread every time a child finishes a turn, and
   on bithub that was 88 of the project steward's 96 turns. A project's
-  stewards share one sidebar section, named after the project, with each
-  steward's workers nested under it; see DESIGN.md §15.
+  stewards share one sidebar section, named after the project; see
+  DESIGN.md §15.
 - **Ops stewards.** Each target in the project file's `ops.targets` (a
   Kubernetes namespace or a Sentry project) gets an `ops` steward, reporting to the project
   steward, for as long as it is listed. The plugin looks at the target with
@@ -106,7 +106,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   what a binding touches and overlaps; the project steward's wake lists
   both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
-  children of a steward thread.
+  workers by their lifecycle owner.
 - **Lifecycle.** A terminal state gets a wrap-up turn with its workers
   still running. The steward either ends the binding there, or keeps it open
   to follow through (`steward_report { followThrough }`) on what the state
@@ -135,10 +135,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   spawned before this, lets go of stewards an earlier version made children
   of another steward, and renames an older project steward once. After
   that, a project steward renamed by hand keeps its name.
-- **Workers** are child threads with their own checkout, one per bounded
-  task, owned by their steward. They show nested under their steward's
-  sidebar row, which collapses them like any parent. A runaway guard stops a steward's
-  workers past a per-hour limit.
+- **Workers** are top-level threads with their own checkout, one per bounded
+  task, owned by their steward through `--lifecycle-owner-thread`. They do
+  not nest under their steward's sidebar row: bb's list trees by parent
+  thread, not by lifecycle owner, so they show loose; whether it should tree
+  by lifecycle owner too is a core question. A runaway guard stops a
+  steward's workers past a per-hour limit.
 - **Decisions stay with the agents.** Escalations are conditions on the
   status record, routed to the parent steward, then the project steward,
   which decides from the project's guidance (AGENTS.md, design docs). Only
