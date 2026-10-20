@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [devbox-provider, github-watcher, html-preview, image-copy, kubernetes-provider, team-setup, thread-briefs, workstreams]
+        plugin: [devbox-provider, github-watcher, html-preview, image-copy, kubernetes-provider, pr-inbox, team-setup, thread-briefs, workstreams]
     defaults:
       run:
         working-directory: plugins/${{ matrix.plugin }}

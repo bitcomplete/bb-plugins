@@ -195,11 +195,11 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         if (addressing.has(pr.id) || state.dispatch.kind !== "none") throw new Error("This PR already has a dispatch. Open its thread, or clear the previous attempt first.");
         return pr;
       });
-      for (const pr of selected) {
-        addressing.add(pr.id);
-        saveState(pr.id, { ...readState(pr.id), dispatch: { kind: "starting" } });
-      }
       try {
+        for (const pr of selected) {
+          addressing.add(pr.id);
+          saveState(pr.id, { ...readState(pr.id), dispatch: { kind: "starting" } });
+        }
         const thread = await bb.sdk.threads.spawn({
           projectId, environment, prompt: addressPrompt(selected),
           title: selected.length === 1 ? `Address ${selected[0]?.repo}#${selected[0]?.number}` : `Address feedback on ${selected.length} PRs`,

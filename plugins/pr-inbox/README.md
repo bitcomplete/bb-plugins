@@ -21,7 +21,7 @@ server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
 The page groups PRs alphabetically by GitHub organization, then by area, using the same compact layout as Reviews. Its
-branch-and-arrow icon distinguishes My PRs in the sidebar. Groups come from PR title
+branch icon distinguishes My PRs in the sidebar. Groups come from PR title
 scopes, falling back to the repository name.
 
 The header and navigation badge show the number of PRs on Your turn. The
