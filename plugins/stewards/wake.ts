@@ -11,6 +11,7 @@ import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } fro
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { dueDate } from "./deps.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
 
@@ -148,6 +149,8 @@ export type WakeInput = {
   own: ReadonlySet<string>;
   /** The project's adoption label. */
   label: string;
+  /** Open bindings already at work on what this one touches. */
+  conflicts?: Conflict[];
   now: number;
 };
 
@@ -220,7 +223,29 @@ function gateLines(input: WakeInput): string[] {
   if (!gate.approvalNeeded) lines.push("- Approval: not needed");
   else if (!gate.approved) lines.push(`- Approval: not given (given by ${how})${binding.ready.voidedAt === null ? "" : `; the last one was voided ${iso(binding.ready.voidedAt)}`}.${asked}`);
   else lines.push(`- Approval: given ${iso(binding.ready.approval!.at)}${gate.approvalStale ? ` — the spec has changed since, so the gate needs it again.${asked}` : ""}`);
-  lines.push(`- Gate: ${gate.passed ? "PASSED" : "not passed — start no implementation workers"}`);
+  const scheduling = input.escalations.find((x) => x.status === "open" && x.kind === "schedule");
+  lines.push(`- Gate: ${gate.passed ? (scheduling === undefined ? "PASSED" : `PASSED — but scheduling is with the project steward (${scheduling.id}, see 3): start no implementation workers and do not move the ticket into a build state until it decides`) : "not passed — start no implementation workers"}`);
+  return lines;
+}
+
+/** The hold line of a wake: the reason, and what it waits behind when it was placed to schedule. */
+const holdLine = (binding: Binding, then: string): string =>
+  binding.hold === null
+    ? "- Hold: none"
+    : `- **HOLD: ${binding.hold}**${binding.holdBehind.length === 0 ? "" : ` (behind ${binding.holdBehind.join(", ")}: it lifts itself, and you are woken, once ${binding.holdBehind.length === 1 ? "that binding has merged its pull requests or ended" : "each of them has merged its pull requests or ended"})`} — ${then}`;
+
+/** Section 3's scheduling lines for a ticket or pull request binding: what it touches, and what is in flight on the same paths. */
+function schedulingLines(binding: Binding, conflicts: Conflict[], escalations: Escalation[]): string[] {
+  if (binding.kind !== "ticket" && binding.kind !== "pr") return [];
+  const lines = [
+    binding.touches.length === 0
+      ? "- Touches: not reported. Report the repo-relative paths the work changes, repo directory first, with steward_report { touches: [\"<repo>/<path>\", …] } as soon as the spec names them, and refine it as pull requests open: the project steward schedules tickets that touch the same paths one after another."
+      : `- Touches: ${binding.touches.join(", ")} (steward_report { touches } replaces it)`,
+  ];
+  if (conflicts.length > 0) lines.push(`- In flight on the same paths: ${conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ")}.`);
+  const scheduling = escalations.find((x) => x.status === "open" && x.kind === "schedule");
+  if (scheduling !== undefined) lines.push(`- **Scheduling is with the project steward (${scheduling.id}).** Start no workers and do not move the ticket into a build state until it decides: it holds you behind that work (the hold lifts itself when the work lands) or tells you to start. Do not escalate for it.`);
+  else if (conflicts.length > 0 && binding.hold === null) lines.push("- Once your ready gate passes, the plugin asks the project steward to schedule you against that work; do not escalate for it.");
   return lines;
 }
 
@@ -272,11 +297,12 @@ export function formatWake(input: WakeInput): string {
     out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
   }
 
-  out.push("", "## 3. Guidance, priority and holds", "");
+  out.push("", "## 3. Guidance, priority, holds and scheduling", "");
   if (binding.guidance.length === 0) out.push("No standing guidance.");
   for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
-  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — take no new actions and start no workers until it is lifted.`);
+  out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
+  out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
@@ -556,6 +582,12 @@ export function formatProjectWake(input: {
         "",
       );
     }
+    if (input.routed.some((r) => r.escalation.kind === "schedule")) {
+      out.push(
+        "A schedule escalation is the plugin's: the ticket's ready gate has passed, and it touches paths another binding is already building or reviewing, so starting it now means two branches changing the same files and a rebase for whichever merges second. Decide the order from the project's guidance and priorities. Usually the ticket waits: steward_update { binding, hold: \"<why>\", behind: [<the keys named>] } holds it behind that work and resolves the request; the hold lifts itself, and the steward is woken, once every binding named has merged its pull requests or ended. When the overlap is harmless or the new ticket matters more (then consider holding the other one instead), let it start: steward_update { binding, guidance: \"Start now: <why>\", resolve }. A hold is also how you sequence any two tickets, asked or not.",
+        "",
+      );
+    }
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
       out.push(
         "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
@@ -590,9 +622,11 @@ export function formatProjectWake(input: {
   }
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
+  const allOpen = input.bindings.map((x) => x.binding);
   for (const { binding: b, openEscalations } of input.bindings.slice(0, 200)) {
     const s = b.status;
-    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
+    const conflicts = conflictsOf(b, allOpen);
+    const flags = [b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, b.touches.length === 0 ? null : `touches ${b.touches.join(", ")}`, conflicts.length === 0 ? null : `overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`, openEscalations.length > 0 ? `${openEscalations.length} escalation(s): ${openEscalations.map((x) => `${x.kind}→${x.route}`).join(", ")}` : null, unheardWait(s, openEscalations)].filter((f): f is string => f !== null);
     out.push(`- ${b.entityKey} (${b.kind}, ${b.phase ?? "?"}): ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? ` [${flags.join("; ")}]` : ""}`);
   }
   const bindings = out.splice(0);
@@ -780,7 +814,7 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
 
   const stuck = [
     ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
-    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}`),
+    ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."));
   return out;
@@ -793,6 +827,7 @@ export const PROJECT_STEWARD_INTRO = `You are this project's steward. Every Line
 - steward_update sets guidance, priority, holds and models on any binding, approves a substantial ticket's spec, and resolves or forwards escalations.
 - Before you ask the user something in a reply, record it with steward_update { ask: { question, context } } (with binding when it concerns one); close it with steward_update { resolve: "<question id>", answer } when they answer. Every wake lists the questions still open, so list them from there, not from memory.
 - You are woken by escalations, at the end of each nightly pass to write the morning digest, and by the user. When the user says something like "hold everything touching billing", turn it into steward_update calls on the bindings it concerns, and say what you changed.
+- You schedule the work so that two tickets do not change the same files at once. Every binding reports what it touches; when a ready ticket overlaps work in flight, the plugin asks you with a schedule escalation. Hold it behind that work (steward_update { binding, hold, behind: [keys] }: the hold lifts itself when the work lands) or let it start (guidance + resolve). Use the same hold to sequence any two tickets whose overlap you can see in the bindings list.
 - Budget is advisory: keep the total work sensible through priority and holds.
 
 Wait for the user or a wake; there is nothing to do right now.`;
