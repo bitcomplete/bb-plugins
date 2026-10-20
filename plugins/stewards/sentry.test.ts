@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { classify } from "./ops.js";
-import { NO_TOKEN, SentryApiError, createSentryReader, eventOf, issueOf, issuesOf, recentLine, sentryChanges, sentrySightings, sentrySummary, stackTraceOf, type SentryFinding, type SentryIssue, type SentryLook } from "./sentry.js";
+import { NO_TOKEN, SentryApiError, createSentryReader, eventOf, issueInOrg, issueOf, issuesOf, recentLine, sentryChanges, sentrySightings, sentrySummary, stackTraceOf, type SentryFinding, type SentryIssue, type SentryLook } from "./sentry.js";
 
 const now = Date.parse("2026-10-20T15:00:00Z");
 const since = now - 3_600_000;
@@ -137,6 +137,13 @@ describe("sightings", () => {
     ]);
     // A new issue that is also rung is both; "ongoing" is not said of it.
     expect(sentrySightings([fresh], { since }, new Set(["6081234567"]), new Set(["6081234567"]))[0]!.reasons).toEqual(["new", "rung"]);
+    // An issue read by id is the target's organization's only when its permalink says so; one without a permalink is taken on trust.
+    expect(issueInOrg({ permalink: "https://acme.sentry.io/issues/1/" }, "acme")).toBe(true);
+    expect(issueInOrg({ permalink: "https://sentry.example.com/organizations/acme/issues/1/" }, "acme")).toBe(true);
+    expect(issueInOrg({ permalink: "https://other.sentry.io/issues/1/" }, "acme")).toBe(false);
+    expect(issueInOrg({ permalink: "https://sentry.example.com/organizations/other/issues/1/" }, "acme")).toBe(false);
+    expect(issueInOrg({ permalink: null }, "acme")).toBe(true);
+    expect(issueInOrg({ permalink: "not a url" }, "acme")).toBe(true);
     // An old regression Sentry still labels regressed is not news again once it was seen before the last look.
     expect(sentrySightings([issue({ ...old, substatus: "regressed", lastSeen: "2026-10-20T12:00:00Z" })], { since }, new Set(), new Set())).toEqual([]);
   });

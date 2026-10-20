@@ -51,7 +51,7 @@ import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult,
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
-import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
+import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -1565,8 +1565,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         for (const id of [...rung].filter((x) => !byId.has(x)).slice(0, RUNG_PER_LOOK)) {
           try {
             const issue = await reader.issue(id);
-            // Gone (resolved, or not this token's to see), or another project's with the same slug.
-            if (issue === null || (issue.project !== null && issue.project !== target.project)) continue;
+            // Gone (resolved, or not this token's to see), or another organization's project with the same slug.
+            if (issue === null || (issue.project !== null && issue.project !== target.project) || !issueInOrg(issue, target.org)) continue;
             issues.push(issue);
           } catch (error) {
             notes.push(`Issue ${id}, which Sentry rang for, could not be read (${errorMessage(error)})`);

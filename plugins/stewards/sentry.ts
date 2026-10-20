@@ -251,6 +251,24 @@ export function sentrySightings(issues: readonly SentryIssue[], at: { since: num
   return out.slice(0, FINDINGS_PER_LOOK);
 }
 
+/**
+ * Whether an issue belongs to this organization, as far as its permalink
+ * says: `https://<org>.sentry.io/issues/<id>/` on sentry.io, and
+ * `/organizations/<org>/issues/<id>/` on a self-hosted server. The issue
+ * JSON names its project by slug only, and a slug is unique only within an
+ * organization, so a rung issue read by id is checked here before it joins
+ * a look; an issue with no permalink is taken as the target's.
+ */
+export function issueInOrg(issue: Pick<SentryIssue, "permalink">, org: string): boolean {
+  if (issue.permalink === null) return true;
+  try {
+    const url = new URL(issue.permalink);
+    return url.hostname.toLowerCase().startsWith(`${org}.`) || url.pathname.toLowerCase().includes(`/organizations/${org}/`);
+  } catch {
+    return true;
+  }
+}
+
 /** The one-line summary the fingerprint map keeps for an issue. */
 export const sentrySummary = (issue: SentryIssue): string => `${issue.shortId}: ${issue.title}${issue.culprit === null ? "" : ` (${issue.culprit})`}`;
 

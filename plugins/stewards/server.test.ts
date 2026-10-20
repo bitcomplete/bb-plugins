@@ -3383,11 +3383,17 @@ describe("Sentry stewards", () => {
     t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "In Progress", stateType: "started" }));
     const before = wakes().length;
 
-    // A new issue created after the last look: the doorbell names it and the look lists it as new.
+    // A doorbell for another organization's issue with the same project slug is read by id and left out.
     t.advance(60_000);
+    sentry.issues.set("66", sentryIssue({ id: "66", shortId: "WEB-66", title: "Not ours", permalink: "https://other.sentry.io/issues/66/", status: "ignored", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
+    await doorbell("66");
+    expect(wakes()).toHaveLength(before);
+
+    // A new issue created after the last look: the doorbell names it and the look lists it as new.
     sentry.issues.set("7", sentryIssue({ id: "7", shortId: "WEB-13", title: "Boom", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
     await doorbell("7");
     expect(wakes()).toHaveLength(before + 1);
+    expect(wakes().at(-1)).not.toContain("#### 66");
     expect(wakes().at(-1)).toContain("#### 7");
     expect(wakes().at(-1)).toMatch(/New Sentry issue: WEB-13 Boom/u);
     // The filed one is not news: quiet, with its ticket.
