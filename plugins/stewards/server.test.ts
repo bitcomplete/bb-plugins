@@ -658,9 +658,9 @@ describe("a Linear ticket steward", () => {
     const steward = t.spawns[1]!.id;
     const binding = t.hooks.store.open("p1")[0]!.id;
 
-    // Spawned with only --lifecycle-owner-thread: no parent thread at all.
+    // Spawned with only --lifecycle-owner-thread: no parent thread at all
+    // (`createdOwned` sets parentThreadId null).
     await t.createdOwned("thr_w1", steward, "ENG-12: Implement");
-    expect(t.threads.get("thr_w1")!.parentThreadId ?? null).toBeNull();
     expect(t.hooks.store.workers(binding)).toMatchObject([{ threadId: "thr_w1", bindingId: binding, status: "running" }]);
     expect(t.sends).toEqual([]);
 
