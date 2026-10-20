@@ -63,11 +63,11 @@ import {
   type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatDepsWake, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatDepsWake, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -236,7 +236,7 @@ export const rpcContract = defineRpcContract({
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
           questions: z.array(
-            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
+            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), choices: z.array(z.string()), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
           ),
           /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
           withUser: z.array(
@@ -252,6 +252,8 @@ export const rpcContract = defineRpcContract({
               url: z.string().nullable(),
               /** The escalation this item answers, when the project steward forwarded one. */
               escalationId: z.string().nullable(),
+              /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
+              choices: z.array(z.string()),
               what: z.string(),
               how: z.string().nullable(),
               threadId: z.string().nullable(),
@@ -286,9 +288,10 @@ export const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
-  // The user closes a question from the page, with or without an answer.
+  // The user closes a question from the page, with or without an answer, or
+  // picks one of its fixed choices.
   stewardsAnswerQuestion: {
-    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable() }),
+    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable().optional(), choice: z.string().trim().min(1).max(100).nullable().optional() }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
   // The user presses a button on a "needs you" item: approve or decline a spec,
@@ -297,8 +300,10 @@ export const rpcContract = defineRpcContract({
   stewardsNeedAction: {
     input: z.object({
       needId: z.string().min(1).max(100),
-      action: z.enum(["approve", "decline", "done", "merge", "provide"]),
+      action: z.enum(["approve", "decline", "done", "merge", "provide", "choose"]),
       note: z.string().trim().max(4000).nullable().optional(),
+      /** With action `choose`: the label, which must be one of the item's choices. */
+      choice: z.string().trim().min(1).max(100).nullable().optional(),
     }),
     output: z.object({ ok: z.boolean(), message: z.string(), threadId: z.string().nullable().optional() }),
   },
@@ -326,6 +331,17 @@ const PRIORITY_ORDER: Record<string, number> = { urgent: 0, high: 1, normal: 2, 
 
 /** Authors whose pull requests the dependency watch adopts under deps-prs. */
 export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
+
+/**
+ * Fixed choices on a `decide` need or an escalation: two to six short,
+ * distinct labels, so the page can show one button each. Never a
+ * multi-select.
+ */
+export const choicesSchema = z
+  .array(z.string().trim().min(1).max(60))
+  .min(2)
+  .max(6)
+  .refine((labels) => new Set(labels).size === labels.length, "choices must be distinct");
 
 export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
@@ -2576,7 +2592,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
             questions: questions.map((q) => {
               const b = q.bindingId === null ? null : store.binding(q.bindingId);
-              return { id: q.id, question: q.question, context: q.context, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
+              return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
             }),
             withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
             needs,
@@ -2603,13 +2619,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           },
         };
       },
-      async stewardsAnswerQuestion({ questionId, answer }, { experimental_caller: caller }) {
+      async stewardsAnswerQuestion({ questionId, answer, choice }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
         const q = store.question(questionId);
         if (q === null || q.status !== "open") return { ok: false, message: "That question is already closed." };
-        const text = answer === null || answer === "" ? null : answer;
+        const text = answer === undefined || answer === null || answer === "" ? null : answer;
         const x = q.escalationId === null ? null : store.escalation(q.escalationId);
         const b = x === null ? null : store.binding(x.bindingId);
+        // A fixed choice: the label is the answer, saved as guidance, and a
+        // forwarded escalation resolves with that guidance, exactly as
+        // steward_update { guidance, resolve } records it (BB-20).
+        const chosen = choice === undefined || choice === null || choice === "" ? null : choice;
+        if (chosen !== null) {
+          if (q.choices.length === 0) return { ok: false, message: "That question has no choices; answer it in the text box." };
+          if (!q.choices.includes(chosen)) return { ok: false, message: `"${chosen}" is not one of the choices: ${q.choices.join(", ")}.` };
+          const guidance = text === null ? chosen : `${chosen} — ${text}`;
+          store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
+          if (x !== null && b !== null && b.endedAt === null) {
+            store.addGuidance(b.id, guidance, "user");
+            store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
+            scheduleReconcile(b.id);
+            return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
+          }
+          return { ok: true, message: "Closed." };
+        }
         // Criterion 1: an approval request answered on the page approves or
         // declines the current spec and closes the request in one
         // transaction. Ambiguous words are not a decline: the project steward
@@ -2657,12 +2690,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The page's buttons. Each action runs on the server as the connected user
       // and unsigned, so it counts as a human action; each closes its item and
       // wakes the binding's steward with the closure under "What changed".
-      async stewardsNeedAction({ needId, action, note }, { experimental_caller: caller }) {
+      async stewardsNeedAction({ needId, action, note, choice }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("needs are actioned by the user, from the stewards page");
         const need = store.need(needId);
         if (need === null || need.status !== "open") return { ok: false, message: "That item is already closed." };
         const b = store.binding(need.bindingId);
         if (b === null) return { ok: false, message: "That binding is gone." };
+        if (action === "choose" && need.kind !== "decide") return { ok: false, message: `Choices are for a decide item; this is ${need.kind}.` };
         const text = note === undefined || note === null || note.trim() === "" ? null : note.trim();
         /** Close the item and wake the steward with what happened. */
         const after = (closure: string): void => {
@@ -2742,6 +2776,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (threadId === null) after(`The user pressed Provide for ${named} on the Stewards page; start the worker that will request it, and do not ask them again.`);
           else after(`The user provided ${named}${text === null ? "" : `: ${text}`}.`);
           return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId };
+        }
+
+        if (need.kind === "decide" && action === "choose") {
+          const choices = needChoices(need);
+          const label = choice === undefined || choice === null || choice === "" ? null : choice;
+          if (label === null) return { ok: false, message: "Pick one of the choices." };
+          if (choices.length === 0) return { ok: false, message: "That item has no choices; answer it in the text box." };
+          if (!choices.includes(label)) return { ok: false, message: `"${label}" is not one of the choices: ${choices.join(", ")}.` };
+          const guidance = text === null ? label : `${label} — ${text}`;
+          store.closeNeedByKey(b.id, "decide", need.url, `Chose: ${label}${text === null ? "" : ` — ${text}`}`);
+          store.addGuidance(b.id, guidance, "user");
+          store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
+          // A forwarded escalation answered by a choice resolves with the
+          // choice as guidance, exactly as steward_update { guidance, resolve }.
+          const escalationId = typeof need.data.escalationId === "string" ? need.data.escalationId : null;
+          if (escalationId !== null) {
+            const escalation = store.escalation(escalationId);
+            if (escalation !== null && escalation.status === "open") store.answerEscalation(escalationId, guidance, "user");
+          }
+          scheduleReconcile(b.id);
+          return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
         }
 
         // `decide` is the question mechanism; a raw item of that kind just closes.
@@ -2917,6 +2972,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               purpose: z.string().trim().max(500).optional().describe("provide-secret: what the value is for."),
               worker: z.string().trim().max(200).optional().describe("provide-secret: the worker thread that will request it; its link is used when url is left out."),
               page: z.string().trim().max(500).optional().describe("configure: the external page where the step happens."),
+              choices: choicesSchema.optional().describe('decide only: 2-6 short labels the user picks between (["Merge", "Close", "Verify first"]); the page shows one button each, so do not write "reply with your choice" in prose.'),
             }),
           )
           .max(20)
@@ -2927,6 +2983,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             kind: z.enum(ESCALATION_KINDS).describe("blocked, decision, scope (the scope must change), conflict (the entity's state contradicts the playbook), or stuck."),
             question: z.string().trim().min(1).max(1500).describe("One answerable question."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
+            choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
           })
           .optional()
           .describe("Something the project's guidance does not let you decide. It goes to your parent steward, then the project steward; the answer comes back as guidance and wakes you."),
@@ -2963,6 +3020,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           if (input.followThrough !== undefined && b.ending !== "terminal") {
             return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
+          }
+          // Fixed choices are for a decision, as a `decide` need is: they are
+          // what a forwarded escalation turns into a question with buttons.
+          if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
+            return toolError(new Error("choices are for a decision escalation: escalate a decision, or file a decide need."));
           }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
@@ -3006,7 +3068,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null });
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -3058,6 +3120,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 continue;
               }
             }
+            if (n.choices !== undefined && n.kind !== "decide") {
+              refused.push(`${n.kind} for ${n.url ?? "the item"} not filed: choices are for a decide item.`);
+              continue;
+            }
             store.fileNeed({
               bindingId: b.id,
               kind: n.kind,
@@ -3069,6 +3135,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 ...(n.purpose === undefined ? {} : { purpose: n.purpose }),
                 ...(n.worker === undefined ? {} : { workerThreadId: n.worker }),
                 ...(n.page === undefined ? {} : { page: n.page }),
+                ...(n.choices === undefined ? {} : { choices: n.choices }),
               },
               filedBy: "steward",
             });
@@ -3333,6 +3400,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     escalationId: forwarding.id,
                     question: forwarding.question,
                     context: [`A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                   });
             if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
             await deliver(target, store.escalation(forwarding.id)!);
@@ -3401,7 +3469,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; what: string; how: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -3422,7 +3490,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the action tells the steward to start the worker that requests it.
         threadId = typeof n.data.workerThreadId === "string" ? n.data.workerThreadId : null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), what: n.what, how: n.how, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     function formatBindings(rows: Binding[]): string {
@@ -3706,8 +3774,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
               }
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
-              for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
-              for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
+              for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
+              for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);
               for (const f of store.fingerprints(b.id)) lines.push(`Fingerprint ${f.fingerprint} → ${f.ticketKey ?? "no ticket"}; seen ${f.seenCount} time(s), last ${iso(f.lastSeenAt)}${f.lastCommentedAt === null ? "" : `; last word ${iso(f.lastCommentedAt)}`}`);
               return { exitCode: 0, stdout: lines.join("\n") };
@@ -3729,7 +3797,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   .map((n) => {
                     const b = store.binding(n.bindingId);
                     const view = b === null ? null : needView(n, b);
-                    return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
+                    return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
                   })
                   .join("\n"),
               };
@@ -3737,22 +3805,45 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           done: cliCommand({
-            summary: "Close a waiting item from a thread, or approve a spec item",
-            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed. On an `approve-spec` item it records the approval on the gate, resolves the escalation that asked for it, and wakes the steward and the project steward; decline a spec on the Stewards page instead.",
+            summary: "Close a waiting item from a thread, record a choice, or approve a spec item",
+            description: "Closes a `needs` item (need_…) or a question to the user (qst_…), and wakes the steward with it under What changed. With --choice it records the label the user gave in chat, saved as guidance; a forwarded escalation resolves with it. On an `approve-spec` item it records the approval on the gate, resolves the escalation that asked for it, and wakes the steward and the project steward; decline a spec on the Stewards page instead.",
             positionals: [{ name: "id", description: "The item id (need_…) or question id (qst_…)", required: true }],
-            options: { project: PROJECT_OPTION },
+            options: {
+              project: PROJECT_OPTION,
+              choice: { type: "string", description: "A label the user picked, which must be one of the item's choices" },
+              note: { type: "string", description: "An optional note to save with the choice" },
+            },
             async run(input, ctx) {
               const id = input.positionals.id;
+              const choice = input.options.choice;
+              const note = input.options.note === undefined || input.options.note.trim() === "" ? null : input.options.note.trim();
               // A question is the `decide` kind's mechanism; close it the same way.
               const q = store.question(id);
               if (q !== null) {
                 if (q.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
                 const x = q.escalationId === null ? null : store.escalation(q.escalationId);
-                store.answer(q.id, "Closed from a thread.", "user");
+                if (choice !== undefined) {
+                  if (q.choices.length === 0) throw new PluginCliError(`Question ${id} has no choices; close it without --choice.`, { code: "no_choices" });
+                  if (!q.choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${q.choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
+                  const guidance = note === null ? choice : `${choice} — ${note}`;
+                  store.answer(q.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`, "user", guidance);
+                  if (x !== null) {
+                    const b = store.binding(x.bindingId);
+                    if (b !== null) {
+                      store.addGuidance(b.id, guidance, "user");
+                      store.note(b.id, `The user chose ${choice} for ${q.question}${note === null ? "" : `: ${note}`}.`);
+                      scheduleReconcile(b.id);
+                    }
+                  }
+                  return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
+                }
+                const answer = note ?? "Closed from a thread.";
+                store.answer(q.id, answer, "user");
                 if (x !== null) {
                   const b = store.binding(x.bindingId);
                   if (b !== null) {
-                    store.note(b.id, `Question ${q.id} was closed from a thread.`);
+                    if (note !== null) store.addGuidance(b.id, note, "user");
+                    store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
                     scheduleReconcile(b.id);
                   }
                 }
@@ -3761,6 +3852,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const n = store.need(id);
               if (n === null) throw new PluginCliError(`No waiting item ${id}.`, { code: "need_not_found", hint: "bb stewards needs lists them." });
               if (n.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
+              if (choice !== undefined) {
+                if (n.kind !== "decide") throw new PluginCliError(`Choices are for a decide item; ${id} is ${n.kind}.`, { code: "not_decide" });
+                const choices = needChoices(n);
+                if (choices.length === 0) throw new PluginCliError(`Item ${id} has no choices; close it without --choice.`, { code: "no_choices" });
+                if (!choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
+                const guidance = note === null ? choice : `${choice} — ${note}`;
+                store.closeNeed(n.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`);
+                const b = store.binding(n.bindingId);
+                if (b !== null) {
+                  store.addGuidance(b.id, guidance, "user");
+                  store.note(b.id, `The user chose ${choice} for ${n.what}${note === null ? "" : `: ${note}`}.`);
+                  const escalationId = typeof n.data.escalationId === "string" ? n.data.escalationId : null;
+                  if (escalationId !== null) {
+                    const escalation = store.escalation(escalationId);
+                    if (escalation !== null && escalation.status === "open") store.answerEscalation(escalationId, guidance, "user");
+                  }
+                  scheduleReconcile(b.id);
+                }
+                return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
+              }
               const b = store.binding(n.bindingId);
               // An `approve-spec` item is a decision, not a step to tick off:
               // `done` records the approval through the same path the page's
@@ -3777,9 +3888,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 await wakeProjectOnForwardedAnswer(b, closure, forwarded);
                 return { exitCode: 0, stdout: `Approved ${id}; ${b.entityKey}'s steward has been told.` };
               }
-              store.closeNeed(n.id, "Closed from a thread.");
+              store.closeNeed(n.id, note === null ? "Closed from a thread." : `Answered from a thread: ${note}`);
               if (b !== null) {
-                store.note(b.id, `${n.kind} item ${n.id} was closed from a thread.`);
+                if (note !== null) store.addGuidance(b.id, note, "user");
+                store.note(b.id, note === null ? `${n.kind} item ${n.id} was closed from a thread.` : `${n.kind} item ${n.id} was answered from a thread: ${note}.`);
                 scheduleReconcile(b.id);
               }
               return { exitCode: 0, stdout: `Closed ${id}.` };

@@ -183,8 +183,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   action wakes the binding's steward with the closure under "What changed".
   A button is shown only while the server can verify its preconditions;
   otherwise the item says why not. `bb stewards done <id>` closes one from a
-  thread. A `blockedOn` naming the user, the owner or a human is refused
-  unless an open needs item says so.
+  thread. A `decide` item or a forwarded decision question may carry fixed
+  `choices` (two to six short labels): the page then shows one button per
+  choice, a note field and **Other…** instead of a free-text **Answer**, and
+  a choice is saved as guidance. `bb stewards done <id> --choice <label>`
+  records the same from a thread. A `blockedOn` naming the user, the owner
+  or a human is refused unless an open needs item says so.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
