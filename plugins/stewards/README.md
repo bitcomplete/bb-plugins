@@ -19,7 +19,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   stewards share one sidebar section, named after the project, with each
   steward's workers nested under it; see DESIGN.md §15.
 - **Ops stewards.** Each target in the project file's `ops.targets` (a
-  Kubernetes namespace) gets an `ops` steward, reporting to the project
+  Kubernetes namespace or a Sentry project) gets an `ops` steward, reporting to the project
   steward, for as long as it is listed. The plugin looks at the target with
   `kubectl` on the project's machine, the developer's own, as them (through
   its host entry, [host.ts](host.ts), and [kubectl.ts](kubectl.ts)): pods,
@@ -271,7 +271,15 @@ first of `linear.teams` by default, and it must be one of them) and
 `context` (the kubeconfig context kubectl uses; the machine's current one
 when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
 tickets the ops steward labels for a steward itself when it files them).
-`ops-watch.md` is read only when `ops.targets` lists a k8s namespace.
+A `{ kind: "sentry-project", org, project }` target watches a Sentry
+project with the plugin's **Sentry token** setting (a user auth token with
+`project:read` and `event:read`; `Sentry API` for a self-hosted server),
+rung by bb-gate-hooks the moment an issue is created or regresses and
+backed by the same periodic look; the Sentry issue id is the fingerprint,
+and the wake carries the issue's title, culprit, permalink, counts and
+latest stack trace ([sentry.ts](sentry.ts), DESIGN.md §18).
+`ops-watch.md` is read only when `ops.targets` lists a k8s namespace or a
+Sentry project.
 
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
@@ -283,7 +291,7 @@ written them runs no dependency watch. `bb stewards init` writes them, and
 and reports each repo whose alerts the `gh` login cannot read.
 
 Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
-`source` (`linear`, `github`, or `k8s` for `ops`), `phases` (state → `{ stage,
+`source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
 stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
 `promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as

@@ -10,6 +10,7 @@ import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { dueDate } from "./deps.js";
+import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
@@ -522,6 +523,121 @@ export function formatDepsWake(input: DepsWakeInput): string {
     out.push("", `### ${DEPS_CLASS_TITLES[c]}`, "");
     for (const a of look.alerts.filter((x) => x.class === c)) out.push(...depsAlertLines(a, input.timeZone));
   }
+  const open = input.escalations.filter((x) => x.status === "open");
+  if (open.length > 0) {
+    out.push("", "### Open escalations", "");
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+  }
+
+  const snapshot = out.splice(0);
+  out.push("", "## 4. What changed since your last turn", "");
+  if (input.changes.length === 0) out.push("Nothing new; this is a scheduled look.");
+  for (const c of input.changes) out.push(`- ${c}`);
+  out.push(
+    "",
+    "---",
+    "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+  );
+  return fit(head, snapshot, out);
+}
+
+export type SentryWakeInput = {
+  reason: WakeReason;
+  binding: Binding;
+  playbook: Playbook;
+  look: SentryLook;
+  /** The Linear team tickets are filed in. */
+  team: string | null;
+  label: string;
+  /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
+  autoAdopt: string[];
+  escalations: Escalation[];
+  changes: string[];
+};
+
+const SENTRY_LIFECYCLE: Partial<Record<WakeReason, string>> = {
+  adopted: "You have just been made the ops steward for this Sentry project. Read everything below, then act on what the look found.",
+  reopen: "This project is watched again and its binding has resumed. Re-read everything below as if new.",
+  nightly: "This is the nightly reconcile pass: check that every issue below is filed, and report.",
+};
+
+const SENTRY_REASON_TEXT: Record<SentryReason, string> = {
+  new: "first seen since the last look",
+  regressed: "regressed in Sentry (it was resolved there and fired again)",
+  rung: "Sentry rang for it",
+  ongoing: "known and still firing",
+};
+
+function sentryFindingLines(f: SentryFinding): string[] {
+  const lines = [`#### ${f.fingerprint}`, ""];
+  const ticket = f.ticket === null ? "" : ` · ticket ${f.ticket}${f.ticketState === null ? "" : ` (${f.ticketState})`}${f.lastCommentedAt === null ? "" : `, your last word on it ${iso(f.lastCommentedAt)}`}`;
+  lines.push(`- **${f.shortId}** ${f.title}${f.level === null ? "" : ` (${f.level})`}${ticket}`);
+  if (f.culprit !== null) lines.push(`- Culprit: ${f.culprit}`);
+  if (f.permalink !== null) lines.push(`- ${f.permalink}`);
+  lines.push(`- ${f.count} event${f.count === 1 ? "" : "s"}, ${f.userCount} user${f.userCount === 1 ? "" : "s"}; first seen ${f.firstSeen ?? "?"}, last seen ${f.lastSeen ?? "?"}${f.substatus === null ? "" : `; Sentry says ${f.substatus}`}; first seen by this watch ${iso(f.firstSeenAt)}`);
+  lines.push(`- Why it is here: ${f.reasons.map((r) => SENTRY_REASON_TEXT[r]).join("; ")}`);
+  if (f.event !== null) {
+    lines.push(`- Latest event${f.event.id === null ? "" : ` ${f.event.id}`}${f.event.at === null ? "" : ` at ${f.event.at}`}${f.event.message === null ? "" : `: ${f.event.message}`}`);
+    if (f.event.stack.length > 0) lines.push("- Stack trace, innermost last; `*` marks in-app frames:", "", "```", ...f.event.stack, "```");
+    else lines.push("- No stack trace on the latest event.");
+  } else lines.push("- Latest event: not read this look.");
+  return [...lines, ""];
+}
+
+/** A Sentry project binding's wake: instructions, steering, the look, what changed. */
+export function formatSentryWake(input: SentryWakeInput): string {
+  const { binding, playbook, look } = input;
+  const out: string[] = [];
+  out.push(`# Sentry watch: ${look.target}`);
+  out.push(`Binding ${binding.id} · ops · playbook ${playbook.name}@${playbook.version} · looked ${iso(look.at)}`);
+  out.push("", `${binding.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${binding.threadId}.`} Use it wherever you name yourself, and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`);
+  const special = SENTRY_LIFECYCLE[input.reason];
+  if (special !== undefined) out.push("", `**${special}**`);
+
+  out.push("", "## 1. Instructions");
+  if (playbook.general !== "") out.push("", playbook.general);
+  const present = FINDING_CLASSES.filter((c) => look.findings.some((f) => f.class === c));
+  for (const c of present) {
+    const section = phaseInstructions(playbook, c);
+    if (section !== null) out.push("", `### ${c.charAt(0).toUpperCase()}${c.slice(1)}`, "", section);
+  }
+  out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
+  out.push(
+    "This target is a Sentry project, not a Kubernetes namespace: the plugin reads it with its own Sentry token, which your thread does not hold, so you cannot query Sentry yourself. Diagnose from the evidence below (the stack trace names the code) and the code in your workspace, and link the issue's permalink in the ticket. The fingerprint is the Sentry issue id.",
+  );
+  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
+  if (input.autoAdopt.length > 0) {
+    out.push(
+      `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,
+    );
+  }
+
+  out.push("", "## 2. Guidance, priority and holds", "");
+  if (binding.guidance.length === 0) out.push("No standing guidance.");
+  for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
+  out.push(`- Priority: ${binding.priority ?? "normal"}`);
+  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+
+  const head = out.splice(0);
+  out.push("", "## 3. The look", "");
+  if (look.error === NO_TOKEN) {
+    out.push(
+      `**The plugin has no Sentry token, so it cannot read this project.** The token is the \`${TOKEN_SETTING}\` setting of the stewards plugin on this bb server (Settings → Plugins → Stewards), entered by the user, never pasted into a thread. ` +
+        `File one provide-secret need for it with steward_report: variable \`${TOKEN_SETTING}\`, url ${TOKEN_PAGE}, what "Create a Sentry auth token with the scopes ${TOKEN_SCOPES.join(" and ")} and enter it as the stewards plugin's Sentry token setting", and the steps in how. ` +
+        "Then report with actor me and end the turn; the first look that reads the project wakes you.",
+    );
+  } else if (look.error !== null) out.push(`The project could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);
+  else {
+    out.push(`- ${look.unresolved} unresolved issue${look.unresolved === 1 ? "" : "s"} in the project${look.findings.length === 0 ? "" : `; ${look.findings.length} below`}`);
+    for (const n of look.notes) out.push(`- ${n}`);
+    if (look.findings.length === 0) out.push("", "**Nothing new: no issue is new, regressed or rung since the last look.** There is nothing to file or comment on: report that with steward_report (actor other) and end the turn.");
+  }
+  for (const c of present) {
+    out.push("", `### ${CLASS_TITLES[c]}`, "");
+    for (const f of look.findings.filter((x) => x.class === c)) out.push(...sentryFindingLines(f));
+  }
+  if (look.recent.length > 0) out.push("", "### Other unresolved issues, most recent first", "", ...look.recent.map((r) => `- ${r}`));
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {
     out.push("", "### Open escalations", "");

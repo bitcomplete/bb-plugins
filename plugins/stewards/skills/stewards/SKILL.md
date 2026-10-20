@@ -15,7 +15,7 @@ steward** per project sits above all of them.
 | `ticket` | the project's label (default `bb-managed`) is on a Linear issue in a listed team | `linear-tickets` |
 | `pr` | the label is on a pull request in one of the project's repos | `github-prs` |
 | `review` | a teammate opens, or marks ready, a pull request in one of the project's repos | `github-reviews` |
-| `ops` | `project.json` lists a target in `ops.targets` (a Kubernetes namespace) | `ops-watch` |
+| `ops` | `project.json` lists a target in `ops.targets` (a Kubernetes namespace or a Sentry project) | `ops-watch` |
 
 ## If you are a steward
 
@@ -154,12 +154,16 @@ Two tools are yours; everything else you do with the tools every thread has.
 
 ## If you are an ops steward
 
-You watch one production target; the wake is the plugin's look at it (pods,
-Warning events, and log lines where the server may read them), with each
-problem's fingerprint marked new, recurring or returned. You never change
-production and start no workers. To dig further you may run kubectl on the
-target yourself, but only `get`, `describe`, `logs` and `auth can-i`: it
-acts as the user, whose rights are broad, and nothing else stops a write.
+You watch one production target; the wake is the plugin's look at it (for
+a namespace: pods, Warning events, and log lines where the server may read
+them; for a Sentry project: the issues new, regressed or rung since the
+last look, with the title, culprit, permalink, counts and latest stack
+trace), with each problem's fingerprint marked new, recurring or returned.
+You never change production and start no workers. To dig further into a
+namespace you may run kubectl on the target yourself, but only `get`,
+`describe`, `logs` and `auth can-i`: it acts as the user, whose rights are
+broad, and nothing else stops a write. You cannot query Sentry: the token
+is the plugin's, so diagnose from the wake and the code in your workspace.
 
 - **New:** search the team for an open ticket about it, then file one ticket
   per problem with `linear_create_issue`: pod and container, since when, the
@@ -177,6 +181,9 @@ acts as the user, whose rights are broad, and nothing else stops a write.
   duplicate.
 - **All healthy:** the wake says so every requeue; report it with
   `actor: other` and end the turn.
+- **No Sentry token** (the wake says so): file the one `provide-secret`
+  need it describes (variable `sentryToken`, the Sentry auth-tokens page,
+  the scopes), report with `actor: me`, and end the turn.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 
@@ -249,7 +256,9 @@ The project must be a multi-repo project: configuration is read from its
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams
    ENG,OPS`) and the four default playbooks into the workspace's `.bb`.
    To watch production, list targets in `ops.targets`, such as
-   `{ "kind": "k8s-namespace", "name": "bb-gate-production" }`.
+   `{ "kind": "k8s-namespace", "name": "bb-gate-production" }` or
+   `{ "kind": "sentry-project", "org": "acme", "project": "web" }` (the
+   latter needs the plugin's Sentry token setting).
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.
@@ -287,7 +296,9 @@ above which a steward is compacted after its turn.
   target` and `bb stewards check` says why: kubectl on the project's
   machine cannot reach the cluster (not installed, the machine not on the
   tailnet as the developer or a tagged node, no kubeconfig or context for
-  it; `ops.context` picks one), or it may not list pods there.
+  it; `ops.context` picks one), or it may not list pods there. For a Sentry
+  project: no token in the plugin's settings (the steward is woken once to
+  ask for it), or the token cannot read the project.
   Otherwise it takes a turn every `requeue-default`, healthy or not.
 - **A repo should not be stewarded.** Every GitHub repo in `repos.json` is,
   unless `project.json` lists it in `github.exclude` (`owner/repo`). Bindings

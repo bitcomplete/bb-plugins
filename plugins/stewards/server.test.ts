@@ -184,9 +184,9 @@ function world() {
   return { files, writes, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
-async function setup(extra: Partial<StewardsDeps> = {}) {
+async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}) {
   const w = world();
-  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"] });
+  const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"], settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
   /** Let debounced work run to completion. */
@@ -3445,5 +3445,226 @@ describe("lessons", () => {
     const dropped = await t.harness.behavior.runCli(["drop-lesson", id, "--project", "p1"]);
     expect(dropped.stdout).toMatch(new RegExp(`Dropped ${id}`, "u"));
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "dropped" });
+  });
+});
+
+describe("Sentry stewards", () => {
+  const TARGET = "sentry-project/acme/web";
+  const ISSUE_ID = "6081234567";
+
+  const sentryIssue = (over: Record<string, unknown> = {}) => ({
+    id: ISSUE_ID,
+    shortId: "WEB-12",
+    title: "TypeError: Cannot read properties of undefined (reading 'id')",
+    culprit: "handler(src/api/users.ts)",
+    permalink: `https://acme.sentry.io/issues/${ISSUE_ID}/`,
+    level: "error",
+    status: "unresolved",
+    substatus: "new",
+    count: "17",
+    userCount: 3,
+    firstSeen: "2026-10-14T14:30:00Z",
+    lastSeen: "2026-10-14T14:58:00Z",
+    project: { id: "1", slug: "web", name: "Web" },
+    ...over,
+  });
+  const sentryEvent = {
+    eventID: "abc123",
+    dateCreated: "2026-10-14T14:58:00Z",
+    title: "TypeError: Cannot read properties of undefined (reading 'id')",
+    entries: [{ type: "exception", data: { values: [{ type: "TypeError", value: "Cannot read properties of undefined (reading 'id')", stacktrace: { frames: [{ filename: "src/api/users.ts", function: "handler", lineNo: 42, inApp: true, context: [[42, "  return res.json({ id: user.id });"]] }] } }] } }],
+  };
+
+  /** A fake Sentry: the project's unresolved issues, each issue by id, and one latest event for all. */
+  function fakeSentry() {
+    const issues = new Map<string, Record<string, unknown>>();
+    const calls: string[] = [];
+    let status = 200;
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      const u = new URL(String(url));
+      calls.push(u.pathname);
+      if ((init?.headers as Record<string, string>).authorization !== "Bearer tok-1") return new Response("", { status: 401 });
+      if (status !== 200) return new Response("", { status });
+      if (u.pathname === "/api/0/projects/acme/web/") return Response.json({ slug: "web", name: "Web" });
+      // The list is the organization's own, as the real one is by its URL; an issue whose permalink names another organization is not in it.
+      if (u.pathname === "/api/0/projects/acme/web/issues/") return Response.json([...issues.values()].filter((i) => i.status === "unresolved" && !String(i.permalink).startsWith("https://other.")));
+      const issue = /^\/api\/0\/issues\/(\d+)\/$/u.exec(u.pathname);
+      if (issue !== null) return issues.has(issue[1]!) ? Response.json(issues.get(issue[1]!)) : new Response("", { status: 404 });
+      if (/^\/api\/0\/issues\/\d+\/events\/latest\/$/u.test(u.pathname)) return Response.json(sentryEvent);
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    return { issues, calls, fetchImpl, setStatus: (s: number) => (status = s) };
+  }
+
+  async function watching(options: { token?: string; issues?: Array<Record<string, unknown>>; env?: Record<string, string> } = {}) {
+    const sentry = fakeSentry();
+    for (const i of options.issues ?? [sentryIssue()]) sentry.issues.set(String(i.id), i);
+    const t = await setup({ fetch: sentry.fetchImpl, env: options.env ?? {} }, { sentryToken: options.token ?? "tok-1" });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }], autoAdopt: ["urgent"] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = () => t.spawns.find((x) => String(x.title).startsWith("Sentry watch"));
+    const wakes = () => {
+      const id = steward()?.id;
+      return id === undefined ? [] : [String(steward()!.prompt), ...t.sends.filter((x) => x.threadId === id).map((x) => x.text)];
+    };
+    const doorbell = async (id: string, unit: string | null = "web") => {
+      t.hooks.sentryDoorbell(id, unit);
+      await t.flush();
+    };
+    const report = (opsTickets: Array<{ fingerprint: string; ticket: string; did: "filed" | "commented" | "reopened" }>, summary = "Filed.") =>
+      t.tool("steward_report", { phase: "watching", summary, nextAction: "Watch", actor: "steward", opsTickets }, steward()!.id);
+    return { t, sentry, steward, wakes, doorbell, report };
+  }
+
+  it("watches the project under the ops playbook, with the issue, its culprit, permalink, counts and stack trace in the wake", async () => {
+    const { t, steward, wakes, report } = await watching();
+    expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: steward()!.id, ended: false }]);
+    expect(steward()).toMatchObject({ title: "Sentry watch: acme/web" });
+    // The project is leased on bb-gate-hooks as org/slug; no issue yet, none has a ticket.
+    expect(t.hooks.sentryLeases()).toEqual([{ kind: "project", id: "acme/web" }]);
+
+    const first = wakes()[0]!;
+    expect(first).toMatch(/^# Sentry watch: sentry-project\/acme\/web/u);
+    expect(first).toMatch(/You have just been made the ops steward for this Sentry project/u);
+    expect(first).toMatch(/### New: no ticket yet/u);
+    expect(first).toContain(`#### ${ISSUE_ID}`);
+    expect(first).toMatch(/\*\*WEB-12\*\* TypeError: Cannot read properties of undefined \(reading 'id'\) \(error\)/u);
+    expect(first).toMatch(/Culprit: handler\(src\/api\/users\.ts\)/u);
+    expect(first).toContain(`https://acme.sentry.io/issues/${ISSUE_ID}/`);
+    expect(first).toMatch(/17 events, 3 users; first seen 2026-10-14T14:30:00Z, last seen 2026-10-14T14:58:00Z; Sentry says new/u);
+    expect(first).toMatch(/Why it is here: first seen since the last look/u);
+    expect(first).toMatch(/Latest event abc123 at 2026-10-14T14:58:00Z/u);
+    expect(first).toContain("  * src/api/users.ts:42 in handler\n      return res.json({ id: user.id });");
+    expect(first).toMatch(/1 unresolved issue in the project; 1 below/u);
+    expect(first).toMatch(/File tickets in the Linear team ENG/u);
+    expect(first).toMatch(/ops\.autoAdopt: a ticket you file at urgent priority/u);
+    expect(first).toMatch(/The fingerprint is the Sentry issue id/u);
+    expect(first).toMatch(/New Sentry issue: WEB-12 TypeError/u);
+    // The playbook's text covers the Sentry case, and the thread is told it holds no token.
+    expect(first).toMatch(/For a Sentry project, the plugin reads it with its own Sentry token/u);
+    expect(first).toMatch(/you cannot query Sentry yourself/u);
+
+    // Filing records the issue id against the ticket, and the issue is leased by itself from then on.
+    expect((await report([{ fingerprint: ISSUE_ID, ticket: "ENG-50", did: "filed" }])).error).toBe(false);
+    expect(t.hooks.store.fingerprint("p1", ISSUE_ID)).toMatchObject({ ticketKey: "ENG-50", summary: expect.stringMatching(/^WEB-12: TypeError/u) });
+    expect(t.hooks.sentryLeases()).toEqual([{ kind: "project", id: "acme/web" }, { kind: "issue", id: ISSUE_ID }]);
+  });
+
+  it("rings on a doorbell for a new issue, treats a second event as a comment under the open ticket, and a regression after Done as returned", async () => {
+    const { t, sentry, wakes, doorbell, report } = await watching();
+    expect((await report([{ fingerprint: ISSUE_ID, ticket: "ENG-50", did: "filed" }])).error).toBe(false);
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "In Progress", stateType: "started" }));
+    const before = wakes().length;
+
+    // A doorbell for another organization's issue with the same project slug is read by id and left out.
+    t.advance(60_000);
+    sentry.issues.set("66", sentryIssue({ id: "66", shortId: "WEB-66", title: "Not ours", permalink: "https://other.sentry.io/issues/66/", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
+    await doorbell("66");
+    expect(wakes()).toHaveLength(before);
+
+    // A new issue created after the last look: the doorbell names it and the look lists it as new.
+    sentry.issues.set("7", sentryIssue({ id: "7", shortId: "WEB-13", title: "Boom", firstSeen: "2026-10-14T15:00:30Z", lastSeen: "2026-10-14T15:00:30Z" }));
+    await doorbell("7");
+    expect(wakes()).toHaveLength(before + 1);
+    expect(wakes().at(-1)).not.toContain("#### 66");
+    expect(wakes().at(-1)).toContain("#### 7");
+    expect(wakes().at(-1)).toMatch(/New Sentry issue: WEB-13 Boom/u);
+    // The filed one is not news: quiet, with its ticket.
+    expect(wakes().at(-1)).not.toMatch(/### Recurring/u);
+
+    // Another event minutes after filing is noted, not a wake: filing was a word on it, and a comment is due once per requeue.
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "18", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    await doorbell(ISSUE_ID);
+    expect(wakes()).toHaveLength(before + 1);
+
+    // A second event on the filed issue an hour on: Sentry rings for it, the wake shows it recurring under ENG-50, and no new ticket is asked for.
+    t.advance(2 * 3_600_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "19", lastSeen: "2026-10-14T17:02:00Z", substatus: "ongoing" }));
+    await doorbell(ISSUE_ID);
+    const second = wakes().at(-1)!;
+    expect(wakes()).toHaveLength(before + 2);
+    expect(second).toMatch(/### Recurring: its ticket is open/u);
+    expect(second).toMatch(/\*\*WEB-12\*\*.*· ticket ENG-50 \(In Progress\)/u);
+    expect(second).toMatch(/Why it is here: Sentry rang for it; known and still firing/u);
+    expect(second).toMatch(/Sentry rang for WEB-12 under ENG-50: 19 events/u);
+    expect(second).not.toMatch(/New Sentry issue/u);
+    expect((await report([{ fingerprint: ISSUE_ID, ticket: "ENG-50", did: "commented" }], "Commented.")).error).toBe(false);
+
+    // Another event right after the comment is noted, not a wake.
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "20", lastSeen: "2026-10-14T17:03:00Z", substatus: "ongoing" }));
+    await doorbell(ISSUE_ID);
+    expect(wakes()).toHaveLength(before + 2);
+
+    // Resolved on Linear, then Sentry sees it again: returned, worth a turn at once.
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    t.advance(2 * 3_600_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "21", lastSeen: "2026-10-14T19:03:00Z", substatus: "regressed" }));
+    await doorbell(ISSUE_ID);
+    const back = wakes().at(-1)!;
+    expect(back).toMatch(/### Returned: its ticket was resolved/u);
+    expect(back).toMatch(/Back after ENG-50 was resolved \(Done\): WEB-12/u);
+    expect(back).toMatch(/regressed in Sentry/u);
+  });
+
+  it("lists new and regressed issues from the periodic look alone, with no doorbell", async () => {
+    const { t, sentry, wakes } = await watching();
+    const before = wakes().length;
+    t.advance(10 * 60_000);
+    sentry.issues.set("8", sentryIssue({ id: "8", shortId: "WEB-14", title: "Timeout", firstSeen: "2026-10-14T15:05:00Z", lastSeen: "2026-10-14T15:05:00Z" }));
+    sentry.issues.set("9", sentryIssue({ id: "9", shortId: "WEB-15", title: "Old one back", firstSeen: "2026-10-01T00:00:00Z", lastSeen: "2026-10-14T15:06:00Z", substatus: "regressed" }));
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(before + 1);
+    const look = wakes().at(-1)!;
+    expect(look).toContain("#### 8");
+    expect(look).toContain("#### 9");
+    expect(look).toMatch(/Why it is here: regressed in Sentry/u);
+    expect(look).toMatch(/3 unresolved issues in the project; 2 below/u);
+    // The one already seen and unfiled is still in the map and shown among the others for context.
+    expect(look).toMatch(/### Other unresolved issues, most recent first\n\n- WEB-12/u);
+    // A look that finds nothing new wakes nobody.
+    t.advance(10 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(before + 1);
+  });
+
+  it("without a token, wakes the steward once to file the provide-secret need, and check says so", async () => {
+    const { t, steward, wakes } = await watching({ token: "" });
+    expect(steward()).toBeDefined();
+    const first = wakes()[0]!;
+    expect(first).toMatch(/The plugin has no Sentry token, so it cannot read this project/u);
+    expect(first).toMatch(/File one provide-secret need for it with steward_report: variable `sentryToken`, url https:\/\/sentry\.io\/settings\/account\/api\/auth-tokens\//u);
+    expect(first).toMatch(/project:read and event:read/u);
+    expect(first).toMatch(/Cannot read sentry-project\/acme\/web: no Sentry token is configured/u);
+    // Said once: the next looks are quiet until a token appears.
+    await t.hooks.sweep();
+    await t.flush();
+    expect(wakes()).toHaveLength(1);
+    expect((await t.list())[0]!.summary).toBeNull();
+    const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(check.ok).toBe(false);
+    expect(check.lines).toContain("problem: sentry: no Sentry token is configured: set the Sentry token in the stewards plugin's settings (a user auth token with project:read and event:read)");
+    expect(check.lines.find((l) => l.startsWith("problem: sentry: cannot read the target sentry-project/acme/web"))).toBeDefined();
+    expect(check.lines).toContain("sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only");
+    expect(t.hooks.sentryLeases()).toEqual([{ kind: "project", id: "acme/web" }]);
+  });
+
+  it("with a token, check reads the project and says how doorbells arrive; a refused project is a problem", async () => {
+    const { t, sentry } = await watching({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
+    const ok = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(ok.ok).toBe(true);
+    expect(ok.lines).toContain("sentry: sentry-project/acme/web is readable (Web)");
+    expect(ok.lines).toContain("sentry: doorbells from bb-gate-hooks: stopped");
+    sentry.setStatus(403);
+    const bad = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
+    expect(bad.ok).toBe(false);
+    expect(bad.lines).toContain("problem: sentry: cannot read the target sentry-project/acme/web: Sentry answered HTTP 403 to GET /api/0/projects/acme/web/");
+    // A project that stops reading is logged, not woken about: nothing new until it reads again.
+    expect(sentry.calls.every((c) => c.startsWith("/api/0/"))).toBe(true);
   });
 });
