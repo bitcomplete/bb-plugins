@@ -3942,6 +3942,14 @@ describe("steward invariants on every turn (BB-24)", () => {
     const stranger = await t.harness.behavior.runCli(["spawn-flags"], { threadId: "thr_stranger", projectId: "p1" });
     expect(stranger.exitCode).toBe(1);
     expect(stranger.stderr).toMatch(/not the steward of a binding/u);
+    // The project steward starts no workers; its own brief still works.
+    const project = t.spawns[0]!.id;
+    const fromProject = await t.harness.behavior.runCli(["spawn-flags"], { threadId: project, projectId: "p1" });
+    expect(fromProject.exitCode).toBe(1);
+    expect(fromProject.stderr).toMatch(/project steward starts no workers/u);
+    const projectBrief = await t.harness.behavior.runCli(["brief"], { threadId: project, projectId: "p1" });
+    expect(projectBrief.exitCode).toBe(0);
+    expect(projectBrief.stdout).toContain("# Project steward brief");
   });
 
   it("prints the brief: thread id, allowed actions, phase, ready gate, guidance and holds, standing rules and the spawn command", async () => {

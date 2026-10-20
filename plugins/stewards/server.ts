@@ -4482,11 +4482,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function bindingFromCli(positional: string | undefined, option: string | undefined, ctx: { threadId?: string; projectId?: string }): Binding {
       if (positional !== undefined && positional !== "") return bindingOrThrow(positional, option ?? ctx.projectId);
       const own = ctx.threadId === undefined ? null : store.byThread(ctx.threadId);
-      if (own === null)
+      if (own === null) {
+        const project = ctx.threadId === undefined ? null : store.projectByThread(ctx.threadId);
         throw new PluginCliError("This thread is not the steward of a binding; pass one (an entity key or binding id).", {
           code: "no_binding",
-          hint: "bb stewards list shows the project's bindings.",
+          hint: project === null ? "bb stewards list shows the project's bindings." : "The project steward starts no workers; run `bb stewards brief` for its invariants.",
         });
+      }
       return own;
     }
 
