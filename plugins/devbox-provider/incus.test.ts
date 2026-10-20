@@ -13,7 +13,9 @@ function fakeIncus() {
   let stdinReceived = "";
   let stdinEnded = false;
   let exitCode = 0;
-  const instances = new Map<string, { status: string; config: Record<string, string> }>();
+  const instances = new Map<string, { status: string; config: Record<string, string>; state?: unknown }>();
+  let projectState: unknown = {};
+  let lastInstancesQuery: string | null = null;
 
   const reply = (res: any, status: number, body: unknown) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -42,7 +44,11 @@ function fakeIncus() {
         return reply(res, 202, asyncOp("create"));
       }
       if (path === "/1.0/instances" && req.method === "GET") {
+        lastInstancesQuery = url.searchParams.get("recursion");
         return reply(res, 200, { type: "sync", metadata: [...instances].map(([name, i]) => ({ name, ...i })) });
+      }
+      if (path === "/1.0/projects/dylan/state" && req.method === "GET") {
+        return reply(res, 200, { type: "sync", metadata: { resources: projectState } });
       }
       const inst = path.match(/^\/1\.0\/instances\/([^/]+)(\/.*)?$/u);
       if (inst) {
@@ -100,8 +106,18 @@ function fakeIncus() {
     server,
     seen,
     instances,
+    setInstanceState(name: string, state: unknown) {
+      const instance = instances.get(name);
+      if (instance !== undefined) instance.state = state;
+    },
+    setProjectState(state: unknown) {
+      projectState = state;
+    },
     get execBody() {
       return execBody;
+    },
+    get lastInstancesQuery() {
+      return lastInstancesQuery;
     },
     get stdin() {
       return { received: stdinReceived, ended: stdinEnded };
@@ -205,5 +221,41 @@ describe("instances", () => {
   it("says to reconnect when devbox refuses the token", async () => {
     const incus = await client("dbx_wrong");
     await expect(incus.ping(new AbortController().signal)).rejects.toThrow(/unauthorized|connect devbox again/u);
+  });
+
+  it("lists instances with their live state and reads the project state", async () => {
+    const incus = await client();
+    const signal = new AbortController().signal;
+    await incus.createInstance({ name: "box", image: "devbox", profiles: [], config: {} }, signal);
+    fake.setInstanceState("box", {
+      status: "Running",
+      cpu: { usage: 1_000_000_000 },
+      memory: { usage: 512, total: 1024 },
+      disk: { root: { usage: 10, total: 100 } },
+      network: { eth0: { counters: { bytes_received: 5, bytes_sent: 7 } } },
+      processes: 9,
+      started_at: "2026-10-20T17:00:00Z",
+    });
+    fake.setProjectState({
+      cpu: { limit: 12, usage: 4 },
+      memory: { limit: 48 * 1024 ** 3, usage: 16 * 1024 ** 3 },
+      disk: { limit: 250 * 1024 ** 3, usage: 40 * 1024 ** 3 },
+      instances: { limit: 6, usage: 2 },
+    });
+
+    const listed = await incus.listInstancesWithState(signal);
+    expect(listed).toHaveLength(1);
+    expect(listed[0].state).toMatchObject({ cpu: { usage: 1_000_000_000 }, processes: 9 });
+    expect(fake.seen.find((s) => s.method === "GET" && s.path === "/1.0/instances")?.path).toBe("/1.0/instances");
+    // recursion=2 is what asks Incus to embed the state.
+    expect(fake.lastInstancesQuery).toBe("2");
+
+    expect(await incus.getProjectState(signal)).toEqual({
+      cpu: { limit: 12, usage: 4 },
+      memory: { limit: 48 * 1024 ** 3, usage: 16 * 1024 ** 3 },
+      disk: { limit: 250 * 1024 ** 3, usage: 40 * 1024 ** 3 },
+      instances: { limit: 6, usage: 2 },
+    });
+    expect(fake.seen.some((s) => s.path === "/1.0/projects/dylan/state")).toBe(true);
   });
 });

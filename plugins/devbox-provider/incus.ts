@@ -18,6 +18,37 @@ export interface Instance {
   name: string;
   status: string; // "Running", "Stopped", ...
   config: Record<string, string>;
+  // Present only on the recursion=2 listing, which embeds each instance's
+  // live state alongside its config.
+  state?: InstanceState;
+}
+
+// The subset of Incus's instance state this plugin reads. Every field is
+// optional because the shape varies with the instance's status and with the
+// Incus version behind devbox-gate.
+export interface InstanceState {
+  status?: string;
+  status_code?: number;
+  cpu?: { usage?: number };
+  memory?: { usage?: number; usage_peak?: number; total?: number; swap_usage?: number };
+  disk?: Record<string, { usage?: number; total?: number }>;
+  network?: Record<string, { counters?: { bytes_received?: number; bytes_sent?: number } }>;
+  processes?: number;
+  started_at?: string;
+}
+
+// A project resource cap as Incus reports it: the sum of the instances'
+// configured limits ("allocated"), not their live usage.
+export interface ProjectResource {
+  limit?: number;
+  usage?: number;
+}
+
+export interface ProjectState {
+  cpu?: ProjectResource;
+  memory?: ProjectResource;
+  disk?: ProjectResource;
+  instances?: ProjectResource;
 }
 
 export interface CreateInstance {
@@ -68,6 +99,10 @@ export interface IncusClient {
   ping(signal: AbortSignal): Promise<void>;
   getInstance(name: string, signal: AbortSignal): Promise<Instance | null>;
   listInstances(signal: AbortSignal): Promise<Instance[]>;
+  // One call that also embeds each instance's live state (recursion=2).
+  listInstancesWithState(signal: AbortSignal): Promise<Instance[]>;
+  // The project's allocated resources: resources.{cpu,memory,disk,instances}.{limit,usage}.
+  getProjectState(signal: AbortSignal): Promise<ProjectState>;
   createInstance(spec: CreateInstance, signal: AbortSignal): Promise<void>;
   setState(name: string, action: "start" | "stop", signal: AbortSignal): Promise<void>;
   deleteInstance(name: string, signal: AbortSignal): Promise<void>;
@@ -156,6 +191,15 @@ export function createIncusClient(cfg: IncusConfig, fetchImpl: typeof fetch = fe
       const env = await call("GET", "/1.0/instances", signal, undefined, { recursion: "1" });
       return Array.isArray(env.metadata) ? env.metadata.map(toInstance) : [];
     },
+    async listInstancesWithState(signal) {
+      const env = await call("GET", "/1.0/instances", signal, undefined, { recursion: "2" });
+      return Array.isArray(env.metadata) ? env.metadata.map(toInstance) : [];
+    },
+    async getProjectState(signal) {
+      const env = await call("GET", `/1.0/projects/${encodeURIComponent(cfg.project)}/state`, signal);
+      const metadata = (env.metadata ?? {}) as { resources?: ProjectState };
+      return metadata.resources ?? {};
+    },
     async createInstance(spec, signal) {
       const env = await call("POST", "/1.0/instances", signal, {
         name: spec.name,
@@ -219,8 +263,15 @@ export function createIncusClient(cfg: IncusConfig, fetchImpl: typeof fetch = fe
 }
 
 function toInstance(raw: unknown): Instance {
-  const m = (raw ?? {}) as { name?: string; status?: string; config?: Record<string, string> };
-  return { name: m.name ?? "", status: m.status ?? "", config: m.config ?? {} };
+  const m = (raw ?? {}) as {
+    name?: string;
+    status?: string;
+    config?: Record<string, string>;
+    state?: InstanceState;
+  };
+  const instance: Instance = { name: m.name ?? "", status: m.status ?? "", config: m.config ?? {} };
+  if (m.state !== undefined) instance.state = m.state;
+  return instance;
 }
 
 // Runs the four exec websockets until stdout and stderr have both closed,

@@ -3,8 +3,8 @@ import type { PluginMachineProviderProgress } from "@get-bb/plugin-sdk/machine-p
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
-import type { ExecOptions, IncusClient, Instance } from "./incus.js";
-import { createDevboxProviderPlugin, defaultMachineName, KEY_CONFIG, PROVIDER_ID } from "./server.js";
+import type { ExecOptions, IncusClient, Instance, ProjectState } from "./incus.js";
+import { chooseMemoryTotal, deriveUsage, parseCores, parseMemoryBytes, createDevboxProviderPlugin, defaultMachineName, KEY_CONFIG, PROVIDER_ID } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const CALLBACK = "https://bb.example/api/v1/plugins/devbox-provider/http/connect/callback";
@@ -14,10 +14,13 @@ function fakeIncus(tailscale: Array<Record<string, unknown>>) {
   const instances = new Map<string, Instance>();
   const execs: Array<{ name: string; options: ExecOptions }> = [];
   let ts = 0;
+  const projectState: ProjectState = {};
   const client: IncusClient = {
     ping: vi.fn(async () => {}),
     getInstance: vi.fn(async (name: string) => instances.get(name) ?? null),
     listInstances: vi.fn(async () => [...instances.values()]),
+    listInstancesWithState: vi.fn(async () => [...instances.values()]),
+    getProjectState: vi.fn(async () => projectState),
     createInstance: vi.fn(async (spec) => {
       instances.set(spec.name, { name: spec.name, status: "Running", config: spec.config });
     }),
@@ -38,7 +41,7 @@ function fakeIncus(tailscale: Array<Record<string, unknown>>) {
       return { exitCode: 0 };
     }),
   };
-  return { client, instances, execs };
+  return { client, instances, execs, projectState };
 }
 
 const report = (): PluginMachineProviderProgress & { lines: string[] } => {
@@ -327,5 +330,154 @@ describe("machines", () => {
     await provider.resume!({ resource, hostId: "h", checkpoint: async () => {}, report: report(), signal: signal() });
     expect(incus.instances.get("box")?.status).toBe("Running");
     expect((bootstrap.mock.calls.at(-1) as unknown[])[0]).toMatchObject({ key: "k" });
+  });
+});
+
+describe("usage derivation", () => {
+  const instance = (over: Partial<Instance> = {}): Instance => ({
+    name: "box",
+    status: "Running",
+    config: { "limits.cpu": "4" },
+    ...over,
+  });
+  const running = (cpuUsage: number): Instance =>
+    instance({
+      state: {
+        status: "Running",
+        cpu: { usage: cpuUsage },
+        memory: { usage: 1_000, total: 2_000 },
+        disk: { root: { usage: 10, total: 100 } },
+        network: { eth0: { counters: { bytes_received: 5, bytes_sent: 7 } } },
+        processes: 3,
+        started_at: "2026-10-20T17:00:00.000Z",
+      },
+    });
+
+  it("parses cores from a count, a cpuset or a list", () => {
+    expect(parseCores("4")).toBe(4);
+    expect(parseCores("0-3")).toBe(4);
+    expect(parseCores("0,2,3")).toBe(3);
+    expect(parseCores(undefined)).toBe(4);
+    expect(parseCores("junk")).toBe(4);
+  });
+
+  it("parses the memory quantities Incus accepts", () => {
+    expect(parseMemoryBytes("16GiB")).toBe(16 * 1024 ** 3);
+    expect(parseMemoryBytes("512MiB")).toBe(512 * 1024 ** 2);
+    expect(parseMemoryBytes("1073741824")).toBe(1_073_741_824);
+    expect(parseMemoryBytes("nonsense")).toBeNull();
+    expect(parseMemoryBytes(undefined)).toBeNull();
+  });
+
+  it("derives CPU percent from the delta over wall time and cores", () => {
+    const samples = new Map<string, { usage: number; at: number }>();
+    // First sample: no percent yet.
+    expect(deriveUsage([running(1_000_000_000)], new Set(), samples, 1_000_000)[0].cpuPercent).toBeNull();
+    // +2 CPU-seconds over 1 wall second across 4 cores = 50%.
+    const second = deriveUsage([running(3_000_000_000)], new Set(), samples, 1_001_000)[0];
+    expect(second.cpuPercent).toBeCloseTo(50);
+    expect(second.cores).toBe(4);
+  });
+
+  it("reports no percent on a counter reset rather than a negative one", () => {
+    const samples = new Map<string, { usage: number; at: number }>();
+    deriveUsage([running(5_000_000_000)], new Set(), samples, 1_000_000);
+    const reset = deriveUsage([running(1_000)], new Set(), samples, 1_001_000)[0];
+    expect(reset.cpuPercent).toBeNull();
+  });
+
+  it("falls back to limits.memory when memory.total looks like host memory", () => {
+    const withTotal = (total: number, limits: string) =>
+      deriveUsage(
+        [instance({ config: { "limits.cpu": "4", "limits.memory": limits }, state: { status: "Running", memory: { usage: 100, total } } })],
+        new Set(),
+        new Map(),
+        1_000_000,
+      )[0];
+    const hostLooking = withTotal(64 * 1024 ** 3, "16GiB");
+    expect(hostLooking.memoryTotal).toBe(16 * 1024 ** 3);
+    expect(hostLooking.memoryTotalSource).toBe("limit");
+    const within = withTotal(8 * 1024 ** 3, "16GiB");
+    expect(within.memoryTotal).toBe(8 * 1024 ** 3);
+    expect(within.memoryTotalSource).toBe("state");
+    expect(chooseMemoryTotal(null, 1024)).toEqual({ total: 1024, source: "limit" });
+    expect(chooseMemoryTotal(null, null)).toEqual({ total: null, source: null });
+  });
+
+  it("gives a stopped instance disk only", () => {
+    const stopped = instance({
+      status: "Stopped",
+      state: { status: "Stopped", disk: { root: { usage: 40, total: 100 } } },
+    });
+    const row = deriveUsage([stopped], new Set(), new Map(), 1_000_000)[0];
+    expect(row.status).toBe("Stopped");
+    expect(row.cpuPercent).toBeNull();
+    expect(row.memoryUsed).toBeNull();
+    expect(row.memoryTotal).toBeNull();
+    expect(row.networkIn).toBe(0);
+    expect(row.networkOut).toBe(0);
+    expect(row.uptimeSeconds).toBeNull();
+    expect(row.diskUsed).toBe(40);
+    expect(row.diskTotal).toBe(100);
+  });
+
+  it("marks bb machines by key or by the host list", () => {
+    const byKey = instance({ name: "mine", config: { [KEY_CONFIG]: "k" } });
+    const byHost = instance({ name: "box", config: {} });
+    const foreign = instance({ name: "cli", config: {} });
+    const rows = deriveUsage([byKey, byHost, foreign], new Set(["box"]), new Map(), 1_000_000);
+    expect(rows.map((row) => row.bb)).toEqual([true, true, false]);
+  });
+});
+
+describe("usage rpc", () => {
+  it("reports not connected when there is no token", async () => {
+    const { harness } = await setup();
+    expect(await harness.callRpc("usage", null)).toEqual({ connected: false, project: null, instances: [], totals: null });
+  });
+
+  it("returns one row per instance, bb marking, and allocated totals", async () => {
+    const { harness, incus } = await setup({ token: "dbx_abc" });
+    incus.instances.set("mine", {
+      name: "mine",
+      status: "Running",
+      config: { [KEY_CONFIG]: "k" },
+      state: {
+        status: "Running",
+        cpu: { usage: 1_000_000_000 },
+        memory: { usage: 1_000, total: 2_000 },
+        disk: { root: { usage: 10, total: 100 } },
+        network: { eth0: { counters: { bytes_received: 5, bytes_sent: 7 } } },
+        processes: 3,
+      },
+    });
+    // A CLI-created instance is listed too, and marked via the host list.
+    incus.instances.set("box", { name: "box", status: "Stopped", config: {}, state: { status: "Stopped", disk: { root: { usage: 1, total: 2 } } } });
+    Object.assign(incus.projectState, {
+      cpu: { limit: 12, usage: 4 },
+      memory: { limit: 48 * 1024 ** 3, usage: 16 * 1024 ** 3 },
+      disk: { limit: 250 * 1024 ** 3, usage: 40 * 1024 ** 3 },
+      instances: { limit: 6, usage: 2 },
+    } satisfies ProjectState);
+
+    const result = (await harness.callRpc("usage", null)) as {
+      connected: boolean;
+      project: string;
+      instances: Array<{ name: string; bb: boolean; status: string; cpuPercent: number | null }>;
+      totals: unknown;
+    };
+    expect(result.connected).toBe(true);
+    expect(result.project).toBe("dylan");
+    expect(result.instances.map((row) => row.name).sort()).toEqual(["box", "mine"]);
+    expect(result.instances.find((row) => row.name === "mine")!.bb).toBe(true);
+    expect(result.instances.find((row) => row.name === "box")!.bb).toBe(true);
+    // The first sample has no CPU percent.
+    expect(result.instances.find((row) => row.name === "mine")!.cpuPercent).toBeNull();
+    expect(result.totals).toEqual({
+      cpu: { limit: 12, usage: 4 },
+      memory: { limit: 48 * 1024 ** 3, usage: 16 * 1024 ** 3 },
+      disk: { limit: 250 * 1024 ** 3, usage: 40 * 1024 ** 3 },
+      instances: { limit: 6, usage: 2 },
+    });
   });
 });
