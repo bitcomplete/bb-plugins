@@ -1555,8 +1555,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.");
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
-      if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
-        await quietly(`archive ${b.entityKey}'s steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+      if (info !== null && info.deletedAt === null && info.archivedAt === null) {
+        if (busy(info.status)) {
+          // Its wrap-up turn is still running (the ending came from another
+          // idle, or timed out): the idle that ends that turn archives it.
+          store.patch(b.id, { archiveWhenIdle: true });
+          bb.log.info(`stewards: ${b.entityKey}'s steward is still in its last turn; archiving it when that ends`);
+        } else {
+          await quietly(`archive ${b.entityKey}'s steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+        }
       }
       // Parent ends first: promoted children still open move up a level.
       const up = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
@@ -2002,7 +2009,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       const b = store.byThread(thread.id);
-      if (b === null || b.endedAt !== null) return;
+      if (b === null) return;
+      if (b.endedAt !== null) {
+        // The binding ended while this turn was running: finishEnding left the
+        // archive to this idle. Once only, so a later turn the owner starts in
+        // the ended steward is not archived under them.
+        if (b.archiveWhenIdle) {
+          store.patch(b.id, { archiveWhenIdle: false });
+          const info = await threadInfo(thread.id).catch(() => null);
+          if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
+            await quietly(`archive ${b.entityKey}'s ended steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+          }
+        }
+        return;
+      }
       if (b.ending !== null) {
         // A steward following through ends when a turn finishes without
         // saying something still remains, or without reporting at all.
