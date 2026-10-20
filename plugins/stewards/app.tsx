@@ -539,21 +539,28 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [note, setNote] = useState("");
+  // With choices, the text box answers a choice's note until Other… turns it
+  // into the free-text answer.
+  const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  const act = (action: "approve" | "decline" | "done" | "merge" | "provide") => {
+  const act = (action: "approve" | "decline" | "done" | "merge" | "provide" | "choose", choice?: string) => {
     setState("running");
-    rpc.call("stewardsNeedAction", { needId: n.id, action, note: note.trim() === "" ? null : note.trim() }).then(
-      (r) => {
-        if (!r.ok) return setState({ error: r.message });
-        onDone();
-        if (r.threadId !== null && r.threadId !== undefined) navigate.toThread(r.threadId);
-      },
-      (e: unknown) => setState({ error: message(e) }),
-    );
+    rpc
+      .call("stewardsNeedAction", { needId: n.id, action, note: note.trim() === "" ? null : note.trim(), ...(choice === undefined ? {} : { choice }) })
+      .then(
+        (r) => {
+          if (!r.ok) return setState({ error: r.message });
+          onDone();
+          if (r.threadId !== null && r.threadId !== undefined) navigate.toThread(r.threadId);
+        },
+        (e: unknown) => setState({ error: message(e) }),
+      );
   };
   const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
+  const choices = n.kind === "decide" ? n.choices : [];
+  const freeText = choices.length === 0 || other;
   return (
     <li className="flex flex-col gap-2 p-3">
       <p className="flex flex-wrap items-center gap-2">
@@ -569,7 +576,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
           value={note}
           onChange={(e) => setNote(e.target.value)}
           rows={1}
-          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "decide" ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : freeText ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
           aria-label={`Note for: ${n.what}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
@@ -596,9 +603,24 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
           <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
             Provide
           </button>
-        ) : (
+        ) : n.kind === "configure" ? (
           <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
             Done
+          </button>
+        ) : choices.length > 0 && !other ? (
+          <>
+            {choices.map((choice) => (
+              <button key={choice} type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("choose", choice)}>
+                {choice}
+              </button>
+            ))}
+            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => setOther(true)}>
+              Other…
+            </button>
+          </>
+        ) : (
+          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
+            Answer
           </button>
         )}
         {n.threadId !== null ? <ThreadLink threadId={n.threadId}>Open the worker</ThreadLink> : null}
@@ -611,10 +633,13 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
 function QuestionRow({ question: q, now, onClosed }: { question: Board["questions"][number]; now: number; onClosed: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [answer, setAnswer] = useState("");
+  // With choices, the text box is the choice's note until Other… turns it
+  // into the free-text answer.
+  const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "closing" | { error: string }>("idle");
-  const close = () => {
+  const close = (choice?: string) => {
     setState("closing");
-    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim() }).then(
+    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim(), ...(choice === undefined ? {} : { choice }) }).then(
       (r) => {
         if (r.ok) onClosed();
         else setState({ error: r.message });
@@ -622,6 +647,7 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
       (e: unknown) => setState({ error: message(e) }),
     );
   };
+  const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
     <li className="flex flex-col gap-2 p-3">
       <p className="flex flex-wrap items-center gap-2">
@@ -636,13 +662,26 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
           value={answer}
           onChange={(e) => setAnswer(e.target.value)}
           rows={1}
-          placeholder="Your answer (optional)"
+          placeholder={q.choices.length > 0 && !other ? "Note (optional)" : "Your answer (optional)"}
           aria-label={`Answer to: ${q.question}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
-        <button type="button" disabled={state === "closing"} className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50" onClick={close}>
-          {state === "closing" ? "Closing…" : answer.trim() === "" ? "Close" : "Answer and close"}
-        </button>
+        {q.choices.length > 0 && !other ? (
+          <>
+            {q.choices.map((choice) => (
+              <button key={choice} type="button" disabled={state === "closing"} className={button} onClick={() => close(choice)}>
+                {choice}
+              </button>
+            ))}
+            <button type="button" disabled={state === "closing"} className={button} onClick={() => setOther(true)}>
+              Other…
+            </button>
+          </>
+        ) : (
+          <button type="button" disabled={state === "closing"} className={button} onClick={() => close()}>
+            {state === "closing" ? "Closing…" : "Answer"}
+          </button>
+        )}
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
     </li>

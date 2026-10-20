@@ -13,7 +13,7 @@ import { dueDate } from "./deps.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
-import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
+import { needChoices, type Binding, type Escalation, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -31,9 +31,9 @@ const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. 
  */
 const STANDING_RULES = [
   "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
-  "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
+  "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). A `decide` item that is really a pick between fixed options carries `choices` (2-6 short labels, e.g. `choices: [\"Merge\", \"Close\", \"Verify first\"]`), and the page shows one button each; never write \"reply with your choice\" in prose. It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
   "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing `provide-secret` item for it, and the worker takes the value.",
-  "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up.",
+  "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
 ];
 const DESCRIPTION_CHARS = 4000;
 const COMMENT_CHARS = 1500;
@@ -46,6 +46,11 @@ const oneLine = (text: string, max = 400) => {
   const flat = text.replace(/\s+/gu, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
 };
+
+/** Fixed choices after an item, so the wake, the digest and the CLI read as a menu. */
+export function choicesNote(choices: readonly string[]): string {
+  return choices.length === 0 ? "" : ` [choices: ${choices.join(", ")}]`;
+}
 
 /**
  * The question a worker's final message ended with, or null when it asked
@@ -293,7 +298,7 @@ export function formatWake(input: WakeInput): string {
   out.push("", "## Waiting on you", "");
   if (needs.length === 0) out.push("Nothing is filed for the user.");
   else {
-    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${n.how === null ? "" : `\n  ${n.how}`}`);
+    for (const n of needs) out.push(`- ${n.id} (${n.kind}) ${n.what}${n.url === "" ? "" : ` — ${n.url}`}${choicesNote(needChoices(n))}${n.how === null ? "" : `\n  ${n.how}`}`);
     out.push("", "These are on the Stewards page with their own buttons. Do not ask the user about them in prose; the page is where they act.");
   }
 
@@ -325,9 +330,9 @@ export function formatWake(input: WakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0 || input.routedToMe.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
-      out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
+      out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
@@ -567,7 +572,7 @@ export function formatProjectWake(input: {
     const fresh = input.routed.filter((r) => r.escalation.deliveredAt === null);
     const before = input.routed.filter((r) => r.escalation.deliveredAt !== null);
     const line = ({ escalation: x, from }: { escalation: Escalation; from: Binding }) =>
-      `- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`;
+      `- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`;
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
@@ -598,7 +603,7 @@ export function formatProjectWake(input: {
   const withUser = input.withUser ?? [];
   if (withUser.length > 0) {
     out.push("## Escalations with the user", "");
-    for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
+    for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
     out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve }.", "");
   }
   const questions = input.questions ?? [];
@@ -606,7 +611,7 @@ export function formatProjectWake(input: {
     out.push("## Questions open with the user", "");
     for (const { question: q, about } of questions) {
       const where = [`asked ${day(q.createdAt)}`, about === null ? null : `about ${about.entityKey}`, q.escalationId === null ? null : `forwarded escalation ${q.escalationId}`].filter((f) => f !== null).join(", ");
-      out.push(`- ${q.id} (${where}): ${oneLine(q.question)}${q.context === null ? "" : ` Context: ${oneLine(q.context)}`}`);
+      out.push(`- ${q.id} (${where}): ${oneLine(q.question)}${choicesNote(q.choices)}${q.context === null ? "" : ` Context: ${oneLine(q.context)}`}`);
     }
     out.push(
       "",
@@ -617,7 +622,7 @@ export function formatProjectWake(input: {
   const needs = input.needs ?? [];
   if (needs.length > 0) {
     out.push("## Needs you", "");
-    for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`);
+    for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`);
     out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
   }
   const head = out.splice(0);
@@ -806,18 +811,18 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     [...questions.map(({ question: q }) => q.escalationId), ...(r.needs ?? []).map(({ need: n }) => (typeof n.data.escalationId === "string" ? n.data.escalationId : null))].filter((id): id is string => id !== null),
   );
   const waiting = [
-    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}`),
-    ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${n.url === "" ? "" : ` — ${n.url}`}`),
+    ...questions.map(({ question: q, about }) => `- Question ${q.id} (since ${day(q.createdAt)}${about === null ? "" : `, about ${about.entityKey}`}): ${oneLine(q.question)}${choicesNote(q.choices)}`),
+    ...(r.needs ?? []).map(({ need: n, binding }) => `- ${n.kind} (${n.id}, since ${day(n.createdAt)}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`),
     ...r.withUser
       .filter(({ escalation: x }) => !asked.has(x.id))
       .map(({ escalation: x, from }) =>
-        x.kind === "approval" ? `- Approval of ${from.entityKey}'s spec (${x.id}, since ${day(x.createdAt)})` : `- Escalation ${x.id} from ${from.entityKey} (${x.kind}, since ${day(x.createdAt)}): ${oneLine(x.question)}`,
+        x.kind === "approval" ? `- Approval of ${from.entityKey}'s spec (${x.id}, since ${day(x.createdAt)})` : `- Escalation ${x.id} from ${from.entityKey} (${x.kind}, since ${day(x.createdAt)}): ${oneLine(x.question)}${choicesNote(x.choices)}`,
       ),
   ];
   out.push("### Waiting on the user", "", ...capped(waiting, "Nothing."), "");
 
   const stuck = [
-    ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}`),
+    ...r.stuck.map(({ escalation: x, from }) => `- ${from.entityKey}: stuck escalation ${x.id} with ${x.route}, since ${day(x.createdAt)}: ${oneLine(x.question)}${choicesNote(x.choices)}`),
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."));

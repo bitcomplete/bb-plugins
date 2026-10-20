@@ -836,7 +836,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 | `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
 | `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
-| `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the question record's text box) |
+| `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
 | `provide-secret` | steward, with the variable name and purpose | the worker thread | the worker's `bb secret request` completes | **Provide**: opens the worker thread named in the item, or wakes the steward to start the worker that will request it |
 | `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |
 
@@ -865,6 +865,22 @@ The rules that hold:
   changed", and the wake lists the binding's open items and says not to ask the
   user about them in prose. Closing an item from the page or with
   `bb stewards done <id>` does the same.
+- **Fixed choices.** A `decide` item filed with `steward_report { needs }`
+  may carry `choices`, two to six short labels kept in the item's `data`; a
+  `steward_report { escalate }` may carry the same, kept on the escalation
+  and copied onto the question when the project steward forwards it. The page
+  shows one button per choice, a note field and **Other…** (which reveals the
+  text box with **Answer**); a `decide` item or question without choices
+  shows the text box and **Answer**, never **Done** (`configure` keeps
+  **Done**, since its "what" names the step being confirmed). Pressing a
+  choice closes with `Chose: <label>` plus the note, saves the choice (and
+  note) as guidance on the binding, and wakes the steward with "The user
+  chose <label> for <what>" under What changed. A forwarded escalation
+  answered by a choice resolves with the choice as its guidance, exactly as
+  `steward_update { guidance, resolve }` records it. `bb stewards done <id>
+  --choice <label> [--note …]` does the same from a thread and refuses a
+  label not among the item's choices. The CLI, the digest and every wake list
+  the choices after the item.
 - **A forwarded approval is a need.** When the project steward forwards an
   `approval` escalation to the user, the plugin files an `approve-spec` need
   on the binding and keeps the escalation open, linked to it
@@ -873,7 +889,8 @@ The rules that hold:
   page's Approve and Decline, and `bb stewards done` for Approve, record the
   gate verdict and resolve the open `approval` escalations in the same step,
   so the project steward is not left holding the request. A forwarded
-  `decision` escalation stays a question, answered in prose.
+  `decision` escalation stays a question; with `choices`, it is answered by a
+  button per label, and a choice is recorded as guidance.
 - **Dedupe.** A need is keyed by (binding, kind, url) while open: a steward
   that re-reports updates the wording rather than adding a row. The store
   enforces it with a partial unique index.

@@ -177,7 +177,7 @@ describe("a worker in flight between its turns (BB-11)", () => {
 
 describe("waits nobody hears", () => {
   const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
-  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null }];
+  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null }];
 
   it("flags a status blocked on the project steward or the user with no escalation open", () => {
     expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);

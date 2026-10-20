@@ -2395,6 +2395,129 @@ describe("needs you items", () => {
   });
 });
 
+// BB-20: a decide item or forwarded decision question can carry fixed
+// choices, so the page shows a button each instead of asking for a word.
+describe("fixed choices on decide items and questions", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
+
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const binding = () => t.hooks.store.find("ENG-12")!;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ id: string; kind: string; choices: string[] }>; questions: Array<{ id: string; choices: string[] }> } }).board;
+    return { ...t, project, steward, binding, board };
+  }
+
+  it("criterion 1: choosing closes the decide item, records guidance and wakes the steward", async () => {
+    const t = await adopted();
+    const reported = await t.tool(
+      "steward_report",
+      { ...base, actor: "me", needs: [{ kind: "decide", what: "Merge, close, or verify the workflow first?", choices: ["Merge", "Close", "Verify first"] }] },
+      t.steward,
+    );
+    expect(reported.error).toBe(false);
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
+    expect(need.data.choices).toEqual(["Merge", "Close", "Verify first"]);
+    // The page gets the choices to render a button each.
+    expect((await t.board()).needs.find((n) => n.id === need.id)).toMatchObject({ kind: "decide", choices: ["Merge", "Close", "Verify first"] });
+
+    // A label not among the choices is refused and changes nothing.
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Ship it" }, client)).toMatchObject({ ok: false, message: expect.stringMatching(/not one of the choices/u) });
+    expect(t.hooks.store.need(need.id)!.status).toBe("open");
+
+    const before = t.sends.filter((s) => s.threadId === t.steward).length;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Verify first", note: "Check the workflow run" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/ENG-12's steward has been told/u) });
+    const closed = t.hooks.store.need(need.id)!;
+    expect(closed.status).toBe("done");
+    expect(closed.resolution).toBe("Chose: Verify first — Check the workflow run");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Verify first — Check the workflow run");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBeGreaterThan(before);
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*The user chose Verify first for Merge, close, or verify the workflow first\?/u);
+  });
+
+  it("criterion 2: choices survive a decision escalation and its forwarded question, and a choice resolves it as guidance", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Merge, close, or verify first?", meanwhile: "Wait.", choices: ["Merge", "Close", "Verify first"] } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    // Carried on the escalation, and shown in the project steward's wake.
+    expect(t.hooks.store.escalation(esc)!.choices).toEqual(["Merge", "Close", "Verify first"]);
+    expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/\[choices: Merge, Close, Verify first\]/u);
+
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project);
+    expect(forwarded.text).toMatch(/to the user as question qst_/u);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    expect(t.hooks.store.question(qst)!.choices).toEqual(["Merge", "Close", "Verify first"]);
+    // The page shows the question with the same buttons.
+    expect((await t.board()).questions.find((q) => q.id === qst)).toMatchObject({ choices: ["Merge", "Close", "Verify first"] });
+
+    // A label not among the question's choices is refused while it is open.
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, choice: "Ship it", answer: null }, client)).toMatchObject({ ok: false, message: expect.stringMatching(/not one of the choices/u) });
+    expect(t.hooks.store.question(qst)!.status).toBe("open");
+
+    const before = t.sends.filter((s) => s.threadId === t.steward).length;
+    const res = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, choice: "Verify first", answer: "Check the run" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/ENG-12's steward has been told/u) });
+    // The question says Chose:…, the escalation and the binding take the choice as guidance.
+    expect(t.hooks.store.question(qst)!.answer).toBe("Chose: Verify first — Check the run");
+    expect(t.hooks.store.escalation(esc)!.resolution).toBe("Verify first — Check the run");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Verify first — Check the run");
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).length).toBeGreaterThan(before);
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/The user chose Verify first for Merge, close, or verify first\?/u);
+  });
+
+  it("criterion 4: bb stewards done --choice records a choice for a need and a question, and refuses a label not among them", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
+    const refused = await t.harness.behavior.runCli(["done", need.id, "--choice", "Ship it", "--project", "p1"]);
+    expect(refused).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/not one of .* choices: Merge, Close/u) });
+    expect(t.hooks.store.need(need.id)!.status).toBe("open");
+    const ok = await t.harness.behavior.runCli(["done", need.id, "--choice", "Close", "--note", "Ship later", "--project", "p1"]);
+    expect(ok).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Close/u) });
+    expect(t.hooks.store.need(need.id)!.resolution).toBe("Chose: Close — Ship later");
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toContain("Close — Ship later");
+
+    // The same for a question id, resolving its escalation with the choice.
+    await t.tool("steward_report", { ...base, escalate: { kind: "decision", question: "Merge or close?", meanwhile: "Wait.", choices: ["Merge", "Close"] } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const qst = /(qst_[\w-]+)/u.exec((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text)![1]!;
+    const bad = await t.harness.behavior.runCli(["done", qst, "--choice", "Maybe", "--project", "p1"]);
+    expect(bad).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/not one of .* choices: Merge, Close/u) });
+    const question = await t.harness.behavior.runCli(["done", qst, "--choice", "Merge", "--project", "p1"]);
+    expect(question).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Chose Merge/u) });
+    expect(t.hooks.store.question(qst)!.answer).toBe("Chose: Merge");
+    expect(t.hooks.store.escalation(esc)!.resolution).toBe("Merge");
+  });
+
+  it("criterion 5: needs, show and the digest print the choices", async () => {
+    const t = await adopted();
+    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
+    expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/Merge or close\? \[choices: Merge, Close\]/u);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Need need_\S+ decide \(open\): Merge or close\? \[choices: Merge, Close\]/u);
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toMatch(/decide \(need_\S+, since 2026-10-14, ENG-12\): Merge or close\? \[choices: Merge, Close\]/u);
+    expect(wake).toMatch(/## Needs you[\s\S]*decide, ENG-12\): Merge or close\? \[choices: Merge, Close\]/u);
+  });
+
+  it("rejects choices outside two to six labels", async () => {
+    const t = await adopted();
+    await expect(t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "One option?", choices: ["Only"] }] }, t.steward)).rejects.toThrow(/expected array to have >=2/u);
+    await expect(t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Too many?", choices: ["a", "b", "c", "d", "e", "f", "g"] }] }, t.steward)).rejects.toThrow(/expected array to have <=6/u);
+    const wrongKind = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", what: "Set it", choices: ["Yes", "No"] }] }, t.steward);
+    expect(wrongKind.error).toBe(false);
+    expect(wrongKind.text).toMatch(/choices are for a decide item/u);
+    expect(t.hooks.store.openNeeds(t.binding().id).some((n) => n.kind === "configure")).toBe(false);
+  });
+});
+
 // BB-19: a spec approval the project steward forwards to the user is the
 // user's to decide, so it becomes an `approve-spec` item with Approve and
 // Decline, not a free-text question.

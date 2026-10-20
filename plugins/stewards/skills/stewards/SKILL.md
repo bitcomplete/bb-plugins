@@ -34,13 +34,18 @@ Two tools are yours; everything else you do with the tools every thread has.
   step outside the repos, a secret, a decision — file it with
   `steward_report { needs: [{ kind, url, what, how }] }` (`configure`,
   `provide-secret`, `decide`); it appears on the Stewards page with its
-  button, deduplicated by (binding, kind, url).
+  button, deduplicated by (binding, kind, url). A `decide` item that is a
+  pick between fixed options carries `choices` — two to six short labels,
+  such as `choices: ["Merge", "Close", "Verify first"]` — and the page
+  shows a button each; never write "reply with your choice" in prose.
 - **Decide what the project's guidance settles.** AGENTS.md, architecture
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
   meanwhile } }`: it goes to your parent steward, then the project steward.
   The answer comes back as guidance and wakes you. The user hears only about
-  the project's big decisions.
+  the project's big decisions. An escalation that asks them to pick between
+  fixed options carries `choices` (two to six short labels), so the page
+  shows one button each instead of asking in prose.
 - **One ask per reply, and only what is open.** Ask the user at most one
   thing, and only what the playbook, this skill or the project's guidance
   leaves open. Models, flags, lanes and who merges are settled there: never
@@ -209,8 +214,12 @@ production: adopt it when the project's guidance says it is worth working
 picks it up), or decline with a reason, then resolve the escalation.
 
 Everything you ask the user is a record. Forwarding a non-approval
-escalation to them makes a question for it; a forwarded `approval` makes an
-`approve-spec` item instead, and the escalation stays open linked to it.
+escalation to them makes a question for it, carrying the escalation's
+`choices` when it has them (the page then shows a button each); a forwarded
+`approval` makes an `approve-spec` item instead, and the escalation stays
+open linked to it. A choice the user gives in chat is recorded with
+`bb stewards done <id> --choice <label>` (for a need or a question id),
+which saves it as guidance and resolves a forwarded escalation with it.
 Anything else you ask in a reply, record first
 with `steward_update { ask: { question, context } }` (with `binding` when
 it concerns one). Ask one thing per reply, and never ask what the playbook,
@@ -259,7 +268,7 @@ project.
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
-| `bb stewards done <need_… \| qst_…>` | Close a waiting item from a thread; an `approve-spec` item records the approval on the gate and resolves its escalation; wakes the steward with it |
+| `bb stewards done <need_… \| qst_…> [--choice <label>] [--note <text>]` | Close a waiting item from a thread; `--choice` records the label the user gave in chat (it must be one of the item's choices) and saves it as guidance; an `approve-spec` item records the approval on the gate and resolves its escalation; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
 | `bb stewards pass [--nightly]` | The mechanical sweep now, or the full nightly pass |
 | `bb stewards digest` | The latest morning digest |

@@ -171,6 +171,9 @@ export const MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN schedule_asked TEXT NOT NULL DEFAULT '[]'`,
   // A ticket whose gate has passed and that nothing holds or schedules: about to start, so it counts as in flight before Linear says so.
   `ALTER TABLE bindings ADD COLUMN cleared_to_start INTEGER NOT NULL DEFAULT 0`,
+  // Fixed choices on a decide item's escalation and on the question a forwarded one makes: short labels, JSON, so the page can offer a button each (BB-20).
+  `ALTER TABLE escalations ADD COLUMN choices TEXT`,
+  `ALTER TABLE questions ADD COLUMN choices TEXT`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -419,6 +422,8 @@ export type Escalation = {
   meanwhile: string;
   route: EscalationRoute;
   recommendation: string | null;
+  /** Fixed choices the user picks from, when the escalation offers any. */
+  choices: string[];
   status: "open" | "resolved";
   resolution: string | null;
   createdAt: number;
@@ -440,6 +445,8 @@ export type Question = {
   escalationId: string | null;
   question: string;
   context: string | null;
+  /** Fixed choices the user picks from, when the question offers any. */
+  choices: string[];
   status: "open" | "answered";
   answer: string | null;
   /** The thread that recorded the answer, or "user" from the page. */
@@ -474,6 +481,12 @@ export type Need = {
   createdAt: number;
   resolvedAt: number | null;
 };
+
+/** The fixed choices a need's `data` carries, whatever else it holds. */
+export function needChoices(n: Pick<Need, "data">): string[] {
+  const parsed = z.array(z.string()).safeParse(n.data.choices);
+  return parsed.success ? parsed.data : [];
+}
 
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
 export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
@@ -510,7 +523,7 @@ export function createStore(db: Database.Database, now: () => number) {
   );
 
   const insertEscalation = db.prepare(
-    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, created_at) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @created_at)",
+    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, choices, created_at) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @choices, @created_at)",
   );
   const getEscalation = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ?");
   const openEscalations = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND status = 'open' ORDER BY created_at");
@@ -523,7 +536,7 @@ export function createStore(db: Database.Database, now: () => number) {
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
   const insertQuestion = db.prepare(
-    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @created_at)",
+    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, choices, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @choices, @created_at)",
   );
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE id = ?");
   const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'open' ORDER BY created_at");
@@ -560,6 +573,7 @@ export function createStore(db: Database.Database, now: () => number) {
     meanwhile: String(r.meanwhile),
     route: String(r.route) as EscalationRoute,
     recommendation: r.recommendation === null ? null : String(r.recommendation),
+    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
     status: String(r.status) as "open" | "resolved",
     resolution: r.resolution === null ? null : String(r.resolution),
     createdAt: Number(r.created_at),
@@ -573,6 +587,7 @@ export function createStore(db: Database.Database, now: () => number) {
     escalationId: r.escalation_id === null ? null : String(r.escalation_id),
     question: String(r.question),
     context: r.context === null ? null : String(r.context),
+    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
     status: String(r.status) as "open" | "answered",
     answer: r.answer === null ? null : String(r.answer),
     answeredBy: r.answered_by === null ? null : String(r.answered_by),
@@ -758,9 +773,9 @@ export function createStore(db: Database.Database, now: () => number) {
     },
 
     // escalations
-    escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null }): Escalation {
+    escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null; choices?: string[] }): Escalation {
       const id = newId("esc");
-      insertEscalation.run({ id, binding_id: fields.bindingId, kind: fields.kind, question: fields.question, meanwhile: fields.meanwhile, route: fields.route, recommendation: fields.recommendation, created_at: now() });
+      insertEscalation.run({ id, binding_id: fields.bindingId, kind: fields.kind, question: fields.question, meanwhile: fields.meanwhile, route: fields.route, recommendation: fields.recommendation, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -809,9 +824,9 @@ export function createStore(db: Database.Database, now: () => number) {
     },
 
     // questions to the user
-    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null }): Question {
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[] }): Question {
       const id = newId("qst");
-      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, created_at: now() });
+      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
       return toQuestion(getQuestion.get(id)!);
     },
     question(id: string): Question | null {
@@ -824,13 +839,18 @@ export function createStore(db: Database.Database, now: () => number) {
     answeredSince(projectId: string, since: number): Question[] {
       return answeredSince.all(projectId, since).map(toQuestion);
     },
-    /** Close an open question with its answer, and resolve the escalation it was forwarded for, if any. */
-    answer(id: string, answer: string, by: string): boolean {
+    /**
+     * Close an open question with its answer, and resolve the escalation it was
+     * forwarded for, if any. `resolution` is what the escalation records when
+     * the two differ, as a choice does: the question says "Chose: X" while the
+     * escalation takes the choice as guidance.
+     */
+    answer(id: string, answer: string, by: string, resolution = answer): boolean {
       return db.transaction(() => {
         const at = now();
         if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
         const q = toQuestion(getQuestion.get(id)!);
-        if (q.escalationId !== null) resolveEscalation.run(answer, at, q.escalationId);
+        if (q.escalationId !== null) resolveEscalation.run(resolution, at, q.escalationId);
         return true;
       })();
     },
