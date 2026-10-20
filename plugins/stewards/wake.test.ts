@@ -47,11 +47,11 @@ function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
 }
 
 describe("a steward's wake", () => {
-  it("carries the standing rules: credentials through bb secret request, one ask, and build-time decisions", () => {
+  it("carries the standing rules: credentials as provide-secret needs, one ask, and build-time decisions", () => {
     const wake = formatWake(wakeInput());
-    expect(wake).toContain("bb secret request");
-    expect(wake).toContain("the `secrets` skill");
-    expect(wake).toContain("never paste a secret");
+    expect(wake).toContain("provide-secret");
+    expect(wake).toContain("writeEnv");
+    expect(wake).toMatch(/never paste a secret/iu);
     expect(wake).toContain("One ask per reply");
     expect(wake).toContain("escalated as a `decision` in the same turn");
   });

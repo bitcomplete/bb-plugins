@@ -846,9 +846,9 @@ what a wake carries.
   from the wake's evidence and the code in its workspace. **Until a token
   is set, the look fails with "no Sentry token is configured"; that one
   failure wakes the steward**, which files the `provide-secret` need naming
-  the setting (variable `sentryToken`, the Sentry auth-tokens page, the
-  scopes) and does nothing else; later looks are quiet until the token
-  appears. Any other read failure (403, a wrong URL) is logged and shown by
+  the setting (variable `SENTRY_TOKEN`, setting `sentryToken`, the Sentry
+  auth-tokens page, the scopes) and does nothing else; later looks are quiet
+  until the token appears. Any other read failure (403, a wrong URL) is logged and shown by
   `bb stewards check`, and wakes nobody, as a namespace kubectl cannot read
   does not.
 - **Doorbells come from bb-gate-hooks directly** (`hooks-client.ts`, a copy
@@ -916,7 +916,7 @@ listed under "Waiting on you" on the Stewards page, in the digest, and by
 | `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
-| `provide-secret` | steward, with the variable name and purpose | the worker thread | the worker's `bb secret request` completes | **Provide**: opens the worker thread named in the item, or wakes the steward to start the worker that will request it |
+| `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
 | `configure` | steward, for a step outside the repos (install an app, grant a permission, enable an event, set a setting) | the external page where it happens | the user presses Done, or the steward observes it done | **Done** (with an optional note, saved as guidance) |
 
 The rules that hold:

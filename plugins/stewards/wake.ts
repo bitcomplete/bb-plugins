@@ -33,7 +33,7 @@ const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. 
 const STANDING_RULES = [
   "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
   "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). A `decide` item that is really a pick between fixed options carries `choices` (2-6 short labels, e.g. `choices: [\"Merge\", \"Close\", \"Verify first\"]`), and the page shows one button each; never write \"reply with your choice\" in prose. It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
-  "- **A credential the work needs is a worker's to fetch**, with `bb secret request` (the `secrets` skill): never paste a secret, and never route the user to a script to run. You file the user-facing `provide-secret` item for it, and the worker takes the value.",
+  "- **A credential is a `provide-secret` need, not a worker's job to prompt.** File it with `steward_report { needs: [{ kind: \"provide-secret\", url, what, how, variable, purpose }] }`; the plugin spawns a requester thread and opens bb's secure form there. For a dotenv on a worker's machine name `writeEnv` (or `worker`); for one of the stewards plugin's own settings name `setting` (only a declared secret setting is accepted). Never paste a secret, and never route the user to a script to run.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
 ];
 const DESCRIPTION_CHARS = 4000;
@@ -624,7 +624,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
   if (look.error === NO_TOKEN) {
     out.push(
       `**The plugin has no Sentry token, so it cannot read this project.** The token is the \`${TOKEN_SETTING}\` setting of the stewards plugin on this bb server (Settings → Plugins → Stewards), entered by the user, never pasted into a thread. ` +
-        `File one provide-secret need for it with steward_report: variable \`${TOKEN_SETTING}\`, url ${TOKEN_PAGE}, what "Create a Sentry auth token with the scopes ${TOKEN_SCOPES.join(" and ")} and enter it as the stewards plugin's Sentry token setting", and the steps in how. ` +
+        `File one provide-secret need for it with steward_report: variable \`SENTRY_TOKEN\`, setting \`${TOKEN_SETTING}\`, url ${TOKEN_PAGE}, what "Create a Sentry auth token with the scopes ${TOKEN_SCOPES.join(" and ")} and enter it as the stewards plugin's Sentry token setting", and the steps in how. ` +
         "Then report with actor me and end the turn; the first look that reads the project wakes you.",
     );
   } else if (look.error !== null) out.push(`The project could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);

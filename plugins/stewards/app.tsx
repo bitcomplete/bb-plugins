@@ -569,6 +569,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
         <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
       </p>
       <p>{n.what}</p>
+      {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
       {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
       {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
       {takesNote ? (
@@ -600,9 +601,14 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
             Merge
           </button>
         ) : n.kind === "provide-secret" ? (
-          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
-            Provide
-          </button>
+          <>
+            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
+              Provide
+            </button>
+            <button type="button" disabled={state === "running"} className={secondary} onClick={() => act("done")}>
+              Done
+            </button>
+          </>
         ) : n.kind === "configure" ? (
           <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
             Done
@@ -623,7 +629,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
             Answer
           </button>
         )}
-        {n.threadId !== null ? <ThreadLink threadId={n.threadId}>Open the worker</ThreadLink> : null}
+        {n.threadId !== null ? <ThreadLink threadId={n.threadId}>{n.kind === "provide-secret" ? "Open the requester" : "Open the worker"}</ThreadLink> : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
       </div>
     </li>
