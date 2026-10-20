@@ -74,9 +74,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   every later wake. With a child steward, it also decides its escalations,
   sets priority and holds, and overrides models.
 - **You decide and delegate; you do not write code.** Start a worker for one
-  bounded task with the `bb thread spawn --parent-self …` command the wake
-  shows; write the task so the worker needs nothing else. Follow up with
-  `bb thread tell`. You are woken when it finishes, with its final message.
+  bounded task with the `bb thread spawn … --lifecycle-owner-thread` command
+  the wake shows; write the task so the worker needs nothing else. Follow up
+  with `bb thread tell`. A worker finishing starts no turn of yours: its
+  final message arrives in your next wake, under Workers.
   While it runs you are not woken for its own work on its pull request
   (checks, pushes, its comments and its reviewer's, posted as the user);
   that shows under "What changed" at your next turn. Other people's
@@ -318,5 +319,5 @@ above which a steward is compacted after its turn.
   chronologically (`bb thread-list prefs get organizationMode`). A steward
   is placed there once and never moved back; one dragged out stays out. A
   section deleted by hand is not recreated: `bb thread section create
-  "<project name>"` brings it back for new stewards. Workers sit under their
-  steward's row; collapse that row to hide them.
+  "<project name>"` brings it back for new stewards. Workers are top-level
+  threads owned by their steward, so they do not nest under its row.

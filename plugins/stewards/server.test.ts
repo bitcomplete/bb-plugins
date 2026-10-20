@@ -226,13 +226,19 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     await harness.behavior.emitThreadEvent("thread.idle", { thread: makeThreadResponse({ id: threadId }), lastAssistantText });
     await flush();
   };
-  /** A thread a steward started with `bb thread spawn --parent-self`. */
+  /** A thread an older steward started as a child: `bb thread spawn --parent-self`. */
   const created = async (id: string, parent: string, title = "Implement") => {
     w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null }) });
     await flush();
   };
-  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created };
+  /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
+  const createdOwned = async (id: string, owner: string, title = "Implement") => {
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null }) });
+    await flush();
+  };
+  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned };
 }
 
 describe("a Linear ticket steward", () => {
@@ -263,7 +269,10 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/given by the project steward/u);
     // The first wake is the spawn prompt, before the thread has an id.
     expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
-    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).not.toContain("--parent-self");
+    expect(prompt).not.toContain("--parent-thread");
+    expect(prompt).toContain("A worker finishing starts no turn of yours");
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
@@ -637,6 +646,40 @@ describe("a Linear ticket steward", () => {
     const wake = t.sends.at(-1)!.text;
     expect(wake).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
     expect(wake).toMatch(/Opened acme\/web#7\./u);
+  });
+
+  // BB-23: a worker is a top-level thread owned only through its lifecycle
+  // owner. It must still be tracked, guarded and reported, and its finish must
+  // not start a turn of its own.
+  it("recognizes a top-level worker by its lifecycle owner, guards it, and reports its finish in the next wake", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const binding = t.hooks.store.open("p1")[0]!.id;
+
+    // Spawned with only --lifecycle-owner-thread: no parent thread at all.
+    await t.createdOwned("thr_w1", steward, "ENG-12: Implement");
+    expect(t.threads.get("thr_w1")!.parentThreadId ?? null).toBeNull();
+    expect(t.hooks.store.workers(binding)).toMatchObject([{ threadId: "thr_w1", bindingId: binding, status: "running" }]);
+    expect(t.sends).toEqual([]);
+
+    // Its finish is the wake: the Workers section carries its final text.
+    await t.idle("thr_w1", "Opened acme/web#7.");
+    const wake = t.sends.at(-1)!.text;
+    const workers = wake.slice(wake.indexOf("### Workers"));
+    expect(workers).toMatch(/ENG-12: Implement \(thread thr_w1\): finished/u);
+    expect(workers).toMatch(/Opened acme\/web#7\./u);
+
+    // A top-level worker counts toward the runaway guard exactly as a child did.
+    for (let i = 2; i <= 7; i++) await t.createdOwned(`thr_w${i}`, steward);
+    expect(t.harness.sdk.callsTo("threads.stop")).toEqual([[{ threadId: "thr_w7" }]]);
+
+    // The template the steward acts from names no parent flag.
+    expect(String(t.spawns[1]!.prompt)).not.toContain("--parent-self");
+    expect(String(t.spawns[1]!.prompt)).not.toContain("--parent-thread");
+    expect(t.sends.at(-1)!.text).not.toContain("--parent-self");
+    expect(t.sends.at(-1)!.text).not.toContain("--parent-thread");
   });
 
   it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {

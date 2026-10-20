@@ -2692,9 +2692,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- thread events ---------------------------------------------------------------------------
     //
-    // Workers are started by stewards with `bb thread spawn --parent-self`, so
-    // they are recognized here, as children of a steward thread, rather than
-    // through a tool of their own.
+    // Workers are started by stewards as top-level threads with
+    // `--lifecycle-owner-thread`, so they are recognized here through their
+    // lifecycle owner rather than a tool of their own. A thread an older
+    // steward made a child is still recognized by its parent.
 
     bb.events.on("thread.created", async ({ thread }) => {
       // Stewards this plugin spawned (a promoted child under its parent) are not workers.

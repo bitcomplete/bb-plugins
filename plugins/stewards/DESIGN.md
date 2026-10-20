@@ -642,14 +642,18 @@ follow-through: 6h                # how long a terminal binding may be kept open
   done. thread-briefs only moves threads in and out of its own sections, so
   it leaves the project section alone. The project steward is titled
   "<project name> project steward".
-- Workers are visible children of their steward, started by the steward
-  with `bb thread spawn --project … --parent-self --lifecycle-owner-thread
-  …` and recognized by the plugin as children of a steward thread. bb's list
-  builds the parent tree before it files trees into sections, so a worker
-  shows under its steward's row in the project section whatever section
-  thread-briefs gives the worker itself, and collapses with that row
-  (`collapsedThreads`). Workers are not tagged for thread-briefs: their
-  briefs, renames and auto-archiving are thread-briefs' as for any thread.
+- Workers are top-level threads, owned by their steward through
+  `--lifecycle-owner-thread` and started with `bb thread spawn --project …
+  --lifecycle-owner-thread "$BB_THREAD_ID" …`; the plugin recognizes them by
+  that owner, and still recognizes a worker an older steward made a child by
+  its parent. A worker is no thread's child, so finishing a turn does not
+  wake the steward: its final message arrives in the next wake, which lists
+  finished workers. The sidebar loss is accepted: a worker no longer nests
+  under its steward's row in the project section, because bb's list trees by
+  parent thread and not by lifecycle owner. Whether it should tree by
+  lifecycle owner too is a core question, not worked around here. Workers are
+  not tagged for thread-briefs: their briefs, renames and auto-archiving are
+  thread-briefs' as for any thread.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. Ended bindings are archived
   by this plugin, not by thread-briefs.
