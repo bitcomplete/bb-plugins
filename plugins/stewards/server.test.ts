@@ -4029,4 +4029,45 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(stopped).not.toContain("thr_ok");
     expect(t.hooks.store.worker("thr_ok")!.status).not.toBe("stopped");
   });
+
+  it("says the gate is not passed once an approved spec changes, in the brief and the injected context", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const project = t.spawns[0]!.id;
+    const steward = t.spawns[1]!.id;
+    await t.tool(
+      "steward_report",
+      { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } },
+      steward,
+    );
+    expect((await t.tool("steward_update", { binding: "ENG-12", approve: true }, project)).error).toBe(false);
+
+    const brief = () => t.harness.behavior.runCli(["brief"], { threadId: steward, projectId: "p1" });
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
+    expect((await brief()).stdout).toContain("Ready gate: PASSED");
+    expect(instructions()).toContain("Ready gate: PASSED");
+
+    // The spec changes; the approval is stale, and a brief pinned to the
+    // approval's own hash would still call the gate passed.
+    const b = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(b.id, { lastSnapshot: { entity: issue({ description: "Users cannot log in. Also SSO." }), pulls: [] } });
+    expect((await brief()).stdout).toMatch(/Ready gate: not passed/);
+    expect(instructions()).toMatch(/Ready gate: not passed/);
+  });
+
+  it("points the injected brief at `bb stewards spawn-flags` when the project's machine is not cached", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
+    expect(instructions()).toContain("bb thread spawn --project p1 --lifecycle-owner-thread");
+
+    // A machine read more than a sweep ago is not trusted for a synchronous brief.
+    t.advance(31 * 60_000);
+    const stale = instructions();
+    expect(stale).toContain("Run `bb stewards spawn-flags` for the exact worker spawn command");
+    expect(stale).not.toContain("bb thread spawn --project p1");
+  });
 });

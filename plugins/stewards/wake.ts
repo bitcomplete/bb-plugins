@@ -377,8 +377,8 @@ export type BriefInput = {
   binding: Binding;
   playbook: Playbook;
   gate: GateState;
-  /** The worker spawn flags, environment first, exactly as the wake and `bb stewards spawn-flags` build them. */
-  workerFlags: string;
+  /** The worker spawn flags, environment first, exactly as the wake and `bb stewards spawn-flags` build them; null when the project's machine is not known yet, so the brief points at the command instead of printing one it is unsure of. */
+  workerFlags: string | null;
   /** Open escalations, so the gate line can say who is being asked for approval or scheduling. */
   escalations?: Escalation[];
   /** Open bindings at work on the same paths, for the scheduling line. */
@@ -419,13 +419,10 @@ export function formatBrief(input: BriefInput, maxChars?: number): string {
     `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`,
   ];
   if (!ops) head.push(briefGateLine(gate, escalations));
-  if (!ops)
-    head.push(
-      "",
-      "Start a worker with:",
-      "",
-      spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags }),
-    );
+  if (!ops) {
+    if (input.workerFlags === null) head.push("", "Run `bb stewards spawn-flags` for the exact worker spawn command: the project's machine has not been read on this server yet.");
+    else head.push("", "Start a worker with:", "", spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags }));
+  }
 
   const middle: string[] = [];
   if (!ops) middle.push("", ...gateLines({ gate, binding: b, playbook, escalations }));

@@ -900,7 +900,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The last answer is cached for the synchronous per-turn brief, which
      * cannot await this.
      */
-    const projectHostCache = new Map<string, string | null>();
+    const projectHostCache = new Map<string, { at: number; hostId: string | null }>();
     async function projectHost(projectId: string): Promise<string | null> {
       try {
         const [project, hosts] = await Promise.all([bb.sdk.projects.get({ projectId }), bb.sdk.hosts.list().catch(() => [])]);
@@ -911,13 +911,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           sources.find((source) => connected.has(source.hostId)) ??
           sources.find((source) => source.isDefault) ??
           sources[0];
-        projectHostCache.set(projectId, pick?.hostId ?? null);
+        projectHostCache.set(projectId, { at: now(), hostId: pick?.hostId ?? null });
         return pick?.hostId ?? null;
       } catch (error) {
         bb.log.warn(`stewards: could not find the machine for ${projectId} (${errorMessage(error)}); leaving it to bb's default`);
-        projectHostCache.set(projectId, null);
+        projectHostCache.set(projectId, { at: now(), hostId: null });
         return null;
       }
+    }
+
+    /**
+     * The cached project machine, or undefined when it was never read or is
+     * older than a sweep. The synchronous per-turn brief cannot await
+     * `projectHost`; when the cache cannot answer, it points at
+     * `bb stewards spawn-flags` rather than print a command with a machine it
+     * is unsure of.
+     */
+    function cachedProjectHost(projectId: string): string | null | undefined {
+      const entry = projectHostCache.get(projectId);
+      return entry === undefined || now() - entry.at > timing.sweepMs ? undefined : entry.hostId;
     }
 
     /** A fresh environment for a project's thread: a multi-repo workspace on its machine. */
@@ -1212,6 +1224,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The spec hash a binding's approval is pinned to, counting the user's own spec comments. */
     const specHashFor = (b: Pick<Binding, "threadId">, entity: EntitySnapshot): string => specHash(entity, b.threadId, isUserThread);
+
+    /**
+     * The ready gate for a brief: the live spec hash when the binding has a
+     * snapshot, so an approval whose spec changed reads as not passed. The
+     * wake does the same; a brief pinned to the approval's own hash would call
+     * a stale gate passed on exactly the compacted/non-wake turns it protects.
+     */
+    const briefGate = (b: Binding, playbook: Playbook) =>
+      gateState(playbook, b.ready, b.lastSnapshot === null ? (b.ready.approval?.specHash ?? "") : specHashFor(b, b.lastSnapshot.entity));
 
     const ownThreads = (b: Binding) => new Set([b.threadId, ...store.workers(b.id).map((w) => w.threadId)].filter((t): t is string => t !== null));
 
@@ -3560,14 +3581,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * in `configure`; this carries the live binding state, which is why the
      * brief is built here and not in the skill.
      */
+    /** The project steward's invariants, injected per turn and printed by `bb stewards brief` in its thread. */
+    const projectStewardInvariants = (threadId: string): string =>
+      [
+        "Your context may have been compacted. You are the project steward; the record, not memory, is what you decide from.",
+        `Your thread id is ${threadId}. Read status with \`bb stewards list\` and \`bb stewards show <key>\`; steer with steward_update. End the nightly wake with the morning digest.`,
+      ].join("\n");
+
     bb.agents.contributeInstructions(({ threadId }) => {
       const project = store.projectByThread(threadId);
-      if (project !== null) {
-        return [
-          "Your context may have been compacted. You are the project steward; the record, not memory, is what you decide from.",
-          `Your thread id is ${threadId}. Read status with \`bb stewards list\` and \`bb stewards show <key>\`; steer with steward_update. End the nightly wake with the morning digest.`,
-        ].join("\n");
-      }
+      if (project !== null) return projectStewardInvariants(threadId);
       const b = store.byThread(threadId);
       if (b === null || b.endedAt !== null) return null;
       const config = configs.get(b.projectId)?.value ?? null;
@@ -3578,11 +3601,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           "The project's playbook could not be read; run `bb stewards brief` and `bb stewards check` before acting.",
         ].join("\n");
       }
-      const hostId = projectHostCache.get(b.projectId) ?? null;
-      const flags = [environmentFlags(hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
-      const gate = gateState(playbook, b.ready, b.ready.approval?.specHash ?? "");
+      const hostId = cachedProjectHost(b.projectId);
+      const flags = hostId === undefined ? null : [environmentFlags(hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
       return formatBrief(
-        { binding: b, playbook, gate, workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
+        { binding: b, playbook, gate: briefGate(b, playbook), workerFlags: flags, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
         BRIEF_MAX_CHARS,
       );
     });
@@ -4603,14 +4625,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
             options: { project: PROJECT_OPTION },
             async run(input, ctx) {
+              const own = input.positionals.binding === undefined || input.positionals.binding === "" ? (ctx.threadId === undefined ? null : store.projectByThread(ctx.threadId)) : null;
+              if (own !== null && ctx.threadId !== undefined) return { exitCode: 0, stdout: `# Project steward brief\n\n${projectStewardInvariants(ctx.threadId)}` };
               const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
               const config = await loadConfig(b.projectId);
               const playbook = config === null ? null : bindingPlaybook(config, b);
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
-              const gate = gateState(playbook, b.ready, b.ready.approval?.specHash ?? "");
               return {
                 exitCode: 0,
-                stdout: formatBrief({ binding: b, playbook, gate, workerFlags: await workerFlagsFor(b, playbook), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
+                stdout: formatBrief({ binding: b, playbook, gate: briefGate(b, playbook), workerFlags: await workerFlagsFor(b, playbook), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
               };
             },
           }),
