@@ -8,6 +8,7 @@
 import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
+import type { DepsFinding, DepsLook } from "./deps.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
 import type { Binding, Escalation, Need, Observed, Question, Worker } from "./store.js";
@@ -394,6 +395,99 @@ export function formatOpsWake(input: OpsWakeInput): string {
     for (const f of look.findings.filter((x) => x.class === c)) out.push(...findingLines(f, look));
   }
   if (look.warnings.length > 0) out.push("", "### Other warning events", "", ...look.warnings.map((w) => `- ${w}`));
+  const open = input.escalations.filter((x) => x.status === "open");
+  if (open.length > 0) {
+    out.push("", "### Open escalations", "");
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : "the project steward"}): ${x.question}`);
+  }
+
+  const snapshot = out.splice(0);
+  out.push("", "## 4. What changed since your last turn", "");
+  if (input.changes.length === 0) out.push("Nothing new; this is a scheduled look.");
+  for (const c of input.changes) out.push(`- ${c}`);
+  out.push(
+    "",
+    "---",
+    "Before filing, look for evidence that you already did (a signed ticket or comment with the fingerprint). " +
+      `End your turn with steward_report, listing in opsTickets every ticket you filed, commented on or reopened, by fingerprint: { fingerprint, ticket: "${input.team ?? "ENG"}-123", did: "filed" | "commented" | "reopened" }. requeueAfter defaults to ${formatDuration(playbook.requeueDefaultMs)}.`,
+  );
+  return fit(head, snapshot, out);
+}
+
+export type DepsWakeInput = {
+  reason: WakeReason;
+  binding: Binding;
+  playbook: Playbook;
+  look: DepsLook;
+  /** The Linear team tickets are filed in. */
+  team: string | null;
+  label: string;
+  /** Severities whose tickets are labelled when filed (deps.autoAdopt). */
+  autoAdopt: string[];
+  escalations: Escalation[];
+  changes: string[];
+};
+
+const DEPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
+  adopted: "You have just been made the dependency steward for this repository. Read everything below, then act on the alerts.",
+  reopen: "This repository is watched again and its binding has resumed. Re-read everything below as if new.",
+  nightly: "This is the nightly reconcile pass: re-list the open alerts and check that every one is filed, batched or trimmed.",
+};
+
+const DEPS_CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
+
+const days = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+function depsAlertLines(a: DepsFinding): string[] {
+  const lines: string[] = [`#### ${a.fingerprint}`, ""];
+  const ticket = a.ticket === null ? "" : ` · ticket ${a.ticket}${a.ticketState === null ? "" : ` (${a.ticketState})`}${a.lastCommentedAt === null ? "" : `, your last word on it ${iso(a.lastCommentedAt)}`}`;
+  lines.push(`- **${a.severity}** priority ${a.priority}, due ${days(a.dueAt)}${ticket}`);
+  lines.push(`- \`${a.package}\` (${a.ecosystem})${a.manifestPath === null ? "" : ` — ${a.manifestPath}`}${a.ghsaId === null ? "" : ` — ${a.ghsaId}`}`);
+  lines.push(`- ${a.fixedVersion === null ? "No fixed version yet" : `Fixed in ${a.fixedVersion}`}; first seen ${iso(a.firstSeenAt)}${a.url === null ? "" : ` — ${a.url}`}`);
+  if (a.batch.kind === "join") lines.push(`- Batch: join the open ticket ${a.batch.ticketKey} (its due date is already inside this alert's).`);
+  else if (a.batch.kind === "tighten") lines.push(`- Batch: tighten the open ticket ${a.batch.ticketKey} to due ${days(a.batch.dueAt)}.`);
+  else if (a.severity === "medium" || a.severity === "low") lines.push("- Batch: no open ticket for this repo and ecosystem; file a new one.");
+  else lines.push("- This severity gets its own ticket.");
+  return [...lines, ""];
+}
+
+/** A dependency binding's wake: instructions, steering, the alerts, what changed. */
+export function formatDepsWake(input: DepsWakeInput): string {
+  const { binding, playbook, look } = input;
+  const out: string[] = [];
+  out.push(`# Deps watch: ${look.target}`);
+  out.push(`Binding ${binding.id} · deps · playbook ${playbook.name}@${playbook.version} · looked ${iso(look.at)}`);
+  out.push("", `${binding.threadId === null ? "Your thread id is in `$BB_THREAD_ID`." : `Your thread id is ${binding.threadId}.`} Use it wherever you name yourself, and never take one from your workspace's path: you share the project steward's workspace, and its path names that thread.`);
+  const special = DEPS_LIFECYCLE[input.reason];
+  if (special !== undefined) out.push("", `**${special}**`);
+
+  out.push("", "## 1. Instructions");
+  if (playbook.general !== "") out.push("", playbook.general);
+  const present = FINDING_CLASSES.filter((c) => look.alerts.some((a) => a.class === c));
+  for (const c of present) {
+    const section = phaseInstructions(playbook, c);
+    if (section !== null) out.push("", `### ${c.charAt(0).toUpperCase()}${c.slice(1)}`, "", section);
+  }
+  out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
+  out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue, and set each ticket's due date to the deadline the alert names.`);
+  if (input.autoAdopt.length > 0) {
+    out.push(`deps.autoAdopt: a ticket you file for a ${input.autoAdopt.join(" or ")} alert is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`);
+  }
+
+  out.push("", "## 2. Guidance, priority and holds", "");
+  if (binding.guidance.length === 0) out.push("No standing guidance.");
+  for (const g of binding.guidance) out.push(`- ${iso(g.at)} (${g.by}): ${g.text}`);
+  out.push(`- Priority: ${binding.priority ?? "normal"}`);
+  out.push(binding.hold === null ? "- Hold: none" : `- **HOLD: ${binding.hold}** — file and comment nothing until it is lifted.`);
+
+  const head = out.splice(0);
+  out.push("", "## 3. The alerts", "");
+  if (look.error !== null) out.push(`The repository could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);
+  else if (look.alerts.length === 0) out.push("**No open alerts.** Nothing to file, comment on or close: report that with steward_report (actor other) and end the turn.");
+  for (const c of present) {
+    out.push("", `### ${DEPS_CLASS_TITLES[c]}`, "");
+    for (const a of look.alerts.filter((x) => x.class === c)) out.push(...depsAlertLines(a));
+  }
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0) {
     out.push("", "### Open escalations", "");

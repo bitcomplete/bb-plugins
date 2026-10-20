@@ -73,6 +73,8 @@ export const interestViewSchema = z.object({
   nouns: z.object({ unit: nounSchema, entity: nounSchema }),
   /** As a person names them. */
   units: z.array(z.string()),
+  /** Repositories whose Dependabot alerts are leased, separate from `units`. */
+  dependabot: z.array(z.string()).default([]),
   entities: z.array(z.object({ key: z.string(), url: z.string().nullable() })),
   /** What stewards asked for and is not leased, and why. Empty when all is well. */
   unleased: z.array(z.object({ key: z.string(), reason: z.string() })),
@@ -174,9 +176,10 @@ const ENTITIES_NAMED = 20;
 
 /** What stewards has leased, one line, then a line per thing it asked for that is not leased. */
 export function describeInterest(i: InterestView): string[] {
-  if (i.units.length === 0 && i.entities.length === 0 && i.unleased.length === 0) return ["Stewards: nothing asked for."];
+  if (i.units.length === 0 && i.entities.length === 0 && (i.dependabot ?? []).length === 0 && i.unleased.length === 0) return ["Stewards: nothing asked for."];
   const parts: string[] = [];
   if (i.units.length > 0) parts.push(`${i.units.length === 1 ? i.nouns.unit[0] : i.nouns.unit[1]} ${i.units.join(", ")}`);
+  if ((i.dependabot ?? []).length > 0) parts.push(`Dependabot alerts for ${(i.dependabot ?? []).join(", ")}`);
   if (i.entities.length > 0) {
     const named = i.entities.slice(0, ENTITIES_NAMED).map((e) => e.key);
     const more = i.entities.length - named.length;

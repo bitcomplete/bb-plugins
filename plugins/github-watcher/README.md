@@ -36,12 +36,21 @@ copy shared with stewards and linear; edit all three or none):
   A `gh` that is not signed in is reported in `error`, not thrown.
 - `sourceAdoptable`: every open pull request in the repositories, oldest
   first, up to the limit.
-- `sourceSetInterest`: the repositories and entities stewards wants to hear
-  about. Only stewards may call it. Kept in kv, leased on bb-gate-hooks
-  beside the watches (`repo` leases for repositories, `issue` leases for
-  entities), and every doorbell for one of them is debounced and rung over
-  to stewards as `stewardsRing` (`ringStewards`, quiet when stewards is not
-installed). A refused lease is logged.
+- `sourceDependabotAlerts`: a repository's Dependabot alerts, read with the
+  token from `GET /repos/{owner}/{repo}/dependabot/alerts` and named the way
+  the shared contract wants them. Reading alerts needs the token's alert
+  access (the `security_events` scope, or Dependabot alerts read), more than
+  read access to the repository; a repo the token cannot read is named in
+  `errors` and the rest are still returned.
+- `sourceSetInterest`: the repositories, entities and Dependabot
+  repositories stewards wants to hear about. Only stewards may call it. Kept
+  in kv, leased on bb-gate-hooks beside the watches (`repo` leases for
+  repositories, `issue` leases for entities, `dependabot_repo` leases for
+  Dependabot repositories; a `repo` lease does not receive alert doorbells),
+  and every doorbell for one of them is debounced and rung over to stewards
+  as `stewardsRing` (`ringStewards`, quiet when stewards is not installed).
+  A refused lease is logged; a refused `dependabot_repo` is a skip, since a
+  login that cannot read alerts simply does not get those doorbells.
 
 There are no write tools: a steward comments and reviews with `gh` like
 any thread, and signs what it posts as the skill asks, which is how

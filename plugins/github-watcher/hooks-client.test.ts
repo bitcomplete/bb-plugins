@@ -163,6 +163,7 @@ describe("the loop", () => {
     const logs: string[] = [];
     const sweeps: string[] = [];
     const doorbells: string[] = [];
+    const doorbellKinds: string[] = [];
     const units: Array<string | null> = [];
     const rejected: Rejection[][] = [];
     let token = "tok-1";
@@ -179,7 +180,8 @@ describe("the loop", () => {
         return token;
       },
       watchIds: over.watchIds ?? (() => [{ kind: "issue", id: "i-1" }, { kind: "issue", id: "i-2" }]),
-      onDoorbell: (id, unit) => {
+      onDoorbell: (kind, id, unit) => {
+        doorbellKinds.push(kind);
         doorbells.push(id);
         units.push(unit);
       },
@@ -193,7 +195,7 @@ describe("the loop", () => {
     });
     const controller = new AbortController();
     const done = loop.run(controller.signal);
-    return { loop, logs, sweeps, doorbells, units, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
+    return { loop, logs, sweeps, doorbells, doorbellKinds, units, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
   }
 
   it("subscribes every watch on hello with the current token, sweeps, then rings on doorbells for issues only", async () => {
@@ -211,13 +213,15 @@ describe("the loop", () => {
 
     hooks.last().send(hooks.doorbell("i-1"));
     hooks.last().send(hooks.doorbell("acme/widgets", { kind: "repo" }));
+    hooks.last().send(hooks.doorbell("acme/widgets#4", { kind: "dependabot_alert" }));
     hooks.last().send(hooks.doorbell("i-9", { source: "linear" }));
     hooks.last().send("event: doorbell\ndata: not json\n\n");
     hooks.last().send(hooks.doorbell("i-2", { action: "remove", unit: "" }));
     await tick();
-    expect(s.doorbells).toEqual(["i-1", "i-2"]);
+    expect(s.doorbells).toEqual(["i-1", "acme/widgets#4", "i-2"]);
+    expect(s.doorbellKinds).toEqual(["issue", "dependabot_alert", "issue"]);
     // The unit comes along when the service names one.
-    expect(s.units).toEqual(["acme/widgets", null]);
+    expect(s.units).toEqual(["acme/widgets", "acme/widgets", null]);
     expect(s.logs.join("\n")).not.toContain("tok-1");
 
     s.controller.abort();

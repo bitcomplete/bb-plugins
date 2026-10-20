@@ -17,14 +17,19 @@ import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
   DEFAULT_PLAYBOOKS,
+  DEPS_ALERTS_PLAYBOOK,
+  DEPS_PRS_PLAYBOOK,
   ESCALATION_KINDS,
   KINDS,
   PROJECT_FILE,
+  depsAlertsPlaybookName,
+  depsPrsPlaybookName,
+  depsTargets,
   durationSchema,
   formatDuration,
   isTerminal,
+  k8sTargets,
   modelSpecSchema,
-  opsTargets,
   opsTeam,
   parsePlaybook,
   parseProjectFile,
@@ -39,10 +44,11 @@ import {
   type Playbook,
   type ProjectFile,
 } from "./config.js";
+import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type OpsLook, type OpsTarget, type TicketState } from "./ops.js";
+import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type Sighting, type TicketState } from "./ops.js";
 import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -51,14 +57,16 @@ import {
   signatureLine,
   sourceContract,
   stewardsContract,
+  type DependabotAlert,
+  type DependabotSeverity,
   type EntitySnapshot,
   type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, type Binding, type Escalation, type EscalationRoute, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, createStore, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, formatDepsWake, formatOpsWake, formatProjectWake, formatSessionWake, formatWake, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -300,6 +308,10 @@ type ProjectConfig = {
   projectId: string;
   file: ProjectFile;
   playbooks: Partial<Record<BindingKind, Playbook>>;
+  /** The dependency watch's alert playbook, when it parses. */
+  depsAlerts: Playbook | null;
+  /** The Dependabot pull request playbook, when it parses. */
+  depsPrs: Playbook | null;
   /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
   repos: string[];
   /** What is wrong with the configuration, in sentences; bindings keep running under the last good playbook. */
@@ -308,6 +320,9 @@ type ProjectConfig = {
 };
 
 const PRIORITY_ORDER: Record<string, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
+
+/** Authors whose pull requests the dependency watch adopts under deps-prs. */
+export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
 
 export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
@@ -437,7 +452,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       const kinds = KINDS.filter((k) => usesKind(file, k));
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
-      const texts = await readFiles(projectId, [...new Set(names.values())].map(playbookPath));
+      const depsAlertsName = depsAlertsPlaybookName(file);
+      const depsPrsName = depsPrsPlaybookName(file);
+      const texts = await readFiles(projectId, [...new Set([...names.values(), depsAlertsName, depsPrsName])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       for (const [kind, name] of names) {
         const text = texts.get(playbookPath(name)) ?? null;
@@ -458,6 +475,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
 
+      /**
+       * The dependency watch's two playbooks. They are optional: a project that
+       * has not written them runs no dependency watch, which is how the feature
+       * is off before `bb stewards init` writes them. One that is present but
+       * does not parse is a problem, like any other playbook.
+       */
+      const loadOptional = async (name: string): Promise<Playbook | null> => {
+        const text = texts.get(playbookPath(name)) ?? null;
+        if (text === null) return null;
+        const goodKey = `good/${projectId}/playbook/${name}`;
+        let result = parsePlaybook(text, name);
+        if (result.ok) {
+          await bb.storage.kv.set(goodKey, text);
+          return result.value;
+        }
+        problems.push(result.error);
+        const last = await bb.storage.kv.get<string>(goodKey);
+        const lastParsed = typeof last === "string" ? parsePlaybook(last, name) : null;
+        if (lastParsed !== null && lastParsed.ok) {
+          problems.push(`${name} keeps running under the last good version (${lastParsed.value.version}).`);
+          return lastParsed.value;
+        }
+        return null;
+      };
+      const depsAlerts = await loadOptional(depsAlertsName);
+      const depsPrs = await loadOptional(depsPrsName);
+
       let repos: string[] = [];
       try {
         const set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
@@ -471,7 +515,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       } catch (error) {
         problems.push(`could not read the repo set: ${errorMessage(error)}`);
       }
-      return { projectId, file, playbooks, repos, problems, loadedAt: now() };
+      return { projectId, file, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
     }
 
     /** Every project with a stewards configuration. */
@@ -486,6 +530,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     const playbookFor = (config: ProjectConfig, kind: BindingKind) => config.playbooks[kind] ?? null;
+
+    /**
+     * The playbook a binding runs under. A Dependabot alert target uses the
+     * deps-alerts playbook; a pull request the dependency watch adopted uses
+     * deps-prs; everything else uses its kind's playbook.
+     */
+    function bindingPlaybook(config: ProjectConfig, b: Pick<Binding, "kind" | "playbook" | "entityId">): Playbook | null {
+      if (b.kind === "ops") {
+        const target = parseOpsTargetKey(b.entityId);
+        if (target?.kind === "dependabot") return config.depsAlerts;
+      }
+      if (b.kind === "pr" && b.playbook === depsPrsPlaybookName(config.file)) return config.depsPrs;
+      return playbookFor(config, b.kind);
+    }
 
     // ---- the sources ---------------------------------------------------------------------
 
@@ -535,10 +593,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function sendInterest(): Promise<void> {
       const projects = [...configs.values()].map((c) => c.value).filter((c): c is ProjectConfig => c !== null);
       const open = store.open();
-      const sets: Record<Source, { units: string[]; entities: string[] }> = {
+      const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[] }> = {
         linear: {
           units: [...new Set(projects.flatMap((p) => p.file.linear.teams))].sort(),
           entities: [...new Set(open.filter((b) => b.source === "linear").map((b) => b.entityId))].sort(),
+          dependabot: [],
         },
         github: {
           units: [...new Set(projects.flatMap((p) => p.repos))].sort(),
@@ -548,6 +607,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               ...open.flatMap((b) => leasedPulls(b)),
             ]),
           ].sort(),
+          // Every repo the project watches for Dependabot alerts. A server
+          // whose gh login cannot read alerts has each lease refused as
+          // `forbidden`, which it skips; stewards check says so.
+          dependabot: [...new Set(projects.flatMap((p) => (p.depsAlerts === null ? [] : depsTargets(p.file, p.repos).map((t) => t.repo))))].sort(),
         },
       };
       for (const source of ["linear", "github"] as const) {
@@ -978,7 +1041,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b === null) return;
       const config = await loadConfig(b.projectId);
       if (config === null) return;
-      const playbook = playbookFor(config, b.kind);
+      const playbook = bindingPlaybook(config, b);
       if (playbook === null) return;
       if (b.source === "ops") {
         await reconcileOps(b, config, playbook, force);
@@ -999,10 +1062,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
       const prev = b.lastSnapshot;
 
-      const life = lifecycle(b, playbook, entity, config.file.label);
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file) });
       let reason: WakeReason | null = force;
       if (life.kind === "stay-ended") {
-        const labelled = b.kind === "review" || hasLabel(entity, config.file.label);
+        const labelled = b.kind === "review" || b.playbook === depsPrsPlaybookName(config.file) || hasLabel(entity, config.file.label);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
         return;
       }
@@ -1154,8 +1217,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return out;
     }
 
+    /** Every ops target a project watches: the k8s namespaces and the Dependabot repositories. */
+    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...k8sTargets(config.file), ...depsTargets(config.file, config.repos)];
+
     /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
-    async function lookAt(b: Binding, config: ProjectConfig, target: OpsTarget, playbook: Playbook): Promise<OpsLook> {
+    async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
       const at = now();
       const since = b.opsLook !== null && b.opsLook.error === null ? b.opsLook.at : at - playbook.requeueDefaultMs;
       try {
@@ -1168,11 +1234,110 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * The open tickets a new medium or low alert may join, one per repo and
+     * ecosystem: grouped from the fingerprint map by ticket, each with the
+     * tightest deadline among its alerts. Only batchable (medium and low)
+     * fingerprints count, since critical and high never coalesce.
+     */
+    function openBatchedTickets(rows: readonly Fingerprint[], sla: ProjectFile["deps"]["sla"]): DepsTicket[] {
+      const byTicket = new Map<string, DepsTicket>();
+      for (const r of rows) {
+        if (r.ticketKey === null || r.severity === null || r.ecosystem === null) continue;
+        if (!isBatchable(r.severity as DependabotSeverity)) continue;
+        const repo = repoOfFingerprint(r.fingerprint);
+        if (repo === null) continue;
+        const dueAt = deadlineAt(r.severity as DependabotSeverity, sla, r.firstSeenAt);
+        const ticket = byTicket.get(r.ticketKey);
+        if (ticket === undefined) byTicket.set(r.ticketKey, { ticketKey: r.ticketKey, repo, ecosystem: r.ecosystem, dueAt });
+        else ticket.dueAt = Math.min(ticket.dueAt, dueAt);
+      }
+      return [...byTicket.values()];
+    }
+
+    /** One look at a Dependabot alert target: the repository's open alerts, classified and batched. */
+    async function lookAtDeps(b: Binding, config: ProjectConfig, target: DependabotTarget): Promise<DepsLook> {
+      const at = now();
+      try {
+        const out = await sourceRpc("github", "sourceDependabotAlerts", { units: [target.repo], state: "open" }, sourceContract.sourceDependabotAlerts.output);
+        const alerts: DependabotAlert[] = out.alerts;
+        const rows = store.sight(
+          b.projectId,
+          b.id,
+          alerts.map((a) => {
+            const s = sightingOf(a);
+            return { fingerprint: s.fingerprint, summary: s.summary, severity: s.severity, ecosystem: s.ecosystem };
+          }),
+        );
+        const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
+        const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        const findings = classify(sightings, rows, tickets, at);
+        const open = openBatchedTickets(store.fingerprints(b.id), config.file.deps.sla);
+        const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
+        const depsFindings: DepsFinding[] = [];
+        for (const f of findings) {
+          const a = byFingerprint.get(f.fingerprint);
+          if (a === undefined) continue;
+          const firstSeenAt = rows.get(f.fingerprint)?.firstSeenAt ?? at;
+          const dueAt = deadlineAt(a.severity, config.file.deps.sla, firstSeenAt);
+          depsFindings.push({
+            fingerprint: f.fingerprint,
+            alertNumber: a.number,
+            severity: a.severity,
+            package: a.package,
+            ecosystem: a.ecosystem,
+            manifestPath: a.manifestPath,
+            ghsaId: a.ghsaId,
+            fixedVersion: a.fixedVersion,
+            summary: a.summary ?? f.summary,
+            state: a.state,
+            url: a.url,
+            dueAt,
+            priority: priorityFor(a.severity),
+            class: f.class,
+            ticket: f.ticket,
+            ticketState: f.ticketState,
+            firstSeenAt,
+            lastCommentedAt: f.lastCommentedAt,
+            batch: batchAlert(a, dueAt, open),
+          });
+        }
+        return { at, target: opsTargetKey(target), error: null, viewer: out.viewer, alerts: depsFindings };
+      } catch (error) {
+        return { at, target: opsTargetKey(target), error: errorMessage(error), viewer: null, alerts: [] };
+      }
+    }
+
+    /** What changed between two dependency looks, as the mechanical tier weighs it. */
+    function depsChanges(before: DepsLook | null, after: DepsLook, ticketFor: (fingerprint: string) => string | null): Change[] {
+      if (after.error !== null) return before === null || before.error === null ? [{ text: `Cannot read ${after.target}: ${after.error}`, actionable: false }] : [];
+      const changes: Change[] = [];
+      if (before !== null && before.error !== null) changes.push({ text: `${after.target} is readable again`, actionable: false });
+      const was = new Map((before?.alerts ?? []).map((a) => [a.fingerprint, a]));
+      for (const a of after.alerts) {
+        const prev = was.get(a.fingerprint);
+        if (a.class === "new" && (prev === undefined || prev.class !== "new")) changes.push({ text: `New alert: ${a.fingerprint} — ${a.summary}`, actionable: true });
+        else if (a.class === "returned" && prev?.class !== "returned") changes.push({ text: `Back after ${a.ticket} was resolved (${a.ticketState ?? "closed"}): ${a.fingerprint}`, actionable: true });
+        else if (a.class === "recurring" && prev === undefined) changes.push({ text: `Seen again under ${a.ticket}: ${a.fingerprint}`, actionable: false });
+      }
+      const current = new Set(after.alerts.map((a) => a.fingerprint));
+      for (const a of was.values()) {
+        if (current.has(a.fingerprint)) continue;
+        const ticket = a.ticket ?? ticketFor(a.fingerprint);
+        changes.push({ text: `No longer open: ${a.fingerprint}${ticket === null ? "" : ` (${ticket})`}`, actionable: true });
+      }
+      return changes;
+    }
+
     async function reconcileOps(b: Binding, config: ProjectConfig, playbook: Playbook, force: WakeReason | null): Promise<void> {
       if (b.endedAt !== null || b.ending !== null) return;
       const target = parseOpsTargetKey(b.entityId);
       // A target no longer listed is ended by the sweep.
-      if (target === null || !opsTargets(config.file).some((t) => opsTargetKey(t) === b.entityId)) return;
+      if (target === null || !allOpsTargets(config).some((t) => opsTargetKey(t) === b.entityId)) return;
+      if (target.kind === "dependabot") {
+        await reconcileDeps(b, config, playbook, target, force);
+        return;
+      }
       const before = b.opsLook;
       const look = await lookAt(b, config, target, playbook);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
@@ -1227,14 +1392,72 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
     }
 
+    /** The same turn for a Dependabot alert target: re-list the open alerts and wake on what changed. */
+    async function reconcileDeps(b: Binding, config: ProjectConfig, playbook: Playbook, target: DependabotTarget, force: WakeReason | null): Promise<void> {
+      const before = b.depsLook;
+      const look = await lookAtDeps(b, config, target);
+      const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
+      const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
+      b = store.patch(b.id, { depsLook: look, requeueAt });
+      if (look.error !== null) {
+        if (before?.error !== look.error) bb.log.warn(`stewards: cannot read ${b.entityKey}: ${look.error}`);
+        return;
+      }
+
+      const changes = depsChanges(before, look, (fp) => store.fingerprint(b.projectId, fp)?.ticketKey ?? null);
+      if (requeueCame) changes.push({ text: look.alerts.length > 0 ? "Requeue time came, with alerts still open" : "Requeue time came: a scheduled look", actionable: true });
+      if (b.playbookVersion !== playbook.version) changes.push({ text: `Playbook ${playbook.name} updated (${b.playbookVersion} → ${playbook.version})`, actionable: false });
+      const queued = b.pending;
+      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      for (const n of queued) {
+        const same = changes.find((c) => c.text === n.text);
+        if (same !== undefined) same.actionable ||= n.quiet !== true;
+        else changes.push({ text: n.text, actionable: n.quiet !== true });
+      }
+      b = store.patch(b.id, { playbookVersion: playbook.version });
+      const keep = () => {
+        for (const c of changes) if (!queued.some((n) => n.text === c.text && (n.quiet === true) === !c.actionable)) store.note(b.id, c.text, !c.actionable);
+      };
+      const reason = force ?? (b.threadId === null ? "adopted" : null);
+      if (reason === null && !changes.some((c) => c.actionable)) {
+        keep();
+        return;
+      }
+      const deferred = (await settings.get()).paused || (b.hold !== null && reason === null && loudQueued === 0);
+      const info = b.threadId === null ? null : await threadInfo(b.threadId);
+      if (deferred || (info !== null && busy(info.status))) {
+        keep();
+        if (reason !== null && reason !== "changed" && reason !== "adopted") store.note(b.id, `Due: ${reason}`);
+        return;
+      }
+      const text = formatDepsWake({
+        reason: reason ?? (requeueCame && loudQueued === 0 ? "requeue" : "changed"),
+        binding: b,
+        playbook,
+        look,
+        team: opsTeam(config.file),
+        label: config.file.label,
+        autoAdopt: config.file.deps.autoAdopt,
+        escalations: store.openEscalations(b.id),
+        changes: [...new Set(changes.map((c) => c.text))],
+      });
+      if (!(await deliverWake(b, config, playbook, text))) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+    }
+
     /**
      * One ops binding per configured target. A target taken out of the
      * project file ends its binding; put back, the same binding and thread
      * resume. One detached by hand stays ended while its target is listed,
-     * as a ticket stays detached while it keeps its label.
+     * as a ticket stays detached while it keeps its label. The Dependabot
+     * targets come from the project's repos (or its explicit dependabot
+     * targets) and run the deps-alerts playbook.
      */
     async function syncOpsBindings(config: ProjectConfig): Promise<void> {
-      const wanted = new Map(opsTargets(config.file).map((t) => [opsTargetKey(t), t] as const));
+      const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
+      const k8sPlaybook = playbookFor(config, "ops");
+      if (k8sPlaybook !== null) for (const target of k8sTargets(config.file)) wanted.set(opsTargetKey(target), { target, playbook: k8sPlaybook });
+      if (config.depsAlerts !== null) for (const target of depsTargets(config.file, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
       const existing = store.all(config.projectId).filter((b) => b.kind === "ops");
       for (const b of existing) {
         if (wanted.has(b.entityId)) continue;
@@ -1245,14 +1468,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           });
         } else if (b.manualDetach) store.patch(b.id, { manualDetach: false });
       }
-      const playbook = playbookFor(config, "ops");
-      if (playbook === null || (await settings.get()).paused) return;
-      for (const [key, target] of wanted) {
+      if ((await settings.get()).paused) return;
+      for (const [key, { target, playbook }] of wanted) {
         const b = existing.find((x) => x.entityId === key);
         if (b === undefined) {
           let created: Binding;
+          const title = target.kind === "k8s-namespace" ? `Ops watch: ${target.name}` : `Deps watch: ${target.repo}`;
           try {
-            created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title: `Ops watch: ${target.name}`, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
+            created = store.create({ projectId: config.projectId, source: "ops", entityId: key, entityKey: key, url: null, title, kind: "ops", playbook: playbook.name, playbookVersion: playbook.version, parentBindingId: null, phase: "watching", stage: null });
           } catch {
             continue; // made concurrently
           }
@@ -1262,7 +1485,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await serial(`b:${b.id}`, async () => {
             const fresh = store.binding(b.id);
             if (fresh === null || fresh.endedAt === null) return;
-            await reopen(fresh, `${key} is listed in ops.targets again`);
+            await reopen(fresh, `${key} is configured again`);
             await reconcileBinding(b.id, "reopen");
           });
         }
@@ -1362,7 +1585,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
 
     /** Which kind of binding an entity wants in this project, or null for none. */
-    function adoptionKind(config: ProjectConfig, e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean }, viewer: string | null): BindingKind | null {
+    function adoptionKind(config: ProjectConfig, e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string }, viewer: string | null): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
       if (e.source === "linear") {
         const playbook = playbookFor(config, "ticket");
@@ -1373,6 +1596,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const playbook = playbookFor(config, "pr");
         return playbook !== null && !isTerminal(playbook, e.state) ? "pr" : null;
       }
+      // The dependency watch adopts the bot's version-update pull requests in
+      // the repos it watches, whether or not they are labelled. deps-prs
+      // reviews them and escalates for a human merge; it never merges.
+      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && config.repos.some((r) => lc(r) === lc(e.unit))) return "pr";
       const review = playbookFor(config, "review");
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;
@@ -1400,7 +1627,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (store.byEntity(entity.source, entity.id) !== null) return null;
       const kind = adoptionKind(config, { ...entity, draft: entity.pull?.draft ?? false }, entity.viewer);
       if (kind === null) return null;
-      const playbook = playbookFor(config, kind)!;
+      const depBot = kind === "pr" && entity.author !== null && DEPENDENCY_BOTS.has(lc(entity.author));
+      const playbook = (depBot ? config.depsPrs : null) ?? playbookFor(config, kind);
+      if (playbook === null) return null;
       const parent = kind === "ticket" ? await managedAncestor(entity) : null;
       const { phase, stage } = phaseAndStage(playbook, entity.state);
       let b: Binding;
@@ -1437,6 +1666,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bound = store.byEntity(source, id);
       if (bound !== null) scheduleReconcile(bound.id);
       if (source === "github") {
+        // A Dependabot alert doorbell names the alert, not the repository's
+        // ops binding; wake that repository's dependency watch. An id with a
+        // github binding is an issue or pull request, not an alert.
+        const repo = bound === null ? repoOfFingerprint(id) : null;
+        if (repo !== null) {
+          const deps = store.byEntity("ops", opsTargetKey({ kind: "dependabot", repo }));
+          if (deps !== null && deps.endedAt === null) scheduleReconcile(deps.id);
+        }
         for (const t of store.open()) {
           if (t.kind === "ticket" && (t.lastSnapshot?.entity.linkedPulls ?? []).some((l) => lc(l.key) === lc(id))) scheduleReconcile(t.id);
         }
@@ -2533,7 +2770,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
           }
           const config = await loadConfig(b.projectId);
-          const playbook = config === null ? null : playbookFor(config, b.kind);
+          const playbook = config === null ? null : bindingPlaybook(config, b);
           // Follow-through has one deadline from when it was first declared; a
           // requeue past it is a requeue at it.
           const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (input.followThrough === undefined ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
@@ -2954,7 +3191,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (!(await settings.get()).paused) await adoptionPass(config);
         await keepProjectSteward(config.projectId);
         await syncOpsBindings(config);
-        const playbooks = config.playbooks;
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -2967,8 +3203,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             });
             continue;
           }
-          const playbook = playbooks[b.kind];
-          if (playbook !== undefined) {
+          const playbook = bindingPlaybook(config, b);
+          if (playbook !== null) {
             const limit = stuckDue(b, playbook, store.openEscalations(b.id), now());
             if (limit !== null) await raise(b, "stuck", `${b.entityKey}'s status has not moved in ${formatDuration(limit)} (phase ${b.phase}). What should happen?`, "Carrying on as before.");
           }
@@ -3071,6 +3307,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);
       }
+      lines.push(`deps-alerts: ${config.depsAlerts === null ? `no playbook (${depsAlertsPlaybookName(config.file)}); the dependency watch is off` : `${config.depsAlerts.name}@${config.depsAlerts.version}`}`);
+      lines.push(`deps-prs: ${config.depsPrs === null ? `no playbook (${depsPrsPlaybookName(config.file)}); Dependabot pull requests are not adopted` : `${config.depsPrs.name}@${config.depsPrs.version}`}`);
       const validate = async (source: Source, units: string[], states: string[]) => {
         if (units.length === 0) return;
         try {
@@ -3093,7 +3331,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const host = await projectHost(projectId);
         lines.push(`ops: kubectl runs on ${host ?? "no machine"}${config.file.ops.context === undefined ? ", in its current context" : `, in context ${config.file.ops.context}`}`);
         const reader = opsReaderFor(config);
-        for (const target of opsTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
+        for (const target of k8sTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
+      }
+      const deps = config.file.deps;
+      const slaText = (v: number | "asap") => (v === "asap" ? "asap" : formatDuration(v));
+      lines.push(`deps: sla critical=${slaText(deps.sla.critical)} high=${slaText(deps.sla.high)} medium=${slaText(deps.sla.medium)} low=${slaText(deps.sla.low)}; batch medium=${formatDuration(deps.batch.medium)} low=${formatDuration(deps.batch.low)}; autoAdopt ${deps.autoAdopt.join(", ") || "(none)"}`);
+      const depsRepos = depsTargets(config.file, config.repos);
+      if (config.depsAlerts !== null && depsRepos.length > 0) {
+        lines.push(`deps: watching ${depsRepos.length} repo${depsRepos.length === 1 ? "" : "s"} for alerts: ${depsRepos.map((t) => t.repo).join(", ")}`);
+        try {
+          const out = await sourceRpc("github", "sourceDependabotAlerts", { units: depsRepos.map((t) => t.repo), state: "open" }, sourceContract.sourceDependabotAlerts.output);
+          if (out.viewer !== null) lines.push(`deps: reading alerts as ${out.viewer}`);
+          for (const e of out.errors) lines.push(`deps: skipping ${e}: the gh login cannot read its alerts (a skip, not a problem)`);
+        } catch (error) {
+          lines.push(`problem: deps: could not read alerts: ${errorMessage(error)}`);
+        }
       }
       return { ok: !lines.some((l) => l.startsWith("problem:")), lines };
     }
@@ -3261,7 +3513,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (b.endedAt !== null) return { exitCode: 0, stdout: `${b.entityKey} has already ended (${b.endReason}).` };
               store.patch(b.id, { manualDetach: true });
               const config = await loadConfig(b.projectId);
-              const playbook = config === null ? null : playbookFor(config, b.kind);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
               await serial(`b:${b.id}`, async () => {
                 const fresh = store.binding(b.id)!;
                 if (config === null || playbook === null || fresh.lastSnapshot === null) await finishEnding(fresh, "detach");

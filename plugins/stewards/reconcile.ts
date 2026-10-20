@@ -505,9 +505,12 @@ const hasLabel = (entity: EntitySnapshot, label: string) => entity.labels.some((
  * ending reopens it too: a ticket an automation moved to Done and someone
  * moved straight back should not cost its steward its workers.
  */
-export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string): Lifecycle {
+export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean } = {}): Lifecycle {
   const terminal = isTerminal(playbook, entity.state);
-  const labelled = binding.kind === "review" || hasLabel(entity, label);
+  // A review binding is not labelled; a binding the plugin adopts itself (a
+  // dependency bot's pull request) has no label to hold it, so its label is
+  // not required either.
+  const labelled = binding.kind === "review" || opts.labelRequired === false || hasLabel(entity, label);
   if (binding.endedAt !== null) {
     if (terminal || !labelled || binding.manualDetach) return { kind: "stay-ended" };
     if (binding.endReason === "terminal") return { kind: "reopen", why: `reopened: now ${entity.state}` };

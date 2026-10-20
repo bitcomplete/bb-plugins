@@ -20,9 +20,13 @@ export const SUBSCRIBE_BATCH = 100;
 /**
  * What a lease hangs off. `issue` is one issue or pull request,
  * "owner/repo#12"; `repo` is a whole repository, "owner/repo", and receives
- * every doorbell whose unit it is. Doorbells themselves are always `issue`.
+ * every issue doorbell whose unit it is; `dependabot_repo` is a whole
+ * repository and receives every `dependabot_alert` doorbell in it. Doorbells
+ * are always `issue` or `dependabot_alert`; the unit lease kinds are
+ * separate because reading a repository does not entitle a token to its
+ * alerts (bb-gate/docs/hooks.md).
  */
-export type LeaseKind = "issue" | "repo";
+export type LeaseKind = "issue" | "repo" | "dependabot_repo";
 export type Lease = { kind: LeaseKind; id: string };
 
 // ---- server-sent events ----------------------------------------------------
@@ -212,8 +216,12 @@ export interface HooksLoopDeps {
   refreshToken: () => Promise<string>;
   /** Every lease to hold, right now: watched issues, and whatever stewards asked for. */
   watchIds: () => Lease[];
-  /** A doorbell for an issue, with the unit (the repository) it fell in when the service named one: look at it again. */
-  onDoorbell: (issueId: string, unit: string | null) => void;
+  /**
+   * A doorbell: the kind (`issue` or `dependabot_alert`), the entity id, and
+   * the unit (the repository) when the service named one. The caller decides
+   * what to look at.
+   */
+  onDoorbell: (kind: string, id: string, unit: string | null) => void;
   /** Leases the service refused. The caller decides what that means for each watch. */
   onRejected: (rejected: Rejection[]) => Promise<void>;
   /** Check every watch against its cursor. */
@@ -418,10 +426,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           // `action` and `at` are for the service's logs; the reaction to any
           // doorbell is the same check. The unit is passed on so a repository
           // lease can tell which of its doorbells it was rung for.
-          if (doorbell.success && doorbell.data.source === SOURCE && doorbell.data.kind === "issue") {
+          if (doorbell.success && doorbell.data.source === SOURCE && (doorbell.data.kind === "issue" || doorbell.data.kind === "dependabot_alert")) {
             doorbells.push();
             const unit = doorbell.data.unit?.trim() ?? "";
-            deps.onDoorbell(doorbell.data.id, unit === "" ? null : unit);
+            deps.onDoorbell(doorbell.data.kind, doorbell.data.id, unit === "" ? null : unit);
           }
         }
       }

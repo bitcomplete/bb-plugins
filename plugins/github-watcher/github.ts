@@ -4,11 +4,15 @@
 // function that talks to the network takes its fetch as an argument, and no
 // token appears in anything this module returns or throws.
 import { z } from "zod";
-import { SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type EntitySnapshot } from "./source-contract.js";
+import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type DependabotAlert, type DependabotSeverity, type EntitySnapshot } from "./source-contract.js";
 
 export const GITHUB_URL = "https://github.com";
 export const GITHUB_API_URL = "https://api.github.com";
 export const GRAPHQL_PATH = "/graphql";
+
+/** The Dependabot alerts REST path for one repository, and one alert's. */
+export const dependabotAlertsPath = (repo: string, state: string, perPage = 100): string => `/repos/${repo}/dependabot/alerts?state=${encodeURIComponent(state)}&per_page=${perPage}`;
+export const dependabotAlertPath = (repo: string, number: number): string => `/repos/${repo}/dependabot/alerts/${number}`;
 
 export class GitHubRequestError extends Error {
   constructor(
@@ -486,3 +490,55 @@ export function parseOpenPulls(payload: unknown): { viewer: string | null; entit
 
 /** "pull request" or "issue", for prose. */
 export const kindName = (kind: Target["kind"]): string => (kind === "pull" ? "pull request" : "issue");
+
+// ---- Dependabot alerts -------------------------------------------------------------
+
+const dependabotAlertNode = z.object({
+  number: z.number(),
+  state: z.string(),
+  dependency: z
+    .object({
+      package: z.object({ ecosystem: z.string(), name: z.string() }),
+      manifest_path: z.string().nullish(),
+    })
+    .nullish(),
+  security_advisory: z.object({ ghsa_id: z.string().nullish(), severity: z.string().nullish(), summary: z.string().nullish() }).nullish(),
+  security_vulnerability: z.object({ severity: z.string().nullish(), first_patched_version: z.object({ identifier: z.string() }).nullish() }).nullish(),
+  html_url: z.string().nullish(),
+  url: z.string().nullish(),
+  created_at: z.string().nullish(),
+  updated_at: z.string().nullish(),
+});
+
+/** GitHub's severity is one of the four; anything unexpected is read as low rather than thrown away. */
+const severityOf = (value: string | null | undefined): DependabotSeverity => {
+  const s = (value ?? "").toLowerCase();
+  return (DEPENDABOT_SEVERITIES as readonly string[]).includes(s) ? (s as DependabotSeverity) : "low";
+};
+
+/**
+ * One page of `GET /repos/{owner}/{repo}/dependabot/alerts`, as the shared
+ * contract wants it. `repo` is the name the caller asked with; GitHub's
+ * answer does not repeat it. The alert number is the repository's own alert
+ * numbering, which is what the entity id and fingerprint use.
+ */
+export function parseDependabotAlerts(payload: unknown, repo: string): DependabotAlert[] {
+  const parsed = z.array(dependabotAlertNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a Dependabot alert list");
+  return parsed.data.map((a) => ({
+    id: `${repo}#${a.number}`,
+    repo,
+    number: a.number,
+    severity: severityOf(a.security_advisory?.severity ?? a.security_vulnerability?.severity),
+    package: a.dependency?.package.name ?? "(unknown)",
+    ecosystem: a.dependency?.package.ecosystem ?? "unknown",
+    manifestPath: a.dependency?.manifest_path ?? null,
+    state: a.state,
+    ghsaId: a.security_advisory?.ghsa_id ?? null,
+    fixedVersion: a.security_vulnerability?.first_patched_version?.identifier ?? null,
+    summary: a.security_advisory?.summary ?? null,
+    url: a.html_url ?? null,
+    createdAt: a.created_at ?? null,
+    updatedAt: a.updated_at ?? null,
+  }));
+}

@@ -38,11 +38,19 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden" };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
-    if (String(url) !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
+    const u = String(url);
+    const dependabot = /\/repos\/([^/]+)\/([^/]+)\/dependabot\/alerts(?:\?|$)/u.exec(u);
+    if (dependabot !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      if (`${dependabot[1]}/${dependabot[2]}`.toLowerCase() !== "acme/widgets") return Response.json({ message: "Not Found" }, { status: 404 });
+      if (state.dependabotStatus !== 200) return Response.json({ message: state.dependabotMessage }, { status: state.dependabotStatus });
+      return Response.json(state.dependabotAlerts);
+    }
+    if (u !== `${API_URL}/graphql`) return new Response("not found", { status: 404 });
     const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
     calls.push({ token, variables: body.variables });
     if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
@@ -498,6 +506,52 @@ describe("stewards' source contract", () => {
     expect(w.github.calls.find((c) => c.variables.first !== undefined)!.variables).toMatchObject({ owner: "Acme", name: "Widgets", first: 1, after: null });
   });
 
+  it("reads a repository's Dependabot alerts, naming a repository or a repo the token cannot read rather than failing", async () => {
+    const w = await setup();
+    w.github.state.dependabotAlerts = [
+      {
+        number: 4,
+        state: "open",
+        dependency: { package: { ecosystem: "npm", name: "lodash" }, manifest_path: "package-lock.json" },
+        security_advisory: { ghsa_id: "GHSA-x", severity: "high", summary: "Prototype pollution" },
+        security_vulnerability: { severity: "high", first_patched_version: { identifier: "4.17.21" } },
+        html_url: "https://github.com/Acme/Widgets/security/dependabot/4",
+        created_at: "2026-10-01T00:00:00Z",
+        updated_at: "2026-10-02T00:00:00Z",
+      },
+    ];
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toEqual({
+      viewer: "dev",
+      alerts: [
+        {
+          id: "Acme/Widgets#4",
+          repo: "Acme/Widgets",
+          number: 4,
+          severity: "high",
+          package: "lodash",
+          ecosystem: "npm",
+          manifestPath: "package-lock.json",
+          state: "open",
+          ghsaId: "GHSA-x",
+          fixedVersion: "4.17.21",
+          summary: "Prototype pollution",
+          url: "https://github.com/Acme/Widgets/security/dependabot/4",
+          createdAt: "2026-10-01T00:00:00Z",
+          updatedAt: "2026-10-02T00:00:00Z",
+        },
+      ],
+      errors: [],
+    });
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["acme/gone", "widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], errors: ["acme/gone: GitHub answered HTTP 404: Not Found", "widgets: not owner/repo"] });
+  });
+
+  it("names a repository whose alerts the token cannot read (403) without failing the whole call", async () => {
+    const w = await setup();
+    w.github.state.dependabotStatus = 403;
+    w.github.state.dependabotMessage = "Resource not accessible by integration";
+    expect(await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)).toMatchObject({ alerts: [], errors: ["Acme/Widgets: GitHub answered HTTP 403: Resource not accessible by integration"] });
+  });
+
   describe("interest", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
@@ -516,7 +570,7 @@ describe("stewards' source contract", () => {
       expect(w.hooks.subscribes).toEqual([]);
 
       expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/gadgets"], entities: ["https://github.com/Acme/Widgets/pull/12"] }, STEWARDS)).toEqual({ ok: true });
-      expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"] });
+      expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"], dependabot: [] });
       type Interest = { units: string[]; entities: Array<{ key: string; url: string | null }>; unleased: Array<{ key: string; reason: string }> };
       const interestOf = async () => ((await w.harness.callRpc("watches", null)) as { interest: Interest }).interest;
       expect(await interestOf()).toMatchObject({ units: ["acme/gadgets"], entities: [{ key: "Acme/Widgets#12", url: "https://github.com/Acme/Widgets/issues/12" }], unleased: [] });
@@ -548,6 +602,28 @@ describe("stewards' source contract", () => {
         { key: "Acme/Widgets#12", reason: "refused by bb-gate-hooks (forbidden)" },
       ]);
       expect(w.send).not.toHaveBeenCalled();
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("leases Dependabot repositories and rings stewards for dependabot_alert doorbells, skipping a refused lease", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: ["acme/widgets"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "dependabot_repo", id: "acme/widgets" }]]);
+      // A dependabot_alert doorbell in the leased repository rings stewards; one elsewhere does not.
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "dependabot_alert", id: "Acme/Widgets#4", unit: "Acme/Widgets" })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "dependabot_alert", id: "Acme/Other#4", unit: "Acme/Other" })}\n\n`);
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/Widgets#4" } }]);
+      // A refused dependabot_repo lease is a skip, logged as one.
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+      await tick(30 * 60_000);
+      expect(w.harness.logEntries.some((l) => l.message.includes("this server skips Dependabot alerts there"))).toBe(true);
       service.controller.abort();
       await service.done;
     });

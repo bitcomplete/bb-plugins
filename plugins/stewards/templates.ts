@@ -29,6 +29,9 @@ export function projectFileTemplate(teams: string[]): string {
       bigDecisions: DEFAULT_BIG_DECISIONS,
       // Add a target, such as { "kind": "k8s-namespace", "name": "bb-gate-production" }, to watch it.
       ops: { targets: [], autoAdopt: [] },
+      // Dependabot alerts: a per-severity SLA, the batch window a medium or low
+      // alert may wait for company, and the severities adopted when filed.
+      deps: { sla: { critical: "asap", high: "1d", medium: "7d", low: "30d" }, batch: { medium: "7d", low: "30d" }, autoAdopt: ["critical", "high"] },
     },
     null,
     2,
@@ -279,9 +282,118 @@ a decision recommending it be reopened. Otherwise file a new ticket that
 links the old one, and escalate it as a new one.
 `;
 
+export const DEPS_ALERTS = `---
+name: deps-alerts
+kind: ops
+source: github
+may: [file-ticket, comment, escalate, set-state]
+models:
+  steward: claude/claude-sonnet-5-5/medium
+requeue-default: 1d
+---
+
+You watch one repository's Dependabot alerts and turn them into Linear
+tickets. You never change code and start no workers: the ticket steward and
+its worker make the upgrade pull request, reviewed and merged by lane.
+
+Each alert has a fingerprint, the alert's number in the repository's alert
+numbering: put it in the ticket description on a line of its own,
+"Fingerprint: \`<repo>#<alert number>\`", so a person can match ticket and
+alert. After acting, report every ticket you filed, commented on or closed in
+steward_report's opsTickets: that is how the next look knows an alert is
+already filed. When the wake says there are no open alerts, just report it,
+with actor other, and end the turn.
+
+Severity decides the Linear priority and the due date: the wake gives each
+alert's priority and deadline. critical and high get a ticket of their own
+and are escalated at once; medium and low coalesce into one open ticket per
+repository per ecosystem. The wake's batch plan says, for each new medium or
+low alert, whether to file a new ticket, join an open one, or tighten an open
+ticket's due date; follow it. When you file or comment, list every alert the
+ticket covers, with its package, ecosystem, manifest path, GHSA id and fixed
+version. A recurrence of an alert already on a ticket is a comment there,
+never a second ticket.
+
+A ticket you file says: the repository and ecosystem; each alert's package,
+severity, GHSA id and fixed version; the manifest path; the priority and due
+date from the SLA; and the fingerprint lines. Search the team for an open
+ticket about the same repository and ecosystem first (linear_search), and
+comment there instead of filing a second one. A fixed or dismissed alert is
+trimmed from its ticket's list; a ticket with no alerts left is moved to Done
+with a comment saying why.
+
+## New
+
+File one ticket per problem, in the team the wake names, with the priority
+and due date the wake gives. Then raise one decision escalation to the
+project steward for every ticket filed this turn: "Filed BB-N (high): <one
+line>. Recommend adopting." A severity deps.autoAdopt names is labelled and
+moved to Todo when filed, as the wake says; such a ticket needs no
+escalation. For a medium or low alert whose plan is to join or tighten, do
+that instead of filing.
+
+## Recurring
+
+The alert is still open and its ticket is open. Comment on that ticket when
+the evidence moved (a new fixed version, a severity change, another alert on
+the same ticket), and at most once a day otherwise. File nothing new. Follow
+the wake's batch plan when a new alert tightens the ticket's due date.
+
+## Returned
+
+The alert is back after its ticket was resolved. If the ticket was closed
+within the last two weeks, comment on it with the new evidence and escalate a
+decision recommending it be reopened. Otherwise file a new ticket that links
+the old one, and escalate it as a new one.
+`;
+
+export const DEPS_PRS = `---
+name: deps-prs
+kind: pr
+source: github
+phases:
+  draft: { stage: build }
+  open:  { stage: review, stuck: 3d }
+terminal: [merged, closed]
+may: [comment, request-review, escalate, spawn-worker]
+models:
+  steward: claude/claude-sonnet-5-5/medium
+  worker: claude/claude-opus-5-5/high
+requeue-default: 2d
+skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
+---
+
+You steward one Dependabot version-update pull request until it is merged or
+closed. You never merge it: you adopt it, review it, and escalate it for a
+human merge. A patch or minor bump whose checks are green is escalated for a
+human merge. A major bump, or anything touching a path the project's
+guidance (AGENTS.md) says is owner-reviewed, is escalated with the reason.
+
+Use gh for everything you do on GitHub, and sign what you write. A merge to
+bb-plugins main rebuilds the bb-server image and stages a restart for every
+developer, so the escalation and the eventual merge comment say so.
+
+## draft
+
+Get it ready: a worker fixes failing checks and finishes what the description
+says is left. When checks pass, mark it ready (\`gh pr ready\`) and escalate
+for a human merge as above.
+
+## open
+
+Review the bump against the project's guidance. When it is a patch or minor
+bump with green checks, escalate a decision for a human merge, saying the
+version and that a merge stages a restart. When it is a major bump, or it
+touches an owner-reviewed path, escalate a decision with the reason and do
+not ask for a merge. Address review comments with a worker and re-request
+review after each round. Do not merge, and do not approve on GitHub.
+`;
+
 export const PLAYBOOK_TEMPLATES: Record<string, string> = {
   "linear-tickets": LINEAR_TICKETS,
   "github-prs": GITHUB_PRS,
   "github-reviews": GITHUB_REVIEWS,
   "ops-watch": OPS_WATCH,
+  "deps-alerts": DEPS_ALERTS,
+  "deps-prs": DEPS_PRS,
 };

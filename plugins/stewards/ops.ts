@@ -11,14 +11,18 @@
 import { z } from "zod";
 import type { Change } from "./reconcile.js";
 
-export type OpsTarget = { kind: "k8s-namespace"; name: string };
+export type K8sTarget = { kind: "k8s-namespace"; name: string };
+export type DependabotTarget = { kind: "dependabot"; repo: string };
+export type OpsTarget = K8sTarget | DependabotTarget;
 
-/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production". */
-export const opsTargetKey = (t: OpsTarget): string => `${t.kind}/${t.name}`;
+/** The binding's entity id and key for a target: "k8s-namespace/bb-gate-production" or "dependabot/acme/web". */
+export const opsTargetKey = (t: OpsTarget): string => (t.kind === "k8s-namespace" ? `${t.kind}/${t.name}` : `${t.kind}/${t.repo}`);
 
 export function parseOpsTargetKey(key: string): OpsTarget | null {
-  const m = /^(k8s-namespace)\/([a-z0-9][-a-z0-9]*)$/u.exec(key);
-  return m === null ? null : { kind: m[1] as OpsTarget["kind"], name: m[2]! };
+  const k8s = /^(k8s-namespace)\/([a-z0-9][-a-z0-9]*)$/u.exec(key);
+  if (k8s !== null) return { kind: "k8s-namespace", name: k8s[2]! };
+  const dep = /^(dependabot)\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/u.exec(key);
+  return dep === null ? null : { kind: "dependabot", repo: dep[2]! };
 }
 
 // ---- reading the Kubernetes API's JSON --------------------------------------------

@@ -869,6 +869,63 @@ The rules that hold:
   names the user, the owner or a human with no open needs item is refused and
   told to file one, so the ask reaches the page instead of only the prose.
 
+## 19. Dependency stewards
+
+Nothing kept dependencies current: a vulnerable or stale package was
+noticed by a person reading a build log, or not at all. GitHub does the
+scanning, and the stewards turn its findings into tickets. Two kinds of
+binding do it.
+
+```jsonc
+"deps": {
+  "sla":       { "critical": "asap", "high": "1d", "medium": "7d", "low": "30d" },
+  "autoAdopt": ["critical", "high"],
+  "batch":     { "medium": "7d", "low": "30d" }
+}
+```
+
+- **Dependabot alerts are an `ops` target kind**, `{ "kind": "dependabot",
+  "repo": "owner/repo" }`. The default is every repo in `repos.json` not in
+  `github.exclude`; the project file may list explicit targets instead. The
+  binding's key is `dependabot/owner/repo`, it runs the `deps-alerts`
+  playbook, and it is woken by the `dependabot_alert` doorbell rather than a
+  look interval.
+- **The github plugin reads the alerts** with the developer's token from
+  `GET /repos/{owner}/{repo}/dependabot/alerts`, through the shared
+  `sourceDependabotAlerts` RPC. It leases each watched repo as a
+  `dependabot_repo` (a plain `repo` lease does not receive alert doorbells)
+  and rings stewards for each `dependabot_alert` doorbell. Reading alerts
+  needs the token's alert access; a `rejected: forbidden` lease is a skip,
+  not an error, and `bb stewards check` says which repos are skipped.
+- **Severity maps onto priority and the deadline.** critical → urgent and
+  due now, high → high and due in a day, and so on. `asap` escalates at
+  once rather than waiting for the adopt pass. The alert's fingerprint is
+  `owner/repo#<alert number>` (the alert's own numbering), recorded in the
+  ops fingerprint map so a recurrence is a comment, never a second ticket.
+- **critical and high get their own ticket; medium and low coalesce** into
+  one open ticket per repo per ecosystem. A new alert joins that ticket
+  when its due date is inside the new alert's deadline, and otherwise
+  tightens the ticket's due date to the new deadline. The plugin computes
+  the plan (`new`, `join` or `tighten`) from the fingerprint map and gives
+  it to the steward in the wake; the steward files or comments.
+- **A fixed or dismissed alert leaves the open list**, the look says so,
+  and the steward trims it from its ticket or moves the ticket to Done when
+  nothing is left.
+- **The nightly pass re-lists every watched repo's open alerts**, so a
+  missed doorbell costs a night, not a deadline.
+- **`deps-prs` adopts the bot's version-update pull requests.** A
+  `dependabot[bot]` pull request in a watched repo gets a `pr` binding under
+  the `deps-prs` playbook whether or not it is labelled. It reviews the bump
+  and escalates for a human merge; it never merges. A patch or minor bump
+  with green checks is escalated for a merge, and a major bump or anything
+  touching an owner-reviewed path is escalated with the reason.
+
+`bb stewards init` writes `deps-alerts.md` and `deps-prs.md`; a project
+that has not written them runs no dependency watch, which is how the feature
+is off until it is wanted. The dependency watch's targets are derived from
+the repo set, so a repo added to `repos.json` is watched without a second
+edit.
+
 ## Known limits
 
 - **Multi-repo projects only.** A bb project whose source is a single
