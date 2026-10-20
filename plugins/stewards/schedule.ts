@@ -36,12 +36,20 @@ export function touchesOverlap(a: readonly string[], b: readonly string[]): stri
 }
 
 /**
- * Whether a binding is at work on its touches: being built or reviewed, not
- * held, not ending, not ended, and its pull requests not all merged yet (work
- * that has landed is what the next ticket rebases onto, not a conflict).
+ * Whether a binding is at work on its touches: being built or reviewed, or
+ * cleared to start (its gate passed, nothing holds or schedules it: the
+ * steward is moving it and starting a worker, and Linear's state reaches the
+ * plugin a look later); not held, not ending, not ended, and its pull
+ * requests not all merged yet (work that has landed is what the next ticket
+ * rebases onto, not a conflict).
  */
 export const atWork = (b: Binding): boolean =>
-  b.endedAt === null && b.ending === null && b.hold === null && (b.stage === "build" || b.stage === "review") && b.touches.length > 0 && !(b.lastSnapshot !== null && allPullsMerged(b, b.lastSnapshot));
+  b.endedAt === null &&
+  b.ending === null &&
+  b.hold === null &&
+  (b.stage === "build" || b.stage === "review" || b.clearedToStart) &&
+  b.touches.length > 0 &&
+  !(b.lastSnapshot !== null && allPullsMerged(b, b.lastSnapshot));
 
 export type Conflict = { with: Binding; on: string[] };
 

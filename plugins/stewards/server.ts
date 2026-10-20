@@ -1535,7 +1535,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * watch, production to verify); they are stopped when it ends.
      */
     async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
-      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed });
+      b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
+      // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
+      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : "was detached");
       if (kind === "detach") await stopWorkers(b);
       bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : "was detached"}; one last turn`);
       if (b.threadId === null) {
@@ -1888,19 +1890,34 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function syncScheduleRequest(b: Binding, playbook: Playbook): Promise<Escalation | null> {
       const open = store.openEscalations(b.id).filter((x) => x.kind === "schedule");
-      const withdraw = (why: string) => {
+      // Cleared: the gate has passed and nothing holds or schedules it, so it
+      // is starting now, and the next ticket to pass its gate, before Linear
+      // shows this one In Progress, schedules against it rather than racing it.
+      const cleared = (v: boolean) => {
+        if (b.clearedToStart !== v) store.patch(b.id, { clearedToStart: v });
+      };
+      const withdraw = (why: string, startable: boolean) => {
         for (const x of open) store.resolve(x.id, why);
+        cleared(startable);
         return null;
       };
-      if (b.kind !== "ticket" || b.endedAt !== null || b.ending !== null || b.lastSnapshot === null) return withdraw("Withdrawn.");
-      if (b.hold !== null) return withdraw("Held.");
+      if (b.kind !== "ticket" || b.endedAt !== null || b.ending !== null || b.lastSnapshot === null) return withdraw("Withdrawn.", false);
+      if (b.hold !== null) return withdraw("Held.", false);
       const gate = gateState(playbook, b.ready, specHashFor(b, b.lastSnapshot.entity));
-      if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.");
-      if (b.stage === "review" || store.workers(b.id).some((w) => w.status === "running")) return withdraw("Withdrawn: the work has started.");
+      if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
+      if (b.stage === "review" || store.workers(b.id).some((w) => w.status === "running")) return withdraw("Withdrawn: the work has started.", true);
       const conflicts = conflictsOf(b, store.open(b.projectId));
-      if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.");
+      if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.", true);
       const keys = conflicts.map((c) => c.with.entityKey);
-      if (open.length > 0 || keys.every((k) => b.scheduleAsked.includes(k))) return null;
+      if (open.length > 0) {
+        cleared(false);
+        return null;
+      }
+      if (keys.every((k) => b.scheduleAsked.includes(k))) {
+        cleared(true);
+        return null;
+      }
+      cleared(false);
       store.patch(b.id, { scheduleAsked: keys });
       const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ");
       const x = store.escalate({
@@ -3206,6 +3223,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               else if (!behind.some((x) => x.id === other.id)) behind.push(other);
             }
             if (missing.length > 0) return toolError(new Error(`Not an open binding in this project to wait behind: ${missing.join(", ")}.`));
+            // No cycles: a hold behind something that, through its own holds, waits behind this binding would never lift.
+            const waitsOn = (from: Binding, seen = new Set<string>()): string | null => {
+              for (const k of from.holdBehind) {
+                const next = store.find(k, from.projectId);
+                if (next === null || next.endedAt !== null || seen.has(next.id)) continue;
+                if (next.id === target.id) return from.entityKey;
+                seen.add(next.id);
+                const via = waitsOn(next, seen);
+                if (via !== null) return via;
+              }
+              return null;
+            };
+            for (const other of behind) {
+              const via = other.id === target.id ? null : waitsOn(other);
+              if (via !== null) return toolError(new Error(`${target.entityKey} cannot wait behind ${other.entityKey}: ${via} already waits behind ${target.entityKey}, so neither hold would ever lift.`));
+            }
           }
 
           done.push(...questionWrites(closing, target));

@@ -169,6 +169,8 @@ export const MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN touches TEXT NOT NULL DEFAULT '[]'`,
   `ALTER TABLE bindings ADD COLUMN hold_behind TEXT NOT NULL DEFAULT '[]'`,
   `ALTER TABLE bindings ADD COLUMN schedule_asked TEXT NOT NULL DEFAULT '[]'`,
+  // A ticket whose gate has passed and that nothing holds or schedules: about to start, so it counts as in flight before Linear says so.
+  `ALTER TABLE bindings ADD COLUMN cleared_to_start INTEGER NOT NULL DEFAULT 0`,
 ];
 
 // ---- values kept as JSON ------------------------------------------------------------
@@ -257,6 +259,8 @@ export type Binding = {
   holdBehind: string[];
   /** Entity keys the project steward was last asked to schedule this binding against; asked again only for a new one. */
   scheduleAsked: string[];
+  /** The gate has passed and nothing holds or schedules it: it is starting, whatever Linear still says, so others schedule against it. */
+  clearedToStart: boolean;
   modelSteward: string | null;
   modelWorker: string | null;
   status: StatusRecord | null;
@@ -320,6 +324,7 @@ function rowToBinding(r: BindingRow): Binding {
     touches: json(z.array(z.string()), str("touches"), []),
     holdBehind: json(z.array(z.string()), str("hold_behind"), []),
     scheduleAsked: json(z.array(z.string()), str("schedule_asked"), []),
+    clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
     modelWorker: str("model_worker"),
     status: json(statusRecordSchema.nullable(), str("status"), null),
@@ -365,6 +370,7 @@ const COLUMNS = {
   touches: "touches",
   holdBehind: "hold_behind",
   scheduleAsked: "schedule_asked",
+  clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",
   modelWorker: "model_worker",
   status: "status",

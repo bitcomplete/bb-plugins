@@ -95,8 +95,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   or lets it start (guidance + resolve, not asked again until a new overlap
   appears). A hold placed `behind` lifts itself once every binding named
   has merged its pull requests or ended: the held steward is woken with a
-  note to rebase, and the project steward is told. Work whose pull requests
-  have all merged no longer counts as in flight. `bb stewards show` prints
+  note to rebase, and the project steward is told. A binding reaching a
+  terminal state, or detached, releases what waits behind it as its ending
+  begins, so a steward that follows through for hours holds nobody up. A
+  hold that would form a cycle is refused. Work whose pull requests have all
+  merged no longer counts as in flight; a ticket whose gate has passed with
+  nothing holding or scheduling it counts as in flight already, so two
+  tickets going ready in the same minute schedule against each other rather
+  than racing to In Progress. `bb stewards show` prints
   what a binding touches and overlaps; the project steward's wake lists
   both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
