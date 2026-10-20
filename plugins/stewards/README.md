@@ -151,7 +151,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   escalation with the project steward, or an `approve-spec` item on the
   Stewards page when the approver is the user (`approval: me`), whatever
   the steward's report says, and closes it once approved or no longer
-  needed. An approval is recorded from the approver's
+  needed. When the project steward forwards an `approval` escalation to
+  you, the plugin files the same `approve-spec` item and keeps the
+  escalation open, linked to it, so a forwarded approval is answered with
+  Approve/Decline exactly as `approval: me` is; a forwarded `decision`
+  stays a question. An approval is recorded from the approver's
   words wherever they are: the project steward's guidance that resolves the
   request, the user's answer on the Stewards page, their message in the
   steward's thread, or their unsigned approving comment on the entity. A

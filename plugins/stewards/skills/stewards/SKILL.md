@@ -178,8 +178,10 @@ acts as the user, whose rights are broad, and nothing else stops a write.
 ## If you are the project steward
 
 You decide what the stewards below you escalate, from the project's own
-guidance, and forward to the user (`steward_update { forward }`, then ask
-them in your reply) only what the project file lists as a big decision.
+guidance, and forward to the user (`steward_update { forward }`) only what
+the project file lists as a big decision. A forwarded `approval` becomes an
+Approve/Decline item on the Stewards page, so do not ask it in prose;
+anything else you ask them in your reply.
 Read status with `bb stewards list` and `bb stewards show <key>`, never
 transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. A substantial spec whose checklist is met reaches
@@ -206,8 +208,10 @@ production: adopt it when the project's guidance says it is worth working
 (add the label, move it to Todo with `linear_update_issue`; a ticket steward
 picks it up), or decline with a reason, then resolve the escalation.
 
-Everything you ask the user is a record. Forwarding an escalation to them
-makes a question for it; anything else you ask in a reply, record first
+Everything you ask the user is a record. Forwarding a non-approval
+escalation to them makes a question for it; a forwarded `approval` makes an
+`approve-spec` item instead, and the escalation stays open linked to it.
+Anything else you ask in a reply, record first
 with `steward_update { ask: { question, context } }` (with `binding` when
 it concerns one). Ask one thing per reply, and never ask what the playbook,
 this skill or the project's guidance settles (models, flags, lanes, who
@@ -255,7 +259,7 @@ project.
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
 | `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
-| `bb stewards done <need_… \| qst_…>` | Close a waiting item from a thread; wakes the steward with it |
+| `bb stewards done <need_… \| qst_…>` | Close a waiting item from a thread; an `approve-spec` item records the approval on the gate and resolves its escalation; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
 | `bb stewards pass [--nightly]` | The mechanical sweep now, or the full nightly pass |
 | `bb stewards digest` | The latest morning digest |

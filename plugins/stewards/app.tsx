@@ -386,7 +386,12 @@ function BoardPage({ subPath }: { subPath: string }) {
 
 function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
   const now = Date.now();
-  const waiting = b.questions.length + b.withUser.length + b.needs.length;
+  // An escalation a need answers is shown as that need's row, not as the raw
+  // escalation: a forwarded approval is answered with Approve/Decline, not by
+  // "approve or decline in its steward's thread".
+  const covered = new Set(b.needs.map((n) => n.escalationId).filter((id): id is string => id !== null));
+  const withUser = b.withUser.filter((x) => !covered.has(x.id));
+  const waiting = b.questions.length + withUser.length + b.needs.length;
   return (
     <>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -412,7 +417,7 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
             {b.questions.map((q) => (
               <QuestionRow key={q.id} question={q} now={now} onClosed={refetch} />
             ))}
-            {b.withUser.map((x) => (
+            {withUser.map((x) => (
               <li key={x.id} className="flex flex-col gap-1 p-3">
                 <p className="flex flex-wrap items-center gap-2">
                   <EntityLink entityKey={x.key} url={x.url} />

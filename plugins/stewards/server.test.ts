@@ -1724,6 +1724,7 @@ describe("questions to the user", () => {
       digest: { text: string; at: number } | null;
       questions: Array<{ id: string; question: string; key: string | null; escalationId: string | null }>;
       withUser: Array<{ id: string; kind: string }>;
+      needs: Array<{ id: string; kind: string; escalationId: string | null }>;
       stewards: Array<{ key: string; stage: string | null; summary: string | null; nextAction: string | null; actor: string | null; workers: Array<{ threadId: string; title: string }> }>;
       stuck: Array<{ key: string; why: string }>;
       ended: Array<{ key: string; endReason: string | null }>;
@@ -1849,22 +1850,30 @@ describe("questions to the user", () => {
       const t = await adopted();
       await t.tool("steward_report", { ...base, ready: met }, t.steward);
       const esc = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
-      const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
       const stewardWakes = () => t.sends.filter((s) => s.threadId === t.steward).length;
       const projectWakes = () => t.sends.filter((s) => s.threadId === t.project).length;
-      return { ...t, esc, qst, stewardWakes, projectWakes };
+      return { ...t, esc, stewardWakes, projectWakes };
     }
 
-    it("records a page answer that approves, resolving the escalation in one step", async () => {
+    /** The same, forwarded to the user: the page's Approve/Decline answers the item it files. */
+    async function forwarded() {
       const t = await requested();
-      const answered = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "Approved" }, client);
+      expect((await t.tool("steward_update", { binding: "ENG-12", forward: t.esc }, t.project)).text).toMatch(/as an approve-spec item/u);
+      const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "approve-spec")!;
+      expect(need.data.escalationId).toBe(t.esc);
+      return { ...t, need };
+    }
+
+    it("records the page's Approve, resolving the forwarded escalation in one step", async () => {
+      const t = await forwarded();
+      const answered = await t.harness.callRpc("stewardsNeedAction", { needId: t.need.id, action: "approve" }, client);
       expect(answered).toMatchObject({ ok: true, message: expect.stringMatching(/Approved/u) });
       const b = t.hooks.store.find("ENG-12")!;
       expect(b.ready.approval).not.toBeNull();
       expect(b.ready.approval!.by).toBe("user");
       expect(b.ready.declinedSpecHash).toBeNull();
       expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "resolved" });
-      expect(t.hooks.store.question(t.qst)!.status).toBe("answered");
+      expect(t.hooks.store.need(t.need.id)!.status).toBe("done");
       expect((await t.list())[0]!.escalations).toBe(0);
       // No fresh request is filed for the same spec.
       const before = t.projectWakes();
@@ -1872,26 +1881,22 @@ describe("questions to the user", () => {
       expect(t.projectWakes()).toBe(before);
     });
 
-    it("declines a page answer that clearly refuses", async () => {
-      const t = await requested();
-      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "No, not yet" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
+    it("records the page's Decline, resolving the forwarded escalation", async () => {
+      const t = await forwarded();
+      expect(await t.harness.callRpc("stewardsNeedAction", { needId: t.need.id, action: "decline" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
       const b = t.hooks.store.find("ENG-12")!;
       expect(b.ready.approval).toBeNull();
       expect(b.ready.declinedSpecHash).not.toBeNull();
       expect(t.hooks.store.escalation(t.esc)!.status).toBe("resolved");
+      expect(t.hooks.store.need(t.need.id)!.status).toBe("done");
     });
 
-    it("hands an ambiguous page answer to the project steward, not a decline", async () => {
-      const t = await requested();
-      const before = t.projectWakes();
-      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "What about SSO?" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/project steward/u) });
-      const b = t.hooks.store.find("ENG-12")!;
-      expect(b.ready.approval).toBeNull();
-      expect(b.ready.declinedSpecHash).toBeNull();
-      const x = t.hooks.store.escalation(t.esc)!;
-      expect(x).toMatchObject({ status: "open", route: "project" });
-      expect(t.projectWakes()).toBeGreaterThan(before);
-      expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/ambiguous/u);
+    it("files a need, not a question, when the approval is forwarded", async () => {
+      const t = await forwarded();
+      expect(t.hooks.store.openQuestions("p1").filter((q) => q.escalationId === t.esc)).toEqual([]);
+      const board = await t.board();
+      expect(board.withUser).toEqual([]);
+      expect(board.needs).toMatchObject([{ kind: "approve-spec", escalationId: t.esc }]);
     });
 
     it("records approval when the project steward resolves with approving words, no approve: true", async () => {
@@ -2029,17 +2034,18 @@ describe("questions to the user", () => {
       expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toMatch(/asks for an approval that is already open/u);
     });
 
-    it("passes the BB-11 sequence: page answer, amendment, page answer again, no duplicate request", async () => {
+    it("passes the BB-11 sequence: page Approve, amendment, page Approve again, no duplicate request", async () => {
       const t = await adopted();
-      const answer = async (esc: string, text: string) => {
-        const qst = t.qid((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project)).text);
-        await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: text }, client);
+      const answer = async (esc: string, action: "approve" | "decline") => {
+        await t.tool("steward_update", { binding: "ENG-12", forward: esc }, t.project);
+        const need = t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "approve-spec" && n.data.escalationId === esc)!;
+        await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action }, client);
       };
       const projectWakes = () => t.sends.filter((s) => s.threadId === t.project).length;
 
       await t.tool("steward_report", { ...base, ready: met }, t.steward);
       const first = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
-      await answer(first, "Approved");
+      await answer(first, "approve");
       expect(t.hooks.store.find("ENG-12")!.ready.approval).not.toBeNull();
       const afterFirst = projectWakes();
       await t.tool("steward_report", { ...base, ready: met }, t.steward);
@@ -2053,7 +2059,7 @@ describe("questions to the user", () => {
       expect(second).not.toBe(first);
 
       // And approves the amended spec on the page again.
-      await answer(second, "LGTM");
+      await answer(second, "approve");
       const b = t.hooks.store.find("ENG-12")!;
       expect(b.ready.approval).not.toBeNull();
       expect(b.ready.declinedSpecHash).toBeNull();
@@ -2386,6 +2392,115 @@ describe("needs you items", () => {
     expect(all.find((n) => n.kind === "merge")!.status).toBe("open");
     expect(t.hooks.store.openNeeds(b().id).map((n) => n.kind)).toEqual(["merge"]);
     expect(project).toBeDefined();
+  });
+});
+
+// BB-19: a spec approval the project steward forwards to the user is the
+// user's to decide, so it becomes an `approve-spec` item with Approve and
+// Decline, not a free-text question.
+describe("forwarded spec approvals", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+  const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other" as const };
+
+  /** A bound ticket whose approval request is with the project steward, forwarded to the user. */
+  async function forwarded() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { ...base, ready: met }, steward);
+    const esc = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === project).at(-1)!.text)![1]!;
+    const forwardedText = (await t.tool("steward_update", { binding: "ENG-12", forward: esc }, project)).text;
+    const binding = () => t.hooks.store.find("ENG-12")!;
+    const need = () => t.hooks.store.openNeeds(binding().id).find((n) => n.kind === "approve-spec")!;
+    const projectWakes = () => t.sends.filter((s) => s.threadId === project).length;
+    const stewardWakes = () => t.sends.filter((s) => s.threadId === steward).length;
+    return { ...t, project, steward, esc, forwardedText, binding, need, projectWakes, stewardWakes };
+  }
+
+  it("files exactly one approve-spec need, no question, and keeps the escalation linked", async () => {
+    const t = await forwarded();
+    expect(t.forwardedText).toMatch(/as an approve-spec item/u);
+    const open = t.hooks.store.openNeeds(t.binding().id).filter((n) => n.kind === "approve-spec");
+    expect(open).toHaveLength(1);
+    expect(open[0]!.data.escalationId).toBe(t.esc);
+    expect(open[0]!.filedBy).toBe("plugin");
+    // No free-text question for it, and the escalation stays open with the user.
+    expect(t.hooks.store.openQuestions("p1")).toEqual([]);
+    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "open", route: "me" });
+    // The page shows the item, not the raw escalation row.
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { withUser: unknown[]; needs: Array<{ kind: string; escalationId: string | null }> } };
+    expect(board.board.withUser).toEqual([]);
+    expect(board.board.needs).toMatchObject([{ kind: "approve-spec", escalationId: t.esc }]);
+  });
+
+  it("re-reporting and re-forwarding do not duplicate the need", async () => {
+    const t = await forwarded();
+    // A re-report re-runs syncNeeds: the item is updated, not added.
+    await t.tool("steward_report", { ...base, ready: met }, t.steward);
+    expect(t.hooks.store.openNeeds(t.binding().id).filter((n) => n.kind === "approve-spec")).toHaveLength(1);
+    // A retry of the forward is refused (the escalation is no longer with the
+    // project steward), and changes nothing.
+    expect((await t.tool("steward_update", { binding: "ENG-12", forward: t.esc }, t.project)).error).toBe(true);
+    expect(t.hooks.store.openNeeds(t.binding().id).filter((n) => n.kind === "approve-spec")).toHaveLength(1);
+    expect(t.hooks.store.openQuestions("p1")).toEqual([]);
+  });
+
+  it("Approve records the gate approval, closes the item, resolves the escalation, and wakes both stewards", async () => {
+    const t = await forwarded();
+    const need = t.need();
+    const projectBefore = t.projectWakes();
+    const stewardBefore = t.stewardWakes();
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Approved/u) });
+    expect(t.binding().ready.approval).not.toBeNull();
+    expect(t.binding().ready.approval!.by).toBe("user");
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "resolved" });
+    await t.flush();
+    expect(t.stewardWakes()).toBeGreaterThan(stewardBefore);
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*approved ENG-12's spec on the Stewards page/u);
+    expect(t.projectWakes()).toBeGreaterThan(projectBefore);
+    expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(new RegExp(`${t.esc} is resolved`, "u"));
+  });
+
+  it("Decline records the declined spec hash, closes the item, resolves the escalation, and wakes both stewards", async () => {
+    const t = await forwarded();
+    const need = t.need();
+    const projectBefore = t.projectWakes();
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline", note: "Name the migration." }, client)).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
+    expect(t.binding().ready.approval).toBeNull();
+    expect(t.binding().ready.declinedSpecHash).not.toBeNull();
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "resolved" });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/declined ENG-12's spec on the Stewards page/u);
+    expect(t.projectWakes()).toBeGreaterThan(projectBefore);
+  });
+
+  it("bb stewards done approves the spec and resolves the forwarded escalation", async () => {
+    const t = await forwarded();
+    const need = t.need();
+    const out = await t.harness.behavior.runCli(["done", need.id, "--project", "p1"]);
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toMatch(/Approved/u);
+    expect(t.binding().ready.approval).not.toBeNull();
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    expect(t.hooks.store.escalation(t.esc)).toMatchObject({ status: "resolved" });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/approved ENG-12's spec from a thread/u);
+  });
+
+  it("still asks a question for a forwarded decision", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.tool("steward_report", { ...base, summary: "Scope unclear.", nextAction: "Wait", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === project).at(-1)!.text)![1]!;
+    expect((await t.tool("steward_update", { binding: "ENG-12", forward: esc }, project)).text).toMatch(/to the user as question qst_/u);
+    expect(t.hooks.store.openQuestions("p1")).toHaveLength(1);
+    expect(t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id)).toEqual([]);
   });
 });
 
