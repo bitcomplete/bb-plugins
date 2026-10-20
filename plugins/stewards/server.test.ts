@@ -3312,7 +3312,8 @@ describe("Sentry stewards", () => {
       if ((init?.headers as Record<string, string>).authorization !== "Bearer tok-1") return new Response("", { status: 401 });
       if (status !== 200) return new Response("", { status });
       if (u.pathname === "/api/0/projects/acme/web/") return Response.json({ slug: "web", name: "Web" });
-      if (u.pathname === "/api/0/projects/acme/web/issues/") return Response.json([...issues.values()].filter((i) => i.status === "unresolved"));
+      // The list is the organization's own, as the real one is by its URL; an issue whose permalink names another organization is not in it.
+      if (u.pathname === "/api/0/projects/acme/web/issues/") return Response.json([...issues.values()].filter((i) => i.status === "unresolved" && !String(i.permalink).startsWith("https://other.")));
       const issue = /^\/api\/0\/issues\/(\d+)\/$/u.exec(u.pathname);
       if (issue !== null) return issues.has(issue[1]!) ? Response.json(issues.get(issue[1]!)) : new Response("", { status: 404 });
       if (/^\/api\/0\/issues\/\d+\/events\/latest\/$/u.test(u.pathname)) return Response.json(sentryEvent);
