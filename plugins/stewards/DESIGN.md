@@ -365,9 +365,10 @@ A turn that ends without a report is noted; repeated misses raise `stuck`.
 Not every turn a steward acts on is one the plugin composed. The turns it
 does not compose are:
 
-- a plain message the user types in the steward's thread, and an `@bb`
-  mention (the plugin builds a session wake for a mention, but the turn
-  itself is the provider's);
+- a plain message the user types in the steward's thread, and a trusted
+  `@bb` mention (the plugin builds a session wake for a mention, but the
+  turn itself is the provider's; a mention from anyone other than the
+  server's owner is answered by the plugin and starts no turn);
 - a `bb thread tell` from another thread, including the answer to a worker's
   question;
 - bb core's child-completed notice, and any other core notice a turn starts

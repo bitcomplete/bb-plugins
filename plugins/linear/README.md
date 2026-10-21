@@ -115,10 +115,17 @@ plugin already holds. This plugin's side:
 - **The wake.** A mention is handed to stewards (`stewardsSession` in
   `source-contract.ts`) with the issue, the session id, who asked, and the
   text. The text is marked untrusted unless the asker is the server's
-  owner. The plugin checks this itself and does not rely on the event's own
-  flag. Stewards gives it to the issue's steward or the project steward.
-  When no project here lists the issue's team, or stewards is not
-  installed, the plugin answers the session itself with an `error`.
+  owner; the plugin checks this itself and does not rely on the event's own
+  flag. Stewards gives the owner's words to the issue's steward or the
+  project steward. **A mention from anyone else runs no turn:** stewards
+  parks it and returns `routed: "held"` with a short request id, and the
+  plugin answers the session itself with an `elicitation` asking the owner
+  to `confirm <id>`. That reply releases exactly the named request and
+  wakes the steward with it, framed as the owner's confirmation; a vague
+  answer releases nothing and is re-asked once, and an unknown, expired or
+  already-released id gets a short reply. When no project here lists the
+  issue's team, or stewards is not installed, the plugin answers the
+  session itself with an `error`.
 - **The reply.** The steward ends the turn that handled the mention with
   `linear_session_reply { session, kind, body }`. `kind` is `response`,
   `elicitation` or `error`. The tool signs the body, adds a link to the

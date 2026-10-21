@@ -12,6 +12,7 @@
 //
 // Configuration lives in the project's `.bb`, read through multi-repo's RPC
 // from the canonical checkout's committed HEAD. Nothing here reads a file.
+import { randomBytes } from "node:crypto";
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -3115,66 +3116,167 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // goes to the issue's ticket steward when the issue has an open binding,
     // else to the project steward of the project whose file lists the
     // issue's team; with neither, linear answers the session itself. The
-    // steward answers with linear_session_reply. A request from anyone but
-    // the server's owner waits for the owner to confirm it; it is kept here
-    // so the owner's answer arrives with what it answers.
+    // steward answers with linear_session_reply.
+    //
+    // A mention from anyone but the server's owner runs no turn at all: bb
+    // core cannot withhold a turn's tools, so the words are parked under a
+    // short id and no model sees them. The owner releases exactly one by
+    // replying `confirm <id>`; only then is a steward woken, with the
+    // request framed as confirmed.
 
     const PENDING_KEY = "sessions/pending";
     const PENDING_TTL_MS = 7 * 86_400_000;
     /** At most this many requests wait on the owner per session; the oldest go first. */
     const PENDING_MAX = 5;
-    const pendingItem = z.object({ asker: z.string(), text: z.string(), at: z.string() });
+    const pendingItem = z.object({ id: z.string(), asker: z.string(), text: z.string(), at: z.string() });
     const pendingRecord = z.record(z.string(), z.object({ requests: z.array(pendingItem), savedAt: z.number() }));
-    /** Add a request waiting on the owner, or (with null) take every one waiting, which the owner's words answer. */
-    async function updatePending(session: string, add: PendingRequest | null): Promise<PendingRequest[]> {
-      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
-      const before = all[session]?.requests ?? [];
-      if (add === null) delete all[session];
-      else all[session] = { requests: [...before, add].slice(-PENDING_MAX), savedAt: now() };
-      for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
-      await bb.storage.kv.set(PENDING_KEY, all);
-      return before;
+
+    /** A short, easy-to-type id the owner names in a `confirm <id>` reply. */
+    function newRequestId(taken: ReadonlySet<string>): string {
+      const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+      for (;;) {
+        let id = "r-";
+        for (const b of randomBytes(4)) id += alphabet[b % alphabet.length];
+        if (!taken.has(id)) return id;
+      }
     }
 
-    async function onSession(w: SessionWake): Promise<{ routed: "ticket" | "project" | "none"; threadId: string | null; projectId: string | null }> {
-      const trusted = w.fromOwner && !w.comment.untrusted;
-      // Untrusted requests are what the owner's next words may confirm; the
-      // owner's words answer them, so they are taken off.
-      const pending = trusted ? await updatePending(w.session, null) : (await updatePending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at }), []);
+    /** The requests waiting on the owner for one session, oldest first. */
+    async function pendingRequests(session: string): Promise<PendingRequest[]> {
+      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+      return all[session]?.requests ?? [];
+    }
 
-      const bound = store.byEntity("linear", w.issue.id);
-      if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
-        const config = await loadConfig(bound.projectId);
-        const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
-        await serial(`b:${bound.id}`, async () => {
-          const b = store.binding(bound.id);
-          if (b === null || b.endedAt !== null || b.threadId === null) return;
-          sent.outcome = await sendTo(b.threadId, formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, pending, label: config?.file.label ?? "bb-managed" }));
-          // A turn like any wake's: it ends with steward_report, and one
-          // waiting on someone else is archived when it is done.
-          if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
-        });
-        if (sent.outcome === "sent") {
-          bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward`);
-          return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId };
+    /** Serialize the pending list's read-modify-write so two events cannot lose one. */
+    let pendingLock: Promise<unknown> = Promise.resolve();
+    function withPendingLock<T>(fn: () => Promise<T>): Promise<T> {
+      const run = pendingLock.then(fn, fn);
+      pendingLock = run.catch(() => undefined);
+      return run;
+    }
+
+    /** Park a request waiting on the owner, under a fresh short id; returns the stored entry. */
+    async function addPending(session: string, request: { asker: string; text: string; at: string }): Promise<PendingRequest> {
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        const item: PendingRequest = { id: newRequestId(new Set(before.map((r) => r.id))), ...request };
+        all[session] = { requests: [...before, item].slice(-PENDING_MAX), savedAt: now() };
+        for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
+        await bb.storage.kv.set(PENDING_KEY, all);
+        return item;
+      });
+    }
+
+    /** Remove exactly the waiting request with this id; returns it, or null when nothing waits under it. */
+    async function takePending(session: string, id: string): Promise<PendingRequest | null> {
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        const found = before.find((r) => r.id === id) ?? null;
+        if (found !== null) {
+          const rest = before.filter((r) => r.id !== id);
+          if (rest.length === 0) delete all[session];
+          else all[session] = { requests: rest, savedAt: all[session]!.savedAt };
         }
-        bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
+        for (const [sid, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[sid];
+        await bb.storage.kv.set(PENDING_KEY, all);
+        return found;
+      });
+    }
+
+    /** Put a claimed request back after a failed delivery; a no-op if it is already waiting. */
+    async function restorePending(session: string, item: PendingRequest): Promise<void> {
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        if (before.some((r) => r.id === item.id)) return;
+        all[session] = { requests: [...before, item].slice(-PENDING_MAX), savedAt: all[session]?.savedAt ?? now() };
+        await bb.storage.kv.set(PENDING_KEY, all);
+      });
+    }
+
+    /** The id in an owner's `confirm <id>` reply, or null. The whole text, so a vague "sure" names nothing. */
+    function parseConfirm(text: string): string | null {
+      const m = /^(?:@bb[,\s]+)?confirm[\s:]+(r-[a-z0-9]+)[.!]?$/iu.exec(text.trim());
+      return m?.[1]?.toLowerCase() ?? null;
+    }
+
+    type SessionRoute = { routed: "ticket" | "project" | "none" | "held"; threadId: string | null; projectId: string | null; requestId: string | null };
+
+    async function onSession(w: SessionWake): Promise<SessionRoute> {
+      const trusted = w.fromOwner && !w.comment.untrusted;
+      if (!trusted) {
+        const held = await addPending(w.session, { asker: w.asker.name, text: w.comment.text, at: w.at });
+        bb.log.info(`stewards: held ${w.asker.name}'s @bb mention on ${w.issue.key} as ${held.id}; no turn runs until ${w.owner.name} confirms it`);
+        return { routed: "held", threadId: null, projectId: null, requestId: held.id };
       }
 
-      const projects = await stewardedProjects();
-      const config =
-        (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
-        projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
-      if (config === undefined) {
-        bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
-        return { routed: "none", threadId: null, projectId: null };
+      // The owner's own words. A `confirm <id>` releases exactly one waiting
+      // request; anything else releases nothing, and while requests wait the
+      // plugin re-asks for the id instead of waking a model on a vague word.
+      // The request is claimed under the pending lock, so two copies of the
+      // same confirmation cannot both wake a steward; it is put back below if
+      // no steward can be reached.
+      let confirmed: PendingRequest | null = null;
+      const named = parseConfirm(w.comment.text);
+      if (named !== null) {
+        confirmed = await takePending(w.session, named);
+        if (confirmed === null) {
+          bb.log.info(`stewards: ${w.owner.name} confirmed ${named} on session ${w.session}, but nothing waits under that id`);
+          return { routed: "none", threadId: null, projectId: null, requestId: named };
+        }
+      } else {
+        const waiting = await pendingRequests(w.session);
+        if (waiting.length > 0) {
+          const latest = waiting[waiting.length - 1]!;
+          bb.log.info(`stewards: ${w.owner.name} answered session ${w.session} without naming a request; ${waiting.length} still wait, re-asking about ${latest.id}`);
+          return { routed: "held", threadId: null, projectId: null, requestId: latest.id };
+        }
       }
-      const threadId = await ensureProjectSteward(config);
-      if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
-      const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, pending, label: config.file.label }));
-      if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
-      bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
-      return { routed: "project", threadId, projectId: config.projectId };
+
+      try {
+        const bound = store.byEntity("linear", w.issue.id);
+        if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
+          const config = await loadConfig(bound.projectId);
+          const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
+          await serial(`b:${bound.id}`, async () => {
+            const b = store.binding(bound.id);
+            if (b === null || b.endedAt !== null || b.threadId === null) return;
+            sent.outcome = await sendTo(
+              b.threadId,
+              formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, ...(confirmed === null ? {} : { confirmed }), label: config?.file.label ?? "bb-managed" }),
+            );
+            // A turn like any wake's: it ends with steward_report, and one
+            // waiting on someone else is archived when it is done.
+            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+          });
+          if (sent.outcome === "sent") {
+            bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
+            return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId, requestId: confirmed?.id ?? null };
+          }
+          bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
+        }
+
+        const projects = await stewardedProjects();
+        const config =
+          (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
+          projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
+        if (config === undefined) {
+          if (confirmed !== null) await restorePending(w.session, confirmed);
+          bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
+          return { routed: "none", threadId: null, projectId: null, requestId: null };
+        }
+        const threadId = await ensureProjectSteward(config);
+        if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
+        const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, ...(confirmed === null ? {} : { confirmed }), label: config.file.label }));
+        if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
+        bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
+        return { routed: "project", threadId, projectId: config.projectId, requestId: confirmed?.id ?? null };
+      } catch (error) {
+        if (confirmed !== null) await restorePending(w.session, confirmed);
+        throw error;
+      }
     }
 
     // ---- the RPC -------------------------------------------------------------------------------------

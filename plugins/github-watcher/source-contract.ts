@@ -331,16 +331,25 @@ export const stewardsContract = {
    * An `@bb` mention to hand to a steward: the issue's ticket steward when it
    * has an open binding, else the project steward of the project whose file
    * lists the issue's team. `routed: "none"` means no project here lists the
-   * team, and the caller answers the session itself. Only linear may call it.
+   * team, and the caller answers the session itself. `routed: "held"` means
+   * the mention is untrusted, or a follow-up that names no waiting request:
+   * it was parked under `requestId`, no model turn was run, and the caller
+   * asks the owner to `confirm <id>`. Only linear may call it.
    */
   stewardsSession: {
     input: sessionWakeSchema,
     output: z.object({
-      routed: z.enum(["ticket", "project", "none"]),
-      /** The thread the mention went to; null with `none`. */
+      routed: z.enum(["ticket", "project", "none", "held"]),
+      /** The thread the mention went to; null with `none` and `held`. */
       threadId: z.string().nullable(),
-      /** That thread's project, for a link to it; null with `none`. */
+      /** That thread's project, for a link to it; null with `none` and `held`. */
       projectId: z.string().nullable(),
+      /**
+       * With `held`, the id the owner confirms to release the request. With a
+       * trusted confirmation that names nothing waiting, the id they named.
+       * Null otherwise.
+       */
+      requestId: z.string().nullable(),
     }),
   },
 } as const;
