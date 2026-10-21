@@ -3147,30 +3147,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return all[session]?.requests ?? [];
     }
 
+    /** Serialize the pending list's read-modify-write so two events cannot lose one. */
+    let pendingLock: Promise<unknown> = Promise.resolve();
+    function withPendingLock<T>(fn: () => Promise<T>): Promise<T> {
+      const run = pendingLock.then(fn, fn);
+      pendingLock = run.catch(() => undefined);
+      return run;
+    }
+
     /** Park a request waiting on the owner, under a fresh short id; returns the stored entry. */
     async function addPending(session: string, request: { asker: string; text: string; at: string }): Promise<PendingRequest> {
-      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
-      const before = all[session]?.requests ?? [];
-      const item: PendingRequest = { id: newRequestId(new Set(before.map((r) => r.id))), ...request };
-      all[session] = { requests: [...before, item].slice(-PENDING_MAX), savedAt: now() };
-      for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
-      await bb.storage.kv.set(PENDING_KEY, all);
-      return item;
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        const item: PendingRequest = { id: newRequestId(new Set(before.map((r) => r.id))), ...request };
+        all[session] = { requests: [...before, item].slice(-PENDING_MAX), savedAt: now() };
+        for (const [id, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[id];
+        await bb.storage.kv.set(PENDING_KEY, all);
+        return item;
+      });
     }
 
     /** Remove exactly the waiting request with this id; returns it, or null when nothing waits under it. */
     async function takePending(session: string, id: string): Promise<PendingRequest | null> {
-      const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
-      const before = all[session]?.requests ?? [];
-      const found = before.find((r) => r.id === id) ?? null;
-      if (found !== null) {
-        const rest = before.filter((r) => r.id !== id);
-        if (rest.length === 0) delete all[session];
-        else all[session] = { requests: rest, savedAt: all[session]!.savedAt };
-      }
-      for (const [sid, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[sid];
-      await bb.storage.kv.set(PENDING_KEY, all);
-      return found;
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        const found = before.find((r) => r.id === id) ?? null;
+        if (found !== null) {
+          const rest = before.filter((r) => r.id !== id);
+          if (rest.length === 0) delete all[session];
+          else all[session] = { requests: rest, savedAt: all[session]!.savedAt };
+        }
+        for (const [sid, p] of Object.entries(all)) if (now() - p.savedAt > PENDING_TTL_MS) delete all[sid];
+        await bb.storage.kv.set(PENDING_KEY, all);
+        return found;
+      });
     }
 
     /** The id in an owner's `confirm <id>` reply, or null. The whole text, so a vague "sure" names nothing. */
@@ -3192,10 +3204,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The owner's own words. A `confirm <id>` releases exactly one waiting
       // request; anything else releases nothing, and while requests wait the
       // plugin re-asks for the id instead of waking a model on a vague word.
+      // The request is removed only once a steward has taken it, so a delivery
+      // failure leaves the owner's confirmation to retry.
       let confirmed: PendingRequest | null = null;
       const named = parseConfirm(w.comment.text);
       if (named !== null) {
-        confirmed = await takePending(w.session, named);
+        confirmed = (await pendingRequests(w.session)).find((r) => r.id === named) ?? null;
         if (confirmed === null) {
           bb.log.info(`stewards: ${w.owner.name} confirmed ${named} on session ${w.session}, but nothing waits under that id`);
           return { routed: "none", threadId: null, projectId: null, requestId: named };
@@ -3225,6 +3239,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
         });
         if (sent.outcome === "sent") {
+          if (confirmed !== null) await takePending(w.session, confirmed.id);
           bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
           return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId, requestId: confirmed?.id ?? null };
         }
@@ -3243,6 +3258,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
       const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, ...(confirmed === null ? {} : { confirmed }), label: config.file.label }));
       if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
+      if (confirmed !== null) await takePending(w.session, confirmed.id);
       bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
       return { routed: "project", threadId, projectId: config.projectId, requestId: confirmed?.id ?? null };
     }

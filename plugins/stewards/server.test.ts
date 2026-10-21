@@ -3254,6 +3254,16 @@ describe("an @bb mention", () => {
     expect(t.sends).toEqual([]);
   });
 
+  it("keeps a confirmed request when no steward can take it, so the owner can retry", async () => {
+    const t = await setup();
+    const issue = { id: "uuid-7", key: "OPS-7", team: "t-ops", teamKey: "OPS" };
+    const held = (await t.harness.callRpc("stewardsSession", mention({ issue, comment: { text: "@bb build this", untrusted: true } }), LINEAR)) as { requestId: string | null };
+    // No project lists OPS, so the confirmation cannot be delivered.
+    expect(await t.harness.callRpc("stewardsSession", fromJane(`confirm ${held.requestId}`, { action: "prompted", issue }), LINEAR)).toEqual({ routed: "none", threadId: null, projectId: null, requestId: null });
+    // It is still waiting, not "no such request": a retry routes the same way.
+    expect(await t.harness.callRpc("stewardsSession", fromJane(`confirm ${held.requestId}`, { action: "prompted", issue }), LINEAR)).toEqual({ routed: "none", threadId: null, projectId: null, requestId: null });
+  });
+
   it("releases exactly the named request and nothing else", async () => {
     const t = await bound();
     const held: string[] = [];
@@ -3272,6 +3282,10 @@ describe("an @bb mention", () => {
     expect(t.sends).toHaveLength(1);
     expect(t.sends[0]!.text).toMatch(new RegExp(`Jane confirmed request ${held[1]}`, "u"));
     expect(t.sends[0]!.text).toMatch(/and the SSO page/u);
+
+    // The released id is gone: confirming it again names nothing.
+    expect(await t.harness.callRpc("stewardsSession", fromJane(`confirm ${held[1]}`, { action: "prompted" }), LINEAR)).toEqual({ routed: "none", threadId: null, projectId: null, requestId: held[1] });
+    expect(t.sends).toHaveLength(1);
 
     // The others are still waiting; a second confirm releases the next.
     await t.harness.callRpc("stewardsSession", fromJane(`confirm ${held[2]}`, { action: "prompted" }), LINEAR);
