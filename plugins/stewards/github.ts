@@ -51,6 +51,12 @@ export interface GithubWriter {
   comment(repo: string, number: number, body: string): Promise<void>;
   /** Squash-merge the pull request, with the given commit title and message. */
   squashMerge(repo: string, number: number, title: string, body: string): Promise<void>;
+  /**
+   * The repo-relative paths a pull request changes, for the decide list. When
+   * absent, or when the read fails, the plugin cannot classify the pull
+   * request and treats it as the user's (fail closed).
+   */
+  files?(repo: string, number: number): Promise<string[]>;
 }
 
 /** "owner/repo#12" or "https://github.com/owner/repo/pull/12" → { repo, number }. */
@@ -61,7 +67,7 @@ export function parsePullRef(ref: string): { repo: string; number: number } | nu
 
 /** The default writer: the server's gh token against the GitHub REST API. */
 export function createGhWriter(token: TokenReader = createGhTokenReader(), doFetch: typeof fetch = fetch): GithubWriter {
-  const request = async (method: string, path: string, body: unknown): Promise<void> => {
+  const request = async (method: string, path: string, body: unknown): Promise<Response> => {
     const value = await token();
     const response = await doFetch(`${API}${path}`, {
       method,
@@ -79,6 +85,7 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       const detail = await response.text().catch(() => "");
       throw new GithubApiError(`${method} ${path} failed: ${response.status} ${detail.replace(/\s+/gu, " ").trim().slice(0, 500)}`);
     }
+    return response;
   };
   return {
     async comment(repo, number, body) {
@@ -86,6 +93,12 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
     },
     async squashMerge(repo, number, title, body) {
       await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });
+    },
+    async files(repo, number) {
+      const response = await request("GET", `/repos/${repo}/pulls/${number}/files?per_page=100`, undefined);
+      const body = (await response.json().catch(() => null)) as unknown;
+      if (!Array.isArray(body)) return [];
+      return body.map((f) => (f !== null && typeof f === "object" && "filename" in f ? String((f as { filename: unknown }).filename) : "")).filter((f) => f !== "");
     },
   };
 }

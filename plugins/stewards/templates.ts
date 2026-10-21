@@ -1,7 +1,7 @@
 // What `bb stewards init` writes into a project's `.bb`: the project file and
 // the four default playbooks. They are starting points, meant to be edited
 // and reviewed like any other change to `.bb`.
-import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL } from "./config.js";
+import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL, defaultDecideList } from "./config.js";
 
 /**
  * A credential a worker needs, in the linear-tickets build section. The worker
@@ -26,7 +26,7 @@ export function projectFileTemplate(teams: string[]): string {
       label: DEFAULT_LABEL,
       nightly: { at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 },
       projectSteward: { model: "claude/claude-opus-5-5/high" },
-      bigDecisions: DEFAULT_BIG_DECISIONS,
+      bigDecisions: defaultDecideList(),
       // Add a target, such as { "kind": "k8s-namespace", "name": "bb-gate-production" }, to watch it.
       ops: { targets: [], autoAdopt: [] },
       // Dependabot alerts: a per-severity SLA, the batch window a medium or low

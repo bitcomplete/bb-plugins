@@ -427,7 +427,7 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
                 <p>{x.question}</p>
                 {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
                 <p className="text-xs text-muted-foreground">
-                  {x.kind === "approval" ? "Approve or decline in its steward's thread." : "Answer in the project steward's thread."}
+                  {x.kind === "approval" ? "Approve or decline in its steward's thread." : "The project steward has not said how to ask you this yet."}
                   {x.kind === "approval" && x.threadId !== null ? (
                     <>
                       {" "}

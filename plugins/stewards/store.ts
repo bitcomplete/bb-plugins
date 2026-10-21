@@ -16,7 +16,7 @@ import { sentryLookSchema, type SentryLook } from "./sentry.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
-export const MIGRATIONS = [
+export const BASE_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS bindings (
      id TEXT PRIMARY KEY,
      project_id TEXT NOT NULL,
@@ -210,10 +210,126 @@ export const MIGRATIONS = [
    )`,
 ];
 
+// ---- the one escalation chain (BB-30) -----------------------------------------------
+//
+// Every hop of the chain is one `escalations` row: a worker's, a steward's, the
+// project steward's and the project steward's ask to the user. The envelope is
+// the columns added here; the payload is `question`; the human-boundary fields
+// are `resolution_kind`, `choices`, `url` and `data`. `questions` and the
+// steward-filed `needs` kinds migrate into it below, and both old tables are
+// renamed rather than dropped, so a rollback keeps every row.
+export const CHAIN_MIGRATIONS = [
+  // Envelope: where it came from, the chain it passed through, where it is now.
+  `ALTER TABLE escalations ADD COLUMN project_id TEXT`,
+  `ALTER TABLE escalations ADD COLUMN origin TEXT`,
+  `ALTER TABLE escalations ADD COLUMN chain TEXT NOT NULL DEFAULT '[]'`,
+  // Human boundary: how the page asks, and what it needs to ask.
+  `ALTER TABLE escalations ADD COLUMN resolution_kind TEXT`,
+  `ALTER TABLE escalations ADD COLUMN url TEXT`,
+  `ALTER TABLE escalations ADD COLUMN data TEXT NOT NULL DEFAULT '{}'`,
+  `ALTER TABLE escalations ADD COLUMN answered_by TEXT`,
+  // The escalation this row forwards, when it is a question made from one.
+  `ALTER TABLE escalations ADD COLUMN forwarded_from TEXT`,
+  // 1 when this row is a question the project steward kept (or a forwarded
+  // non-approval escalation), so the page's questions list stays its own.
+  `ALTER TABLE escalations ADD COLUMN is_question INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE escalations ADD COLUMN context TEXT`,
+  // The pull-request head a project-steward approval is bound to.
+  `ALTER TABLE escalations ADD COLUMN head_sha TEXT`,
+  // A project steward's approval of an owner-reviewed pull request, bound to
+  // the head sha: a new push is a new sha and voids it. It lives only here,
+  // never as a GitHub comment or review.
+  `CREATE TABLE IF NOT EXISTS project_approvals (
+     binding_id TEXT NOT NULL,
+     head_sha TEXT NOT NULL,
+     entry TEXT,
+     by_thread TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     PRIMARY KEY (binding_id, head_sha)
+   )`,
+  // Every question becomes an escalation with route `me`, keeping its id and
+  // its answer. Questions that were forwarded keep their link, so the page
+  // still shows the question rather than the raw escalation.
+  `INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, choices, status, resolution, created_at, resolved_at, delivered_at, project_id, forwarded_from, resolution_kind, answered_by, is_question, context, origin)
+   SELECT q.id, COALESCE(q.binding_id, ''), 'decision', q.question, 'wait', 'me', q.choices,
+          CASE WHEN q.status = 'open' THEN 'open' ELSE 'resolved' END,
+          q.answer, q.created_at, q.resolved_at, q.created_at, q.project_id, q.escalation_id,
+          CASE WHEN q.choices IS NOT NULL AND json_array_length(q.choices) > 0 THEN 'choice' ELSE 'text' END,
+          q.answered_by, 1, q.context,
+          json_object('threadId', NULL, 'bindingId', q.binding_id, 'chain', json('[]'))
+   FROM questions q`,
+  // An escalation whose forwarded question was answered is resolved with that answer.
+  `UPDATE escalations
+   SET status = 'resolved',
+       resolution = COALESCE(resolution, (SELECT q.answer FROM questions q WHERE q.escalation_id = escalations.id AND q.status = 'answered' ORDER BY q.resolved_at DESC LIMIT 1)),
+       resolved_at = COALESCE(resolved_at, (SELECT q.resolved_at FROM questions q WHERE q.escalation_id = escalations.id AND q.status = 'answered' ORDER BY q.resolved_at DESC LIMIT 1))
+   WHERE status = 'open' AND EXISTS (SELECT 1 FROM questions q WHERE q.escalation_id = escalations.id AND q.status = 'answered')`,
+  `ALTER TABLE questions RENAME TO questions_legacy`,
+  // The steward-filed needs (decide, configure, provide-secret) become
+  // escalations with route `me`; the plugin-filed gate items stay in `needs`.
+  `INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, choices, status, resolution, created_at, resolved_at, delivered_at, project_id, resolution_kind, url, data, is_question, origin)
+   SELECT n.id, n.binding_id, 'decision', n.what, 'wait', 'me',
+          CASE WHEN n.data IS NOT NULL THEN json_extract(n.data, '$.choices') END,
+          CASE WHEN n.status = 'open' THEN 'open' ELSE 'resolved' END,
+          n.resolution, n.created_at, n.resolved_at, n.created_at,
+          (SELECT b.project_id FROM bindings b WHERE b.id = n.binding_id),
+          CASE WHEN n.kind = 'provide-secret' THEN 'secret' WHEN n.kind = 'configure' THEN 'done'
+        WHEN n.data IS NOT NULL AND json_array_length(json_extract(n.data, '$.choices')) > 0 THEN 'choice' ELSE 'text' END,
+          n.url, n.data, 0,
+          json_object('threadId', NULL, 'bindingId', n.binding_id, 'chain', json('[]'))
+   FROM needs n
+   WHERE n.kind IN ('decide','configure','provide-secret')`,
+  // Rename the old table rather than drop it, then rebuild `needs` for the
+  // plugin's gate items and copy those rows across.
+  `ALTER TABLE needs RENAME TO needs_legacy`,
+  `DROP INDEX IF EXISTS needs_binding`,
+  `DROP INDEX IF EXISTS needs_open_key`,
+  `CREATE TABLE IF NOT EXISTS needs (
+     id TEXT PRIMARY KEY,
+     binding_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     url TEXT NOT NULL DEFAULT '',
+     what TEXT NOT NULL,
+     how TEXT,
+     data TEXT NOT NULL DEFAULT '{}',
+     filed_by TEXT NOT NULL DEFAULT 'steward',
+     status TEXT NOT NULL DEFAULT 'open',
+     resolution TEXT,
+     created_at INTEGER NOT NULL,
+     resolved_at INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS needs_binding ON needs (binding_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS needs_open_key ON needs (binding_id, kind, url) WHERE status = 'open'`,
+  `INSERT INTO needs SELECT * FROM needs_legacy WHERE kind IN ('approve-spec','approve-pr','merge')`,
+  // Answers go straight to the originator: a resolution records guidance on
+  // the originating binding and a quiet note on each binding between, and
+  // queues one delivery to the originating thread (a tell for a worker, a
+  // wake for a steward). The server flushes it, so every resolve path takes
+  // the one road.
+  `CREATE TABLE IF NOT EXISTS pending_deliveries (
+     id TEXT PRIMARY KEY,
+     escalation_id TEXT NOT NULL,
+     origin_thread_id TEXT,
+     origin_binding_id TEXT,
+     text TEXT NOT NULL,
+     decided_by TEXT NOT NULL,
+     created_at INTEGER NOT NULL,
+     delivered_at INTEGER
+   )`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS];
+
 // ---- values kept as JSON ------------------------------------------------------------
 
 export const guidanceEntrySchema = z.object({ at: z.number(), text: z.string(), by: z.string() });
 export type GuidanceEntry = z.infer<typeof guidanceEntrySchema>;
+
+export const escalationOriginSchema = z.object({
+  threadId: z.string().nullable().default(null),
+  bindingId: z.string().nullable().default(null),
+  chain: z.array(z.object({ threadId: z.string(), bindingId: z.string().nullable().default(null), rewording: z.string().nullable().default(null) })).default([]),
+});
 
 export const readyStateSchema = z.object({
   checklist: z.array(z.object({ item: z.string(), met: z.boolean(), note: z.string().nullable().default(null) })).default([]),
@@ -450,7 +566,19 @@ export type NewBinding = Pick<Binding, "projectId" | "source" | "entityId" | "en
 
 // ---- escalations, actions, workers --------------------------------------------------------
 
-export type EscalationRoute = "parent" | "project" | "me";
+export type EscalationRoute = "steward" | "parent" | "project" | "me";
+
+/** How the page asks the user: what the human boundary looks like. */
+export const RESOLUTION_KINDS = ["choice", "text", "approve-decline", "secret", "done"] as const;
+export type ResolutionKind = (typeof RESOLUTION_KINDS)[number];
+
+/** Where an escalation came from: the thread, its binding, and the hops it passed through. */
+export type EscalationOrigin = {
+  threadId: string | null;
+  bindingId: string | null;
+  /** Each hop a steward forwarded it through, with that hop's rewording kept. */
+  chain: Array<{ threadId: string; bindingId: string | null; rewording: string | null }>;
+};
 
 export type Escalation = {
   id: string;
@@ -468,6 +596,34 @@ export type Escalation = {
   resolvedAt: number | null;
   /** When the project steward was first sent it as new. */
   deliveredAt: number | null;
+  /** The project this escalation belongs to, when known. */
+  projectId: string | null;
+  /** The thread and binding it originated from, and the chain it passed through. */
+  origin: EscalationOrigin;
+  /** What the page's ask looks like, once it reaches the human boundary. */
+  resolutionKind: ResolutionKind | null;
+  /** The link the page shows, when there is one. */
+  url: string | null;
+  /** Kind-specific human-boundary fields: the secret's variable, purpose and destination, the matched decide entry. */
+  data: Record<string, unknown>;
+  /** The thread that answered it, or "user" from the page. */
+  answeredBy: string | null;
+  /** The escalation this row forwards, when it is a question made from one. */
+  forwardedFrom: string | null;
+  /** The pull-request head a project-steward approval would be bound to. */
+  headSha: string | null;
+  /** True when this row is a question the project steward kept, rather than a raw escalation. */
+  isQuestion: boolean;
+};
+
+/** A project steward's approval of an owner-reviewed pull request, bound to its head sha. */
+export type ProjectApproval = {
+  bindingId: string;
+  headSha: string;
+  /** The decide-list entry the project steward classified it under. */
+  entry: string | null;
+  byThread: string;
+  createdAt: number;
 };
 
 /**
@@ -598,7 +754,7 @@ export function createStore(db: Database.Database, now: () => number) {
   );
 
   const insertEscalation = db.prepare(
-    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, choices, created_at) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @choices, @created_at)",
+    "INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, recommendation, choices, created_at, project_id, origin, chain, resolution_kind, url, data, forwarded_from, is_question, context, head_sha) VALUES (@id, @binding_id, @kind, @question, @meanwhile, @route, @recommendation, @choices, @created_at, @project_id, @origin, @chain, @resolution_kind, @url, @data, @forwarded_from, @is_question, @context, @head_sha)",
   );
   const getEscalation = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ?");
   const openEscalations = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND status = 'open' ORDER BY created_at");
@@ -610,15 +766,44 @@ export function createStore(db: Database.Database, now: () => number) {
   const clearDelivered = db.prepare("UPDATE escalations SET delivered_at = NULL WHERE id = ? AND delivered_at = ?");
   const lastResolvedOfKind = db.prepare<[string, string], { resolved_at: number }>("SELECT resolved_at FROM escalations WHERE binding_id = ? AND kind = ? AND status = 'resolved' ORDER BY resolved_at DESC LIMIT 1");
 
+  // Questions are escalations too: the project steward's `ask` is an escalation
+  // it originates with route `me`. `is_question` keeps the page's questions
+  // list its own among all the route-`me` escalations.
   const insertQuestion = db.prepare(
-    "INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, choices, created_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @question, @context, @choices, @created_at)",
+    "INSERT INTO escalations (id, project_id, binding_id, forwarded_from, question, context, choices, meanwhile, route, status, created_at, resolution_kind, url, data, is_question, kind, origin) VALUES (@id, @project_id, @binding_id, @forwarded_from, @question, @context, @choices, 'wait', 'me', 'open', @created_at, @resolution_kind, @url, @data, 1, 'decision', @origin)",
   );
-  const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE id = ?");
-  const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'open' ORDER BY created_at");
-  const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM questions WHERE project_id = ? AND status = 'answered' AND resolved_at >= ? ORDER BY resolved_at");
-  const answerQuestion = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND status = 'open'");
-  const answerForEscalation = db.prepare("UPDATE questions SET status = 'answered', answer = ?, answered_by = ?, resolved_at = ? WHERE escalation_id = ? AND status = 'open'");
-  const appendAnswerForEscalation = db.prepare("UPDATE questions SET answer = ? WHERE escalation_id = ? AND status = 'answered'");
+  const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ? AND is_question = 1");
+  const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY created_at");
+  const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'resolved' AND resolved_at >= ? AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY resolved_at");
+  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) AND (is_question = 1 OR NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = escalations.id AND q.is_question = 1)) ORDER BY created_at");
+  // A route-`me` escalation a question or a need already covers is not listed
+  // again as a need: the page shows the question or the item, never the raw row.
+  const openEscalationNeeds = db.prepare<[string], Record<string, unknown>>(
+    "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
+      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
+      "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
+  );
+  const openEscalationNeedsForProject = db.prepare<[string], Record<string, unknown>>(
+    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
+      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
+      "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
+  );
+  // The raw escalations an open question covers (its `forwarded_from`), whatever
+  // the question's resolution, so the page and wakes show the question/item once.
+  const openQuestionCovered = db.prepare<[string], { forwarded_from: string }>("SELECT DISTINCT forwarded_from FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND forwarded_from IS NOT NULL");
+  const answerQuestion = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND is_question = 1 AND status = 'open'");
+  const answerForEscalation = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'open'");
+  const appendAnswerForEscalation = db.prepare("UPDATE escalations SET resolution = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'resolved'");
+
+  const insertDelivery = db.prepare("INSERT INTO pending_deliveries (id, escalation_id, origin_thread_id, origin_binding_id, text, decided_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  const pendingDeliveriesStmt = db.prepare<[number], Record<string, unknown>>("SELECT * FROM pending_deliveries WHERE delivered_at IS NULL AND created_at <= ? ORDER BY created_at");
+  const markDeliveryDoneStmt = db.prepare("UPDATE pending_deliveries SET delivered_at = ? WHERE id = ?");
+
+  const insertProjectApproval = db.prepare(
+    "INSERT INTO project_approvals (binding_id, head_sha, entry, by_thread, created_at) VALUES (@binding_id, @head_sha, @entry, @by_thread, @created_at) ON CONFLICT (binding_id, head_sha) DO UPDATE SET entry = @entry, by_thread = @by_thread, created_at = @created_at",
+  );
+  const getProjectApproval = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
+  const deleteProjectApproval = db.prepare("DELETE FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
 
   const insertWorker = db.prepare("INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES (?, ?, ?, 'running', ?)");
   const getWorker = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE thread_id = ?");
@@ -658,21 +843,33 @@ export function createStore(db: Database.Database, now: () => number) {
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
     deliveredAt: r.delivered_at === null || r.delivered_at === undefined ? null : Number(r.delivered_at),
+    projectId: r.project_id === null || r.project_id === undefined ? null : String(r.project_id),
+    origin: json(escalationOriginSchema, r.origin === null || r.origin === undefined ? null : String(r.origin), { threadId: null, bindingId: null, chain: [] }),
+    resolutionKind: r.resolution_kind === null || r.resolution_kind === undefined ? null : (String(r.resolution_kind) as ResolutionKind),
+    url: r.url === null || r.url === undefined ? null : String(r.url),
+    data: json(z.record(z.string(), z.unknown()), r.data === null || r.data === undefined ? null : String(r.data), {}),
+    answeredBy: r.answered_by === null || r.answered_by === undefined ? null : String(r.answered_by),
+    forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
+    headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
+    isQuestion: Number(r.is_question ?? 0) === 1,
   });
-  const toQuestion = (r: Record<string, unknown>): Question => ({
-    id: String(r.id),
-    projectId: String(r.project_id),
-    bindingId: r.binding_id === null ? null : String(r.binding_id),
-    escalationId: r.escalation_id === null ? null : String(r.escalation_id),
-    question: String(r.question),
-    context: r.context === null ? null : String(r.context),
-    choices: json(z.array(z.string()), r.choices === null || r.choices === undefined ? null : String(r.choices), []),
-    status: String(r.status) as "open" | "answered",
-    answer: r.answer === null ? null : String(r.answer),
-    answeredBy: r.answered_by === null ? null : String(r.answered_by),
-    createdAt: Number(r.created_at),
-    resolvedAt: r.resolved_at === null ? null : Number(r.resolved_at),
-  });
+  const toQuestion = (r: Record<string, unknown>): Question => {
+    const e = toEscalation(r);
+    return {
+      id: e.id,
+      projectId: e.projectId ?? "",
+      bindingId: e.bindingId === "" ? null : e.bindingId,
+      escalationId: e.forwardedFrom,
+      question: e.question,
+      context: r.context === null || r.context === undefined ? null : String(r.context),
+      choices: e.choices,
+      status: e.status === "open" ? "open" : "answered",
+      answer: e.resolution,
+      answeredBy: e.answeredBy,
+      createdAt: e.createdAt,
+      resolvedAt: e.resolvedAt,
+    };
+  };
   const insertNeed = db.prepare(
     "INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, created_at) VALUES (@id, @binding_id, @kind, @url, @what, @how, @data, @filed_by, @created_at)",
   );
@@ -711,6 +908,27 @@ export function createStore(db: Database.Database, now: () => number) {
     resolution: r.resolution === null || r.resolution === undefined ? null : String(r.resolution),
     createdAt: Number(r.created_at),
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
+  });
+
+  /**
+   * A steward-filed escalation (decide, configure, provide-secret) as the
+   * `Need` shape the provide-secret machinery and the page still speak. The
+   * rows live in `escalations`; this keeps `need(id)` and its callers working
+   * across the migration.
+   */
+  const needFromEscalation = (x: Escalation): Need => ({
+    id: x.id,
+    bindingId: x.bindingId,
+    kind: x.resolutionKind === "secret" ? "provide-secret" : x.resolutionKind === "done" ? "configure" : "decide",
+    url: x.url ?? "",
+    what: x.question,
+    how: null,
+    data: x.data,
+    filedBy: "project",
+    status: x.status === "open" ? "open" : "done",
+    resolution: x.resolution,
+    createdAt: x.createdAt,
+    resolvedAt: x.resolvedAt,
   });
 
   const toWorker = (r: Record<string, unknown>): Worker => ({
@@ -774,8 +992,41 @@ export function createStore(db: Database.Database, now: () => number) {
       const at = now();
       if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
       answerForEscalation.run(resolution, by, at, id);
+      const x = getEscalation.get(id);
+      if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by);
       return true;
     })();
+  }
+
+  /**
+   * On any resolve, record the answer on the originating binding as guidance
+   * (verbatim, with who decided as its author) and a quiet note on each binding
+   * the escalation passed through, then queue one delivery to the originating
+   * thread. The server flushes the queue; a worker gets a tell, a steward a
+   * wake. This is the one road every resolve takes (BB-30).
+   */
+  function recordResolutionDelivery(x: Escalation, resolution: string, by: string): void {
+    const originBindingId = x.origin.bindingId ?? x.bindingId;
+    // A mechanical closure (the plugin withdrawing or closing something) is
+    // not a decision: it is noted, but it is not written as guidance a worker
+    // would later read as standing instruction.
+    const decided = by !== "plugin";
+    if (decided && originBindingId !== "") {
+      const raw = getBinding.get(originBindingId);
+      if (raw !== undefined) {
+        const b = rowToBinding(raw);
+        const last = b.guidance.at(-1);
+        if (last === undefined || last.text !== resolution || last.by !== by) patch(originBindingId, { guidance: [...b.guidance, { at: now(), text: resolution, by }].slice(-50) });
+      }
+    }
+    for (const hop of x.origin.chain) {
+      if (hop.bindingId === null || hop.bindingId === originBindingId) continue;
+      const raw = getBinding.get(hop.bindingId);
+      if (raw === undefined) continue;
+      const b = rowToBinding(raw);
+      patch(hop.bindingId, { pending: [...b.pending, { at: now(), text: `Escalation ${x.id} was answered by ${by}: ${resolution}`, quiet: true }].slice(-30) });
+    }
+    if (x.origin.threadId !== null && x.origin.threadId !== "") insertDelivery.run(newId("dlv"), x.id, x.origin.threadId, originBindingId === "" ? null : originBindingId, resolution, by, now());
   }
 
   function patch(id: string, fields: BindingPatch): Binding {
@@ -871,7 +1122,7 @@ export function createStore(db: Database.Database, now: () => number) {
         const b = rowToBinding(getBinding.get(bindingId)!);
         patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
         closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
-        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
       })();
     },
     /** Remember the current spec as declined and close its approval request, in one transaction. */
@@ -880,14 +1131,50 @@ export function createStore(db: Database.Database, now: () => number) {
         const b = rowToBinding(getBinding.get(bindingId)!);
         patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
         closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
-        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval")) resolve(x.id, resolution, by);
+        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
       })();
     },
 
     // escalations
-    escalate(fields: { bindingId: string; kind: EscalationKind; question: string; meanwhile: string; route: EscalationRoute; recommendation: string | null; choices?: string[] }): Escalation {
+    escalate(fields: {
+      bindingId: string;
+      kind: EscalationKind;
+      question: string;
+      meanwhile: string;
+      route: EscalationRoute;
+      recommendation: string | null;
+      choices?: string[];
+      projectId?: string | null;
+      origin?: EscalationOrigin;
+      resolutionKind?: ResolutionKind | null;
+      url?: string | null;
+      data?: Record<string, unknown>;
+      forwardedFrom?: string | null;
+      headSha?: string | null;
+    }): Escalation {
       const id = newId("esc");
-      insertEscalation.run({ id, binding_id: fields.bindingId, kind: fields.kind, question: fields.question, meanwhile: fields.meanwhile, route: fields.route, recommendation: fields.recommendation, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
+      const origin: EscalationOrigin = fields.origin ?? { threadId: null, bindingId: fields.bindingId, chain: [] };
+      insertEscalation.run({
+        id,
+        binding_id: fields.bindingId,
+        kind: fields.kind,
+        question: fields.question,
+        meanwhile: fields.meanwhile,
+        route: fields.route,
+        recommendation: fields.recommendation,
+        choices: JSON.stringify(fields.choices ?? []),
+        created_at: now(),
+        project_id: fields.projectId ?? null,
+        origin: JSON.stringify(origin),
+        chain: JSON.stringify(origin.chain),
+        resolution_kind: fields.resolutionKind ?? null,
+        url: fields.url ?? null,
+        data: JSON.stringify(fields.data ?? {}),
+        forwarded_from: fields.forwardedFrom ?? null,
+        is_question: 0,
+        context: null,
+        head_sha: fields.headSha ?? null,
+      });
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -931,14 +1218,81 @@ export function createStore(db: Database.Database, now: () => number) {
     reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
       return rerouteEscalation.run(route, recommendation, id).changes > 0;
     },
+    /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
+    setEscalationHead(id: string, headSha: string | null): void {
+      db.prepare("UPDATE escalations SET head_sha = ? WHERE id = ?").run(headSha, id);
+    },
+    /** Record a forwarding hop on the escalation's chain, keeping its rewording. */
+    addHop(id: string, hop: { threadId: string; bindingId: string | null; rewording: string | null }): void {
+      const x = getEscalation.get(id);
+      if (x === undefined) return;
+      const e = toEscalation(x);
+      const chain = [...e.origin.chain, hop];
+      db.prepare("UPDATE escalations SET chain = ?, origin = ? WHERE id = ?").run(JSON.stringify(chain), JSON.stringify({ ...e.origin, chain }), id);
+    },
+    /** Answers waiting to be delivered to their originating thread. */
+    pendingDeliveries(limit = 100): Array<{ id: string; escalationId: string; originThreadId: string | null; originBindingId: string | null; text: string; decidedBy: string; createdAt: number }> {
+      return pendingDeliveriesStmt.all(now()).slice(0, limit).map((r) => ({
+        id: String(r.id),
+        escalationId: String(r.escalation_id),
+        originThreadId: r.origin_thread_id === null || r.origin_thread_id === undefined ? null : String(r.origin_thread_id),
+        originBindingId: r.origin_binding_id === null || r.origin_binding_id === undefined ? null : String(r.origin_binding_id),
+        text: String(r.text),
+        decidedBy: String(r.decided_by),
+        createdAt: Number(r.created_at),
+      }));
+    },
+    markDeliveryDone(id: string): void {
+      markDeliveryDoneStmt.run(now(), id);
+    },
     lastResolved(bindingId: string, kind: EscalationKind): number | null {
       return lastResolvedOfKind.get(bindingId, kind)?.resolved_at ?? null;
     },
 
+    // project-steward approvals of owner-reviewed pull requests (BB-30)
+    /**
+     * The project steward's approval of an owner-reviewed pull request, if it
+     * recorded one for this binding's current head. A new push is a new sha,
+     * so this is null again and the approval must be asked for afresh.
+     */
+    projectApproval(bindingId: string, headSha: string): ProjectApproval | null {
+      const r = getProjectApproval.get(bindingId, headSha);
+      return r === undefined
+        ? null
+        : { bindingId: String(r.binding_id), headSha: String(r.head_sha), entry: r.entry === null || r.entry === undefined ? null : String(r.entry), byThread: String(r.by_thread), createdAt: Number(r.created_at) };
+    },
+    /**
+     * Record a project-steward approval, bound to the pull request's head sha.
+     * The caller is responsible for checking that the approver is the project
+     * steward's thread; this is the store half.
+     */
+    recordProjectApproval(fields: { bindingId: string; headSha: string; entry: string | null; byThread: string }): ProjectApproval {
+      insertProjectApproval.run({ binding_id: fields.bindingId, head_sha: fields.headSha, entry: fields.entry, by_thread: fields.byThread, created_at: now() });
+      const r = getProjectApproval.get(fields.bindingId, fields.headSha)!;
+      return { bindingId: String(r.binding_id), headSha: String(r.head_sha), entry: r.entry === null || r.entry === undefined ? null : String(r.entry), byThread: String(r.by_thread), createdAt: Number(r.created_at) };
+    },
+    /** Drop a recorded approval (a new push voids it by sha; this is for an explicit retraction). */
+    clearProjectApproval(bindingId: string, headSha: string): boolean {
+      return deleteProjectApproval.run(bindingId, headSha).changes > 0;
+    },
+
     // questions to the user
-    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[] }): Question {
+    ask(fields: { projectId: string; bindingId: string | null; escalationId: string | null; question: string; context: string | null; choices?: string[]; resolutionKind?: ResolutionKind; url?: string | null; data?: Record<string, unknown> }): Question {
       const id = newId("qst");
-      insertQuestion.run({ id, project_id: fields.projectId, binding_id: fields.bindingId, escalation_id: fields.escalationId, question: fields.question, context: fields.context, choices: JSON.stringify(fields.choices ?? []), created_at: now() });
+      insertQuestion.run({
+        id,
+        project_id: fields.projectId,
+        binding_id: fields.bindingId ?? "",
+        forwarded_from: fields.escalationId,
+        question: fields.question,
+        context: fields.context,
+        choices: JSON.stringify(fields.choices ?? []),
+        created_at: now(),
+        resolution_kind: fields.resolutionKind ?? ((fields.choices ?? []).length > 0 ? "choice" : "text"),
+        url: fields.url ?? null,
+        data: JSON.stringify(fields.data ?? {}),
+        origin: JSON.stringify({ threadId: null, bindingId: fields.bindingId, chain: [] }),
+      });
       return toQuestion(getQuestion.get(id)!);
     },
     question(id: string): Question | null {
@@ -951,6 +1305,10 @@ export function createStore(db: Database.Database, now: () => number) {
     answeredSince(projectId: string, since: number): Question[] {
       return answeredSince.all(projectId, since).map(toQuestion);
     },
+    /** The raw route-`me` escalations an open question covers, whatever its resolution. */
+    openQuestionEscalationIds(projectId: string): string[] {
+      return openQuestionCovered.all(projectId).map((r) => r.forwarded_from);
+    },
     /**
      * Close an open question with its answer, and resolve the escalation it was
      * forwarded for, if any. `resolution` is what the escalation records when
@@ -962,7 +1320,7 @@ export function createStore(db: Database.Database, now: () => number) {
         const at = now();
         if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
         const q = toQuestion(getQuestion.get(id)!);
-        if (q.escalationId !== null) resolveEscalation.run(resolution, at, q.escalationId);
+        if (q.escalationId !== null) resolve(q.escalationId, resolution, by);
         return true;
       })();
     },
@@ -978,16 +1336,25 @@ export function createStore(db: Database.Database, now: () => number) {
     // needs: what waits on the user
     need(id: string): Need | null {
       const r = getNeed.get(id);
-      return r === undefined ? null : toNeed(r);
+      if (r !== undefined) return toNeed(r);
+      // A steward-filed need migrated to an escalation keeps the same id.
+      const e = getEscalation.get(id);
+      return e === undefined ? null : needFromEscalation(toEscalation(e));
     },
     needs(bindingId: string, includeDone = false): Need[] {
-      return needsFor.all(bindingId, includeDone ? 1 : 0).map(toNeed);
+      const rows = needsFor.all(bindingId, includeDone ? 1 : 0).map(toNeed);
+      const fromEscalations = (includeDone ? escalationNeedsForBinding.all(bindingId) : openEscalationNeeds.all(bindingId)).map((r) => needFromEscalation(toEscalation(r)));
+      return [...rows, ...fromEscalations].sort((a, b) => a.createdAt - b.createdAt);
     },
     openNeeds(bindingId: string): Need[] {
-      return needsFor.all(bindingId, 0).map(toNeed);
+      const rows = needsFor.all(bindingId, 0).map(toNeed);
+      const fromEscalations = openEscalationNeeds.all(bindingId).map((r) => needFromEscalation(toEscalation(r)));
+      return [...rows, ...fromEscalations].sort((a, b) => a.createdAt - b.createdAt);
     },
     openNeedsForProject(projectId: string): Need[] {
-      return openNeedsForProject.all(projectId).map(toNeed);
+      const rows = openNeedsForProject.all(projectId).map(toNeed);
+      const fromEscalations = openEscalationNeedsForProject.all(projectId).map((r) => needFromEscalation(toEscalation(r)));
+      return [...rows, ...fromEscalations].sort((a, b) => a.createdAt - b.createdAt);
     },
     allNeedsForProject(projectId: string): Need[] {
       return allNeedsForProject.all(projectId).map(toNeed);
@@ -1006,8 +1373,10 @@ export function createStore(db: Database.Database, now: () => number) {
       insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
       return toNeed(getNeed.get(id)!);
     },
-    closeNeed(id: string, resolution: string): boolean {
-      return closeNeedStmt.run(resolution, now(), id).changes > 0;
+    closeNeed(id: string, resolution: string, by = "plugin"): boolean {
+      if (closeNeedStmt.run(resolution, now(), id).changes > 0) return true;
+      // A migrated provide-secret need is an escalation now.
+      return resolve(id, resolution, by);
     },
     closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
       return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;

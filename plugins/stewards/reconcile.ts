@@ -294,9 +294,21 @@ export type PrGate = {
   missing: string | null;
   /** The plugin's `approve-pr` condition: owner lane, marker approved, checks green, no owner approval yet. */
   needsOwnerApproval: boolean;
+  /** The decide mark applied to this pull request; `user` unless the project steward classified it under a `project` entry. */
+  decision: "project" | "user";
+  /** Whether the project steward recorded an approval bound to this head sha. */
+  projectApproved: boolean;
 };
 
-export function prGate(entity: EntitySnapshot): PrGate {
+/** The project steward's side of the gate: the decide mark and the recorded approval. */
+export type PrGateOptions = {
+  /** The mark for the entry the project steward classified the pull request under; omitted is `user` (fail closed). */
+  decision?: "project" | "user";
+  /** Whether a project-steward approval exists in the store for this head sha. */
+  projectApproved?: boolean;
+};
+
+export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate {
   const pull = entity.pull;
   const headSha = pull?.headSha ?? null;
   const marker = latestReviewMarker(entity.comments);
@@ -305,8 +317,13 @@ export function prGate(entity: EntitySnapshot): PrGate {
   const checksGreen = pull !== null && (pull.checks === null || pull.checks.state === "success");
   const owner = ownerApproval(entity);
   const markerApproved = marker !== null && marker.verdict === "approved";
-  const ownerLane = lane === "owner-reviewed";
-  const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || owner.approved);
+  // Only an explicit `no-review` marker skips the owner; a marker the plugin
+  // cannot read, or an unknown lane, is the user's (fail closed).
+  const ownerLane = lane !== "no-review";
+  const decision: "project" | "user" = opts.decision === "project" || (opts.decision === undefined && opts.projectApproved === true) ? "project" : "user";
+  const projectApproved = opts.projectApproved === true && decision === "project";
+  const approved = owner.approved || projectApproved;
+  const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || approved);
   const missing = gateMet
     ? null
     : pull === null
@@ -317,8 +334,10 @@ export function prGate(entity: EntitySnapshot): PrGate {
           ? `reviewer verdict: ${marker.verdict}`
           : !checksGreen
             ? `checks ${checksState ?? "not run"}`
-            : ownerLane && !owner.approved
-              ? "owner approval needed"
+            : ownerLane && !approved
+              ? decision === "project"
+                ? "project steward approval needed"
+                : "owner approval needed"
               : "not met";
   return {
     headSha,
@@ -330,7 +349,9 @@ export function prGate(entity: EntitySnapshot): PrGate {
     ownerApprovalAt: owner.at,
     gateMet,
     missing,
-    needsOwnerApproval: ownerLane && markerApproved && checksGreen && !owner.approved,
+    needsOwnerApproval: ownerLane && markerApproved && checksGreen && !approved,
+    decision,
+    projectApproved,
   };
 }
 

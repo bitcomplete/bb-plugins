@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
+import { formatDuration, phaseInstructions, type BigDecision, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
@@ -171,6 +171,8 @@ export type WakeInput = {
   needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
+  /** Head shas the project steward has approved in the store, so the lane gate reads the same as the button. */
+  projectApprovedShas?: ReadonlySet<string>;
   /** The project's adoption label. */
   label: string;
   /** Open bindings already at work on what this one touches. */
@@ -188,7 +190,7 @@ function commentLines(comments: SnapshotComment[]): string[] {
   return lines;
 }
 
-function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string): string[] {
+function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovedShas?: ReadonlySet<string>): string[] {
   const lines = [`### ${heading}`, ""];
   lines.push(`- ${e.key}: ${e.title ?? "(untitled)"}${e.url === null ? "" : ` — ${e.url}`}`);
   lines.push(`- State: ${e.state}${e.stateType === null ? "" : ` (${e.stateType})`}`);
@@ -200,7 +202,7 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
-    const gate = prGate(e);
+    const gate = prGate(e, { projectApproved: e.pull?.headSha !== null && e.pull?.headSha !== undefined && projectApprovedShas?.has(e.pull.headSha) === true });
     const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
     if (gate.gateMet) {
       const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
@@ -331,8 +333,8 @@ export function formatWake(input: WakeInput): string {
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
-  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity"));
-  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`));
+  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovedShas));
+  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovedShas));
   if (input.workers.length > 0) {
     out.push("", "### Workers", "");
     for (const w of input.workers) {
@@ -350,7 +352,7 @@ export function formatWake(input: WakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0 || input.routedToMe.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
@@ -767,7 +769,7 @@ export function formatProjectWake(input: {
   problems: string[];
   digestDue: boolean;
   notes: string[];
-  bigDecisions: string[];
+  bigDecisions: BigDecision[];
   /** Questions open with the user, from the record, with the binding each is about. */
   questions?: Array<{ question: Question; about: Binding | null }>;
   /** Open `needs` items, with the binding each is about. */
@@ -794,9 +796,9 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions, and say which entry you matched:",
       "",
-      ...input.bigDecisions.map((d) => `- ${d}`),
+      ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
     );
     if (input.routed.some((r) => r.from.kind === "ops")) {
