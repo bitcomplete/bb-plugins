@@ -550,6 +550,26 @@ An escalation is raised with the turn's `steward_report` and takes:
 An escalation is a condition on the status record, not a message, and stays
 until it is resolved.
 
+**One chain, one record (BB-30).** Every hop is one `escalations` row with
+one shape: a machine-read envelope (id, origin thread and binding, the
+chain of hops each with its rewording, the route the plugin assigned, the
+status, and `meanwhile`), a free-text payload the model reads, and the
+human-boundary fields (`resolution`, `choices`, `url`, and a secret's
+variable, purpose and destination) the project steward supplies when the
+route becomes `me`. `route` is assigned, never chosen: a worker's
+`bb stewards escalate` goes to its steward, `steward_report { escalate }`
+from a steward goes to the project steward, and only the project steward
+reaches the user. Each layer decides from the guidance if it can; it
+forwards only what the guidance does not settle, and forwarding to the user
+is for the project file's decide list alone. Whoever decides answers the
+originating thread directly: the answer is recorded verbatim as guidance on
+the originating binding with who decided, the bindings in between get a
+quiet note and no turn, and the originating thread is told (a `bb thread
+tell` for a worker, a wake for a steward). The `questions` table is gone,
+and the steward-filed `decide`, `configure` and `provide-secret` needs are
+escalations; the plugin-filed gate items (`approve-spec`, `approve-pr`,
+`merge`) stay as they are.
+
 - **Routing:** nearest managed ancestor, then the project steward. Each level
   decides it from the project's guidance by writing guidance onto the binding
   (`steward_update` with `resolve`) — which clears the condition and wakes the
@@ -594,25 +614,30 @@ hard stop is the runaway guard (§12).
   you, and writes the morning digest as its reply to the nightly wake.
 - **Woken** at the end of the nightly pass, by escalations that reach it, and
   by your messages.
-- **Questions to you are records.** Whatever the project steward asks you is
-  a row in the `questions` table, not just a sentence in its reply, so a
-  compaction cannot lose it and an answer given elsewhere cannot leave it
-  listed as open. A row is made when the project steward asks you something
-  itself with `steward_update { ask: { question, context } }`, bound to a
-  binding when it names one; and when it forwards a non-approval escalation
-  to you (`steward_update { forward }` with the route reaching `me`), bound
-  to that escalation and its binding. A forwarded `approval` escalation is
-  not a question: it becomes an `approve-spec` need with Approve/Decline
-  (§18), and the escalation stays open, linked to it. A question closes when
-  the project steward records your answer
-  (`steward_update { resolve: "<question id>", answer }`) or when you close
-  it on the stewards page, with or without an answer. A question made by
-  forwarding and its escalation close together, in one transaction, from
-  either side: resolving the escalation (by decision, by the binding
-  ending) closes the question with the same text, and closing the question
-  resolves the escalation and tells the binding's steward. Every project
-  steward wake lists the open questions from the table, and tells it not
-  to ask one again.
+- **It decides the owner-reviewed lane (BB-30).** The owner-reviewed
+triggers are one list in `stewards/project.json` (`bigDecisions`), each
+entry marked `decide: project | user`. The plugin raises an
+`approve-decline` escalation to the project steward when the reviewer's
+marker puts a pull request in the owner-reviewed lane. The project
+steward classifies it into an entry and either records a project-steward
+approval for a `project` entry (`steward_update { binding, approve,
+entry }`, bound to the pull request's head sha so a new push voids it and
+kept only in the store, never as a GitHub comment or review) or forwards
+it to you for a `user` one. A missing entry, an unknown mark, a `user`
+entry, or a change to the decide list, `bigDecisions`, `prGate` or the
+approval code is always yours, whatever the list says; a signed comment
+never satisfies either. `prGate` accepts the project-steward approval for
+a `project` entry, and the user's unsigned GitHub approval is unchanged.
+- **Questions and asks are escalations.** Whatever the project steward
+asks you is an `escalations` row with `route: me` and a `resolution`
+(`choice`, `text`, `approve-decline`, `secret`, `done`), not a sentence in
+its reply and not a separate table. A row is made when the project
+steward asks you itself with `steward_update { ask: { question,
+resolution, … } }`, or when it forwards an escalation to you. The page
+picks its buttons from `resolution` alone; a `secret` carries the
+variable, purpose and destination the requester thread uses. Resolving it
+at any layer delivers the answer to the originating thread, records it as
+guidance there, and notes the bindings between.
 - **The digest is written from the record.** The nightly wake carries a
   section the plugin assembles from its tables: the previous digest with
   its date; what moved since then (open bindings whose status record
@@ -972,15 +997,20 @@ what a wake carries.
 Everything a person had to do on a ticket used to exist only as prose,
 repeated across Linear comments, the project steward's digest and the stewards'
 replies. A **needs** record makes it structured: one row per thing the user
-must do, with a link, one line of what, steps, and a close rule. It is filed by
-the plugin from the snapshot or by a steward through `steward_report { needs }`,
-listed under "Waiting on you" on the Stewards page, in the digest, and by
-`bb stewards needs` and `bb stewards show`.
+must do, with a link, one line of what, steps, and a close rule. Under
+BB-30 the steward-filed asks (`decide`, `configure`, `provide-secret`) are
+the one `escalations` record with `route: me` and a `resolution`; the
+plugin-filed gate items (`approve-spec`, `approve-pr`, `merge`) stay as
+needs. Both are listed under "Waiting on you" on the Stewards page, in the
+digest, and by `bb stewards needs` and `bb stewards show`. A `route: me`
+escalation is rendered from its `resolution` alone: `choice` (one button
+per label), `text` (the answer box), `approve-decline`, `secret` (the
+requester thread and bb's secure form) or `done`.
 
 | kind | filed by | link | done when | one-click action |
 | -- | -- | -- | -- | -- |
 | `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
-| `approve-pr` | plugin, when a linked pull request is in the owner-reviewed lane, the reviewer's latest marker is `approved`, checks are green, and no owner approval exists | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
+| `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
 | `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
@@ -992,7 +1022,10 @@ The rules that hold:
   gate: the reviewer's latest marker has verdict `approved`,
   every check has passed, and, in the owner-reviewed lane, the owner has
   approved — an unsigned approving comment or an APPROVED review by the
-  connected user; a signed comment is a thread's, never the owner's. The merge
+  connected user, or, for an entry the decide list marks `project`, a
+  project-steward approval recorded in the store and bound to the head sha
+  (BB-30); a signed comment is a thread's, never the owner's. An unknown
+  lane is owner-reviewed, not no-review. The merge
   button, the item the plugin files and the wake's "Lane gate" line all read
   it, so a steward is told whether a pull request's gate is met in the same
   words the button acts on.

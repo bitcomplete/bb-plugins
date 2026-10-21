@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { MIGRATIONS, createStore } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, MIGRATIONS, createStore } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -162,5 +162,105 @@ describe("lessons", () => {
     s.markLessonDropped(lesson.id, "Dropped on the Stewards page.");
     expect(s.lesson(lesson.id)).toMatchObject({ status: "dropped", resolvedAt: expect.any(Number) });
     expect(s.lessons("p1")).toEqual([]);
+  });
+});
+
+describe("the escalation-chain migration (BB-30)", () => {
+  function legacy() {
+    const db = new Database(":memory:");
+    for (const sql of BASE_MIGRATIONS) db.exec(sql);
+    db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
+             VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
+    // A question with no linked escalation, answered, with choices.
+    db.exec(`INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, status, answer, answered_by, created_at, resolved_at, choices)
+             VALUES ('qst_open', 'p1', 'bnd_1', NULL, 'Ship on Friday?', 'A context.', 'open', NULL, NULL, 1000, NULL, NULL)`);
+    db.exec(`INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, status, answer, answered_by, created_at, resolved_at, choices)
+             VALUES ('qst_answered', 'p1', NULL, NULL, 'File an a11y ticket?', NULL, 'answered', 'Yes, file it.', 'user', 1100, 1200, '["Yes","No"]')`);
+    // A question forwarded from an escalation, answered; the escalation is open.
+    db.exec(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at)
+             VALUES ('esc_1', 'bnd_1', 'decision', 'Include SSO?', 'Wait.', 'me', 'open', 1300)`);
+    db.exec(`INSERT INTO questions (id, project_id, binding_id, escalation_id, question, context, status, answer, answered_by, created_at, resolved_at, choices)
+             VALUES ('qst_forwarded', 'p1', 'bnd_1', 'esc_1', 'Include SSO?', NULL, 'answered', 'Yes, include SSO.', 'user', 1300, 1400, NULL)`);
+    // Steward-filed needs of each kind, open and answered.
+    db.exec(`INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, status, resolution, created_at, resolved_at)
+             VALUES ('need_decide', 'bnd_1', 'decide', 'https://x/1', 'Merge or close?', NULL, '{"choices":["Merge","Close"]}', 'steward', 'open', NULL, 1500, NULL)`);
+    db.exec(`INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, status, resolution, created_at, resolved_at)
+             VALUES ('need_config', 'bnd_1', 'configure', '', 'Enable SSO on the page.', 'Steps.', '{"page":"https://x/page"}', 'steward', 'done', 'Done.', 1600, 1700)`);
+    db.exec(`INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, status, resolution, created_at, resolved_at)
+             VALUES ('need_secret', 'bnd_1', 'provide-secret', 'https://x/thread', 'Provide API_TOKEN.', NULL, '{"variable":"API_TOKEN","purpose":"deploys","setting":"githubToken"}', 'steward', 'open', NULL, 1800, NULL)`);
+    // A plugin-filed gate item stays in needs.
+    db.exec(`INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, status, resolution, created_at, resolved_at)
+             VALUES ('need_approve', 'bnd_1', 'approve-pr', 'https://github.com/acme/web/pull/7', 'Approve the PR.', NULL, '{}', 'plugin', 'open', NULL, 1900, NULL)`);
+    for (const sql of CHAIN_MIGRATIONS) db.exec(sql);
+    let now = 2000;
+    return { db, s: createStore(db, () => now) };
+  }
+
+  it("carries every question into escalations with its answer, and renames the old table", () => {
+    const { db, s } = legacy();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='questions_legacy'").get()).toBeDefined();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='questions'").get()).toBeUndefined();
+
+    expect(s.question("qst_open")).toMatchObject({ status: "open", answer: null, question: "Ship on Friday?", context: "A context." });
+    expect(s.question("qst_answered")).toMatchObject({ status: "answered", answer: "Yes, file it.", answeredBy: "user", choices: ["Yes", "No"] });
+    expect(s.question("qst_forwarded")).toMatchObject({ status: "answered", answer: "Yes, include SSO.", escalationId: "esc_1" });
+    // The escalation a forwarded question answered is resolved with that answer.
+    expect(s.escalation("esc_1")).toMatchObject({ status: "resolved", resolution: "Yes, include SSO." });
+    expect(s.openQuestions("p1").map((q) => q.id)).toEqual(["qst_open"]);
+  });
+
+  it("carries every steward-filed need into escalations with its answer, and keeps the plugin gate item in needs", () => {
+    const { db, s } = legacy();
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='needs_legacy'").get()).toBeDefined();
+
+    expect(s.need("need_decide")).toMatchObject({ kind: "decide", status: "open", what: "Merge or close?", data: { choices: ["Merge", "Close"] } });
+    expect(s.need("need_config")).toMatchObject({ kind: "configure", status: "done", resolution: "Done." });
+    expect(s.need("need_secret")).toMatchObject({ kind: "provide-secret", status: "open", data: { variable: "API_TOKEN", setting: "githubToken" } });
+
+    const migrated = s.escalation("need_decide")!;
+    expect(migrated).toMatchObject({ resolutionKind: "choice", projectId: "p1", route: "me" });
+    expect(s.escalation("need_secret")).toMatchObject({ resolutionKind: "secret", url: "https://x/thread" });
+    // The gate item is still a need and not an escalation.
+    expect(s.need("need_approve")).toMatchObject({ kind: "approve-pr", status: "open" });
+    expect(s.escalation("need_approve")).toBeNull();
+  });
+
+  it("keeps a fresh database's needs table for gate items", () => {
+    const { s, binding } = store();
+    const need = s.fileNeed({ bindingId: binding.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve.", how: null, data: {} });
+    expect(s.need(need.id)).toMatchObject({ kind: "approve-pr" });
+  });
+});
+
+describe("answers go straight to the originator (BB-30)", () => {
+  it("records the answer verbatim as guidance on the originating binding, with who decided", () => {
+    const { s, binding } = store();
+    const other = s.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    const x = s.escalate({
+      bindingId: binding.id,
+      kind: "decision",
+      question: "Include SSO?",
+      meanwhile: "Wait.",
+      route: "me",
+      recommendation: null,
+      origin: { threadId: "thr_worker", bindingId: binding.id, chain: [{ threadId: "thr_mid", bindingId: other.id, rewording: "Still include SSO?" }] },
+    });
+    expect(s.resolve(x.id, "Yes, include SSO.", "user")).toBe(true);
+    // Verbatim, with who decided as the author.
+    expect(s.binding(binding.id)!.guidance).toMatchObject([{ text: "Yes, include SSO.", by: "user" }]);
+    // The binding between gets a quiet note only.
+    expect(s.binding(other.id)!.pending).toMatchObject([{ text: expect.stringContaining("Yes, include SSO."), quiet: true }]);
+    // One delivery is queued for the originating thread.
+    expect(s.pendingDeliveries()).toMatchObject([{ originThreadId: "thr_worker", originBindingId: binding.id, text: "Yes, include SSO.", decidedBy: "user" }]);
+    s.markDeliveryDone(s.pendingDeliveries()[0]!.id);
+    expect(s.pendingDeliveries()).toEqual([]);
+  });
+
+  it("does not queue a delivery when the origin has no thread", () => {
+    const { s, binding } = store();
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "Wait.", route: "me", recommendation: null, origin: { threadId: null, bindingId: binding.id, chain: [] } });
+    s.resolve(x.id, "Answer.", "project");
+    expect(s.binding(binding.id)!.guidance).toMatchObject([{ text: "Answer.", by: "project" }]);
+    expect(s.pendingDeliveries()).toEqual([]);
   });
 });

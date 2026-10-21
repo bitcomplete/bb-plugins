@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type Playbook } from "./config.js";
+import { formatDuration, phaseInstructions, type BigDecision, type Playbook } from "./config.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
@@ -350,7 +350,7 @@ export function formatWake(input: WakeInput): string {
   const open = input.escalations.filter((x) => x.status === "open");
   if (open.length > 0 || input.routedToMe.length > 0) {
     out.push("", "### Open escalations", "");
-    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
+    for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
       out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
@@ -767,7 +767,7 @@ export function formatProjectWake(input: {
   problems: string[];
   digestDue: boolean;
   notes: string[];
-  bigDecisions: string[];
+  bigDecisions: BigDecision[];
   /** Questions open with the user, from the record, with the binding each is about. */
   questions?: Array<{ question: Question; about: Binding | null }>;
   /** Open `needs` items, with the binding each is about. */
@@ -794,9 +794,9 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions, and say which entry you matched:",
       "",
-      ...input.bigDecisions.map((d) => `- ${d}`),
+      ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
     );
     if (input.routed.some((r) => r.from.kind === "ops")) {

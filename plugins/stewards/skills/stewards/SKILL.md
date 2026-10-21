@@ -47,39 +47,37 @@ Two tools are yours; everything else you do with the tools every thread has.
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
   without a report raise `stuck`. When only the user can do something — a
-  step outside the repos, a secret, a decision — file it with
-  `steward_report { needs: [{ kind, url, what, how }] }` (`configure`,
-  `provide-secret`, `decide`); it appears on the Stewards page with its
-  button, deduplicated by (binding, kind, url). A `decide` item that is a
-  pick between fixed options carries `choices` — two to six short labels,
-  such as `choices: ["Merge", "Close", "Verify first"]` — and the page
-  shows a button each; never write "reply with your choice" in prose. A
-  `provide-secret` item carries the `variable` and `purpose`, and either
-  the `writeEnv` dotenv path (or `worker` thread) or the `setting` of one
-  of the stewards plugin's own `secret: true` settings.
+  step outside the repos, a secret, a decision — raise it as an escalation
+  (`steward_report { escalate }`); the project steward forwards it, and it
+  appears on the Stewards page with a button. `steward_report { needs }`
+  accepts only the plugin's gate kinds (`approve-spec`, `approve-pr`,
+  `merge`); a steward-filed `decide`, `configure` or `provide-secret` is
+  refused and points at `escalate`.
 - **Decide what the project's guidance settles.** AGENTS.md, architecture
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
   meanwhile } }`: it goes to your parent steward, then the project steward.
   The answer comes back as guidance and wakes you. The user hears only about
-  the project's big decisions. An escalation that asks them to pick between
-  fixed options carries `choices` (two to six short labels), so the page
-  shows one button each instead of asking in prose.
+  the project's big decisions, and the project steward is the only layer
+  that reaches them. A worker raises an escalation with
+  `bb stewards escalate "<payload>"`; it goes to you, its steward. An
+  escalation that asks for a pick between fixed options carries `choices`
+  (two to six short labels), so the page shows one button each instead of
+  asking in prose.
 - **One ask per reply, and only what is open.** Ask the user at most one
   thing, and only what the playbook, this skill or the project's guidance
   leaves open. Models, flags, lanes and who merges are settled there: never
   ask them. An escalation or approval request that is already open is on the
   Stewards page: do not ask for it again, and a reply that does counts like a
   missed report toward `stuck`.
-- **A credential is a `provide-secret` need, not a code-writing worker's
-  job to prompt.** File the user-facing item with
-  `steward_report { needs: [{ kind: "provide-secret", url, what, how,
-  variable, purpose }] }`; the plugin spawns a requester thread and opens
-  bb's secure form in its first turn. For a dotenv on a worker's machine
-  name the `writeEnv` path (or the `worker`); for one of the stewards
-  plugin's own settings name `setting` — only a declared `secret: true`
-  setting is accepted. Never paste a secret, and never route the user to a
-  script to run.
+- **A credential is an escalation the project steward forwards as a
+  `provide-secret` item, not a code-writing worker's job to prompt.** Raise
+  it with `steward_report { escalate }`, naming the variable and purpose,
+  and either the `writeEnv` dotenv path (or the `worker`) or the `setting`
+  of one of the stewards plugin's own `secret: true` settings; the project
+  steward forwards it and the plugin spawns a requester thread that opens
+  bb's secure form in its first turn. Never paste a secret, and never route
+  the user to a script to run.
 - **A build-time blocker is a `decision` the same turn.** A worker's finding
   that would stop the feature working once it ships, or that changes what the
   ticket needs (a credential, an access, a contract), is escalated as a

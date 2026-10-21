@@ -177,7 +177,7 @@ describe("a worker in flight between its turns (BB-11)", () => {
 
 describe("waits nobody hears", () => {
   const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
-  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null }];
+  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false }];
 
   it("flags a status blocked on the project steward or the user with no escalation open", () => {
     expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);
@@ -376,6 +376,27 @@ describe("the pull request gate (build-tickets)", () => {
     expect(waiting).toMatchObject({ gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
     const approved = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green));
     expect(approved).toMatchObject({ gateMet: true, ownerApproved: true, needsOwnerApproval: false });
+  });
+
+  it("accepts a project-steward approval for a project entry, and only the user's for a user entry (BB-30)", () => {
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green);
+    expect(prGate(project, { decision: "project", projectApproved: true })).toMatchObject({ decision: "project", projectApproved: true, gateMet: true, needsOwnerApproval: false });
+    // The same approval on a `user` entry is ignored: the user's unsigned GitHub approval is required.
+    expect(prGate(project, { decision: "user", projectApproved: true })).toMatchObject({ decision: "user", projectApproved: false, gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    // The user's unsigned approval satisfies it either way.
+    const ownerApproved = pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green);
+    expect(prGate(ownerApproved, { decision: "user", projectApproved: false }).gateMet).toBe(true);
+    // No project approval means the owner's.
+    expect(prGate(project, { projectApproved: false }).needsOwnerApproval).toBe(true);
+  });
+
+  it("fails closed on a lane the plugin cannot read (BB-30)", () => {
+    // An unknown lane is treated as owner-reviewed, not no-review.
+    const unknown = prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green));
+    expect(unknown).toMatchObject({ lane: "something-else", gateMet: false, needsOwnerApproval: true });
+    // With a project approval it is satisfied as owner-reviewed, not as no-review.
+    expect(prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green), { decision: "project", projectApproved: true }).gateMet).toBe(true);
+    expect(prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green), { projectApproved: false }).gateMet).toBe(false);
   });
 
   it("is not met when the verdict is not approved, checks are not green, or there is no round", () => {

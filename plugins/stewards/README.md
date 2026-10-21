@@ -187,24 +187,40 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open
   escalation or needs item is flagged in `bb stewards list` and the digest.
-- **"Needs you" items** are the structured things only the user can do: an
-  `approve-spec`, an `approve-pr` or a `merge` the plugin files from the
-  snapshot, and a `configure`, `provide-secret` or `decide` a steward files
-  through `steward_report { needs }`. They are deduplicated by (binding,
-  kind, url) while open, listed under "Waiting on you" on the Stewards page
-  with a link and a button each, in the digest, and by `bb stewards needs`.
-  The buttons run on the server as the connected user, unsigned: Approve
-  posts the "Approved <sha> from the Stewards page" comment, Merge re-checks
-  the lane gate and squash-merges through the server's `gh` login, and every
-  action wakes the binding's steward with the closure under "What changed".
-  A button is shown only while the server can verify its preconditions;
-  otherwise the item says why not. `bb stewards done <id>` closes one from a
-  thread. A `decide` item or a forwarded decision question may carry fixed
-  `choices` (two to six short labels): the page then shows one button per
-  choice, a note field and **Other…** instead of a free-text **Answer**, and
-  a choice is saved as guidance. `bb stewards done <id> --choice <label>`
-  records the same from a thread. A `blockedOn` naming the user, the owner
-  or a human is refused unless an open needs item says so.
+- **"Needs you" items** are the structured things only the user can do. The
+  plugin files the gate items (`approve-spec`, `approve-pr`, `merge`) from
+  the snapshot; a steward's `decide`, `configure` and `provide-secret` asks
+  are the one `escalations` record with `route: me` and a `resolution`
+  (`choice`, `text`, `approve-decline`, `secret`, `done`), forwarded by the
+  project steward (BB-30). Both are listed under "Waiting on you" on the
+  Stewards page with a link and a button each, in the digest, and by
+  `bb stewards needs`. The buttons run on the server as the connected user,
+  unsigned: Approve posts the "Approved <sha> from the Stewards page"
+  comment, Merge re-checks the lane gate and squash-merges through the
+  server's `gh` login, and every action wakes the binding's steward with the
+  closure under "What changed". A button is shown only while the server can
+  verify its preconditions; otherwise the item says why not. `bb stewards
+  done <id>` closes one from a thread. A `choice` resolution carries fixed
+  labels (two to six): the page shows one button per choice, a note field
+  and **Other…** instead of a free-text **Answer**, and a choice is saved as
+  guidance. `bb stewards done <id> --choice <label>` records the same from a
+  thread. A `blockedOn` naming the user, the owner or a human is refused
+  unless an open item says so.
+- **One escalation chain (BB-30).** Every hop is one `escalations` row: a
+  worker's `bb stewards escalate` goes to its steward, a steward's
+  `steward_report { escalate }` to the project steward, and only the
+  project steward reaches the user. Each layer decides from the guidance
+  when it can and forwards only what it does not settle. Whoever decides
+  answers the originating thread directly: the answer is recorded verbatim
+  as guidance on the originating binding with who decided, the bindings in
+  between get a quiet note and no turn, and the originating thread is told
+  (a `bb thread tell` for a worker, a wake for a steward). The
+  owner-reviewed lane is the project file's decide list (`bigDecisions`,
+  each entry `decide: project | user`): the project steward approves a
+  `project` entry (recorded in the store, bound to the pull request's head
+  sha, never a GitHub comment or review) and forwards a `user` one to you.
+  A missing or unknown mark, a change to the list, `bigDecisions`, `prGate`
+  or the approval code is always yours.
 - **Lessons** are a project steward's general judgements, made permanent in
   `.bb` instead of being lost with the ticket that raised them. It records
   one with `steward_update { lesson: { text, file, scope } }`; a `procedure`
@@ -227,13 +243,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   flight by stage with each status record and running workers, what is stuck
   or held, what ended in the last two weeks, and the latest digest with its
   date.
-- **Questions to you** are kept in the store from the moment the project
-  steward asks (`steward_update { ask }`, or forwarding an escalation)
-  until it records your answer (`steward_update { resolve: "<question id>",
-  answer }`) or you close it on the page. A forwarded escalation and its
-  question close together. The nightly wake lists them, with the previous
-  digest, what moved, what waits on you and what is stuck, all read from
-  the store, so the digest does not depend on the project steward's memory.
+- **Questions and asks to you** are escalations with `route: me`, kept in
+  the store from the moment the project steward asks
+  (`steward_update { ask }`, or forwarding an escalation) until it records
+  your answer (`steward_update { resolve: "<id>", answer }`) or you close it
+  on the page. A forwarded escalation and its ask close together. The
+  nightly wake lists them, with the previous digest, what moved, what waits
+  on you and what is stuck, all read from the store, so the digest does not
+  depend on the project steward's memory.
 - **The settings page** (Settings → Plugins → Stewards, [app.tsx](app.tsx))
   shows each stewarded project's configuration, problems, project steward
   and nightly pass, runs `bb stewards check` on a button, and lists every

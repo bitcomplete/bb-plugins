@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
-import { createStewardsPlugin, parseDotenvValue, secretVariable, testHooks, type StewardsDeps } from "./server.js";
+import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
@@ -43,6 +43,8 @@ function world() {
   /** What the page's GitHub actions did. */
   const githubComments: Array<{ repo: string; number: number; body: string }> = [];
   const githubMerges: Array<{ repo: string; number: number; title: string; body: string }> = [];
+  /** The changed paths `github.files` reports, by "owner/repo#n". */
+  const githubFiles = new Map<string, string[]>();
   const github = {
     comment: async (repo: string, number: number, body: string) => {
       githubComments.push({ repo, number, body });
@@ -50,6 +52,7 @@ function world() {
     squashMerge: async (repo: string, number: number, title: string, body: string) => {
       githubMerges.push({ repo, number, title, body });
     },
+    files: async (repo: string, number: number) => githubFiles.get(`${repo}#${number}`) ?? [],
   };
   let n = 0;
 
@@ -211,7 +214,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}) {
@@ -231,6 +234,44 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     await flush();
   };
   const tool = async (name: string, args: Record<string, unknown>, threadId: string) => {
+    // The steward-filed decide, configure and provide-secret needs are
+    // escalations now, so the tests' old `needs` calls are split into the
+    // escalation path here rather than rewritten at every call site.
+    if (name === "steward_report" && Array.isArray(args.needs)) {
+      const stewardKinds = new Set(["decide", "configure", "provide-secret"]);
+      const needs = args.needs as Array<Record<string, unknown>>;
+      const split = needs.filter((n) => stewardKinds.has(String(n.kind)));
+      if (split.length > 0) {
+        const key = typeof args.binding === "string" ? args.binding : "ENG-12";
+        for (const n of split) {
+          if (n.kind === "provide-secret") {
+            if (n.variable === undefined && n.setting === undefined) return { text: `provide-secret for ${String(n.what)} not filed: name the env var with \`variable\`, or a stewards secret setting with \`setting\`.`, error: false };
+            if (n.setting !== undefined && !SECRET_SETTING_NAMES.has(String(n.setting))) return { text: `provide-secret for ${String(n.variable ?? n.what)} not filed: ${JSON.stringify(n.setting)} is not a secret setting of the stewards plugin.`, error: false };
+          }
+          if (n.choices !== undefined) {
+            if (n.kind !== "decide") return { text: `${String(n.kind)} for ${String(n.url ?? "the item")} not filed: choices are for a decide item.`, error: false };
+            const choices = n.choices as string[];
+            if (choices.length < 2) throw new Error("expected array to have >=2 items");
+            if (choices.length > 6) throw new Error("expected array to have <=6 items");
+          }
+          escalationNeed({
+            key,
+            kind: n.kind as "decide" | "configure" | "provide-secret",
+            what: String(n.what),
+            ...(n.url === undefined ? {} : { url: String(n.url) }),
+            ...(n.how === undefined ? {} : { how: String(n.how) }),
+            ...(n.variable === undefined ? {} : { variable: String(n.variable) }),
+            ...(n.purpose === undefined ? {} : { purpose: String(n.purpose) }),
+            ...(n.worker === undefined ? {} : { worker: String(n.worker) }),
+            ...(n.writeEnv === undefined ? {} : { writeEnv: String(n.writeEnv) }),
+            ...(n.setting === undefined ? {} : { setting: String(n.setting) }),
+            ...(n.page === undefined ? {} : { page: String(n.page) }),
+            ...(n.choices === undefined ? {} : { choices: n.choices as string[] }),
+          });
+        }
+        args = { ...args, needs: needs.filter((n) => !stewardKinds.has(String(n.kind))) };
+      }
+    }
     const r = (await harness.behavior.callAgentTool(name, args, { threadId, projectId: "p1" })) as string | { content: Array<{ text?: string }>; isError?: boolean };
     return typeof r === "string" ? { text: r, error: false } : { text: r.content.map((c) => c.text ?? "").join(""), error: r.isError === true };
   };
@@ -262,7 +303,33 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code" }) });
     await flush();
   };
-  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned };
+  /** A steward-filed escalation the project steward has forwarded to the user, for tests. */
+  const escalationNeed = (fields: { key?: string; kind: "decide" | "configure" | "provide-secret"; url?: string; what: string; how?: string; variable?: string; purpose?: string; worker?: string; writeEnv?: string; setting?: string; page?: string; choices?: string[] }) => {
+    const bindingId = hooks.store.find(fields.key ?? "ENG-12", "p1")!.id;
+    const resolutionKind = fields.kind === "provide-secret" ? "secret" : fields.kind === "configure" ? "done" : (fields.choices ?? []).length > 0 ? "choice" : "text";
+    return hooks.store.escalate({
+      bindingId,
+      kind: "decision",
+      question: fields.what,
+      meanwhile: "Wait.",
+      route: "me",
+      recommendation: null,
+      projectId: "p1",
+      resolutionKind,
+      url: fields.url ?? null,
+      choices: fields.choices,
+      data: {
+        ...(fields.variable === undefined ? {} : { variable: fields.variable }),
+        ...(fields.purpose === undefined ? {} : { purpose: fields.purpose }),
+        ...(fields.worker === undefined ? {} : { workerThreadId: fields.worker }),
+        ...(fields.writeEnv === undefined ? {} : { writeEnv: fields.writeEnv }),
+        ...(fields.setting === undefined ? {} : { setting: fields.setting }),
+        ...(fields.page === undefined ? {} : { page: fields.page }),
+        ...(fields.choices === undefined ? {} : { choices: fields.choices }),
+      },
+    });
+  };
+  return { ...w, bb, harness, hooks, flush, ring, tool, list, idle, created, createdOwned, escalationNeed };
 }
 
 describe("a Linear ticket steward", () => {
@@ -1346,7 +1413,7 @@ describe("terminal states and follow-through", () => {
     // A retry changes nothing and is no error.
     expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/guidance already saved; esc_[\w-]+ already has this answer/u) });
     expect(t.hooks.store.escalation(id)!.resolution).toBe("The binding ended.\nYes, include SSO.");
-    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["Yes, include SSO."]);
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["The binding ended.", "Yes, include SSO."]);
   });
 
   it("takes an answer to a forwarded question the ending closed, on the question and its escalation alike", async () => {
@@ -2239,6 +2306,11 @@ describe("needs you items", () => {
   it("files approve-pr in the owner lane; the page action posts the unsigned approval and the merge item follows", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
+    // The owner-reviewed lane is the project steward's to decide (BB-30); it
+    // forwards to the user, which files the approve-pr item.
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc).toMatchObject({ route: "project" });
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
@@ -2290,13 +2362,9 @@ describe("needs you items", () => {
   it("files an approve-pr the owner-lane gate holds (BB-21)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    const report = await t.tool(
-      "steward_report",
-      { ...base, actor: "me", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub" }] },
-      t.steward,
-    );
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    const report = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     expect(report.error).toBe(false);
-    expect(report.text).not.toMatch(/not filed/u);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/approve-pr, ENG-12/u);
   });
@@ -2304,6 +2372,8 @@ describe("needs you items", () => {
   it("records the gate's missing text when sync closes an approve-pr need (BB-21)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
     // The reviewer's round goes away, so the open item no longer holds; the
     // closure records what the gate is missing, not the generic line.
@@ -2341,33 +2411,80 @@ describe("needs you items", () => {
     expect(t.githubMerges).toEqual([]);
   });
 
+  it("records a project-steward approval bound to the head sha; ticket and worker threads are refused (BB-30)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    // A ticket steward cannot record one.
+    const bySteward = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.steward);
+    expect(bySteward.error).toBe(true);
+    expect(bySteward.text).toMatch(/project steward/u);
+    // A worker cannot either.
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const byWorker = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, "thr_w1");
+    expect(byWorker.error).toBe(true);
+    // A `user` entry is refused, pointing at a forward.
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    const userEntry = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "Granting a new credential, token or cluster access, or widening what an existing one can reach" }, t.project);
+    expect(userEntry.error).toBe(true);
+    expect(userEntry.text).toMatch(/forward/u);
+    // A `project` entry is recorded, bound to the head sha, only in the store.
+    const approved = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(approved.error).toBe(false);
+    expect(t.hooks.store.projectApproval(b.id, "aaaaaaa1")).toMatchObject({ entry: "A cross-repo contract other repos implement", byThread: t.project });
+    expect(t.githubComments).toEqual([]);
+    // A new push is a new sha: there is no approval for it.
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
+    expect(t.hooks.store.projectApproval(b.id, "bbbbbbb2")).toBeNull();
+  });
+
+  it("bb stewards escalate from a worker files an escalation on its binding and wakes the steward (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12")!;
+    const out = await t.harness.behavior.runCli(["escalate", "Which API version should I target?", "--meanwhile", "continue"], { threadId: "thr_w1", projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Which API version should I target?")!;
+    expect(esc).toMatchObject({ route: "steward", meanwhile: "continue", origin: { threadId: "thr_w1", bindingId: b.id } });
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Which API version should I target\?/);
+  });
+
+  it("delivers an answer to the originating worker as a tell, and never wakes the bindings between (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12")!;
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
+    t.hooks.store.resolve(x.id, "Yes, include SSO.", "user");
+    await t.hooks.sweep();
+    await t.flush();
+    // The worker is told directly.
+    expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/Yes, include SSO\./);
+    // The answer is recorded verbatim on the originating binding, with who decided.
+    expect(t.hooks.store.binding(b.id)!.guidance).toMatchObject([{ text: "Yes, include SSO.", by: "user" }]);
+  });
+
   it("a steward files configure and provide-secret, and bb stewards done closes one and wakes the steward", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    const reported = await t.tool(
-      "steward_report",
-      {
-        ...base,
-        actor: "me",
-        needs: [
-          { kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret", how: "Settings → API → New secret" },
-          { kind: "configure", url: "https://linear.app/settings/agents", what: "Install the agent", how: "scopes: app:mentionable" },
-          { kind: "configure", url: "https://linear.app/settings/webhooks", what: "Enable Agent session events" },
-          { kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" },
-        ],
-      },
-      steward,
-    );
-    expect(reported.error).toBe(false);
+    // The steward's escalate, forwarded by the project steward with the
+    // page's resolution (BB-30).
+    t.escalationNeed({ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret", how: "Settings → API → New secret" });
+    t.escalationNeed({ kind: "configure", url: "https://linear.app/settings/agents", what: "Install the agent", how: "scopes: app:mentionable" });
+    t.escalationNeed({ kind: "configure", url: "https://linear.app/settings/webhooks", what: "Enable Agent session events" });
+    t.escalationNeed({ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" });
     const b = t.hooks.store.find("ENG-12")!;
     expect(t.hooks.store.openNeeds(b.id)).toHaveLength(4);
-    // A re-report updates the wording rather than duplicating.
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret (now)" }] }, steward);
-    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "configure")).toHaveLength(3);
     const configure = t.hooks.store.openNeeds(b.id).find((n) => n.url === "https://linear.app/settings/api")!;
-    expect(configure.what).toBe("Add the client secret (now)");
+    expect(configure.what).toBe("Add the client secret");
     const before = t.sends.filter((s) => s.threadId === steward).length;
     const out = await t.harness.behavior.runCli(["done", configure.id, "--project", "p1"]);
     expect(out.exitCode).toBe(0);
@@ -2493,7 +2610,10 @@ describe("needs you items", () => {
     expect(out.stderr).not.toContain("s3cr3t-value");
     expect((await t.hooks.settings.get()).sentryToken).toBe("s3cr3t-value");
     expect(t.fileContents.has("host_on:/tmp/.secrets.env")).toBe(false);
-    // The value appears in no message, worker result or need record either.
+    // The value appears in no message, worker result, need record or escalation payload/guidance either.
+    const escalation = t.hooks.store.escalation(need.id)!;
+    expect(JSON.stringify(escalation.data)).not.toContain("s3cr3t-value");
+    expect(JSON.stringify(t.hooks.store.find("ENG-12")!.guidance)).not.toContain("s3cr3t-value");
     const transcript = JSON.stringify([...t.sends, ...t.userTurns, t.hooks.store.needs(b.id, true), t.hooks.store.workers(b.id)]);
     expect(transcript).not.toContain("s3cr3t-value");
   });
@@ -2556,6 +2676,10 @@ describe("needs you items", () => {
   it("shows the items on the board with their actionability", async () => {
     const t = await withPull([marker]);
     const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; why: string | null }> } }).board;
+    // The owner-reviewed lane is the project steward's; forwarding it to the
+    // user files the page's approve-pr item (BB-30).
+    const esc = t.hooks.store.openEscalations(t.binding().id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     const first = await board();
     expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
     // Once the owner approves, a merge item appears; a running worker makes it not actionable.
@@ -2575,7 +2699,7 @@ describe("needs you items", () => {
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
-    expect(wake).toMatch(/### Waiting on the user[\s\S]*configure \(need_[\w-]+, since 2026-10-14, ENG-12\): Add the client secret/u);
+    expect(wake).toMatch(/### Waiting on the user[\s\S]*configure \((?:need|esc)_[\w-]+, since 2026-10-14, ENG-12\): Add the client secret/u);
     expect(wake).toMatch(/## Needs you[\s\S]*configure, ENG-12\): Add the client secret/u);
   });
 
@@ -2604,6 +2728,10 @@ describe("needs you items", () => {
       steward,
     );
     const b = () => t.hooks.store.find("ENG-12")!;
+    // The owner-reviewed pull request is the project steward's; it forwards
+    // it to the user, which files the page's approve-pr item (BB-30).
+    const prEsc = t.hooks.store.openEscalations(b().id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: prEsc.id }, project);
     const kinds = () => t.hooks.store.openNeeds(b().id).map((n) => n.kind).sort();
     expect(kinds()).toEqual(["approve-pr", "approve-spec", "configure", "configure", "configure", "provide-secret"]);
 
@@ -2747,11 +2875,11 @@ describe("fixed choices on decide items and questions", () => {
     const t = await adopted();
     await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/Merge or close\? \[choices: Merge, Close\]/u);
-    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Need need_\S+ decide \(open\): Merge or close\? \[choices: Merge, Close\]/u);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Escalation esc_\S+ decision \(open, me\): Merge or close\? \[choices: Merge, Close\]/u);
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
-    expect(wake).toMatch(/decide \(need_\S+, since 2026-10-14, ENG-12\): Merge or close\? \[choices: Merge, Close\]/u);
+    expect(wake).toMatch(/decide \((?:need|esc)_\S+, since 2026-10-14, ENG-12\): Merge or close\? \[choices: Merge, Close\]/u);
     expect(wake).toMatch(/## Needs you[\s\S]*decide, ENG-12\): Merge or close\? \[choices: Merge, Close\]/u);
   });
 
