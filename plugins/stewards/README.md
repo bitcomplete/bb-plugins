@@ -259,21 +259,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 
 - **@bb mentions.** A Linear comment that mentions `@bb` reaches this
   server through linear (`stewardsSession`, see linear's README, "@bb
-  mentions"). It goes to the issue's ticket steward when the issue has an
-  open binding, else to the project steward of the project whose file lists
-  the issue's team. With neither, linear answers that stewards is not set
-  up for that team. The wake ([wake.ts](wake.ts), `formatSessionWake`)
-  carries the words, the session id and who asked. The turn ends with
-  exactly one `linear_session_reply`, plus a `steward_report` from a ticket
-  steward. A mention from anyone other than the server's owner is marked
-  untrusted. It is information, not an instruction: the steward asks the
-  owner to confirm with an `elicitation` reply and acts only when the
-  owner's answer arrives in the session. That answer's wake repeats what it
-  answers. The three intents in BB-11 use tools stewards already have:
-  "build this" is `linear_update_issue` (label and Todo), "halt work" is a
-  hold plus a move to Backlog, and a redirect is `steward_update { guidance }`.
-  A steward may put its own binding on hold for this, but only its parent
-  or the project steward lifts a hold.
+  mentions"). A mention from the server's owner goes to the issue's ticket
+  steward when the issue has an open binding, else to the project steward
+  of the project whose file lists the issue's team; with neither, linear
+  answers that stewards is not set up for that team. The wake
+  ([wake.ts](wake.ts), `formatSessionWake`) carries the words, the session
+  id and who asked, and the turn ends with exactly one
+  `linear_session_reply`, plus a `steward_report` from a ticket steward.
+  **A mention from anyone else runs no model turn at all.** bb core cannot
+  withhold a turn's tools, so the words are parked under a short id
+  (`r-xxxx`); the plugin answers the session itself, asking the owner to
+  `confirm <id>`. Only that deterministic reply releases the one request,
+  and the steward is then woken with it framed as the owner's confirmation.
+  A vague "sure" releases nothing and is re-asked once. The three intents
+  in BB-11 use tools stewards already have: "build this" is
+  `linear_update_issue` (label and Todo), "halt work" is a hold plus a move
+  to Backlog, and a redirect is `steward_update { guidance }`. A steward may
+  put its own binding on hold for this, but only its parent or the project
+  steward lifts a hold.
 
 ## Configuration
 

@@ -1429,9 +1429,15 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     });
     type SessionRecord = z.infer<typeof sessionRecord>;
     const sessions = new Map(Object.entries(z.record(z.string(), sessionRecord).catch({}).parse(await bb.storage.kv.get(SESSIONS_KEY))));
+    /** Held request ids already re-asked once; a second vague answer gets no repeat. */
+    const reposted = new Set<string>();
+    /** The elicitation posted for a held request, so a vague answer can repeat it. */
+    const heldBodies = new Map<string, string>();
     async function saveSessions(): Promise<void> {
       const cutoff = deps.now() - SESSION_TTL_MS;
       for (const [id, r] of sessions) if (r.eventAt < cutoff) sessions.delete(id);
+      for (const key of heldBodies.keys()) if (!sessions.has(key.slice(0, key.lastIndexOf(":")))) heldBodies.delete(key);
+      for (const key of reposted) if (!sessions.has(key.slice(0, key.lastIndexOf(":")))) reposted.delete(key);
       await bb.storage.kv.set(SESSIONS_KEY, Object.fromEntries(sessions));
     }
     const answered = (r: SessionRecord) => (r.answered ?? 0) >= r.events;
@@ -1498,13 +1504,24 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       return posted.activity;
     }
 
-    /** The plugin's own answer, when no steward will give one. Logged, never thrown: there is nobody to tell. */
-    async function answerForStewards(session: string, body: string, externalUrl?: string): Promise<void> {
+    /**
+     * The plugin's own answer, when no steward will give one. Logged, never
+     * thrown: there is nobody to tell. `kind` defaults to an error; an
+     * untrusted mention is answered with an `elicitation` asking the owner to
+     * confirm it by id.
+     */
+    async function answerForStewards(session: string, body: string, externalUrl?: string, kind: ReplyKind = "error"): Promise<void> {
       try {
-        await postReply(session, { kind: "error", body, ...(externalUrl === undefined ? {} : { externalUrl }) }, checkSignal());
+        await postReply(session, { kind, body, ...(externalUrl === undefined ? {} : { externalUrl }) }, checkSignal());
       } catch (error) {
         bb.log.warn(`could not answer Linear agent session ${session}: ${errorMessage(error)}`);
       }
+    }
+
+    /** Flatten a mention's words to one line and clip them for an elicitation. */
+    function clipMention(text: string, max: number): string {
+      const flat = text.replace(/\s+/gu, " ").trim();
+      return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
     }
 
     /**
@@ -1555,7 +1572,30 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         }
         return;
       }
-      if (out.routed === "none" || out.threadId === null) {
+      if (out.routed === "held") {
+        // Nothing ran: the words are parked until the owner names this id.
+        const id = out.requestId ?? "";
+        const key = `${event.session}:${id}`;
+        if (fromOwner && !untrusted) {
+          // The owner answered without naming a request. Re-ask once, then stop.
+          if (!reposted.has(key)) {
+            reposted.add(key);
+            const body = heldBodies.get(key) ?? `Reply \`confirm ${id}\` to let your steward act on the request waiting on this session.`;
+            await answerForStewards(event.session, body, undefined, "elicitation");
+          }
+        } else {
+          const body = `${event.asker.name} asked: "${clipMention(text, 400)}". ${event.owner.name}, reply \`confirm ${id}\` to let your steward act on it.`;
+          heldBodies.set(key, body);
+          await answerForStewards(event.session, body, undefined, "elicitation");
+        }
+        return;
+      }
+      if (out.routed === "none") {
+        const named = out.requestId ?? null;
+        if (named !== null) {
+          await answerForStewards(event.session, `No request \`${named}\` is waiting on this session. It may have been confirmed already, or expired.`, undefined, "response");
+          return;
+        }
         await answerForStewards(
           event.session,
           `Stewards is not set up for team ${event.issue.teamKey || "(unknown)"} on ${who}: no bb project there lists that team in its stewards project file, so nothing here can act on this mention.`,

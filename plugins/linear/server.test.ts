@@ -1403,6 +1403,54 @@ describe("agent sessions", () => {
     await s.stop();
   });
 
+  it("answers an untrusted mention itself with an elicitation naming the held request, running no turn", async () => {
+    const s = await sessions(() => ({ routed: "held", threadId: null, projectId: null, requestId: "r-abcd" }));
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.hooks.replies).toEqual([
+      {
+        session: "sess-1",
+        body: {
+          connection: "c_1",
+          kind: "elicitation",
+          body: 'Carol asked: "@bb build this". Jane, reply `confirm r-abcd` to let your steward act on it.',
+        },
+      },
+    ]);
+    await s.stop();
+  });
+
+  it("answers a confirmation that names nothing waiting with a short reply", async () => {
+    const s = await sessions(() => ({ routed: "none", threadId: null, projectId: null, requestId: "r-zzzz" }));
+    s.hooks.last().send(s.hooks.session({ action: "prompted", fromOwner: true, asker: { id: "u1", name: "Jane" }, comment: { text: "confirm r-zzzz", untrusted: false } }));
+    await tick();
+    expect(s.hooks.replies).toEqual([
+      { session: "sess-1", body: { connection: "c_1", kind: "response", body: "No request `r-zzzz` is waiting on this session. It may have been confirmed already, or expired." } },
+    ]);
+    await s.stop();
+  });
+
+  it("re-asks once with the same elicitation when the owner answers without naming the held request", async () => {
+    const s = await sessions(() => ({ routed: "held", threadId: null, projectId: null, requestId: "r-abcd" }));
+    // The untrusted mention: the plugin posts the elicitation.
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.hooks.replies).toHaveLength(1);
+    const first = String(s.hooks.replies[0]!.body.body);
+    expect(first).toMatch(/Carol asked: "@bb build this"\. Jane, reply `confirm r-abcd`/u);
+    // The owner's vague answer: the same elicitation is posted once more.
+    const vague = { action: "prompted", fromOwner: true, asker: { id: "u1", name: "Jane" }, comment: { text: "sure", untrusted: false } };
+    s.hooks.last().send(s.hooks.session(vague));
+    await tick();
+    expect(s.hooks.replies).toHaveLength(2);
+    expect(s.hooks.replies[1]!.body.body).toBe(first);
+    // A second vague answer gets no repeat.
+    s.hooks.last().send(s.hooks.session({ ...vague, comment: { text: "yes", untrusted: false } }));
+    await tick();
+    expect(s.hooks.replies).toHaveLength(2);
+    await s.stop();
+  });
+
   it("answers with an error itself when stewards has no project for the team, or is not installed", async () => {
     const s = await sessions((input) => {
       if (input.session === "sess-missing") throw Object.assign(new Error("plugin stewards is not installed"), { status: 404 });
