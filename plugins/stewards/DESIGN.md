@@ -565,7 +565,10 @@ is for the project file's decide list alone. Whoever decides answers the
 originating thread directly: the answer is recorded verbatim as guidance on
 the originating binding with who decided, the bindings in between get a
 quiet note and no turn, and the originating thread is told (a `bb thread
-tell` for a worker, a wake for a steward). The `questions` table is gone,
+tell` for a worker, a wake for a steward). A hop that names the origin
+binding is not noted again: the origin binding's own steward reads the
+answer as guidance, and its closure wake already tells it. The `questions`
+table is gone,
 and the steward-filed `decide`, `configure` and `provide-secret` needs are
 escalations; the plugin-filed gate items (`approve-spec`, `approve-pr`,
 `merge`) stay as they are.

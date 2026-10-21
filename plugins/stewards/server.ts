@@ -2323,7 +2323,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // mark, so a throw while building it leaves nothing marked.
       const open = store.open(projectId);
       const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
-      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.kind !== "approval" && x.resolutionKind === null).map((escalation) => ({ escalation, from: b })));
+      const coveredWithUser = new Set(store.openQuestionEscalationIds(projectId));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.kind !== "approval" && x.resolutionKind === null && !coveredWithUser.has(x.id)).map((escalation) => ({ escalation, from: b })));
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
@@ -2343,13 +2344,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const all = store.all(projectId);
       const open = all.filter((b) => b.endedAt === null);
       const openWith = (pick: (x: Escalation) => boolean) => open.flatMap((b) => store.openEscalations(b.id).filter(pick).map((escalation) => ({ escalation, from: b })));
+      const coveredInDigest = new Set(store.openQuestionEscalationIds(projectId));
       return {
         previous: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
         since,
         moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
-        withUser: openWith((x) => x.route === "me" && x.resolutionKind === null && !x.isQuestion),
+        withUser: openWith((x) => x.route === "me" && x.resolutionKind === null && !x.isQuestion && !coveredInDigest.has(x.id)),
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
@@ -2756,14 +2758,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * the escalation, so it is told too, to resolve it or leave it open.
      */
     async function toldWhileWithUser(b: Binding, fresh: Change[]): Promise<void> {
-      const withUser = store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval");
+      const withUser = store.openEscalations(b.id).filter((x) => x.route === "me" && x.kind !== "approval" && !x.isQuestion);
       const news = fresh.filter((c) => c.actionable && c.own !== true);
       if (withUser.length === 0 || news.length === 0 || (await settings.get()).paused) return;
       await wakeProject(b.projectId, `${b.entityKey} changed while the user has its escalation`, {
         digestDue: false,
         notes: [
           `What changed on ${b.entityKey}${b.url === null ? "" : ` (${b.url})`}: ${[...new Set(news.map((c) => c.text))].join("; ")}.`,
-          ...withUser.map((x) => `Escalation ${x.id} (${x.kind}) is with the user: ${x.question}`),
+          ...withUser.map((x) => `Escalation ${x.id} (${x.kind}) is with the user: ${x.question}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`),
           `The user may have answered on the entity instead of here. Read the change (\`bb stewards show ${b.entityKey}\`, or the entity itself). If it answers an escalation, record that with steward_update { binding, guidance, resolve }, which wakes the steward; if it does not, leave the escalation open and do not ask the user again.`,
         ],
       });
@@ -3275,7 +3277,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const needs = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
         // A question or a need covers the escalation it was made for: the
         // page's row is the question or the item, never the raw escalation.
-        const covered = new Set([...questions.map((q) => q.escalationId), ...needs.map((n) => n.escalationId)].filter((id): id is string => id !== null));
+        const covered = new Set([...questions.map((q) => q.escalationId), ...needs.map((n) => n.escalationId), ...store.openQuestionEscalationIds(projectId)].filter((id): id is string => id !== null));
         const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => ({ x, b })));
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
@@ -3560,7 +3562,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
 
         // `decide` is the question mechanism; a raw item of that kind just closes.
-        store.closeNeed(need.id, text === null ? "Closed on the Stewards page." : `Closed on the Stewards page: ${text}`);
+        store.closeNeed(need.id, text === null ? "Closed on the Stewards page." : `Closed on the Stewards page: ${text}`, "user");
         after(`${need.kind} item ${need.id} was closed on the Stewards page${text === null ? "" : `: ${text}`}.`);
         return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
       },
@@ -5049,7 +5051,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 if (choices.length === 0) throw new PluginCliError(`Item ${id} has no choices; close it without --choice.`, { code: "no_choices" });
                 if (!choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
                 const guidance = note === null ? choice : `${choice} — ${note}`;
-                store.closeNeed(n.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`);
+                store.closeNeed(n.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`, "user");
                 const b = store.binding(n.bindingId);
                 if (b !== null) {
                   store.addGuidance(b.id, guidance, "user");
@@ -5079,7 +5081,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 await wakeProjectOnForwardedAnswer(b, closure, forwarded);
                 return { exitCode: 0, stdout: `Approved ${id}; ${b.entityKey}'s steward has been told.` };
               }
-              store.closeNeed(n.id, note === null ? "Closed from a thread." : `Answered from a thread: ${note}`);
+              store.closeNeed(n.id, note === null ? "Closed from a thread." : `Answered from a thread: ${note}`, "user");
               if (b !== null) {
                 if (note !== null) store.addGuidance(b.id, note, "user");
                 store.note(b.id, note === null ? `${n.kind} item ${n.id} was closed from a thread.` : `${n.kind} item ${n.id} was answered from a thread: ${note}.`);

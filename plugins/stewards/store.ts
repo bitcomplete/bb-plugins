@@ -780,14 +780,17 @@ export function createStore(db: Database.Database, now: () => number) {
   // again as a need: the page shows the question or the item, never the raw row.
   const openEscalationNeeds = db.prepare<[string], Record<string, unknown>>(
     "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
-      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret','done'))) " +
+      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
   const openEscalationNeedsForProject = db.prepare<[string], Record<string, unknown>>(
     "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
-      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret','done'))) " +
+      "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open') " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
+  // The raw escalations an open question covers (its `forwarded_from`), whatever
+  // the question's resolution, so the page and wakes show the question/item once.
+  const openQuestionCovered = db.prepare<[string], { forwarded_from: string }>("SELECT DISTINCT forwarded_from FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND forwarded_from IS NOT NULL");
   const answerQuestion = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND is_question = 1 AND status = 'open'");
   const answerForEscalation = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'open'");
   const appendAnswerForEscalation = db.prepare("UPDATE escalations SET resolution = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'resolved'");
@@ -1301,6 +1304,10 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     answeredSince(projectId: string, since: number): Question[] {
       return answeredSince.all(projectId, since).map(toQuestion);
+    },
+    /** The raw route-`me` escalations an open question covers, whatever its resolution. */
+    openQuestionEscalationIds(projectId: string): string[] {
+      return openQuestionCovered.all(projectId).map((r) => r.forwarded_from);
     },
     /**
      * Close an open question with its answer, and resolve the escalation it was
