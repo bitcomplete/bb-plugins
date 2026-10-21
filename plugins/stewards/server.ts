@@ -3185,6 +3185,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
     }
 
+    /** Put a claimed request back after a failed delivery; a no-op if it is already waiting. */
+    async function restorePending(session: string, item: PendingRequest): Promise<void> {
+      return withPendingLock(async () => {
+        const all = pendingRecord.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
+        const before = all[session]?.requests ?? [];
+        if (before.some((r) => r.id === item.id)) return;
+        all[session] = { requests: [...before, item].slice(-PENDING_MAX), savedAt: all[session]?.savedAt ?? now() };
+        await bb.storage.kv.set(PENDING_KEY, all);
+      });
+    }
+
     /** The id in an owner's `confirm <id>` reply, or null. The whole text, so a vague "sure" names nothing. */
     function parseConfirm(text: string): string | null {
       const m = /^(?:@bb[,\s]+)?confirm[\s:]+(r-[a-z0-9]+)[.!]?$/iu.exec(text.trim());
@@ -3204,12 +3215,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The owner's own words. A `confirm <id>` releases exactly one waiting
       // request; anything else releases nothing, and while requests wait the
       // plugin re-asks for the id instead of waking a model on a vague word.
-      // The request is removed only once a steward has taken it, so a delivery
-      // failure leaves the owner's confirmation to retry.
+      // The request is claimed under the pending lock, so two copies of the
+      // same confirmation cannot both wake a steward; it is put back below if
+      // no steward can be reached.
       let confirmed: PendingRequest | null = null;
       const named = parseConfirm(w.comment.text);
       if (named !== null) {
-        confirmed = (await pendingRequests(w.session)).find((r) => r.id === named) ?? null;
+        confirmed = await takePending(w.session, named);
         if (confirmed === null) {
           bb.log.info(`stewards: ${w.owner.name} confirmed ${named} on session ${w.session}, but nothing waits under that id`);
           return { routed: "none", threadId: null, projectId: null, requestId: named };
@@ -3223,44 +3235,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
 
-      const bound = store.byEntity("linear", w.issue.id);
-      if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
-        const config = await loadConfig(bound.projectId);
-        const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
-        await serial(`b:${bound.id}`, async () => {
-          const b = store.binding(bound.id);
-          if (b === null || b.endedAt !== null || b.threadId === null) return;
-          sent.outcome = await sendTo(
-            b.threadId,
-            formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, ...(confirmed === null ? {} : { confirmed }), label: config?.file.label ?? "bb-managed" }),
-          );
-          // A turn like any wake's: it ends with steward_report, and one
-          // waiting on someone else is archived when it is done.
-          if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
-        });
-        if (sent.outcome === "sent") {
-          if (confirmed !== null) await takePending(w.session, confirmed.id);
-          bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
-          return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId, requestId: confirmed?.id ?? null };
+      try {
+        const bound = store.byEntity("linear", w.issue.id);
+        if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
+          const config = await loadConfig(bound.projectId);
+          const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
+          await serial(`b:${bound.id}`, async () => {
+            const b = store.binding(bound.id);
+            if (b === null || b.endedAt !== null || b.threadId === null) return;
+            sent.outcome = await sendTo(
+              b.threadId,
+              formatSessionWake({ wake: w, role: { kind: "ticket", binding: b }, ...(confirmed === null ? {} : { confirmed }), label: config?.file.label ?? "bb-managed" }),
+            );
+            // A turn like any wake's: it ends with steward_report, and one
+            // waiting on someone else is archived when it is done.
+            if (sent.outcome === "sent") store.patch(b.id, { awaitingReport: true, wokeAt: now(), archiveWhenIdle: false });
+          });
+          if (sent.outcome === "sent") {
+            bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
+            return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId, requestId: confirmed?.id ?? null };
+          }
+          bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
         }
-        bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
-      }
 
-      const projects = await stewardedProjects();
-      const config =
-        (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
-        projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
-      if (config === undefined) {
-        bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
-        return { routed: "none", threadId: null, projectId: null, requestId: null };
+        const projects = await stewardedProjects();
+        const config =
+          (bound === null ? undefined : projects.find((p) => p.projectId === bound.projectId && p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)))) ??
+          projects.find((p) => p.file.linear.teams.some((t) => lc(t) === lc(w.issue.teamKey)));
+        if (config === undefined) {
+          if (confirmed !== null) await restorePending(w.session, confirmed);
+          bb.log.info(`stewards: an @bb mention on ${w.issue.key}, but no project lists team ${w.issue.teamKey}`);
+          return { routed: "none", threadId: null, projectId: null, requestId: null };
+        }
+        const threadId = await ensureProjectSteward(config);
+        if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
+        const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, ...(confirmed === null ? {} : { confirmed }), label: config.file.label }));
+        if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
+        bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
+        return { routed: "project", threadId, projectId: config.projectId, requestId: confirmed?.id ?? null };
+      } catch (error) {
+        if (confirmed !== null) await restorePending(w.session, confirmed);
+        throw error;
       }
-      const threadId = await ensureProjectSteward(config);
-      if (threadId === null) throw new Error(`could not start the project steward of ${config.projectId}`);
-      const sent = await sendTo(threadId, formatSessionWake({ wake: w, role: { kind: "project" }, ...(confirmed === null ? {} : { confirmed }), label: config.file.label }));
-      if (sent !== "sent") throw new Error(`could not message the project steward of ${config.projectId}`);
-      if (confirmed !== null) await takePending(w.session, confirmed.id);
-      bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to the project steward of ${config.projectId}`);
-      return { routed: "project", threadId, projectId: config.projectId, requestId: confirmed?.id ?? null };
     }
 
     // ---- the RPC -------------------------------------------------------------------------------------
