@@ -273,7 +273,8 @@ export const CHAIN_MIGRATIONS = [
           CASE WHEN n.status = 'open' THEN 'open' ELSE 'resolved' END,
           n.resolution, n.created_at, n.resolved_at, n.created_at,
           (SELECT b.project_id FROM bindings b WHERE b.id = n.binding_id),
-          CASE n.kind WHEN 'provide-secret' THEN 'secret' WHEN 'configure' THEN 'done' ELSE 'choice' END,
+          CASE WHEN n.kind = 'provide-secret' THEN 'secret' WHEN n.kind = 'configure' THEN 'done'
+        WHEN n.data IS NOT NULL AND json_array_length(json_extract(n.data, '$.choices')) > 0 THEN 'choice' ELSE 'text' END,
           n.url, n.data, 0,
           json_object('threadId', NULL, 'bindingId', n.binding_id, 'chain', json('[]'))
    FROM needs n
@@ -774,16 +775,16 @@ export function createStore(db: Database.Database, now: () => number) {
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ? AND is_question = 1");
   const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY created_at");
   const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'resolved' AND resolved_at >= ? AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY resolved_at");
-  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND is_question = 0 AND kind != 'approval' ORDER BY created_at");
+  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) ORDER BY created_at");
   // A route-`me` escalation a question or a need already covers is not listed
   // again as a need: the page shows the question or the item, never the raw row.
   const openEscalationNeeds = db.prepare<[string], Record<string, unknown>>(
-    "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'me' AND e.status = 'open' AND e.is_question = 0 AND e.kind != 'approval' " +
+    "SELECT * FROM escalations e WHERE e.binding_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
       "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret','done'))) " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
   const openEscalationNeedsForProject = db.prepare<[string], Record<string, unknown>>(
-    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'me' AND e.status = 'open' AND e.is_question = 0 AND e.kind != 'approval' " +
+    "SELECT e.* FROM escalations e JOIN bindings b ON b.id = e.binding_id WHERE b.project_id = ? AND e.route = 'me' AND e.status = 'open' AND e.kind != 'approval' AND (e.is_question = 0 OR e.resolution_kind IN ('secret','done')) " +
       "AND NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = e.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret','done'))) " +
       "AND NOT EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = e.binding_id AND n.status = 'open' AND json_extract(n.data, '$.escalationId') = e.id) ORDER BY e.created_at",
   );
@@ -1003,7 +1004,11 @@ export function createStore(db: Database.Database, now: () => number) {
    */
   function recordResolutionDelivery(x: Escalation, resolution: string, by: string): void {
     const originBindingId = x.origin.bindingId ?? x.bindingId;
-    if (originBindingId !== "") {
+    // A mechanical closure (the plugin withdrawing or closing something) is
+    // not a decision: it is noted, but it is not written as guidance a worker
+    // would later read as standing instruction.
+    const decided = by !== "plugin";
+    if (decided && originBindingId !== "") {
       const raw = getBinding.get(originBindingId);
       if (raw !== undefined) {
         const b = rowToBinding(raw);
@@ -1210,6 +1215,10 @@ export function createStore(db: Database.Database, now: () => number) {
     reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
       return rerouteEscalation.run(route, recommendation, id).changes > 0;
     },
+    /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
+    setEscalationHead(id: string, headSha: string | null): void {
+      db.prepare("UPDATE escalations SET head_sha = ? WHERE id = ?").run(headSha, id);
+    },
     /** Record a forwarding hop on the escalation's chain, keeping its rewording. */
     addHop(id: string, hop: { threadId: string; bindingId: string | null; rewording: string | null }): void {
       const x = getEscalation.get(id);
@@ -1304,7 +1313,7 @@ export function createStore(db: Database.Database, now: () => number) {
         const at = now();
         if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
         const q = toQuestion(getQuestion.get(id)!);
-        if (q.escalationId !== null) resolveEscalation.run(resolution, at, q.escalationId);
+        if (q.escalationId !== null) resolve(q.escalationId, resolution, by);
         return true;
       })();
     },
@@ -1357,10 +1366,10 @@ export function createStore(db: Database.Database, now: () => number) {
       insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
       return toNeed(getNeed.get(id)!);
     },
-    closeNeed(id: string, resolution: string): boolean {
+    closeNeed(id: string, resolution: string, by = "plugin"): boolean {
       if (closeNeedStmt.run(resolution, now(), id).changes > 0) return true;
       // A migrated provide-secret need is an escalation now.
-      return resolve(id, resolution, "plugin");
+      return resolve(id, resolution, by);
     },
     closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
       return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;

@@ -272,6 +272,14 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
         args = { ...args, needs: needs.filter((n) => !stewardKinds.has(String(n.kind))) };
       }
     }
+    // `ask` and a user-bound `forward` require a resolution; the tests predate
+    // that and default to text here. A test for the requirement passes none.
+    if (name === "steward_update") {
+      if (args.ask !== undefined && typeof args.ask === "object" && (args.ask as Record<string, unknown>).resolution === undefined) {
+        args = { ...args, ask: { ...(args.ask as Record<string, unknown>), resolution: "text" } };
+      }
+      if (args.forward !== undefined && args.resolution === undefined) args = { ...args, resolution: "text" };
+    }
     const r = (await harness.behavior.callAgentTool(name, args, { threadId, projectId: "p1" })) as string | { content: Array<{ text?: string }>; isError?: boolean };
     return typeof r === "string" ? { text: r, error: false } : { text: r.content.map((c) => c.text ?? "").join(""), error: r.isError === true };
   };
@@ -1413,7 +1421,7 @@ describe("terminal states and follow-through", () => {
     // A retry changes nothing and is no error.
     expect(await t.tool("steward_update", answer, t.project)).toMatchObject({ error: false, text: expect.stringMatching(/guidance already saved; esc_[\w-]+ already has this answer/u) });
     expect(t.hooks.store.escalation(id)!.resolution).toBe("The binding ended.\nYes, include SSO.");
-    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["The binding ended.", "Yes, include SSO."]);
+    expect(t.hooks.store.find("ENG-12")!.guidance.map((g) => g.text)).toEqual(["Yes, include SSO."]);
   });
 
   it("takes an answer to a forwarded question the ending closed, on the question and its escalation alike", async () => {
@@ -2468,6 +2476,63 @@ describe("needs you items", () => {
     expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/Yes, include SSO\./);
     // The answer is recorded verbatim on the originating binding, with who decided.
     expect(t.hooks.store.binding(b.id)!.guidance).toMatchObject([{ text: "Yes, include SSO.", by: "user" }]);
+  });
+
+  it("a forward with resolution secret renders the provide-secret item on the page (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...base, actor: "me", escalate: { kind: "decision", question: "Provide API_TOKEN.", meanwhile: "Wait." } }, steward);
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "decision")!;
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "secret", variable: "API_TOKEN", purpose: "deploys" }, t.spawns[0]!.id);
+    expect(out.error).toBe(false);
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    expect(need).toMatchObject({ what: "Provide API_TOKEN.", data: { variable: "API_TOKEN", purpose: "deploys" } });
+    const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; id: string }> } };
+    expect(board.board.needs.find((n) => n.id === need.id)).toMatchObject({ kind: "provide-secret" });
+  });
+
+  it("the page's Done closes a configure and a provide-secret escalation (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const cfg = t.escalationNeed({ kind: "configure", url: "https://x/page", what: "Enable SSO." });
+    const sec = t.escalationNeed({ kind: "provide-secret", what: "Provide API_TOKEN.", variable: "API_TOKEN", purpose: "deploys" });
+    expect((await t.harness.callRpc("stewardsNeedAction", { needId: cfg.id, action: "done" }, client)) as { ok: boolean }).toMatchObject({ ok: true });
+    expect(t.hooks.store.need(cfg.id)!.status).toBe("done");
+    expect((await t.harness.callRpc("stewardsNeedAction", { needId: sec.id, action: "done" }, client)) as { ok: boolean }).toMatchObject({ ok: true });
+    expect(t.hooks.store.need(sec.id)!.status).toBe("done");
+  });
+
+  it("ask and forward require a resolution (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    await expect(t.harness.behavior.callAgentTool("steward_update", { ask: { question: "Which way?" } }, { threadId: t.spawns[0]!.id, projectId: "p1" })).rejects.toThrow(/ask\.resolution/u);
+  });
+
+  it("a worker-raised escalation forwarded two hops is answered on the page and reaches the worker (BB-30)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12")!;
+    await t.harness.behavior.runCli(["escalate", "Include SSO?"], { threadId: "thr_w1", projectId: "p1" });
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Include SSO?")!;
+    // The steward forwards to the project steward, which forwards to the user.
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, recommendation: "Leave it out." }, steward);
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "text" }, t.spawns[0]!.id);
+    const q = t.hooks.store.openQuestions("p1").find((x) => x.question === "Include SSO?")!;
+    await t.harness.callRpc("stewardsAnswerQuestion", { questionId: q.id, answer: "Yes, include SSO." }, client);
+    await t.hooks.sweep();
+    await t.flush();
+    // The worker is told directly; the chain kept both hops.
+    expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/Yes, include SSO\./);
+    expect(t.hooks.store.binding(b.id)!.guidance).toMatchObject([{ text: "Yes, include SSO.", by: "user" }]);
+    expect(t.hooks.store.escalation(esc.id)!.origin.chain.length).toBeGreaterThanOrEqual(2);
   });
 
   it("a steward files configure and provide-secret, and bb stewards done closes one and wakes the steward", async () => {

@@ -171,6 +171,8 @@ export type WakeInput = {
   needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
+  /** Head shas the project steward has approved in the store, so the lane gate reads the same as the button. */
+  projectApprovedShas?: ReadonlySet<string>;
   /** The project's adoption label. */
   label: string;
   /** Open bindings already at work on what this one touches. */
@@ -188,7 +190,7 @@ function commentLines(comments: SnapshotComment[]): string[] {
   return lines;
 }
 
-function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string): string[] {
+function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovedShas?: ReadonlySet<string>): string[] {
   const lines = [`### ${heading}`, ""];
   lines.push(`- ${e.key}: ${e.title ?? "(untitled)"}${e.url === null ? "" : ` — ${e.url}`}`);
   lines.push(`- State: ${e.state}${e.stateType === null ? "" : ` (${e.stateType})`}`);
@@ -200,7 +202,7 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
-    const gate = prGate(e);
+    const gate = prGate(e, { projectApproved: e.pull?.headSha !== null && e.pull?.headSha !== undefined && projectApprovedShas?.has(e.pull.headSha) === true });
     const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
     if (gate.gateMet) {
       const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
@@ -331,8 +333,8 @@ export function formatWake(input: WakeInput): string {
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
-  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity"));
-  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`));
+  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovedShas));
+  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovedShas));
   if (input.workers.length > 0) {
     out.push("", "### Workers", "");
     for (const w of input.workers) {

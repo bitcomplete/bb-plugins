@@ -1301,6 +1301,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         changes,
         needs: store.openNeeds(b.id),
         own: ownThreads(b),
+        projectApprovedShas: new Set(
+          [observed.entity, ...observed.pulls]
+            .map((e) => e.pull?.headSha)
+            .filter((sha): sha is string => sha !== null && sha !== undefined && store.projectApproval(b.id, sha) !== null),
+        ),
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
         now: now(),
@@ -2445,7 +2450,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const parent = b.parentBindingId === null ? null : store.binding(b.parentBindingId);
         return parent !== null && parent.endedAt === null && parent.threadId !== null ? "parent" : "project";
       }
-      if (from === "parent") return "project";
+      if (from === "steward" || from === "parent") return "project";
       return "me";
     }
 
@@ -2653,7 +2658,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (forwarded.length === 0) return;
       await wakeProject(b.projectId, `${b.entityKey}'s forwarded escalation was answered`, {
         digestDue: false,
-        notes: [`${closure} ${forwarded.map((x) => `Escalation ${x.id}`).join(", ")} ${forwarded.length === 1 ? "is" : "are"} resolved.`],
+        notes: [
+          `${closure} ${forwarded.map((x) => `Escalation ${x.id}`).join(", ")} ${forwarded.length === 1 ? "is" : "are"} resolved.`,
+          "If the answer is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.",
+        ],
       });
     }
 
@@ -2711,6 +2719,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             } else {
               // A new push is a new sha: the old approval (if any) is void and
               // the request is re-pointed at the head to decide.
+              store.setEscalationHead(approvalEsc.id, g.headSha);
               store.reroute(approvalEsc.id, "project", null);
             }
           }
@@ -3459,7 +3468,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
         if (need.kind === "configure") {
           if (action !== "done") return { ok: false, message: "Press Done once the step is finished." };
-          store.closeNeedByKey(b.id, "configure", need.url, text === null ? "Done on the Stewards page." : `Done on the Stewards page: ${text}`);
+          store.closeNeed(need.id, text === null ? "Done on the Stewards page." : `Done on the Stewards page: ${text}`, "user");
           after(`The user did ${need.what}${text === null ? "" : `: ${text}`}.`);
           return { ok: true, message: `Marked done; ${b.entityKey}'s steward has been told.` };
         }
@@ -3469,7 +3478,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const named = typeof need.data.variable === "string" && need.data.variable.trim() !== "" ? need.data.variable.trim() : need.what;
           // Done is the manual escape hatch: the value was entered another way.
           if (action === "done") {
-            store.closeNeedByKey(b.id, "provide-secret", need.url, text === null ? "Marked done on the Stewards page." : `Marked done on the Stewards page: ${text}`);
+            store.closeNeed(need.id, text === null ? "Marked done on the Stewards page." : `Marked done on the Stewards page: ${text}`, "user");
             after(`The user marked ${named} done on the Stewards page${text === null ? "" : `: ${text}`}; the value was entered another way.`);
             return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.`, threadId: null };
           }
@@ -4000,7 +4009,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .object({
             question: z.string().trim().min(1).max(1500).describe("The question, as you put it to the user."),
             context: z.string().trim().max(3000).optional().describe("What the user needs to answer it."),
-            resolution: z.enum(RESOLUTION_KINDS).optional().describe("How the page asks: choice (with choices), text, approve-decline, secret (with variable and destination), or done. Defaults to choice when choices are given, else text."),
+            resolution: z.enum(RESOLUTION_KINDS).describe("How the page asks: choice (with choices), text, approve-decline, secret (with variable and destination), or done."),
             choices: choicesSchema.optional().describe('For resolution "choice": 2-6 short labels the user picks between, so the page shows one button each.'),
             url: z.string().trim().max(500).optional().describe("The link the page shows, when there is one."),
             variable: z.string().trim().max(200).optional().describe("For resolution \"secret\": the variable name."),
@@ -4070,7 +4079,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               out.push(`${closed ? `closed ${closing.question.id}` : `${closing.question.id} already closed with this answer`}${dropped}`);
             }
             if (input.ask !== undefined) {
-              const askResolution = input.ask.resolution ?? ((input.ask.choices ?? []).length > 0 ? "choice" : "text");
+              const askResolution = input.ask.resolution;
               if (askResolution === "choice" && (input.ask.choices === undefined || input.ask.choices.length < 2)) {
                 throw new Error("A choice question needs 2-6 choices for the page's buttons.");
               }
@@ -4195,14 +4204,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // approval bound to the head sha, or is refused when the entry is
             // missing, unknown, `user`, or the change widens the list itself.
             const prApproval = store.openEscalations(target.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline") ?? null;
-            if (input.approve === true && prApproval !== null) {
+            if (input.approve === true && prApproval !== null && input.entry !== undefined) {
               if (!isProjectSteward(threadId, target)) return toolError(new Error("An owner-reviewed pull request is the project steward's to approve; a steward escalates it and waits."));
               const config = await loadConfig(target.projectId);
               if (config === null) return toolError(new Error("The project file could not be read, so no project-steward approval can be recorded."));
               const observed = target.lastSnapshot;
               const pull = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === prApproval.url) ?? null;
               const files = pull === null ? null : await pullChangedFiles(pull);
-              const decision = decideFor(files ?? [], input.entry ?? null, config.file.bigDecisions);
+              const decision = decideFor(files, input.entry ?? null, config.file.bigDecisions);
               if (decision !== "project") {
                 const why = input.entry === undefined ? "no decide-list entry was given" : decideForEntry(input.entry, config.file.bigDecisions) === "user" ? `the entry ${JSON.stringify(input.entry)} is not marked project` : "the change touches the decide list or the code that enforces it";
                 return toolError(new Error(`That pull request is the user's to approve: ${why}. Forward it with steward_update { binding: "${target.entityKey}", forward: "${prApproval.id}", resolution: "approve-decline", recommendation } instead.`));
@@ -4247,7 +4256,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // approver the gate names may do it, as with approve: true: the
               // project steward for mode project, and never a steward's own
               // words for mode me (there the user's quote is required).
-              if (approval === null && resolving.kind === "approval" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
+              if (approval === null && resolving.kind === "approval" && resolving.resolutionKind !== "approve-decline" && resolving.status === "open" && target.lastSnapshot !== null && classifyApproval(guidance) === "approve") {
                 const config = await loadConfig(target.projectId);
                 const playbook = config === null ? null : playbookFor(config, target.kind);
                 if (playbook?.ready?.approval === "project" && isProjectSteward(threadId, target)) approval = { entity: (target.source === "ops" ? null : await snapshot(target.source, target.entityId).catch(() => null)) ?? target.lastSnapshot.entity, byUser: false };
@@ -4293,6 +4302,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
+            // Keep the chain: each forwarding hop, with the forwarder's
+            // rewording, so the bindings between get their quiet note and the
+            // originator can be answered directly (BB-30).
+            store.addHop(forwarding.id, { threadId, bindingId: target.id, rewording: recommendation });
             store.reroute(forwarding.id, route, recommendation);
             // A forwarded approval is the user's to decide exactly as
             // `approval: me` is: file the page's `approve-spec` need and keep
@@ -4302,6 +4315,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // leave the need or question open.
             const prToUser = route === "me" && forwarding.kind === "approval" && forwarding.resolutionKind === "approve-decline";
             const approvalToUser = route === "me" && forwarding.kind === "approval" && !prToUser;
+            if (route === "me" && !approvalToUser && !prToUser && input.resolution === undefined) {
+              return toolError(new Error("Forwarding to the user needs a resolution: choice (with choices), text, approve-decline, secret or done. It is what the page's ask looks like; the plugin assigns the route, but the human boundary is yours to describe."));
+            }
             const resolutionKind = input.resolution ?? (forwarding.choices.length > 0 ? "choice" : "text");
             if (resolutionKind === "choice" && forwarding.choices.length < 2) {
               return toolError(new Error("A choice question needs 2-6 choices for the page's buttons; escalate a decision with choices, or forward as text."));
@@ -4373,7 +4389,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const fresh = store.binding(target.id)!;
               store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) } });
             }
-            if (resolving.status === "open") done.push(`resolved ${resolving.id}`);
+            if (resolving.status === "open") done.push(`resolved ${resolving.id}${isProjectSteward(threadId, target) ? "; if this is a general judgement the playbook should carry, record it with steward_update { lesson: { text, file, scope } }" : ""}`);
             else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
             else done.push(`${resolving.id} already has this answer`);
             if (outcome !== "unchanged") notes.push(`Escalation ${resolving.id} decided: ${guidance}`);

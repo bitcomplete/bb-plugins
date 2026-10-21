@@ -65,6 +65,27 @@ describe("no self-widening", () => {
     expect(decideFor(["bb-gate/docs/hooks.md"], "A cross-repo contract other repos implement", decisions)).toBe("project");
   });
 
+  it("fires for a repo-relative filename as GitHub returns it (BB-30 review)", () => {
+    // github.files returns repo-relative paths, the decide list is workspace-relative.
+    expect(isSelfWidening(["plugins/stewards/server.ts", "plugins/stewards/store.ts"])).toBe(true);
+    expect(decideFor(["plugins/stewards/decisions.ts"], "A store migration", decisions)).toBe("user");
+    expect(isSelfWidening(["plugins/stewards/config.ts"])).toBe(true);
+  });
+
+  it("fails closed when the changed files could not be read", () => {
+    expect(decideFor(null, "A store migration", decisions)).toBe("user");
+    expect(decideFor([], "A store migration", decisions)).toBe("user");
+  });
+
+  it("requires the changed files to touch the named entry's paths", () => {
+    // The store-migration entry names store.ts; a migration in another plugin matches.
+    expect(decideFor(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBe("project");
+    // The stewards' own store.ts is self-widening, so it is the user's whatever the entry says.
+    expect(decideFor(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("user");
+    // A file that matches no entry path is the user's.
+    expect(decideFor(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toBe("user");
+  });
+
   it("matches a glob across path segments", () => {
     expect(touchesAny(["bb-plugins/plugins/linear/store.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(true);
     expect(touchesAny(["bb-plugins/plugins/linear/server.ts"], ["bb-plugins/plugins/*/store.ts"])).toBe(false);
