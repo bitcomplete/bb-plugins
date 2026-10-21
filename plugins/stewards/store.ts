@@ -775,7 +775,7 @@ export function createStore(db: Database.Database, now: () => number) {
   const getQuestion = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = ? AND is_question = 1");
   const openQuestions = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY created_at");
   const answeredSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'resolved' AND resolved_at >= ? AND (resolution_kind IS NULL OR resolution_kind NOT IN ('secret','done')) ORDER BY resolved_at");
-  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) ORDER BY created_at");
+  const escalationNeedsForBinding = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND route = 'me' AND kind != 'approval' AND (is_question = 0 OR resolution_kind IN ('secret','done')) AND (is_question = 1 OR NOT EXISTS (SELECT 1 FROM escalations q WHERE q.forwarded_from = escalations.id AND q.is_question = 1)) ORDER BY created_at");
   // A route-`me` escalation a question or a need already covers is not listed
   // again as a need: the page shows the question or the item, never the raw row.
   const openEscalationNeeds = db.prepare<[string], Record<string, unknown>>(
