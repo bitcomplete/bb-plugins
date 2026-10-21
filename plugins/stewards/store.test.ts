@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, MIGRATIONS, createStore } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -165,6 +165,95 @@ describe("lessons", () => {
   });
 });
 
+describe("lesson citation counts (BB-35 step 2)", () => {
+  const second = (s: ReturnType<typeof store>["s"]) =>
+    s.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+  const lesson = (s: ReturnType<typeof store>["s"], projectId = "p1") => s.addLesson({ projectId, bindingId: null, escalationId: null, file: "AGENTS.md", text: "A rule.", scope: "procedure", branch: null });
+
+  it("count hits once per distinct binding, refresh lastCitedAt, and ignore unknown ids", () => {
+    const { s, binding, advance } = store();
+    const l = lesson(s);
+    const other = second(s);
+    expect(l).toMatchObject({ hits: 0, corrections: 0, lastCitedAt: null, citedBindings: [] });
+
+    const first = s.recordCitations("p1", [l.id], binding.id);
+    expect(first.unknown).toEqual([]);
+    expect(first.cited).toMatchObject([{ id: l.id, hits: 1, lastCitedAt: 1_000, citedBindings: [binding.id] }]);
+
+    // The same binding again is not a new hit, but it does refresh the time.
+    advance(500);
+    expect(s.recordCitations("p1", [l.id], binding.id).cited).toMatchObject([{ hits: 1, lastCitedAt: 1_500 }]);
+
+    // A different binding is a second hit.
+    advance(500);
+    expect(s.recordCitations("p1", [l.id], other.id).cited).toMatchObject([{ hits: 2, citedBindings: [binding.id, other.id] }]);
+
+    // Unknown and other-project ids never count.
+    const stranger = lesson(s, "p2");
+    const unknown = s.recordCitations("p1", ["lsn_nope", stranger.id], binding.id);
+    expect(unknown).toEqual({ cited: [], unknown: ["lsn_nope", stranger.id] });
+    expect(s.lesson(stranger.id)).toMatchObject({ hits: 0 });
+
+    // A citation with no binding counts once for the project.
+    expect(s.recordCitations("p1", [l.id], null).cited).toMatchObject([{ hits: 3, citedBindings: [binding.id, other.id, "project:p1"] }]);
+    expect(s.recordCitations("p1", [l.id], null).cited).toMatchObject([{ hits: 3 }]);
+  });
+
+  it("count corrections once each, and keep them on the escalation's citations", () => {
+    const { s, binding } = store();
+    const l = lesson(s);
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Q", meanwhile: "m", route: "me", recommendation: "Do it." });
+    expect(s.escalation(x.id)).toMatchObject({ citedLessons: [], correctionsCounted: false });
+    s.setEscalationCitations(x.id, [l.id, l.id]);
+    expect(s.escalation(x.id)).toMatchObject({ citedLessons: [l.id] });
+    s.recordCorrections([l.id, l.id]);
+    expect(s.lesson(l.id)).toMatchObject({ corrections: 1 });
+    s.recordCorrections([l.id]);
+    expect(s.lesson(l.id)).toMatchObject({ corrections: 2 });
+    s.markEscalationCorrected(x.id);
+    expect(s.escalation(x.id)).toMatchObject({ correctionsCounted: true });
+  });
+
+  it("fails closed: a lesson with no scope or an unknown one reads as boundary", () => {
+    expect(lessonScope(null)).toBe("boundary");
+    expect(lessonScope(undefined)).toBe("boundary");
+    expect(lessonScope("procedure")).toBe("procedure");
+    expect(lessonScope("anything-else")).toBe("boundary");
+  });
+
+  it("migrates losslessly: an existing lesson keeps its values and gets the counters at zero", () => {
+    const db = new Database(":memory:");
+    for (const sql of BASE_MIGRATIONS) db.exec(sql);
+    for (const sql of CHAIN_MIGRATIONS) db.exec(sql);
+    db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
+             VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
+    db.exec(`INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, status, branch, merge_sha, note, created_at, updated_at, resolved_at)
+             VALUES ('lsn_old', 'p1', 'bnd_1', NULL, 'AGENTS.md', 'An old rule.', 'boundary', 'pending', 'refs/heads/guidance-thr_x', NULL, 'kept', 1000, 1100, NULL)`);
+    for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 2000);
+    expect(s.lesson("lsn_old")).toMatchObject({
+      id: "lsn_old",
+      projectId: "p1",
+      bindingId: "bnd_1",
+      file: "AGENTS.md",
+      text: "An old rule.",
+      scope: "boundary",
+      status: "pending",
+      branch: "refs/heads/guidance-thr_x",
+      note: "kept",
+      createdAt: 1_000,
+      updatedAt: 1_100,
+      hits: 0,
+      corrections: 0,
+      lastCitedAt: null,
+      citedBindings: [],
+    });
+    // The old columns are all still there; nothing was dropped or renamed.
+    const columns = (db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(["id", "project_id", "binding_id", "escalation_id", "file", "text", "scope", "status", "branch", "merge_sha", "note", "created_at", "updated_at", "resolved_at", "hits", "corrections", "last_cited_at", "cited_bindings"]));
+  });
+});
+
 describe("the escalation-chain migration (BB-30)", () => {
   function legacy() {
     const db = new Database(":memory:");
@@ -192,6 +281,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     db.exec(`INSERT INTO needs (id, binding_id, kind, url, what, how, data, filed_by, status, resolution, created_at, resolved_at)
              VALUES ('need_approve', 'bnd_1', 'approve-pr', 'https://github.com/acme/web/pull/7', 'Approve the PR.', NULL, '{}', 'plugin', 'open', NULL, 1900, NULL)`);
     for (const sql of CHAIN_MIGRATIONS) db.exec(sql);
+    for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }

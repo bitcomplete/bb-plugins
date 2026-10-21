@@ -1170,6 +1170,17 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   steward is woken with the answer and asked whether it is a general
   judgement: the answer is a lesson candidate for its next turn. A plain
   question with no escalation behind it wakes nobody.
+- **Counts (BB-35 step 2).** A `steward_update { resolve }` carries
+  `cites: [lesson ids]` — the lessons the decision rested on — and the wake
+  says a decision must cite what it was decided from. The plugin records
+  `hits` (one per distinct binding), `corrections` (the owner's answer or
+  unsigned comment on the entity differing from the steward's recommendation
+  on a decision that cited the lesson), and `lastCitedAt`, keeping the cited
+  bindings and the escalation's cited lessons. This step only records:
+  nothing is promoted, retired or written to `.bb` from these counts yet.
+  Only the owner's own words, or this project's steward or worker threads,
+  may create, cite or correct a lesson; a signed or non-owner comment never
+  does.
 - **Procedure lessons self-merge.** Playbook procedure, sequencing and
   conventions are what the project steward may already decide. It applies
   the text to the file in its `.bb` checkout, commits, and publishes with

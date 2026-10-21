@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, anyWorkerInFlight, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -177,7 +177,7 @@ describe("a worker in flight between its turns (BB-11)", () => {
 
 describe("waits nobody hears", () => {
   const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
-  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false }];
+  const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false, citedLessons: [], correctionsCounted: false }];
 
   it("flags a status blocked on the project steward or the user with no escalation open", () => {
     expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);
@@ -420,5 +420,32 @@ describe("a blockedOn naming the user", () => {
     expect(namesUserAsBlocker("a human has to install it")).toBe(true);
     expect(namesUserAsBlocker("the project steward's call")).toBe(false);
     expect(namesUserAsBlocker("sam's review")).toBe(false);
+  });
+});
+
+// BB-35 step 2: the citation counters. A correction is the owner's own words
+// differing from the steward's recommendation on a decision that cited a
+// lesson; only the owner's own unsigned comment counts.
+describe("a correction from a comment", () => {
+  it("is the connected owner's own unsigned words differing from the recommendation", () => {
+    const mine = comment({ author: "jane", body: "Do it the other way.", signedBy: null });
+    expect(commentDiffersFromRecommendation(mine, "jane", "Do it the recommended way.")).toBe(true);
+    expect(commentDiffersFromRecommendation(mine, "jane", "Do it the other way.")).toBe(false);
+    expect(commentDiffersFromRecommendation(mine, "jane", null)).toBe(false);
+    expect(commentDiffersFromRecommendation(mine, null, "Do it the recommended way.")).toBe(false);
+  });
+
+  it("never counts someone else's comment, or a signed one", () => {
+    // A non-owner's words are information, not an instruction.
+    expect(commentDiffersFromRecommendation(comment({ author: "Sam", body: "No, do it the other way." }), "jane", "Do it the recommended way.")).toBe(false);
+    // A signed comment belongs to a thread, however it reads.
+    expect(commentDiffersFromRecommendation(comment({ author: "jane", body: "No, do it the other way.", signedBy: "thr_w" }), "jane", "Do it the recommended way.")).toBe(false);
+  });
+
+  it("treats an empty side as no difference", () => {
+    expect(answerDiffers("", "Do it.")).toBe(false);
+    expect(answerDiffers("Do it.", "")).toBe(false);
+    expect(answerDiffers("  do   it. ", "Do it.")).toBe(false);
+    expect(answerDiffers("Don't do it.", "Do it.")).toBe(true);
   });
 });

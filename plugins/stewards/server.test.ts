@@ -2094,6 +2094,68 @@ describe("questions to the user", () => {
     });
   });
 
+  // BB-35 step 2: a resolve cites the lessons it rested on, and the plugin
+  // counts hits, corrections and the last citation. Counts only: no tier and
+  // no transition, and nothing is written to `.bb`.
+  describe("citations and counts (BB-35 step 2)", () => {
+    /** A project with a recorded lesson and an escalation the project steward forwarded. */
+    async function cited() {
+      const t = await adopted();
+      const recorded = await t.tool("steward_update", { lesson: { text: "Auth is the plugin's.", file: "AGENTS.md", scope: "procedure" } }, t.project);
+      const lesson = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+      await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+      const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: esc, recommendation: "Leave SSO out.", cites: [lesson] }, t.project);
+      const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+      return { ...t, lesson, esc, qst };
+    }
+
+    it("counts a citation once per distinct binding and keeps it on the escalation", async () => {
+      const t = await cited();
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1, corrections: 0, lastCitedAt: expect.any(Number), citedBindings: [t.hooks.store.find("ENG-12")!.id] });
+      expect(t.hooks.store.escalation(t.esc)).toMatchObject({ citedLessons: [t.lesson] });
+      // A second citation from the same binding refreshes the time but is not a new hit.
+      await t.tool("steward_update", { binding: "ENG-12", guidance: "Leave SSO out.", resolve: t.esc, cites: [t.lesson] }, t.project);
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1 });
+    });
+
+    it("ignores an unknown lesson id and still resolves", async () => {
+      const t = await cited();
+      const closed = await t.tool("steward_update", { binding: "ENG-12", guidance: "Leave SSO out.", resolve: t.esc, cites: ["lsn_nope", t.lesson] }, t.project);
+      expect(closed.error).toBe(false);
+      expect(closed.text).toMatch(/not counted/u);
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ hits: 1 });
+    });
+
+    it("counts a correction when the owner's page answer differs from the recommendation", async () => {
+      const t = await cited();
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "No, keep SSO." }, client)).toMatchObject({ ok: true });
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ corrections: 1 });
+      expect(t.hooks.store.escalation(t.esc)).toMatchObject({ correctionsCounted: true });
+    });
+
+    it("does not count a correction when the owner agrees with the recommendation", async () => {
+      const t = await cited();
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: "Agreed, leave SSO out." }, client)).toMatchObject({ ok: true });
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ corrections: 0 });
+    });
+
+    it("counts the owner's own unsigned comment as a correction", async () => {
+      const t = await cited();
+      t.entities.set("uuid-12", issue({ comments: [comment({ author: "Jane", body: "Actually, keep SSO.", signedBy: null })] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ corrections: 1 });
+    });
+
+    it("never counts a non-owner's comment as a correction", async () => {
+      const t = await cited();
+      t.entities.set("uuid-12", issue({ comments: [comment({ author: "Sam", body: "Actually, keep SSO.", signedBy: null })] }));
+      await t.ring("linear", "uuid-12");
+      expect(t.hooks.store.lesson(t.lesson)).toMatchObject({ corrections: 0 });
+      expect(t.hooks.store.escalation(t.esc)).toMatchObject({ correctionsCounted: false });
+    });
+  });
+
   // BB-13: one spec approval, from any surface. The page answer, the project
   // steward's words, an unsigned comment on the entity, and the user's own
   // amendment all approve the same gate.

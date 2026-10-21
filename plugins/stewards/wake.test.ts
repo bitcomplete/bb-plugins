@@ -154,6 +154,15 @@ describe("the nightly prompt", () => {
     expect(wake.indexOf("## The record since")).toBeLessThan(wake.indexOf("reply with the morning digest"));
   });
 
+  it("tells the project steward to cite the lessons a decision rested on (BB-35 step 2)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "project", recommendation: null });
+    const wake = formatProjectWake({ reason: "escalation", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(wake).toMatch(/cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/a decision must cite what it was decided from/u);
+  });
+
   it("gives dates in the project's nightly time zone", () => {
     const { s } = world();
     const q = s.ask({ projectId: "p1", bindingId: null, escalationId: null, question: "Freeze on Friday?", context: null });

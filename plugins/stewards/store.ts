@@ -318,7 +318,24 @@ export const CHAIN_MIGRATIONS = [
    )`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS];
+// BB-35 step 2: citations and counts, no transitions. Additive and lossless:
+// every existing lesson and escalation keeps its values and gets the new
+// columns at their defaults, and nothing is dropped or renamed. A later step
+// reads these counts to move tiers; this step only records them.
+export const LESSON_COUNTER_MIGRATIONS = [
+  `ALTER TABLE lessons ADD COLUMN hits INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE lessons ADD COLUMN corrections INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE lessons ADD COLUMN last_cited_at INTEGER`,
+  `ALTER TABLE lessons ADD COLUMN cited_bindings TEXT NOT NULL DEFAULT '[]'`,
+  // The lessons a resolve or a forwarding recommendation rested on, kept on the
+  // escalation so a later reversal can be attributed to them.
+  `ALTER TABLE escalations ADD COLUMN cited_lessons TEXT NOT NULL DEFAULT '[]'`,
+  // 1 once a reversal has been counted, so one correction is one count however
+  // often the comment or answer is observed.
+  `ALTER TABLE escalations ADD COLUMN corrections_counted INTEGER NOT NULL DEFAULT 0`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -614,6 +631,10 @@ export type Escalation = {
   headSha: string | null;
   /** True when this row is a question the project steward kept, rather than a raw escalation. */
   isQuestion: boolean;
+  /** The lesson ids the resolve or recommendation rested on (BB-35 step 2). */
+  citedLessons: string[];
+  /** True once a reversal has been counted against this escalation's citations. */
+  correctionsCounted: boolean;
 };
 
 /** A project steward's approval of an owner-reviewed pull request, bound to its head sha. */
@@ -693,6 +714,12 @@ export function needChoices(n: Pick<Need, "data">): string[] {
  */
 export const LESSON_SCOPES = ["procedure", "boundary"] as const;
 export type LessonScope = (typeof LESSON_SCOPES)[number];
+/**
+ * A lesson's scope, failing closed: anything the plugin cannot classify — a
+ * missing value, an unknown string from an older or hand-edited row — is
+ * `boundary`, the one only the user may widen. Never `procedure` by default.
+ */
+export const lessonScope = (value: unknown): LessonScope => (value === "procedure" ? "procedure" : "boundary");
 export type LessonStatus = "pending" | "merged" | "dropped";
 export type Lesson = {
   id: string;
@@ -711,6 +738,14 @@ export type Lesson = {
   mergeSha: string | null;
   /** The last refusal or explanation from a merge attempt, for the nightly prompt. */
   note: string | null;
+  /** How many distinct bindings have cited it (BB-35 step 2). */
+  hits: number;
+  /** How many times the user reversed a decision that cited it (BB-35 step 2). */
+  corrections: number;
+  /** When it was last cited, or null. */
+  lastCitedAt: number | null;
+  /** The bindings whose decisions cited it; one `hits` each, plus the project sentinel for a citation with no binding. */
+  citedBindings: string[];
   createdAt: number;
   updatedAt: number;
   resolvedAt: number | null;
@@ -852,6 +887,8 @@ export function createStore(db: Database.Database, now: () => number) {
     forwardedFrom: r.forwarded_from === null || r.forwarded_from === undefined ? null : String(r.forwarded_from),
     headSha: r.head_sha === null || r.head_sha === undefined ? null : String(r.head_sha),
     isQuestion: Number(r.is_question ?? 0) === 1,
+    citedLessons: json(z.array(z.string()), r.cited_lessons === null || r.cited_lessons === undefined ? null : String(r.cited_lessons), []),
+    correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
   });
   const toQuestion = (r: Record<string, unknown>): Question => {
     const e = toEscalation(r);
@@ -894,6 +931,10 @@ export function createStore(db: Database.Database, now: () => number) {
   const resolveLessonStmt = db.prepare(
     "UPDATE lessons SET status = ?, merge_sha = COALESCE(?, merge_sha), branch = COALESCE(?, branch), note = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?) WHERE id = ?",
   );
+  const citeLessonStmt = db.prepare("UPDATE lessons SET hits = ?, last_cited_at = ?, cited_bindings = ?, updated_at = ? WHERE id = ?");
+  const correctLessonStmt = db.prepare("UPDATE lessons SET corrections = corrections + 1, updated_at = ? WHERE id = ?");
+  const setEscalationCitationsStmt = db.prepare("UPDATE escalations SET cited_lessons = ? WHERE id = ?");
+  const markEscalationCorrectedStmt = db.prepare("UPDATE escalations SET corrections_counted = 1 WHERE id = ?");
 
   const toNeed = (r: Record<string, unknown>): Need => ({
     id: String(r.id),
@@ -976,11 +1017,15 @@ export function createStore(db: Database.Database, now: () => number) {
     escalationId: r.escalation_id === null || r.escalation_id === undefined ? null : String(r.escalation_id),
     file: String(r.file),
     text: String(r.text),
-    scope: String(r.scope) as LessonScope,
+    scope: lessonScope(r.scope),
     status: String(r.status) as LessonStatus,
     branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
     mergeSha: r.merge_sha === null || r.merge_sha === undefined ? null : String(r.merge_sha),
     note: r.note === null || r.note === undefined ? null : String(r.note),
+    hits: Number(r.hits ?? 0),
+    corrections: Number(r.corrections ?? 0),
+    lastCitedAt: r.last_cited_at === null || r.last_cited_at === undefined ? null : Number(r.last_cited_at),
+    citedBindings: json(z.array(z.string()), r.cited_bindings === null || r.cited_bindings === undefined ? null : String(r.cited_bindings), []),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
@@ -1504,6 +1549,47 @@ export function createStore(db: Database.Database, now: () => number) {
     markLessonDropped(id: string, note: string | null = null): void {
       const at = now();
       resolveLessonStmt.run("dropped", null, null, note, at, at, id);
+    },
+    /**
+     * Record the lessons one decision cited (BB-35 step 2). A lesson's `hits`
+     * counts distinct bindings: a second citation from the same binding
+     * refreshes `lastCitedAt` but does not count again. A citation with no
+     * binding — a project-steward decision about no one binding — counts once
+     * per project. `unknown` names ids that are not lessons of this project;
+     * they are never counted. Counts only: no tier and no transition.
+     */
+    recordCitations(projectId: string, lessonIds: string[], bindingId: string | null): { cited: Lesson[]; unknown: string[] } {
+      const at = now();
+      const key = bindingId ?? `project:${projectId}`;
+      const cited: Lesson[] = [];
+      const unknown: string[] = [];
+      for (const id of [...new Set(lessonIds)]) {
+        const r = getLesson.get(id);
+        const lesson = r === undefined ? null : toLesson(r);
+        if (lesson === null || lesson.projectId !== projectId) {
+          unknown.push(id);
+          continue;
+        }
+        const seen = lesson.citedBindings.includes(key);
+        const citedBindings = seen ? lesson.citedBindings : [...lesson.citedBindings, key];
+        const hits = seen ? lesson.hits : lesson.hits + 1;
+        citeLessonStmt.run(hits, at, JSON.stringify(citedBindings), at, id);
+        cited.push({ ...lesson, hits, lastCitedAt: at, citedBindings });
+      }
+      return { cited, unknown };
+    },
+    /** Count a reversal of a decision against each lesson it cited, once each (BB-35 step 2). */
+    recordCorrections(lessonIds: string[]): void {
+      const at = now();
+      for (const id of new Set(lessonIds)) correctLessonStmt.run(at, id);
+    },
+    /** Keep the lessons an escalation's decision rested on, for a later correction. */
+    setEscalationCitations(id: string, lessonIds: string[]): void {
+      setEscalationCitationsStmt.run(JSON.stringify([...new Set(lessonIds)]), id);
+    },
+    /** Mark an escalation's citations counted, so one reversal is one correction. */
+    markEscalationCorrected(id: string): void {
+      markEscalationCorrectedStmt.run(id);
     },
 
     // project stewards
