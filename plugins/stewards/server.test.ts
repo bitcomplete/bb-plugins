@@ -2070,6 +2070,28 @@ describe("questions to the user", () => {
       await t.flush();
       expect(t.sends.filter((s) => s.threadId === t.project).length).toBe(before);
     });
+
+    it("asks the project steward for a lesson when it resolves an escalation itself", async () => {
+      const t = await adopted();
+      await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+      const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+      const closed = await t.tool("steward_update", { binding: "ENG-12", guidance: "SSO is out of scope.", resolve: esc }, t.project);
+      expect(closed.error).toBe(false);
+      expect(closed.text).toMatch(/general judgement the playbook should carry/u);
+      expect(closed.text).toMatch(/record it with steward_update \{ lesson/u);
+    });
+
+    it("tells the project steward about an answerless close without the lesson nudge", async () => {
+      const t = await forwarded();
+      const before = t.projectWakes().length;
+      expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qst, answer: null }, client)).toMatchObject({ ok: true });
+      await t.flush();
+      const wakes = t.projectWakes();
+      expect(wakes.length).toBeGreaterThan(before);
+      const wake = wakes.at(-1)!.text;
+      expect(wake).toMatch(/forwarded escalation on the Stewards page without an answer/u);
+      expect(wake).not.toMatch(/general judgement the playbook should carry/u);
+    });
   });
 
   // BB-13: one spec approval, from any surface. The page answer, the project

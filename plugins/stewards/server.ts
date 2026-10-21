@@ -2656,14 +2656,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * The project steward forwarded an escalation to the user, so it holds it
      * until the user answers. Tell it when the answer lands on the page or from
      * a thread, naming the closure, so it is not left holding a resolved one.
+     * `lessonCandidate` is false when the user closed it without an answer, so
+     * the lesson nudge does not read oddly against an empty one.
      */
-    async function wakeProjectOnForwardedAnswer(b: Binding, closure: string, forwarded: Escalation[]): Promise<void> {
+    async function wakeProjectOnForwardedAnswer(b: Binding, closure: string, forwarded: Escalation[], lessonCandidate = true): Promise<void> {
       if (forwarded.length === 0) return;
       await wakeProject(b.projectId, `${b.entityKey}'s forwarded escalation was answered`, {
         digestDue: false,
         notes: [
           `${closure} ${forwarded.map((x) => `Escalation ${x.id}`).join(", ")} ${forwarded.length === 1 ? "is" : "are"} resolved.`,
-          "If the answer is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.",
+          ...(lessonCandidate ? ["If the answer is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }."] : []),
         ],
       });
     }
@@ -3499,7 +3501,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (text !== null) store.addGuidance(b.id, text, "user");
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
           scheduleReconcile(b.id);
-          await wakeProjectOnForwardedAnswer(b, closure, [x]);
+          await wakeProjectOnForwardedAnswer(b, closure, [x], text !== null);
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
         return { ok: true, message: "Closed." };
@@ -5120,7 +5122,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     if (note !== null) store.addGuidance(b.id, note, "user");
                     store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
                     scheduleReconcile(b.id);
-                    await wakeProjectOnForwardedAnswer(b, closure, [x]);
+                    await wakeProjectOnForwardedAnswer(b, closure, [x], note !== null);
                   }
                 }
                 return { exitCode: 0, stdout: `Closed ${id}.` };
