@@ -587,10 +587,13 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
   // A lesson's Merge/Drop are its only choices: no free-text "Other…".
   const lesson = n.lessonId !== null;
   const freeText = choices.length === 0 || other;
+  // The entity link opens the binding's ticket; for approve-pr and merge the
+  // item's `url` is the pull request, so it gets its own link.
+  const prUrl = n.kind === "approve-pr" || n.kind === "merge" ? n.url : null;
   return (
     <li className="flex flex-col gap-2 p-3">
       <p className="flex flex-wrap items-center gap-2">
-        <EntityLink entityKey={n.key} url={n.url} />
+        <EntityLink entityKey={n.key} url={n.entityUrl ?? n.url} />
         <Badge tone="bad">{n.kind}</Badge>
         <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
       </p>
@@ -658,6 +661,11 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
           </button>
         )}
         {n.threadId !== null ? <ThreadLink threadId={n.threadId}>{n.kind === "provide-secret" ? "Open the requester" : "Open the worker"}</ThreadLink> : null}
+        {prUrl !== null ? (
+          <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.openUrl(prUrl)}>
+            Open the pull request
+          </button>
+        ) : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
       </div>
     </li>

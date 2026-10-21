@@ -2242,6 +2242,10 @@ describe("needs you items", () => {
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    // BB-29: the board's `url` is the pull request and `entityUrl` the ticket,
+    // so the page can link the PR separately from the entity key.
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; url: string | null; entityUrl: string | null }> } }).board;
+    expect((await board()).needs.find((n) => n.kind === "approve-pr")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
     expect(res).toMatchObject({ ok: true });
     expect(t.githubComments).toEqual([{ repo: "acme/web", number: 7, body: "Approved aaaaaaa1 from the Stewards page" }]);
@@ -2252,6 +2256,7 @@ describe("needs you items", () => {
     await t.flush();
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeDefined();
+    expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
   });
 
   it("refuses an approve-pr the gate cannot hold, names the missing step and files nothing (BB-21)", async () => {
@@ -2550,7 +2555,7 @@ describe("needs you items", () => {
 
   it("shows the items on the board with their actionability", async () => {
     const t = await withPull([marker]);
-    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; actionable: boolean; why: string | null }> } }).board;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { needs: Array<{ kind: string; key: string; url: string | null; entityUrl: string | null; actionable: boolean; why: string | null }> } }).board;
     const first = await board();
     expect(first.needs).toEqual([expect.objectContaining({ kind: "approve-pr", key: "ENG-12", url: "https://github.com/acme/web/pull/7", actionable: true, why: null })]);
     // Once the owner approves, a merge item appears; a running worker makes it not actionable.
