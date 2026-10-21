@@ -102,6 +102,40 @@ export function newHumanComments(entity: EntitySnapshot, cursor: string, own: Re
   return entity.comments.filter((c) => c.createdAt > cursor && (c.signedBy === null || !own.has(c.signedBy)));
 }
 
+/**
+ * Whether an answer says something other than the recommendation, whitespace-
+ * and case-insensitively. An empty side never differs: there is nothing to
+ * reverse. A leading agreement adds nothing, and a negation on only one side
+ * flips the meaning. Used by the citation counters, where "differs" is what
+ * makes a correction (BB-35 step 2).
+ */
+const NEGATION = /(?:\b(?:no|not|never|without|avoid|reject|decline|stop|keep)\b|n't\b)/iu;
+const AGREEMENT = /^(?:yes|yep|yeah|agreed?|ok(?:ay)?|sure|correct|confirmed|approved|lgtm|sounds good|do it|please do|go ahead)[\s,.:;—-]+/iu;
+const words = (s: string): Set<string> => new Set(s.split(/[^a-z0-9']+/u).filter((w) => w !== ""));
+const subset = (x: Set<string>, y: Set<string>): boolean => [...x].every((w) => y.has(w));
+export function answerDiffers(answer: string, recommendation: string): boolean {
+  const a = answer.replace(/\s+/gu, " ").trim().toLowerCase();
+  const r = recommendation.replace(/\s+/gu, " ").trim().toLowerCase();
+  if (a === "" || r === "") return false;
+  if (a === r) return false;
+  if (NEGATION.test(a) !== NEGATION.test(r)) return true;
+  const aw = words(a.replace(AGREEMENT, ""));
+  const rw = words(r);
+  return !subset(rw, aw) && !subset(aw, rw);
+}
+
+/**
+ * Whether a comment is the connected owner's own unsigned words that differ
+ * from the recommendation. Only the owner's own unsigned comment can correct a
+ * lesson: a signed comment belongs to a thread, and anyone else's words — on
+ * Linear or GitHub — never do (BB-35 step 2).
+ */
+export function commentDiffersFromRecommendation(c: SnapshotComment, viewer: string | null, recommendation: string | null): boolean {
+  if (viewer === null || recommendation === null || c.signedBy !== null) return false;
+  if (c.author.toLowerCase() !== viewer.toLowerCase()) return false;
+  return answerDiffers(c.body, recommendation);
+}
+
 export const newestCommentAt = (observed: Observed): string =>
   [observed.entity, ...observed.pulls].flatMap((e) => e.comments.map((c) => c.createdAt)).reduce((a, b) => (a > b ? a : b), "");
 

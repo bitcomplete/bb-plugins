@@ -54,7 +54,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -1418,6 +1418,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const workerInFlight = anyWorkerInFlight(store.workers(b.id));
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userThread: isUserThread });
       changes.push(...fresh);
+      // BB-35 step 2: a fresh unsigned comment by the owner that differs from
+      // the recommendation on a decision that cited lessons is a correction,
+      // counted once. Anyone else's words never count. Only from the second
+      // observation on: comments already there at adoption are history, not an
+      // event.
+      if (prev !== null) countCommentCorrections(b, observed);
       // Criterion 4: a spec comment the user wrote from their own thread is
       // the user's own words. With approval: me it carries its own approval,
       // pinned to the spec it just changed, whether or not an earlier
@@ -2447,6 +2453,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * Count a correction when the owner's answer to an escalation differs from
+     * the steward's recommendation on it and the decision cited lessons
+     * (BB-35 step 2). Observed, never asked for; `correctionsCounted` keeps one
+     * reversal to one count.
+     */
+    function countCorrections(x: Escalation, answer: string): void {
+      if (x.correctionsCounted || x.recommendation === null || x.citedLessons.length === 0) return;
+      if (!answerDiffers(answer, x.recommendation)) return;
+      store.recordCorrections(x.citedLessons);
+      store.markEscalationCorrected(x.id);
+    }
+
+    /**
+     * The same for an unsigned comment the owner wrote on the entity itself: it
+     * differs from the recommendation on an open escalation that cited
+     * lessons. A signed comment belongs to a thread, and anyone else's words
+     * never count (BB-35 step 2).
+     */
+    function countCommentCorrections(b: Binding, observed: Observed): void {
+      const viewer = observed.entity.viewer;
+      if (viewer === null) return;
+      const comments = newHumanComments(observed.entity, b.commentCursor, ownThreads(b));
+      if (comments.length === 0) return;
+      for (const x of store.openEscalations(b.id)) {
+        if (x.correctionsCounted || x.recommendation === null || x.citedLessons.length === 0) continue;
+        if (!comments.some((c) => commentDiffersFromRecommendation(c, viewer, x.recommendation))) continue;
+        store.recordCorrections(x.citedLessons);
+        store.markEscalationCorrected(x.id);
+      }
+    }
+
     /** Where an escalation goes next, above where it is. */
     function nextRoute(b: Binding, from: EscalationRoute | null): EscalationRoute {
       if (from === null) {
@@ -3449,6 +3487,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (x !== null && b !== null && b.endedAt === null) {
             const closure = `The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`;
             store.addGuidance(b.id, guidance, "user");
+            countCorrections(x, guidance);
             store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
             scheduleReconcile(b.id);
             await wakeProjectOnForwardedAnswer(b, closure, [x]);
@@ -3499,6 +3538,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ? `The user closed ${b.entityKey}'s forwarded escalation on the Stewards page without an answer.`
             : `The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`;
           if (text !== null) store.addGuidance(b.id, text, "user");
+          if (text !== null) countCorrections(x, text);
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
           scheduleReconcile(b.id);
           await wakeProjectOnForwardedAnswer(b, closure, [x], text !== null);
@@ -3659,13 +3699,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (ownEscalation !== null && ownEscalation.status === "open") {
             store.addGuidance(b.id, guidance, "user");
             store.answerEscalation(need.id, `Chose: ${label}${text === null ? "" : ` — ${text}`}`, "user");
+            countCorrections(ownEscalation, guidance);
           } else {
             store.closeNeedByKey(b.id, "decide", need.url, `Chose: ${label}${text === null ? "" : ` — ${text}`}`);
             store.addGuidance(b.id, guidance, "user");
             const escalationId = typeof need.data.escalationId === "string" ? need.data.escalationId : null;
             if (escalationId !== null) {
               const escalation = store.escalation(escalationId);
-              if (escalation !== null && escalation.status === "open") store.answerEscalation(escalationId, guidance, "user");
+              if (escalation !== null && escalation.status === "open") {
+                store.answerEscalation(escalationId, guidance, "user");
+                countCorrections(escalation, guidance);
+              }
             }
           }
           store.note(b.id, `The user chose ${label} for ${need.what}${text === null ? "" : `: ${text}`}.`);
@@ -4118,6 +4162,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: z.string().trim().min(1).max(300).optional().describe("The entity key (ENG-12, owner/repo#3) or binding id. Leave out for this thread's own binding, or, from the project steward, for a question about no one binding."),
         guidance: z.string().trim().min(1).max(4000).optional().describe("Standing guidance, in the user's or your own terms. With resolve, the answer to the escalation."),
         resolve: z.string().trim().min(1).max(100).optional().describe("An open escalation on that binding that the guidance answers; or, from the project steward, an open question (qst_…) the user answered, with answer."),
+        cites: z
+          .array(z.string().trim().min(1).max(100))
+          .max(20)
+          .optional()
+          .describe("With resolve (or forward): the lesson ids (lsn_…) this decision rested on. A lesson's hits count once per distinct binding, and a later reversal of the decision counts a correction. Counts only — nothing is promoted or retired here."),
         answer: z.string().trim().min(1).max(4000).optional().describe("With resolve and a question id: the user's answer, kept on the question."),
         ask: z
           .object({
@@ -4279,6 +4328,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
           }
 
+          if (input.cites !== undefined && resolve === undefined && input.forward === undefined) {
+            return toolError(new Error("cites goes with resolve (the decision it rested on) or forward (the recommendation it rested on)."));
+          }
+
           const target = bindingRef === undefined ? (projectOf !== null ? null : ownBinding(threadId)) : store.find(bindingRef);
           if (bindingRef !== undefined && target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
           if (target === null) {
@@ -4413,6 +4466,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           done.push(...questionWrites(closing, target));
           if (input.lesson !== undefined) done.push(recordLesson(target.id, resolving?.id ?? closing?.question.escalationId ?? null));
+          if (input.cites !== undefined) {
+            // BB-35 step 2: count the citation, and keep the lessons on the
+            // escalation so a later reversal can be attributed. Counts only:
+            // nothing is promoted, retired or written to `.bb` here.
+            const { cited, unknown } = store.recordCitations(target.projectId, input.cites, target.id);
+            const citeTarget = resolving ?? forwarding;
+            if (citeTarget !== null) store.setEscalationCitations(citeTarget.id, cited.map((l) => l.id));
+            if (cited.length === 0) done.push("no lesson cited");
+            else done.push(`cited ${cited.length} lesson${cited.length === 1 ? "" : "s"}: ${cited.map((l) => `${l.id} (${l.hits} binding${l.hits === 1 ? "" : "s"})`).join(", ")}`);
+            if (unknown.length > 0) done.push(`not counted (no such lesson in this project): ${unknown.join(", ")}`);
+          }
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
             const recommendation = input.recommendation ?? forwarding.recommendation;
@@ -5104,6 +5168,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     if (b !== null) {
                       const closure = `The user chose ${choice} for ${b.entityKey}'s forwarded escalation from a thread${note === null ? "" : `: ${note}`}.`;
                       store.addGuidance(b.id, guidance, "user");
+                      countCorrections(x, guidance);
                       store.note(b.id, `The user chose ${choice} for ${q.question}${note === null ? "" : `: ${note}`}.`);
                       scheduleReconcile(b.id);
                       await wakeProjectOnForwardedAnswer(b, closure, [x]);
@@ -5120,6 +5185,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       ? `The user closed ${b.entityKey}'s forwarded escalation from a thread without an answer.`
                       : `The user answered ${b.entityKey}'s forwarded escalation from a thread: ${JSON.stringify(note)}.`;
                     if (note !== null) store.addGuidance(b.id, note, "user");
+                    if (note !== null) countCorrections(x, note);
                     store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
                     scheduleReconcile(b.id);
                     await wakeProjectOnForwardedAnswer(b, closure, [x], note !== null);

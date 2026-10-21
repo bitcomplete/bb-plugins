@@ -234,7 +234,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   escalation on the Stewards page (or from a thread) wakes the project
   steward with that answer as a lesson candidate: if it is a general
   judgement the playbook should carry, the project steward records it as a
-  lesson. `bb stewards lessons [--all]`
+  lesson. A resolve carries `cites: [lesson ids]` — the lessons it rested on
+  — and the plugin counts `hits` (once per distinct binding), `corrections`
+  and `lastCitedAt`. Counts only for now: nothing is promoted, retired or
+  written to `.bb` from them yet. `bb stewards lessons [--all]`
   lists them, `bb stewards drop-lesson <id>` drops one. DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open

@@ -355,7 +355,7 @@ export function formatWake(input: WakeInput): string {
     for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
-      out.push("  Decide it with steward_update { binding, guidance, resolve }, or pass it up with steward_update { binding, forward, recommendation }.");
+      out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids] }.");
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
@@ -796,7 +796,7 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }. Forward one to the user (steward_update { binding, forward, recommendation }) only when it is one of these big decisions, and say which entry you matched:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons it rested on with `cites: [lesson ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [lesson ids] }) only when it is one of these big decisions, and say which entry you matched:",
       "",
       ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
@@ -824,7 +824,7 @@ export function formatProjectWake(input: {
   if (withUser.length > 0) {
     out.push("## Escalations with the user", "");
     for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
-    out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve }.", "");
+    out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve, cites: [lesson ids] }, citing the lessons the decision rested on.", "");
   }
   const questions = input.questions ?? [];
   if (questions.length > 0) {

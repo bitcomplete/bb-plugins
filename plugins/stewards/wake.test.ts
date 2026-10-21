@@ -75,6 +75,15 @@ describe("a steward's wake", () => {
     expect(wake).toContain("counts like a missed report toward `stuck`");
   });
 
+  it("tells the steward to cite the lessons behind a routed escalation (BB-35 step 2)", () => {
+    const { s, bind } = world();
+    const binding = bind("ENG-12");
+    const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "steward", recommendation: null });
+    const wake = formatWake(wakeInput({ binding, routedToMe: [{ escalation: x, from: binding }] }));
+    expect(wake).toMatch(/resolve, cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
+  });
+
   it("names the reviewer's sha and the head when the approval is on an earlier commit", () => {
     const marker = comment({ id: "m1", author: "trotterdylan", body: "<!-- bb-review round=1 sha=bbbbbbb2 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-18T04:00:00Z" });
     const entity = pull({ comments: [marker] }, { headSha: "aaaaaaa1", checks: { state: "success", failing: [] } });
@@ -152,6 +161,17 @@ describe("the nightly prompt", () => {
     expect(section("Stuck or held").split("\n")).toEqual([`- ENG-3: stuck escalation ${stuck.id} with project, since 2026-10-18: Status has not moved in 3 days.`, "- ENG-3: on hold: billing freeze"]);
     expect(wake).toMatch(/Write it from the record above, not from memory/u);
     expect(wake.indexOf("## The record since")).toBeLessThan(wake.indexOf("reply with the morning digest"));
+  });
+
+  it("tells the project steward to cite the lessons a decision rested on (BB-35 step 2)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "project", recommendation: null });
+    const wake = formatProjectWake({ reason: "escalation", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(wake).toMatch(/cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/a decision must cite what it was decided from/u);
+    // A forward can cite too: the recommendation a correction is measured against lives there.
+    expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
   });
 
   it("gives dates in the project's nightly time zone", () => {
