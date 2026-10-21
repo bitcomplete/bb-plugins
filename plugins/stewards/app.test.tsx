@@ -12,6 +12,7 @@ type Need = {
   key: string;
   kind: string;
   url: string | null;
+  entityUrl: string | null;
   escalationId: string | null;
   choices: string[];
   lessonId: string | null;
@@ -40,6 +41,7 @@ const need = (over: Partial<Need> = {}): Need => ({
   key: "ENG-12",
   kind: "decide",
   url: null,
+  entityUrl: null,
   escalationId: null,
   choices: [],
   lessonId: null,
@@ -144,6 +146,36 @@ describe("the Stewards page's decide items and questions (BB-20)", () => {
     await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: "Merge" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Merge" } }));
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-29: an approve-pr or merge card links the pull request separately, while
+// the entity key keeps opening the binding's ticket.
+describe("the Stewards page's need links (BB-29)", () => {
+  const pr = "https://github.com/bitcomplete/bb-gate/pull/17";
+  const ticket = "https://linear.app/bit-complete/issue/BB-28";
+
+  it("links the key to the ticket and offers Open the pull request for approve-pr and merge", async () => {
+    const slot = await renderBoard(
+      [
+        need({ kind: "approve-pr", key: "BB-28", url: pr, entityUrl: ticket, what: "Approve bitcomplete/bb-gate#17 on GitHub" }),
+        need({ id: "need_2", kind: "merge", key: "BB-29", url: pr, entityUrl: "https://linear.app/bit-complete/issue/BB-29", what: "Merge bitcomplete/bb-gate#17" }),
+      ],
+      [],
+    );
+    await waitFor(() => expect(slot.getAllByRole("button", { name: "Open the pull request" })).toHaveLength(2));
+    fireEvent.click(slot.getByRole("button", { name: "BB-28" }));
+    fireEvent.click(slot.getAllByRole("button", { name: "Open the pull request" })[0]!);
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: ticket }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: pr }));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows no Open the pull request link for other kinds", async () => {
+    const slot = await renderBoard([need({ kind: "decide", url: ticket, entityUrl: ticket })], []);
+    await waitFor(() => expect(slot.getByRole("button", { name: "Answer" })).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Open the pull request" })).toBeNull();
     slot.lifecycle.unmount();
   });
 });

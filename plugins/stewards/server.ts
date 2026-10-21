@@ -278,6 +278,8 @@ export const rpcContract = defineRpcContract({
               key: z.string(),
               kind: z.string(),
               url: z.string().nullable(),
+              /** The binding's own link (its ticket or pull request), so the key opens the entity, not the item's `url`. */
+              entityUrl: z.string().nullable(),
               /** The escalation this item answers, when the project steward forwarded one. */
               escalationId: z.string().nullable(),
               /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
@@ -4282,7 +4284,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -4303,7 +4305,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // appears in its first turn. Link the thread once one has been spawned.
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     function formatBindings(rows: Binding[]): string {
