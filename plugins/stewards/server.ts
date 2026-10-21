@@ -3445,9 +3445,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const guidance = text === null ? chosen : `${chosen} — ${text}`;
           store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
           if (x !== null && b !== null && b.endedAt === null) {
+            const closure = `The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`;
             store.addGuidance(b.id, guidance, "user");
             store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
             scheduleReconcile(b.id);
+            await wakeProjectOnForwardedAnswer(b, closure, [x]);
             return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
           }
           return { ok: true, message: "Closed." };
@@ -3486,12 +3488,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           });
           return { ok: true, message: `Closed; the project steward will interpret the answer.` };
         }
-        // Closes the escalation it was forwarded for, too.
+        // Closes the escalation it was forwarded for, too. The project
+        // steward forwarded it, so it is told too: the user's answer is a
+        // lesson candidate for its next wake (BB-35 step 1).
         store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
         if (x !== null && b !== null && b.endedAt === null) {
+          const closure = text === null
+            ? `The user closed ${b.entityKey}'s forwarded escalation on the Stewards page without an answer.`
+            : `The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`;
           if (text !== null) store.addGuidance(b.id, text, "user");
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
           scheduleReconcile(b.id);
+          await wakeProjectOnForwardedAnswer(b, closure, [x]);
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
         return { ok: true, message: "Closed." };
@@ -5092,9 +5100,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   if (x !== null) {
                     const b = store.binding(x.bindingId);
                     if (b !== null) {
+                      const closure = `The user chose ${choice} for ${b.entityKey}'s forwarded escalation from a thread${note === null ? "" : `: ${note}`}.`;
                       store.addGuidance(b.id, guidance, "user");
                       store.note(b.id, `The user chose ${choice} for ${q.question}${note === null ? "" : `: ${note}`}.`);
                       scheduleReconcile(b.id);
+                      await wakeProjectOnForwardedAnswer(b, closure, [x]);
                     }
                   }
                   return { exitCode: 0, stdout: `Chose ${choice} for ${id}.` };
@@ -5104,9 +5114,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 if (x !== null) {
                   const b = store.binding(x.bindingId);
                   if (b !== null) {
+                    const closure = note === null
+                      ? `The user closed ${b.entityKey}'s forwarded escalation from a thread without an answer.`
+                      : `The user answered ${b.entityKey}'s forwarded escalation from a thread: ${JSON.stringify(note)}.`;
                     if (note !== null) store.addGuidance(b.id, note, "user");
                     store.note(b.id, note === null ? `Question ${q.id} was closed from a thread.` : `Question ${q.id} was answered from a thread: ${note}`);
                     scheduleReconcile(b.id);
+                    await wakeProjectOnForwardedAnswer(b, closure, [x]);
                   }
                 }
                 return { exitCode: 0, stdout: `Closed ${id}.` };

@@ -1165,7 +1165,11 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   `boundary`. Only the project steward may record one — a binding steward
   still escalates — and it is kept with the binding and escalation it came
   from in the `lessons` table. A lesson is `pending` until its text is found
-  in its file at `.bb` HEAD, or it is dropped.
+  in its file at `.bb` HEAD, or it is dropped. When the user answers a
+  forwarded escalation on the Stewards page or from a thread, the project
+  steward is woken with the answer and asked whether it is a general
+  judgement: the answer is a lesson candidate for its next turn. A plain
+  question with no escalation behind it wakes nobody.
 - **Procedure lessons self-merge.** Playbook procedure, sequencing and
   conventions are what the project steward may already decide. It applies
   the text to the file in its `.bb` checkout, commits, and publishes with
