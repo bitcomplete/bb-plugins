@@ -261,8 +261,12 @@ this skill or the project's guidance settles (models, flags, lanes, who
 merges). When they answer, close it with
 `steward_update { resolve: "<question id>", answer }`; for a forwarded one
 that decides the escalation too, and resolving the escalation closes the
-question. The user may also close a question on the Stewards page. Every
-wake lists the questions still open: list them from there, never from
+question. The user may also close a question on the Stewards page. A
+forwarded escalation they answer on the page or from a thread wakes you
+with the answer and asks whether it is a general judgement: if it is, record
+it with `steward_update { lesson: { text, file, scope } }` so it is not
+asked again. Every wake lists the questions still open: list them from
+there, never from
 memory, and do not ask one again. At the end of each nightly pass your reply is
 kept as the morning digest; the wake carries the record to write it from
 (your previous digest, what moved, what waits on the user, what is stuck),
