@@ -178,6 +178,10 @@ describe("Slack plugin", () => {
     const status = (await s.harness.callRpc("status")) as { signedIn: boolean; user: { name: string } | null };
     expect(status).toMatchObject({ signedIn: true, user: { name: "Alice" } });
     expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("xoxp-user-token");
+    // The state is single use: a second callback with the same state is refused.
+    const again = await s.harness.behavior.fetchHttp("GET", `${CALLBACK_PATH}?code=the-code&state=st-1`);
+    expect(again.status).toBe(400);
+    expect(s.hooks.exchanges).toHaveLength(1);
     await s.stop();
   });
 
@@ -290,6 +294,67 @@ describe("Slack plugin", () => {
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("keeps the conversation's thread on a transient send error, and starts a new one only when it is gone", async () => {
+    let sends = 0;
+    const transient = await live({
+      send: () => {
+        sends += 1;
+        if (sends === 1) throw new Error("the host is busy");
+        return { outcome: "sent" };
+      },
+    });
+    transient.hooks.last().send(transient.hooks.session());
+    await tick();
+    transient.hooks.last().send(transient.hooks.session({ comment: { text: "again", untrusted: false } }));
+    await tick();
+    transient.hooks.last().send(transient.hooks.session({ comment: { text: "third", untrusted: false } }));
+    await tick();
+    expect(transient.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(transient.harness.sdk.callsTo("threads.send")).toHaveLength(2);
+    expect(transient.hooks.messages.at(-1)?.body.text).toContain("could not deliver");
+    await transient.stop();
+
+    let spawned = 0;
+    const gone = await live({
+      spawn: () => ({ id: `thr-${++spawned}` }),
+      send: () => {
+        throw Object.assign(new Error("thread not found"), { status: 404 });
+      },
+    });
+    gone.hooks.last().send(gone.hooks.session());
+    await tick();
+    gone.hooks.last().send(gone.hooks.session({ comment: { text: "again", untrusted: false } }));
+    await tick();
+    expect(gone.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    await gone.stop();
+  });
+
+  it("records a context change without running a turn or expecting a reply", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_reply", { text: "hi" }, { threadId: "thr-1" });
+    const before = s.hooks.messages.length;
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_context_changed", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toEqual([]);
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(before);
+    await s.stop();
+  });
+
+  it("forgets the token when the service refuses it on identify", async () => {
+    const hooks = fakeHooks();
+    hooks.state.identify = () => new Response("token refused", { status: 401 });
+    const s = await live({ hooks, token: "xoxp-old" });
+    expect((await s.harness.callRpc("status")) as { signedIn: boolean }).toMatchObject({ signedIn: false });
+    expect(await s.bb.storage.kv.get("identity")).toBeUndefined();
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("xoxp-old");
     await s.stop();
   });
 });

@@ -255,6 +255,10 @@ export interface HooksLoopDeps {
   onSession: (event: SessionEvent) => void;
   /** The service's answer to an identify, for the settings view and logs. */
   onIdentified?: (identity: IdentifyResponse) => void;
+  /** A new connection's hello, for housekeeping that belongs to a fresh stream. */
+  onHello?: () => void;
+  /** The service refused the stored token (401): it is bad, expired or revoked, so sign in again. */
+  onTokenRefused?: () => void;
   timing?: Partial<HooksTiming>;
 }
 
@@ -340,6 +344,13 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
       deps.onIdentified?.(result);
     } catch (error) {
       if (signal.aborted) return;
+      if (error instanceof HooksRequestError && error.status === 401) {
+        // The token itself was refused: bad, expired or revoked. Tell the
+        // caller so it can stop claiming to be signed in.
+        deps.log.warn("bb-gate-hooks refused the Slack sign-in token; sign in again");
+        deps.onTokenRefused?.();
+        return;
+      }
       if (error instanceof HooksRequestError && error.status === 404) {
         if (error.unknownConnection) {
           if (connection === current) {
@@ -372,6 +383,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           setState("connected");
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
           deps.log.info(`Slack: connected to bb-gate-hooks as ${connection}`);
+          deps.onHello?.();
           // Not awaited: wakes behind the hello must not wait for identify.
           void identifyNow(signal);
           if (renewTimer !== null) clearInterval(renewTimer);

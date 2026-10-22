@@ -75,7 +75,7 @@ describe("createHooksLoop", () => {
     const running = loop.run(abort.signal);
     await ready;
     controller.enqueue(encoder.encode(`event: hello\ndata: ${JSON.stringify({ connection: "c_1", leaseSeconds: 3600 })}\n\n`));
-    controller.enqueue(encoder.encode(`event: session\ndata: ${JSON.stringify({ source: "slack", session: "D1:1", action: "message", channel: "D1", thread: "1", asker: { id: "U1", name: "Alice" }, owner: { id: "U1", name: "Alice" }, fromOwner: true, routedTo: "owner", comment: { text: "hi", untrusted: false }, at: "t" })}\n\n`));
+    controller.enqueue(encoder.encode(`event: session\ndata: ${JSON.stringify({ source: "slack", session: "D1:1", action: "message", channel: "D1", thread: "1", asker: { id: "U1", name: "Alice" }, owner: { id: "U1", name: "Alice" }, fromOwner: true, routedAs: "owner", comment: { text: "hi", untrusted: false }, at: "t" })}\n\n`));
     await vi.waitFor(() => expect(seen).toHaveLength(1));
     expect(identifies).toEqual([{ connection: "c_1", source: "slack", token: "tok", teams: [] }]);
     expect(loop.connectionId).toBe("c_1");

@@ -177,6 +177,19 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       if (changed) announceConnection(true);
     }
 
+    /** Forget the stored token and the identity, and reconnect so the service drops the binding. */
+    async function forgetSignin(reason: string): Promise<void> {
+      await settings.experimental_set({ token: null });
+      cachedToken = "";
+      identity = null;
+      await bb.storage.kv.delete(IDENTITY_KEY);
+      // Drop the stream so the service forgets the identity bound to this
+      // connection; the new connection has no token to prove.
+      hooks.reconnect();
+      announceConnection(false);
+      bb.log.info(`signed out of Slack: ${reason}`);
+    }
+
     // ---- projects ----------------------------------------------------------
 
     async function projects(): Promise<Project[]> {
@@ -208,8 +221,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         // awaited; the cached token is kept in step by the settings listener.
         return cachedToken;
       },
-      onSession: (event) => void onSession(event).catch((error: unknown) => bb.log.warn(`Slack session ${event.session} failed: ${errorMessage(error)}`)),
+      onSession: (event) => onSession(event),
       onIdentified: (who) => rememberIdentity(who),
+      onHello: () => void prunePending(),
+      onTokenRefused: () => void forgetSignin("bb-gate-hooks refused the sign-in token"),
     });
 
     settings.onChange((next, prev) => {
@@ -302,26 +317,69 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       return first.length <= 80 ? first : `${first.slice(0, 77)}…`;
     }
 
+    /** Message a thread; "gone" when it no longer exists, "failed" for a transient error. */
+    async function sendToThread(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
+      try {
+        await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
+        return "sent";
+      } catch (error) {
+        const e = error as { code?: string; status?: number };
+        if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return "gone";
+        bb.log.warn(`Slack could not message thread ${threadId}: ${errorMessage(error)}`);
+        return "failed";
+      }
+    }
+
+    async function markHanded(session: string, handedAt: number): Promise<void> {
+      const r = sessions.get(session);
+      if (r === undefined) return;
+      sessions.set(session, { ...r, handedAt });
+      await saveSessions();
+    }
+
+    /** Start the bb thread for a conversation, or answer with the reason it cannot. */
+    async function spawnThread(event: SessionEvent, text: string, handedAt: number): Promise<void> {
+      const project = await targetProject();
+      if (project === null) {
+        await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.");
+        return;
+      }
+      const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: { type: "project-default" }, prompt: text, title: threadTitle(event) });
+      const after = sessions.get(event.session);
+      if (after !== undefined) {
+        sessions.set(event.session, { ...after, threadId: thread.id, projectId: project.id, handedAt });
+        await saveSessions();
+      }
+      bb.log.info(`Slack session ${event.session} started bb thread ${thread.id} in ${project.name}`);
+    }
+
     /**
      * A Slack conversation woke this server. The first message spawns a bb
      * thread; a follow-up is sent to the same one. The words are marked
-     * untrusted whenever they are not the owner's.
+     * untrusted whenever they are not the owner's. A context change carries no
+     * words and needs no reply: it keeps the conversation mapped and runs no
+     * turn, so it never trips the backstop.
      */
-    async function onSession(event: SessionEvent): Promise<void> {
+    async function handleSession(event: SessionEvent): Promise<void> {
       const previous = sessions.get(event.session);
+      const needsReply = event.action !== "assistant_thread_context_changed";
       const record: SessionRecord = {
         channel: event.channel,
         thread: event.thread,
         threadId: previous?.threadId ?? null,
         projectId: previous?.projectId ?? null,
         eventAt: deps.now(),
-        events: (previous?.events ?? 0) + 1,
+        events: (previous?.events ?? 0) + (needsReply ? 1 : 0),
         answered: previous?.answered ?? 0,
         handedAt: previous?.handedAt ?? null,
         title: previous?.title ?? null,
       };
       sessions.set(event.session, record);
       await saveSessions();
+      if (!needsReply) {
+        bb.log.info(`Slack session ${event.session} context changed; nothing to answer`);
+        return;
+      }
       bb.log.info(`Slack session ${event.session} (${event.action}) from ${isFromOwner(event) ? "the owner" : "someone else"}; handing it to a bb thread`);
 
       // The thinking indicator, best effort: the service only accepts it for a
@@ -334,37 +392,41 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const handedAt = deps.now();
       try {
         if (record.threadId === null) {
-          const project = await targetProject();
-          if (project === null) {
-            await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.");
-            return;
-          }
-          const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: { type: "project-default" }, prompt: text, title: threadTitle(event) });
+          await spawnThread(event, text, handedAt);
+          return;
+        }
+        const outcome = await sendToThread(record.threadId, text);
+        if (outcome === "sent") {
+          await markHanded(event.session, handedAt);
+        } else if (outcome === "gone") {
+          bb.log.info(`Slack session ${event.session}'s bb thread ${record.threadId} is gone; starting a new one`);
           const after = sessions.get(event.session);
           if (after !== undefined) {
-            sessions.set(event.session, { ...after, threadId: thread.id, projectId: project.id, handedAt });
+            sessions.set(event.session, { ...after, threadId: null, projectId: null });
             await saveSessions();
           }
-          bb.log.info(`Slack session ${event.session} started bb thread ${thread.id} in ${project.name}`);
+          await spawnThread(event, text, handedAt);
         } else {
-          await bb.sdk.threads.send({ threadId: record.threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
-          const after = sessions.get(event.session);
-          if (after !== undefined) {
-            sessions.set(event.session, { ...after, handedAt });
-            await saveSessions();
-          }
+          // A transient error keeps the mapping: the thread still exists and
+          // the next message must continue it, not start a second one.
+          await backstop(event.session, "Your bb could not deliver this Slack message to its thread. Try again in a moment.");
         }
       } catch (error) {
         bb.log.warn(`Slack session ${event.session} could not reach a bb thread: ${errorMessage(error)}`);
-        // The mapped thread may be gone (deleted or archived): forget it so
-        // the next message starts a fresh one.
-        const after = sessions.get(event.session);
-        if (after !== undefined && after.threadId !== null) {
-          sessions.set(event.session, { ...after, threadId: null, projectId: null });
-          await saveSessions();
-        }
         await backstop(event.session, `Your bb could not start or continue a thread for this Slack conversation: ${errorMessage(error)}`);
       }
+    }
+
+    /** One wake at a time per conversation, so two quick messages cannot both spawn a thread. */
+    const sessionChains = new Map<string, Promise<void>>();
+    function onSession(event: SessionEvent): void {
+      const run = (sessionChains.get(event.session) ?? Promise.resolve())
+        .then(() => handleSession(event))
+        .catch((error: unknown) => bb.log.warn(`Slack session ${event.session} failed: ${errorMessage(error)}`));
+      sessionChains.set(event.session, run);
+      void run.then(() => {
+        if (sessionChains.get(event.session) === run) sessionChains.delete(event.session);
+      });
     }
 
     /** A bb thread that went away stops answering its Slack conversation; the next message starts a new one. */
@@ -436,15 +498,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return { url: authorizeUrl };
       },
       async signout() {
-        await settings.experimental_set({ token: null });
-        cachedToken = "";
-        identity = null;
-        await bb.storage.kv.delete(IDENTITY_KEY);
-        // Drop the stream so the service forgets the identity bound to this
-        // connection; the new connection has no token to prove.
-        hooks.reconnect();
-        announceConnection(false);
-        bb.log.info("signed out of Slack");
+        await forgetSignin("the developer signed out");
         return { ok: true };
       },
       async setProject({ projectId }) {
