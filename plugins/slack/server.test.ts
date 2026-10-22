@@ -1,6 +1,6 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CALLBACK_PATH, createSlackPlugin } from "./server.js";
+import serverEntry, { CALLBACK_PATH, createSlackPlugin } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -136,6 +136,11 @@ async function setup(
 }
 
 describe("Slack plugin", () => {
+  it("default-exports the factory bb loads as the server entry", () => {
+    // bb refuses the plugin ("server entry must default-export a factory (bb) => void, got undefined") without this.
+    expect(typeof serverEntry).toBe("function");
+  });
+
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
   const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);

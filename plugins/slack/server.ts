@@ -611,3 +611,5 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
   };
 }
+
+export default createSlackPlugin({ fetch: (url, init) => fetch(url, init), now: () => Date.now(), env: process.env });
