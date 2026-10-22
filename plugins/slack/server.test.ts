@@ -16,10 +16,14 @@ function fakeHooks() {
   const messages: Array<{ session: string; body: Record<string, unknown> }> = [];
   const statuses: Array<{ session: string; body: Record<string, unknown> }> = [];
   const titles: Array<{ session: string; body: Record<string, unknown> }> = [];
-  const state = {
-    start: (): Response => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
-    exchange: (): Response => Response.json({ token: "xoxp-user-token" }),
-    identify: (): Response => Response.json({ user: { id: "U0123", name: "Alice" }, teams: [], rejected: [] }),
+  const state: {
+    start: () => Response | Promise<Response>;
+    exchange: () => Response | Promise<Response>;
+    identify: () => Response | Promise<Response>;
+  } = {
+    start: () => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
+    exchange: () => Response.json({ token: "xoxp-user-token" }),
+    identify: () => Response.json({ user: { id: "U0123", name: "Alice" }, teams: [], rejected: [] }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
@@ -356,5 +360,23 @@ describe("Slack plugin", () => {
     expect(await s.bb.storage.kv.get("identity")).toBeUndefined();
     expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("xoxp-old");
     await s.stop();
+  });
+
+  it("does not clear a newer token when an old one is refused", async () => {
+    const hooks = fakeHooks();
+    let setToken: (token: string) => Promise<void> = async () => undefined;
+    hooks.state.identify = async () => {
+      await setToken("xoxp-new");
+      return new Response("token refused", { status: 401 });
+    };
+    const s = await setup({ hooks, token: "xoxp-old" });
+    setToken = (token) => s.harness.setSettings({ token });
+    const service = s.harness.runService("slack");
+    await tick();
+    hooks.last().send(hooks.hello("c_1"));
+    await tick();
+    expect((await s.harness.callRpc("status")) as { signedIn: boolean }).toMatchObject({ signedIn: true });
+    await service.controller.abort();
+    await service.done;
   });
 });

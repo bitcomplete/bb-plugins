@@ -257,8 +257,8 @@ export interface HooksLoopDeps {
   onIdentified?: (identity: IdentifyResponse) => void;
   /** A new connection's hello, for housekeeping that belongs to a fresh stream. */
   onHello?: () => void;
-  /** The service refused the stored token (401): it is bad, expired or revoked, so sign in again. */
-  onTokenRefused?: () => void;
+  /** The service refused this token (401): it is bad, expired or revoked, so sign in again. */
+  onTokenRefused?: (token: string) => void;
   timing?: Partial<HooksTiming>;
 }
 
@@ -348,7 +348,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
         // The token itself was refused: bad, expired or revoked. Tell the
         // caller so it can stop claiming to be signed in.
         deps.log.warn("bb-gate-hooks refused the Slack sign-in token; sign in again");
-        deps.onTokenRefused?.();
+        deps.onTokenRefused?.(token);
         return;
       }
       if (error instanceof HooksRequestError && error.status === 404) {

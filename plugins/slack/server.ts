@@ -177,8 +177,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       if (changed) announceConnection(true);
     }
 
-    /** Forget the stored token and the identity, and reconnect so the service drops the binding. */
-    async function forgetSignin(reason: string): Promise<void> {
+    /**
+     * Forget the stored token and the identity, and reconnect so the service
+     * drops the binding. `refused`, when given, is the token the service
+     * refused: if a newer one has been stored since (a sign-in that completed
+     * while the old identify was in flight), it is left alone.
+     */
+    async function forgetSignin(reason: string, refused?: string): Promise<void> {
+      if (refused !== undefined && ((await settings.get()).token ?? "").trim() !== refused) return;
       await settings.experimental_set({ token: null });
       cachedToken = "";
       identity = null;
@@ -224,7 +230,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       onSession: (event) => onSession(event),
       onIdentified: (who) => rememberIdentity(who),
       onHello: () => void prunePending(),
-      onTokenRefused: () => void forgetSignin("bb-gate-hooks refused the sign-in token"),
+      onTokenRefused: (token) => void forgetSignin("bb-gate-hooks refused the sign-in token", token),
     });
 
     settings.onChange((next, prev) => {
