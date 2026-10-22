@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        plugin: [devbox-provider, github-watcher, html-preview, image-copy, kubernetes-provider, pr-inbox, stewards, team-setup, thread-briefs, workstreams]
+        plugin: [devbox-provider, github-watcher, html-preview, image-copy, kubernetes-provider, linear, multi-repo, pr-inbox, repo-dashboard, slack, stewards, team-setup, thread-briefs, workstreams]
     defaults:
       run:
         working-directory: plugins/${{ matrix.plugin }}
@@ -26,6 +26,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22.19.0
+      # The same npm install bb's git plugin installer runs, without
+      # --legacy-peer-deps: a peer conflict here fails `bb plugin install`.
+      - name: Install as bb does
+        run: npm install --dry-run --ignore-scripts --omit dev --omit optional --no-audit --no-fund
       - name: Install
         run: npm install --include=dev --legacy-peer-deps --no-audit --no-fund
       - name: Typecheck

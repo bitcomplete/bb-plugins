@@ -27,6 +27,9 @@ updates:
     # moves by hand with BB_REF; a newer one typechecks APIs servers lack.
     ignore:
       - dependency-name: "@get-bb/plugin-sdk"
+      # The SDK's peer range is ^7.6.12; a newer major fails bb's npm install.
+      - dependency-name: "@types/better-sqlite3"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
