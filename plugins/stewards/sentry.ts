@@ -12,7 +12,7 @@
 // (with credentials redacted as the kubectl look's logs are), and what
 // changed between two looks. server.ts stores and wakes.
 import { z } from "zod";
-import { redactLine, type OpsTarget, type SentryTarget } from "./ops.js";
+import { redactLine, type FingerprintRow, type OpsTarget, type SentryTarget, type TicketState } from "./ops.js";
 import type { Change } from "./reconcile.js";
 
 export const SENTRY_API_URL = "https://sentry.io";
@@ -22,8 +22,8 @@ export const NO_TOKEN = "no Sentry token is configured";
 export const TOKEN_SETTING = "sentryToken";
 /** Where a Sentry user creates an auth token. */
 export const TOKEN_PAGE = "https://sentry.io/settings/account/api/auth-tokens/";
-/** The scopes the token needs: read the project (admission, the list) and its events (stack traces). */
-export const TOKEN_SCOPES = ["project:read", "event:read"] as const;
+/** The scopes the token needs: read the project (admission, the list), its events (stack traces), and write one thing (resolve a Done ticket's issue). */
+export const TOKEN_SCOPES = ["project:read", "event:read", "event:write"] as const;
 
 /** Unresolved issues read per look, newest activity first. */
 export const ISSUES_PER_LOOK = 50;
@@ -155,6 +155,9 @@ export class SentryApiError extends Error {
   }
 }
 
+/** What a Sentry write answered: done, or the status and message when it did not. Never thrown. */
+export type SentryResolveResult = { ok: true } | { ok: false; status: number; error: string };
+
 export interface SentryReader {
   /** The project's unresolved issues, most recent activity first. Throws when the project cannot be read. */
   issues(target: SentryTarget): Promise<SentryIssue[]>;
@@ -162,6 +165,8 @@ export interface SentryReader {
   issue(id: string): Promise<SentryIssue | null>;
   /** The latest event of an issue; null when there is none to read. */
   latestEvent(id: string): Promise<SentryEvent | null>;
+  /** The one write: resolve an issue. A failure is returned, never thrown, so a look reports it and carries on. */
+  resolve(id: string): Promise<SentryResolveResult>;
   /** What `bb stewards check` reports: the project read with the token, or why not. */
   access(target: SentryTarget): Promise<{ ok: true; name: string } | { ok: false; error: string }>;
 }
@@ -204,6 +209,24 @@ export function createSentryReader(fetchImpl: FetchLike, opts: { apiUrl: string;
         if (notFound(error)) return null;
         throw error;
       }
+    },
+    async resolve(id) {
+      const token = (await opts.token())?.trim() ?? "";
+      if (token === "") return { ok: false, status: 0, error: NO_TOKEN };
+      const path = `/api/0/issues/${encodeURIComponent(id)}/`;
+      let response: Response;
+      try {
+        response = await fetchImpl(`${base}${path}`, {
+          method: "PUT",
+          headers: { authorization: `Bearer ${token}`, accept: "application/json", "content-type": "application/json" },
+          body: JSON.stringify({ status: "resolved" }),
+          signal: AbortSignal.timeout(opts.timeoutMs ?? 20_000),
+        });
+      } catch (error) {
+        return { ok: false, status: 0, error: error instanceof Error ? error.message : String(error) };
+      }
+      if (response.ok) return { ok: true };
+      return { ok: false, status: response.status, error: response.status === 403 ? `Sentry refused the write (403) to PUT ${path}` : `Sentry answered HTTP ${response.status} to PUT ${path}` };
     },
     async access(target) {
       try {
@@ -276,6 +299,28 @@ export const sentrySummary = (issue: SentryIssue): string => `${issue.shortId}: 
 export const recentLine = (issue: SentryIssue): string => `${issue.shortId} · ${issue.title}${issue.culprit === null ? "" : ` · ${issue.culprit}`} · ${issue.count} event${issue.count === 1 ? "" : "s"}, last ${issue.lastSeen ?? "?"}`;
 
 // ---- the look ------------------------------------------------------------------------------
+
+/**
+ * The fingerprint rows the look resolves in Sentry: its ticket is in a
+ * completed state (Done), and the issue Sentry still shows as unresolved.
+ * A canceled ticket (won't fix), an open ticket, a ticket whose state could
+ * not be read, and an issue Sentry has already resolved are all left alone.
+ * `unresolved` is the set of issue ids the look read as unresolved.
+ */
+export function sentryResolveTargets(
+  rows: Iterable<FingerprintRow>,
+  tickets: ReadonlyMap<string, TicketState>,
+  unresolved: ReadonlySet<string>,
+): { fingerprint: string; ticket: string; state: string }[] {
+  const out: { fingerprint: string; ticket: string; state: string }[] = [];
+  for (const row of rows) {
+    if (row.ticketKey === null || !unresolved.has(row.fingerprint)) continue;
+    const state = tickets.get(row.ticketKey) ?? null;
+    if (state === null || state.stateType !== "completed") continue;
+    out.push({ fingerprint: row.fingerprint, ticket: row.ticketKey, state: state.state });
+  }
+  return out;
+}
 
 export const sentryFindingSchema = z.object({
   /** The Sentry issue id. */

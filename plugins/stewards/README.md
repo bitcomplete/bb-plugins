@@ -316,11 +316,15 @@ when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `
 tickets the ops steward labels for a steward itself when it files them).
 A `{ kind: "sentry-project", org, project }` target watches a Sentry
 project with the plugin's **Sentry token** setting (a user auth token with
-`project:read` and `event:read`; `Sentry API` for a self-hosted server),
-rung by bb-gate-hooks the moment an issue is created or regresses and
-backed by the same periodic look; the Sentry issue id is the fingerprint,
-and the wake carries the issue's title, culprit, permalink, counts and
-latest stack trace ([sentry.ts](sentry.ts), DESIGN.md §18).
+`project:read`, `event:read` and `event:write`; `Sentry API` for a
+self-hosted server), rung by bb-gate-hooks the moment an issue is created
+or regresses and backed by the same periodic look; the Sentry issue id is
+the fingerprint, and the wake carries the issue's title, culprit,
+permalink, counts and latest stack trace ([sentry.ts](sentry.ts), DESIGN.md
+§18). With `ops.sentry.resolveOnDone` on (it defaults off), the look
+resolves a mapped issue whose ticket is Done while Sentry still shows it
+unresolved — the plugin's only Sentry write — and notes it in the look;
+`event:write` is the scope that write needs.
 `ops-watch.md` is read only when `ops.targets` lists a k8s namespace or a
 Sentry project.
 

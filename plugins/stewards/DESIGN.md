@@ -933,9 +933,10 @@ and the same fingerprint map; what differs is how the plugin looks and
 what a wake carries.
 
 - **The credential is the plugin's, a secret setting.** `sentryToken` on
-  the stewards plugin holds a Sentry *user auth token* with `project:read`
-  and `event:read`, entered by the user in the plugin's settings and never
-  pasted into a thread; `sentryApiUrl` points at a self-hosted Sentry. The
+  the stewards plugin holds a Sentry *user auth token* with `project:read`,
+  `event:read` and `event:write`, entered by the user in the plugin's
+  settings and never pasted into a thread; `sentryApiUrl` points at a
+  self-hosted Sentry. The
   ticket's decision: no `sentry` plugin, because the source contract has no
   use for one and a new plugin would mean the three plugin lists in the
   `bb-server` Dockerfile. The steward's thread holds no token: it diagnoses
@@ -992,9 +993,20 @@ what a wake carries.
   playbook's "a second event on the same Sentry issue is a comment, never a
   second ticket"); and the requeue, as for every ops binding. A known issue
   seen again, and one no longer seen, are noted quietly.
-- **What the plugin never does with Sentry:** write to it. Resolving,
-  assigning or commenting on a Sentry issue is not in the `may` list, and
-  the token's read scopes are the wall.
+- **The plugin writes exactly one thing in Sentry.** With
+  `ops.sentry.resolveOnDone` on (it defaults off, so a project opts in),
+  the look resolves a mapped issue whose ticket is in a completed state
+  (Done) while Sentry still shows the issue unresolved, with one
+  `PUT /api/0/issues/<id>/` carrying `{ "status": "resolved" }` and one
+  quiet note in the look ("Resolved WEB-12 in Sentry: BB-N is Done").
+  Canceled tickets (won't fix), open tickets and issues Sentry has already
+  resolved are left alone; no last-seen or deploy-timing guard is added,
+  since Sentry's own regression detection reopens the issue if it fires
+  again, and the existing Returned path handles that. The write needs the
+  token's `event:write` scope: a 403 is one note per look naming the
+  missing scope, and the look skips the rest of its resolves and otherwise
+  completes. Assigning or commenting on a Sentry issue is not in the `may`
+  list, and the token's scopes are the wall.
 
 ## 18. Needs you items and one-click actions
 

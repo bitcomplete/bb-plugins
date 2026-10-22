@@ -4152,7 +4152,10 @@ describe("Sentry stewards", () => {
   function fakeSentry() {
     const issues = new Map<string, Record<string, unknown>>();
     const calls: string[] = [];
+    /** The one write: each PUT, with the body it carried. */
+    const writes: Array<{ path: string; body: string | null }> = [];
     let status = 200;
+    let putStatus = 200;
     const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
       const u = new URL(String(url));
       calls.push(u.pathname);
@@ -4162,18 +4165,29 @@ describe("Sentry stewards", () => {
       // The list is the organization's own, as the real one is by its URL; an issue whose permalink names another organization is not in it.
       if (u.pathname === "/api/0/projects/acme/web/issues/") return Response.json([...issues.values()].filter((i) => i.status === "unresolved" && !String(i.permalink).startsWith("https://other.")));
       const issue = /^\/api\/0\/issues\/(\d+)\/$/u.exec(u.pathname);
-      if (issue !== null) return issues.has(issue[1]!) ? Response.json(issues.get(issue[1]!)) : new Response("", { status: 404 });
+      if (issue !== null) {
+        if (init?.method === "PUT") {
+          writes.push({ path: u.pathname, body: typeof init.body === "string" ? init.body : null });
+          if (putStatus !== 200) return new Response("", { status: putStatus });
+          return Response.json({ ...(issues.get(issue[1]!) ?? { id: issue[1] }), status: "resolved" });
+        }
+        return issues.has(issue[1]!) ? Response.json(issues.get(issue[1]!)) : new Response("", { status: 404 });
+      }
       if (/^\/api\/0\/issues\/\d+\/events\/latest\/$/u.test(u.pathname)) return Response.json(sentryEvent);
       return new Response("", { status: 404 });
     }) as typeof fetch;
-    return { issues, calls, fetchImpl, setStatus: (s: number) => (status = s) };
+    return { issues, calls, writes, fetchImpl, setStatus: (s: number) => (status = s), setPutStatus: (s: number) => (putStatus = s) };
   }
 
-  async function watching(options: { token?: string; issues?: Array<Record<string, unknown>>; env?: Record<string, string> } = {}) {
+  async function watching(options: { token?: string; issues?: Array<Record<string, unknown>>; env?: Record<string, string>; resolveOnDone?: boolean } = {}) {
     const sentry = fakeSentry();
     for (const i of options.issues ?? [sentryIssue()]) sentry.issues.set(String(i.id), i);
     const t = await setup({ fetch: sentry.fetchImpl, env: options.env ?? {} }, { sentryToken: options.token ?? "tok-1" });
-    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }], autoAdopt: ["urgent"] } });
+    t.files[PROJECT_FILE] = JSON.stringify({
+      version: 1,
+      linear: { teams: ["ENG"] },
+      ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }], autoAdopt: ["urgent"], ...(options.resolveOnDone === undefined ? {} : { sentry: { resolveOnDone: options.resolveOnDone } }) },
+    });
     t.files[playbookPath("ops-watch")] = OPS_WATCH;
     await t.hooks.sweep();
     await t.flush();
@@ -4306,13 +4320,83 @@ describe("Sentry stewards", () => {
     expect(wakes()).toHaveLength(before + 1);
   });
 
+  it("resolves a mapped issue in Sentry when its ticket is Done and the switch is on", async () => {
+    const { t, sentry, wakes, doorbell, report } = await watching({ resolveOnDone: true });
+    expect((await report([{ fingerprint: ISSUE_ID, ticket: "ENG-50", did: "filed" }])).error).toBe(false);
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    // The issue is still unresolved and firing; the look resolves it and notes that it did.
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "18", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    await doorbell(ISSUE_ID);
+    expect(sentry.writes).toEqual([{ path: `/api/0/issues/${ISSUE_ID}/`, body: '{"status":"resolved"}' }]);
+    expect(wakes().at(-1)).toMatch(/Resolved WEB-12 in Sentry: ENG-50 is Done/u);
+  });
+
+  it("makes no Sentry write when ops.sentry.resolveOnDone is off (the default)", async () => {
+    const { t, sentry, doorbell, report } = await watching();
+    expect((await report([{ fingerprint: ISSUE_ID, ticket: "ENG-50", did: "filed" }])).error).toBe(false);
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "18", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    await doorbell(ISSUE_ID);
+    expect(sentry.writes).toEqual([]);
+  });
+
+  it("leaves a Canceled ticket's issue, an open ticket's and one Sentry already resolved untouched", async () => {
+    const { t, sentry, doorbell, report } = await watching({
+      resolveOnDone: true,
+      issues: [
+        sentryIssue(),
+        sentryIssue({ id: "2", shortId: "WEB-13", title: "Boom", permalink: "https://acme.sentry.io/issues/2/", count: "5" }),
+        sentryIssue({ id: "3", shortId: "WEB-14", title: "Timeout", permalink: "https://acme.sentry.io/issues/3/", count: "2" }),
+      ],
+    });
+    for (const [fingerprint, ticket] of [[ISSUE_ID, "ENG-50"], ["2", "ENG-51"], ["3", "ENG-52"]] as const) {
+      expect((await report([{ fingerprint, ticket, did: "filed" }])).error).toBe(false);
+    }
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Canceled", stateType: "canceled" }));
+    t.entities.set("ENG-51", issue({ id: "ENG-51", key: "ENG-51", state: "In Progress", stateType: "started" }));
+    t.entities.set("ENG-52", issue({ id: "ENG-52", key: "ENG-52", state: "Done", stateType: "completed" }));
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "18", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    sentry.issues.set("2", sentryIssue({ id: "2", shortId: "WEB-13", title: "Boom", permalink: "https://acme.sentry.io/issues/2/", count: "6", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    // Sentry resolved the third one itself before its ticket reached Done.
+    sentry.issues.set("3", sentryIssue({ id: "3", shortId: "WEB-14", title: "Timeout", permalink: "https://acme.sentry.io/issues/3/", status: "resolved" }));
+    await doorbell(ISSUE_ID);
+    await doorbell("2");
+    await doorbell("3");
+    expect(sentry.writes).toEqual([]);
+  });
+
+  it("gives one note naming event:write when a resolve is refused, and skips the rest of the look's resolves", async () => {
+    const { t, sentry, wakes, doorbell, report } = await watching({
+      resolveOnDone: true,
+      issues: [sentryIssue(), sentryIssue({ id: "2", shortId: "WEB-13", title: "Boom", permalink: "https://acme.sentry.io/issues/2/", count: "5" })],
+    });
+    for (const [fingerprint, ticket] of [[ISSUE_ID, "ENG-50"], ["2", "ENG-51"]] as const) {
+      expect((await report([{ fingerprint, ticket, did: "filed" }])).error).toBe(false);
+    }
+    t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", state: "Done", stateType: "completed" }));
+    t.entities.set("ENG-51", issue({ id: "ENG-51", key: "ENG-51", state: "Done", stateType: "completed" }));
+    t.advance(60_000);
+    sentry.issues.set(ISSUE_ID, sentryIssue({ count: "18", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    sentry.issues.set("2", sentryIssue({ id: "2", shortId: "WEB-13", title: "Boom", permalink: "https://acme.sentry.io/issues/2/", count: "6", lastSeen: "2026-10-14T15:02:00Z", substatus: "ongoing" }));
+    sentry.setPutStatus(403);
+    await doorbell(ISSUE_ID);
+    expect(sentry.writes).toHaveLength(1);
+    const wake = wakes().at(-1)!;
+    expect(wake).toMatch(/the token is missing the event:write scope/u);
+    // The look otherwise completes: both Done issues are still in it.
+    expect(wake).toContain("#### 2");
+  });
+
   it("without a token, wakes the steward once to file the provide-secret need, and check says so", async () => {
     const { t, steward, wakes } = await watching({ token: "" });
     expect(steward()).toBeDefined();
     const first = wakes()[0]!;
     expect(first).toMatch(/The plugin has no Sentry token, so it cannot read this project/u);
     expect(first).toMatch(/File one provide-secret need for it with steward_report: variable `SENTRY_TOKEN`, setting `sentryToken`, url https:\/\/sentry\.io\/settings\/account\/api\/auth-tokens\//u);
-    expect(first).toMatch(/project:read and event:read/u);
+    expect(first).toMatch(/project:read and event:read and event:write/u);
     expect(first).toMatch(/Cannot read sentry-project\/acme\/web: no Sentry token is configured/u);
     // Said once: the next looks are quiet until a token appears.
     await t.hooks.sweep();
@@ -4321,7 +4405,7 @@ describe("Sentry stewards", () => {
     expect((await t.list())[0]!.summary).toBeNull();
     const check = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
     expect(check.ok).toBe(false);
-    expect(check.lines).toContain("problem: sentry: no Sentry token is configured: set the Sentry token in the stewards plugin's settings (a user auth token with project:read and event:read)");
+    expect(check.lines).toContain("problem: sentry: no Sentry token is configured: set the Sentry token in the stewards plugin's settings (a user auth token with project:read and event:read and event:write)");
     expect(check.lines.find((l) => l.startsWith("problem: sentry: cannot read the target sentry-project/acme/web"))).toBeDefined();
     expect(check.lines).toContain("sentry: no bb-gate-hooks here (BB_HOOKS_URL is not set), so Sentry issues are seen by the periodic look only");
     expect(t.hooks.sentryLeases()).toEqual([{ kind: "project", id: "acme/web" }]);

@@ -265,9 +265,16 @@ export const projectFileSchema = z
         /** The kubeconfig context kubectl uses on the developer's machine; its current context when left out. */
         context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
         autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
+        /**
+         * The Sentry write, off by default. On, the Sentry look resolves a
+         * mapped issue whose ticket is Done and which Sentry still shows as
+         * unresolved; Sentry's own regression detection reopens it if it fires
+         * again. The token needs `event:write` for it.
+         */
+        sentry: z.object({ resolveOnDone: z.boolean().default(false) }).strict().default({ resolveOnDone: false }),
       })
       .strict()
-      .default({ targets: [], autoAdopt: [] }),
+      .default({ targets: [], autoAdopt: [], sentry: { resolveOnDone: false } }),
     /** The dependency watch: per-severity SLA, the batch window, and what auto-adopts. */
     deps: depsSchema,
   })
