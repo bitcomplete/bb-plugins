@@ -53,7 +53,7 @@ import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult,
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
-import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
+import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
@@ -1823,7 +1823,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         });
 
     /** One look at a Sentry project: the issues new, regressed, rung or still firing since the last look, classified against the fingerprint map. */
-    async function lookAtSentry(b: Binding, target: SentryTarget, playbook: Playbook): Promise<SentryLook> {
+    async function lookAtSentry(b: Binding, target: SentryTarget, playbook: Playbook, resolveOnDone: boolean): Promise<SentryLook> {
       const at = now();
       const key = opsTargetKey(target);
       const since = b.sentryLook !== null && b.sentryLook.error === null ? b.sentryLook.at : at - playbook.requeueDefaultMs;
@@ -1853,6 +1853,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           sightings.map((s) => ({ fingerprint: s.fingerprint, summary: sentrySummary(s.issue) })),
         );
         const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
+        // The one write: with ops.sentry.resolveOnDone on, a mapped ticket
+        // that is Done while its issue is still unresolved is resolved in
+        // Sentry. Canceled and open tickets, and issues Sentry has already
+        // resolved, are left alone. A 403 (the token lacks event:write) is
+        // one note per look, and the rest of the look's resolves are skipped.
+        const unresolvedById = new Map(issues.filter((i) => i.status === "unresolved").map((i) => [i.id, i]));
+        if (resolveOnDone) {
+          let refused = false;
+          for (const t of sentryResolveTargets(rows.values(), tickets, new Set(unresolvedById.keys()))) {
+            if (refused) break;
+            const issue = unresolvedById.get(t.fingerprint)!;
+            const resolved = await reader.resolve(t.fingerprint);
+            if (resolved.ok) notes.push(`Resolved ${issue.shortId} in Sentry: ${t.ticket} is ${t.state}`);
+            else if (resolved.status === 403) {
+              notes.push(`Sentry refused to resolve ${issue.shortId} (403): the token is missing the event:write scope, so the rest of this look's resolves were skipped`);
+              refused = true;
+            } else notes.push(`Could not resolve ${issue.shortId} in Sentry (${resolved.error})`);
+          }
+        }
         const asSightings: Sighting[] = sightings.map((s) => ({ fingerprint: s.fingerprint, workload: s.issue.shortId, pods: [], container: null, signature: s.reasons[0] ?? "ongoing", summary: sentrySummary(s.issue), restarts: 0, events: [], logs: null, previous: false }));
         const classified = classify(asSightings, rows, tickets, at);
         const findings: SentryFinding[] = [];
@@ -1907,7 +1926,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function reconcileSentry(b: Binding, config: ProjectConfig, playbook: Playbook, target: SentryTarget, force: WakeReason | null): Promise<void> {
       const before = b.sentryLook;
-      const look = await lookAtSentry(b, target, playbook);
+      const look = await lookAtSentry(b, target, playbook, config.file.ops.sentry.resolveOnDone);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
       const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
       b = store.patch(b.id, { sentryLook: look, requeueAt });

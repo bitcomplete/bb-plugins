@@ -13,7 +13,7 @@ describe("the project file", () => {
     expect(parsed.value.projectSteward.model).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
     expect(parsed.value.reviews.enabled).toBe(true);
     expect(parsed.value.github.exclude).toEqual([]);
-    expect(parsed.value.ops).toEqual({ targets: [], autoAdopt: [] });
+    expect(parsed.value.ops).toEqual({ targets: [], autoAdopt: [], sentry: { resolveOnDone: false } });
     expect(usesKind(parsed.value, "ops")).toBe(false);
   });
 
@@ -59,7 +59,7 @@ describe("ops in the project file", () => {
   it("takes namespace targets, a team and the priorities to adopt at once", () => {
     const r = file({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "ops", autoAdopt: ["urgent"] });
     if (!r.ok) throw new Error(r.error);
-    expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "OPS", autoAdopt: ["urgent"] });
+    expect(r.value.ops).toEqual({ targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }, { kind: "k8s-namespace", name: "devbox-production" }], team: "OPS", autoAdopt: ["urgent"], sentry: { resolveOnDone: false } });
     expect(usesKind(r.value, "ops")).toBe(true);
     expect(opsTeam(r.value)).toBe("OPS");
   });
@@ -94,6 +94,16 @@ describe("ops in the project file", () => {
     expect(error({ targets: [{ kind: "sentry-project", org: "acme", project: "web api" }] })).toMatch(/ops\.targets\.0\.project: a Sentry slug/u);
     expect(error({ targets: [{ kind: "sentry-project", org: "acme" }] })).toMatch(/ops\.targets\.0\.project/u);
     expect(error({ targets: [{ kind: "sentry-project", org: "acme", project: "web" }, { kind: "sentry-project", org: "ACME", project: "web" }] })).toMatch(/ops\.targets\.1: sentry-project\/acme\/web is listed twice/u);
+  });
+
+  it("takes ops.sentry.resolveOnDone, off by default", () => {
+    const off = file({ targets: [{ kind: "sentry-project", org: "acme", project: "web" }] });
+    if (!off.ok) expect.fail(off.error);
+    expect(off.value.ops.sentry.resolveOnDone).toBe(false);
+    const on = file({ targets: [{ kind: "sentry-project", org: "acme", project: "web" }], sentry: { resolveOnDone: true } });
+    if (!on.ok) expect.fail(on.error);
+    expect(on.value.ops.sentry.resolveOnDone).toBe(true);
+    expect(error({ targets: [], sentry: { resolve: true } })).toMatch(/ops\.sentry/u);
   });
 
   it("refuses what would watch nothing or file where nobody stewards", () => {

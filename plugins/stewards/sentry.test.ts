@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { classify } from "./ops.js";
-import { NO_TOKEN, SentryApiError, createSentryReader, eventOf, issueInOrg, issueOf, issuesOf, recentLine, sentryChanges, sentrySightings, sentrySummary, stackTraceOf, type SentryFinding, type SentryIssue, type SentryLook } from "./sentry.js";
+import { NO_TOKEN, TOKEN_SCOPES, SentryApiError, createSentryReader, eventOf, issueInOrg, issueOf, issuesOf, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, stackTraceOf, type SentryFinding, type SentryIssue, type SentryLook } from "./sentry.js";
 
 const now = Date.parse("2026-10-20T15:00:00Z");
 const since = now - 3_600_000;
@@ -114,6 +114,34 @@ describe("the reader", () => {
     // The token never leaves the header: no call was made without one, and no error names it.
     expect(fetchImpl.mock.calls.every(([, init]) => String((init.headers as Record<string, string>).authorization).startsWith("Bearer "))).toBe(true);
   });
+
+  it("resolves an issue with one PUT and returns a failure rather than throwing", async () => {
+    const calls: Array<{ url: string; method: string; body: string | null }> = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init: RequestInit) => {
+      calls.push({ url: String(url), method: String(init.method), body: typeof init.body === "string" ? init.body : null });
+      if ((init.headers as Record<string, string>).authorization !== "Bearer tok-1") return new Response("", { status: 401 });
+      if (String(url).endsWith("/issues/1/")) return new Response("", { status: 403 });
+      return Response.json({ id: "6081234567", status: "resolved" });
+    });
+    const reader = createSentryReader(fetchImpl, { apiUrl: "https://sentry.io/", token: async () => "tok-1" });
+    expect(await reader.resolve("6081234567")).toEqual({ ok: true });
+    expect(calls.at(-1)).toEqual({ url: "https://sentry.io/api/0/issues/6081234567/", method: "PUT", body: '{"status":"resolved"}' });
+    // A 403 is returned, so the look can name the missing event:write scope and carry on.
+    expect(await reader.resolve("1")).toMatchObject({ ok: false, status: 403 });
+    // A network failure is returned too, never thrown; no token means no request at all.
+    const down = createSentryReader(
+      vi.fn(async () => {
+        throw new Error("socket hang up");
+      }),
+      { apiUrl: "https://sentry.io", token: async () => "tok-1" },
+    );
+    expect(await down.resolve("1")).toEqual({ ok: false, status: 0, error: "socket hang up" });
+    const noRequest = vi.fn();
+    const without = createSentryReader(noRequest as unknown as typeof fetch, { apiUrl: "https://sentry.io", token: async () => null });
+    expect(await without.resolve("1")).toEqual({ ok: false, status: 0, error: NO_TOKEN });
+    expect(noRequest).not.toHaveBeenCalled();
+    expect(TOKEN_SCOPES).toContain("event:write");
+  });
 });
 
 describe("sightings", () => {
@@ -146,6 +174,26 @@ describe("sightings", () => {
     expect(issueInOrg({ permalink: "not a url" }, "acme")).toBe(true);
     // An old regression Sentry still labels regressed is not news again once it was seen before the last look.
     expect(sentrySightings([issue({ ...old, substatus: "regressed", lastSeen: "2026-10-20T12:00:00Z" })], { since }, new Set(), new Set())).toEqual([]);
+  });
+});
+
+describe("what the look resolves in Sentry", () => {
+  const row = (fingerprint: string, ticketKey: string | null) => ({ fingerprint, ticketKey, firstSeenAt: 1, lastCommentedAt: null });
+  const ticket = (stateType: string | null) => ({ state: "Done", stateType });
+
+  it("is the rows whose ticket is completed and whose issue Sentry still shows unresolved", () => {
+    const rows = [row("1", "ENG-1"), row("2", "ENG-2"), row("3", "ENG-3"), row("4", null), row("5", "ENG-5"), row("6", "ENG-6")];
+    const tickets = new Map<string, ReturnType<typeof ticket> | null>([
+      ["ENG-1", ticket("completed")],
+      ["ENG-2", ticket("canceled")],
+      ["ENG-3", ticket("started")],
+      ["ENG-5", ticket("completed")],
+      ["ENG-6", null],
+    ]);
+    expect(sentryResolveTargets(rows, tickets, new Set(["1", "2", "3", "5"])).map((t) => t.fingerprint)).toEqual(["1", "5"]);
+    // Canceled (won't fix) is not completed; an already-resolved issue is not in the unresolved set.
+    expect(sentryResolveTargets([row("2", "ENG-2")], tickets, new Set(["2"]))).toEqual([]);
+    expect(sentryResolveTargets([row("1", "ENG-1")], tickets, new Set())).toEqual([]);
   });
 });
 
