@@ -27,6 +27,15 @@ updates:
     # moves by hand with BB_REF; a newer one typechecks APIs servers lack.
     ignore:
       - dependency-name: "@get-bb/plugin-sdk"
+      # Deliberately held at ^7. The SDK declares a peer of ^7.6.12 on it,
+      # so a plugin that moves to ^9 fails a plain `npm install` with an
+      # ERESOLVE peer conflict (#42 did this; CI and the bb-server image
+      # install with --legacy-peer-deps and never saw it, developers
+      # installing a plugin from a checkout did). The plugins import
+      # better-sqlite3 for its types only and get the database from the
+      # bb host, so the ^7 typings lose nothing. Move it only when the
+      # SDK's peer range moves.
+      - dependency-name: "@types/better-sqlite3"
 
   - package-ecosystem: github-actions
     directory: "/"
