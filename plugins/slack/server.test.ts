@@ -100,12 +100,28 @@ const PROJECTS = [
   { id: "prj-2", name: "Personal", kind: "personal" },
 ];
 
+/** A machine that is on, and the project's checkout on it. */
+const HOSTS = [
+  { id: "host_off", status: "disconnected" },
+  { id: "host_on", status: "connected" },
+];
+const SOURCES = [{ type: "local_path", hostId: "host_on", isDefault: true }];
+/** The project's environments, newest last: a workspace on the machine that is on. */
+const ENVIRONMENTS = [
+  { environmentProviderId: "project-checkout", hostId: "host_on", createdAt: 1, lifecycle: { phase: "active" }, environmentProviderSelection: null },
+  { environmentProviderId: "multi-repo-workspace", hostId: "host_on", createdAt: 2, lifecycle: { phase: "active" }, environmentProviderSelection: { inputs: { repos: ["a"] } } },
+  { environmentProviderId: "git-worktree", hostId: "host_off", createdAt: 3, lifecycle: { phase: "active" }, environmentProviderSelection: null },
+];
+
 async function setup(
   options: {
     hooks?: ReturnType<typeof fakeHooks>;
     token?: string;
     project?: string;
     projects?: typeof PROJECTS;
+    hosts?: Array<{ id: string; status: string }>;
+    sources?: Array<{ type: string; hostId: string; isDefault: boolean }>;
+    environments?: Array<{ environmentProviderId: string | null; hostId: string; createdAt: number; lifecycle: { phase: string }; environmentProviderSelection: { inputs: unknown } | null }>;
     spawn?: () => unknown;
     send?: () => unknown;
     get?: () => unknown;
@@ -118,7 +134,12 @@ async function setup(
     appUrl: APP_URL,
     settings: { token: options.token ?? "", project: options.project ?? "" },
     sdk: {
-      projects: { list: async () => options.projects ?? PROJECTS },
+      projects: {
+        list: async () => options.projects ?? PROJECTS,
+        get: async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId, kind: "standard", sources: options.sources ?? SOURCES }),
+      },
+      hosts: { list: async () => options.hosts ?? HOSTS },
+      environments: { list: async () => options.environments ?? ENVIRONMENTS },
       threads: {
         spawn: async () => options.spawn?.() ?? { id: "thr-1" },
         send: async () => options.send?.() ?? { outcome: "sent" },
@@ -230,7 +251,12 @@ describe("Slack plugin", () => {
     await tick();
     const spawns = s.harness.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
-    expect(spawns[0]![0]).toMatchObject({ projectId: "prj-1", environment: { type: "project-default" } });
+    // The thread runs where the developer's newest environment runs: that
+    // provider, with its inputs, on its machine; never the pod's own host.
+    expect(spawns[0]![0]).toMatchObject({
+      projectId: "prj-1",
+      environment: { type: "provider", environmentProviderId: "multi-repo-workspace", inputs: { repos: ["a"] }, machine: { type: "existing", hostId: "host_on" } },
+    });
     expect(String((spawns[0]![0] as { prompt: string }).prompt)).toContain("session D0123:1712345678.901234");
     expect(s.hooks.statuses.at(-1)).toMatchObject({ session: "D0123:1712345678.901234", body: { connection: "c_1", status: "is thinking…" } });
 
@@ -284,6 +310,38 @@ describe("Slack plugin", () => {
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages).toEqual([]);
+    await s.stop();
+  });
+
+  it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {
+    const s = await live({ environments: [] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
+      environment: { type: "provider", environmentProviderId: "project-checkout", inputs: null, machine: { type: "existing", hostId: "host_on" } },
+    });
+    await s.stop();
+  });
+
+  it("skips a default source whose machine is off for one that is on", async () => {
+    const s = await live({
+      environments: [],
+      sources: [
+        { type: "local_path", hostId: "host_off", isDefault: true },
+        { type: "local_path", hostId: "host_on", isDefault: false },
+      ],
+    });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({ environment: { machine: { hostId: "host_on" } } });
+    await s.stop();
+  });
+
+  it("leaves the environment to bb only when the project has no connected machine", async () => {
+    const s = await live({ environments: [], hosts: [{ id: "host_off", status: "disconnected" }] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({ environment: { type: "project-default" } });
     await s.stop();
   });
 

@@ -111,6 +111,9 @@ function resultPage(title: string, body: string, status: number): Response {
 /** The projects a Slack thread can be started in, in bb's own order. */
 type Project = { id: string; name: string; kind: string };
 
+/** The environment a spawned thread runs in: `threads.spawn`'s `environment`. */
+type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+
 /** The project a Slack conversation goes to: the chosen one, else the first. */
 export function chooseProject(projects: Project[], chosen: string): Project | null {
   const named = chosen.trim();
@@ -209,6 +212,38 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     async function targetProject(): Promise<Project | null> {
       return chooseProject(await projects(), (await settings.get()).project ?? "");
+    }
+
+    /**
+     * Where a Slack conversation's thread runs. A plugin has no composer to
+     * resolve "the project's default", and on a bb-gate server the pod itself
+     * is no machine (the local host daemon is never initialised), so the
+     * thread must name a connected machine. The project's newest environment
+     * says what the developer actually uses: its provider and inputs are
+     * replayed on its machine when that machine is connected. Otherwise the
+     * project's checkout on its default source's machine, and only when the
+     * project has no connected machine at all is the choice left to bb.
+     */
+    async function environmentFor(project: Project): Promise<SpawnEnvironment> {
+      const [hosts, full, environments] = await Promise.all([
+        bb.sdk.hosts.list().catch(() => []),
+        bb.sdk.projects.get({ projectId: project.id }).catch(() => null),
+        bb.sdk.environments.list({ projectId: project.id }).catch(() => []),
+      ]);
+      const connected = new Set(hosts.filter((h) => h.status === "connected").map((h) => h.id));
+      const newest = environments
+        .filter((e) => e.environmentProviderId !== null && e.lifecycle.phase === "active" && connected.has(e.hostId))
+        .sort((a, b) => b.createdAt - a.createdAt)[0];
+      if (newest !== undefined && newest.environmentProviderId !== null) {
+        return { type: "provider", environmentProviderId: newest.environmentProviderId, inputs: newest.environmentProviderSelection?.inputs ?? null, machine: { type: "existing", hostId: newest.hostId } };
+      }
+      const sources = (full?.sources ?? []).filter((source) => source.type === "local_path");
+      const source = sources.find((s) => s.isDefault && connected.has(s.hostId)) ?? sources.find((s) => connected.has(s.hostId));
+      if (source !== undefined) {
+        const providerId = project.kind === "personal" ? "personal-workspace" : "project-checkout";
+        return { type: "provider", environmentProviderId: providerId, inputs: null, machine: { type: "existing", hostId: source.hostId } };
+      }
+      return { type: "project-default" };
     }
 
     // ---- the hooks stream --------------------------------------------------
@@ -350,7 +385,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.");
         return;
       }
-      const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: { type: "project-default" }, prompt: text, title: threadTitle(event) });
+      const thread = await bb.sdk.threads.spawn({ projectId: project.id, environment: await environmentFor(project), prompt: text, title: threadTitle(event) });
       const after = sessions.get(event.session);
       if (after !== undefined) {
         sessions.set(event.session, { ...after, threadId: thread.id, projectId: project.id, handedAt });
