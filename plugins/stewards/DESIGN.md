@@ -106,7 +106,7 @@ These were settled while designing; each changes what gets built.
   Stewards pin nothing and create no sidebar sections. A finished steward
   says so in its last turn and the plugin archives it when the binding ends;
   a later wake brings it back. A steward waiting on someone else is
-  archived between wakes too (§5, "Waiting"). thread-briefs is asked,
+  hidden between wakes too (§5, "Waiting"). thread-briefs is asked,
   through each thread's metadata, not to archive or rename stewards and not
   to group the project steward: between wakes a steward reads done while
   its entity is still open, and its title carries the entity key. (This
@@ -265,26 +265,24 @@ plugins.
 - **Review stewards** end when the pull request is merged or closed.
 - **Waiting.** A wake turn whose report names `other` as the next actor
   (a review posted and the author's move, a ticket in review waiting on
-  reviewers) archives the steward's thread when the turn ends. The binding
-  stays, and the next wake brings the same thread back. It stays in the
-  sidebar while any worker of the binding is in flight — from its spawn
-  until it is stopped, failed or archived, across the idle between its
-  turns — or while a worker's own thread or any thread beneath a worker is
-  still running or pending (a worker whose reviewer is running still has
-  work), or while an escalation is open, while it follows through after a
-  terminal state, when the user is next, and after a turn the user started,
-  which is theirs to read. Workers stay lifecycle-owned: they are the
-  steward's children in bb, and the plugin stops them explicitly only when
-  the binding ends (a detach, or a terminal state without follow-through),
-  never to keep the steward in the sidebar. Archiving a waiting steward
-  would therefore archive its workers and their descendants with it, and
-  the rule above is what keeps that from happening while a worker still
-  has work. When a worker's final message asks a question,
-  the next wake names it (`Worker thr_… asked: …`) ahead of every other
-  change and tells the steward to answer it with `bb thread tell` or
-  escalate before anything else; a worker archived since it asked is
-  brought back on that wake so the tell reaches it, and a worker whose
-  thread is gone is reported as gone, needing a fresh one.
+  reviewers) hides the steward's thread when the turn ends
+  (`threads.update { visibility: "hidden" }`). The binding stays, the thread
+  stays addressable, and the next wake reaches it. It is made visible again
+  when it needs the user — the report puts the user next, an escalation is
+  open, a question is unanswered, or a needs item is on the Stewards page —
+  and stays hidden across "nothing changed" wakes. Hiding does not cascade to
+  the workers, so a worker in flight is no reason to keep the steward
+  visible; the open-escalation rule stays. A report that needs nobody is also
+  marked read (`threads.markRead`), so the unread dot means "needs you";
+  binding end still archives the thread. Workers stay lifecycle-owned: they
+  are the steward's children in bb, and the plugin stops them explicitly only
+  when the binding ends (a detach, or a terminal state without
+  follow-through). When a worker's final message asks a question, the next
+  wake names it (`Worker thr_… asked: …`) ahead of every other change and
+  tells the steward to answer it with `bb thread tell` or escalate before
+  anything else; a worker archived since it asked is brought back on that
+  wake so the tell reaches it, and a worker whose thread is gone is reported
+  as gone, needing a fresh one.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
 
@@ -729,23 +727,29 @@ follow-through: 6h                # how long a terminal binding may be kept open
 - Stewards, the project steward included, are kept out of thread-briefs'
   status sections (`group: false`), where one idle between wakes would read
   done. thread-briefs only moves threads in and out of its own sections, so
-  it leaves the project section alone. The project steward is titled
-  "<project name> project steward".
+  it leaves the project section alone. Workers and reviewers are tagged the
+  same way when the `thread.created` handler files them, so thread-briefs
+  never moves one out of the section or auto-archives it. The project
+  steward is titled "<project name> project steward".
 - Workers are top-level threads, owned by their steward through
   `--lifecycle-owner-thread` and started with `bb thread spawn --project …
-  --lifecycle-owner-thread "$BB_THREAD_ID" …`; the plugin recognizes them by
-  that owner, and still recognizes a worker an older steward made a child by
-  its parent. A worker is no thread's child, so finishing a turn does not
-  wake the steward: its final message arrives in the next wake, which lists
-  finished workers. The sidebar loss is accepted: a worker no longer nests
-  under its steward's row in the project section, because bb's list trees by
-  parent thread and not by lifecycle owner. Whether it should tree by
-  lifecycle owner too is a core question, not worked around here. Workers are
-  not tagged for thread-briefs: their briefs, renames and auto-archiving are
-  thread-briefs' as for any thread.
+  --lifecycle-owner-thread "$BB_THREAD_ID" --section <section id> …`; the
+  plugin recognizes them by that owner, and still recognizes a worker an
+  older steward made a child by its parent. A worker is no thread's child,
+  so finishing a turn does not wake the steward: its final message arrives
+  in the next wake, which lists finished workers. The sidebar loss is
+  accepted: a worker no longer nests under its steward's row in the project
+  section, because bb's list trees by parent thread and not by lifecycle
+  owner. Whether it should tree by lifecycle owner too is a core question,
+  not worked around here. The `thread.created` handler files any unsectioned
+  worker or reviewer into the owner's project section, so a skill that
+  builds its own spawn command lands there too.
 - Whether a steward is waiting on you, waiting on someone else, or done is
-  thread-briefs' judgment from its transcript. Ended bindings are archived
-  by this plugin, not by thread-briefs.
+  thread-briefs' judgment from its transcript. A steward waiting on someone
+  else is hidden (`threads.update { visibility: "hidden" }`), not archived,
+  so it leaves the sidebar but stays addressable; a wake that needs you makes
+  it visible again, and the unread dot is cleared after a report that needs
+  nobody. Ended bindings are archived by this plugin, not by thread-briefs.
 
 ## 16. Architecture
 
@@ -885,7 +889,7 @@ goes wrong there into Linear tickets for the project steward to adopt.
     ticket linking the old one.
   Every `requeue-default` the steward takes a turn whatever the look
   found; a healthy one is cheap, a wake that says "all healthy" and a
-  report with actor `other`, which archives the thread until the next
+  report with actor `other`, which hides the thread until the next
   look. A sweep's look between requeues wakes it only for a new or
   returned problem.
 - **Triage is the project steward's.** The steward files one ticket per new

@@ -176,8 +176,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   brings it back. If someone moves the entity out of its terminal state
   before then, the ending is taken back and you carry on.
 - **Waiting.** Report `actor: other` only when someone else really is next.
-  The plugin then archives your thread after a wake turn, unless a worker
-  runs or an escalation is open, and the next wake brings it back.
+  The plugin then hides your thread after a wake turn, unless an escalation,
+  a question or a needs item is open; the next wake still reaches it, and a
+  wake that needs you makes it visible again. A report that needs nobody is
+  also marked read, so the sidebar's unread dot means "needs you".
 
 ## If you are an ops steward
 
