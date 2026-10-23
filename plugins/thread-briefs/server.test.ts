@@ -811,6 +811,8 @@ describe("the auto-archive sweep", () => {
     threads: ReturnType<typeof makeThreadResponse>[];
     doneArchiveHours?: number;
     listPluginMetadata?: ReturnType<typeof metadataFrom>;
+    /** Fail every `threads.get`, as a transient read error would. */
+    getFails?: boolean;
   }) {
     globalThis.fetch = fakeCompletion(SUMMARY) as unknown as typeof globalThis.fetch;
     const archived: string[] = [];
@@ -825,8 +827,10 @@ describe("the auto-archive sweep", () => {
       sdk: {
         threads: {
           list: async () => options.threads,
-          get: async ({ threadId }) =>
-            options.threads.find((entry) => entry.id === threadId) ?? thread,
+          get: async ({ threadId }) => {
+            if (options.getFails === true) throw new Error("503");
+            return options.threads.find((entry) => entry.id === threadId) ?? thread;
+          },
           archive: async ({ threadId }) => {
             archived.push(threadId);
             return { id: threadId, archivedAt: Date.now() };
@@ -956,6 +960,24 @@ describe("the auto-archive sweep", () => {
     });
     await plugin(bb);
     await seedDoneBrief(bb, "thr_steward");
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("treats a failed owner lookup as unknown, keeping a worker rather than archiving it", async () => {
+    // A transient `threads.get` failure while resolving the chain must not be
+    // cached as "no plugin": that would read as opted in and let the sweep
+    // archive a tagged worker, cascading to its reviewer (BB-14).
+    const { bb, harness, archived } = archiveHost({
+      threads: [coldThread("thr_worker", 9, { lifecycleOwnerThreadId: "thr_missing" })],
+      listPluginMetadata: metadataFrom({}),
+      getFails: true,
+    });
+    await plugin(bb);
     await seedDoneBrief(bb, "thr_worker");
 
     await harness.behavior.runSchedule("archive-done");
@@ -2005,13 +2027,23 @@ describe("renaming threads", () => {
     update?: (args: { threadId: string; title?: string | null }) => void;
     /** The spawning plugin's namespace on the thread, when a plugin spawned it. */
     originMetadata?: Record<string, unknown>;
+    /** The steward that owns a CLI-spawned worker: its metadata under the stewards namespace. */
+    ownerMetadata?: Record<string, unknown>;
+    /** The CLI-spawned worker's own opt-out under the owning plugin's namespace. */
+    workerMetadata?: Record<string, unknown>;
   }) {
+    const ownerId = "thr_steward";
+    const chain = options.ownerMetadata !== undefined;
+    const ownerThread = chain
+      ? makeThreadResponse({ id: ownerId, title: "Steward", visibility: "visible", status: "idle", originPluginId: "stewards" })
+      : null;
     const live = makeThreadResponse({
       id: "thr_1",
       title: options.title === undefined ? "Build me a thing that does..." : options.title,
       visibility: "visible",
       status: "idle",
-      originPluginId: options.originMetadata === undefined ? null : "stewards",
+      originPluginId: options.originMetadata === undefined && !chain ? null : "stewards",
+      ...(chain ? { lifecycleOwnerThreadId: ownerId } : {}),
     });
     const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => {
       options.onRequest?.();
@@ -2036,6 +2068,10 @@ describe("renaming threads", () => {
     // Mutable, so a test can change what the plugin asks for between passes.
     const metadata: Record<string, Record<string, unknown>> =
       options.originMetadata === undefined ? {} : { thr_1: options.originMetadata };
+    if (chain) {
+      metadata[ownerId] = options.ownerMetadata!;
+      if (options.workerMetadata !== undefined) metadata.thr_1 = options.workerMetadata;
+    }
     // Advanced per summary so a test can wait for *that* summary's write,
     // rather than seeing the previous one's brief and racing ahead.
     let seq = 12;
@@ -2050,8 +2086,9 @@ describe("renaming threads", () => {
       },
       sdk: {
         threads: {
-          get: async () => ({ ...live }),
-          list: async () => [live],
+          get: async ({ threadId }: { threadId: string }) =>
+            threadId === ownerId && ownerThread !== null ? { ...ownerThread } : { ...live },
+          list: async () => (ownerThread === null ? [live] : [live, ownerThread]),
           update: async (args) => {
             options.update?.(args as { threadId: string; title?: string | null });
             if (typeof args.title === "string") live.title = args.title;
@@ -2180,6 +2217,22 @@ describe("renaming threads", () => {
       signals: { autoArchive: boolean }[];
     };
     expect(signals[0]?.autoArchive).toBe(false);
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("keeps the title of a CLI-spawned worker whose steward asked to keep it", async () => {
+    const current = renameHost({
+      title: "ENG-42: Fix the flaky test",
+      ownerMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
+      workerMetadata: { role: "worker", threadBriefs: { rename: false, archive: false } },
+    });
+    await plugin(current.bb);
+    await summarize(current);
+
+    // The worker has no origin plugin of its own; the opt-out is found through
+    // its lifecycle owner and still keeps its title.
+    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
+    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
     await current.harness.lifecycle.dispose();
   });
 

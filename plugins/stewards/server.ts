@@ -978,6 +978,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The section id `projectSection` last resolved for a project, including a
+     * null when it has none. The per-turn brief is synchronous and cannot call
+     * `projectSection`, so it reads this instead of the store row, whose
+     * tombstone for a section deleted by hand still holds the dead id.
+     */
+    const sectionCache = new Map<string, string | null>();
+
+    /**
      * The sidebar section a project's stewards are put in, named after the
      * project; null when there is none to use. The one this plugin made is
      * remembered by id, so a rename by hand sticks. One deleted by hand stays
@@ -1008,6 +1016,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.info(`stewards: made the sidebar section ${JSON.stringify(name)} for ${projectId} (${created.id})`);
         sectionId = created.id;
       });
+      sectionCache.set(projectId, sectionId);
       return sectionId;
     }
 
@@ -3836,8 +3845,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const hostId = cachedProjectHost(b.projectId);
       const flags = hostId === undefined ? null : [environmentFlags(hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
+      const cachedSection = sectionCache.get(b.projectId);
+      const sectionId = cachedSection === undefined ? store.project(b.projectId).sectionId : cachedSection;
       return formatBrief(
-        { binding: b, playbook, gate: briefGate(b, playbook), workerFlags: flags, sectionId: store.project(b.projectId).sectionId, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
+        { binding: b, playbook, gate: briefGate(b, playbook), workerFlags: flags, sectionId, escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) },
         BRIEF_MAX_CHARS,
       );
     });

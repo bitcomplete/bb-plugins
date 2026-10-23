@@ -12,10 +12,12 @@
  * ```
  *
  * in its own metadata namespace when it spawns the thread, and this plugin
- * reads it back from `thread.originPluginId`'s namespace. bb attributes a
- * thread seeded with metadata to the plugin that seeded it, so the origin is
- * always the namespace to look in, and this plugin never has to know which
- * plugins exist.
+ * reads it back from the namespace of the plugin that owns the thread. For a
+ * thread a plugin spawned that is `thread.originPluginId`. A worker or
+ * reviewer a long-lived thread spawns through the CLI has no origin plugin of
+ * its own, so the owning plugin is the nearest ancestor's along the
+ * `lifecycleOwnerThreadId` chain, and the tag still lives in that plugin's
+ * namespace. This plugin never has to know which plugins exist.
  *
  * Each key is an opt-out: `false` turns that behaviour off for the thread,
  * and anything else — absent, `true`, a typo — leaves it on. The brief itself

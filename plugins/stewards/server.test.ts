@@ -4691,4 +4691,22 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
     expect(marks()).toHaveLength(before);
   });
+
+  it("does not print a section id deleted by hand in the injected brief", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
+    expect(instructions()).toContain("--section sec_1");
+
+    // The user deletes the section by hand. A wake resolves it to null, and the
+    // synchronous brief must not fall back to the dead id in the store row.
+    t.sections.splice(0);
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    await t.flush();
+    expect(t.hooks.store.project("p1").sectionId).toBe("sec_1");
+    expect(instructions()).not.toContain("--section");
+  });
 });

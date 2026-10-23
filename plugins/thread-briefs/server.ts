@@ -438,9 +438,10 @@ export default async function plugin(bb: BbPluginApi) {
      * ancestor's through the lifecycle-owner chain. A thread spawned by the
      * CLI has no origin plugin of its own, so this is how its steward's
      * namespace — where the stewards plugin tags its workers and reviewers —
-     * is found.
+     * is found. undefined when a read failed: the caller treats the thread as
+     * unknown for this pass rather than opted in, and nothing is cached.
      */
-    const ownerPlugin = async (threadId: string, depth = 0): Promise<string | null> => {
+    const ownerPlugin = async (threadId: string, depth = 0): Promise<string | null | undefined> => {
       const known = pluginOwner.get(threadId);
       if (known !== undefined) return known;
       if (depth > 10) return null;
@@ -456,24 +457,30 @@ export default async function plugin(bb: BbPluginApi) {
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        pluginOwner.set(threadId, null);
-        return null;
+        return undefined;
       }
-      const direct = info.originPluginId ?? null;
-      const found =
-        direct ??
-        (info.lifecycleOwnerThreadId == null
-          ? null
-          : await ownerPlugin(info.lifecycleOwnerThreadId, depth + 1));
+      let found: string | null;
+      if (info.originPluginId != null) found = info.originPluginId;
+      else if (info.lifecycleOwnerThreadId == null) found = null;
+      else {
+        const inherited = await ownerPlugin(info.lifecycleOwnerThreadId, depth + 1);
+        if (inherited === undefined) return undefined;
+        found = inherited;
+      }
       pluginOwner.set(threadId, found);
       return found;
     };
     for (const thread of threads) {
-      const pluginId =
-        thread.originPluginId ??
-        (thread.lifecycleOwnerThreadId == null
-          ? null
-          : await ownerPlugin(thread.lifecycleOwnerThreadId));
+      let pluginId: string | null | undefined;
+      if (thread.originPluginId !== null) pluginId = thread.originPluginId;
+      else if (thread.lifecycleOwnerThreadId == null) pluginId = null;
+      else pluginId = await ownerPlugin(thread.lifecycleOwnerThreadId);
+      if (pluginId === undefined) {
+        // A read failed: unknown, which every caller treats fail-safe (see
+        // `FULL_OPT_OUT`), rather than opted in.
+        result.set(thread.id, null);
+        continue;
+      }
       if (pluginId === null) {
         result.set(thread.id, NO_OPT_OUT);
         continue;
