@@ -209,7 +209,12 @@ function world() {
             ? usage.has(threadId)
               ? [{ id: "u", seq: 1, threadId, createdAt: now, scope: "thread", type: "thread/contextWindowUsage/updated", data: { contextWindowUsage: { usedTokens: usage.get(threadId), modelContextWindow: 1_000_000, estimated: true } } }]
               : []
-            : userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
+            : types?.includes("client/turn/requested")
+              ? // The spawn's execution as the server resolved it; absent while the thread is still pending its first turn.
+                threads.get(threadId)?.model === undefined
+                ? []
+                : [{ id: "t", seq: 1, threadId, createdAt: now, scope: "thread", type: "client/turn/requested", data: { execution: { model: threads.get(threadId)!.model, reasoningLevel: threads.get(threadId)!.reasoningLevel ?? "none", permissionMode: "auto", serviceTier: "default", source: "client/turn/requested" } } }]
+              : userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
       },
     },
   };
@@ -4561,6 +4566,37 @@ describe("steward invariants on every turn (BB-24)", () => {
     await t.created("thr_ok", steward, "ENG-12: Implement");
     expect(stopped).not.toContain("thr_ok");
     expect(t.hooks.store.worker("thr_ok")!.status).not.toBe("stopped");
+  });
+
+  it("checks a still-pending worker's model when it goes active, not against the project's defaults", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const stopped = () => t.harness.sdk.callsTo("threads.stop").map(([args]) => (args as { threadId: string }).threadId);
+    const active = async (id: string) => {
+      await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id, parentThreadId: steward, lifecycleOwnerThreadId: steward, status: "active", originPluginId: null, providerId: "claude-code" }) });
+      await t.flush();
+    };
+
+    // No first turn yet (the spawn is queued under the concurrency limit): nothing to read, so nothing is stopped.
+    await t.created("thr_wait", steward, "ENG-12: Implement", { model: null, reasoningLevel: null });
+    await t.created("thr_fine", steward, "ENG-12: Implement", { model: null, reasoningLevel: null });
+    expect(stopped()).toEqual([]);
+
+    // The first turn is dispatched with the wrong model: stopped then.
+    Object.assign(t.threads.get("thr_wait")!, { model: "claude-fable-5-1", reasoningLevel: "medium" });
+    await active("thr_wait");
+    expect(stopped()).toEqual(["thr_wait"]);
+    expect(t.hooks.store.worker("thr_wait")!.result).toContain("wrong model claude-fable-5-1 instead of claude-opus-5-5, reasoning level medium instead of high");
+
+    // Dispatched with the playbook's model: left alone, and not checked again on later turns.
+    Object.assign(t.threads.get("thr_fine")!, { model: "claude-opus-5-5", reasoningLevel: "high" });
+    await active("thr_fine");
+    Object.assign(t.threads.get("thr_fine")!, { model: "claude-fable-5-1" });
+    await active("thr_fine");
+    expect(stopped()).toEqual(["thr_wait"]);
+    expect(t.hooks.store.worker("thr_fine")!.status).toBe("running");
   });
 
   it("says the gate is not passed once an approved spec changes, in the brief and the injected context", async () => {
