@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -230,6 +230,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     db.exec(`INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, status, branch, merge_sha, note, created_at, updated_at, resolved_at)
              VALUES ('lsn_old', 'p1', 'bnd_1', NULL, 'AGENTS.md', 'An old rule.', 'boundary', 'pending', 'refs/heads/guidance-thr_x', NULL, 'kept', 1000, 1100, NULL)`);
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
+    for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.lesson("lsn_old")).toMatchObject({
       id: "lsn_old",
@@ -251,6 +252,33 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     // The old columns are all still there; nothing was dropped or renamed.
     const columns = (db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name);
     expect(columns).toEqual(expect.arrayContaining(["id", "project_id", "binding_id", "escalation_id", "file", "text", "scope", "status", "branch", "merge_sha", "note", "created_at", "updated_at", "resolved_at", "hits", "corrections", "last_cited_at", "cited_bindings"]));
+  });
+});
+
+describe("a worker's pending model check", () => {
+  it("is kept on the row, so a store reopened after a restart still sees it", () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS) db.exec(sql);
+    const first = createStore(db, () => 1000);
+    const b = first.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    first.addWorker("thr_w1", b.id, "ENG-12: Implement");
+    expect(first.worker("thr_w1")!.modelCheckPending).toBe(false);
+    first.setWorkerModelCheckPending("thr_w1", true);
+
+    const reopened = createStore(db, () => 2000);
+    expect(reopened.worker("thr_w1")!.modelCheckPending).toBe(true);
+    reopened.setWorkerModelCheckPending("thr_w1", false);
+    expect(reopened.worker("thr_w1")!.modelCheckPending).toBe(false);
+  });
+
+  it("reads workers from before the column existed as not pending", () => {
+    const db = new Database(":memory:");
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS]) db.exec(sql);
+    db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
+             VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
+    db.exec(`INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES ('thr_old', 'bnd_1', 'ENG-12: Implement', 'running', 1000)`);
+    for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
+    expect(createStore(db, () => 2000).worker("thr_old")!.modelCheckPending).toBe(false);
   });
 });
 
@@ -282,6 +310,7 @@ describe("the escalation-chain migration (BB-30)", () => {
              VALUES ('need_approve', 'bnd_1', 'approve-pr', 'https://github.com/acme/web/pull/7', 'Approve the PR.', NULL, '{}', 'plugin', 'open', NULL, 1900, NULL)`);
     for (const sql of CHAIN_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
+    for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }
