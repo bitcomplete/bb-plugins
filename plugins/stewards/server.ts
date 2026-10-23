@@ -2861,9 +2861,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * project's remembered defaults for the provider, the owner's own picker
      * choices, and call a correct spawn wrong. So a worker whose first turn
      * has not been dispatched is checked for provider and environment now and
-     * for model and reasoning level when it goes active.
+     * for model and reasoning level when it goes active. That wait is kept on
+     * the worker row, so a server restart in between does not lose it.
      */
-    const workerModelCheckPending = new Set<string>();
     async function workerExecution(threadId: string): Promise<{ model: string | null; reasoningLevel: string | null } | null> {
       const [row] = await bb.sdk.threads.events.list({ threadId, types: ["client/turn/requested"], order: "asc", limit: "1" });
       if (row === undefined) return null;
@@ -2907,10 +2907,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (actualReasoning !== null && expected.reasoningLevel !== null && actualReasoning !== expected.reasoningLevel) problems.push(`reasoning level ${actualReasoning} instead of ${expected.reasoningLevel}`);
       if (actualEnv !== undefined && expectedEnv !== null && actualEnv !== expectedEnv) problems.push(`environment provider ${actualEnv ?? "(none)"} instead of ${expectedEnv}`);
       if (problems.length === 0) {
-        if (!firstTurnDispatched && (expected.model !== null || expected.reasoningLevel !== null)) workerModelCheckPending.add(thread.id);
+        if (!firstTurnDispatched && (expected.model !== null || expected.reasoningLevel !== null)) store.setWorkerModelCheckPending(thread.id, true);
         return;
       }
-      workerModelCheckPending.delete(thread.id);
+      store.setWorkerModelCheckPending(thread.id, false);
       const flags = [environmentFlags(hostId), workerFlags(expected)].filter((f) => f !== "").join(" ");
       store.setWorker(thread.id, "stopped", `Started with the wrong ${problems.join(", ")}; stopped.`);
       await quietly(`stop mis-spawned worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
@@ -3163,7 +3163,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (worker === null) return;
       if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
       // The first turn is dispatched now, so the spawn's model can be read.
-      if (workerModelCheckPending.delete(thread.id) && worker.status !== "stopped") {
+      if (worker.modelCheckPending && worker.status !== "stopped") {
+        store.setWorkerModelCheckPending(thread.id, false);
         const owner = store.binding(worker.bindingId);
         if (owner !== null && owner.endedAt === null) await validateWorkerSpawn(thread, owner);
       }
@@ -3185,14 +3186,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.archived", ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+      if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
       // An archived requester can no longer import; drop its binding so the
       // page's next Provide spawns a fresh one.
       if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
     });
     bb.events.on("thread.deleted", ({ thread }) => {
-      workerModelCheckPending.delete(thread.id);
       const worker = store.worker(thread.id);
       if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+      if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
       const b = store.byThread(thread.id);
       if (b === null || b.endedAt !== null) return;
       store.patch(b.id, { threadId: null, endedAt: now(), endReason: "deleted", manualDetach: true, awaitingReport: false, ending: null });

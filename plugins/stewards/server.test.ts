@@ -166,10 +166,14 @@ function world() {
           ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null } }),
         };
       },
+      // What the server answers: the thread's own execution once a turn ran, and before that the
+      // project's remembered picker defaults, which a spawn with other flags does not change.
+      // The plugin must not read a pending worker's model from here.
       defaultExecutionOptions: async ({ threadId }: { threadId: string }) => {
         const t = threads.get(threadId);
-        if (t === undefined || t.model === undefined) return null;
-        return { model: t.model, reasoningLevel: t.reasoningLevel ?? "none", serviceTier: "standard", permissionMode: "default", source: "explicit" };
+        if (t === undefined) return null;
+        if (t.model === undefined) return { model: "claude-fable-5-1", reasoningLevel: "medium", serviceTier: "default", permissionMode: "auto", source: "client/turn/requested" };
+        return { model: t.model, reasoningLevel: t.reasoningLevel ?? "none", serviceTier: "default", permissionMode: "auto", source: "client/turn/requested" };
       },
       list: async ({ sectionId, archived, parentThreadId }: { sectionId?: string; archived?: boolean; parentThreadId?: string }) =>
         [...threads.entries()]
@@ -4579,10 +4583,13 @@ describe("steward invariants on every turn (BB-24)", () => {
       await t.flush();
     };
 
-    // No first turn yet (the spawn is queued under the concurrency limit): nothing to read, so nothing is stopped.
+    // No first turn yet (the spawn is queued under the concurrency limit): nothing to read, so nothing is
+    // stopped, whatever defaultExecutionOptions says, and the wait is on the worker row for a restart.
     await t.created("thr_wait", steward, "ENG-12: Implement", { model: null, reasoningLevel: null });
     await t.created("thr_fine", steward, "ENG-12: Implement", { model: null, reasoningLevel: null });
     expect(stopped()).toEqual([]);
+    expect(t.hooks.store.worker("thr_wait")!.modelCheckPending).toBe(true);
+    expect(t.hooks.store.worker("thr_fine")!.modelCheckPending).toBe(true);
 
     // The first turn is dispatched with the wrong model: stopped then.
     Object.assign(t.threads.get("thr_wait")!, { model: "claude-fable-5-1", reasoningLevel: "medium" });
@@ -4597,6 +4604,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     await active("thr_fine");
     expect(stopped()).toEqual(["thr_wait"]);
     expect(t.hooks.store.worker("thr_fine")!.status).toBe("running");
+    expect(t.hooks.store.worker("thr_fine")!.modelCheckPending).toBe(false);
   });
 
   it("says the gate is not passed once an approved spec changes, in the brief and the injected context", async () => {

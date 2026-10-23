@@ -102,7 +102,7 @@ describe("a steward's wake", () => {
   it("names a worker's question ahead of every other change, with how to answer", () => {
     const wake = formatWake(
       wakeInput({
-        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T }],
+        workers: [{ threadId: "thr_w1", bindingId: "b1", title: "Implement", status: "finished", result: "Should I bring the reviewer back?", startedAt: T, endedAt: T, modelCheckPending: false }],
         workerQuestions: [{ threadId: "thr_w1", question: "Should I bring the reviewer back?", state: "live" }],
         changes: ["1 new comment from Sam"],
       }),

@@ -335,7 +335,14 @@ export const LESSON_COUNTER_MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN corrections_counted INTEGER NOT NULL DEFAULT 0`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS];
+export const WORKER_CHECK_MIGRATIONS = [
+  // 1 while a worker's model and reasoning level are still to be checked:
+  // its first turn had not been dispatched when it was created, so the check
+  // waits for it to go active, and must survive a server restart in between.
+  `ALTER TABLE workers ADD COLUMN model_check_pending INTEGER NOT NULL DEFAULT 0`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -752,7 +759,7 @@ export type Lesson = {
 };
 
 export type WorkerStatus = "running" | "finished" | "failed" | "stopped";
-export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null };
+export type Worker = { threadId: string; bindingId: string; title: string; status: WorkerStatus; result: string | null; startedAt: number; endedAt: number | null; modelCheckPending: boolean };
 
 /** The requester thread the plugin spawned for an open provide-secret need (BB-22). */
 export type SecretRequester = { threadId: string; needId: string; createdAt: number };
@@ -845,6 +852,7 @@ export function createStore(db: Database.Database, now: () => number) {
   const workersFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM workers WHERE binding_id = ? ORDER BY started_at");
   const spawnsSince = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM workers WHERE binding_id = ? AND started_at >= ?");
   const setWorker = db.prepare("UPDATE workers SET status = ?, result = ?, ended_at = ? WHERE thread_id = ?");
+  const setWorkerModelCheckPending = db.prepare("UPDATE workers SET model_check_pending = ? WHERE thread_id = ?");
   const insertSecretRequester = db.prepare("INSERT OR REPLACE INTO secret_requesters (thread_id, need_id, created_at) VALUES (?, ?, ?)");
   const getSecretRequester = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE thread_id = ?");
   const getSecretRequesterForNeed = db.prepare<[string], Record<string, unknown>>("SELECT * FROM secret_requesters WHERE need_id = ? ORDER BY created_at DESC LIMIT 1");
@@ -980,6 +988,7 @@ export function createStore(db: Database.Database, now: () => number) {
     result: r.result === null ? null : String(r.result),
     startedAt: Number(r.started_at),
     endedAt: r.ended_at === null ? null : Number(r.ended_at),
+    modelCheckPending: Number(r.model_check_pending ?? 0) === 1,
   });
   const toSecretRequester = (r: Record<string, unknown>): SecretRequester => ({
     threadId: String(r.thread_id),
@@ -1446,6 +1455,10 @@ export function createStore(db: Database.Database, now: () => number) {
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+    },
+    /** Whether the worker's model is still to be checked when its first turn is dispatched. */
+    setWorkerModelCheckPending(threadId: string, pending: boolean): void {
+      setWorkerModelCheckPending.run(pending ? 1 : 0, threadId);
     },
 
     // provide-secret requester threads (BB-22)
