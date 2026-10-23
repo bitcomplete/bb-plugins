@@ -401,27 +401,86 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------- opt-outs
 
   /**
-   * Each thread's opt-out, read from the namespace of the plugin that spawned
-   * it: see `optout.ts`.
+   * Thread id → the plugin that owns it, memoized across passes. A thread's
+   * origin plugin and its lifecycle-owner chain never change, and a hidden
+   * steward is absent from some batches, so caching saves a read per worker.
+   */
+  const pluginOwner = new Map<string, string | null>();
+
+  /**
+   * Each thread's opt-out, read from the namespace of the plugin that owns
+   * it: its own origin plugin, or the nearest ancestor's through the
+   * lifecycle-owner chain when it has none (a worker or reviewer spawned by
+   * the CLI). See `optout.ts`.
    *
-   * A thread no plugin spawned costs nothing. The rest are batched per
-   * spawning plugin, so a pass over the whole sidebar is one request per
-   * plugin rather than one per thread. null means that namespace could not be
-   * read, and each caller decides what not knowing means for it.
+   * A thread no plugin owns costs nothing. The rest are batched per plugin,
+   * so a pass over the whole sidebar is one request per plugin rather than one
+   * per thread. null means that namespace could not be read, and each caller
+   * decides what not knowing means for it.
    */
   async function optOutsFor(
-    threads: readonly { id: string; originPluginId: string | null }[],
+    threads: readonly {
+      id: string;
+      originPluginId: string | null;
+      lifecycleOwnerThreadId?: string | null;
+    }[],
   ): Promise<Map<string, OptOut | null>> {
     const result = new Map<string, OptOut | null>();
     const byPlugin = new Map<string, string[]>();
+    // A thread's owning plugin never changes, so the answer is kept across
+    // passes: a hidden steward is absent from some batches, and its workers
+    // would otherwise be re-read every reconcile.
     for (const thread of threads) {
-      if (thread.originPluginId === null) {
+      if (thread.originPluginId !== null) pluginOwner.set(thread.id, thread.originPluginId);
+    }
+    /**
+     * The plugin that owns a thread: its origin plugin, or the nearest
+     * ancestor's through the lifecycle-owner chain. A thread spawned by the
+     * CLI has no origin plugin of its own, so this is how its steward's
+     * namespace — where the stewards plugin tags its workers and reviewers —
+     * is found.
+     */
+    const ownerPlugin = async (threadId: string, depth = 0): Promise<string | null> => {
+      const known = pluginOwner.get(threadId);
+      if (known !== undefined) return known;
+      if (depth > 10) return null;
+      let info: { originPluginId?: string | null; lifecycleOwnerThreadId?: string | null };
+      try {
+        info = (await bb.sdk.threads.get({ threadId })) as {
+          originPluginId?: string | null;
+          lifecycleOwnerThreadId?: string | null;
+        };
+      } catch (error) {
+        bb.log.warn(
+          `could not read thread ${threadId} to find its owning plugin: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        pluginOwner.set(threadId, null);
+        return null;
+      }
+      const direct = info.originPluginId ?? null;
+      const found =
+        direct ??
+        (info.lifecycleOwnerThreadId == null
+          ? null
+          : await ownerPlugin(info.lifecycleOwnerThreadId, depth + 1));
+      pluginOwner.set(threadId, found);
+      return found;
+    };
+    for (const thread of threads) {
+      const pluginId =
+        thread.originPluginId ??
+        (thread.lifecycleOwnerThreadId == null
+          ? null
+          : await ownerPlugin(thread.lifecycleOwnerThreadId));
+      if (pluginId === null) {
         result.set(thread.id, NO_OPT_OUT);
         continue;
       }
-      const ids = byPlugin.get(thread.originPluginId) ?? [];
+      const ids = byPlugin.get(pluginId) ?? [];
       ids.push(thread.id);
-      byPlugin.set(thread.originPluginId, ids);
+      byPlugin.set(pluginId, ids);
     }
     for (const [pluginId, ids] of byPlugin) {
       for (let start = 0; start < ids.length; start += METADATA_PAGE_SIZE) {
@@ -748,9 +807,15 @@ export default async function plugin(bb: BbPluginApi) {
    * written, and the sidebar is told once.
    */
   async function syncStoredOptOuts(
-    threads: readonly { id: string; originPluginId: string | null }[],
+    threads: readonly {
+      id: string;
+      originPluginId: string | null;
+      lifecycleOwnerThreadId?: string | null;
+    }[],
   ): Promise<void> {
-    const fromPlugins = threads.filter((thread) => thread.originPluginId !== null);
+    const fromPlugins = threads.filter(
+      (thread) => thread.originPluginId !== null || thread.lifecycleOwnerThreadId != null,
+    );
     if (fromPlugins.length === 0) return;
     let changed = 0;
     for (const [threadId, optOut] of await optOutsFor(fromPlugins)) {
@@ -1064,9 +1129,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Visible, live threads, in pages, capped. */
   const listGroupableThreads = async (): Promise<
-    (SectionedThread & { originPluginId: string | null })[]
+    (SectionedThread & { originPluginId: string | null; lifecycleOwnerThreadId: string | null })[]
   > => {
-    const threads: (SectionedThread & { originPluginId: string | null })[] = [];
+    const threads: (SectionedThread & {
+      originPluginId: string | null;
+      lifecycleOwnerThreadId: string | null;
+    })[] = [];
     for (let offset = 0; offset < SECTION_THREAD_LIMIT; offset += SECTION_PAGE_SIZE) {
       const page = await bb.sdk.threads.list({
         limit: SECTION_PAGE_SIZE,
@@ -1081,6 +1149,7 @@ export default async function plugin(bb: BbPluginApi) {
           id: thread.id,
           sectionId: thread.sectionId ?? null,
           originPluginId: thread.originPluginId,
+          lifecycleOwnerThreadId: thread.lifecycleOwnerThreadId,
         });
       }
       if (page.length < SECTION_PAGE_SIZE) break;

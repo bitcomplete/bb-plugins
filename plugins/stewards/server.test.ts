@@ -28,7 +28,7 @@ function world() {
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
-  const threads = new Map<string, { status: string; archivedAt: number | null; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
   const fileContents = new Map<string, string>();
@@ -142,6 +142,7 @@ function world() {
         threads.set(id, {
           status: "idle",
           archivedAt: null,
+          visibility: "visible",
           title: (args.title as string | undefined) ?? null,
           sectionId: (args.sectionId as string | undefined) ?? null,
           ...(environment?.machine?.hostId === undefined ? {} : { hostId: environment.machine.hostId }),
@@ -162,7 +163,7 @@ function world() {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
         return {
-          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
+          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
           ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null } }),
         };
       },
@@ -189,13 +190,15 @@ function world() {
         return {};
       },
       stop: async () => ({}),
-      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null; sectionId?: string | null }) => {
+      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null; sectionId?: string | null; visibility?: string }) => {
         const t = threads.get(args.threadId);
         if (t !== undefined && args.sectionId !== undefined) t.sectionId = args.sectionId;
         if (t !== undefined && args.title !== undefined) t.title = args.title;
         if (t !== undefined && args.parentThreadId !== undefined) t.parentThreadId = args.parentThreadId;
+        if (t !== undefined && args.visibility !== undefined) t.visibility = args.visibility;
         return {};
       },
+      markRead: async ({ threadId }: { threadId: string }) => ({ threadId, readAt: now, unreadCount: 0 }),
       compact: async () => ({ ok: true }),
       storageLocation: async ({ threadId }: { threadId: string }) => ({ hostId: "host_on", storageRootPath: `/storage/${threadId}` }),
       updatePluginMetadata: async (args: { threadId: string; set?: Record<string, unknown> }) => {
@@ -295,20 +298,20 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     id: string,
     parent: string,
     title = "Implement",
-    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null } = {},
+    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; sectionId?: string | null } = {},
   ) => {
     const providerId = over.providerId ?? "claude-code";
     const model = over.model === undefined ? "claude-opus-5-5" : over.model;
     const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
     const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
-    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId }) });
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
-  const createdOwned = async (id: string, owner: string, title = "Implement") => {
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
-    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code" }) });
+  const createdOwned = async (id: string, owner: string, title = "Implement", sectionId: string | null = null) => {
+    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
+    await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code", sectionId }) });
     await flush();
   };
   /** A steward-filed escalation the project steward has forwarded to the user, for tests. */
@@ -368,7 +371,7 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/given by the project steward/u);
     // The first wake is the spawn prompt, before the thread has an id.
     expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
-    expect(prompt).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
     expect(prompt).not.toContain("--parent-self");
     expect(prompt).not.toContain("--parent-thread");
     expect(prompt).toContain("A worker finishing starts no turn of yours");
@@ -1640,41 +1643,60 @@ describe("pull requests", () => {
 describe("stewards waiting on others", () => {
   const waiting = { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", blockedOn: "sam" };
 
-  it("archives a review steward after a wake turn that ends waiting, and brings it back on the next", async () => {
+  it("hides a review steward after a wake turn that ends waiting, and keeps it hidden until a wake needs the user", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull());
     await t.ring("github", "acme/web#7");
     const steward = t.spawns[1]!.id;
 
     const report = await t.tool("steward_report", waiting, steward);
-    expect(report.text).toMatch(/Your thread is archived when the turn ends/u);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(report.text).toMatch(/Your thread is hidden when the turn ends/u);
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
     expect((await t.list())[0]).toMatchObject({ ended: false, threadId: steward });
 
-    // Sam pushes: the same thread comes back for the round, then goes again.
+    // Sam pushes: the same thread is woken for the round, but the wake does
+    // not need the user, so it stays hidden and the next report keeps it so.
     t.entities.set("acme/web#7", pull({}, { headSha: "bbbbbbb2" }));
     await t.ring("github", "acme/web#7");
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
     expect(t.sends.at(-1)!.text).toMatch(/Pushed bbbbbbb/u);
     await t.tool("steward_report", waiting, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
     expect(t.spawns).toHaveLength(2);
   });
 
-  it("archives a ticket steward waiting on reviews of its pull requests", async () => {
+  it("brings a hidden steward back on a wake that needs the user", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", waiting, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+
+    // The status now says the user is next (as a report would have left it),
+    // so the next wake is one that needs them and the row comes back.
+    const b = t.hooks.store.byThread(steward)!;
+    t.hooks.store.patch(b.id, { status: { ...b.status!, actor: "me" } });
+    t.entities.set("acme/web#7", pull({}, { headSha: "ccccccc3" }));
+    await t.ring("github", "acme/web#7");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+  });
+
+  it("hides a ticket steward waiting on reviews of its pull requests", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Review", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.tool("steward_report", { ...waiting, phase: "In Review", blockedOn: "reviewers on acme/web#7" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
-  it("leaves a steward in the sidebar when the user is next, a worker runs, or an escalation is open", async () => {
+  it("leaves a steward visible when the user is next, hides it with a worker in flight, and keeps an open escalation visible", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -1682,29 +1704,32 @@ describe("stewards waiting on others", () => {
 
     await t.tool("steward_report", { ...waiting, actor: "me" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
 
-    // One worker finishes and wakes it while another still runs.
+    // The worker-in-flight guard is gone: hiding does not cascade to the
+    // worker, so a steward waiting on someone else hides even while it runs.
     await t.created("thr_w1", steward);
     await t.created("thr_w2", steward);
     await t.idle("thr_w1", "Done.");
     expect(t.sends.at(-1)!.text).toMatch(/finished its turn/u);
     await t.tool("steward_report", { phase: "In Progress", summary: "Implementing.", nextAction: "Wait for the second worker", actor: "other" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    expect(t.threads.get("thr_w2")!.archivedAt).toBeNull();
   });
 
-  it("leaves a steward with an open escalation in the sidebar", async () => {
+  it("keeps a steward with an open escalation visible", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
   });
 
-  it("does not archive a turn the user started", async () => {
+  it("does not hide a turn the user started", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull());
     await t.ring("github", "acme/web#7");
@@ -1712,13 +1737,13 @@ describe("stewards waiting on others", () => {
     await t.tool("steward_report", waiting, steward);
     await t.idle(steward);
     // The user brings it back to talk to it; its report then is theirs to read.
-    t.threads.get(steward)!.archivedAt = null;
+    t.threads.get(steward)!.visibility = "visible";
     await t.tool("steward_report", waiting, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
   });
 
-  it("archives after compaction rather than during it", async () => {
+  it("hides after compaction rather than during it", async () => {
     const t = await setup();
     t.entities.set("acme/web#7", pull());
     await t.ring("github", "acme/web#7");
@@ -1727,13 +1752,13 @@ describe("stewards waiting on others", () => {
     t.usage.set(steward, 500_000);
     await t.idle(steward);
     expect(t.harness.sdk.callsTo("threads.compact")).toHaveLength(1);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
     // Compaction ends in another idle.
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
-  it("does not archive while an idle worker's child is still running, and names the worker's question next wake (BB-11)", async () => {
+  it("hides even while an idle worker's child is still running, and names the worker's question next wake (BB-11)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -1747,13 +1772,14 @@ describe("stewards waiting on others", () => {
     expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
     expect(t.threads.get("thr_r1")!.status).toBe("active");
 
-    // The steward reports that someone else is next and ends its turn: it must
-    // not be archived, or bb would archive the worker and, through it, the
-    // reviewer.
+    // The steward reports that someone else is next and ends its turn: it is
+    // hidden, not archived, and hiding does not touch the worker or reviewer.
     expect((await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward)).error).toBe(false);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
     expect(t.harness.sdk.callsTo("threads.archive").map(([args]) => (args as { threadId: string }).threadId)).not.toContain(steward);
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
 
     // The next wake names the worker's question ahead of everything else.
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
@@ -1779,7 +1805,8 @@ describe("stewards waiting on others", () => {
 
     await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.archivedAt).toBeNull();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+    expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
   });
 
   it("brings back a finished-but-archived worker whose question is surfaced, and says when the worker is gone", async () => {
@@ -3672,7 +3699,7 @@ describe("ops stewards", () => {
     expect(healthy).toMatch(/Requeue time came: a scheduled look/u);
     expect(healthy).not.toMatch(/#### /u);
     const report = await t.tool("steward_report", { phase: "watching", summary: "All healthy.", nextAction: "Look again", actor: "other" }, ops.id);
-    expect(report.text).toMatch(/Your thread is archived when the turn ends/u);
+    expect(report.text).toMatch(/Your thread is hidden when the turn ends/u);
   });
 
   it("compacts the ops steward's context before a wake that would push it over the limit, and still delivers it", async () => {
@@ -4446,7 +4473,7 @@ describe("the dotenv a requester imports", () => {
 // context was compacted, and a worker spawned wrong must be caught here.
 describe("steward invariants on every turn (BB-24)", () => {
   const spawnLine = (over = "") =>
-    `bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
+    `bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
 
   it("prints the full runnable spawn command from the playbook's worker model and the project environment", async () => {
     const t = await setup();
@@ -4539,7 +4566,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
     const wake = t.sends.at(-1)!.text;
     expect(wake).toMatch(/Worker thr_bad was started with the wrong provider codex instead of claude-code/u);
-    expect(wake).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
+    expect(wake).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
   });
 
   it("stops a worker on the wrong model, reasoning level or environment provider, and leaves a matching one alone", async () => {
@@ -4602,5 +4629,66 @@ describe("steward invariants on every turn (BB-24)", () => {
     const stale = instructions();
     expect(stale).toContain("Run `bb stewards spawn-flags` for the exact worker spawn command");
     expect(stale).not.toContain("bb thread spawn --project p1");
+  });
+});
+
+// BB-39: everything a steward spawns stays in the project's section, is left
+// alone by thread-briefs, and the sidebar's unread dot means "needs you".
+describe("steward-spawned threads and the sidebar (BB-39)", () => {
+  it("files an unsectioned worker or reviewer into the owner's project section, and leaves a sectioned one alone", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    expect(t.sections).toEqual([{ id: "sec_1", name: "Acme" }]);
+
+    // A worker with no section is filed into the project's section.
+    await t.created("thr_w1", steward);
+    expect(t.threads.get("thr_w1")!.sectionId).toBe("sec_1");
+
+    // A worker already in a section of its own is left there.
+    t.sections.push({ id: "sec_mine", name: "Mine" });
+    await t.created("thr_w2", steward, "Implement", { sectionId: "sec_mine" });
+    expect(t.threads.get("thr_w2")!.sectionId).toBe("sec_mine");
+
+    // A reviewer (a child of the worker) with no section is filed too.
+    await t.created("thr_r1", "thr_w1", "Review the pull request");
+    expect(t.threads.get("thr_r1")!.sectionId).toBe("sec_1");
+
+    // A top-level worker (no parent) is recognized by its lifecycle owner.
+    await t.createdOwned("thr_w3", steward);
+    expect(t.threads.get("thr_w3")!.sectionId).toBe("sec_1");
+  });
+
+  it("tags workers and reviewers for thread-briefs, so it never moves or archives them", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.created("thr_r1", "thr_w1", "Review the pull request");
+    expect(t.metadata.get("thr_w1")).toEqual({ threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get("thr_r1")).toEqual({ threadBriefs: { rename: false, group: false, archive: false } });
+  });
+
+  it("marks a steward read after a report that needs nobody, and leaves it unread when it needs the user", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    const steward = t.spawns[1]!.id;
+    const marks = () => t.harness.sdk.callsTo("threads.markRead").map(([args]) => (args as { threadId: string }).threadId);
+
+    // Waiting on someone else, nothing for the user: read.
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", blockedOn: "sam" }, steward);
+    expect(marks()).toContain(steward);
+
+    // The user is next: left unread.
+    const before = marks().length;
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "me" }, steward);
+    expect(marks()).toHaveLength(before);
+
+    // An escalation is open: left unread.
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
+    expect(marks()).toHaveLength(before);
   });
 });

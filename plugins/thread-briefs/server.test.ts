@@ -940,6 +940,30 @@ describe("the auto-archive sweep", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("honours a worker's opt-out keyed on its steward's namespace", async () => {
+    // The worker was spawned by the CLI, not the plugin, so it has no origin
+    // plugin of its own: its opt-out lives in its steward's namespace and is
+    // found through the lifecycle-owner chain.
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_steward", 9, { originPluginId: "stewards" }),
+        coldThread("thr_worker", 9, { lifecycleOwnerThreadId: "thr_steward" }),
+      ],
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "steward", threadBriefs: { archive: false } },
+        thr_worker: { role: "worker", threadBriefs: { archive: false } },
+      }),
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_steward");
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
   it("leaves a plugin's thread alone when its metadata cannot be read", async () => {
     const { bb, harness, archived } = archiveHost({
       threads: [
@@ -1703,6 +1727,30 @@ describe("sidebar grouping by status", () => {
     await plugin(bb);
 
     await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("takes a worker keyed on its steward's namespace out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_steward", sectionId: null, originPluginId: "stewards" }),
+      // Spawned by the CLI, so no origin plugin of its own; filed before its
+      // steward's opt-out reached thread-briefs.
+      groupedThread({ id: "thr_worker", sectionId: "sec_3", lifecycleOwnerThreadId: "thr_steward" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "steward", threadBriefs: { group: false } },
+        thr_worker: { role: "worker", threadBriefs: { group: false } },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await bb.storage.kv.set("brief:thr_worker", storedBrief("thr_worker", done));
+    await plugin(bb);
+
     await settle(() => threads[1]!.sectionId === null);
 
     await harness.lifecycle.dispose();

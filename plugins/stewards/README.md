@@ -133,15 +133,21 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   Reopening, or re-adding the label, wakes the same thread, bringing it back
   from the archive; an entity that leaves its terminal state before the
   binding has ended takes the ending back. A steward whose wake turn reports
-  `actor: other` (waiting on a reviewer or the author) is archived too,
-  unless a worker runs or an escalation is open; its next wake brings it
-  back.
+  `actor: other` (waiting on a reviewer or the author) is hidden rather than
+  archived: it leaves the sidebar's organisation and unread attention but
+  stays addressable, so a later wake can reach it. It is made visible again
+  when it needs you (the report puts you next, an escalation is open, or a
+  question is unanswered) and stays hidden across "nothing changed" wakes.
+  Hiding does not cascade to its workers, so a worker in flight is no reason
+  to keep it visible; binding end still archives.
 - **thread-briefs.** Every steward, the project steward included, is
   spawned with `threadBriefs: { rename: false, group: false, archive: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
   runs"). thread-briefs then never renames a steward, whose title carries
   its entity key, never moves one into a status section or auto-archives
   it, since between wakes it reads done while its entity is still open.
+  Workers and reviewers a steward spawns are tagged the same way, so
+  thread-briefs leaves them in the project's section too.
   A ticket or pull request steward's row draws the stage ring like any
   thread's. The project steward also gets `ring: false`: it has no stage of
   its own, so its row keeps bb's own indicators. The project steward
@@ -149,6 +155,12 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   spawned before this, lets go of stewards an earlier version made children
   of another steward, and renames an older project steward once. After
   that, a project steward renamed by hand keeps its name.
+- **The sidebar and the unread dot.** A steward is put in its project's
+  section when it is spawned, and a worker or reviewer the plugin did not
+  place is filed there by the `thread.created` handler. The unread dot
+  means "needs you": a report that waits on someone else, with no
+  escalation, question or needs item, is marked read. A report that needs
+  you is left unread.
 - **Workers** are top-level threads with their own checkout, one per bounded
   task, owned by their steward through `--lifecycle-owner-thread`. They do
   not nest under their steward's sidebar row: bb's list trees by parent
