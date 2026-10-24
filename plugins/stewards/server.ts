@@ -1218,10 +1218,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return thread.parentThreadId === null ? null : store.worker(thread.parentThreadId);
     }
 
-    /** A worker's reviewer threads, as bb lists them: its children, hidden or not, not archived. */
-    async function reviewersOf(workerThreadId: string): Promise<Array<{ id: string; status: string }>> {
-      const children = await bb.sdk.threads.list({ parentThreadId: workerThreadId, includeHidden: true }).catch(() => []);
-      return children.filter((c) => c.archivedAt === null).map((c) => ({ id: c.id, status: String(c.status) }));
+    /**
+     * A worker's reviewer threads, as bb lists them: its children, hidden or
+     * not, not archived. Null when bb could not be asked, so a caller that must
+     * not guess — archiving a worker that might still have a reviewer — can
+     * tell "none" from "unknown".
+     */
+    async function reviewersOf(workerThreadId: string): Promise<Array<{ id: string; status: string }> | null> {
+      try {
+        const children = await bb.sdk.threads.list({ parentThreadId: workerThreadId, includeHidden: true });
+        return children.filter((c) => c.archivedAt === null).map((c) => ({ id: c.id, status: String(c.status) }));
+      } catch (error) {
+        bb.log.warn(`stewards: could not list the reviewers of worker ${workerThreadId}: ${errorMessage(error)}`);
+        return null;
+      }
     }
 
     /**
@@ -1231,7 +1241,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * never archived while its worker is in flight (BB-47).
      */
     async function archiveConsumedReviewers(workerThreadId: string): Promise<void> {
-      for (const r of await reviewersOf(workerThreadId)) {
+      for (const r of (await reviewersOf(workerThreadId)) ?? []) {
         if (busy(r.status)) continue;
         await quietly(`archive consumed reviewer ${r.id}`, () => bb.sdk.threads.archive({ threadId: r.id }));
       }
@@ -1239,7 +1249,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** A newer reviewer round supersedes the older ones: archive every other child of the worker. */
     async function supersedeOlderReviewers(workerThreadId: string, keep: string): Promise<void> {
-      for (const r of await reviewersOf(workerThreadId)) {
+      for (const r of (await reviewersOf(workerThreadId)) ?? []) {
         if (r.id === keep) continue;
         await quietly(`archive superseded reviewer ${r.id}`, () => bb.sdk.threads.archive({ threadId: r.id }));
       }
@@ -1260,8 +1270,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // releases a thread's unarchived children from it when it is archived,
         // so archiving the worker would clear the reviewer's parent: it could
         // no longer wake the worker, and `reviewersOf` could never find it to
-        // archive it (BB-47).
-        if ((await reviewersOf(w.threadId)).length > 0) continue;
+        // archive it. A listing that failed is "unknown", so the worker waits
+        // rather than risking the orphan (BB-47).
+        const reviewers = await reviewersOf(w.threadId);
+        if (reviewers === null || reviewers.length > 0) continue;
         const info = await threadInfo(w.threadId).catch(() => null);
         if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
         await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
@@ -1284,7 +1296,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const w of store.workers(b.id)) {
         if (w.status !== "finished") continue;
         await setVisibility(w.threadId, visibility);
-        for (const r of await reviewersOf(w.threadId)) await setVisibility(r.id, visibility);
+        for (const r of (await reviewersOf(w.threadId)) ?? []) await setVisibility(r.id, visibility);
       }
     }
 
@@ -3381,6 +3393,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.active", async ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker === null) return;
+      // A worker the waiting cascade hid is shown again once it runs (BB-47).
+      if (thread.visibility === "hidden") await quietly(`show running worker ${thread.id}`, () => bb.sdk.threads.update({ threadId: thread.id, visibility: "visible" }));
       if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
       // The first turn is dispatched now, so the spawn's model can be read.
       if (worker.modelCheckPending && worker.status !== "stopped") {

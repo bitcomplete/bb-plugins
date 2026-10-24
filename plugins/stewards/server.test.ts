@@ -2007,6 +2007,32 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     // hidden reviewer into the sidebar.
     expect(t.threads.get("thr_r2")!.visibility).toBe("hidden");
   });
+
+  it("does not archive a finished worker when the reviewer listing fails, so a reviewer is never orphaned", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    // "Unknown" is not "no reviewers": the worker waits for a listing that works.
+    t.harness.sdk.stub("threads.list", async () => {
+      throw new Error("listing is down");
+    });
+    await t.idle("thr_w1", "Implemented the fix.");
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+  });
+
+  it("shows a worker the waiting cascade hid once it is woken again", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    t.threads.get("thr_w1")!.visibility = "hidden";
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1", visibility: "hidden" }) });
+    await t.flush();
+    expect(t.threads.get("thr_w1")!.visibility).toBe("visible");
+  });
 });
 
 describe("passes", () => {
