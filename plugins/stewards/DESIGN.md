@@ -1290,12 +1290,14 @@ not in the sidebar's count or items. `stewardsSidebar` carries, per project,
 `bb.realtime.publish("needs-you-changed", { projectId })`; the store stays
 free of bb. The callback fires from the store's mutation points — a question
 filed (`ask`) or answered (`answer`, `answerQuestionOnly`, `answerEscalation`),
-an escalation forwarded to the user or resolved, and a need filed, updated or
-closed — so a steward's own tools publish as well as the page's buttons. A
-synchronous coalescing guard makes one question filed or answered publish
-exactly one event even when the operation nests (`answer` resolves its
-escalation). Every open sidebar refetches when the event names a project it
-shows, and the board page refetches when it names its project; the
+an escalation filed route-`me` (`escalate`) or forwarded to the user or
+resolved (`reroute`, `resolve`, `approve`, `decline`), a need filed, updated or
+closed (`fileNeed`, `closeNeed`, `closeNeeds`, `closeNeedByKey`), and a binding
+ended or reopened (`patch`) — so a steward's own tools publish as well as the
+page's buttons. A synchronous coalescing guard makes one question filed or
+answered publish exactly one event even when the operation nests (`answer`
+resolves its escalation). Every open sidebar refetches when the event names a
+project it shows, and the board page refetches when it names its project; the
 half-minute poll remains the fallback.
 
 **The default provider, checked (BB-44 criterion 1).** With

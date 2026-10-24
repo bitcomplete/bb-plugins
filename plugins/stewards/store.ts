@@ -1144,12 +1144,17 @@ export function createStore(db: Database.Database, now: () => number, options: S
   }
 
   function patch(id: string, fields: BindingPatch): Binding {
+    const wasOpen = getBinding.get(id)?.ended_at === null;
     const entries = Object.entries(fields).filter(([, v]) => v !== undefined) as Array<[keyof typeof COLUMNS, unknown]>;
     if (entries.length > 0) {
       const sets = entries.map(([k]) => `${COLUMNS[k]} = ?`).join(", ");
       db.prepare(`UPDATE bindings SET ${sets} WHERE id = ?`).run(...entries.map(([, v]) => toColumn(v)), id);
     }
-    return rowToBinding(getBinding.get(id)!);
+    const b = rowToBinding(getBinding.get(id)!);
+    // Ending a binding takes its needs and with-user escalations off the board
+    // and the sidebar; reopening one puts them back.
+    if (fields.endedAt !== undefined && wasOpen !== (b.endedAt === null)) needsYouChanged(b.projectId);
+    return b;
   }
 
   return {
@@ -1295,6 +1300,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
         context: null,
         head_sha: fields.headSha ?? null,
       });
+      // A route-`me` escalation is a "needs you" item the moment it is filed.
+      if (fields.route === "me") needsYouChanged(fields.projectId ?? projectIdForBinding(fields.bindingId));
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -1341,8 +1348,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const before = getEscalation.get(id);
       const changed = rerouteEscalation.run(route, recommendation, id).changes > 0;
       // A route-`me` escalation is a "needs you" item: forwarding one to the
-      // user adds it, and moving one off the user removes it.
-      if (changed && before !== undefined && (String(before.route) === "me" || route === "me")) needsYouChanged(projectIdForBinding(String(before.binding_id)));
+      // user adds it, and moving one off the user removes it. A reroute to the
+      // route it already had changes nothing on the board.
+      if (changed && before !== undefined && String(before.route) !== route && (String(before.route) === "me" || route === "me")) needsYouChanged(projectIdForBinding(String(before.binding_id)));
       return changed;
     },
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */

@@ -344,10 +344,10 @@ that project. The block and the board page read one server function
 non-actionable need is on the page but not in the sidebar. The count and the
 items come from `stewardsSidebar`; the plugin publishes
 `needs-you-changed { projectId }` on its realtime channel whenever a question
-is opened or answered, an escalation is forwarded to the user or resolved, or
-a need is filed, updated or closed — including from a steward's own tools —
-so every open sidebar and the board page refresh within seconds. The
-half-minute poll stays as the fallback.
+is opened or answered, an escalation is filed with or forwarded to the user
+or resolved, a need is filed, updated or closed, or a binding ends or reopens
+— including from a steward's own tools — so every open sidebar and the board
+page refresh within seconds. The half-minute poll stays as the fallback.
 
 **Per client or per server?** Checked on a dev server: the preference is
 **server-synced**, so a flip is per server, not per browser. Every open

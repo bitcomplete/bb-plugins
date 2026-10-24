@@ -2615,6 +2615,29 @@ describe("the sidebar's needs you block (BB-46)", () => {
     const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
     expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
   });
+
+  it("publishes one event when a route-me escalation is filed directly", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+  });
+
+  it("publishes when a binding ends and its needs leave the set", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "merged" });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+  });
 });
 
 describe("needs you items", () => {
