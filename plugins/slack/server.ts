@@ -54,7 +54,7 @@ export function settingDescriptors(_env: Record<string, string | undefined>) {
     project: {
       type: "string",
       label: "Project",
-      description: "Which bb project a Slack conversation starts its thread in. Leave empty to use the first project on this server.",
+      description: "Which bb project a Slack conversation starts its thread in. Leave empty to use the personal project, or the first project when this server has none.",
     },
   } as const;
 }
@@ -114,14 +114,18 @@ type Project = { id: string; name: string; kind: string };
 /** The environment a spawned thread runs in: `threads.spawn`'s `environment`. */
 type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
 
-/** The project a Slack conversation goes to: the chosen one, else the first. */
+/**
+ * The project a Slack conversation goes to: the chosen one, else the personal
+ * project (the way a thread with no project starts in bb), and only when there
+ * is none the first standard project.
+ */
 export function chooseProject(projects: Project[], chosen: string): Project | null {
   const named = chosen.trim();
   if (named !== "") {
     const found = projects.find((p) => p.id === named || p.name.toLowerCase() === named.toLowerCase());
     if (found !== undefined) return found;
   }
-  return projects.find((p) => p.kind === "standard") ?? projects[0] ?? null;
+  return projects.find((p) => p.kind === "personal") ?? projects.find((p) => p.kind === "standard") ?? projects[0] ?? null;
 }
 
 export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => Promise<void> {

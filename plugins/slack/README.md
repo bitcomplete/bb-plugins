@@ -43,7 +43,7 @@ on the pod.
 | Setting | What it is |
 |---|---|
 | Slack sign-in token | Filled in by Sign in with Slack. A secret; do not edit or paste by hand. |
-| Project | Which bb project a Slack conversation starts its thread in. Empty uses the first project on this server. |
+| Project | Which bb project a Slack conversation starts its thread in. Empty uses the personal project, or the first project when this server has none. |
 
 **Sign out** forgets the token and reconnects the stream, so the service drops
 the identity bound to the old connection.
