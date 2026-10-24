@@ -188,9 +188,9 @@ describe("the sidebar-footer toggle (BB-45)", () => {
   type SetArgs = { key: string; value: string; expectedRevision: number };
 
   /** A `uiPreferences.list()` answer with just the one preference the toggle reads. */
-  const listed = (entry: UiPrefEntry) => ({ preferences: { "sidebar.threadListProvider": entry } }) as never;
+  const listed = (entry: UiPrefEntry | null) => ({ preferences: entry === null ? {} : { "sidebar.threadListProvider": entry } }) as never;
 
-  const renderToggle = async (options: { entry: UiPrefEntry; set: (args: SetArgs) => Promise<unknown> }) => {
+  const renderToggle = async (options: { entry: UiPrefEntry | null; set: (args: SetArgs) => Promise<unknown> }) => {
     const captured = await loadApp();
     const item = captured.experimentalSidebarFooterItems[0]!;
     if (item.kind !== "disclosure") throw new Error("the sidebar footer item is not a disclosure");
@@ -218,6 +218,15 @@ describe("the sidebar-footer toggle (BB-45)", () => {
     const onSwitch = await waitFor(() => on.slot.getByRole("switch", { name: "Stewards sidebar" }));
     expect(onSwitch.getAttribute("aria-checked")).toBe("true");
     on.slot.lifecycle.unmount();
+  });
+
+  it("reads an unpinned provider as on, the effective stewards list", async () => {
+    for (const entry of [null, { value: "__automatic__", revision: 0 }]) {
+      const { slot } = await renderToggle({ entry, set: echo });
+      const toggle = await waitFor(() => slot.getByRole("switch", { name: "Stewards sidebar" }));
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      slot.lifecycle.unmount();
+    }
   });
 
   it("turns the stewards list on with the stewards list id and the listed revision", async () => {
