@@ -1264,6 +1264,40 @@ The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
 component joins them to `experimental_useSidebarThreads` and polls
 `stewardsSidebar` on the board's half-minute visibility-aware cadence.
 
+**The Needs you block and the count badge (BB-46).** The sidebar is where the
+user already looks, so what waits on them is shown there, not only on the
+Stewards page. Each tab carries a count pill when its project has anything
+waiting; the compact picker shows the summed count and per-project counts in
+its options. Above In flight, a **Needs you** block lists one row per item
+with the entity key (opening the entity), one line of text, and a question's
+or `decide` item's fixed `choices` as small buttons. A choice makes exactly
+the write the page makes (`stewardsAnswerQuestion` with `answer: null` for a
+question, `stewardsNeedAction { action: "choose" }` for a `decide` item) and
+refetches; a row without choices, or a `provide-secret` item, opens the
+Stewards page at that project, where the free-text answer and the secret form
+live. The block adds no write path of its own.
+
+**One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
+})` builds the board's `questions`, `withUser` and `needs` lists in one place;
+the board calls it unfiltered and the sidebar calls it with `actionableOnly`,
+so the two surfaces cannot drift and a non-actionable need is on the page but
+not in the sidebar's count or items. `stewardsSidebar` carries, per project,
+`needs: { count, items }` with the same row shapes, each tagged
+`question`/`withUser`/`need` so the app knows which RPC a choice calls.
+
+**Realtime, not the poll.** The store takes an optional
+`onNeedsYouChange(projectId)` callback, wired in `server.ts` to
+`bb.realtime.publish("needs-you-changed", { projectId })`; the store stays
+free of bb. The callback fires from the store's mutation points — a question
+filed (`ask`) or answered (`answer`, `answerQuestionOnly`, `answerEscalation`),
+an escalation forwarded to the user or resolved, and a need filed, updated or
+closed — so a steward's own tools publish as well as the page's buttons. A
+synchronous coalescing guard makes one question filed or answered publish
+exactly one event even when the operation nests (`answer` resolves its
+escalation). Every open sidebar refetches when the event names a project it
+shows, and the board page refetches when it names its project; the
+half-minute poll remains the fallback.
+
 **The default provider, checked (BB-44 criterion 1).** With
 `sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to
 "the first installed thread list plugin other than the bundled
@@ -1290,7 +1324,7 @@ choice explicit. The preference is server-synced, so a flip is per server:
 every window of one bb server shows the same list. Each developer has their
 own server behind bb-gate, so it is per developer in practice.
 
-The "Needs you" block and the tab badge are a separate ticket.
+
 
 ## Known limits
 

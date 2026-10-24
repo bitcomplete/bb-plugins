@@ -777,7 +777,16 @@ export const GUIDANCE_DEDUPE_MS = 5 * 60_000;
 
 export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("base64url")}`;
 
-export function createStore(db: Database.Database, now: () => number) {
+/**
+ * What a store reports back to its owner when a project's "needs you" set
+ * changes. The server wires it to the realtime channel; the store itself
+ * knows nothing about bb.
+ */
+export interface StoreOptions {
+  onNeedsYouChange?: (projectId: string) => void;
+}
+
+export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
   const getBinding = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE id = ?");
   const byEntity = db.prepare<[string, string], BindingRow>("SELECT * FROM bindings WHERE source = ? AND entity_id = ? COLLATE NOCASE ORDER BY created_at LIMIT 1");
   const byKey = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE entity_key = ? COLLATE NOCASE ORDER BY ended_at IS NOT NULL, created_at DESC");
@@ -1040,16 +1049,67 @@ export function createStore(db: Database.Database, now: () => number) {
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
   });
 
+  const onNeedsYouChange = options.onNeedsYouChange;
+
+  /** The project a binding belongs to, for a mutation that only has the binding. */
+  function projectIdForBinding(bindingId: string): string | null {
+    const b = getBinding.get(bindingId);
+    return b === undefined ? null : String(b.project_id);
+  }
+
+  // A "needs you" change is coalesced within one synchronous store operation,
+  // so one question filed or answered publishes exactly one event even when
+  // the operation nests (answer -> resolve) or closes a migrated need through
+  // resolve. The flush runs when the outermost operation finishes.
+  let notifyDepth = 0;
+  const dirtyProjects = new Set<string>();
+
+  function flushNeedsYou(): void {
+    const projects = [...dirtyProjects];
+    dirtyProjects.clear();
+    if (onNeedsYouChange !== undefined) for (const projectId of projects) onNeedsYouChange(projectId);
+  }
+
+  /** Mark a project's "needs you" set changed; publishes now, or on the way out of a nested operation. */
+  function needsYouChanged(projectId: string | null | undefined): void {
+    if (onNeedsYouChange === undefined || projectId === null || projectId === undefined || projectId === "") return;
+    dirtyProjects.add(projectId);
+    if (notifyDepth === 0) flushNeedsYou();
+  }
+
+  /** Run `fn`, flushing at most one notification per project when it returns successfully. */
+  function coalescing<T>(fn: () => T): T {
+    notifyDepth += 1;
+    try {
+      const result = fn();
+      notifyDepth -= 1;
+      if (notifyDepth === 0) flushNeedsYou();
+      return result;
+    } catch (error) {
+      // A failed operation did not change anything: drop its pending marks.
+      notifyDepth -= 1;
+      if (notifyDepth === 0) dirtyProjects.clear();
+      throw error;
+    }
+  }
+
   /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
   function resolve(id: string, resolution: string, by = "plugin"): boolean {
-    return db.transaction(() => {
-      const at = now();
-      if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
-      answerForEscalation.run(resolution, by, at, id);
-      const x = getEscalation.get(id);
-      if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by);
-      return true;
-    })();
+    return coalescing(() => {
+      const resolved = db.transaction(() => {
+        const at = now();
+        if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
+        answerForEscalation.run(resolution, by, at, id);
+        const x = getEscalation.get(id);
+        if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by);
+        return true;
+      })();
+      if (resolved) {
+        const x = getEscalation.get(id);
+        needsYouChanged(x === undefined ? null : projectIdForBinding(String(x.binding_id)));
+      }
+      return resolved;
+    });
   }
 
   /**
@@ -1172,21 +1232,27 @@ export function createStore(db: Database.Database, now: () => number) {
      * the current spec and closes the request together.
      */
     approve(bindingId: string, approval: NonNullable<ReadyState["approval"]>, resolution: string, by: string): void {
-      db.transaction(() => {
-        const b = rowToBinding(getBinding.get(bindingId)!);
-        patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
-        closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
-        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
-      })();
+      coalescing(() =>
+        db.transaction(() => {
+          const b = rowToBinding(getBinding.get(bindingId)!);
+          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+          closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
+          for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
+          needsYouChanged(projectIdForBinding(bindingId));
+        })(),
+      );
     },
     /** Remember the current spec as declined and close its approval request, in one transaction. */
     decline(bindingId: string, specHash: string, resolution: string, by: string): void {
-      db.transaction(() => {
-        const b = rowToBinding(getBinding.get(bindingId)!);
-        patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
-        closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
-        for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
-      })();
+      coalescing(() =>
+        db.transaction(() => {
+          const b = rowToBinding(getBinding.get(bindingId)!);
+          patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
+          closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
+          for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
+          needsYouChanged(projectIdForBinding(bindingId));
+        })(),
+      );
     },
 
     // escalations
@@ -1249,16 +1315,18 @@ export function createStore(db: Database.Database, now: () => number) {
      * already says it.
      */
     answerEscalation(id: string, text: string, by: string): "resolved" | "appended" | "unchanged" {
-      return db.transaction(() => {
-        if (resolve(id, text, by)) return "resolved" as const;
-        const x = getEscalation.get(id);
-        const resolution = x === undefined || x.resolution === null ? "" : String(x.resolution);
-        if (x === undefined || resolution === text || resolution.endsWith(`\n${text}`)) return "unchanged" as const;
-        const appended = resolution === "" ? text : `${resolution}\n${text}`;
-        appendResolution.run(appended, id);
-        appendAnswerForEscalation.run(appended, id);
-        return "appended" as const;
-      })();
+      return coalescing(() =>
+        db.transaction(() => {
+          if (resolve(id, text, by)) return "resolved" as const;
+          const x = getEscalation.get(id);
+          const resolution = x === undefined || x.resolution === null ? "" : String(x.resolution);
+          if (x === undefined || resolution === text || resolution.endsWith(`\n${text}`)) return "unchanged" as const;
+          const appended = resolution === "" ? text : `${resolution}\n${text}`;
+          appendResolution.run(appended, id);
+          appendAnswerForEscalation.run(appended, id);
+          return "appended" as const;
+        })(),
+      );
     },
     /** Mark escalations delivered to the project steward; returns the time, to undo with undeliver if the send fails. */
     markDelivered(ids: string[]): number {
@@ -1270,7 +1338,12 @@ export function createStore(db: Database.Database, now: () => number) {
       for (const id of ids) clearDelivered.run(id, at);
     },
     reroute(id: string, route: EscalationRoute, recommendation: string | null): boolean {
-      return rerouteEscalation.run(route, recommendation, id).changes > 0;
+      const before = getEscalation.get(id);
+      const changed = rerouteEscalation.run(route, recommendation, id).changes > 0;
+      // A route-`me` escalation is a "needs you" item: forwarding one to the
+      // user adds it, and moving one off the user removes it.
+      if (changed && before !== undefined && (String(before.route) === "me" || route === "me")) needsYouChanged(projectIdForBinding(String(before.binding_id)));
+      return changed;
     },
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
     setEscalationHead(id: string, headSha: string | null): void {
@@ -1347,6 +1420,7 @@ export function createStore(db: Database.Database, now: () => number) {
         data: JSON.stringify(fields.data ?? {}),
         origin: JSON.stringify({ threadId: null, bindingId: fields.bindingId, chain: [] }),
       });
+      needsYouChanged(fields.projectId);
       return toQuestion(getQuestion.get(id)!);
     },
     question(id: string): Question | null {
@@ -1370,13 +1444,16 @@ export function createStore(db: Database.Database, now: () => number) {
      * escalation takes the choice as guidance.
      */
     answer(id: string, answer: string, by: string, resolution = answer): boolean {
-      return db.transaction(() => {
-        const at = now();
-        if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
-        const q = toQuestion(getQuestion.get(id)!);
-        if (q.escalationId !== null) resolve(q.escalationId, resolution, by);
-        return true;
-      })();
+      return coalescing(() =>
+        db.transaction(() => {
+          const at = now();
+          if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
+          const q = toQuestion(getQuestion.get(id)!);
+          if (q.escalationId !== null) resolve(q.escalationId, resolution, by);
+          needsYouChanged(q.projectId);
+          return true;
+        })(),
+      );
     },
     /**
      * Close an open question with its answer, leaving the escalation it was
@@ -1384,7 +1461,14 @@ export function createStore(db: Database.Database, now: () => number) {
      * project steward, not the plugin, decides what it means.
      */
     answerQuestionOnly(id: string, answer: string, by: string): boolean {
-      return answerQuestion.run(answer, by, now(), id).changes > 0;
+      return coalescing(() => {
+        const changed = answerQuestion.run(answer, by, now(), id).changes > 0;
+        if (changed) {
+          const q = getQuestion.get(id);
+          needsYouChanged(q === undefined || q.project_id === null || q.project_id === undefined ? null : String(q.project_id));
+        }
+        return changed;
+      });
     },
 
     // needs: what waits on the user
@@ -1418,25 +1502,38 @@ export function createStore(db: Database.Database, now: () => number) {
      * that re-reports one updates the wording rather than adding a row.
      */
     fileNeed(fields: { bindingId: string; kind: NeedKind; url: string; what: string; how: string | null; data?: Record<string, unknown>; filedBy?: string }): Need {
+      const projectId = projectIdForBinding(fields.bindingId);
       const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
       if (existing !== undefined) {
         updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
+        needsYouChanged(projectId);
         return toNeed(getNeed.get(String(existing.id))!);
       }
       const id = newId("need");
       insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
+      needsYouChanged(projectId);
       return toNeed(getNeed.get(id)!);
     },
     closeNeed(id: string, resolution: string, by = "plugin"): boolean {
-      if (closeNeedStmt.run(resolution, now(), id).changes > 0) return true;
-      // A migrated provide-secret need is an escalation now.
-      return resolve(id, resolution, by);
+      return coalescing(() => {
+        const row = getNeed.get(id);
+        if (closeNeedStmt.run(resolution, now(), id).changes > 0) {
+          needsYouChanged(row === undefined ? null : projectIdForBinding(String(row.binding_id)));
+          return true;
+        }
+        // A migrated provide-secret need is an escalation now.
+        return resolve(id, resolution, by);
+      });
     },
     closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
-      return closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
+      const changed = closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
+      if (changed > 0) needsYouChanged(projectIdForBinding(bindingId));
+      return changed;
     },
     closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
-      return closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
+      const changed = closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
+      if (changed > 0) needsYouChanged(projectIdForBinding(bindingId));
+      return changed;
     },
 
     // workers

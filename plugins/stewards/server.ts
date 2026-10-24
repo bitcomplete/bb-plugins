@@ -72,6 +72,7 @@ import { ACTORS, MIGRATIONS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needCho
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
+import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
@@ -206,6 +207,60 @@ export const lessonBranchFor = (threadId: string): string => `refs/heads/guidanc
 /** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
 const normalizeLessonText = (text: string) => text.replace(/\s+/gu, " ").trim();
 
+// One row each in the board's "waiting on you" section. The sidebar reuses
+// these shapes, tagged, for its "Needs you" list, so the two surfaces cannot
+// disagree about what an item is.
+const questionViewSchema = z.object({
+  id: z.string(),
+  question: z.string(),
+  context: z.string().nullable(),
+  choices: z.array(z.string()),
+  key: z.string().nullable(),
+  url: z.string().nullable(),
+  escalationId: z.string().nullable(),
+  createdAt: z.number(),
+});
+const withUserViewSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  question: z.string(),
+  recommendation: z.string().nullable(),
+  key: z.string(),
+  url: z.string().nullable(),
+  threadId: z.string().nullable(),
+  createdAt: z.number(),
+});
+const needViewSchema = z.object({
+  id: z.string(),
+  bindingId: z.string(),
+  key: z.string(),
+  kind: z.string(),
+  url: z.string().nullable(),
+  /** The binding's own link (its ticket or pull request), so the key opens the entity, not the item's `url`. */
+  entityUrl: z.string().nullable(),
+  /** The escalation this item answers, when the project steward forwarded one. */
+  escalationId: z.string().nullable(),
+  /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
+  choices: z.array(z.string()),
+  /** The lesson a `decide` item is about, when it is a boundary lesson; null otherwise. */
+  lessonId: z.string().nullable(),
+  what: z.string(),
+  how: z.string().nullable(),
+  /** For a provide-secret item: where the value goes, in words. */
+  destination: z.string().nullable(),
+  threadId: z.string().nullable(),
+  createdAt: z.number(),
+  /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
+  actionable: z.boolean(),
+  why: z.string().nullable(),
+});
+/** One "needs you" item in the sidebar, tagged so the app knows which write it makes. */
+const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
+  questionViewSchema.extend({ type: z.literal("question") }),
+  withUserViewSchema.extend({ type: z.literal("withUser") }),
+  needViewSchema.extend({ type: z.literal("need") }),
+]);
+
 /** The steward's own surface for the app and the CLI. Cross-plugin methods are in source-contract.ts. */
 export const rpcContract = defineRpcContract({
   ...stewardsContract,
@@ -295,40 +350,11 @@ export const rpcContract = defineRpcContract({
           /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
           stages: z.array(z.string()),
           digest: z.object({ text: z.string(), at: z.number() }).nullable(),
-          questions: z.array(
-            z.object({ id: z.string(), question: z.string(), context: z.string().nullable(), choices: z.array(z.string()), key: z.string().nullable(), url: z.string().nullable(), escalationId: z.string().nullable(), createdAt: z.number() }),
-          ),
+          questions: z.array(questionViewSchema),
           /** Open escalations with the user that no question covers: approval requests, and forwards from before questions were kept. */
-          withUser: z.array(
-            z.object({ id: z.string(), kind: z.string(), question: z.string(), recommendation: z.string().nullable(), key: z.string(), url: z.string().nullable(), threadId: z.string().nullable(), createdAt: z.number() }),
-          ),
+          withUser: z.array(withUserViewSchema),
           /** "Needs you" items: links and the one-click action each supports. */
-          needs: z.array(
-            z.object({
-              id: z.string(),
-              bindingId: z.string(),
-              key: z.string(),
-              kind: z.string(),
-              url: z.string().nullable(),
-              /** The binding's own link (its ticket or pull request), so the key opens the entity, not the item's `url`. */
-              entityUrl: z.string().nullable(),
-              /** The escalation this item answers, when the project steward forwarded one. */
-              escalationId: z.string().nullable(),
-              /** Fixed choices the user picks from, for a `decide` item; empty otherwise. */
-              choices: z.array(z.string()),
-              /** The lesson a `decide` item is about, when it is a boundary lesson; null otherwise. */
-              lessonId: z.string().nullable(),
-              what: z.string(),
-              how: z.string().nullable(),
-              /** For a provide-secret item: where the value goes, in words. */
-              destination: z.string().nullable(),
-              threadId: z.string().nullable(),
-              createdAt: z.number(),
-              /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
-              actionable: z.boolean(),
-              why: z.string().nullable(),
-            }),
-          ),
+          needs: z.array(needViewSchema),
           /** Pending lessons: general rules the project steward has recorded and not yet landed. */
           lessons: z.array(
             z.object({
@@ -372,8 +398,9 @@ export const rpcContract = defineRpcContract({
     }),
   },
   // The sidebar thread list's one call: every stewarded project's bindings,
-  // their workers and known reviewers, the project steward, and what ended.
-  // One call for all projects, so a replaced sidebar does not refetch per tab.
+  // their workers and known reviewers, the project steward, what ended, and
+  // the project's "needs you" count and items. One call for all projects, so a
+  // replaced sidebar does not refetch per tab.
   stewardsSidebar: {
     input: z.null(),
     output: z.object({
@@ -382,6 +409,13 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           name: z.string(),
           projectStewardThreadId: z.string().nullable(),
+          /**
+           * The board's "waiting on you" items, in the sidebar's own shape: the
+           * same questions, with-user escalations and actionable needs, tagged
+           * so the app knows which write a choice makes. `count` is their sum;
+           * a non-actionable need is in neither the items nor the count.
+           */
+          needs: z.object({ count: z.number(), items: z.array(sidebarNeedsItemSchema) }),
           bindings: z.array(
             z.object({
               key: z.string(),
@@ -602,7 +636,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
-    const store = createStore(db, now);
+    // The store reports a project whose "needs you" set changed; the sidebar
+    // and the board page refetch on the channel. Keeping it a callback keeps
+    // store.ts free of bb, so steward-side mutations publish too.
+    const store = createStore(db, now, { onNeedsYouChange: (projectId) => bb.realtime.publish(NEEDS_YOU_CHANGED, { projectId }) });
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
@@ -3537,12 +3574,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const row = store.project(projectId);
         const all = store.all(projectId);
         const open = all.filter((b) => b.endedAt === null);
-        const questions = store.openQuestions(projectId);
-        const needs = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
-        // A question or a need covers the escalation it was made for: the
-        // page's row is the question or the item, never the raw escalation.
-        const covered = new Set([...questions.map((q) => q.escalationId), ...needs.map((n) => n.escalationId), ...store.openQuestionEscalationIds(projectId)].filter((id): id is string => id !== null));
-        const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => ({ x, b })));
+        const { questions, withUser, needs } = needsYou(projectId);
         const stuck = open.flatMap((b) => [
           ...store.openEscalations(b.id).filter((x) => x.kind === "stuck").map((x) => ({ b, why: `Stuck, with ${x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: ${x.question}`, since: x.createdAt })),
           ...(b.hold === null ? [] : [{ b, why: `On hold: ${b.hold}`, since: null }]),
@@ -3557,11 +3589,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectStewardThreadId: row.threadId,
             stages: [...STAGES],
             digest: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
-            questions: questions.map((q) => {
-              const b = q.bindingId === null ? null : store.binding(q.bindingId);
-              return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
-            }),
-            withUser: withUser.map(({ x, b }) => ({ id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt })),
+            questions,
+            withUser,
             needs,
             lessons: store.lessons(projectId).map((l) => {
               const b = l.bindingId === null ? null : store.binding(l.bindingId);
@@ -3615,10 +3644,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               .filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS)
               .sort((a, b) => b.endedAt! - a.endedAt!)
               .slice(0, 30);
+            const { questions, withUser, needs } = needsYou(projectId, { actionableOnly: true });
             return {
               projectId,
               name,
               projectStewardThreadId: store.project(projectId).threadId,
+              needs: {
+                count: questions.length + withUser.length + needs.length,
+                items: [
+                  ...questions.map((q) => ({ type: "question" as const, ...q })),
+                  ...withUser.map((w) => ({ type: "withUser" as const, ...w })),
+                  ...needs.map((n) => ({ type: "need" as const, ...n })),
+                ],
+              },
               bindings: all
                 .filter((b) => b.endedAt === null)
                 .map((b) => {
@@ -4810,6 +4848,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
       return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
+    }
+
+    /**
+     * The board's "waiting on you" lists for one project, in one place so the
+     * board and the sidebar cannot disagree: open questions, the route-`me`
+     * escalations no question or item covers, and open needs. `actionableOnly`
+     * drops needs the server cannot act on now, which the sidebar's badge and
+     * block do not show; the board keeps them and says why.
+     */
+    function needsYou(projectId: string, opts: { actionableOnly?: boolean } = {}): { questions: ReturnType<typeof questionView>[]; withUser: ReturnType<typeof withUserView>[]; needs: ReturnType<typeof needView>[] } {
+      const open = store.all(projectId).filter((b) => b.endedAt === null);
+      const questions = store.openQuestions(projectId).map(questionView);
+      const allNeeds = open.flatMap((b) => store.openNeeds(b.id).map((n) => needView(n, b)));
+      // A question or a need covers the escalation it was made for: the page's
+      // row is the question or the item, never the raw escalation.
+      const covered = new Set([...questions.map((q) => q.escalationId), ...allNeeds.map((n) => n.escalationId), ...store.openQuestionEscalationIds(projectId)].filter((id): id is string => id !== null));
+      const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.resolutionKind === null && !covered.has(x.id)).map((x) => withUserView(x, b)));
+      return { questions, withUser, needs: opts.actionableOnly === true ? allNeeds.filter((n) => n.actionable) : allNeeds };
+    }
+
+    /** The board's question row; the sidebar reuses it, tagged. */
+    function questionView(q: Question) {
+      const b = q.bindingId === null ? null : store.binding(q.bindingId);
+      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
+    }
+
+    /** The board's with-user row; the sidebar reuses it, tagged. */
+    function withUserView(x: Escalation, b: Binding) {
+      return { id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt };
     }
 
     function formatBindings(rows: Binding[]): string {
