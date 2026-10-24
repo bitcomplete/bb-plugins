@@ -102,8 +102,8 @@ describe("the stewards sidebar list (BB-44)", () => {
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "billing freeze" })] }) } as never,
     });
-    await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" })).toBeTruthy());
-    expect(slot.getByRole("tab", { name: "Personal" })).toBeTruthy();
+    await waitFor(() => expect(slot.getByRole("option", { name: "Acme" })).toBeTruthy());
+    expect(slot.getByRole("option", { name: "Personal" })).toBeTruthy();
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     // The title does not name the key, so the key shows; the stage does not.
     expect(slot.getByText("ENG-1")).toBeTruthy();
@@ -249,20 +249,23 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("renders a project picker on a compact viewport", async () => {
-    const slot = await renderSidebar(
-      {
-        sidebarThreads: { projects, threads: [] },
-        rpc: { stewardsSidebar: () => sidebarData() } as never,
-      },
-      { isCompactViewport: true },
-    );
-    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
-    expect(slot.queryByRole("tab")).toBeNull();
-    slot.lifecycle.unmount();
+  it("renders the project picker at every viewport width", async () => {
+    for (const isCompactViewport of [false, true]) {
+      const slot = await renderSidebar(
+        {
+          sidebarThreads: { projects, threads: [] },
+          rpc: { stewardsSidebar: () => sidebarData() } as never,
+        },
+        { isCompactViewport },
+      );
+      await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
+      expect(slot.queryByRole("tab")).toBeNull();
+      expect(slot.getByRole("option", { name: "Acme" })).toBeTruthy();
+      slot.lifecycle.unmount();
+    }
   });
 
-  it("follows activeProjectId for the active tab and switches on pick", async () => {
+  it("follows activeProjectId in the picker and switches on pick without navigating", async () => {
     const slot = await renderSidebar(
       {
         sidebarThreads: { projects, threads: [thread({ id: "thr_personal", projectId: "personal", displayTitle: "My notes" })] },
@@ -270,11 +273,36 @@ describe("the stewards sidebar list (BB-44)", () => {
       },
       { activeProjectId: "personal" },
     );
-    await waitFor(() => expect(slot.getByRole("tab", { name: "Personal" }).getAttribute("aria-selected")).toBe("true"));
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.value).toBe("personal");
     fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
     await waitFor(() => expect(slot.getByText("My notes")).toBeTruthy());
-    fireEvent.click(slot.getByRole("tab", { name: "Acme" }));
-    await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" }).getAttribute("aria-selected")).toBe("true"));
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(select.value).toBe("p1"));
+    expect(slot.inspection.navigateCalls).not.toContainEqual(expect.objectContaining({ method: "toProject" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the composer on the picked project, then closes the drawer", async () => {
+    let slot!: RenderedSlot;
+    let composeSeenAtNavigate = false;
+    const onNavigate = vi.fn(() => {
+      composeSeenAtNavigate = slot.inspection.navigateCalls.some((c) => c.method === "toCompose");
+    });
+    slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { onNavigate },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(select.value).toBe("personal"));
+    fireEvent.click(slot.getByRole("button", { name: "New thread" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "personal" } }));
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    expect(composeSeenAtNavigate).toBe(true);
     slot.lifecycle.unmount();
   });
 

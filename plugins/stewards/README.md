@@ -318,7 +318,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 ## The sidebar thread list and its toggle
 
 BB-44 registers a replacement for bb's own sidebar thread list through the
-exclusive `experimental_threadList` slot: one tab per stewarded project,
+exclusive `experimental_threadList` slot: one project dropdown,
 in-flight efforts grouped by the steward relationship, and collapsed Watches
 and Recently ended rows. BB-45 makes it switchable from where you are.
 
@@ -346,10 +346,9 @@ is left alone. The write is best-effort: a failure is logged and the sidebar
 keeps working. (`bb.onInstall` is not usable here; it does not run for
 plugins baked into the `bb-server` image.)
 
-**The Needs you block and the tab badge (BB-46).** Each tab shows a small
-count pill when the project has anything waiting on you, and the compact
-viewport's picker shows the summed count beside it and per-project counts in
-its options. Above **In flight**, a **Needs you** block lists one row per
+**The Needs you block and the picker badge (BB-46).** The project dropdown
+shows each project's count in its option label and the summed count in a small
+pill beside it. Above **In flight**, a **Needs you** block lists one row per
 item: the entity key opens the entity, one line of what, and a question's or
 `decide` item's fixed `choices` as small buttons. A choice makes the same
 write the page does (`stewardsAnswerQuestion` for a question,
