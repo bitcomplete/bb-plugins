@@ -11,9 +11,13 @@ the team's `bb` app reaches the server of the Slack user who sent it as an
 Slack conversation and posts the reply back through bb-gate-hooks, which holds
 the app's bot token. The pod never holds a Slack bot credential.
 
-Phase 1 is DMs only: the asker is always the server's owner, so the
-owner-confirmation path other people's text needs is not exercised yet. Text
-from anyone but the proven owner is still marked untrusted in the wake.
+A DM and a channel mention of the app both wake the server of the Slack user
+who sent them. A channel mention by someone other than the server's owner is
+held: no turn runs, and the plugin posts one reply asking the owner to
+`confirm <id>`. Only the owner's mention that names the id releases the held
+text into a thread. Which bb project a conversation starts in is chosen from
+the channel map (Settings → Plugins → Slack), then the channel the assistant
+pane was showing, then the `dm` entry, then the Project setting.
 
 ## Replying
 
@@ -47,5 +51,10 @@ reply per Slack message:
 - "not connected to bb-gate-hooks": the server's stream is reconnecting, or
   the server has no `BB_HOOKS_URL`. Try again, or ask the developer to check
   Settings → Plugins → Slack.
-- Settings → Plugins → Slack shows the connection as "Signed in as …". Sign
-  out forgets the token; sign in again with Sign in with Slack.
+- Settings → Plugins → Slack shows the connection as "Signed in as …" and the
+  channel map. Sign out forgets the token; sign in again with Sign in with
+  Slack.
+- "confirm r-…": a mention from anyone but the owner does not run a turn. The
+  plugin replies with the id to confirm; the owner mentions the app with
+  `confirm <id>` to release it. A vague reply while a request waits re-asks for
+  the id.

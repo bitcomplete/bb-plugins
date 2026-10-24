@@ -4,9 +4,8 @@ Talk to your own bb from Slack. One team Slack app named `bb` is installed
 once; a DM to it reaches the server of the Slack user who sent it, which runs
 a bb thread and replies in the same Slack thread.
 
-Phase 1 is DMs only. Channel mentions and per-message "Alice's bb" naming are
-a later step; they bring in other people's text and need the owner's
-confirmation path first.
+A DM and a channel mention of the app both reach the server of the Slack user
+who sent them. Per-message "Alice's bb" naming is a later step.
 
 ## How it fits together
 
@@ -43,7 +42,18 @@ on the pod.
 | Setting | What it is |
 |---|---|
 | Slack sign-in token | Filled in by Sign in with Slack. A secret; do not edit or paste by hand. |
-| Project | Which bb project a Slack conversation starts its thread in. Empty uses the personal project, or the first project when this server has none. |
+| Project | The bb project a Slack conversation starts its thread in when the channel map has no entry for it. Empty uses the personal project, or the first project when this server has none. |
+| Channel map | A JSON array of `{"channel":"C…","project":"name"}` entries. A channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry; the reserved key `dm` is a direct message with the app. A channel or DM with no entry uses the Project above. The settings page edits the same map as a list. |
+
+A DM typed while the assistant pane is showing a mapped channel uses that
+channel's project: the plugin remembers the latest
+`assistant_thread_context_changed` channel per DM conversation and consults it
+before the `dm` entry. Context is read only when a thread is started; an
+existing Slack thread keeps its bb thread.
+
+Words from anyone but the owner never run a turn. A channel mention by someone
+else is held under a short id and the owner releases it by replying
+`confirm <id>`; only then does the text reach a bb thread.
 
 **Sign out** forgets the token and reconnects the stream, so the service drops
 the identity bound to the old connection.
@@ -60,3 +70,12 @@ signing secret, bot token or OAuth client secret; they are sealed with
 | Tool | What it does |
 |---|---|
 | `slack_reply` | Post the one reply on the Slack conversation that woke this thread. The service holds the bot token; the request carries only the connection id and the text. |
+
+## Other people's text
+
+The map decides where a thread starts, not whose words it trusts. A channel
+mention by someone other than the server's owner is parked (no turn runs) and
+the plugin posts one reply asking the owner to `confirm <id>`; a mention by the
+owner that names the id releases exactly one held message into the thread. A
+vague owner reply while requests wait re-asks for the id instead of running a
+turn.
