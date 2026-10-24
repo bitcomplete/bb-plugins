@@ -1270,12 +1270,27 @@ component joins them to `experimental_useSidebarThreads` and polls
 `thread-list/thread-list`". Registering the slot therefore makes the stewards
 list active on every client that has not pinned a provider, and
 `bb settings ui get sidebar.threadListProvider` on the dev server reads
-`__automatic__`. **This PR must not land alone:** it lands with the toggle
-ticket, whose server-side pin keeps bb's own list for clients that have not
-opted in. Until that lands, the list is opt-in only in code, not in effect.
+`__automatic__`. **The guard was needed:** without it the list would win by
+default. On load the plugin (`server.ts`, `pinSidebarThreadListProvider`)
+reads the preference and, when it is unset or `__automatic__`, sets it to
+`thread-list/thread-list`; an explicit value is left alone, and a failure is
+logged, never thrown. `bb.onInstall` is not usable here — it does not run for
+plugins baked into the `bb-server` image — so the pin is on load. BB-44 and
+BB-45 are one landing; BB-44 must not land alone.
 
-The "Needs you" block and the tab badge are a separate ticket, as is the
-footer toggle.
+**The footer toggle (BB-45).** `app.tsx` registers a
+`experimental_sidebarFooter` disclosure (`id: "sidebar"`, `icon:
+"ShieldCheck"`): a switch that writes the same preference. On sets
+`<pluginId>/sidebar`, the id BB-44 registers; off sets
+`thread-list/thread-list`. It lists the preference when the disclosure opens
+and, on an HTTP 409 revision conflict, re-lists and retries once with the
+fresh revision. `__automatic__` (or a missing entry) reads as on, because it
+means the stewards list is the effective provider until the pin makes the
+choice explicit. The preference is server-synced, so a flip is per server:
+every window of one bb server shows the same list. Each developer has their
+own server behind bb-gate, so it is per developer in practice.
+
+The "Needs you" block and the tab badge are a separate ticket.
 
 ## Known limits
 

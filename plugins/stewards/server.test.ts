@@ -37,6 +37,10 @@ function world() {
   /** Each thread's latest context window reading, as bb reports it. */
   const usage = new Map<string, number>();
   const metadata = new Map<string, Record<string, unknown>>();
+  /** The fake server's UI preferences, keyed by preference key. */
+  const uiPreferences = new Map<string, { value: unknown; revision: number }>([["sidebar.threadListProvider", { value: "__automatic__", revision: 0 }]]);
+  /** Every `system.uiPreferences.set` the plugin made, for the load-time pin's tests. */
+  const uiPreferencesWrites: Array<{ key: string; value: unknown; expectedRevision: number }> = [];
   const spawns: Array<Record<string, unknown> & { id: string }> = [];
   const sends: Array<{ threadId: string; text: string }> = [];
   const userTurns: Array<{ threadId: string; text: string }> = [];
@@ -224,13 +228,34 @@ function world() {
               : userTurns.filter((t) => t.threadId === threadId).map((t, i) => ({ id: `e${i}`, seq: i, threadId, createdAt: now, scope: "thread", type: "client/turn/start", data: { initiator: "user", request: { method: "turn/start", params: { input: [{ type: "text", text: t.text }] } } } })),
       },
     },
+    system: {
+      uiPreferences: {
+        list: async () => ({ preferences: Object.fromEntries([...uiPreferences].map(([key, entry]) => [key, { ...entry }])) }),
+        set: async (args: { key: string; value: unknown; expectedRevision: number }) => {
+          const current = uiPreferences.get(args.key);
+          if (current !== undefined && current.revision !== args.expectedRevision) throw Object.assign(new Error(`revision conflict for ${args.key}`), { status: 409 });
+          const next = { value: args.value, revision: (current?.revision ?? 0) + 1 };
+          uiPreferences.set(args.key, next);
+          uiPreferencesWrites.push({ ...args });
+          return { key: args.key, ...next };
+        },
+      },
+    },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
-async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}) {
+async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
   const w = world();
+  if (seedProvider === null) w.uiPreferences.delete("sidebar.threadListProvider");
+  else if (seedProvider === "fail-list") w.sdk.system.uiPreferences.list = async () => {
+    throw new Error("the preferences store is down");
+  };
+  else if (seedProvider === "fail-set") w.sdk.system.uiPreferences.set = async () => {
+    throw new Error("the preferences store is down");
+  };
+  else if (seedProvider !== undefined) w.uiPreferences.set("sidebar.threadListProvider", { value: seedProvider, revision: 4 });
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"], settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
@@ -4811,5 +4836,36 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     await t.flush();
     expect(t.hooks.store.project("p1").sectionId).toBe("sec_1");
     expect(instructions()).not.toContain("--section");
+  });
+});
+
+// BB-45: BB-44's dev-server check found that an unset `sidebar.threadListProvider`
+// resolves to the stewards list, so the plugin pins bb's own list on load and
+// leaves any explicit choice alone.
+describe("the load-time sidebar thread-list pin (BB-45)", () => {
+  it("pins bb's own list when the preference is unset or automatic", async () => {
+    const unset = await setup({}, {}, null);
+    expect(unset.uiPreferences.get("sidebar.threadListProvider")).toMatchObject({ value: "thread-list/thread-list" });
+    expect(unset.uiPreferencesWrites).toEqual([{ key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 0 }]);
+
+    const automatic = await setup({}, {}, "__automatic__");
+    expect(automatic.uiPreferences.get("sidebar.threadListProvider")).toMatchObject({ value: "thread-list/thread-list" });
+    expect(automatic.uiPreferencesWrites).toEqual([{ key: "sidebar.threadListProvider", value: "thread-list/thread-list", expectedRevision: 4 }]);
+  });
+
+  it("leaves an explicit provider alone, including the stewards list", async () => {
+    for (const value of ["thread-list/thread-list", "stewards/sidebar"]) {
+      const t = await setup({}, {}, value);
+      expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value, revision: 4 });
+      expect(t.uiPreferencesWrites).toEqual([]);
+    }
+  });
+
+  it("logs and carries on when the preference cannot be read or written", async () => {
+    for (const seed of ["fail-list", "fail-set"] as const) {
+      const t = await setup({}, {}, seed);
+      expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value: "__automatic__", revision: 0 });
+      expect(t.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("could not pin the sidebar thread list"))).toBe(true);
+    }
   });
 });

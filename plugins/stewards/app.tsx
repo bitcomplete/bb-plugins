@@ -13,9 +13,11 @@ import {
   experimental_Icon as Icon,
   experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
   experimental_ThreadStatusGlyph as ThreadStatusGlyph,
+  experimental_usePluginId,
   experimental_useSidebarThreads,
   useBbNavigate,
   useRpc,
+  useSdk,
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
   type PluginSidebarThread,
@@ -1062,6 +1064,117 @@ function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: Plu
   );
 }
 
+// ---- The sidebar-footer toggle -----------------------------------------------------------------
+//
+// BB-45: an icon in the sidebar footer that opens a small panel above the
+// footer row with a switch for the stewards list BB-44 registers. The footer
+// is host-rendered and stays in place under either list, so the toggle is
+// reachable in both states. The preference it writes is the one Settings →
+// Appearance → Sidebar sets; the value is the plugin id plus the `sidebar`
+// slot id BB-44 registers.
+
+/** The value that turns the stewards list on (BB-44's `experimental_threadList` slot). */
+function stewardsThreadListId(pluginId: string): string {
+  return `${pluginId}/sidebar`;
+}
+/** bb's bundled thread list: the value that turns the stewards list off. */
+const BUILTIN_THREAD_LIST_ID = "thread-list/thread-list";
+/** What `sidebar.threadListProvider` reads while nothing is pinned. */
+const AUTOMATIC_THREAD_LIST_PROVIDER = "__automatic__";
+const THREAD_LIST_PROVIDER_KEY = "sidebar.threadListProvider";
+
+/** bb answers a stale `expectedRevision` with HTTP 409. */
+function isRevisionConflict(error: unknown): boolean {
+  const status = typeof error === "object" && error !== null && "status" in error ? (error as { status?: unknown }).status : null;
+  return status === 409 || /\bHTTP\s*409\b/u.test(String(error));
+}
+
+type ThreadListProviderState = { status: "loading" } | { status: "ready"; on: boolean; revision: number } | { status: "error"; message: string };
+
+/**
+ * The disclosure's body: a switch that writes `sidebar.threadListProvider`.
+ * The preference is read when the disclosure opens (the component mounts) and
+ * again after a conflict. `__automatic__` (the value while nothing is pinned)
+ * means bb picks the stewards list, so it reads as on until the load-time pin
+ * has made the choice explicit.
+ */
+function SidebarToggle() {
+  const sdk = useSdk();
+  const pluginId = experimental_usePluginId();
+  const onId = stewardsThreadListId(pluginId);
+  const [state, setState] = useState<ThreadListProviderState>({ status: "loading" });
+  const [busy, setBusy] = useState(false);
+
+  const read = useCallback(async (): Promise<{ on: boolean; revision: number }> => {
+    const { preferences } = await sdk.system.uiPreferences.list();
+    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
+    const value = entry?.value;
+    return { on: value === onId || value === undefined || value === AUTOMATIC_THREAD_LIST_PROVIDER, revision: entry?.revision ?? 0 };
+  }, [sdk, onId]);
+
+  useEffect(() => {
+    let live = true;
+    read().then(
+      (next) => {
+        if (live) setState({ status: "ready", ...next });
+      },
+      (error: unknown) => {
+        if (live) setState({ status: "error", message: message(error) });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [read]);
+
+  const flip = useCallback(async () => {
+    if (state.status !== "ready" || busy) return;
+    const next = !state.on;
+    const value = next ? onId : BUILTIN_THREAD_LIST_ID;
+    setBusy(true);
+    try {
+      let revision: number;
+      try {
+        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: state.revision })).revision;
+      } catch (error) {
+        // Another window changed the preference between our list and our set:
+        // re-list and retry once with the fresh revision. Anything else is a
+        // real failure.
+        if (!isRevisionConflict(error)) throw error;
+        const fresh = await read();
+        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: fresh.revision })).revision;
+      }
+      setState({ status: "ready", on: next, revision });
+    } catch (error) {
+      setState({ status: "error", message: message(error) });
+    } finally {
+      setBusy(false);
+    }
+  }, [state, busy, onId, read, sdk]);
+
+  const on = state.status === "ready" && state.on;
+  return (
+    <div className="flex flex-col gap-1 p-2 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium">Stewards sidebar</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={on}
+          aria-label="Stewards sidebar"
+          disabled={state.status !== "ready" || busy}
+          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors disabled:opacity-50 ${on ? "border-success bg-success/70" : "border-input bg-state-hover"}`}
+          onClick={() => void flip()}
+        >
+          <span aria-hidden="true" className={`absolute top-0.5 size-3.5 rounded-full bg-background transition-all ${on ? "left-4" : "left-0.5"}`} />
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground">Show the stewards list of threads grouped by project and effort. Off shows bb's own list.</p>
+      {state.status === "error" ? <p className="text-xs text-destructive">Could not change the sidebar: {state.message}</p> : null}
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "board",
@@ -1077,6 +1190,15 @@ export default definePluginApp((app) => {
     title: "Stewards",
     description: "Threads grouped by project and in-flight effort, with stages, workers and reviewers.",
     component: StewardsSidebar,
+  });
+  // The footer disclosure that writes the provider preference, so the list
+  // above can be turned on and off without Settings → Appearance.
+  app.experimental_sidebarFooter.register({
+    kind: "disclosure",
+    id: "sidebar",
+    label: "Stewards sidebar",
+    icon: "ShieldCheck",
+    component: SidebarToggle,
   });
   app.slots.settingsSection({
     id: "status",
