@@ -138,8 +138,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   stays addressable, so a later wake can reach it. It is made visible again
   when it needs you (the report puts you next, an escalation is open, or a
   question is unanswered) and stays hidden across "nothing changed" wakes.
-  Hiding does not cascade to its workers, so a worker in flight is no reason
-  to keep it visible; binding end still archives.
+  Hiding cascades to its finished workers and their reviewers, so no row is
+  left behind without its steward; a running worker is unaffected, and
+  showing the steward again shows them. Binding end still archives.
+- **Finished workers and reviewers.** A worker whose turn ends is marked
+  `finished`; once the reconcile that consumed its report has woken the
+  steward, its thread is archived, so the sidebar keeps only work in flight.
+  A worker that ended with a question for the steward stays visible until it
+  is answered. A reviewer is archived once its round is consumed — the
+  worker's next turn ends, or a newer round reviewer is spawned for the same
+  worker — and the newest reviewer for a worker is never archived while that
+  worker is in flight. A later message to an archived worker unarchives it,
+  and it shows under its effort again.
 - **thread-briefs.** Every steward, the project steward included, is
   spawned with `threadBriefs: { rename: false, group: false, archive: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
@@ -157,12 +167,16 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   that, a project steward renamed by hand keeps its name.
 - **The sidebar and the unread dot.** A steward is put in its project's
   section when it is spawned, and a worker or reviewer the plugin did not
-  place is filed there by the `thread.created` handler. The unread dot
+  place is filed there by the `thread.created` handler. A finished worker
+  leaves the sidebar once its report is consumed, and a consumed reviewer
+  once its round is; a waiting steward's finished workers and their reviewers
+  hide with it and come back when it does. The unread dot
   means "needs you": a report that waits on someone else, with no
   escalation, question or needs item, is marked read. A report that needs
   you is left unread.
 - **Workers** are top-level threads with their own checkout, one per bounded
-  task, owned by their steward through `--lifecycle-owner-thread`. They do
+  task, owned by their steward through `--lifecycle-owner-thread`. A reviewer
+  is a child of the worker that started it, one per review round. Workers do
   not nest under their steward's sidebar row: bb's list trees by parent
   thread, not by lifecycle owner, so they show loose; whether it should tree
   by lifecycle owner too is a core question. A runaway guard stops a

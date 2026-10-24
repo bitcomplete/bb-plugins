@@ -68,7 +68,7 @@ import {
   type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { ACTORS, MIGRATIONS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
+import { ACTORS, MIGRATIONS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
@@ -933,7 +933,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; sectionId: string | null };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; visibility: string | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; sectionId: string | null };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
@@ -944,6 +944,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           status: String(t.status ?? "idle"),
           archivedAt: t.archivedAt ?? null,
           deletedAt: t.deletedAt ?? null,
+          visibility: t.visibility === undefined ? null : String(t.visibility),
           environmentId: t.environmentId ?? null,
           // The SDK's thread carries its machine on `environment`, not at the top level.
           environmentHostId: t.environment?.hostId ?? t.environmentHostId ?? null,
@@ -1204,6 +1205,94 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The worker a thread is a child of, if any. A reviewer is spawned with
+     * its worker as parent (`--parent-self`, what build-tickets uses) or as
+     * lifecycle owner; either way its parent is the worker, not the steward.
+     * Null for a worker itself and for anything else.
+     */
+    function reviewerOwner(thread: { lifecycleOwnerThreadId: string | null; parentThreadId: string | null }): Worker | null {
+      for (const id of [thread.parentThreadId, thread.lifecycleOwnerThreadId]) {
+        if (id === null) continue;
+        const w = store.worker(id);
+        if (w !== null) return w;
+      }
+      return null;
+    }
+
+    /** A worker's reviewer threads, as bb lists them: its children, hidden or not, not archived. */
+    async function reviewersOf(workerThreadId: string): Promise<Array<{ id: string; status: string }>> {
+      const children = await bb.sdk.threads.list({ parentThreadId: workerThreadId, includeHidden: true }).catch(() => []);
+      return children.filter((c) => c.archivedAt === null).map((c) => ({ id: c.id, status: String(c.status) }));
+    }
+
+    /**
+     * Archive a reviewer whose round is consumed. A worker's turn ending means
+     * it has read the verdict (or ended the turn that spawned the reviewer to
+     * wait); a reviewer still running is left alone, so the newest round is
+     * never archived while its worker is in flight (BB-47).
+     */
+    async function archiveConsumedReviewers(workerThreadId: string): Promise<void> {
+      for (const r of await reviewersOf(workerThreadId)) {
+        if (busy(r.status)) continue;
+        await quietly(`archive consumed reviewer ${r.id}`, () => bb.sdk.threads.archive({ threadId: r.id }));
+      }
+    }
+
+    /** A newer reviewer round supersedes the older ones: archive every other child of the worker. */
+    async function supersedeOlderReviewers(workerThreadId: string, keep: string): Promise<void> {
+      for (const r of await reviewersOf(workerThreadId)) {
+        if (r.id === keep) continue;
+        await quietly(`archive superseded reviewer ${r.id}`, () => bb.sdk.threads.archive({ threadId: r.id }));
+      }
+    }
+
+    /**
+     * Archive a finished worker once the reconcile that consumed its report
+     * has run, so its row leaves the sidebar with the steward's next turn. A
+     * worker that ended with a question for the steward, or whose binding
+     * needs the user, stays visible; a later message to an archived worker
+     * unarchives it (sendTo), and it shows under its effort again (BB-47).
+     */
+    async function archiveFinishedWorkers(b: Binding): Promise<void> {
+      if (needsUser(b)) return;
+      for (const w of store.workers(b.id)) {
+        if (w.status !== "finished" || workerQuestion(w.result) !== null) continue;
+        const info = await threadInfo(w.threadId).catch(() => null);
+        if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
+        await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
+      }
+    }
+
+    /** Set a thread's sidebar visibility, unless it is archived, gone, or already there. */
+    async function setVisibility(threadId: string, visibility: "hidden" | "visible"): Promise<void> {
+      const info = await threadInfo(threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null || info.archivedAt !== null || info.visibility === visibility) return;
+      await quietly(`${visibility === "hidden" ? "hide" : "show"} ${threadId}`, () => bb.sdk.threads.update({ threadId, visibility }));
+    }
+
+    /**
+     * A waiting steward's finished workers and their reviewers share its
+     * visibility: hidden with it, and shown again when it comes back. Running
+     * workers are unaffected (BB-47).
+     */
+    async function cascadeVisibility(b: Binding, visibility: "hidden" | "visible"): Promise<void> {
+      for (const w of store.workers(b.id)) {
+        if (visibility === "hidden" && w.status !== "finished") continue;
+        await setVisibility(w.threadId, visibility);
+        for (const r of await reviewersOf(w.threadId)) await setVisibility(r.id, visibility);
+      }
+    }
+
+    /** Show a steward, and with it the finished workers and reviewers that were hidden with it. */
+    async function showSteward(b: Binding): Promise<void> {
+      if (b.threadId === null) return;
+      const info = await threadInfo(b.threadId).catch(() => null);
+      const wasHidden = info !== null && info.visibility === "hidden";
+      await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId: b.threadId!, visibility: "visible" }));
+      if (wasHidden) await cascadeVisibility(b, "visible");
+    }
+
+    /**
      * Keep the project steward's title on its project's name, and tag it. A
      * title someone else put there is left alone: only one still showing what
      * this plugin last wrote is updated, or one this plugin never titled (the
@@ -1416,8 +1505,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // sendTo queues the wake for the next idle.
       await compactIfLarge(b.threadId, text.length);
       // A wake that needs the user brings a hidden steward back into the
-      // sidebar; a scheduled look that found nothing leaves it hidden.
-      if (needsUser(b)) await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId: b.threadId!, visibility: "visible" }));
+      // sidebar, with the finished workers and reviewers that were hidden with
+      // it; a scheduled look that found nothing leaves it hidden.
+      if (needsUser(b)) await showSteward(b);
       const sent = await sendTo(b.threadId, text);
       if (sent === "gone") {
         // The user deleted the thread: that is a detach they meant.
@@ -1429,7 +1519,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** Wake the steward, spawning its thread on the first wake. */
-    async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<void> {
+    async function wake(b: Binding, config: ProjectConfig, playbook: Playbook, observed: Observed, changes: string[], reason: WakeReason): Promise<boolean> {
       const gate = gateState(playbook, b.ready, specHashFor(b, observed.entity));
       const workerQuestions = await collectWorkerQuestions(b);
       const text = formatWake({
@@ -1457,7 +1547,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         conflicts: conflictsOf(b, store.open(b.projectId)),
         now: now(),
       });
-      if (!(await deliverWake(b, config, playbook, text))) return;
+      if (!(await deliverWake(b, config, playbook, text))) return false;
       const cursor = newestCommentAt(observed);
       store.patch(b.id, {
         awaitingReport: true,
@@ -1469,6 +1559,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // A fallback until the report names its own.
         requeueAt: now() + playbook.requeueDefaultMs,
       });
+      return true;
     }
 
     /**
@@ -1640,7 +1731,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (reason !== null && reason !== "changed") store.note(b.id, `Due: ${reason}`);
         return;
       }
-      await wake(b, config, playbook, observed, lines, reason ?? (followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"));
+      // The steward now has the workers' reports: archive the finished ones
+      // that do not need it to stay visible (BB-47). Only once the wake was
+      // delivered, so a failed send keeps the worker for the retry.
+      if (await wake(b, config, playbook, observed, lines, reason ?? (followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"))) await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     // ---- ops bindings ----------------------------------------------------------------------------
@@ -1875,6 +1969,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       if (!(await deliverWake(b, config, playbook, text))) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      // The steward now has the workers' reports: archive the finished ones (BB-47).
+      await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     /** The same turn for a Dependabot alert target: re-list the open alerts and wake on what changed. */
@@ -1929,6 +2025,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       if (!(await deliverWake(b, config, playbook, text))) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      // The steward now has the workers' reports: archive the finished ones (BB-47).
+      await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     // ---- Sentry targets ----------------------------------------------------------------------------
@@ -2119,6 +2217,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       if (!(await deliverWake(b, config, playbook, text))) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      // The steward now has the workers' reports: archive the finished ones (BB-47).
+      await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     // The subscriber: one stream to bb-gate-hooks for the `sentry` source,
@@ -3080,6 +3180,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await placeOnce(spawned.projectId, { id: thread.id, sectionId: thread.sectionId ?? null });
         await tagThread(thread.id, STEWARD_BRIEFS);
       }
+      // A reviewer is a child of a worker. The newest round supersedes the
+      // older ones, so they are archived as it is created (BB-47).
+      const reviewerOf = reviewerOwner(thread);
+      if (reviewerOf !== null) await supersedeOlderReviewers(reviewerOf.threadId, thread.id);
       const owner = [thread.lifecycleOwnerThreadId, thread.parentThreadId].map((t) => (t === null ? null : store.byThread(t))).find((b) => b !== null && b !== undefined && b.endedAt === null);
       if (owner === undefined || owner === null || store.worker(thread.id) !== null) return;
       const limit = (await settings.get()).workerSpawnsPerHour;
@@ -3103,6 +3207,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (worker.status === "stopped") return;
         store.setWorker(thread.id, "finished", lastAssistantText === null ? null : clip(lastAssistantText, 4000));
         closeRequesterNeed(thread.id);
+        // Its turn is over: the reviewers it read (or started and then waited
+        // on) have had their round consumed (BB-47).
+        await archiveConsumedReviewers(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
         store.note(b.id, `Worker "${worker.title}" finished its turn.`);
@@ -3166,9 +3273,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * out of the sidebar's organisation and unread attention while remaining
      * addressable; the binding stays, and the next wake brings it back
      * (deliverWake). Not while anything needs the user — an open escalation, a
-     * question, or a needs item — which they should still see. Unlike the
-     * archive it replaced, hiding does not cascade to the steward's workers, so
-     * a worker in flight is no reason to keep it visible (BB-14/BB-17).
+     * question, or a needs item — which they should still see. The finished
+     * workers and their reviewers are hidden with it, so a row without its
+     * steward is not left behind; a running worker is unaffected, and showing
+     * the steward again shows them (BB-47).
      */
     async function hideWaiting(b: Binding): Promise<void> {
       store.patch(b.id, { archiveWhenIdle: false });
@@ -3177,6 +3285,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(b.threadId).catch(() => null);
       if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) return;
       await quietly(`hide ${b.entityKey}'s waiting steward`, () => bb.sdk.threads.update({ threadId: info.id, visibility: "hidden" }));
+      await cascadeVisibility(b, "hidden");
       bb.log.info(`stewards: ${b.entityKey} waits on others; hid its steward until the next wake`);
     }
 
@@ -4332,7 +4441,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // terminal ending archives the thread, so there is no read state to
           // set.
           if (b.ending !== "terminal") {
-            if (needsUser(b)) await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId, visibility: "visible" }));
+            if (needsUser(b)) await showSteward(b);
             else await quietly(`mark ${b.entityKey}'s steward read`, () => bb.sdk.threads.markRead({ threadId }));
           }
           if (moved && b.parentBindingId !== null) {

@@ -339,13 +339,13 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     const model = over.model === undefined ? "claude-opus-5-5" : over.model;
     const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
     const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
   const createdOwned = async (id: string, owner: string, title = "Implement", sectionId: string | null = null) => {
-    w.threads.set(id, { status: "active", archivedAt: null, parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code", sectionId }) });
     await flush();
   };
@@ -1414,7 +1414,9 @@ describe("terminal states and follow-through", () => {
     await t.idle(t.steward);
     expect((await t.list())[0]).toMatchObject({ ended: true });
     expect(t.stops()).toEqual(["thr_w1", "thr_w2"]);
-    expect(t.archives()).toEqual([t.steward]);
+    // thr_w1 finished and its report was consumed by the follow-through wake,
+    // so it was archived then; the steward archives at the binding's end.
+    expect(t.archives()).toEqual(["thr_w1", t.steward]);
   });
 
   it("ends a follow-through that runs out, stopping its workers and telling the project steward", async () => {
@@ -1887,6 +1889,110 @@ describe("stewards waiting on others", () => {
     expect(gone).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
     expect(gone).toMatch(/Its thread is gone/u);
     expect(gone).toMatch(/start a fresh worker/u);
+  });
+});
+
+describe("archiving finished workers and reviewers (BB-47)", () => {
+  it("archives a reviewer once its worker's next turn ends, but not while its round is running", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.created("thr_r1", "thr_w1", "Review round 1");
+
+    // The worker ends its turn to wait on the reviewer, which is still
+    // running: its round is not consumed, so it stays.
+    t.threads.get("thr_r1")!.status = "active";
+    await t.idle("thr_w1", "Should I wait for the reviewer?");
+    expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
+
+    // The reviewer has finished and the worker's next turn ends: the round is
+    // consumed and the reviewer leaves the sidebar.
+    t.threads.get("thr_r1")!.status = "idle";
+    await t.idle("thr_w1", "Addressed the review and pushed.");
+    expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+  });
+
+  it("archives the older reviewer when a newer round is spawned, and never the newest while its worker is in flight", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.created("thr_r1", "thr_w1", "Review round 1");
+    expect(t.threads.get("thr_w1")!.status).toBe("active");
+    await t.created("thr_r2", "thr_w1", "Review round 2");
+    expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_r2")!.archivedAt).toBeNull();
+  });
+
+  it("archives a finished worker after the reconcile that consumed its report, unless it needs the user", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Implemented the fix.");
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+
+    // A worker that ended with a question for the steward stays, so the
+    // steward can answer it.
+    await t.created("thr_w2", steward);
+    await t.idle("thr_w2", "Should I file a follow-up?");
+    expect(t.threads.get("thr_w2")!.archivedAt).toBeNull();
+  });
+
+  it("unarchives a finished worker when the plugin messages it, so it shows under its effort again", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Implemented the fix.");
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
+
+    // An escalation the worker raised is answered: the plugin tells it through
+    // sendTo, which brings an archived thread back first.
+    const b = t.hooks.store.find("ENG-12")!;
+    const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
+    t.hooks.store.resolve(x.id, "The second one.", "user");
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
+    expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/The second one\./u);
+  });
+
+  it("hides a waiting steward's finished workers and their reviewers with it, and shows them again", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.created("thr_w2", steward);
+    await t.created("thr_r1", "thr_w1", "Review round 1");
+    // thr_w1 is finished (it asked a question, so it stays visible), its
+    // reviewer is still running, and thr_w2 is still running.
+    await t.idle("thr_w1", "Should I keep the reviewer open?");
+
+    await t.tool("steward_report", { phase: "In Progress", summary: "Implemented.", nextAction: "Wait for the worker", actor: "other", blockedOn: "the worker" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+    expect(t.threads.get("thr_w1")!.visibility).toBe("hidden");
+    expect(t.threads.get("thr_r1")!.visibility).toBe("hidden");
+    // A running worker is unaffected.
+    expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
+
+    // A wake that needs the user brings the steward back, and them with it.
+    const b = t.hooks.store.byThread(steward)!;
+    t.hooks.store.patch(b.id, { status: { ...b.status!, actor: "me" } });
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+    expect(t.threads.get("thr_w1")!.visibility).toBe("visible");
+    expect(t.threads.get("thr_r1")!.visibility).toBe("visible");
+    expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
   });
 });
 

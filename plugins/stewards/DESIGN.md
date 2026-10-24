@@ -106,7 +106,8 @@ These were settled while designing; each changes what gets built.
   Stewards pin nothing and create no sidebar sections. A finished steward
   says so in its last turn and the plugin archives it when the binding ends;
   a later wake brings it back. A steward waiting on someone else is
-  hidden between wakes too (§5, "Waiting"). thread-briefs is asked,
+  hidden between wakes too, and its finished workers and their reviewers are
+  hidden with it (§5, "Waiting"). thread-briefs is asked,
   through each thread's metadata, not to archive or rename stewards and not
   to group the project steward: between wakes a steward reads done while
   its entity is still open, and its title carries the entity key. (This
@@ -270,10 +271,12 @@ plugins.
   stays addressable, and the next wake reaches it. It is made visible again
   when it needs the user — the report puts the user next, an escalation is
   open, a question is unanswered, or a needs item is on the Stewards page —
-  and stays hidden across "nothing changed" wakes. Hiding does not cascade to
-  the workers, so a worker in flight is no reason to keep the steward
-  visible; the open-escalation rule stays. A report that needs nobody is also
-  marked read (`threads.markRead`), so the unread dot means "needs you";
+  and stays hidden across "nothing changed" wakes. Hiding cascades to the
+  steward's finished workers and their reviewers, so a row is not left
+  behind without its steward; a running worker is unaffected, and showing the
+  steward again shows them. The open-escalation rule stays. A report that
+  needs nobody is also marked read (`threads.markRead`), so the unread dot
+  means "needs you";
   binding end still archives the thread. Workers stay lifecycle-owned: they
   are the steward's children in bb, and the plugin stops them explicitly only
   when the binding ends (a detach, or a terminal state without
@@ -283,6 +286,16 @@ plugins.
   anything else; a worker archived since it asked is brought back on that
   wake so the tell reaches it, and a worker whose thread is gone is reported
   as gone, needing a fresh one.
+- **Finished workers and reviewers.** A worker's turn ending marks it
+  `finished`; once the reconcile that consumed its report has woken the
+  steward, its thread is archived, so the sidebar keeps only work in flight.
+  A worker that ended with a question for the steward stays visible until it
+  is answered, and so does a worker whose binding needs the user. A reviewer
+  is archived once its round is consumed — the worker's next turn ends, or a
+  newer round reviewer is spawned for the same worker — and the newest
+  reviewer for a worker is never archived while that worker is in flight.
+  Messaging an archived worker unarchives it first (`sendTo`), and it shows
+  under its effort again.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
 
@@ -513,6 +526,9 @@ gets a review steward.
 - **Rounds.** For each round the review steward starts a review worker on the
   pull request head with fresh context and the playbook's review instructions.
   The worker returns findings; the steward posts them as your review, signed.
+  A reviewer thread is archived once its round is consumed — the worker's
+  next turn ends, or a newer round reviewer is spawned for the same worker —
+  so six rounds do not leave six rows in the sidebar (§5).
 - **Later rounds** — new pushes after your review, or a re-request — cover only
   what changed since your last review.
 - **Reviews post without asking, approvals included.** The review steward
@@ -743,13 +759,18 @@ follow-through: 6h                # how long a terminal binding may be kept open
   owner. Whether it should tree by lifecycle owner too is a core question,
   not worked around here. The `thread.created` handler files any unsectioned
   worker or reviewer into the owner's project section, so a skill that
-  builds its own spawn command lands there too.
+  builds its own spawn command lands there too. A finished worker's thread is
+  archived once the reconcile that consumed its report has woken the steward,
+  and a reviewer once its round is consumed, so a long-running binding does
+  not leave its finished rows loose (§5).
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. A steward waiting on someone
   else is hidden (`threads.update { visibility: "hidden" }`), not archived,
-  so it leaves the sidebar but stays addressable; a wake that needs you makes
-  it visible again, and the unread dot is cleared after a report that needs
-  nobody. Ended bindings are archived by this plugin, not by thread-briefs.
+  so it leaves the sidebar but stays addressable; its finished workers and
+  their reviewers are hidden with it, and a wake that needs you makes them
+  visible again. A running worker is not hidden. The unread dot is cleared
+  after a report that needs nobody. Ended bindings are archived by this
+  plugin, not by thread-briefs.
 
 ## 16. Architecture
 
