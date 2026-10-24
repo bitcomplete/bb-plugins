@@ -2460,6 +2460,65 @@ describe("questions to the user", () => {
   });
 });
 
+describe("the stewards sidebar call", () => {
+  type Sidebar = {
+    projects: Array<{
+      projectId: string;
+      name: string;
+      projectStewardThreadId: string | null;
+      bindings: Array<{
+        key: string;
+        kind: string;
+        stage: string | null;
+        threadId: string | null;
+        hold: string | null;
+        blockedOn: string | null;
+        needsUser: boolean;
+        advancedAt: number | null;
+        workers: Array<{ threadId: string; title: string }>;
+        reviewers: Array<{ threadId: string; workerThreadId: string }>;
+      }>;
+      ended: Array<{ key: string; kind: string; threadId: string | null; title: string | null; endedAt: number }>;
+    }>;
+  };
+
+  it("returns every stewarded project's bindings, workers and reviewers, the project steward and what ended", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "Implement retry");
+    await t.created("thr_r1", "thr_w1", "Review the pull request");
+
+    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
+    expect(result.projects).toMatchObject([{ projectId: "p1", name: "Acme", projectStewardThreadId: project }]);
+    expect(result.projects[0]!.bindings).toMatchObject([
+      {
+        key: "ENG-12",
+        kind: "ticket",
+        threadId: steward,
+        needsUser: false,
+        workers: [{ threadId: "thr_w1", title: "Implement retry" }],
+        reviewers: [{ threadId: "thr_r1", workerThreadId: "thr_w1" }],
+      },
+    ]);
+    expect(result.projects[0]!.ended).toEqual([]);
+  });
+
+  it("lists an ended binding in `ended` and drops it from the bindings", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const binding = t.hooks.store.find("ENG-12")!;
+    t.hooks.store.patch(binding.id, { endedAt: t.now(), endReason: "merged" });
+
+    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
+    expect(result.projects[0]!.bindings).toEqual([]);
+    expect(result.projects[0]!.ended).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
+    expect(result.projects[0]!.ended[0]!.endedAt).toBe(t.now());
+  });
+});
+
 describe("needs you items", () => {
   const client = { experimental_caller: { kind: "client" } } as const;
   const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };

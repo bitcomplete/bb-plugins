@@ -341,6 +341,37 @@ export const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
+  // The sidebar thread list's one call: every stewarded project's bindings,
+  // their workers and known reviewers, the project steward, and what ended.
+  // One call for all projects, so a replaced sidebar does not refetch per tab.
+  stewardsSidebar: {
+    input: z.null(),
+    output: z.object({
+      projects: z.array(
+        z.object({
+          projectId: z.string(),
+          name: z.string(),
+          projectStewardThreadId: z.string().nullable(),
+          bindings: z.array(
+            z.object({
+              key: z.string(),
+              kind: z.string(),
+              stage: z.string().nullable(),
+              threadId: z.string().nullable(),
+              hold: z.string().nullable(),
+              blockedOn: z.string().nullable(),
+              needsUser: z.boolean(),
+              advancedAt: z.number().nullable(),
+              workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
+              /** Reviewer threads, each under the worker it reviews. */
+              reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })),
+            }),
+          ),
+          ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), endedAt: z.number() })),
+        }),
+      ),
+    }),
+  },
   // The user closes a question from the page, with or without an answer, or
   // picks one of its fixed choices.
   stewardsAnswerQuestion: {
@@ -3527,6 +3558,57 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             stuck: stuck.map(({ b, why, since }) => ({ key: b.entityKey, url: b.url, threadId: b.threadId, why, since })),
             ended: ended.map((b) => ({ key: b.entityKey, url: b.url, title: b.title, kind: b.kind, endReason: b.endReason, endedAt: b.endedAt!, threadId: b.threadId })),
           },
+        };
+      },
+      // The sidebar's one call: every stewarded project's bindings, their
+      // workers, and the reviewers known under them. One `threads.list` per
+      // worker finds the reviewers; everything else is the store's own records.
+      async stewardsSidebar() {
+        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
+        const projects = projectIds((await stewardedProjects()).map((c) => c.projectId))
+          .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const workerIds = [
+          ...new Set(projects.flatMap((p) => store.all(p.projectId).filter((b) => b.endedAt === null).flatMap((b) => store.workers(b.id).map((w) => w.threadId)))),
+        ];
+        const reviewersByWorker = new Map<string, string[]>();
+        await Promise.all(
+          workerIds.map(async (workerId) => {
+            const children = await bb.sdk.threads.list({ parentThreadId: workerId, includeHidden: true }).catch(() => []);
+            reviewersByWorker.set(workerId, children.map((c) => c.id));
+          }),
+        );
+        return {
+          projects: projects.map(({ projectId, name }) => {
+            const all = store.all(projectId);
+            const ended = all
+              .filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS)
+              .sort((a, b) => b.endedAt! - a.endedAt!)
+              .slice(0, 30);
+            return {
+              projectId,
+              name,
+              projectStewardThreadId: store.project(projectId).threadId,
+              bindings: all
+                .filter((b) => b.endedAt === null)
+                .map((b) => {
+                  const workers = store.workers(b.id).map((w) => ({ threadId: w.threadId, title: w.title }));
+                  return {
+                    key: b.entityKey,
+                    kind: b.kind,
+                    stage: b.stage,
+                    threadId: b.threadId,
+                    hold: b.hold,
+                    blockedOn: b.status?.blockedOn ?? null,
+                    needsUser: needsUser(b),
+                    advancedAt: b.advancedAt,
+                    workers,
+                    reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),
+                  };
+                }),
+              ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, endedAt: b.endedAt! })),
+            };
+          }),
         };
       },
       async stewardsAnswerQuestion({ questionId, answer, choice }, { experimental_caller: caller }) {

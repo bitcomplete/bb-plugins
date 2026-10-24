@@ -1245,6 +1245,38 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   closes the record, not the file. A boundary lesson is undone the same way
   once the user has merged it.
 
+## 21. The sidebar thread list
+
+An opt-in replacement for bb's own sidebar list, registered through the
+exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One tab
+per project in the live view; in-flight efforts grouped by the steward
+relationship; a collapsed Watches row for `ops`, Dependabot and Sentry
+bindings; a collapsed Recently ended row; and the project steward demoted to
+one small row at the bottom. Every row carries bb's own thread actions
+context menu, so archive, pin, rename, split and delete still work.
+
+**Grouping is the steward relationship, not the thread tree.** A worker
+belongs to its binding through the plugin's `workers` table and a reviewer
+through the worker the RPC names, so BB-23's removal of the parent link cannot
+break it. The thread tree is used only for one-off threads, which have nothing
+else, and as a fallback for a pre-BB-23 worker whose parent is its steward.
+The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
+component joins them to `experimental_useSidebarThreads` and polls
+`stewardsSidebar` on the board's half-minute visibility-aware cadence.
+
+**The default provider, checked (BB-44 criterion 1).** With
+`sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to
+"the first installed thread list plugin other than the bundled
+`thread-list/thread-list`". Registering the slot therefore makes the stewards
+list active on every client that has not pinned a provider, and
+`bb settings ui get sidebar.threadListProvider` on the dev server reads
+`__automatic__`. **This PR must not land alone:** it lands with the toggle
+ticket, whose server-side pin keeps bb's own list for clients that have not
+opted in. Until that lands, the list is opt-in only in code, not in effect.
+
+The "Needs you" block and the tab badge are a separate ticket, as is the
+footer toggle.
+
 ## Known limits
 
 - **Multi-repo projects only.** A bb project whose source is a single
