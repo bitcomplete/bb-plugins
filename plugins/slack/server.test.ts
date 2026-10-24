@@ -180,7 +180,7 @@ describe("Slack plugin", () => {
     expect(await s.harness.callRpc("status")).toEqual({
       signedIn: false,
       user: null,
-      project: { id: "prj-1", name: "Project One" },
+      project: { id: "prj-2", name: "Personal" },
       projects: PROJECTS,
       hooks: { configured: true, connected: true, state: "connected" },
     });
@@ -254,7 +254,7 @@ describe("Slack plugin", () => {
     // The thread runs where the developer's newest environment runs: that
     // provider, with its inputs, on its machine; never the pod's own host.
     expect(spawns[0]![0]).toMatchObject({
-      projectId: "prj-1",
+      projectId: "prj-2",
       environment: { type: "provider", environmentProviderId: "multi-repo-workspace", inputs: { repos: ["a"] }, machine: { type: "existing", hostId: "host_on" } },
     });
     expect(String((spawns[0]![0] as { prompt: string }).prompt)).toContain("session D0123:1712345678.901234");
@@ -314,7 +314,7 @@ describe("Slack plugin", () => {
   });
 
   it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {
-    const s = await live({ environments: [] });
+    const s = await live({ project: "prj-1", environments: [] });
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
@@ -361,6 +361,38 @@ describe("Slack plugin", () => {
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("starts a conversation in the personal project when the setting is empty, even when it is not first", async () => {
+    const s = await live();
+    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-2");
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("falls back to the personal project when the setting names no project", async () => {
+    const s = await live({ project: "not-a-project" });
+    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-2");
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("falls back to the first standard project when the server has no personal one", async () => {
+    const s = await live({
+      projects: [
+        { id: "prj-1", name: "Project One", kind: "standard" },
+        { id: "prj-3", name: "Project Two", kind: "standard" },
+      ],
+    });
+    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-1");
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
     await s.stop();
   });
 
