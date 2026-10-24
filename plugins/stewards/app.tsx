@@ -853,6 +853,13 @@ function shortBindingKey(key: string): string {
   return pull === null ? key : `#${pull[1]}`;
 }
 
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Whether the title names the key as a whole token, so `#612` is not swallowed by `#6123`. */
+function titleNamesKey(title: string, key: string): boolean {
+  return new RegExp(`${escapeRegExp(key)}(?!\\d)`).test(title);
+}
+
 /** One thread row: bb's glyph, title and context menu, expanding into its children. */
 function SidebarThreadRow({
   thread,
@@ -940,7 +947,7 @@ function SidebarEffortRow({ effort, byId, onNavigate }: { effort: SidebarEffort;
   const key = effort.bindingKey;
   const displayKey = key === null ? null : shortBindingKey(key);
   // The title wins: a steward is titled after its binding, so showing the key again is noise.
-  const keyInTitle = key !== null && displayKey !== null && (root.displayTitle.includes(key) || root.displayTitle.includes(displayKey));
+  const keyInTitle = key !== null && displayKey !== null && (titleNamesKey(root.displayTitle, key) || titleNamesKey(root.displayTitle, displayKey));
   const showKey = displayKey !== null && !keyInTitle;
   const badges = effort.hold !== null || effort.blockedOn !== null;
   const meta =

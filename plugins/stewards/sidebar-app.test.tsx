@@ -137,6 +137,15 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("does not swallow a key into a longer number in the title", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login #6123" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("#612", { exact: true })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
   it("renders held and blocked badges without a stage", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
