@@ -1271,8 +1271,8 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 ## 21. The sidebar thread list
 
 An opt-in replacement for bb's own sidebar list, registered through the
-exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One tab
-per project in the live view; in-flight efforts grouped by the steward
+exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One
+project dropdown in the live view; in-flight efforts grouped by the steward
 relationship; a collapsed Watches row for `ops`, Dependabot and Sentry
 bindings; a collapsed Recently ended row; and the project steward demoted to
 one small row at the bottom. Every row carries bb's own thread actions
@@ -1303,9 +1303,9 @@ component joins them to `experimental_useSidebarThreads` and polls
 
 **The Needs you block and the count badge (BB-46).** The sidebar is where the
 user already looks, so what waits on them is shown there, not only on the
-Stewards page. Each tab carries a count pill when its project has anything
-waiting; the compact picker shows the summed count and per-project counts in
-its options. Above In flight, a **Needs you** block lists one row per item
+Stewards page. The project dropdown carries each project's count in its option
+label and the summed count in a pill beside it. Above In flight, a **Needs you**
+block lists one row per item
 with the entity key (opening the entity), one line of text, and a question's
 or `decide` item's fixed `choices` as small buttons. A choice makes exactly
 the write the page makes (`stewardsAnswerQuestion` with `answer: null` for a

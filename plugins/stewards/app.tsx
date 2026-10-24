@@ -820,13 +820,10 @@ function InFlightRow({ steward: s, now }: { steward: Board["stewards"][number]; 
 // ---- The sidebar thread list -------------------------------------------------------------------
 //
 // The opt-in replacement for bb's sidebar list, registered through the
-// exclusive `experimental_threadList` slot. One tab per project, in-flight
+// exclusive `experimental_threadList` slot. One project dropdown, in-flight
 // efforts grouped by the steward relationship, collapsed Watches and Recently
 // ended rows, and a demoted project-steward row. Every row carries bb's own
 // thread actions context menu, so nothing bb's rows can do is lost.
-
-/** Past this many projects the tabs become a picker, as on a compact viewport. */
-const SIDEBAR_TAB_LIMIT = 5;
 
 /** The live fields bb's thread actions read, from a sidebar row. */
 function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
@@ -990,48 +987,43 @@ function SidebarCollapsible({ title, count, children }: { title: string; count: 
   );
 }
 
-function ProjectTabs({ tabs, counts, activeId, compact, onPick }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; compact: boolean; onPick: (projectId: string) => void }) {
+/**
+ * The project dropdown, always a native `<select>`: the per-project needs count
+ * in each option and the summed `NeedsBadge` beside it. The plus button opens
+ * the composer on the dropdown's project — the host's own New thread button
+ * cannot be retargeted from a thread list — then closes the mobile drawer.
+ */
+function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
   const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
-  if (compact || tabs.length > SIDEBAR_TAB_LIMIT) {
-    return (
-      <div className="flex items-center gap-1 px-1 py-1">
-        <select
-          aria-label="Project"
-          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
-          value={activeId ?? ""}
-          onChange={(e) => onPick(e.target.value)}
-        >
-          {tabs.map((t) => {
-            const count = counts.get(t.projectId) ?? 0;
-            return (
-              <option key={t.projectId} value={t.projectId}>
-                {count > 0 ? `${t.name} (${count})` : t.name}
-              </option>
-            );
-          })}
-        </select>
-        {total > 0 ? <NeedsBadge count={total} /> : null}
-      </div>
-    );
-  }
   return (
-    <div role="tablist" className="flex flex-wrap gap-1 border-b border-border px-1 py-1">
-      {tabs.map((t) => {
-        const count = counts.get(t.projectId) ?? 0;
-        return (
-          <button
-            key={t.projectId}
-            type="button"
-            role="tab"
-            aria-selected={t.projectId === activeId}
-            className={`rounded-md px-2 py-0.5 text-xs ${t.projectId === activeId ? "bg-state-hover font-medium" : "text-muted-foreground hover:text-foreground"}`}
-            onClick={() => onPick(t.projectId)}
-          >
-            {t.name}
-            {count > 0 ? <NeedsBadge count={count} /> : null}
-          </button>
-        );
-      })}
+    <div className="flex items-center gap-1 px-1 py-1">
+      <select
+        aria-label="Project"
+        className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+        value={activeId ?? ""}
+        onChange={(e) => onPick(e.target.value)}
+      >
+        {tabs.map((t) => {
+          const count = counts.get(t.projectId) ?? 0;
+          return (
+            <option key={t.projectId} value={t.projectId}>
+              {count > 0 ? `${t.name} (${count})` : t.name}
+            </option>
+          );
+        })}
+      </select>
+      {total > 0 ? <NeedsBadge count={total} /> : null}
+      {tabs.length > 0 ? (
+        <button
+          type="button"
+          aria-label="New thread"
+          title="New thread"
+          className="shrink-0 rounded-md border border-input p-1 text-muted-foreground hover:bg-state-hover hover:text-foreground"
+          onClick={onNewThread}
+        >
+          <Icon name="Plus" className="size-4" />
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -1113,8 +1105,9 @@ function SidebarNeedsSection({ projectId, needs, onChanged }: { projectId: strin
   );
 }
 
-function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: PluginThreadListProps) {
+function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps) {
   const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const { status, threads, projects } = experimental_useSidebarThreads();
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [] }), [projects, threads, data]);
@@ -1141,9 +1134,15 @@ function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: Plu
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
   const activeNeeds = active === null ? undefined : needsByProject.get(active.projectId);
   const now = Date.now();
+  // The picker only changes local state; the plus button is what retargets the
+  // composer to it, then closes the drawer.
+  const openNewThread = () => {
+    if (active !== null) navigate.toCompose({ projectId: active.projectId });
+    onNavigate();
+  };
   return (
     <div className="flex h-full flex-col text-sm">
-      <ProjectTabs tabs={tabs} counts={counts} activeId={active?.projectId ?? null} compact={isCompactViewport} onPick={setPicked} />
+      <ProjectTabs tabs={tabs} counts={counts} activeId={active?.projectId ?? null} onPick={setPicked} onNewThread={openNewThread} />
       {status === "loading" && data === null ? (
         <p className="p-3 text-muted-foreground">Loading…</p>
       ) : active === null ? (
