@@ -356,11 +356,13 @@ describe("Slack plugin", () => {
 
   it("changes the project the next Slack conversation goes to", async () => {
     const s = await live();
-    expect((await s.harness.callRpc("setProject", { projectId: "prj-2" })) as { ok: boolean }).toEqual({ ok: true });
-    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-2");
+    // prj-1 is the standard project; the empty setting would pick the personal
+    // prj-2, so this proves the setting wins over the default.
+    expect((await s.harness.callRpc("setProject", { projectId: "prj-1" })) as { ok: boolean }).toEqual({ ok: true });
+    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-1");
     s.hooks.last().send(s.hooks.session());
     await tick();
-    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
     await s.stop();
   });
 
