@@ -3,9 +3,10 @@ import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
-import { MIGRATIONS, createStore } from "./store.js";
+import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
+import { ESCALATED_NEED_KINDS } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
-import { formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
 const DAY = 86_400_000;
@@ -47,13 +48,16 @@ function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
 }
 
 describe("a steward's wake", () => {
-  it("carries the standing rules: credentials as provide-secret needs, one ask, and build-time decisions", () => {
+  it("carries the standing rules: a credential is an escalation, not a provide-secret need (BB-51)", () => {
     const wake = formatWake(wakeInput());
-    expect(wake).toContain("provide-secret");
+    expect(wake).toContain("steward_report { escalate");
+    for (const kind of ESCALATED_NEED_KINDS) expect(wake).toContain(kind);
     expect(wake).toContain("writeEnv");
     expect(wake).toMatch(/never paste a secret/iu);
     expect(wake).toContain("One ask per reply");
     expect(wake).toContain("escalated as a `decision` in the same turn");
+    // The old contradiction is gone: no rule tells a steward to file one.
+    expect(wake).not.toMatch(/File it with `steward_report \{ needs/);
   });
 
   it("names the worker and reviewer models as flags that are not the steward's to choose", () => {
@@ -172,6 +176,19 @@ describe("the nightly prompt", () => {
     expect(wake).toMatch(/a decision must cite what it was decided from/u);
     // A forward can cite too: the recommendation a correction is measured against lives there.
     expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
+  });
+
+  it("names the five resolution kinds and how a credential is forwarded (BB-51)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "decision", question: "Provide API_TOKEN.", meanwhile: "Wait.", route: "project", recommendation: null });
+    const wake = formatProjectWake({ reason: "escalation", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    for (const kind of RESOLUTION_KINDS) expect(wake).toContain(`\`${kind}\``);
+    expect(wake).toMatch(/resolution: "secret"/u);
+    expect(wake).toContain("variable");
+    expect(wake).toContain("purpose");
+    expect(wake).toContain("writeEnv");
+    expect(wake).toContain("setting");
   });
 
   it("gives dates in the project's nightly time zone", () => {

@@ -326,8 +326,10 @@ export type PrGate = {
   gateMet: boolean;
   /** What is missing, in words; null when the gate is met. */
   missing: string | null;
-  /** The plugin's `approve-pr` condition: owner lane, marker approved, checks green, no owner approval yet. */
+  /** The plugin's `approve-pr` condition: user lane, marker approved, checks green, no owner approval yet. */
   needsOwnerApproval: boolean;
+  /** The project steward's side: a `decide: project` entry, marker approved, checks green, no project approval yet. */
+  needsProjectApproval: boolean;
   /** The decide mark applied to this pull request; `user` unless the project steward classified it under a `project` entry. */
   decision: "project" | "user";
   /** Whether the project steward recorded an approval bound to this head sha. */
@@ -354,9 +356,14 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // Only an explicit `no-review` marker skips the owner; a marker the plugin
   // cannot read, or an unknown lane, is the user's (fail closed).
   const ownerLane = lane !== "no-review";
+  // The gate belongs to whoever the decide list names. An explicit decision
+  // wins; without one, a recorded project approval means the project steward
+  // (a project approval is only ever recorded for a `project` entry), and
+  // everything else is the user's (fail closed).
   const decision: "project" | "user" = opts.decision === "project" || (opts.decision === undefined && opts.projectApproved === true) ? "project" : "user";
   const projectApproved = opts.projectApproved === true && decision === "project";
-  const approved = owner.approved || projectApproved;
+  const approved = decision === "project" ? projectApproved : owner.approved;
+  const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved;
   const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || approved);
   const missing = gateMet
     ? null
@@ -383,7 +390,8 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
     ownerApprovalAt: owner.at,
     gateMet,
     missing,
-    needsOwnerApproval: ownerLane && markerApproved && checksGreen && !approved,
+    needsOwnerApproval: approvalNeeded && decision === "user",
+    needsProjectApproval: approvalNeeded && decision === "project",
     decision,
     projectApproved,
   };

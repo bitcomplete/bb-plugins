@@ -390,6 +390,21 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(project, { projectApproved: false }).needsOwnerApproval).toBe(true);
   });
 
+  it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green);
+    const projectWaiting = prGate(project, { decision: "project", projectApproved: false });
+    expect(projectWaiting).toMatchObject({ decision: "project", needsProjectApproval: true, needsOwnerApproval: false, gateMet: false, missing: "project steward approval needed" });
+    expect(prGate(project, { decision: "project", projectApproved: true })).toMatchObject({ gateMet: true, needsProjectApproval: false });
+    // A user entry needs the owner, and a project-steward approval is not the gate.
+    const userWaiting = prGate(project, { decision: "user", projectApproved: false });
+    expect(userWaiting).toMatchObject({ decision: "user", needsOwnerApproval: true, needsProjectApproval: false, gateMet: false, missing: "owner approval needed" });
+    expect(prGate(project, { decision: "user", projectApproved: true })).toMatchObject({ projectApproved: false, gateMet: false, needsOwnerApproval: true });
+    // An owner approval satisfies the user lane, not the project lane.
+    const ownerApproved = pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green);
+    expect(prGate(ownerApproved, { decision: "user" }).gateMet).toBe(true);
+    expect(prGate(ownerApproved, { decision: "project", projectApproved: false }).gateMet).toBe(false);
+  });
+
   it("fails closed on a lane the plugin cannot read (BB-30)", () => {
     // An unknown lane is treated as owner-reviewed, not no-review.
     const unknown = prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green));

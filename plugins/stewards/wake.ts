@@ -14,7 +14,7 @@ import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, 
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
-import { needChoices, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
+import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
 export const WAKE_MAX_CHARS = 30_000;
@@ -29,11 +29,15 @@ const OPEN_REQUESTS_NOTE = "These are listed for the user on the Stewards page. 
  * The rules that hold on every wake, whatever the playbook: the generic things
  * a steward got wrong without them. They mirror the `stewards` skill and the
  * default playbooks, so a change here belongs there too.
+ *
+ * The escalated need kinds are named from one list (BB-51): the standing rules
+ * and `steward_report`'s refusal derive from `ESCALATED_NEED_KINDS`, so a
+ * steward is never told to file what the tool refuses.
  */
-const STANDING_RULES = [
+export const STANDING_RULES = [
   "- **One ask per reply.** Ask the user at most one thing, and only what the playbook, the project's guidance or the `stewards` skill leaves open. Anything they settle — models, flags, lanes, who merges — is never asked.",
-  "- **What only the user can do is a `needs` item.** File it with `steward_report { needs: [{ kind, url, what, how }] }` — a step outside the repos (`configure`), a secret (`provide-secret`), or a decision (`decide`). A `decide` item that is really a pick between fixed options carries `choices` (2-6 short labels, e.g. `choices: [\"Merge\", \"Close\", \"Verify first\"]`), and the page shows one button each; never write \"reply with your choice\" in prose. It is on the Stewards page with its button; do not ask for it in prose, and do not name the user in `blockedOn` without one.",
-  "- **A credential is a `provide-secret` need, not a worker's job to prompt.** File it with `steward_report { needs: [{ kind: \"provide-secret\", url, what, how, variable, purpose }] }`; the plugin spawns a requester thread and opens bb's secure form there. For a dotenv on a worker's machine name `writeEnv` (or `worker`); for one of the stewards plugin's own settings name `setting` (only a declared secret setting is accepted). Never paste a secret, and never route the user to a script to run.",
+  `- **What only the user can do is an escalation, not a need.** A credential, a step outside the repos, or a decision — ${ESCALATED_NEED_KINDS.map((k) => `\`${k}\``).join(", ")} — is raised with \`steward_report { escalate: { kind, question, meanwhile } }\`: the project steward decides it or forwards it to the user. Since BB-30 \`steward_report { needs }\` refuses exactly those ("that is an escalation now"); it still takes the plugin's gate items (${STEWARD_NEED_KINDS.map((k) => `\`${k}\``).join(", ")}). A decision that is really a pick between fixed options carries \`choices\` (2-6 short labels, e.g. \`choices: ["Merge", "Close", "Verify first"]\`), and the page shows one button each; never write "reply with your choice" in prose.`,
+  "- **A credential is a decision escalation, and the project steward forwards it as a secret.** Raise it with `steward_report { escalate: { kind: \"decision\", question, meanwhile } }`, naming the variable and what it is for in the question. The project steward forwards it with `resolution: \"secret\"` and either `writeEnv`/`worker` (the dotenv a worker reads) or `setting` (a declared secret setting of the stewards plugin); the plugin then spawns a requester thread and opens bb's secure form there. Never paste a secret, and never route the user to a script to run.",
   "- **A finding that would stop the feature working once it ships**, or that changes what the ticket needs (a credential, an access, a contract), is escalated as a `decision` in the same turn, quoting the worker's words — never relayed as a follow-up. An escalation that asks the user to pick between fixed options carries `choices` (2-6 short labels) so the page shows one button each.",
 ];
 /**
@@ -804,6 +808,8 @@ export function formatProjectWake(input: {
       "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons it rested on with `cites: [lesson ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [lesson ids] }) only when it is one of these big decisions, and say which entry you matched:",
       "",
       ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
+      "",
+      `A forward to the user carries a \`resolution\` saying how the page asks: ${RESOLUTION_KINDS.map((k) => `\`${k}\``).join(", ")}. A credential is forwarded with \`resolution: "secret"\`, naming \`variable\` and \`purpose\`, and either \`writeEnv\`/\`worker\` (the dotenv a worker reads) or \`setting\` (a declared secret setting of the stewards plugin); the plugin then opens bb's secure form in a requester thread.`,
       "",
     );
     if (input.routed.some((r) => r.from.kind === "ops")) {

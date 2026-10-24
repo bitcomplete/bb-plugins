@@ -72,3 +72,35 @@ export function decideFor(files: readonly string[] | null | undefined, entry: st
   if (isSelfWidening(files)) return "user";
   return decideForEntry(entry, decisions, files);
 }
+
+/**
+ * The mark for a pull request the plugin has to place itself, from its changed
+ * files: a `project` entry whose paths they touch is the project steward's,
+ * and everything else — no matching entry, a `user` entry, an entry with no
+ * paths, a self-widening change, or a file list that could not be read — is
+ * the user's (fail closed). This is the rule the project steward's own
+ * `approve` applies, so the page and the gate agree (BB-51).
+ */
+export function decideForPull(files: readonly string[] | null | undefined, decisions: readonly BigDecision[]): DecideMark {
+  if (files === null || files === undefined || files.length === 0) return "user";
+  if (isSelfWidening(files)) return "user";
+  const match = decisions.find((d) => d.decide === "project" && d.paths.length > 0 && touchesAny(files, d.paths));
+  return match === undefined ? "user" : decideForEntry(match.text, decisions, files);
+}
+
+/**
+ * Why a pull request is the user's to approve, in words, or null when a
+ * project-steward approval may be recorded. The null/empty file list gets its
+ * own text: it is not the self-widening refusal, it is a failed read (BB-51).
+ */
+export function decideForRefusal(files: readonly string[] | null | undefined, entry: string | null | undefined, decisions: readonly BigDecision[]): string | null {
+  if (files === null || files === undefined) return "the changed files could not be read";
+  if (files.length === 0) return "the pull request changes no files";
+  if (isSelfWidening(files)) return "the change touches the decide list or the code that enforces it";
+  const wanted = (entry ?? "").trim();
+  if (wanted === "") return "no decide-list entry was given";
+  const found = decisions.find((d) => d.text === wanted || d.text.toLowerCase() === wanted.toLowerCase());
+  if (found === undefined) return `the entry ${JSON.stringify(entry)} is not in the decide list`;
+  if (found.paths.length > 0 && !touchesAny(files, found.paths)) return `the changed files do not touch ${JSON.stringify(found.text)}'s paths`;
+  return found.decide === "project" ? null : `the entry ${JSON.stringify(found.text)} is not marked project`;
+}

@@ -7,8 +7,9 @@ import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
-import { MIGRATIONS } from "./store.js";
+import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
+import { STANDING_RULES } from "./wake.js";
 
 type Call = { pluginId: string; method: string; input: Record<string, unknown> };
 
@@ -2825,11 +2826,10 @@ describe("needs you items", () => {
   it("files approve-pr in the owner lane; the page action posts the unsigned approval and the merge item follows", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    // The owner-reviewed lane is the project steward's to decide (BB-30); it
-    // forwards to the user, which files the approve-pr item.
+    // The user's lane is filed on the page at once, with no project-steward
+    // turn (BB-51); the escalation is with the user.
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    expect(esc).toMatchObject({ route: "project" });
-    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
+    expect(esc).toMatchObject({ route: "me" });
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
@@ -2881,9 +2881,7 @@ describe("needs you items", () => {
   it("files an approve-pr the owner-lane gate holds (BB-21)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    const report = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
-    expect(report.error).toBe(false);
+    // No project-steward turn is needed: the plugin files the item itself (BB-51).
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/approve-pr, ENG-12/u);
   });
@@ -2891,8 +2889,6 @@ describe("needs you items", () => {
   it("records the gate's missing text when sync closes an approve-pr need (BB-21)", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
-    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
-    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id }, t.project);
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "approve-pr")).toBe(true);
     // The reviewer's round goes away, so the open item no longer holds; the
     // closure records what the gate is missing, not the generic line.
@@ -3357,6 +3353,176 @@ describe("needs you items", () => {
     expect(all.find((n) => n.kind === "merge")!.status).toBe("open");
     expect(t.hooks.store.openNeeds(b().id).map((n) => n.kind)).toEqual(["merge"]);
     expect(project).toBeDefined();
+  });
+
+  // BB-51: a close on the page resolves the escalation the question was
+  // forwarded from, in the same write, and tells the origin and the project
+  // steward.
+  it("Done on a forwarded question resolves the escalation it came from, wakes the origin, and tells the project steward (BB-51)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12")!;
+    await t.harness.behavior.runCli(["escalate", "Add the client secret?"], { threadId: "thr_w1", projectId: "p1" });
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Add the client secret?")!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, recommendation: "Yes." }, steward);
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "done" }, project);
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "configure")!;
+    expect(need.what).toBe("Add the client secret?");
+    const projectWakes = t.sends.filter((s) => s.threadId === project).length;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "done" }, client);
+    expect(res).toMatchObject({ ok: true });
+    // The escalation the question was forwarded from resolves in the same write.
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    expect(t.hooks.store.escalation(need.id)!.status).toBe("resolved");
+    await t.hooks.sweep();
+    await t.flush();
+    // The originating worker hears the answer.
+    expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/answered/u);
+    // The project steward's next wake says it was answered, not open.
+    expect(t.sends.filter((s) => s.threadId === project).length).toBeGreaterThan(projectWakes);
+    expect(t.sends.filter((s) => s.threadId === project).at(-1)!.text).toMatch(/are resolved|is resolved/u);
+  });
+
+  it("a finished requester resolves the escalation the secret question came from (BB-51)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const b = t.hooks.store.find("ENG-12")!;
+    await t.harness.behavior.runCli(["escalate", "Provide API_TOKEN."], { threadId: "thr_w1", projectId: "p1" });
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Provide API_TOKEN.")!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, recommendation: "Yes." }, steward);
+    await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "secret", variable: "API_TOKEN", purpose: "deploys" }, project);
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
+    const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
+    expect(res.ok).toBe(true);
+    await t.idle(res.threadId, "Provided API_TOKEN.");
+    await t.flush();
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    expect(t.hooks.store.escalation(need.id)!.status).toBe("resolved");
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/answered/u);
+  });
+
+  // BB-51 criterion 3: declined heads are remembered, and a checks-state
+  // change never resolves a request as Approved.
+  it("does not ask again for a project-lane approval declined on the same head (BB-51)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc).toMatchObject({ route: "project", headSha: "aaaaaaa1" });
+    await t.tool("steward_update", { binding: "ENG-12", guidance: "Needs a test first.", resolve: esc.id }, project);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+    expect(t.hooks.store.find("ENG-12")!.declinedPrHeadSha).toBe("aaaaaaa1");
+    // A report on the same head does not raise a new request.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting.", nextAction: "Wait", actor: "other" }, steward);
+    expect(t.hooks.store.openEscalations(b.id).filter((x) => x.kind === "approval")).toEqual([]);
+    // A new reviewer marker on the same head raises a new request.
+    const marker2 = comment({ id: "m2", author: "trotterdylan", body: "<!-- bb-review round=2 sha=aaaaaaa1 verdict=approved lane=owner-reviewed -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [marker, marker2] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("linear", "uuid-12");
+    const again = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")!;
+    expect(again).toMatchObject({ route: "project", headSha: "aaaaaaa1" });
+    // A new head raises a new request too.
+    await t.tool("steward_update", { binding: "ENG-12", guidance: "Still no.", resolve: again.id }, project);
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.openEscalations(b.id).some((x) => x.kind === "approval" && x.headSha === "bbbbbbb2")).toBe(true);
+  });
+
+  it("leaves an approval request open when checks go pending and never resolves it as Approved (BB-51)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")!;
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "pending", failing: [] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    const still = t.hooks.store.escalation(esc.id)!;
+    expect(still.status).toBe("open");
+    expect(still.headSha).toBe("bbbbbbb2");
+    expect(still.resolution).toBeNull();
+  });
+
+  it("keeps the approve-pr item's identity across a push (BB-51)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "pending", failing: [] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(after.id).toBe(need.id);
+    expect(after.data.sha).toBe("bbbbbbb2");
+    expect(t.hooks.store.openNeeds(b.id).filter((n) => n.kind === "approve-pr")).toHaveLength(1);
+  });
+
+  // BB-51 criterion 4: the decide list places the pull request, and a failed
+  // files fetch gets its own refusal text.
+  it("gives a failed files fetch its own refusal text, not the self-widening one (BB-51)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    const [project] = t.spawns as Array<{ id: string }>;
+    // The files fetch fails from now on.
+    t.github.files = async () => {
+      throw new Error("boom");
+    };
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, project.id);
+    expect(res.error).toBe(true);
+    expect(res.text).toMatch(/the changed files could not be read/u);
+    expect(res.text).not.toMatch(/touches the decide list/u);
+  });
+
+  it("routes a project-entry pull request to the project steward and a user-entry one to the page (BB-51)", async () => {
+    const t1 = await setup();
+    t1.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t1.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    t1.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t1.ring("linear", "uuid-12");
+    const b1 = t1.hooks.store.find("ENG-12")!;
+    expect(t1.hooks.store.openEscalations(b1.id).find((x) => x.kind === "approval")).toMatchObject({ route: "project" });
+    expect(t1.hooks.store.openNeeds(b1.id).some((n) => n.kind === "approve-pr")).toBe(false);
+
+    const t2 = await withPull([marker]);
+    const b2 = t2.binding();
+    expect(t2.hooks.store.openEscalations(b2.id).find((x) => x.kind === "approval")).toMatchObject({ route: "me" });
+    expect(t2.hooks.store.openNeeds(b2.id).some((n) => n.kind === "approve-pr")).toBe(true);
+  });
+
+  // BB-51 criterion 5: one list feeds the standing rules and the refusal.
+  it("derives the needs a steward may file from one list, so the rules and the refusal cannot drift (BB-51)", async () => {
+    expect([...ESCALATED_NEED_KINDS, ...STEWARD_NEED_KINDS].sort()).toEqual([...NEEDS_KINDS].sort());
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const rules = STANDING_RULES.join("\n");
+    for (const kind of ESCALATED_NEED_KINDS) {
+      expect(rules).toContain(kind);
+      const res = (await t.harness.behavior.callAgentTool(
+        "steward_report",
+        { phase: "Todo", summary: "Specifying.", nextAction: "Wait", actor: "steward", needs: [{ kind, what: `A ${kind}` }] },
+        { threadId: steward, projectId: "p1" },
+      )) as string | { content: Array<{ text?: string }> };
+      const text = typeof res === "string" ? res : res.content.map((c) => c.text ?? "").join("");
+      expect(text).toContain(`${kind} for`);
+      expect(text).toContain("that is an escalation now");
+    }
+    for (const kind of STEWARD_NEED_KINDS) expect(rules).toContain(kind);
   });
 });
 
