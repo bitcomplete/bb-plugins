@@ -340,17 +340,18 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
     } as never);
   };
 
-  it("shows a count badge on a tab only when the count is non-zero", async () => {
+  it("shows the summed count badge beside the picker only when non-zero", async () => {
     const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }, { count: 0, items: [] }) });
+    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
     await waitFor(() => expect(slot.getByLabelText("2 waiting on you")).toBeTruthy());
     expect(slot.queryByLabelText("0 waiting on you")).toBeNull();
     slot.lifecycle.unmount();
   });
 
-  it("sums the count on the compact picker and shows per-project counts in its options", async () => {
+  it.each([false, true])("sums the count beside the picker and shows per-project counts in its options (compact=%s)", async (isCompactViewport) => {
     const slot = await renderSidebar(
       { stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem(), needItem()] }, { count: 1, items: [needItem({ id: "need_2" })] }) },
-      { isCompactViewport: true },
+      { isCompactViewport },
     );
     await waitFor(() => expect(slot.getByLabelText("3 waiting on you")).toBeTruthy());
     expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy();
