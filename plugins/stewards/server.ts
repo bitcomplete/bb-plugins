@@ -5021,6 +5021,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 declinedPrHeadSha: resolving.headSha ?? pull?.pull?.headSha ?? null,
                 declinedPrMarker: pull === null ? null : markerKey(latestReviewMarker(pull.comments)),
               });
+              done.push(`remembered the decline of ${shortSha(resolving.headSha)} so the same head and reviewer marker are not asked again`);
             } else if (resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
               store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) } });

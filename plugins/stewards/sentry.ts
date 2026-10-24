@@ -16,9 +16,9 @@ import { redactLine, type FingerprintRow, type OpsTarget, type SentryTarget, typ
 import type { Change } from "./reconcile.js";
 
 export const SENTRY_API_URL = "https://sentry.io";
-/** The look's error when the plugin has no Sentry token to read with; the steward files the provide-secret need for it. */
+/** The look's error when the plugin has no Sentry token to read with; the steward escalates for it. */
 export const NO_TOKEN = "no Sentry token is configured";
-/** The setting the token lives in, named so the steward's provide-secret need says where it goes. */
+/** The setting the token lives in, named so the steward's escalation says where it goes. */
 export const TOKEN_SETTING = "sentryToken";
 /** Where a Sentry user creates an auth token. */
 export const TOKEN_PAGE = "https://sentry.io/settings/account/api/auth-tokens/";

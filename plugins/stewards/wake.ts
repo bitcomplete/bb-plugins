@@ -735,7 +735,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
   if (look.error === NO_TOKEN) {
     out.push(
       `**The plugin has no Sentry token, so it cannot read this project.** The token is the \`${TOKEN_SETTING}\` setting of the stewards plugin on this bb server (Settings → Plugins → Stewards), entered by the user, never pasted into a thread. ` +
-        `File one provide-secret need for it with steward_report: variable \`SENTRY_TOKEN\`, setting \`${TOKEN_SETTING}\`, url ${TOKEN_PAGE}, what "Create a Sentry auth token with the scopes ${TOKEN_SCOPES.join(" and ")} and enter it as the stewards plugin's Sentry token setting", and the steps in how. ` +
+        `Raise one escalation for it with steward_report { escalate: { kind: "decision", question: "Provide a Sentry auth token for ${look.target}: variable SENTRY_TOKEN, setting ${TOKEN_SETTING}, url ${TOKEN_PAGE}; create it with the scopes ${TOKEN_SCOPES.join(" and ")} and enter it as the stewards plugin's Sentry token setting.", meanwhile: "Wait: this project cannot be read until the token is provided." } }. The project steward forwards it with resolution "secret", variable "SENTRY_TOKEN" and setting "${TOKEN_SETTING}", and the plugin opens bb's secure form. ` +
         "Then report with actor me and end the turn; the first look that reads the project wakes you.",
     );
   } else if (look.error !== null) out.push(`The project could not be read: ${look.error}. Nothing to do until it can; \`bb stewards check\` says why.`);

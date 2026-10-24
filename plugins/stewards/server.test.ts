@@ -4917,13 +4917,17 @@ describe("Sentry stewards", () => {
     expect(wake).toContain("#### 2");
   });
 
-  it("without a token, wakes the steward once to file the provide-secret need, and check says so", async () => {
+  it("without a token, wakes the steward once to escalate for it, and check says so", async () => {
     const { t, steward, wakes } = await watching({ token: "" });
     expect(steward()).toBeDefined();
     const first = wakes()[0]!;
     expect(first).toMatch(/The plugin has no Sentry token, so it cannot read this project/u);
-    expect(first).toMatch(/File one provide-secret need for it with steward_report: variable `SENTRY_TOKEN`, setting `sentryToken`, url https:\/\/sentry\.io\/settings\/account\/api\/auth-tokens\//u);
+    expect(first).toMatch(/steward_report \{ escalate: \{ kind: "decision", question: "Provide a Sentry auth token for/u);
+    expect(first).toMatch(/variable SENTRY_TOKEN, setting sentryToken/u);
     expect(first).toMatch(/project:read and event:read and event:write/u);
+    // It does not instruct a refused `needs` filing (BB-51).
+    expect(first).not.toMatch(/File one provide-secret need/u);
+    expect(first).not.toMatch(/steward_report \{ needs/u);
     expect(first).toMatch(/Cannot read sentry-project\/acme\/web: no Sentry token is configured/u);
     // Said once: the next looks are quiet until a token appears.
     await t.hooks.sweep();
