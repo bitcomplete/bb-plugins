@@ -146,6 +146,42 @@ export interface StewardsDeps {
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The UI preference that picks the sidebar thread list. */
+export const THREAD_LIST_PROVIDER_KEY = "sidebar.threadListProvider";
+/** bb's bundled thread list; pinning to it leaves the sidebar as it was. */
+export const BUILTIN_THREAD_LIST_ID = "thread-list/thread-list";
+/** What `sidebar.threadListProvider` reads while nothing is pinned. */
+const AUTOMATIC_THREAD_LIST_PROVIDER = "__automatic__";
+
+/**
+ * BB-45: pin bb's own sidebar thread list for clients that have not opted in.
+ *
+ * BB-44 registers the stewards list through the exclusive
+ * `experimental_threadList` slot, and bb resolves an unset (`__automatic__`)
+ * provider to the first installed list other than the bundled
+ * `thread-list/thread-list` — the stewards list. Without this pin the sidebar
+ * would change for everyone the moment BB-44 lands. Set the preference to the
+ * bundled list on load; an explicit value (including the stewards list the
+ * footer toggle writes) is left alone. `bb.onInstall` does not run for plugins
+ * baked into the `bb-server` image, so this runs on load. Best-effort: a
+ * failure is logged and the sidebar keeps working.
+ */
+export async function pinSidebarThreadListProvider(bb: BbPluginApi): Promise<void> {
+  try {
+    const { preferences } = await bb.sdk.system.uiPreferences.list();
+    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
+    if (entry !== undefined && entry.value !== AUTOMATIC_THREAD_LIST_PROVIDER) return;
+    await bb.sdk.system.uiPreferences.set({
+      key: THREAD_LIST_PROVIDER_KEY,
+      value: BUILTIN_THREAD_LIST_ID,
+      expectedRevision: entry?.revision ?? 0,
+    });
+    bb.log.info(`stewards: pinned the sidebar thread list to ${BUILTIN_THREAD_LIST_ID}; the footer toggle switches it to ${STEWARDS_PLUGIN_ID}/sidebar`);
+  } catch (error) {
+    bb.log.warn(`stewards: could not pin the sidebar thread list: ${errorMessage(error)}`);
+  }
+}
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}… (${text.length - max} more characters)`);
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
@@ -5531,6 +5567,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
+    await pinSidebarThreadListProvider(bb);
     testHooks.set(bb.pluginId, { sweep, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
