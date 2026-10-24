@@ -5,6 +5,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
+import { NEEDS_YOU_CHANGED } from "./channels.js";
 
 type Need = {
   id: string;
@@ -278,6 +279,155 @@ describe("the sidebar-footer toggle (BB-45)", () => {
       { method: "system.uiPreferences.set", args: [{ key: "sidebar.threadListProvider", value: "stewards/sidebar", expectedRevision: 9 }] },
     ]);
     expect(lists).toBe(2);
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-46: the sidebar's count badge and "Needs you" block, fed by the
+// `stewardsSidebar` call and refreshed over the realtime channel.
+const sidebarProjects = [
+  { id: "p1", name: "Acme", isPersonal: false, href: "/projects/p1", settingsHref: "/projects/p1/settings" },
+  { id: "p2", name: "Beta", isPersonal: false, href: "/projects/p2", settingsHref: "/projects/p2/settings" },
+];
+
+const sidebarData = (p1Needs: { count: number; items: unknown[] }, p2Needs: { count: number; items: unknown[] } = { count: 0, items: [] }) => ({
+  projects: [
+    { projectId: "p1", name: "Acme", projectStewardThreadId: null, needs: p1Needs, bindings: [], ended: [] },
+    { projectId: "p2", name: "Beta", projectStewardThreadId: null, needs: p2Needs, bindings: [], ended: [] },
+  ],
+});
+
+describe("the stewards sidebar's needs you block (BB-46)", () => {
+  const questionItem = (over: Record<string, unknown> = {}) => ({
+    type: "question",
+    id: "qst_1",
+    question: "Which approach?",
+    context: null,
+    choices: [],
+    key: "ENG-12",
+    url: "https://linear.app/acme/issue/ENG-12",
+    escalationId: null,
+    createdAt: 1_000,
+    ...over,
+  });
+  const needItem = (over: Record<string, unknown> = {}) => ({
+    type: "need",
+    id: "need_1",
+    bindingId: "bnd_1",
+    key: "ENG-12",
+    kind: "decide",
+    url: null,
+    entityUrl: "https://linear.app/acme/issue/ENG-12",
+    escalationId: null,
+    choices: [],
+    lessonId: null,
+    what: "Hold or start?",
+    how: null,
+    destination: null,
+    threadId: null,
+    createdAt: 1_000,
+    actionable: true,
+    why: null,
+    ...over,
+  });
+
+  const renderSidebar = async (rpc: Record<string, unknown>, props: Record<string, unknown> = {}): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    return renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "", ...props } as never, {
+      sidebarThreads: { projects: sidebarProjects, threads: [] },
+      rpc,
+    } as never);
+  };
+
+  it("shows a count badge on a tab only when the count is non-zero", async () => {
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }, { count: 0, items: [] }) });
+    await waitFor(() => expect(slot.getByLabelText("2 waiting on you")).toBeTruthy());
+    expect(slot.queryByLabelText("0 waiting on you")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("sums the count on the compact picker and shows per-project counts in its options", async () => {
+    const slot = await renderSidebar(
+      { stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem(), needItem()] }, { count: 1, items: [needItem({ id: "need_2" })] }) },
+      { isCompactViewport: true },
+    );
+    await waitFor(() => expect(slot.getByLabelText("3 waiting on you")).toBeTruthy());
+    expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy();
+    expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("sends a question's choice through stewardsAnswerQuestion with the page's arguments", async () => {
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [questionItem({ choices: ["Merge", "Close"] })] }),
+      stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Merge" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("sends a decide need's choice through stewardsNeedAction with the page's arguments", async () => {
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ choices: ["Hold", "Start"] })] }),
+      stewardsNeedAction: () => ({ ok: true, message: "done" }),
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Hold" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Hold" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "choose", note: null, choice: "Hold" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the board for a row without choices", async () => {
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "configure", choices: [] })] }) });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Open" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Open" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("refetches on a realtime event for a shown project and ignores an unknown one", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      stewardsSidebar: () => {
+        calls += 1;
+        return sidebarData({ count: 0, items: [] });
+      },
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p9" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(1);
+    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    slot.lifecycle.unmount();
+  });
+
+  it("refetches the board page when the channel names its project", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    let calls = 0;
+    const slot = renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => {
+          calls += 1;
+          return {
+            projects: [{ projectId: "p1", name: "Acme" }],
+            board: { projectId: "p1", name: "Acme", paused: false, projectStewardThreadId: null, stages: [], digest: null, questions: [], withUser: [], needs: [], lessons: [], stewards: [], stuck: [], ended: [] },
+          };
+        },
+      },
+    } as never);
+    await waitFor(() => expect(calls).toBe(1));
+    // The handler only refetches once the board (and its project id) has rendered.
+    await waitFor(() => expect(slot.getByText("Acme")).toBeTruthy());
+    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p2" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBe(2);
     slot.lifecycle.unmount();
   });
 });

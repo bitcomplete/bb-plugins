@@ -16,6 +16,7 @@ import {
   experimental_usePluginId,
   experimental_useSidebarThreads,
   useBbNavigate,
+  useRealtime,
   useRpc,
   useSdk,
   useSidebarThreadDraft,
@@ -25,6 +26,7 @@ import {
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { buildSidebar, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
@@ -34,6 +36,9 @@ type Project = Overview["projects"][number];
 type Steward = Project["stewards"][number];
 type BoardResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { board: unknown }> : never;
 type Board = NonNullable<BoardResult["board"]>;
+type SidebarResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: Array<{ needs: unknown }> }> : never;
+type SidebarNeeds = SidebarResult["projects"][number]["needs"];
+type SidebarNeedItem = SidebarNeeds["items"][number];
 type CheckResult = { ok: boolean; lines: string[] };
 
 const BOARD_PATH = "board";
@@ -124,6 +129,15 @@ function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "mute
   const colors =
     tone === "bad" ? "border-destructive/40 text-destructive" : tone === "warn" ? "border-amber-500/40 text-amber-600 dark:text-amber-500" : "border-border text-muted-foreground";
   return <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
+}
+
+/** The count of everything waiting on the user for one project; rendered only when non-zero. */
+function NeedsBadge({ count }: { count: number }) {
+  return (
+    <span aria-label={`${count} waiting on you`} className="ml-1 inline-flex min-w-4 items-center justify-center rounded-full bg-destructive/10 px-1 text-[10px] font-medium leading-4 text-destructive">
+      {count}
+    </span>
+  );
 }
 
 function EntityLink({ entityKey, url }: { entityKey: string; url: string | null }) {
@@ -365,6 +379,18 @@ function BoardPage({ subPath }: { subPath: string }) {
   const first = subPath.split("/")[0] ?? "";
   const wanted = first === "" ? null : decodeURIComponent(first);
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
+  const boardProjectId = data?.board?.projectId ?? null;
+  // A steward's question or item shows up here without the half-minute poll.
+  useRealtime(
+    NEEDS_YOU_CHANGED,
+    useCallback(
+      (payload) => {
+        const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
+        if (typeof projectId === "string" && projectId === boardProjectId) refetch();
+      },
+      [boardProjectId, refetch],
+    ),
+  );
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-6 text-sm">
@@ -940,64 +966,167 @@ function SidebarCollapsible({ title, count, children }: { title: string; count: 
   );
 }
 
-function ProjectTabs({ tabs, activeId, compact, onPick }: { tabs: Array<{ projectId: string; name: string }>; activeId: string | null; compact: boolean; onPick: (projectId: string) => void }) {
+function ProjectTabs({ tabs, counts, activeId, compact, onPick }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; compact: boolean; onPick: (projectId: string) => void }) {
+  const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
   if (compact || tabs.length > SIDEBAR_TAB_LIMIT) {
     return (
-      <div className="px-1 py-1">
+      <div className="flex items-center gap-1 px-1 py-1">
         <select
           aria-label="Project"
-          className="w-full rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+          className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
           value={activeId ?? ""}
           onChange={(e) => onPick(e.target.value)}
         >
-          {tabs.map((t) => (
-            <option key={t.projectId} value={t.projectId}>
-              {t.name}
-            </option>
-          ))}
+          {tabs.map((t) => {
+            const count = counts.get(t.projectId) ?? 0;
+            return (
+              <option key={t.projectId} value={t.projectId}>
+                {count > 0 ? `${t.name} (${count})` : t.name}
+              </option>
+            );
+          })}
         </select>
+        {total > 0 ? <NeedsBadge count={total} /> : null}
       </div>
     );
   }
   return (
     <div role="tablist" className="flex flex-wrap gap-1 border-b border-border px-1 py-1">
-      {tabs.map((t) => (
-        <button
-          key={t.projectId}
-          type="button"
-          role="tab"
-          aria-selected={t.projectId === activeId}
-          className={`rounded-md px-2 py-0.5 text-xs ${t.projectId === activeId ? "bg-state-hover font-medium" : "text-muted-foreground hover:text-foreground"}`}
-          onClick={() => onPick(t.projectId)}
-        >
-          {t.name}
-        </button>
-      ))}
+      {tabs.map((t) => {
+        const count = counts.get(t.projectId) ?? 0;
+        return (
+          <button
+            key={t.projectId}
+            type="button"
+            role="tab"
+            aria-selected={t.projectId === activeId}
+            className={`rounded-md px-2 py-0.5 text-xs ${t.projectId === activeId ? "bg-state-hover font-medium" : "text-muted-foreground hover:text-foreground"}`}
+            onClick={() => onPick(t.projectId)}
+          >
+            {t.name}
+            {count > 0 ? <NeedsBadge count={count} /> : null}
+          </button>
+        );
+      })}
     </div>
+  );
+}
+
+/**
+ * One item in the sidebar's "Needs you" block: the key, one line of text, and
+ * the fixed choices as buttons. A choice writes through the page's own RPC; a
+ * row without choices (or a provide-secret item) opens the board, where the
+ * free-text answer or the secret form lives.
+ */
+function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedItem; onChanged: () => void; onOpenBoard: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  // Choices are a decide item's or a question's; every other item opens the page.
+  const choices = item.type === "question" ? item.choices : item.type === "need" && item.kind === "decide" ? item.choices : [];
+  const text = item.type === "need" ? item.what : item.question;
+  const entityUrl = item.type === "need" ? item.entityUrl : item.url;
+  const choose = (choice: string) => {
+    setState("running");
+    const call =
+      item.type === "question"
+        ? rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice })
+        : rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice });
+    call.then(
+      (r) => {
+        if (!r.ok) return setState({ error: r.message });
+        onChanged();
+      },
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  return (
+    <li className="flex flex-col gap-1 px-2 py-1.5">
+      <p className="flex flex-wrap items-center gap-2">
+        {item.key !== null ? <EntityLink entityKey={item.key} url={entityUrl} /> : null}
+        {item.type === "withUser" ? <Badge tone="bad">{item.kind === "approval" ? "approval request" : `${item.kind} escalation`}</Badge> : null}
+        {item.type === "need" ? <Badge tone="bad">{item.kind}</Badge> : null}
+      </p>
+      <p className="min-w-0 truncate">{text}</p>
+      <div className="flex flex-wrap items-center gap-1">
+        {choices.length > 0 ? (
+          choices.map((choice) => (
+            <button
+              key={choice}
+              type="button"
+              disabled={state === "running"}
+              className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50"
+              onClick={() => choose(choice)}
+            >
+              {choice}
+            </button>
+          ))
+        ) : (
+          <button type="button" className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover" onClick={onOpenBoard}>
+            Open
+          </button>
+        )}
+        {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
+      </div>
+    </li>
+  );
+}
+
+/** The sidebar's "Needs you" block: the board's waiting items, above In flight. */
+function SidebarNeedsSection({ projectId, needs, onChanged }: { projectId: string; needs: SidebarNeeds; onChanged: () => void }) {
+  const navigate = useBbNavigate();
+  return (
+    <SidebarSection title="Needs you" count={needs.count}>
+      {needs.items.length === 0 ? (
+        <p className="px-2 py-1 text-muted-foreground">Nothing is waiting on you.</p>
+      ) : (
+        <ul className="flex flex-col">
+          {needs.items.map((item) => (
+            <SidebarNeedRow key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} onOpenBoard={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })} />
+          ))}
+        </ul>
+      )}
+    </SidebarSection>
   );
 }
 
 function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: PluginThreadListProps) {
   const rpc = useRpc<typeof rpcContract>();
   const { status, threads, projects } = experimental_useSidebarThreads();
-  const { data, error } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
+  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [] }), [projects, threads, data]);
+  const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
+  const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, needsByProject.get(t.projectId)?.count ?? 0] as const)), [tabs, needsByProject]);
+  // A steward's question or item updates the badge and block within seconds;
+  // the half-minute poll stays the fallback. Only a project this sidebar shows
+  // triggers a refetch.
+  useRealtime(
+    NEEDS_YOU_CHANGED,
+    useCallback(
+      (payload) => {
+        const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
+        if (typeof projectId === "string" && projects.some((p) => p.id === projectId)) refetch();
+      },
+      [projects, refetch],
+    ),
+  );
   const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
   const [picked, setPicked] = useState<string | null>(null);
   // The active tab follows the route; a pick only lasts until the route moves.
   useEffect(() => setPicked(null), [activeProjectId]);
   const wanted = picked ?? activeProjectId;
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
+  const activeNeeds = active === null ? undefined : needsByProject.get(active.projectId);
   const now = Date.now();
   return (
     <div className="flex h-full flex-col text-sm">
-      <ProjectTabs tabs={tabs} activeId={active?.projectId ?? null} compact={isCompactViewport} onPick={setPicked} />
+      <ProjectTabs tabs={tabs} counts={counts} activeId={active?.projectId ?? null} compact={isCompactViewport} onPick={setPicked} />
       {status === "loading" && data === null ? (
         <p className="p-3 text-muted-foreground">Loading…</p>
       ) : active === null ? (
         <p className="p-3 text-muted-foreground">No projects yet.</p>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
+          {activeNeeds !== undefined ? <SidebarNeedsSection projectId={active.projectId} needs={activeNeeds} onChanged={refetch} /> : null}
           <SidebarSection title="In flight" count={active.efforts.length}>
             {active.efforts.length === 0 ? (
               <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>

@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
+import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
@@ -2541,6 +2542,101 @@ describe("the stewards sidebar call", () => {
     expect(result.projects[0]!.bindings).toEqual([]);
     expect(result.projects[0]!.ended).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
     expect(result.projects[0]!.ended[0]!.endedAt).toBe(t.now());
+  });
+});
+
+// BB-46: the sidebar's "needs you" count and items, and the realtime signal
+// that keeps every open sidebar current.
+describe("the sidebar's needs you block (BB-46)", () => {
+  type BoardView = {
+    questions: Array<{ id: string }>;
+    withUser: Array<{ id: string }>;
+    needs: Array<{ id: string; kind: string; actionable: boolean }>;
+  };
+  type SidebarView = { projects: Array<{ projectId: string; needs: { count: number; items: Array<{ type: string; id: string }> } }> };
+  const boardView = async (t: Awaited<ReturnType<typeof setup>>): Promise<BoardView> => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: BoardView }).board;
+  const sidebarView = async (t: Awaited<ReturnType<typeof setup>>) => ((await t.harness.callRpc("stewardsSidebar", null)) as SidebarView).projects.find((p) => p.projectId === "p1")!;
+
+  it("agrees with the board, excluding a non-actionable need and a with-user escalation a question covers", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+
+    // An approval escalation forwarded to the user, covered by the question below.
+    const covered = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: covered.id, question: "Which option?", context: null });
+    // One actionable need, and one the server cannot act on until it observes the pull request.
+    const configure = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const unobserved = t.hooks.store.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/999", what: "Approve an unobserved pull request", how: null });
+
+    const board = await boardView(t);
+    const sidebar = await sidebarView(t);
+    expect(board.questions.map((q) => q.id)).toEqual([question.id]);
+    // The question covers the forwarded escalation, so it is not a with-user row.
+    expect(board.withUser).toEqual([]);
+    expect(board.needs.map((n) => n.id).sort()).toEqual([configure.id, unobserved.id].sort());
+    expect(board.needs.find((n) => n.id === unobserved.id)!.actionable).toBe(false);
+
+    const actionable = board.needs.filter((n) => n.actionable).length;
+    expect(sidebar.needs.count).toBe(board.questions.length + board.withUser.length + actionable);
+    expect(sidebar.needs.items).toHaveLength(sidebar.needs.count);
+    expect(sidebar.needs.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "question", id: question.id }),
+        expect.objectContaining({ type: "need", id: configure.id }),
+      ]),
+    );
+    // The board keeps the non-actionable need; the sidebar drops it from items and count.
+    expect(sidebar.needs.items.some((i) => i.id === unobserved.id)).toBe(false);
+  });
+
+  it("publishes exactly one event carrying the project id when a question is filed", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which approach?", context: null });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+  });
+
+  it("publishes exactly one event when a question is answered, even when it resolves its escalation too", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const esc = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: esc.id, question: "Which approach?", context: null });
+    const before = t.harness.inspection.realtimeSignals.length;
+    const result = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: question.id, answer: "The safe one." }, { experimental_caller: { kind: "client" } });
+    expect(result).toMatchObject({ ok: true });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+  });
+
+  it("publishes one event when a route-me escalation is filed directly", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+  });
+
+  it("publishes when a binding ends and its needs leave the set", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "merged" });
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
+    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
   });
 });
 

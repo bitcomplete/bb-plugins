@@ -217,7 +217,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   and **Other…** instead of a free-text **Answer**, and a choice is saved as
   guidance. `bb stewards done <id> --choice <label>` records the same from a
   thread. A `blockedOn` naming the user, the owner or a human is refused
-  unless an open item says so.
+  unless an open item says so. The sidebar's **Needs you** block and count
+  badge show the same items, so a question reaches you where you already look
+  (BB-46).
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
   worker's `bb stewards escalate` goes to its steward, a steward's
   `steward_report { escalate }` to the project steward, and only the
@@ -327,6 +329,25 @@ reads the preference and, when it is unset or `__automatic__`, sets it to
 is left alone. The write is best-effort: a failure is logged and the sidebar
 keeps working. (`bb.onInstall` is not usable here; it does not run for
 plugins baked into the `bb-server` image.)
+
+**The Needs you block and the tab badge (BB-46).** Each tab shows a small
+count pill when the project has anything waiting on you, and the compact
+viewport's picker shows the summed count beside it and per-project counts in
+its options. Above **In flight**, a **Needs you** block lists one row per
+item: the entity key opens the entity, one line of what, and a question's or
+`decide` item's fixed `choices` as small buttons. A choice makes the same
+write the page does (`stewardsAnswerQuestion` for a question,
+`stewardsNeedAction { action: "choose" }` for a `decide` item) and refetches;
+a row without choices, or a `provide-secret` item, opens the Stewards page at
+that project. The block and the board page read one server function
+(`needsYou`), so the sidebar and the page can never disagree; a
+non-actionable need is on the page but not in the sidebar. The count and the
+items come from `stewardsSidebar`; the plugin publishes
+`needs-you-changed { projectId }` on its realtime channel whenever a question
+is opened or answered, an escalation is filed with or forwarded to the user
+or resolved, a need is filed, updated or closed, or a binding ends or reopens
+— including from a steward's own tools — so every open sidebar and the board
+page refresh within seconds. The half-minute poll stays as the fallback.
 
 **Per client or per server?** Checked on a dev server: the preference is
 **server-synced**, so a flip is per server, not per browser. Every open
