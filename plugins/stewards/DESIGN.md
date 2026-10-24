@@ -1278,6 +1278,20 @@ bindings; a collapsed Recently ended row; and the project steward demoted to
 one small row at the bottom. Every row carries bb's own thread actions
 context menu, so archive, pin, rename, split and delete still work.
 
+**Title-first rows (BB-48).** A row is the status glyph, the title, and — for
+a stewarded effort — the binding key only when the title does not already name
+it, plus the held and blocked badges. The title wins: it takes the available
+width and truncates last, while the meta shrinks and truncates first. A key
+shown is shortened (a pull request `acme/web#612` as `#612`, a ticket as its
+own key) and the full key stays on the row's `title` attribute. The stage
+leaves the row — the board still groups by stage, but a row no longer repeats
+it — and the chevron no longer carries a child count, so only the chevron
+signals children. A child row's worker/reviewer label is a small muted `W`/`R`
+tag. One-off threads no longer share In flight: they sit in a collapsed
+**Threads** row below it, so In flight counts stewarded efforts only.
+`buildSidebar` returns `efforts`, `threads` and `watches` separately, and the
+split is unit tested in `sidebar.test.ts`.
+
 **Grouping is the steward relationship, not the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
 through the worker the RPC names, so BB-23's removal of the parent link cannot

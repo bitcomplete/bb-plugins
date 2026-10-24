@@ -97,20 +97,99 @@ describe("the stewards sidebar list (BB-44)", () => {
     expect(captured.threadLists[0]).toMatchObject({ id: "sidebar", title: "Stewards" });
   });
 
-  it("shows a tab per live project and the active project's effort with its key, stage and badges", async () => {
+  it("shows a tab per live project and a title-first row with the shortened key and badges", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "billing freeze" })] }) } as never,
     });
     await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" })).toBeTruthy());
     expect(slot.getByRole("tab", { name: "Personal" })).toBeTruthy();
-    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
-    expect(slot.getByText("build")).toBeTruthy();
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    // The title does not name the key, so the key shows; the stage does not.
+    expect(slot.getByText("ENG-1")).toBeTruthy();
+    expect(slot.queryByText("build")).toBeNull();
     expect(slot.getByText("held")).toBeTruthy();
+    // The full key stays on the row's title attribute.
+    expect(slot.container.querySelector('[title="ENG-1"]')).not.toBeNull();
     slot.lifecycle.unmount();
   });
 
-  it("shows workers and reviewers only when the effort is expanded", async () => {
+  it("drops the key when the title already names it, and keeps no stage text", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Review acme/web#612: Read dashboard metrics" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612", stage: "review" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Review acme/web#612: Read dashboard metrics")).toBeTruthy());
+    expect(slot.queryByText("#612", { exact: true })).toBeNull();
+    expect(slot.queryByText("review", { exact: true })).toBeNull();
+    expect(slot.container.querySelector('[title="acme/web#612"]')).not.toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shortens a pull-request key to #N when the title omits it", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("#612")).toBeTruthy());
+    expect(slot.queryByText("acme/web#612", { exact: true })).toBeNull();
+    expect(slot.container.querySelector('[title="acme/web#612"]')).not.toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("does not swallow a key into a longer number in the title", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login #6123" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("#612", { exact: true })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("renders held and blocked badges without a stage", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "waiting", blockedOn: "a review" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("held")).toBeTruthy());
+    expect(slot.getByText("blocked")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("drops the child count beside the chevron but keeps the expand aria-label", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry" }] })] }) } as never,
+    });
+    const expand = await waitFor(() => slot.getByRole("button", { name: "Expand Fix login" }));
+    expect(expand.textContent).toBe("");
+    fireEvent.click(expand);
+    await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Collapse Fix login" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps one-off threads out of In flight, in a collapsed Threads section", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_oneoff", displayTitle: "My notes" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    const inFlight = slot.getByRole("heading", { name: /In flight/u });
+    expect(inFlight.textContent).toContain("1");
+    const threads = slot.getByRole("button", { name: /Threads/u });
+    expect(threads.textContent).toContain("1");
+    // Collapsed by default: the one-off's title is not rendered until it is opened.
+    expect(slot.queryByText("My notes")).toBeNull();
+    fireEvent.click(threads);
+    await waitFor(() => expect(slot.getByText("My notes")).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("shows workers and reviewers only when the effort is expanded, as muted glyph tags", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -123,14 +202,14 @@ describe("the stewards sidebar list (BB-44)", () => {
           }),
       } as never,
     });
-    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(slot.queryByText("Implement retry")).toBeNull();
     fireEvent.click(slot.getByRole("button", { name: /Expand Fix login/u }));
     await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
-    expect(slot.getByText("worker")).toBeTruthy();
+    expect(slot.getByTitle("worker").textContent).toBe("W");
     fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
     await waitFor(() => expect(slot.getByText("Review the PR")).toBeTruthy());
-    expect(slot.getByText("reviewer")).toBeTruthy();
+    expect(slot.getByTitle("reviewer").textContent).toBe("R");
     slot.lifecycle.unmount();
   });
 
@@ -192,7 +271,8 @@ describe("the stewards sidebar list (BB-44)", () => {
       { activeProjectId: "personal" },
     );
     await waitFor(() => expect(slot.getByRole("tab", { name: "Personal" }).getAttribute("aria-selected")).toBe("true"));
-    expect(slot.getByText("My notes")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    await waitFor(() => expect(slot.getByText("My notes")).toBeTruthy());
     fireEvent.click(slot.getByRole("tab", { name: "Acme" }));
     await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" }).getAttribute("aria-selected")).toBe("true"));
     slot.lifecycle.unmount();

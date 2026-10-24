@@ -92,9 +92,26 @@ describe("stewards sidebar grouping", () => {
       threads: [thread({ id: "thr_root" }), thread({ id: "thr_child", parentThreadId: "thr_root" }), thread({ id: "thr_fork", lifecycleOwnerThreadId: "thr_child" })],
       data: [data({ projectId: "p1" })],
     });
-    expect(tabs[0]!.efforts).toHaveLength(1);
-    expect(tabs[0]!.efforts[0]).toMatchObject({ rootThreadId: "thr_root", key: "thread:thr_root" });
-    expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_child", role: "thread", children: [{ threadId: "thr_fork", role: "thread" }] }]);
+    expect(tabs[0]!.efforts).toHaveLength(0);
+    expect(tabs[0]!.threads).toHaveLength(1);
+    expect(tabs[0]!.threads[0]).toMatchObject({ rootThreadId: "thr_root", key: "thread:thr_root" });
+    expect(tabs[0]!.threads[0]!.children).toMatchObject([{ threadId: "thr_child", role: "thread", children: [{ threadId: "thr_fork", role: "thread" }] }]);
+  });
+
+  it("returns stewarded efforts, one-off threads and ops watches as separate lists", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ops" }), thread({ id: "thr_oneoff" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward" }), binding({ key: "acme/web", threadId: "thr_ops", kind: "ops", stage: null })],
+        }),
+      ],
+    });
+    expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
+    expect(tabs[0]!.threads.map((e) => e.key)).toEqual(["thread:thr_oneoff"]);
+    expect(tabs[0]!.watches.map((e) => e.key)).toEqual(["acme/web"]);
   });
 
   it("skips a binding whose steward thread is not in the live view", () => {
@@ -103,7 +120,8 @@ describe("stewards sidebar grouping", () => {
       threads: [thread({ id: "thr_other" })],
       data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_archived" })] })],
     });
-    expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["thread:thr_other"]);
+    expect(tabs[0]!.efforts).toHaveLength(0);
+    expect(tabs[0]!.threads.map((e) => e.key)).toEqual(["thread:thr_other"]);
   });
 
   it("gives every live project a tab, stewarded or not, including the personal project", () => {
@@ -148,12 +166,12 @@ describe("stewards sidebar ordering", () => {
     expect(["idle", "finished", "failed"].some(isBusy)).toBe(false);
   });
 
-  it("orders a tab's efforts and watches with the same comparator", () => {
+  it("orders a tab's threads and watches with the same comparator", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_quiet", updatedAt: 5 }), thread({ id: "thr_busy", status: "active", updatedAt: 1 })],
       data: [data({ projectId: "p1" })],
     });
-    expect(tabs[0]!.efforts.map((e) => e.rootThreadId)).toEqual(["thr_busy", "thr_quiet"]);
+    expect(tabs[0]!.threads.map((e) => e.rootThreadId)).toEqual(["thr_busy", "thr_quiet"]);
   });
 });

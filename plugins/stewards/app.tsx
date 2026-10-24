@@ -847,6 +847,19 @@ function countThreads(children: readonly SidebarChild[]): number {
   return children.reduce((n, c) => n + 1 + countThreads(c.children), 0);
 }
 
+/** A pull-request key like `acme/web#612` shortens to `#612`; a ticket key stays its key. */
+function shortBindingKey(key: string): string {
+  const pull = /#(\d+)$/.exec(key);
+  return pull === null ? key : `#${pull[1]}`;
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Whether the title names the key as a whole token, so `#612` is not swallowed by `#6123`. */
+function titleNamesKey(title: string, key: string): boolean {
+  return new RegExp(`${escapeRegExp(key)}(?!\\d)`).test(title);
+}
+
 /** One thread row: bb's glyph, title and context menu, expanding into its children. */
 function SidebarThreadRow({
   thread,
@@ -856,6 +869,7 @@ function SidebarThreadRow({
   byId,
   onNavigate,
   meta,
+  titleAttr,
 }: {
   thread: PluginSidebarThread;
   role: SidebarChildRole;
@@ -864,6 +878,8 @@ function SidebarThreadRow({
   byId: ReadonlyMap<string, PluginSidebarThread>;
   onNavigate: () => void;
   meta?: ReactNode;
+  /** The full binding key, kept on the row's `title` attribute when the row is an effort. */
+  titleAttr?: string;
 }) {
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
@@ -876,17 +892,16 @@ function SidebarThreadRow({
   return (
     <li className="flex flex-col">
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
-        <div className="flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: `${4 + depth * 14}px` }}>
+        <div className="flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
             <button
               type="button"
               aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
               aria-expanded={open}
-              className="flex shrink-0 items-center gap-0.5 text-muted-foreground"
+              className="flex shrink-0 items-center text-muted-foreground"
               onClick={() => setOpen((v) => !v)}
             >
               <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
-              <span className="text-[10px] tabular-nums">{count}</span>
             </button>
           ) : (
             <span className="size-4 shrink-0" />
@@ -903,7 +918,11 @@ function SidebarThreadRow({
           >
             <ThreadTitle threadId={thread.id} />
           </a>
-          {role === "worker" || role === "reviewer" ? <span className="shrink-0 text-[10px] uppercase text-muted-foreground">{role}</span> : null}
+          {role === "worker" || role === "reviewer" ? (
+            <span className="shrink-0 rounded bg-state-hover px-1 text-[9px] font-semibold uppercase leading-4 text-muted-foreground" title={role}>
+              {role === "worker" ? "W" : "R"}
+            </span>
+          ) : null}
           {meta}
         </div>
       </ThreadActionsContextMenu>
@@ -921,20 +940,25 @@ function SidebarThreadRow({
   );
 }
 
-/** One effort's root row, with the binding's key, stage and held/blocked badges. */
+/** One effort's root row, title-first: the shortened key only when the title omits it, and the held/blocked badges. */
 function SidebarEffortRow({ effort, byId, onNavigate }: { effort: SidebarEffort; byId: ReadonlyMap<string, PluginSidebarThread>; onNavigate: () => void }) {
   const root = byId.get(effort.rootThreadId);
   if (root === undefined) return null;
+  const key = effort.bindingKey;
+  const displayKey = key === null ? null : shortBindingKey(key);
+  // The title wins: a steward is titled after its binding, so showing the key again is noise.
+  const keyInTitle = key !== null && displayKey !== null && (titleNamesKey(root.displayTitle, key) || titleNamesKey(root.displayTitle, displayKey));
+  const showKey = displayKey !== null && !keyInTitle;
+  const badges = effort.hold !== null || effort.blockedOn !== null;
   const meta =
-    effort.bindingKey === null ? null : (
-      <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
-        <span className="font-medium">{effort.bindingKey}</span>
-        {effort.stage !== null ? <span>{effort.stage}</span> : null}
+    !showKey && !badges ? null : (
+      <span className="flex min-w-0 shrink items-center gap-1 text-[11px] text-muted-foreground">
+        {showKey ? <span className="min-w-0 truncate font-medium">{displayKey}</span> : null}
         {effort.hold !== null ? <Badge tone="warn">held</Badge> : null}
         {effort.blockedOn !== null ? <Badge tone="bad">blocked</Badge> : null}
       </span>
     );
-  return <SidebarThreadRow thread={root} role="thread" children={effort.children} depth={0} byId={byId} onNavigate={onNavigate} meta={meta} />;
+  return <SidebarThreadRow thread={root} role="thread" children={effort.children} depth={0} byId={byId} onNavigate={onNavigate} meta={meta} titleAttr={key ?? undefined} />;
 }
 
 function SidebarSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
@@ -1138,6 +1162,15 @@ function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: Plu
               </ul>
             )}
           </SidebarSection>
+          {active.threads.length > 0 ? (
+            <SidebarCollapsible title="Threads" count={active.threads.length}>
+              <ul className="flex flex-col">
+                {active.threads.map((e) => (
+                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
+                ))}
+              </ul>
+            </SidebarCollapsible>
+          ) : null}
           {active.watches.length > 0 ? (
             <SidebarCollapsible title="Watches" count={active.watches.length}>
               <ul className="flex flex-col">
