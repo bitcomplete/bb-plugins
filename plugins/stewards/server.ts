@@ -983,6 +983,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return "gone";
       if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
+      // A worker the waiting cascade hid comes back with the message, so a
+      // resumed worker shows under its effort again (BB-47). A steward's own
+      // thread keeps its hidden state: a wake that needs nobody stays hidden.
+      if (info.visibility === "hidden" && store.worker(threadId) !== null) await quietly(`show ${threadId}`, () => bb.sdk.threads.update({ threadId, visibility: "visible" }));
       return send(threadId, typeof text === "string" ? text : text());
     }
 
@@ -1206,17 +1210,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * The worker a thread is a child of, if any. A reviewer is spawned with
-     * its worker as parent (`--parent-self`, what build-tickets uses) or as
-     * lifecycle owner; either way its parent is the worker, not the steward.
-     * Null for a worker itself and for anything else.
+     * its worker as parent (`--parent-self`, what build-tickets uses), which is
+     * also how the sidebar RPC and `reviewersOf` find it. Null for a worker
+     * itself and for anything else.
      */
-    function reviewerOwner(thread: { lifecycleOwnerThreadId: string | null; parentThreadId: string | null }): Worker | null {
-      for (const id of [thread.parentThreadId, thread.lifecycleOwnerThreadId]) {
-        if (id === null) continue;
-        const w = store.worker(id);
-        if (w !== null) return w;
-      }
-      return null;
+    function reviewerOwner(thread: { parentThreadId: string | null }): Worker | null {
+      return thread.parentThreadId === null ? null : store.worker(thread.parentThreadId);
     }
 
     /** A worker's reviewer threads, as bb lists them: its children, hidden or not, not archived. */
@@ -1257,6 +1256,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (needsUser(b)) return;
       for (const w of store.workers(b.id)) {
         if (w.status !== "finished" || workerQuestion(w.result) !== null) continue;
+        // A worker whose reviewer is still unarchived must stay. bb core
+        // releases a thread's unarchived children from it when it is archived,
+        // so archiving the worker would clear the reviewer's parent: it could
+        // no longer wake the worker, and `reviewersOf` could never find it to
+        // archive it (BB-47).
+        if ((await reviewersOf(w.threadId)).length > 0) continue;
         const info = await threadInfo(w.threadId).catch(() => null);
         if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
         await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
@@ -1277,7 +1282,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function cascadeVisibility(b: Binding, visibility: "hidden" | "visible"): Promise<void> {
       for (const w of store.workers(b.id)) {
-        if (visibility === "hidden" && w.status !== "finished") continue;
+        if (w.status !== "finished") continue;
         await setVisibility(w.threadId, visibility);
         for (const r of await reviewersOf(w.threadId)) await setVisibility(r.id, visibility);
       }

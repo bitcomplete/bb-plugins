@@ -1893,7 +1893,7 @@ describe("stewards waiting on others", () => {
 });
 
 describe("archiving finished workers and reviewers (BB-47)", () => {
-  it("archives a reviewer once its worker's next turn ends, but not while its round is running", async () => {
+  it("archives a reviewer once its worker's next turn ends, and keeps the worker until the round is consumed", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -1902,16 +1902,19 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     await t.created("thr_r1", "thr_w1", "Review round 1");
 
     // The worker ends its turn to wait on the reviewer, which is still
-    // running: its round is not consumed, so it stays.
+    // running: neither is archived (archiving the worker would clear the
+    // reviewer's parent in bb and stall the review loop).
     t.threads.get("thr_r1")!.status = "active";
-    await t.idle("thr_w1", "Should I wait for the reviewer?");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
     expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
 
     // The reviewer has finished and the worker's next turn ends: the round is
-    // consumed and the reviewer leaves the sidebar.
+    // consumed, so the reviewer leaves the sidebar, and now the worker does.
     t.threads.get("thr_r1")!.status = "idle";
     await t.idle("thr_w1", "Addressed the review and pushed.");
     expect(t.threads.get("thr_r1")!.archivedAt).not.toBeNull();
+    expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
   });
 
   it("archives the older reviewer when a newer round is spawned, and never the newest while its worker is in flight", async () => {
@@ -1953,8 +1956,9 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     await t.idle("thr_w1", "Implemented the fix.");
     expect(t.threads.get("thr_w1")!.archivedAt).not.toBeNull();
 
-    // An escalation the worker raised is answered: the plugin tells it through
-    // sendTo, which brings an archived thread back first.
+    // The escalation is raised after the archive to exercise sendTo's
+    // unarchive directly; a real worker with an open escalation would keep
+    // needsUser true and not be archived in the first place.
     const b = t.hooks.store.find("ENG-12")!;
     const x = t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Which approach?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1", origin: { threadId: "thr_w1", bindingId: b.id, chain: [] } });
     t.hooks.store.resolve(x.id, "The second one.", "user");
@@ -1971,9 +1975,14 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward);
     await t.created("thr_w2", steward);
+    await t.created("thr_w3", steward);
     await t.created("thr_r1", "thr_w1", "Review round 1");
     // thr_w1 is finished (it asked a question, so it stays visible), its
-    // reviewer is still running, and thr_w2 is still running.
+    // reviewer is still running, thr_w2 runs, and thr_w3's reviewer is a
+    // build-tickets hidden spawn (a running worker's reviewer is not hidden
+    // by the cascade and must stay hidden when the steward comes back).
+    await t.created("thr_r2", "thr_w3", "Review round 1");
+    t.threads.get("thr_r2")!.visibility = "hidden";
     await t.idle("thr_w1", "Should I keep the reviewer open?");
 
     await t.tool("steward_report", { phase: "In Progress", summary: "Implemented.", nextAction: "Wait for the worker", actor: "other", blockedOn: "the worker" }, steward);
@@ -1981,8 +1990,9 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     expect(t.threads.get(steward)!.visibility).toBe("hidden");
     expect(t.threads.get("thr_w1")!.visibility).toBe("hidden");
     expect(t.threads.get("thr_r1")!.visibility).toBe("hidden");
-    // A running worker is unaffected.
+    // A running worker is unaffected, and neither is its hidden reviewer.
     expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
+    expect(t.threads.get("thr_r2")!.visibility).toBe("hidden");
 
     // A wake that needs the user brings the steward back, and them with it.
     const b = t.hooks.store.byThread(steward)!;
@@ -1993,6 +2003,9 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     expect(t.threads.get("thr_w1")!.visibility).toBe("visible");
     expect(t.threads.get("thr_r1")!.visibility).toBe("visible");
     expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
+    // The show cascade is symmetric: it does not flip a running worker's
+    // hidden reviewer into the sidebar.
+    expect(t.threads.get("thr_r2")!.visibility).toBe("hidden");
   });
 });
 

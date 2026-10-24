@@ -308,7 +308,7 @@ export function formatWake(input: WakeInput): string {
       .split("\n")
       .map((line) => `    ${line}`),
     "",
-    "Follow it up with `bb thread tell <id> <message>`. A worker finishing starts no turn of yours: its final message arrives in your next wake, which lists it under Workers.",
+    "Follow it up with `bb thread tell <id> <message>`. A worker finishing starts no turn of yours: its final message arrives in your next wake, which lists it under Workers. Once that report has been consumed the worker's thread is archived, and `bb thread tell` refuses an archived thread: bring it back with `bb thread unarchive <id>` first, or start a fresh worker.",
     "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
     "On a turn that is not a wake — a plain message, a `bb thread tell`, a child notice — run `bb stewards brief` first. It prints this thread's id, the allowed actions, the phase instructions, the ready gate, guidance and holds, the standing rules and the exact spawn command. `bb stewards spawn-flags` prints just the spawn command.",
     "",

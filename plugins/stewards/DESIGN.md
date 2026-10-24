@@ -294,8 +294,10 @@ plugins.
   is archived once its round is consumed — the worker's next turn ends, or a
   newer round reviewer is spawned for the same worker — and the newest
   reviewer for a worker is never archived while that worker is in flight.
-  Messaging an archived worker unarchives it first (`sendTo`), and it shows
-  under its effort again.
+  Messaging an archived worker from the plugin unarchives it first (`sendTo`),
+  and it shows under its effort again; the steward's own `bb thread tell`
+  refuses an archived thread, so it brings the worker back with
+  `bb thread unarchive` first, or starts a fresh worker.
 - **Parent ends first.** Promoted sub-issues still open are re-parented to the
   next managed ancestor, or the project steward.
 

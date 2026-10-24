@@ -149,7 +149,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   worker's next turn ends, or a newer round reviewer is spawned for the same
   worker — and the newest reviewer for a worker is never archived while that
   worker is in flight. A later message to an archived worker unarchives it,
-  and it shows under its effort again.
+  and it shows under its effort again; the steward's own `bb thread tell`
+  refuses an archived thread, so it runs `bb thread unarchive <id>` first, or
+  starts a fresh worker.
 - **thread-briefs.** Every steward, the project steward included, is
   spawned with `threadBriefs: { rename: false, group: false, archive: false }`
   in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
