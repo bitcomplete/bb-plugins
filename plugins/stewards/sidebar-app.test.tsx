@@ -183,6 +183,21 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("follows activeProjectId for the active tab and switches on pick", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_personal", projectId: "personal", displayTitle: "My notes" })] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeProjectId: "personal" },
+    );
+    await waitFor(() => expect(slot.getByRole("tab", { name: "Personal" }).getAttribute("aria-selected")).toBe("true"));
+    expect(slot.getByText("My notes")).toBeTruthy();
+    fireEvent.click(slot.getByRole("tab", { name: "Acme" }));
+    await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" }).getAttribute("aria-selected")).toBe("true"));
+    slot.lifecycle.unmount();
+  });
+
   it("navigates to the row's thread and calls onNavigate", async () => {
     const onNavigate = vi.fn();
     const slot = await renderSidebar(
