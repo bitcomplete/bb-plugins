@@ -1,13 +1,34 @@
 import { describe, expect, it } from "vitest";
-import { conversationOf, isFromOwner, isUntrusted, SESSION_TEXT_CHARS, sessionsSchema, wakeText } from "./sessions.js";
+import {
+  channelProject,
+  chooseConversationProject,
+  conversationOf,
+  isFromOwner,
+  isUntrusted,
+  parseChannelMap,
+  parseConfirm,
+  SESSION_TEXT_CHARS,
+  sessionsSchema,
+  wakeText,
+  type ChannelEntry,
+  type Project,
+} from "./sessions.js";
 import type { SessionEvent } from "./hooks-client.js";
+
+const PROJECTS: Project[] = [
+  { id: "prj-1", name: "Project One", kind: "standard" },
+  { id: "prj-2", name: "Project Two", kind: "standard" },
+  { id: "prj-p", name: "Personal", kind: "personal" },
+];
 
 function event(over: Partial<SessionEvent> = {}): SessionEvent {
   return {
     source: "slack",
     session: "D0123:1712345678.901234",
     action: "message",
+    mention: false,
     channel: "D0123",
+    contextChannel: "",
     thread: "1712345678.901234",
     asker: { id: "U0123", name: "Alice" },
     owner: { id: "U0123", name: "Alice" },
@@ -82,9 +103,70 @@ describe("wakeText", () => {
 });
 
 describe("sessionsSchema", () => {
-  it("fills the title default and tolerates junk", () => {
+  it("fills the title and context defaults and tolerates junk", () => {
     const parsed = sessionsSchema.parse({ a: { channel: "D1", thread: "1", threadId: "thr-1", projectId: "prj-1", eventAt: 1, events: 2, answered: 1, handedAt: 1 } });
     expect(parsed.a?.title).toBeNull();
+    expect(parsed.a?.contextChannel).toBeNull();
     expect(sessionsSchema.parse("nonsense")).toEqual({});
+  });
+});
+
+describe("the channel map", () => {
+  const entries: ChannelEntry[] = [
+    { channel: "C0123", project: "Project One" },
+    { channel: "dm", project: "Personal" },
+  ];
+
+  it("keys by channel id, so a rename does not move it", () => {
+    expect(channelProject(entries, "C0123")).toBe("Project One");
+    // A name never matches: the map is keyed by id, not by the channel's name.
+    expect(channelProject(entries, "hiringloop")).toBeNull();
+    expect(channelProject(entries, "renamed-channel")).toBeNull();
+  });
+
+  it("matches the reserved dm key case-insensitively", () => {
+    expect(channelProject(entries, "dm")).toBe("Personal");
+    expect(channelProject([{ channel: "DM", project: "Project One" }], "dm")).toBe("Project One");
+  });
+
+  it("drops junk rather than failing a wake", () => {
+    expect(parseChannelMap("not json")).toEqual([]);
+    expect(parseChannelMap(JSON.stringify([{ channel: "C1" }, { channel: "C2", project: "P" }, "x"]))).toEqual([{ channel: "C2", project: "P" }]);
+    expect(parseChannelMap("")).toEqual([]);
+  });
+
+  it("chooses by channel id, then context, then dm, then the default", () => {
+    // The conversation's own channel wins.
+    expect(chooseConversationProject(PROJECTS, entries, "", "C0123", "C0456", false)?.id).toBe("prj-1");
+    // A DM with a remembered context channel uses that channel's project.
+    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", "C0123", true)?.id).toBe("prj-1");
+    // No context: the dm entry.
+    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", null, true)?.id).toBe("prj-p");
+    // Nothing mapped: the default.
+    expect(chooseConversationProject(PROJECTS, entries.slice(0, 1), "Project One", "D9999", null, true)?.id).toBe("prj-1");
+  });
+
+  it("never uses the dm entry for a channel, so an unmapped channel uses the default", () => {
+    const dmOnly: ChannelEntry[] = [{ channel: "dm", project: "Personal" }];
+    expect(chooseConversationProject(PROJECTS, dmOnly, "Project One", "C9999", null, false)?.id).toBe("prj-1");
+  });
+
+  it("skips an entry naming a project this server lacks, and matches names ignoring case", () => {
+    const missing: ChannelEntry[] = [{ channel: "C0123", project: "Nope" }, { channel: "dm", project: "project one" }];
+    expect(chooseConversationProject(PROJECTS, missing, "", "D0123", null, true)?.id).toBe("prj-1");
+  });
+
+  it("with an empty map is exactly the old default", () => {
+    expect(chooseConversationProject(PROJECTS, [], "", "D0123", null, true)?.id).toBe("prj-p");
+  });
+});
+
+describe("parseConfirm", () => {
+  it("reads the id from the owner's whole message, with an optional mention", () => {
+    expect(parseConfirm("confirm r-abcd")).toBe("r-abcd");
+    expect(parseConfirm("<@U-bb> confirm r-abcd")).toBe("r-abcd");
+    expect(parseConfirm("Confirm: r-abcd.")).toBe("r-abcd");
+    expect(parseConfirm("sure")).toBeNull();
+    expect(parseConfirm("confirm r-abcd and more")).toBeNull();
   });
 });

@@ -1,6 +1,6 @@
 // The plugin's settings section: whether this server is signed in to Slack as
-// you, and which bb project a Slack conversation starts its thread in. The
-// token itself is never shown.
+// you, which bb project a Slack conversation starts its thread in by default,
+// and the channel → project map. The token itself is never shown.
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -13,12 +13,87 @@ interface Project {
   kind: string;
 }
 
+interface ChannelEntry {
+  channel: string;
+  project: string;
+}
+
 interface Status {
   signedIn: boolean;
   user: { id: string; name: string } | null;
   project: { id: string; name: string } | null;
   projects: Project[];
+  channels: ChannelEntry[];
   hooks: { configured: boolean; connected: boolean; state: string };
+}
+
+/** The name shown beside a channel id when one is known. Only the reserved `dm` has one. */
+function channelLabel(channel: string): string | null {
+  return channel.trim().toLowerCase() === "dm" ? "Direct message" : null;
+}
+
+/** The channel → project map: a row per channel, saved together. */
+function ChannelMapEditor({ status, busy, save }: { status: Status; busy: boolean; save: (entries: ChannelEntry[]) => void }) {
+  const [rows, setRows] = useState<ChannelEntry[]>(status.channels);
+  useEffect(() => setRows(status.channels), [status.channels]);
+  const projectNames = status.projects.map((p) => p.name);
+  const valid = rows.filter((row) => row.channel.trim() !== "" && row.project.trim() !== "");
+  const dirty = JSON.stringify(valid) !== JSON.stringify(status.channels);
+  const change = (index: number, patch: Partial<ChannelEntry>) =>
+    setRows((all) => all.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-muted-foreground">
+        A mention in a channel starts its thread in the project beside it. A channel is a Slack channel id (<code>C…</code> or <code>G…</code>), never a name, so
+        renaming a channel does not break its entry; the reserved <code>dm</code> is a direct message with the app. A channel or DM with no entry uses the project above.
+      </p>
+      {rows.length === 0 ? <p className="text-muted-foreground">No channel entries yet.</p> : null}
+      {rows.map((row, index) => (
+        <div key={index} className="flex items-center gap-2">
+          <label className="flex flex-col gap-0.5">
+            <input
+              className="h-8 w-40 rounded-md border border-input bg-transparent px-2 text-sm"
+              placeholder="C0123 or dm"
+              value={row.channel}
+              disabled={busy}
+              onChange={(e) => change(index, { channel: e.target.value })}
+            />
+            {channelLabel(row.channel) !== null ? <span className="text-xs text-muted-foreground">{channelLabel(row.channel)}</span> : null}
+          </label>
+          <select
+            className="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm"
+            value={row.project}
+            disabled={busy}
+            onChange={(e) => change(index, { project: e.target.value })}
+          >
+            {!projectNames.includes(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
+            {projectNames.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => setRows((all) => all.filter((_, i) => i !== index))}>
+            Remove
+          </Button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy || projectNames.length === 0}
+          onClick={() => setRows((all) => [...all, { channel: "", project: projectNames[0] ?? "" }])}
+        >
+          Add channel
+        </Button>
+        <Button size="sm" disabled={busy || !dirty} onClick={() => save(valid)}>
+          Save map
+        </Button>
+      </div>
+    </div>
+  );
 }
 
 function SlackSection() {
@@ -78,8 +153,8 @@ function SlackSection() {
       <div className="flex items-center justify-between gap-4">
         <p className="text-muted-foreground">
           {status.signedIn
-            ? `Signed in as ${signedInAs ?? "you"}. DMs to the team's bb app reach this server and answer in Slack.`
-            : "Sign in with Slack once so a DM to the team's bb app reaches your bb. This proves who you are; it grants no message access."}
+            ? `Signed in as ${signedInAs ?? "you"}. DMs and channel mentions of the team's bb app reach this server and answer in Slack.`
+            : "Sign in with Slack once so a DM or a channel mention of the team's bb app reaches your bb. This proves who you are; it grants no message access."}
         </p>
         {status.signedIn ? (
           <Button variant="outline" size="sm" disabled={busy} onClick={() => void act(() => rpc.call("signout"))}>
@@ -108,6 +183,9 @@ function SlackSection() {
             ))}
           </select>
         </label>
+      ) : null}
+      {status.projects.length > 0 ? (
+        <ChannelMapEditor status={status} busy={busy} save={(entries) => void act(() => rpc.call("setChannels", { entries }))} />
       ) : null}
       {!status.hooks.connected && status.hooks.configured ? <p className="text-muted-foreground">Connecting to bb-gate-hooks…</p> : null}
       {error !== null ? <p className="text-destructive">{error}</p> : null}

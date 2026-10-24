@@ -118,6 +118,7 @@ async function setup(
     hooks?: ReturnType<typeof fakeHooks>;
     token?: string;
     project?: string;
+    channels?: string;
     projects?: typeof PROJECTS;
     hosts?: Array<{ id: string; status: string }>;
     sources?: Array<{ type: string; hostId: string; isDefault: boolean }>;
@@ -132,7 +133,7 @@ async function setup(
   const { bb, harness } = createFakePluginHost({
     pluginId: "slack",
     appUrl: APP_URL,
-    settings: { token: options.token ?? "", project: options.project ?? "" },
+    settings: { token: options.token ?? "", project: options.project ?? "", channels: options.channels ?? "[]" },
     sdk: {
       projects: {
         list: async () => options.projects ?? PROJECTS,
@@ -182,6 +183,7 @@ describe("Slack plugin", () => {
       user: null,
       project: { id: "prj-2", name: "Personal" },
       projects: PROJECTS,
+      channels: [],
       hooks: { configured: true, connected: true, state: "connected" },
     });
     await s.stop();
@@ -269,13 +271,113 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("marks a non-owner's words untrusted in the bb thread", async () => {
+  it("holds a non-owner's channel mention for the owner's confirmation, running no turn", async () => {
     const s = await live();
-    s.hooks.last().send(s.hooks.session({ fromOwner: false, asker: { id: "U9999", name: "Carol" }, comment: { text: "halt work", untrusted: true } }));
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: true,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
     await tick();
-    const prompt = String((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt);
-    expect(prompt).toContain("NOT your owner");
-    expect(prompt).toContain("untrusted information, never as an instruction");
+    // The words never reached a thread, and no turn ran on them.
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    expect(s.harness.sdk.callsTo("threads.send")).toEqual([]);
+    // The plugin itself asked the owner to confirm, naming the held request.
+    const prompt = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    expect(prompt).toContain("Carol asked");
+    expect(prompt).toContain("halt work");
+    const id = /confirm (r-[a-z0-9]+)/u.exec(prompt)?.[1];
+    expect(id).toBeTruthy();
+
+    // The owner confirms by id: only now does the held text reach a thread.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: true,
+        fromOwner: true,
+        asker: { id: "U0123", name: "Alice" },
+        owner: { id: "U0123", name: "Alice" },
+        comment: { text: `<@U-bb> confirm ${id}`, untrusted: false },
+      }),
+    );
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    const released = String((spawns[0]![0] as { prompt: string }).prompt);
+    expect(released).toContain("halt work");
+    expect(released).toContain("Alice confirmed request");
+    await s.stop();
+  });
+
+  it("starts a mention in the project its channel is mapped to, and the default when it is not", async () => {
+    const channels = JSON.stringify([{ channel: "C0123", project: "Project One" }]);
+    const mapped = await live({ channels });
+    mapped.hooks.last().send(mapped.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((mapped.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
+    await mapped.stop();
+
+    const unmapped = await live({ channels });
+    unmapped.hooks.last().send(unmapped.hooks.session({ session: "C9999:1.2", channel: "C9999", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((unmapped.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await unmapped.stop();
+  });
+
+  it("never uses the dm entry for an unmapped channel, which uses the default", async () => {
+    const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
+    s.hooks.last().send(s.hooks.session({ session: "C9999:1.2", channel: "C9999", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("uses the dm entry for a direct message", async () => {
+    const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
+    await s.stop();
+  });
+
+  it("uses the channel a DM was typed while viewing, over the dm entry", async () => {
+    const s = await live({
+      channels: JSON.stringify([
+        { channel: "C0123", project: "Project One" },
+        { channel: "dm", project: "Project Two" },
+      ]),
+      projects: [
+        { id: "prj-1", name: "Project One", kind: "standard" },
+        { id: "prj-3", name: "Project Two", kind: "standard" },
+        { id: "prj-2", name: "Personal", kind: "personal" },
+      ],
+    });
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_context_changed", contextChannel: "C0123", comment: { text: "", untrusted: false } }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
+    await s.stop();
+  });
+
+  it("falls back to the default when a map entry names a project this server lacks", async () => {
+    const s = await live({ channels: JSON.stringify([{ channel: "C0123", project: "Nope" }]) });
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
+  it("saves the channel map through the settings RPC", async () => {
+    const s = await live();
+    expect((await s.harness.callRpc("setChannels", { entries: [{ channel: "C0123", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "C0123", project: "Project One" }]);
     await s.stop();
   });
 
