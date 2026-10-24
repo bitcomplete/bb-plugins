@@ -102,8 +102,10 @@ export interface SidebarTab {
   projectId: string;
   name: string;
   isPersonal: boolean;
-  /** In-flight efforts, ordered. `ops` bindings are in `watches`, not here. */
+  /** In-flight stewarded efforts, ordered. `ops` bindings are in `watches`, one-off threads in `threads`. */
   efforts: SidebarEffort[];
+  /** One-off threads (no steward binding), ordered. */
+  threads: SidebarEffort[];
   /** `ops`, Dependabot and Sentry bindings, grouped in a collapsed row. */
   watches: SidebarEffort[];
   projectStewardThreadId: string | null;
@@ -278,7 +280,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     projectId: project.id,
     name: project.name,
     isPersonal: project.isPersonal,
-    efforts: efforts.filter((e) => e.kind !== "ops").sort(compareEfforts),
+    efforts: efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops").sort(compareEfforts),
+    threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
     watches: efforts.filter((e) => e.kind === "ops").sort(compareEfforts),
     projectStewardThreadId: stewardThreadId,
     ended: data?.ended ?? [],
