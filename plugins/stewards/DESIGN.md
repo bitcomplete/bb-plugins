@@ -1245,6 +1245,53 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   closes the record, not the file. A boundary lesson is undone the same way
   once the user has merged it.
 
+## 21. The sidebar thread list
+
+An opt-in replacement for bb's own sidebar list, registered through the
+exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One tab
+per project in the live view; in-flight efforts grouped by the steward
+relationship; a collapsed Watches row for `ops`, Dependabot and Sentry
+bindings; a collapsed Recently ended row; and the project steward demoted to
+one small row at the bottom. Every row carries bb's own thread actions
+context menu, so archive, pin, rename, split and delete still work.
+
+**Grouping is the steward relationship, not the thread tree.** A worker
+belongs to its binding through the plugin's `workers` table and a reviewer
+through the worker the RPC names, so BB-23's removal of the parent link cannot
+break it. The thread tree is used only for one-off threads, which have nothing
+else, and as a fallback for a pre-BB-23 worker whose parent is its steward.
+The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
+component joins them to `experimental_useSidebarThreads` and polls
+`stewardsSidebar` on the board's half-minute visibility-aware cadence.
+
+**The default provider, checked (BB-44 criterion 1).** With
+`sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to
+"the first installed thread list plugin other than the bundled
+`thread-list/thread-list`". Registering the slot therefore makes the stewards
+list active on every client that has not pinned a provider, and
+`bb settings ui get sidebar.threadListProvider` on the dev server reads
+`__automatic__`. **The guard was needed:** without it the list would win by
+default. On load the plugin (`server.ts`, `pinSidebarThreadListProvider`)
+reads the preference and, when it is unset or `__automatic__`, sets it to
+`thread-list/thread-list`; an explicit value is left alone, and a failure is
+logged, never thrown. `bb.onInstall` is not usable here — it does not run for
+plugins baked into the `bb-server` image — so the pin is on load. BB-44 and
+BB-45 are one landing; BB-44 must not land alone.
+
+**The footer toggle (BB-45).** `app.tsx` registers a
+`experimental_sidebarFooter` disclosure (`id: "sidebar"`, `icon:
+"ShieldCheck"`): a switch that writes the same preference. On sets
+`<pluginId>/sidebar`, the id BB-44 registers; off sets
+`thread-list/thread-list`. It lists the preference when the disclosure opens
+and, on an HTTP 409 revision conflict, re-lists and retries once with the
+fresh revision. `__automatic__` (or a missing entry) reads as on, because it
+means the stewards list is the effective provider until the pin makes the
+choice explicit. The preference is server-synced, so a flip is per server:
+every window of one bb server shows the same list. Each developer has their
+own server behind bb-gate, so it is per developer in practice.
+
+The "Needs you" block and the tab badge are a separate ticket.
+
 ## Known limits
 
 - **Multi-repo projects only.** A bb project whose source is a single

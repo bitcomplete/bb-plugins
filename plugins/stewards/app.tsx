@@ -5,9 +5,28 @@
 // stewarded and whether their configuration is healthy, then every open
 // steward and where it stands. Steering stays with the project steward and
 // the CLI.
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Markdown, definePluginApp, experimental_Icon as Icon, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Markdown,
+  ThreadTitle,
+  definePluginApp,
+  experimental_Icon as Icon,
+  experimental_ThreadActionsContextMenu as ThreadActionsContextMenu,
+  experimental_ThreadStatusGlyph as ThreadStatusGlyph,
+  experimental_usePluginId,
+  experimental_useSidebarThreads,
+  useBbNavigate,
+  useRpc,
+  useSdk,
+  useSidebarThreadDraft,
+  useSidebarThreadRowStatus,
+  type PluginSidebarThread,
+  type PluginThreadActionTarget,
+  type PluginThreadListProps,
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { buildSidebar, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort } from "./sidebar.js";
+import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
 type Overview = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: unknown; lastSweepAt: unknown }> : never;
@@ -772,6 +791,381 @@ function InFlightRow({ steward: s, now }: { steward: Board["stewards"][number]; 
   );
 }
 
+// ---- The sidebar thread list -------------------------------------------------------------------
+//
+// The opt-in replacement for bb's sidebar list, registered through the
+// exclusive `experimental_threadList` slot. One tab per project, in-flight
+// efforts grouped by the steward relationship, collapsed Watches and Recently
+// ended rows, and a demoted project-steward row. Every row carries bb's own
+// thread actions context menu, so nothing bb's rows can do is lost.
+
+/** Past this many projects the tabs become a picker, as on a compact viewport. */
+const SIDEBAR_TAB_LIMIT = 5;
+
+/** The live fields bb's thread actions read, from a sidebar row. */
+function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
+  return {
+    id: t.id,
+    projectId: t.projectId,
+    parentThreadId: t.parentThreadId,
+    archivedAt: t.archivedAt,
+    pinnedAt: t.pinnedAt,
+    sectionId: t.sectionId,
+    isUnread: t.isUnread,
+    status: t.status,
+    environment: t.environment === null || t.environment.id === null ? null : { id: t.environment.id, path: t.environment.path },
+  };
+}
+
+function countThreads(children: readonly SidebarChild[]): number {
+  return children.reduce((n, c) => n + 1 + countThreads(c.children), 0);
+}
+
+/** One thread row: bb's glyph, title and context menu, expanding into its children. */
+function SidebarThreadRow({
+  thread,
+  role,
+  children,
+  depth,
+  byId,
+  onNavigate,
+  meta,
+}: {
+  thread: PluginSidebarThread;
+  role: SidebarChildRole;
+  children: readonly SidebarChild[];
+  depth: number;
+  byId: ReadonlyMap<string, PluginSidebarThread>;
+  onNavigate: () => void;
+  meta?: ReactNode;
+}) {
+  const navigate = useBbNavigate();
+  const rowStatus = useSidebarThreadRowStatus(thread.id);
+  const draft = useSidebarThreadDraft(thread.id);
+  const [open, setOpen] = useState(false);
+  // The array-wide indicator never reports a draft; the row folds in the
+  // client-local one, as bb's own row does.
+  const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
+  const count = countThreads(children);
+  return (
+    <li className="flex flex-col">
+      <ThreadActionsContextMenu thread={actionTarget(thread)}>
+        <div className="flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: `${4 + depth * 14}px` }}>
+          {count > 0 ? (
+            <button
+              type="button"
+              aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
+              aria-expanded={open}
+              className="flex shrink-0 items-center gap-0.5 text-muted-foreground"
+              onClick={() => setOpen((v) => !v)}
+            >
+              <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+              <span className="text-[10px] tabular-nums">{count}</span>
+            </button>
+          ) : (
+            <span className="size-4 shrink-0" />
+          )}
+          <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+          <a
+            href={thread.href}
+            className="min-w-0 flex-1 truncate text-sm"
+            onClick={(e) => {
+              e.preventDefault();
+              navigate.toThread(thread.id);
+              onNavigate();
+            }}
+          >
+            <ThreadTitle threadId={thread.id} />
+          </a>
+          {role === "worker" || role === "reviewer" ? <span className="shrink-0 text-[10px] uppercase text-muted-foreground">{role}</span> : null}
+          {meta}
+        </div>
+      </ThreadActionsContextMenu>
+      {open && children.length > 0 ? (
+        <ul className="flex flex-col">
+          {children.map((c) => {
+            const child = byId.get(c.threadId);
+            return child === undefined ? null : (
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} />
+            );
+          })}
+        </ul>
+      ) : null}
+    </li>
+  );
+}
+
+/** One effort's root row, with the binding's key, stage and held/blocked badges. */
+function SidebarEffortRow({ effort, byId, onNavigate }: { effort: SidebarEffort; byId: ReadonlyMap<string, PluginSidebarThread>; onNavigate: () => void }) {
+  const root = byId.get(effort.rootThreadId);
+  if (root === undefined) return null;
+  const meta =
+    effort.bindingKey === null ? null : (
+      <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+        <span className="font-medium">{effort.bindingKey}</span>
+        {effort.stage !== null ? <span>{effort.stage}</span> : null}
+        {effort.hold !== null ? <Badge tone="warn">held</Badge> : null}
+        {effort.blockedOn !== null ? <Badge tone="bad">blocked</Badge> : null}
+      </span>
+    );
+  return <SidebarThreadRow thread={root} role="thread" children={effort.children} depth={0} byId={byId} onNavigate={onNavigate} meta={meta} />;
+}
+
+function SidebarSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+  return (
+    <section className="flex flex-col">
+      <h2 className="px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {title} <span className="font-normal">{count}</span>
+      </h2>
+      {children}
+    </section>
+  );
+}
+
+function SidebarCollapsible({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <section className="flex flex-col">
+      <button
+        type="button"
+        aria-expanded={open}
+        className="flex items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+        {title} <span className="font-normal">{count}</span>
+      </button>
+      {open ? children : null}
+    </section>
+  );
+}
+
+function ProjectTabs({ tabs, activeId, compact, onPick }: { tabs: Array<{ projectId: string; name: string }>; activeId: string | null; compact: boolean; onPick: (projectId: string) => void }) {
+  if (compact || tabs.length > SIDEBAR_TAB_LIMIT) {
+    return (
+      <div className="px-1 py-1">
+        <select
+          aria-label="Project"
+          className="w-full rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+          value={activeId ?? ""}
+          onChange={(e) => onPick(e.target.value)}
+        >
+          {tabs.map((t) => (
+            <option key={t.projectId} value={t.projectId}>
+              {t.name}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+  return (
+    <div role="tablist" className="flex flex-wrap gap-1 border-b border-border px-1 py-1">
+      {tabs.map((t) => (
+        <button
+          key={t.projectId}
+          type="button"
+          role="tab"
+          aria-selected={t.projectId === activeId}
+          className={`rounded-md px-2 py-0.5 text-xs ${t.projectId === activeId ? "bg-state-hover font-medium" : "text-muted-foreground hover:text-foreground"}`}
+          onClick={() => onPick(t.projectId)}
+        >
+          {t.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: PluginThreadListProps) {
+  const rpc = useRpc<typeof rpcContract>();
+  const { status, threads, projects } = experimental_useSidebarThreads();
+  const { data, error } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
+  const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [] }), [projects, threads, data]);
+  const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
+  const [picked, setPicked] = useState<string | null>(null);
+  // The active tab follows the route; a pick only lasts until the route moves.
+  useEffect(() => setPicked(null), [activeProjectId]);
+  const wanted = picked ?? activeProjectId;
+  const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
+  const now = Date.now();
+  return (
+    <div className="flex h-full flex-col text-sm">
+      <ProjectTabs tabs={tabs} activeId={active?.projectId ?? null} compact={isCompactViewport} onPick={setPicked} />
+      {status === "loading" && data === null ? (
+        <p className="p-3 text-muted-foreground">Loading…</p>
+      ) : active === null ? (
+        <p className="p-3 text-muted-foreground">No projects yet.</p>
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
+          <SidebarSection title="In flight" count={active.efforts.length}>
+            {active.efforts.length === 0 ? (
+              <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>
+            ) : (
+              <ul className="flex flex-col">
+                {active.efforts.map((e) => (
+                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
+                ))}
+              </ul>
+            )}
+          </SidebarSection>
+          {active.watches.length > 0 ? (
+            <SidebarCollapsible title="Watches" count={active.watches.length}>
+              <ul className="flex flex-col">
+                {active.watches.map((e) => (
+                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
+                ))}
+              </ul>
+            </SidebarCollapsible>
+          ) : null}
+          {active.ended.length > 0 ? (
+            <SidebarCollapsible title="Recently ended" count={active.ended.length}>
+              <ul className="flex flex-col">
+                {active.ended.map((e) => {
+                  const t = e.threadId === null ? undefined : byId.get(e.threadId);
+                  return t === undefined ? (
+                    <li key={`${e.key}-${e.endedAt}`} className="flex items-center gap-2 px-2 py-0.5 text-muted-foreground">
+                      <span className="font-medium">{e.key}</span>
+                      <span className="min-w-0 flex-1 truncate">{e.title ?? ""}</span>
+                      <span className="shrink-0 text-[11px]">{ago(e.endedAt, now)}</span>
+                    </li>
+                  ) : (
+                    <SidebarThreadRow
+                      key={`${e.key}-${e.endedAt}`}
+                      thread={t}
+                      role="thread"
+                      children={[]}
+                      depth={0}
+                      byId={byId}
+                      onNavigate={onNavigate}
+                      meta={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
+                    />
+                  );
+                })}
+              </ul>
+            </SidebarCollapsible>
+          ) : null}
+          {active.projectStewardThreadId !== null && byId.has(active.projectStewardThreadId) ? (
+            <div className="mt-auto border-t border-border pt-1">
+              <SidebarThreadRow
+                thread={byId.get(active.projectStewardThreadId)!}
+                role="thread"
+                children={[]}
+                depth={0}
+                byId={byId}
+                onNavigate={onNavigate}
+                meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
+      {error !== null ? <p className="px-2 py-1 text-xs text-destructive">Refresh failed: {error}</p> : null}
+    </div>
+  );
+}
+
+// ---- The sidebar-footer toggle -----------------------------------------------------------------
+//
+// BB-45: an icon in the sidebar footer that opens a small panel above the
+// footer row with a switch for the stewards list BB-44 registers. The footer
+// is host-rendered and stays in place under either list, so the toggle is
+// reachable in both states. The preference it writes is the one Settings →
+// Appearance → Sidebar sets; the value is the plugin id plus the `sidebar`
+// slot id BB-44 registers.
+
+/** bb answers a stale `expectedRevision` with HTTP 409. */
+function isRevisionConflict(error: unknown): boolean {
+  const status = typeof error === "object" && error !== null && "status" in error ? (error as { status?: unknown }).status : null;
+  return status === 409 || /\bHTTP\s*409\b/u.test(String(error));
+}
+
+type ThreadListProviderState = { status: "loading" } | { status: "ready"; on: boolean; revision: number } | { status: "error"; message: string };
+
+/**
+ * The disclosure's body: a switch that writes `sidebar.threadListProvider`.
+ * The preference is read when the disclosure opens (the component mounts) and
+ * again after a conflict. `__automatic__` (the value while nothing is pinned)
+ * means bb picks the stewards list, so it reads as on until the load-time pin
+ * has made the choice explicit.
+ */
+function SidebarToggle() {
+  const sdk = useSdk();
+  const pluginId = experimental_usePluginId();
+  const onId = stewardsThreadListId(pluginId);
+  const [state, setState] = useState<ThreadListProviderState>({ status: "loading" });
+  const [busy, setBusy] = useState(false);
+
+  const read = useCallback(async (): Promise<{ on: boolean; revision: number }> => {
+    const { preferences } = await sdk.system.uiPreferences.list();
+    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
+    const value = entry?.value;
+    return { on: value === onId || value === undefined || value === AUTOMATIC_THREAD_LIST_PROVIDER, revision: entry?.revision ?? 0 };
+  }, [sdk, onId]);
+
+  useEffect(() => {
+    let live = true;
+    read().then(
+      (next) => {
+        if (live) setState({ status: "ready", ...next });
+      },
+      (error: unknown) => {
+        if (live) setState({ status: "error", message: message(error) });
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [read]);
+
+  const flip = useCallback(async () => {
+    if (state.status !== "ready" || busy) return;
+    const next = !state.on;
+    const value = next ? onId : BUILTIN_THREAD_LIST_ID;
+    setBusy(true);
+    try {
+      let revision: number;
+      try {
+        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: state.revision })).revision;
+      } catch (error) {
+        // Another window changed the preference between our list and our set:
+        // re-list and retry once with the fresh revision. Anything else is a
+        // real failure.
+        if (!isRevisionConflict(error)) throw error;
+        const fresh = await read();
+        revision = (await sdk.system.uiPreferences.set({ key: THREAD_LIST_PROVIDER_KEY, value, expectedRevision: fresh.revision })).revision;
+      }
+      setState({ status: "ready", on: next, revision });
+    } catch (error) {
+      setState({ status: "error", message: message(error) });
+    } finally {
+      setBusy(false);
+    }
+  }, [state, busy, onId, read, sdk]);
+
+  const on = state.status === "ready" && state.on;
+  return (
+    <div className="flex flex-col gap-1 p-2 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium">Stewards sidebar</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={on}
+          aria-label="Stewards sidebar"
+          disabled={state.status !== "ready" || busy}
+          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors disabled:opacity-50 ${on ? "border-success bg-success/70" : "border-input bg-state-hover"}`}
+          onClick={() => void flip()}
+        >
+          <span aria-hidden="true" className={`absolute top-0.5 size-3.5 rounded-full bg-background transition-all ${on ? "left-4" : "left-0.5"}`} />
+        </button>
+      </div>
+      <p className="text-xs text-muted-foreground">Show the stewards list of threads grouped by project and effort. Off shows bb's own list.</p>
+      {state.status === "error" ? <p className="text-xs text-destructive">Could not change the sidebar: {state.message}</p> : null}
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "board",
@@ -779,6 +1173,23 @@ export default definePluginApp((app) => {
     icon: "ShieldCheck",
     path: BOARD_PATH,
     component: BoardPage,
+  });
+  // The exclusive sidebar slot: while this plugin is enabled and no provider is
+  // pinned, this list replaces bb's own (see DESIGN.md, "The sidebar thread list").
+  app.slots.experimental_threadList({
+    id: "sidebar",
+    title: "Stewards",
+    description: "Threads grouped by project and in-flight effort, with stages, workers and reviewers.",
+    component: StewardsSidebar,
+  });
+  // The footer disclosure that writes the provider preference, so the list
+  // above can be turned on and off without Settings → Appearance.
+  app.experimental_sidebarFooter.register({
+    kind: "disclosure",
+    id: "sidebar",
+    label: "Stewards sidebar",
+    icon: "ShieldCheck",
+    component: SidebarToggle,
   });
   app.slots.settingsSection({
     id: "status",

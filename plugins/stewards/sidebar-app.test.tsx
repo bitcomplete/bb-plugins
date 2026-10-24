@@ -1,0 +1,216 @@
+// @vitest-environment jsdom
+// BB-44: the stewards sidebar thread list renders one tab per project, efforts
+// grouped by the steward relationship, collapsed Watches and Recently ended
+// rows, and bb's thread actions context menu on every row.
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, waitFor } from "@testing-library/react";
+import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
+
+const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
+  projectId: "p1",
+  title: over.id,
+  titleFallback: null,
+  displayTitle: over.id,
+  parentThreadId: null,
+  lifecycleOwnerThreadId: null,
+  sourceThreadId: null,
+  sectionId: null,
+  originKind: null,
+  originPluginId: null,
+  providerId: "pi",
+  status: "idle",
+  runtimeStatus: "idle",
+  queuedWork: "none",
+  hasPendingInteraction: false,
+  activity: { workflows: 0, backgroundAgents: 0, backgroundCommands: 0, planMode: 0, goals: 0 },
+  indicator: "none",
+  indicatorLabel: null,
+  isUnread: false,
+  isPinned: false,
+  pinnedAt: null,
+  pinSortKey: null,
+  isArchived: false,
+  archivedAt: null,
+  href: `/projects/p1/threads/${over.id}`,
+  isHidden: false,
+  environment: null,
+  host: null,
+  createdAt: 0,
+  updatedAt: 0,
+  lastReadAt: null,
+  latestAttentionAt: 0,
+  ...over,
+});
+
+const projects = [
+  { id: "p1", name: "Acme", isPersonal: false, href: "/projects/p1", settingsHref: "/projects/p1/settings" },
+  { id: "personal", name: "Personal", isPersonal: true, href: "/projects/personal", settingsHref: "/projects/personal/settings" },
+];
+
+const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; projectStewardThreadId?: string | null } = {}) => ({
+  projects: [
+    {
+      projectId: "p1",
+      name: "Acme",
+      projectStewardThreadId: over.projectStewardThreadId ?? null,
+      bindings: over.bindings ?? [],
+      ended: over.ended ?? [],
+    },
+  ],
+});
+
+const binding = (over: Record<string, unknown> = {}) => ({
+  key: "ENG-1",
+  kind: "ticket",
+  stage: "build",
+  threadId: "thr_steward",
+  hold: null,
+  blockedOn: null,
+  needsUser: false,
+  advancedAt: null,
+  workers: [],
+  reviewers: [],
+  ...over,
+});
+
+let app: CapturedPluginApp | null = null;
+const loadApp = async () => {
+  app ??= await loadPluginApp(() => import("./app.js"));
+  return app;
+};
+
+const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, props: Record<string, unknown> = {}): Promise<RenderedSlot> => {
+  const captured = await loadApp();
+  const list = captured.threadLists[0]!;
+  return renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "", ...props }, options);
+};
+
+afterEach(() => {
+  app = null;
+});
+
+describe("the stewards sidebar list (BB-44)", () => {
+  it("registers exactly one sidebar thread list under the Stewards title", async () => {
+    const captured = await loadApp();
+    expect(captured.threadLists).toHaveLength(1);
+    expect(captured.threadLists[0]).toMatchObject({ id: "sidebar", title: "Stewards" });
+  });
+
+  it("shows a tab per live project and the active project's effort with its key, stage and badges", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "billing freeze" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" })).toBeTruthy());
+    expect(slot.getByRole("tab", { name: "Personal" })).toBeTruthy();
+    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    expect(slot.getByText("build")).toBeTruthy();
+    expect(slot.getByText("held")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows workers and reviewers only when the effort is expanded", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" }), thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" })],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    expect(slot.queryByText("Implement retry")).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: /Expand Fix login/u }));
+    await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
+    expect(slot.getByText("worker")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
+    await waitFor(() => expect(slot.getByText("Review the PR")).toBeTruthy());
+    expect(slot.getByText("reviewer")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("wraps every row in bb's thread actions context menu", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+      threadActions: () =>
+        [{ key: "archive", pluginId: "thread-list", group: "4_lifecycle", action: { label: "Archive", icon: "Archive", run: () => {} } }] as never,
+    });
+    await waitFor(() => expect(slot.getByText("ENG-1")).toBeTruthy());
+    const menu = slot.container.querySelector('[data-testid="bb-thread-actions-context-menu"][data-thread-id="thr_steward"]');
+    expect(menu).not.toBeNull();
+    fireEvent.contextMenu(menu!);
+    await waitFor(() => expect(slot.getByRole("menuitem", { name: "Archive" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("collapses Watches and Recently ended until opened", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ops" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding(), binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops" })],
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: null, title: "Old work", endedAt: 1_000 }],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: /Watches/u })).toBeTruthy());
+    expect(slot.queryByText("acme/web")).toBeNull();
+    expect(slot.queryByText("Old work")).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: /Watches/u }));
+    await waitFor(() => expect(slot.getByText("acme/web")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
+    await waitFor(() => expect(slot.getByText("Old work")).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a project picker on a compact viewport", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { isCompactViewport: true },
+    );
+    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
+    expect(slot.queryByRole("tab")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("follows activeProjectId for the active tab and switches on pick", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_personal", projectId: "personal", displayTitle: "My notes" })] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeProjectId: "personal" },
+    );
+    await waitFor(() => expect(slot.getByRole("tab", { name: "Personal" }).getAttribute("aria-selected")).toBe("true"));
+    expect(slot.getByText("My notes")).toBeTruthy();
+    fireEvent.click(slot.getByRole("tab", { name: "Acme" }));
+    await waitFor(() => expect(slot.getByRole("tab", { name: "Acme" }).getAttribute("aria-selected")).toBe("true"));
+    slot.lifecycle.unmount();
+  });
+
+  it("navigates to the row's thread and calls onNavigate", async () => {
+    const onNavigate = vi.fn();
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+        rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+      },
+      { onNavigate },
+    );
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    fireEvent.click(slot.getByText("Fix login"));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_steward" }));
+    expect(onNavigate).toHaveBeenCalled();
+    slot.lifecycle.unmount();
+  });
+});

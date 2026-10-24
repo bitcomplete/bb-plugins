@@ -71,6 +71,7 @@ import {
 import { ACTORS, MIGRATIONS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
+import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
@@ -146,6 +147,35 @@ export interface StewardsDeps {
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * BB-45: pin bb's own sidebar thread list for clients that have not opted in.
+ *
+ * BB-44 registers the stewards list through the exclusive
+ * `experimental_threadList` slot, and bb resolves an unset (`__automatic__`)
+ * provider to the first installed list other than the bundled
+ * `thread-list/thread-list` — the stewards list. Without this pin the sidebar
+ * would change for everyone the moment BB-44 lands. Set the preference to the
+ * bundled list on load; an explicit value (including the stewards list the
+ * footer toggle writes) is left alone. `bb.onInstall` does not run for plugins
+ * baked into the `bb-server` image, so this runs on load. Best-effort: a
+ * failure is logged and the sidebar keeps working.
+ */
+export async function pinSidebarThreadListProvider(bb: BbPluginApi): Promise<void> {
+  try {
+    const { preferences } = await bb.sdk.system.uiPreferences.list();
+    const entry = preferences[THREAD_LIST_PROVIDER_KEY];
+    if (entry !== undefined && entry.value !== AUTOMATIC_THREAD_LIST_PROVIDER) return;
+    await bb.sdk.system.uiPreferences.set({
+      key: THREAD_LIST_PROVIDER_KEY,
+      value: BUILTIN_THREAD_LIST_ID,
+      expectedRevision: entry?.revision ?? 0,
+    });
+    bb.log.info(`stewards: pinned the sidebar thread list to ${BUILTIN_THREAD_LIST_ID}; the footer toggle switches it to ${STEWARDS_PLUGIN_ID}/sidebar`);
+  } catch (error) {
+    bb.log.warn(`stewards: could not pin the sidebar thread list: ${errorMessage(error)}`);
+  }
+}
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max)}… (${text.length - max} more characters)`);
 const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/u, "Z");
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
@@ -339,6 +369,37 @@ export const rpcContract = defineRpcContract({
           ended: z.array(z.object({ key: z.string(), url: z.string().nullable(), title: z.string().nullable(), kind: z.string(), endReason: z.string().nullable(), endedAt: z.number(), threadId: z.string().nullable() })),
         })
         .nullable(),
+    }),
+  },
+  // The sidebar thread list's one call: every stewarded project's bindings,
+  // their workers and known reviewers, the project steward, and what ended.
+  // One call for all projects, so a replaced sidebar does not refetch per tab.
+  stewardsSidebar: {
+    input: z.null(),
+    output: z.object({
+      projects: z.array(
+        z.object({
+          projectId: z.string(),
+          name: z.string(),
+          projectStewardThreadId: z.string().nullable(),
+          bindings: z.array(
+            z.object({
+              key: z.string(),
+              kind: z.string(),
+              stage: z.string().nullable(),
+              threadId: z.string().nullable(),
+              hold: z.string().nullable(),
+              blockedOn: z.string().nullable(),
+              needsUser: z.boolean(),
+              advancedAt: z.number().nullable(),
+              workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
+              /** Reviewer threads, each under the worker it reviews. */
+              reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })),
+            }),
+          ),
+          ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), endedAt: z.number() })),
+        }),
+      ),
     }),
   },
   // The user closes a question from the page, with or without an answer, or
@@ -3529,6 +3590,57 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           },
         };
       },
+      // The sidebar's one call: every stewarded project's bindings, their
+      // workers, and the reviewers known under them. One `threads.list` per
+      // worker finds the reviewers; everything else is the store's own records.
+      async stewardsSidebar() {
+        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
+        const projects = projectIds((await stewardedProjects()).map((c) => c.projectId))
+          .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        const workerIds = [
+          ...new Set(projects.flatMap((p) => store.all(p.projectId).filter((b) => b.endedAt === null).flatMap((b) => store.workers(b.id).map((w) => w.threadId)))),
+        ];
+        const reviewersByWorker = new Map<string, string[]>();
+        await Promise.all(
+          workerIds.map(async (workerId) => {
+            const children = await bb.sdk.threads.list({ parentThreadId: workerId, includeHidden: true }).catch(() => []);
+            reviewersByWorker.set(workerId, children.map((c) => c.id));
+          }),
+        );
+        return {
+          projects: projects.map(({ projectId, name }) => {
+            const all = store.all(projectId);
+            const ended = all
+              .filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS)
+              .sort((a, b) => b.endedAt! - a.endedAt!)
+              .slice(0, 30);
+            return {
+              projectId,
+              name,
+              projectStewardThreadId: store.project(projectId).threadId,
+              bindings: all
+                .filter((b) => b.endedAt === null)
+                .map((b) => {
+                  const workers = store.workers(b.id).map((w) => ({ threadId: w.threadId, title: w.title }));
+                  return {
+                    key: b.entityKey,
+                    kind: b.kind,
+                    stage: b.stage,
+                    threadId: b.threadId,
+                    hold: b.hold,
+                    blockedOn: b.status?.blockedOn ?? null,
+                    needsUser: needsUser(b),
+                    advancedAt: b.advancedAt,
+                    workers,
+                    reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),
+                  };
+                }),
+              ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, endedAt: b.endedAt! })),
+            };
+          }),
+        };
+      },
       async stewardsAnswerQuestion({ questionId, answer, choice }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
         const q = store.question(questionId);
@@ -5449,6 +5561,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       tagged.clear();
       kept.clear();
     };
+    await pinSidebarThreadListProvider(bb);
     testHooks.set(bb.pluginId, { sweep, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }

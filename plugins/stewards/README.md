@@ -297,6 +297,45 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   put its own binding on hold for this, but only its parent or the project
   steward lifts a hold.
 
+## The sidebar thread list and its toggle
+
+BB-44 registers a replacement for bb's own sidebar thread list through the
+exclusive `experimental_threadList` slot: one tab per stewarded project,
+in-flight efforts grouped by the steward relationship, and collapsed Watches
+and Recently ended rows. BB-45 makes it switchable from where you are.
+
+**The footer toggle.** A `ShieldCheck` icon in the sidebar footer (next to
+Settings) opens a small panel above the footer row with a **Stewards
+sidebar** switch and one line of help. On writes `sidebar.threadListProvider`
+= `stewards/sidebar` (the list BB-44 registers); off writes it back to bb's
+own `thread-list/thread-list`. The sidebar's list swaps without a reload. The
+footer is host-rendered and stays in place under either list, so the icon is
+reachable in both states. Hide it like any footer item through bb's footer
+preferences (Settings → Appearance → Sidebar → footer items, or
+`sidebar.hiddenFooterItems`).
+
+**The Appearance page alternative.** The same choice is Settings → Appearance
+→ Sidebar → the thread-list provider; the toggle is a shortcut to it, not a
+second setting. Both write the one UI preference.
+
+**The default-provider pin.** bb resolves an unset (`__automatic__`)
+provider to the first installed thread list other than the bundled
+`thread-list/thread-list` — the stewards list — so without a guard BB-44
+would change everyone's sidebar the moment it landed. On load the plugin
+reads the preference and, when it is unset or `__automatic__`, sets it to
+`thread-list/thread-list`. An explicit value, including `stewards/sidebar`,
+is left alone. The write is best-effort: a failure is logged and the sidebar
+keeps working. (`bb.onInstall` is not usable here; it does not run for
+plugins baked into the `bb-server` image.)
+
+**Per client or per server?** Checked on a dev server: the preference is
+**server-synced**, so a flip is per server, not per browser. Every open
+window of that bb server shows the same list, and the choice survives a
+reload. `bb settings ui get sidebar.threadListProvider` — a different client —
+sees the value the toggle wrote, and bb tells the other clients the preference
+changed. Each developer has their own server behind bb-gate, so in practice
+the choice is per developer.
+
 ## Configuration
 
 In the project's `.bb` (the multi-repo project repo), read from committed
