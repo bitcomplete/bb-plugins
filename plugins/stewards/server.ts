@@ -4421,7 +4421,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Fixed choices are for a decision, as a `decide` need is: they are
           // what a forwarded escalation turns into a question with buttons.
           if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
-            return toolError(new Error("choices are for a decision escalation: escalate a decision, or file a decide need."));
+            return toolError(new Error("choices are for a decision escalation: escalate a decision with choices."));
           }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
