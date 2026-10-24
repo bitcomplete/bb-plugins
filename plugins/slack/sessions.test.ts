@@ -26,6 +26,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
     source: "slack",
     session: "D0123:1712345678.901234",
     action: "message",
+    mention: false,
     channel: "D0123",
     contextChannel: "",
     thread: "1712345678.901234",
@@ -136,22 +137,27 @@ describe("the channel map", () => {
 
   it("chooses by channel id, then context, then dm, then the default", () => {
     // The conversation's own channel wins.
-    expect(chooseConversationProject(PROJECTS, entries, "", "C0123", "C0456")?.id).toBe("prj-1");
+    expect(chooseConversationProject(PROJECTS, entries, "", "C0123", "C0456", false)?.id).toBe("prj-1");
     // A DM with a remembered context channel uses that channel's project.
-    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", "C0123")?.id).toBe("prj-1");
+    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", "C0123", true)?.id).toBe("prj-1");
     // No context: the dm entry.
-    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", null)?.id).toBe("prj-p");
+    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", null, true)?.id).toBe("prj-p");
     // Nothing mapped: the default.
-    expect(chooseConversationProject(PROJECTS, entries.slice(0, 1), "Project One", "D9999", null)?.id).toBe("prj-1");
+    expect(chooseConversationProject(PROJECTS, entries.slice(0, 1), "Project One", "D9999", null, true)?.id).toBe("prj-1");
+  });
+
+  it("never uses the dm entry for a channel, so an unmapped channel uses the default", () => {
+    const dmOnly: ChannelEntry[] = [{ channel: "dm", project: "Personal" }];
+    expect(chooseConversationProject(PROJECTS, dmOnly, "Project One", "C9999", null, false)?.id).toBe("prj-1");
   });
 
   it("skips an entry naming a project this server lacks, and matches names ignoring case", () => {
     const missing: ChannelEntry[] = [{ channel: "C0123", project: "Nope" }, { channel: "dm", project: "project one" }];
-    expect(chooseConversationProject(PROJECTS, missing, "", "D0123", null)?.id).toBe("prj-1");
+    expect(chooseConversationProject(PROJECTS, missing, "", "D0123", null, true)?.id).toBe("prj-1");
   });
 
   it("with an empty map is exactly the old default", () => {
-    expect(chooseConversationProject(PROJECTS, [], "", "D0123", null)?.id).toBe("prj-p");
+    expect(chooseConversationProject(PROJECTS, [], "", "D0123", null, true)?.id).toBe("prj-p");
   });
 });
 

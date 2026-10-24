@@ -330,6 +330,14 @@ describe("Slack plugin", () => {
     await unmapped.stop();
   });
 
+  it("never uses the dm entry for an unmapped channel, which uses the default", async () => {
+    const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
+    s.hooks.last().send(s.hooks.session({ session: "C9999:1.2", channel: "C9999", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
+    await s.stop();
+  });
+
   it("uses the dm entry for a direct message", async () => {
     const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
     s.hooks.last().send(s.hooks.session());

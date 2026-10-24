@@ -52,8 +52,8 @@ before the `dm` entry. Context is read only when a thread is started; an
 existing Slack thread keeps its bb thread.
 
 Words from anyone but the owner never run a turn. A channel mention by someone
-else is held under a short id and the owner releases it by replying
-`confirm <id>`; only then does the text reach a bb thread.
+else is held under a short id and the owner releases it by mentioning the app
+with `confirm <id>`; only then does the text reach a bb thread.
 
 **Sign out** forgets the token and reconnects the stream, so the service drops
 the identity bound to the old connection.
@@ -75,7 +75,7 @@ signing secret, bot token or OAuth client secret; they are sealed with
 
 The map decides where a thread starts, not whose words it trusts. A channel
 mention by someone other than the server's owner is parked (no turn runs) and
-the plugin posts one reply asking the owner to `confirm <id>`; a mention by the
-owner that names the id releases exactly one held message into the thread. A
-vague owner reply while requests wait re-asks for the id instead of running a
-turn.
+the plugin posts one reply asking the owner to mention it with `confirm <id>`; a
+mention by the owner that names the id releases exactly one held message into
+the thread. A vague owner reply while requests wait re-asks for the id instead
+of running a turn.

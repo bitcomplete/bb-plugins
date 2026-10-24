@@ -191,7 +191,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // does not lose what is waiting on the owner.
 
     const PENDING_KEY = "sessions/pending";
-    const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    /** A held request waits on the owner for a week, then is dropped. */
+    const HELD_TTL_MS = 7 * 24 * 60 * 60 * 1000;
     /** At most this many requests wait on the owner per conversation; the oldest go first. */
     const PENDING_MAX = 5;
     const pending = pendingRecordSchema.catch({}).parse(await bb.storage.kv.get(PENDING_KEY));
@@ -205,7 +206,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     async function savePending(): Promise<void> {
-      const cutoff = deps.now() - PENDING_TTL_MS;
+      const cutoff = deps.now() - HELD_TTL_MS;
       for (const [id, p] of Object.entries(pending)) if (deps.now() - p.savedAt > cutoff) delete pending[id];
       await bb.storage.kv.set(PENDING_KEY, pending);
     }
@@ -305,7 +306,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     async function targetProject(event: SessionEvent, record: SessionRecord): Promise<Project | null> {
       const cfg = await settings.get();
-      return chooseConversationProject(await projects(), parseChannelMap(cfg.channels), cfg.project ?? "", event.channel, record.contextChannel);
+      return chooseConversationProject(await projects(), parseChannelMap(cfg.channels), cfg.project ?? "", event.channel, record.contextChannel, !event.mention);
     }
 
     /**
@@ -462,7 +463,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /** The reply that asks the owner to confirm a held request. */
     function heldPrompt(event: SessionEvent, held: PendingRequest): string {
       const owner = event.owner.name.trim() === "" ? "the owner" : event.owner.name;
-      return `${held.asker} asked: "${clipMention(held.text, 400)}". ${owner}, reply \`confirm ${held.id}\` to let your bb act on it.`;
+      return `${held.asker} asked: "${clipMention(held.text, 400)}". ${owner}, mention me with \`confirm ${held.id}\` to let your bb act on it.`;
     }
 
     /**

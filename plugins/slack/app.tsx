@@ -67,6 +67,7 @@ function ChannelMapEditor({ status, busy, save }: { status: Status; busy: boolea
             disabled={busy}
             onChange={(e) => change(index, { project: e.target.value })}
           >
+            {!projectNames.includes(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
             {projectNames.map((name) => (
               <option key={name} value={name}>
                 {name}

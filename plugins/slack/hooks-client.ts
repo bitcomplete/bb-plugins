@@ -123,6 +123,8 @@ export const sessionEventSchema = z
     source: z.literal(SOURCE),
     session: z.string().min(1).max(200),
     action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed"]),
+    /** True for a channel app_mention, false for a DM or assistant-thread event. */
+    mention: z.boolean().default(false),
     channel: z.string().min(1).max(200),
     /**
      * The channel the user was viewing, on an assistant context change; "" on

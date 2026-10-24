@@ -164,12 +164,13 @@ export function chooseProject(projects: Project[], chosen: string): Project | nu
 }
 
 /**
- * The project a Slack conversation starts its thread in, in order: the map by
- * the conversation's own channel id, then the channel the user was viewing (a
- * DM's remembered assistant context), then the reserved `dm` entry, then the
- * plugin default. An entry naming a project this server does not have is
- * skipped, so the same map works on every server. With an empty map this is
- * exactly `chooseProject`.
+ * The project a Slack conversation starts its thread in. A channel uses the
+ * map by its own channel id, then the default; the reserved `dm` entry is for
+ * a direct message with the app, so it is never consulted for a channel. A DM
+ * uses the map by its channel id, then the channel the assistant pane was
+ * showing (its remembered context), then the `dm` entry, then the default. An
+ * entry naming a project this server does not have is skipped, so the same map
+ * works on every server. With an empty map this is exactly `chooseProject`.
  */
 export function chooseConversationProject(
   projects: Project[],
@@ -177,8 +178,9 @@ export function chooseConversationProject(
   defaultProject: string,
   channel: string,
   contextChannel: string | null,
+  directMessage: boolean,
 ): Project | null {
-  for (const key of [channel, contextChannel, DM_CHANNEL]) {
+  for (const key of directMessage ? [channel, contextChannel, DM_CHANNEL] : [channel]) {
     if (key === null || key === "") continue;
     const name = channelProject(entries, key);
     if (name === null) continue;
