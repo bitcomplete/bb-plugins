@@ -342,7 +342,15 @@ export const WORKER_CHECK_MIGRATIONS = [
   `ALTER TABLE workers ADD COLUMN model_check_pending INTEGER NOT NULL DEFAULT 0`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS];
+// BB-51: the pull-request head (and reviewer marker) a project-steward approval
+// request was declined on, so the same head is not asked again. Additive and
+// defaulted: existing rows keep asking as before.
+export const DECLINED_PR_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN declined_pr_head_sha TEXT`,
+  `ALTER TABLE bindings ADD COLUMN declined_pr_marker TEXT`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -463,6 +471,10 @@ export type Binding = {
   /** When follow-through runs out, whatever the steward says: set when it is first declared. */
   followThroughUntil: number | null;
   manualDetach: boolean;
+  /** The pull-request head a project-steward approval request was declined on; not asked again until the head (or the reviewer marker) changes. */
+  declinedPrHeadSha: string | null;
+  /** The reviewer marker in force when that head was declined, so a new round asks again. */
+  declinedPrMarker: string | null;
   /** An ops binding's last look; null for every other kind. */
   opsLook: OpsLook | null;
   /** A Dependabot alert binding's last look; null for every other kind. */
@@ -523,6 +535,8 @@ function rowToBinding(r: BindingRow): Binding {
     followThrough: str("follow_through"),
     followThroughUntil: num("follow_through_until"),
     manualDetach: Number(r.manual_detach) === 1,
+    declinedPrHeadSha: str("declined_pr_head_sha"),
+    declinedPrMarker: str("declined_pr_marker"),
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
@@ -570,6 +584,8 @@ const COLUMNS = {
   followThrough: "follow_through",
   followThroughUntil: "follow_through_until",
   manualDetach: "manual_detach",
+  declinedPrHeadSha: "declined_pr_head_sha",
+  declinedPrMarker: "declined_pr_marker",
   opsLook: "ops_look",
   depsLook: "deps_look",
   sentryLook: "sentry_look",
@@ -680,6 +696,18 @@ export type Question = {
 /** The kinds of thing that can wait on the user, from the ticket's table. */
 export const NEEDS_KINDS = ["approve-spec", "approve-pr", "merge", "decide", "provide-secret", "configure"] as const;
 export type NeedKind = (typeof NEEDS_KINDS)[number];
+
+/**
+ * The steward-filed `needs` kinds that are escalations since BB-30: a
+ * credential, a step outside the repos, or a decision is raised with
+ * `steward_report { escalate }`, and `steward_report { needs }` refuses it.
+ * One list feeds the standing rules and the refusal text, so they cannot
+ * drift (BB-51).
+ */
+export const ESCALATED_NEED_KINDS = ["decide", "configure", "provide-secret"] as const;
+
+/** The `needs` kinds a steward may still file directly: the plugin's gate items. */
+export const STEWARD_NEED_KINDS = NEEDS_KINDS.filter((k): k is NeedKind => !(ESCALATED_NEED_KINDS as readonly NeedKind[]).includes(k));
 
 /**
  * One "needs you" item: a structured thing the user must do, filed by the
@@ -843,6 +871,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // the question's resolution, so the page and wakes show the question/item once.
   const openQuestionCovered = db.prepare<[string], { forwarded_from: string }>("SELECT DISTINCT forwarded_from FROM escalations WHERE project_id = ? AND is_question = 1 AND status = 'open' AND forwarded_from IS NOT NULL");
   const answerQuestion = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE id = ? AND is_question = 1 AND status = 'open'");
+  const forwardedFromOf = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE id = (SELECT forwarded_from FROM escalations WHERE id = ?)");
   const answerForEscalation = db.prepare("UPDATE escalations SET status = 'resolved', resolution = ?, answered_by = ?, resolved_at = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'open'");
   const appendAnswerForEscalation = db.prepare("UPDATE escalations SET resolution = ? WHERE forwarded_from = ? AND is_question = 1 AND status = 'resolved'");
 
@@ -1093,7 +1122,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
     }
   }
 
-  /** Resolve an open escalation, and close the question forwarding it made, if any. `by` is who answered it. */
+  /**
+   * Resolve an open escalation. The question made from it closes with it, and
+   * the escalation a question was forwarded from closes too, so a close on the
+   * page (answer, Done, a finished requester, a secret import) resolves the
+   * whole pair in one write and the originator hears the answer (BB-51). `by`
+   * is who answered it.
+   */
   function resolve(id: string, resolution: string, by = "plugin"): boolean {
     return coalescing(() => {
       const resolved = db.transaction(() => {
@@ -1102,6 +1137,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
         answerForEscalation.run(resolution, by, at, id);
         const x = getEscalation.get(id);
         if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by);
+        // Follow the link up: a question resolved on the page also resolves the
+        // escalation the project steward forwarded it from.
+        const parent = forwardedFromOf.get(id);
+        if (parent !== undefined && String(parent.status) === "open") {
+          resolveEscalation.run(resolution, at, String(parent.id));
+          recordResolutionDelivery(toEscalation(parent), resolution, by);
+          answerForEscalation.run(resolution, by, at, String(parent.id));
+        }
         return true;
       })();
       if (resolved) {

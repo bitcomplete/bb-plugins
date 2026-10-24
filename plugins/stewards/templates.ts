@@ -9,7 +9,7 @@ import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL, defaultDecideList } from "./confi
  * user sees.
  */
 const SECRET_REQUEST =
-  "A credential the work needs is a `provide-secret` need, not a worker's job to prompt: file it with `steward_report { needs: [{ kind: \"provide-secret\", url, what, how, variable, purpose }] }` and the plugin opens bb's secure form in a requester thread. Name the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings. Never paste the secret, and never a script for the user to run.";
+  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, meanwhile } }`, naming the variable and what it is for. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. Never paste the secret, and never a script for the user to run.";
 
 /**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,
@@ -262,7 +262,7 @@ look, with the title, culprit, permalink, event and user counts, first and
 last seen, and the latest event's stack trace. Your thread holds no Sentry
 token, so you cannot query Sentry: diagnose from that evidence and the code
 in your workspace (the in-app frames name it), and link the permalink. When
-the wake says there is no token, file the provide-secret need it describes
+the wake says there is no token, raise the escalation it describes
 and nothing else.
 
 Each problem has a fingerprint: for a namespace the workload, the container

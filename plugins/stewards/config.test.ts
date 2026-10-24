@@ -127,10 +127,11 @@ describe("playbooks", () => {
     }
   });
 
-  it("tells the default playbooks to file credentials as provide-secret needs and to escalate build-time blockers", () => {
+  it("tells the default playbooks to raise credentials as a secret escalation and to escalate build-time blockers", () => {
     const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!linear.ok) throw new Error(linear.error);
-    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/provide-secret/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/steward_report \{ escalate/u);
+    expect(phaseInstructions(linear.value, "In Progress")).toMatch(/resolution: "secret"/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/writeEnv/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/changes what the ticket needs/u);
     expect(phaseInstructions(linear.value, "In Progress")).toMatch(/escalated as a `decision`/u);

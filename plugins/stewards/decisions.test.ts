@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultDecideList, parseProjectFile, type BigDecision } from "./config.js";
-import { decideFor, decideForEntry, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
+import { decideFor, decideForEntry, decideForPull, decideForRefusal, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
 
 const decisions: BigDecision[] = [
   { text: "Changing what a ticket's requester asked for", decide: "user", paths: [] },
@@ -48,6 +48,27 @@ describe("the decide list fails closed", () => {
   it("treats a pull request the project steward cannot classify as the user's", () => {
     expect(decideFor([], null, decisions)).toBe("user");
     expect(decideFor(["bb-plugins/plugins/linear/foo.ts"], null, decisions)).toBe("user");
+  });
+
+  it("places a pull request by matching its files to a project entry (BB-51)", () => {
+    // A file under a project entry's paths is the project steward's.
+    expect(decideForPull(["bb-plugins/plugins/linear/store.ts"], decisions)).toBe("project");
+    // A user entry, no matching entry, an empty or unreadable file list, and a
+    // self-widening change are all the user's.
+    expect(decideForPull(["bb-plugins/plugins/linear/source-contract.ts"], decisions)).toBe("user");
+    expect(decideForPull(["bb-plugins/plugins/linear/wake.ts"], decisions)).toBe("user");
+    expect(decideForPull([], decisions)).toBe("user");
+    expect(decideForPull(null, decisions)).toBe("user");
+    expect(decideForPull(["bb-plugins/plugins/stewards/store.ts"], decisions)).toBe("user");
+  });
+
+  it("gives the failed files fetch its own refusal text, not the self-widening one (BB-51)", () => {
+    expect(decideForRefusal(null, "A store migration", decisions)).toBe("the changed files could not be read");
+    expect(decideForRefusal([], "A store migration", decisions)).toBe("the pull request changes no files");
+    expect(decideForRefusal(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("the change touches the decide list or the code that enforces it");
+    expect(decideForRefusal(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBeNull();
+    expect(decideForRefusal(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toMatch(/do not touch/u);
+    expect(decideForRefusal(["bb-plugins/plugins/linear/source-contract.ts"], null, decisions)).toBe("no decide-list entry was given");
   });
 });
 

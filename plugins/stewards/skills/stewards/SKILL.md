@@ -139,8 +139,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   project steward or the user reaches nobody; with no open escalation it is
   flagged in `bb stewards list` and the digest. A `blockedOn` naming the
   user, the owner or a human is refused unless an open needs item says so:
-  file it (`configure`, `provide-secret`, `decide`) instead of only saying
-  it. `blockedOn` stays for third parties.
+  raise it with `steward_report { escalate }` (or file a gate item) instead
+  of only saying it. `blockedOn` stays for third parties.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.
@@ -210,9 +210,9 @@ is the plugin's, so diagnose from the wake and the code in your workspace.
   duplicate.
 - **All healthy:** the wake says so every requeue; report it with
   `actor: other` and end the turn.
-- **No Sentry token** (the wake says so): file the one `provide-secret`
-  need it describes (variable `sentryToken`, the Sentry auth-tokens page,
-  the scopes), report with `actor: me`, and end the turn.
+- **No Sentry token** (the wake says so): raise the escalation it describes
+  (variable `SENTRY_TOKEN`, setting `sentryToken`, the Sentry auth-tokens
+  page, the scopes), report with `actor: me`, and end the turn.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 
