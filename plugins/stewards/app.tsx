@@ -1013,15 +1013,17 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
         })}
       </select>
       {total > 0 ? <NeedsBadge count={total} /> : null}
-      <button
-        type="button"
-        aria-label="New thread"
-        title="New thread"
-        className="shrink-0 rounded-md border border-input p-1 text-muted-foreground hover:bg-state-hover hover:text-foreground"
-        onClick={onNewThread}
-      >
-        <Icon name="Plus" className="size-4" />
-      </button>
+      {tabs.length > 0 ? (
+        <button
+          type="button"
+          aria-label="New thread"
+          title="New thread"
+          className="shrink-0 rounded-md border border-input p-1 text-muted-foreground hover:bg-state-hover hover:text-foreground"
+          onClick={onNewThread}
+        >
+          <Icon name="Plus" className="size-4" />
+        </button>
+      ) : null}
     </div>
   );
 }
