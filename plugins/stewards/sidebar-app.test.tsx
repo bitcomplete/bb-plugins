@@ -172,6 +172,87 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("puts every row's status glyph in the same fixed-width slot so titles line up", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_none", displayTitle: "No indicator" }),
+          thread({ id: "thr_dot", displayTitle: "Dot indicator", indicator: "unread-success" }),
+          thread({ id: "thr_spinner", displayTitle: "Spinner indicator", indicator: "runtime" }),
+        ],
+      },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    // One-off threads live in the collapsed Threads section.
+    const threadsToggle = await waitFor(() => slot.getByRole("button", { name: /Threads/u }));
+    fireEvent.click(threadsToggle);
+    await waitFor(() => expect(slot.getByText("No indicator")).toBeTruthy());
+
+    const rows = ["No indicator", "Dot indicator", "Spinner indicator"].map((title) => {
+      const anchor = slot.getByText(title).closest("a")!;
+      const wrapper = anchor.previousElementSibling as HTMLElement;
+      return { anchor, wrapper };
+    });
+
+    // Every indicator, including none, occupies the same slot classes, and the
+    // title anchor is the element right after it.
+    for (const { anchor, wrapper } of rows) {
+      expect(wrapper.dataset.sidebarStatusSlot).toBe("");
+      expect(wrapper.classList.contains("flex")).toBe(true);
+      expect(wrapper.classList.contains("size-4")).toBe(true);
+      expect(wrapper.classList.contains("shrink-0")).toBe(true);
+      expect(wrapper.classList.contains("items-center")).toBe(true);
+      expect(wrapper.classList.contains("justify-center")).toBe(true);
+      expect(anchor.previousElementSibling).toBe(wrapper);
+    }
+    // None has no glyph; the dot and the spinner render inside the slot.
+    expect(rows[0]!.wrapper.querySelector("[data-thread-status-glyph]")).toBeNull();
+    expect(rows[1]!.wrapper.querySelector('[data-thread-status-glyph="unread-success"]')).not.toBeNull();
+    expect(rows[2]!.wrapper.querySelector('[data-thread-status-glyph="runtime"]')).not.toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps the chevron slot the same width as the leaf slot", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_parent", displayTitle: "With children" }),
+          thread({ id: "thr_worker", displayTitle: "A worker" }),
+          thread({ id: "thr_leaf", displayTitle: "Leaf binding" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_parent", workers: [{ threadId: "thr_worker", title: "A worker" }] }),
+              binding({ key: "ENG-2", threadId: "thr_leaf" }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("With children")).toBeTruthy());
+    expect(slot.getByText("Leaf binding")).toBeTruthy();
+
+    const chevronSlot = (title: string): HTMLElement => {
+      const anchor = slot.getByText(title).closest("a")!;
+      return anchor.previousElementSibling!.previousElementSibling as HTMLElement;
+    };
+    // The 14px expand icon and the empty leaf placeholder both sit in a size-4
+    // slot, so at equal depth the title starts at the same x either way.
+    const parentSlot = chevronSlot("With children");
+    const leafSlot = chevronSlot("Leaf binding");
+    expect(parentSlot.tagName).toBe("BUTTON");
+    expect(parentSlot.classList.contains("size-4")).toBe(true);
+    expect(parentSlot.classList.contains("shrink-0")).toBe(true);
+    expect(leafSlot.tagName).toBe("SPAN");
+    expect(leafSlot.classList.contains("size-4")).toBe(true);
+    expect(leafSlot.classList.contains("shrink-0")).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
   it("keeps one-off threads out of In flight, in a collapsed Threads section", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_oneoff", displayTitle: "My notes" })] },
