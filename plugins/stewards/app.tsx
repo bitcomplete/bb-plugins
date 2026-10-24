@@ -895,15 +895,20 @@ function SidebarThreadRow({
               type="button"
               aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
               aria-expanded={open}
-              className="flex shrink-0 items-center text-muted-foreground"
+              className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
               onClick={() => setOpen((v) => !v)}
             >
               <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
             </button>
           ) : (
-            <span className="size-4 shrink-0" />
+            <span className="flex size-4 shrink-0 items-center justify-center" />
           )}
-          <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+          {/* A fixed-width slot keeps the title column put whatever the glyph
+              (none, dot, spinner) or its width. The spinner at size="compact"
+              is the widest, so size-4 is the slot. */}
+          <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
+            <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+          </span>
           <a
             href={thread.href}
             className="min-w-0 flex-1 truncate text-sm"
