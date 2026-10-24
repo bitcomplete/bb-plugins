@@ -26,6 +26,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { buildSidebar, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort } from "./sidebar.js";
+import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
 type Overview = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: unknown; lastSweepAt: unknown }> : never;
@@ -1072,16 +1073,6 @@ function StewardsSidebar({ activeProjectId, isCompactViewport, onNavigate }: Plu
 // reachable in both states. The preference it writes is the one Settings →
 // Appearance → Sidebar sets; the value is the plugin id plus the `sidebar`
 // slot id BB-44 registers.
-
-/** The value that turns the stewards list on (BB-44's `experimental_threadList` slot). */
-function stewardsThreadListId(pluginId: string): string {
-  return `${pluginId}/sidebar`;
-}
-/** bb's bundled thread list: the value that turns the stewards list off. */
-const BUILTIN_THREAD_LIST_ID = "thread-list/thread-list";
-/** What `sidebar.threadListProvider` reads while nothing is pinned. */
-const AUTOMATIC_THREAD_LIST_PROVIDER = "__automatic__";
-const THREAD_LIST_PROVIDER_KEY = "sidebar.threadListProvider";
 
 /** bb answers a stale `expectedRevision` with HTTP 409. */
 function isRevisionConflict(error: unknown): boolean {

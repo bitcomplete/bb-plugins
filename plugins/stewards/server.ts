@@ -71,6 +71,7 @@ import {
 import { ACTORS, MIGRATIONS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
+import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
@@ -146,13 +147,6 @@ export interface StewardsDeps {
 }
 
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
-
-/** The UI preference that picks the sidebar thread list. */
-export const THREAD_LIST_PROVIDER_KEY = "sidebar.threadListProvider";
-/** bb's bundled thread list; pinning to it leaves the sidebar as it was. */
-export const BUILTIN_THREAD_LIST_ID = "thread-list/thread-list";
-/** What `sidebar.threadListProvider` reads while nothing is pinned. */
-const AUTOMATIC_THREAD_LIST_PROVIDER = "__automatic__";
 
 /**
  * BB-45: pin bb's own sidebar thread list for clients that have not opted in.
