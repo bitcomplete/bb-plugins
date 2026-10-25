@@ -1902,7 +1902,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // and a queued count is stale; anything else is kept once, and is
       // actionable if either says so.
       const queued = b.pending;
-      const loudQueued = queued.filter((n) => n.quiet !== true).length;
+      let loudQueued = queued.filter((n) => n.quiet !== true).length;
       for (const n of queued) {
         if (isCommentNews(n.text)) continue;
         const same = changes.find((c) => c.text === n.text);
@@ -1946,6 +1946,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           b = store.patch(b.id, { pending: b.pending.filter((n) => n.text !== START_WORKER_WAKE) });
           for (let i = changes.length - 1; i >= 0; i--) if (changes[i]!.text === START_WORKER_WAKE) changes.splice(i, 1);
         }
+        // The drop changed what is queued; `deferred` and the wake reason read
+        // this, so it must not stay stale.
+        loudQueued = b.pending.filter((n) => n.quiet !== true).length;
       }
       /**
        * Keep news for the next turn: what is actionable as a reason for it, the
