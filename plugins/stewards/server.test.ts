@@ -528,6 +528,14 @@ describe("a Linear ticket steward", () => {
       expect(startWakes(t)).toHaveLength(0);
     });
 
+    it("drops the backstop wake when a hold is applied between the report and the wake", async () => {
+      const { t, project, steward } = await bound();
+      expect((await t.tool("steward_report", { ...base, ready: met }, steward)).text).toBe(startReply);
+      expect((await t.tool("steward_update", { binding: "ENG-12", hold: "Wait for the design" }, project)).error).toBe(false);
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(0);
+    });
+
     it("does not schedule the backstop wake when a hold is open", async () => {
       const { t, project, steward } = await bound();
       expect((await t.tool("steward_update", { binding: "ENG-12", hold: "Wait for the design" }, project)).error).toBe(false);
