@@ -23,7 +23,9 @@ on the pod.
   the code (the client secret never leaves the service), stores the returned
   user token in a secret setting, and presents it at `POST /v1/identify`. The
   service reads the token's own Slack user and binds it to this server's
-  stream.
+  stream. The token also carries the user scopes `channels:read` and
+  `groups:read`, so the settings page can list the channels *this developer*
+  can see — never what the bot can see.
 - **The wake.** A DM from that user arrives as `event: session`,
   `source: "slack"` on the same SSE stream the Linear plugin uses. The plugin
   maps the conversation (`channel:thread`) to one bb thread: the first message
@@ -43,7 +45,13 @@ on the pod.
 |---|---|
 | Slack sign-in token | Filled in by Sign in with Slack. A secret; do not edit or paste by hand. |
 | Project | The bb project a Slack conversation starts its thread in when the channel map has no entry for it. Empty uses the personal project, or the first project when this server has none. |
-| Channel map | A JSON array of `{"channel":"C…","project":"name"}` entries. A channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry; the reserved key `dm` is a direct message with the app. A channel or DM with no entry uses the Project above. The settings page edits the same map as a list. |
+| Channel map | A JSON array of `{"channel":"C…","project":"name"}` entries. A channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry; the reserved key `dm` is a direct message with the app. A channel or DM with no entry uses the Project above. The settings page edits the same map as a list: the channel box is a typeahead over the channels the signed-in developer can see, showing `#name` and a lock for a private channel, and storing the id. A pasted `C…`/`G…` id and `dm` are still accepted. A channel the app's bot is not a member of is flagged "bb is not in this channel yet; invite it". |
+
+The channel typeahead calls Slack's `conversations.list` directly with the
+stored user token, paginated and cached in memory for a few minutes per
+server; filtering by name is local. A still-valid OpenID token from a sign-in
+before this change cannot list channels, so the picker says "Sign in again to
+search channels" and falls back to the id box.
 
 A DM typed while the assistant pane is showing a mapped channel uses that
 channel's project: the plugin remembers the latest

@@ -188,6 +188,12 @@ async function postJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, 
   return schema.parse(await response.json());
 }
 
+async function getJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, schema: z.ZodType<T>, what: string, signal: AbortSignal): Promise<T> {
+  const response = await fetchImpl(new URL(path, baseUrl), { headers: { accept: "application/json" }, signal });
+  if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to ${what}`, response.status, await response.text().catch(() => ""));
+  return schema.parse(await response.json());
+}
+
 /**
  * POST /v1/identify: prove which Slack user this server acts for, with the
  * developer's own sign-in token. Slack has no leases, so `teams` is empty.
@@ -210,6 +216,14 @@ export const signinExchangeResponseSchema = z.object({ token: z.string().min(1) 
 
 export function signinExchange(fetchImpl: FetchLike, baseUrl: string, connection: string, state: string, code: string, signal: AbortSignal): Promise<{ token: string }> {
   return postJson(fetchImpl, baseUrl, "/v1/slack/signin/exchange", { connection, state, code }, signinExchangeResponseSchema, "the Slack sign-in exchange", signal);
+}
+
+/** GET /v1/slack/bot/channels: the ids of the channels the app's bot is in. */
+export const botChannelsResponseSchema = z.object({ channels: z.array(z.string()) });
+export type BotChannelsResponse = z.infer<typeof botChannelsResponseSchema>;
+
+export function fetchBotChannels(fetchImpl: FetchLike, baseUrl: string, signal: AbortSignal): Promise<BotChannelsResponse> {
+  return getJson(fetchImpl, baseUrl, "/v1/slack/bot/channels", botChannelsResponseSchema, "the bot channel list", signal);
 }
 
 export type SessionReply = { session: string; connection: string; text: string };
