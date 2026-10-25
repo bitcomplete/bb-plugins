@@ -148,16 +148,34 @@ function same(a: readonly string[], b: readonly string[]): boolean {
 const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.description ?? "").digest("hex").slice(0, 16);
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+/** Verbs that say the entity was moved, not that it merely ought to be. */
+const SETTING_VERB = /\b(?:set|sets|setting|moved?|moves?|moving|marked?|marks?|marking|put|puts|changed?|changes?|closed?|closes?|closing|merged?|merges?|merging)\b/iu;
+
 /**
  * Whether a worker's final message says it moved this entity to a terminal
- * state (BB-52 rule 4). The entity key and a terminal state name must share a
- * line, so a passing mention of another ticket's Done is not one.
+ * state (BB-52 rule 4). The entity key and a terminal state name must be near
+ * each other on one line and a setting verb must introduce the move (or the
+ * key must run straight into the state, "ENG-12: Done"), so
+ * "ENG-12 should be Done once the rollout lands" is not one.
  */
 export function workerReportedTerminal(result: string | null, entityKey: string, playbook: Playbook): boolean {
   if (result === null || entityKey === "") return false;
+  const key = entityKey.toLowerCase();
   for (const line of result.split("\n")) {
-    if (!line.includes(entityKey)) continue;
-    if (playbook.terminal.some((state) => state !== "" && line.toLowerCase().includes(state.toLowerCase()))) return true;
+    const flat = line.toLowerCase();
+    const ki = flat.indexOf(key);
+    if (ki < 0) continue;
+    for (const state of playbook.terminal) {
+      if (state === "") continue;
+      const term = state.toLowerCase();
+      const si = flat.indexOf(term);
+      if (si < 0 || Math.abs(ki - si) > 60) continue;
+      const from = Math.max(0, Math.min(ki, si) - 30);
+      const span = flat.slice(from, Math.max(ki + key.length, si + term.length));
+      const adjacent = new RegExp(`${escapeRegExp(key)}\\s*[:\\-—]\\s*${escapeRegExp(term)}`, "u").test(flat);
+      if (SETTING_VERB.test(span) || adjacent) return true;
+    }
   }
   return false;
 }

@@ -160,7 +160,10 @@ describe("the worker's own pull requests and state moves (BB-52)", () => {
   it("reads a worker's final message that moved the entity to a terminal state", () => {
     expect(workerReportedTerminal("Merged acme/web#7 and set ENG-12 to Done.", "ENG-12", tickets)).toBe(true);
     expect(workerReportedTerminal("Set ENG-12 to Done", "ENG-12", tickets)).toBe(true);
+    expect(workerReportedTerminal("ENG-12: Done", "ENG-12", tickets)).toBe(true);
     expect(workerReportedTerminal("ENG-12 is still In Review.", "ENG-12", tickets)).toBe(false);
+    // A prediction is not a report that the state was set.
+    expect(workerReportedTerminal("ENG-12 should be Done once the rollout lands.", "ENG-12", tickets)).toBe(false);
     expect(workerReportedTerminal("Done for OPS-9.", "ENG-12", tickets)).toBe(false);
     expect(workerReportedTerminal(null, "ENG-12", tickets)).toBe(false);
   });
