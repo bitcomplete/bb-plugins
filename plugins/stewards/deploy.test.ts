@@ -56,7 +56,7 @@ describe("applying a deployment doorbell", () => {
     expect(matchesTarget(target, "acme/other", "production")).toBe(false);
     const applied = applyDeployment(deployments, target, deployment(), NOW + 60_000);
     expect(applied.changed).toEqual(["acme/web#7"]);
-    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/bb-gate/actions/runs/9", deadlineAt: null });
+    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/bb-gate/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
   });
 
   it("marks a failure or error deployment failed, with the deployment's URL", () => {
@@ -86,9 +86,10 @@ describe("the no-deployment timeout", () => {
     expect(timeoutsDue(failed, NOW + target.timeout + 1000)).toEqual([]);
   });
 
-  it("does not time out a watch that already has a deployment", () => {
+  it("keeps a deadline while deploying, so a deployment with no final status still times out", () => {
     const applied = applyDeployment(recordMerged({}, observed(), target, NOW), target, deployment(), NOW);
-    expect(timeoutsDue(applied.deployments, NOW + target.timeout * 10)).toEqual([]);
+    expect(timeoutsDue(applied.deployments, NOW + target.timeout - 1)).toEqual([]);
+    expect(timeoutsDue(applied.deployments, NOW + target.timeout)).toEqual(["acme/web#7"]);
   });
 });
 
@@ -96,30 +97,30 @@ describe("the steward's verdict", () => {
   const deploying = () => applyDeployment(recordMerged({}, observed(), target, NOW), target, deployment(), NOW).deployments;
 
   it("settles a watch on deployed, and reports all deployed", () => {
-    const result = reportDeployment(deploying(), { state: "deployed" }, NOW + 1000);
+    const result = reportDeployment(deploying(), { state: "deployed" }, NOW + 1000, target.timeout);
     expect(result.changed).toMatchObject({ key: "acme/web#7", state: "deployed", deadlineAt: null });
     expect(allDeployed(result.deployments)).toBe(true);
     expect(allDeployed({})).toBe(false);
   });
 
-  it("puts a deployment that does not carry the merge back to awaiting", () => {
-    const result = reportDeployment(deploying(), { state: "not-yet", note: "ref does not pin the merge" }, NOW + 1000);
-    expect(result.changed).toMatchObject({ state: "merged", note: "ref does not pin the merge" });
+  it("puts a deployment that does not carry the merge back to awaiting, with a fresh deadline", () => {
+    const result = reportDeployment(deploying(), { state: "not-yet", note: "ref does not pin the merge" }, NOW + 1000, target.timeout);
+    expect(result.changed).toMatchObject({ state: "merged", note: "ref does not pin the merge", deadlineAt: NOW + 1000 + target.timeout });
     expect(allDeployed(result.deployments)).toBe(false);
   });
 
   it("marks a failed deployment failed", () => {
-    const result = reportDeployment(deploying(), { state: "failed", note: "run 9 red" }, NOW + 1000);
+    const result = reportDeployment(deploying(), { state: "failed", note: "run 9 red" }, NOW + 1000, target.timeout);
     expect(result.changed).toMatchObject({ state: "failed", note: "run 9 red" });
   });
 
   it("picks the watch a report names, by key or deployment id", () => {
     const two = recordMerged(recordMerged({}, observed(), target, NOW), observed({ entity: pull({ key: "acme/web#8" }, { merged: true }) }), target, NOW);
-    expect(reportDeployment(two, { state: "deployed", key: "ACME/WEB#8" }, NOW).changed?.key).toBe("acme/web#8");
+    expect(reportDeployment(two, { state: "deployed", key: "ACME/WEB#8" }, NOW, target.timeout).changed?.key).toBe("acme/web#8");
     const withDeployment = applyDeployment(two, target, deployment(), NOW).deployments;
-    expect(reportDeployment(withDeployment, { state: "deployed", deploymentId: 7 }, NOW).changed?.key).toBe("acme/web#7");
+    expect(reportDeployment(withDeployment, { state: "deployed", deploymentId: 7 }, NOW, target.timeout).changed?.key).toBe("acme/web#7");
     // No key and more than one unsettled watch: nothing is picked.
-    expect(reportDeployment(two, { state: "deployed" }, NOW).changed).toBeNull();
+    expect(reportDeployment(two, { state: "deployed" }, NOW, target.timeout).changed).toBeNull();
   });
 });
 

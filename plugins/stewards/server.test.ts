@@ -5539,4 +5539,26 @@ describe("deployment watching (BB-53)", () => {
     await doorbell(t, "acme/bb-gate#7", deployment());
     expect(t.sends).toHaveLength(before);
   });
+
+  it("holds a following-through binding open and wakes it when its pull request merges and a deployment is outstanding", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = deploymentPlaybook();
+    t.entities.set("uuid-12", issue({ state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The ticket reaches Done while the pull request is still open: the
+    // wrap-up keeps the binding open to watch the deploy.
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    await t.ring("linear", "uuid-12");
+    await t.tool("steward_report", { phase: "Done", summary: "Merged, watching the deploy.", nextAction: "Watch the deploy", actor: "steward", followThrough: "watch the deploy" }, steward);
+    expect(t.hooks.store.find("ENG-12")!.ending).toBe("terminal");
+    expect(t.hooks.store.find("ENG-12")!.followThrough).toBe("watch the deploy");
+    // The pull request merges: the deployment is recorded and the
+    // following-through steward is woken, not swallowed by the ending.
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/A merge is awaiting deployment/u);
+  });
 });

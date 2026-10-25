@@ -1775,7 +1775,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         b = await reopen(b, life.why);
         reason = "reopen";
       }
-      if ((life.kind === "terminal" || life.kind === "detach") && !(life.kind === "terminal" && awaitingDeploy)) {
+      // A terminal binding holds open while a deployment is outstanding, but
+      // only one that has not begun ending: one already following through (a
+      // ticket Done with its pull request still open) must keep falling
+      // through to the wake, so the deployment is not swallowed.
+      if ((life.kind === "terminal" || life.kind === "detach") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
         if (b.ending === null) {
           await beginEnding(b, config, playbook, life.kind, observed);
           return;
@@ -4681,7 +4685,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           let deploymentNote = "";
           if (input.deployment !== undefined) {
             if (playbook?.deployment === null || playbook?.deployment === undefined) return toolError(new Error(`${b.entityKey}'s playbook names no deployment target, so there is no deployment to report.`));
-            const result = reportDeployment(b.deployments, input.deployment, now());
+            const result = reportDeployment(b.deployments, input.deployment, now(), playbook.deployment.timeout);
             if (result.changed === null) return toolError(new Error(`No deployment is awaiting a verdict for ${b.entityKey}${input.deployment.key === undefined ? "" : ` (${input.deployment.key})`}. A deployment doorbell must arrive first.`));
             deployments = result.deployments;
             deploymentNote = ` ${result.changed.key} is ${result.changed.state}.`;

@@ -87,7 +87,7 @@ export const matchesTarget = (target: Pick<DeploymentTarget, "repo" | "environme
  * target that is not settled moves to `deploying` with the deployment's facts
  * (or `failed` on a failure/error state). Returns the keys that moved.
  */
-export function applyDeployment(deployments: Deployments, target: Pick<DeploymentTarget, "repo" | "environment">, deployment: Deployment, now: number): { deployments: Deployments; changed: string[] } {
+export function applyDeployment(deployments: Deployments, target: Pick<DeploymentTarget, "repo" | "environment" | "timeout">, deployment: Deployment, now: number): { deployments: Deployments; changed: string[] } {
   const next = { ...deployments };
   const changed: string[] = [];
   const failed = deployment.state === "failure" || deployment.state === "error";
@@ -106,7 +106,9 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
       sha: deployment.sha === "" ? null : deployment.sha,
       url: deployment.url,
       at: now,
-      deadlineAt: null,
+      // A deployment that never reaches a final status still wakes the
+      // steward within the playbook's time; a failure is settled.
+      deadlineAt: failed ? null : now + target.timeout,
       note: failed ? `Deployment ${deployment.id} reported ${deployment.state}` : watch.note,
     };
     changed.push(watch.key);
@@ -156,14 +158,17 @@ export function pickWatch(deployments: Deployments, report: DeploymentReport): D
  * failed; `not-yet` puts it back to `merged` with the note, so a later
  * deployment for the same target can still carry it.
  */
-export function reportDeployment(deployments: Deployments, report: DeploymentReport, now: number): { deployments: Deployments; changed: DeploymentWatch | null } {
+export function reportDeployment(deployments: Deployments, report: DeploymentReport, now: number, timeoutMs: number): { deployments: Deployments; changed: DeploymentWatch | null } {
   const watch = pickWatch(deployments, report);
   if (watch === null) return { deployments, changed: null };
   const next = { ...deployments };
   const note = report.note ?? null;
   if (report.state === "deployed") next[watch.key] = { ...watch, state: "deployed", at: now, deadlineAt: null, note };
   else if (report.state === "failed") next[watch.key] = { ...watch, state: "failed", at: now, deadlineAt: null, note: note ?? watch.note };
-  else next[watch.key] = { ...watch, state: "merged", at: now, note: note ?? "The deployment does not carry this merge yet" };
+  // A deployment that does not carry the merge is not settled: it keeps a
+  // fresh deadline, so another deployment, or the timeout, still wakes the
+  // steward within the playbook's time.
+  else next[watch.key] = { ...watch, state: "merged", at: now, deadlineAt: now + timeoutMs, note: note ?? "The deployment does not carry this merge yet" };
   return { deployments: next, changed: next[watch.key]! };
 }
 

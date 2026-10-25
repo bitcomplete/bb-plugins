@@ -658,6 +658,8 @@ describe("stewards' source contract", () => {
       w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
       await tick(30 * 60_000);
       expect(w.harness.logEntries.some((l) => l.message.includes("this server skips deployment doorbells there"))).toBe(true);
+      const interest = ((await w.harness.callRpc("watches", null)) as { interest: { unleased: Array<{ key: string; reason: string }> } }).interest;
+      expect(interest.unleased).toEqual([{ key: "acme/bb-gate", reason: "refused by bb-gate-hooks (forbidden); deployment doorbells are skipped" }]);
       service.controller.abort();
       await service.done;
     });

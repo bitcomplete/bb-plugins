@@ -155,10 +155,8 @@ const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
  * is done: merged is not deployed, and Done set by an automation is not
  * verified. Running workers are left alone until then.
  */
-function lifecycleInstructions(input: WakeInput): string | undefined {
+function baseLifecycleInstruction(input: WakeInput): string | undefined {
   const { binding: b, playbook, observed } = input;
-  const deployment = deploymentInstructions(input);
-  if (deployment !== undefined) return deployment;
   if (input.reason === "terminal") {
     return (
       `The entity has reached a terminal state (${observed.entity.state}). This is your wrap-up turn. Running workers have not been stopped. ` +
@@ -175,6 +173,19 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
     );
   }
   return LIFECYCLE_INSTRUCTIONS[input.reason];
+}
+
+/**
+ * The lifecycle instruction for this wake, with the deployment text appended
+ * rather than replacing it: an adopted or reopened binding keeps its own
+ * instruction and still hears about the deployment it awaits.
+ */
+function lifecycleInstructions(input: WakeInput): string | undefined {
+  const base = baseLifecycleInstruction(input);
+  const deployment = deploymentInstructions(input);
+  if (deployment === undefined) return base;
+  if (base === undefined) return deployment;
+  return `${base}\n\n${deployment}`;
 }
 
 /**

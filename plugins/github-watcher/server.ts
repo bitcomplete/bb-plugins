@@ -335,7 +335,15 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     async function onRejected(rejected: Rejection[]): Promise<void> {
       for (const r of rejected) {
         const watching = r.kind === "issue" ? watches.forKey(r.id) : [];
-        if (r.kind === "repo" ? interestRepos.has(r.id.toLowerCase()) : r.kind === "dependabot_repo" ? interestDependabot.has(r.id.toLowerCase()) : interestEntities.has(r.id.toLowerCase())) refusals.add(`${r.kind} ${r.id.toLowerCase()}`, r.reason);
+        const leased =
+          r.kind === "repo"
+            ? interestRepos.has(r.id.toLowerCase())
+            : r.kind === "dependabot_repo"
+              ? interestDependabot.has(r.id.toLowerCase())
+              : r.kind === "deployment_repo"
+                ? interestDeployment.has(r.id.toLowerCase())
+                : interestEntities.has(r.id.toLowerCase());
+        if (leased) refusals.add(`${r.kind} ${r.id.toLowerCase()}`, r.reason);
         if (r.kind === "dependabot_repo") {
           // A login that cannot read alerts gets `forbidden` here. That is a
           // skip, not an error: the server keeps running without Dependabot

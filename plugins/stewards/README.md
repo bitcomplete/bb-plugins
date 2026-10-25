@@ -452,7 +452,10 @@ default). With it, a merged pull request is recorded as awaiting deployment,
 the github plugin leases the repo as a `deployment_repo` and a `deployment`
 doorbell for the repo and environment wakes the binding, and the steward
 reports the verdict with `steward_report { deployment: { state } }`; a
-failure/error deployment or a timeout wakes it with the run URL. With no
+failure/error deployment or a timeout wakes it with the run URL. The wake's
+`merge <sha>` is the pull request's head, and a squash or rebase merge
+rewrites it, so decide ancestry from the deployment's own `ref`/`sha` and the
+repository rather than the head sha alone. With no
 `deployment`, the playbook behaves exactly as before.
 
 The wake numbers the ready checklist, and `steward_report` takes each item by

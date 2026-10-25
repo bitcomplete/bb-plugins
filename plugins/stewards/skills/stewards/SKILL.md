@@ -175,7 +175,10 @@ Two tools are yours; everything else you do with the tools every thread has.
   matching deployment within the playbook's `timeout`, wakes you with the run
   URL. Once every pull request is merged and deployed you are woken to post
   one closing comment and move the ticket to its terminal state; report
-  without `followThrough` then. A playbook with no `deployment` has none of
+  without `followThrough` then. The wake's `merge <sha>` is the pull
+  request's head, and a squash or rebase merge rewrites it, so decide
+  ancestry from the deployment's own `ref`/`sha` and the repository rather
+  than the head sha alone. A playbook with no `deployment` has none of
   this.
 - **Ending.** When the entity is detached you get one last turn, with your
   workers already stopped: say the work is done here. When it reaches a
