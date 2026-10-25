@@ -5,6 +5,14 @@ import serverEntry, { CALLBACK_PATH, createSlackPlugin } from "./server.js";
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
 
+/** The shape of the searchChannels RPC's answer, for test assertions. */
+type ChannelSearchResult = {
+  state: "ok" | "signin-required" | "unavailable";
+  channels: Array<{ id: string; name: string; private: boolean; extShared: boolean }>;
+  botChannels: string[] | null;
+  message?: string;
+};
+
 // A bb-gate-hooks whose event stream a test writes to, and whose sign-in and
 // session endpoints it scripts. Every Slack call is recorded.
 function fakeHooks() {
@@ -16,14 +24,17 @@ function fakeHooks() {
   const messages: Array<{ session: string; body: Record<string, unknown> }> = [];
   const statuses: Array<{ session: string; body: Record<string, unknown> }> = [];
   const titles: Array<{ session: string; body: Record<string, unknown> }> = [];
+  let botChannelRequests = 0;
   const state: {
     start: () => Response | Promise<Response>;
     exchange: () => Response | Promise<Response>;
     identify: () => Response | Promise<Response>;
+    botChannels: () => Response | Promise<Response>;
   } = {
     start: () => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
     exchange: () => Response.json({ token: "xoxp-user-token" }),
     identify: () => Response.json({ user: { id: "U0123", name: "Alice" }, teams: [], rejected: [] }),
+    botChannels: () => Response.json({ channels: ["C0123", "G0456"] }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
@@ -54,6 +65,10 @@ function fakeHooks() {
       exchanges.push(JSON.parse(String(init?.body)) as (typeof exchanges)[number]);
       return state.exchange();
     }
+    if (u === `${HOOKS_URL}/v1/slack/bot/channels`) {
+      botChannelRequests += 1;
+      return state.botChannels();
+    }
     const route = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/slack\/sessions\/([^/]+)\/(message|status|title)$/u.exec(u);
     if (route !== null) {
       const session = decodeURIComponent(route[1]!);
@@ -75,6 +90,7 @@ function fakeHooks() {
     statuses,
     titles,
     state,
+    botChannelRequests: () => botChannelRequests,
     last: () => streams.at(-1)!,
     hello: (connection: string) => `event: hello\ndata: ${JSON.stringify({ connection, leaseSeconds: 3600 })}\n\n`,
     session: (over: Record<string, unknown> = {}) =>
@@ -95,11 +111,34 @@ function fakeHooks() {
   };
 }
 
+// A stand-in for Slack's conversations.list, paging through `pages` and
+// recording every request so a test can see the pagination and the cache.
+function fakeSlack(options: { pages?: Array<Array<{ id: string; name: string; private?: boolean; extShared?: boolean }>>; tokenError?: string } = {}) {
+  const pages = options.pages ?? [[{ id: "C0123", name: "general" }]];
+  const requests: Array<{ cursor: string | null; token: string }> = [];
+  const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    const u = new URL(String(url));
+    if (u.origin !== "https://slack.com" || u.pathname !== "/api/conversations.list") return new Response("not found", { status: 404 });
+    const token = String((init?.headers as Record<string, string> | undefined)?.authorization ?? "").replace(/^Bearer /u, "");
+    const cursor = u.searchParams.get("cursor");
+    requests.push({ cursor, token });
+    if (options.tokenError !== undefined) return Response.json({ ok: false, error: options.tokenError });
+    const index = cursor === null ? 0 : Number(cursor);
+    const page = pages[index] ?? [];
+    const next = index + 1 < pages.length ? String(index + 1) : "";
+    return Response.json({
+      ok: true,
+      channels: page.map((c) => ({ id: c.id, name: c.name, is_private: c.private ?? false, is_ext_shared: c.extShared ?? false })),
+      response_metadata: { next_cursor: next },
+    });
+  });
+  return { fetchImpl, requests };
+}
+
 const PROJECTS = [
   { id: "prj-1", name: "Project One", kind: "standard" },
   { id: "prj-2", name: "Personal", kind: "personal" },
 ];
-
 /** A machine that is on, and the project's checkout on it. */
 const HOSTS = [
   { id: "host_off", status: "disconnected" },
@@ -116,6 +155,7 @@ const ENVIRONMENTS = [
 async function setup(
   options: {
     hooks?: ReturnType<typeof fakeHooks>;
+    slack?: ReturnType<typeof fakeSlack>;
     token?: string;
     project?: string;
     channels?: string;
@@ -130,6 +170,12 @@ async function setup(
   } = {},
 ) {
   const hooks = options.hooks ?? fakeHooks();
+  const slack = options.slack ?? fakeSlack();
+  // The plugin's one outbound fetch: Slack's own API goes to the Slack fake,
+  // everything else (bb-gate-hooks) to the hooks fake.
+  const fetchImpl = vi.fn((url: string | URL, init?: RequestInit): Promise<Response> =>
+    String(url).startsWith("https://slack.com/") ? slack.fetchImpl(url, init) : hooks.fetchImpl(url, init),
+  ) as unknown as typeof fetch;
   const { bb, harness } = createFakePluginHost({
     pluginId: "slack",
     appUrl: APP_URL,
@@ -150,11 +196,11 @@ async function setup(
     },
   });
   let now = 1_000_000_000_000;
-  await createSlackPlugin({ fetch: hooks.fetchImpl, now: () => now, env: { BB_HOOKS_URL: HOOKS_URL } })(bb);
+  await createSlackPlugin({ fetch: fetchImpl, now: () => now, env: { BB_HOOKS_URL: HOOKS_URL } })(bb);
   const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
-  return { bb, harness, hooks, tool, text, advance: (ms: number) => (now += ms), now: () => now };
+  return { bb, harness, hooks, slack, tool, text, advance: (ms: number) => (now += ms), now: () => now };
 }
 
 describe("Slack plugin", () => {
@@ -378,6 +424,96 @@ describe("Slack plugin", () => {
     const s = await live();
     expect((await s.harness.callRpc("setChannels", { entries: [{ channel: "C0123", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
     expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "C0123", project: "Project One" }]);
+    await s.stop();
+  });
+
+  it("searches the developer's channels, paginating and marking private and shared ones", async () => {
+    const slack = fakeSlack({
+      pages: [
+        [
+          { id: "C0123", name: "general" },
+          { id: "G0456", name: "secret", private: true },
+        ],
+        [{ id: "C0789", name: "shared", extShared: true }],
+      ],
+    });
+    const s = await live({ slack, token: "xoxp-user-1" });
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result.state).toBe("ok");
+    expect(result.channels).toEqual([
+      { id: "C0123", name: "general", private: false, extShared: false },
+      { id: "G0456", name: "secret", private: true, extShared: false },
+      { id: "C0789", name: "shared", private: false, extShared: true },
+    ]);
+    expect(slack.requests.map((r) => r.cursor)).toEqual([null, "1"]);
+    expect(slack.requests[0]!.token).toBe("xoxp-user-1");
+    // The bot's membership list rides along, so the picker can flag an invite.
+    expect(result.botChannels).toEqual(["C0123", "G0456"]);
+    expect(s.hooks.botChannelRequests()).toBe(1);
+    await s.stop();
+  });
+
+  it("still lists channels when the bot membership list is unavailable", async () => {
+    const s = await live({ slack: fakeSlack({ pages: [[{ id: "C0123", name: "general" }]] }), token: "xoxp-user-1" });
+    s.hooks.state.botChannels = () => new Response("not configured", { status: 503 });
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result).toMatchObject({ state: "ok", channels: [{ id: "C0123", name: "general", private: false, extShared: false }], botChannels: null });
+    await s.stop();
+  });
+
+  it("caches the channel list per server and refreshes it after a few minutes", async () => {
+    const slack = fakeSlack({ pages: [[{ id: "C0123", name: "general" }]] });
+    const s = await live({ slack, token: "xoxp-user-1" });
+    await s.harness.callRpc("searchChannels", { query: "" });
+    expect(slack.requests).toHaveLength(1);
+    await s.harness.callRpc("searchChannels", { query: "" });
+    expect(slack.requests).toHaveLength(1);
+    s.advance(6 * 60 * 1000);
+    await s.harness.callRpc("searchChannels", { query: "" });
+    expect(slack.requests).toHaveLength(2);
+    await s.stop();
+  });
+
+  it("filters by name locally, without another Slack call", async () => {
+    const slack = fakeSlack({ pages: [[{ id: "C0123", name: "general" }, { id: "C0456", name: "random" }]] });
+    const s = await live({ slack, token: "xoxp-user-1" });
+    const result = (await s.harness.callRpc("searchChannels", { query: "rand" })) as ChannelSearchResult;
+    expect(result.channels.map((c) => c.name)).toEqual(["random"]);
+    expect(slack.requests).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("asks for sign-in when the stored token is an OpenID one, never logging it", async () => {
+    const slack = fakeSlack({ tokenError: "not_allowed_token_type" });
+    const s = await live({ slack, token: "xoxp-old-openid" });
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result).toMatchObject({ state: "signin-required", channels: [], botChannels: null });
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("xoxp-old-openid");
+    await s.stop();
+  });
+
+  it("asks for sign-in when no token is stored", async () => {
+    const s = await live();
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result).toMatchObject({ state: "signin-required", channels: [] });
+    expect(s.slack.requests).toHaveLength(0);
+    await s.stop();
+  });
+
+  it("reports Slack as unavailable without failing the settings page", async () => {
+    const slack = fakeSlack({ tokenError: "ratelimited" });
+    const s = await live({ slack, token: "xoxp-user-1" });
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result.state).toBe("unavailable");
+    expect(result.message).toBeTruthy();
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("xoxp-user-1");
+    await s.stop();
+  });
+
+  it("still saves the map when the picker has no channel list", async () => {
+    const s = await live({ token: "xoxp-old-openid", slack: fakeSlack({ tokenError: "missing_scope" }) });
+    expect((await s.harness.callRpc("setChannels", { entries: [{ channel: "G0456", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "G0456", project: "Project One" }]);
     await s.stop();
   });
 

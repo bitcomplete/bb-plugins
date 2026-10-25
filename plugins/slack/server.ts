@@ -14,7 +14,8 @@ import { randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
-import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, type IdentifyResponse, type SessionEvent } from "./hooks-client.js";
+import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type SessionEvent } from "./hooks-client.js";
+import { createSlackChannels, SlackTokenError, type SlackChannel } from "./slack-channels.js";
 import {
   channelEntrySchema,
   chooseConversationProject,
@@ -66,7 +67,7 @@ export function settingDescriptors(_env: Record<string, string | undefined>) {
       type: "string",
       secret: true,
       label: "Slack sign-in token",
-      description: "Filled in by Sign in with Slack below and used only to prove who you are. Do not edit or paste by hand.",
+      description: "Filled in by Sign in with Slack below; it proves who you are and reads the channel list you can see. Do not edit or paste by hand.",
     },
     project: {
       type: "string",
@@ -90,6 +91,14 @@ export function settingDescriptors(_env: Record<string, string | undefined>) {
     },
   } as const;
 }
+
+/** One channel the settings picker can show. */
+const channelOptionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  private: z.boolean(),
+  extShared: z.boolean(),
+});
 
 export const rpcContract = defineRpcContract({
   status: {
@@ -123,6 +132,22 @@ export const rpcContract = defineRpcContract({
     input: z.object({ entries: z.array(channelEntrySchema).max(200) }),
     output: z.object({ ok: z.boolean() }),
   },
+  /**
+   * The channels the signed-in developer can see, for the settings picker.
+   * Fetched from Slack with the stored user token, cached in memory per
+   * server. `query` filters by name and id locally; the picker asks for the
+   * full list once and filters as the developer types.
+   */
+  searchChannels: {
+    input: z.object({ query: z.string().max(200).optional() }),
+    output: z.object({
+      state: z.enum(["ok", "signin-required", "unavailable"]),
+      channels: z.array(channelOptionSchema),
+      /** The ids the app's bot is in, or null when that list is unavailable. */
+      botChannels: z.array(z.string()).nullable(),
+      message: z.string().optional(),
+    }),
+  },
 });
 
 function errorMessage(error: unknown): string {
@@ -154,6 +179,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     const settings = bb.settings.define(settingDescriptors(deps.env));
     const hooksUrl = deps.env[HOOKS_URL_ENV]?.trim() ?? "";
     const checkSignal = () => AbortSignal.timeout(30_000);
+
+    // The developer's own Slack channel list, called with the stored user
+    // token and cached per server. The token is never logged.
+    const slackChannels = createSlackChannels({ fetch: deps.fetch, now: deps.now, log: bb.log });
 
     // ---- the conversation → thread map -------------------------------------
     //
@@ -688,6 +717,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     bb.rpc.register(rpcContract, {
       status,
+      async searchChannels({ query }) {
+        return channelSearch(query ?? "");
+      },
       async signinStart() {
         if (hooksUrl === "") throw new Error(`Sign in with Slack is not available on this bb server: it has no bb-gate-hooks service (${HOOKS_URL_ENV} is not set).`);
         if (!hooks.connected) throw new Error("This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again.");
@@ -714,6 +746,39 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return { ok: true };
       },
     });
+
+    /**
+     * The channels the developer can see, for the picker. Calls Slack with the
+     * stored user token; an OpenID token (or a missing, revoked or unscoped
+     * one) answers "signin-required", and the picker falls back to the id box.
+     * The bot's membership list is best-effort: a failure there leaves it null,
+     * so the picker flags nothing rather than flagging every channel.
+     */
+    async function channelSearch(query: string) {
+      const cfg = await settings.get();
+      const token = (cfg.token ?? "").trim();
+      if (token === "") return { state: "signin-required" as const, channels: [], botChannels: null };
+      let channels: SlackChannel[];
+      try {
+        channels = await slackChannels.list(token);
+      } catch (error) {
+        if (error instanceof SlackTokenError) return { state: "signin-required" as const, channels: [], botChannels: null };
+        const message = errorMessage(error);
+        bb.log.warn(`Slack channel search failed: ${message}`);
+        return { state: "unavailable" as const, channels: [], botChannels: null, message };
+      }
+      let botChannels: string[] | null = null;
+      if (hooksUrl !== "") {
+        try {
+          botChannels = (await fetchBotChannels(deps.fetch, hooksUrl, checkSignal())).channels;
+        } catch (error) {
+          bb.log.warn(`could not read the channels the Slack bot is in: ${errorMessage(error)}`);
+        }
+      }
+      const wanted = query.trim().toLowerCase();
+      const filtered = wanted === "" ? channels : channels.filter((c) => c.name.toLowerCase().includes(wanted) || c.id.toLowerCase().includes(wanted));
+      return { state: "ok" as const, channels: filtered, botChannels };
+    }
 
     async function prunePending(): Promise<void> {
       const now = deps.now();
