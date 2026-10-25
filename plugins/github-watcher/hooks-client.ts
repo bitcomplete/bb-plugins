@@ -26,7 +26,7 @@ export const SUBSCRIBE_BATCH = 100;
  * separate because reading a repository does not entitle a token to its
  * alerts (bb-gate/docs/hooks.md).
  */
-export type LeaseKind = "issue" | "repo" | "dependabot_repo";
+export type LeaseKind = "issue" | "repo" | "dependabot_repo" | "deployment_repo";
 export type Lease = { kind: LeaseKind; id: string };
 
 // ---- server-sent events ----------------------------------------------------
@@ -119,7 +119,7 @@ export async function* readSse(body: ReadableStream<Uint8Array>, signal: AbortSi
 // ---- the wire shapes ---------------------------------------------------------
 
 export const helloSchema = z.object({ connection: z.string().min(1), leaseSeconds: z.number().positive().optional() });
-export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional() }).loose();
+export const doorbellSchema = z.object({ source: z.string(), kind: z.string(), id: z.string().min(1), unit: z.string().optional(), deployment: z.unknown().optional() }).loose();
 export const subscribeResponseSchema = z.object({
   leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
   rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
@@ -217,11 +217,12 @@ export interface HooksLoopDeps {
   /** Every lease to hold, right now: watched issues, and whatever stewards asked for. */
   watchIds: () => Lease[];
   /**
-   * A doorbell: the kind (`issue` or `dependabot_alert`), the entity id, and
-   * the unit (the repository) when the service named one. The caller decides
-   * what to look at.
+   * A doorbell: the kind (`issue`, `dependabot_alert` or `deployment`), the
+   * entity id, the unit (the repository) when the service named one, and, on
+   * a `deployment` doorbell, the deployment object the doorbell carries. The
+   * caller decides what to look at.
    */
-  onDoorbell: (kind: string, id: string, unit: string | null) => void;
+  onDoorbell: (kind: string, id: string, unit: string | null, deployment?: unknown) => void;
   /** Leases the service refused. The caller decides what that means for each watch. */
   onRejected: (rejected: Rejection[]) => Promise<void>;
   /** Check every watch against its cursor. */
@@ -426,10 +427,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           // `action` and `at` are for the service's logs; the reaction to any
           // doorbell is the same check. The unit is passed on so a repository
           // lease can tell which of its doorbells it was rung for.
-          if (doorbell.success && doorbell.data.source === SOURCE && (doorbell.data.kind === "issue" || doorbell.data.kind === "dependabot_alert")) {
+          if (doorbell.success && doorbell.data.source === SOURCE && (doorbell.data.kind === "issue" || doorbell.data.kind === "dependabot_alert" || doorbell.data.kind === "deployment")) {
             doorbells.push();
             const unit = doorbell.data.unit?.trim() ?? "";
-            deps.onDoorbell(doorbell.data.kind, doorbell.data.id, unit === "" ? null : unit);
+            deps.onDoorbell(doorbell.data.kind, doorbell.data.id, unit === "" ? null : unit, doorbell.data.deployment);
           }
         }
       }

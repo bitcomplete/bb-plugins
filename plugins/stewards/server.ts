@@ -65,16 +65,19 @@ import {
   stewardsContract,
   type DependabotAlert,
   type DependabotSeverity,
+  type Deployment,
   type EntitySnapshot,
   type SessionWake,
   type Source,
 } from "./source-contract.js";
+import { allDeployed, applyDeployment, deploymentLines, deploymentReportSchema, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
+import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
@@ -852,6 +855,37 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return playbookFor(config, b.kind);
     }
 
+    /**
+     * Every deployment target a project's playbooks name, each once, by
+     * repo/environment. The repos are what the github plugin leases as
+     * `deployment_repo`; the environments are matched on a doorbell (BB-53).
+     */
+    function deploymentTargets(config: ProjectConfig): DeploymentTarget[] {
+      const seen = new Set<string>();
+      const out: DeploymentTarget[] = [];
+      for (const playbook of Object.values(config.playbooks)) {
+        const target = playbook?.deployment;
+        if (target === undefined || target === null) continue;
+        const key = `${target.repo.toLowerCase()}\u0000${target.environment.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(target);
+      }
+      return out;
+    }
+
+    /**
+     * The earliest deadline among a binding's unsettled deployment watches,
+     * so the requeue wakes the steward at the playbook's timeout even if
+     * nothing else does. Null when nothing is waiting.
+     */
+    function deploymentDeadline(deployments: Binding["deployments"]): number | null {
+      const deadlines = Object.values(deployments)
+        .filter((w) => (w.state === "merged" || w.state === "deploying") && w.deadlineAt !== null)
+        .map((w) => w.deadlineAt!);
+      return deadlines.length === 0 ? null : Math.min(...deadlines);
+    }
+
     // ---- the sources ---------------------------------------------------------------------
 
     async function snapshot(source: Source, id: string): Promise<EntitySnapshot | null> {
@@ -959,11 +993,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function sendInterest(): Promise<void> {
       const projects = [...configs.values()].map((c) => c.value).filter((c): c is ProjectConfig => c !== null);
       const open = store.open();
-      const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[] }> = {
+      const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[]; deployment: string[] }> = {
         linear: {
           units: [...new Set(projects.flatMap((p) => p.file.linear.teams))].sort(),
           entities: [...new Set(open.filter((b) => b.source === "linear").map((b) => b.entityId))].sort(),
           dependabot: [],
+          deployment: [],
         },
         github: {
           units: [...new Set(projects.flatMap((p) => p.repos))].sort(),
@@ -977,6 +1012,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // whose gh login cannot read alerts has each lease refused as
           // `forbidden`, which it skips; stewards check says so.
           dependabot: [...new Set(projects.flatMap((p) => (p.depsAlerts === null ? [] : depsTargets(p.file, p.repos).map((t) => t.repo))))].sort(),
+          // Every repo a playbook names as a deployment target. A login
+          // without `deployments:read` has each lease refused as `forbidden`,
+          // which it skips; stewards check says so.
+          deployment: [...new Set(projects.flatMap((p) => deploymentTargets(p).map((t) => t.repo)))].sort(),
         },
       };
       for (const source of ["linear", "github"] as const) {
@@ -1632,10 +1671,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ),
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
+        deployments: b.deployments,
         now: now(),
       });
       if (!(await deliverWake(b, config, playbook, text))) return false;
       const cursor = newestCommentAt(observed);
+      const deployDeadline = deploymentDeadline(b.deployments);
       store.patch(b.id, {
         awaitingReport: true,
         wokeAt: now(),
@@ -1643,8 +1684,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         commentCursor: cursor > b.commentCursor ? cursor : b.commentCursor,
         pending: [],
         archiveWhenIdle: false,
-        // A fallback until the report names its own.
-        requeueAt: now() + playbook.requeueDefaultMs,
+        // A fallback until the report names its own; never later than a
+        // deployment's timeout, so the no-deployment wake is not missed.
+        requeueAt: deployDeadline === null ? now() + playbook.requeueDefaultMs : Math.min(now() + playbook.requeueDefaultMs, deployDeadline),
       });
       return true;
     }
@@ -1699,6 +1741,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const observed: Observed = { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
       const prev = b.lastSnapshot;
 
+      // BB-53: a merged pull request whose playbook names a deployment target
+      // is recorded as awaiting one. The plugin never decides whether a
+      // deployment carries the merge; it records what it sees and wakes the
+      // steward with the playbook's rule.
+      const deployTarget = playbook.deployment;
+      const deploymentChanges: Change[] = [];
+      let deployments = b.deployments;
+      if (deployTarget !== null) {
+        const beforeDeploy = deployments;
+        deployments = recordMerged(deployments, observed, deployTarget, now());
+        if (deployments !== beforeDeploy) {
+          const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
+          deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTarget.repo} ${deployTarget.environment}`, actionable: true });
+        }
+        const late = timeoutsDue(deployments, now());
+        if (late.length > 0) {
+          deployments = timeOut(deployments, late, now());
+          deploymentChanges.push({ text: `No matching deployment for ${late.join(", ")} within ${formatDuration(deployTarget.timeout)}; check the run: https://github.com/${deployTarget.repo}/actions`, actionable: true });
+        }
+        if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
+      }
+      const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
+
       const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file) });
       let reason: WakeReason | null = force;
       if (life.kind === "stay-ended") {
@@ -1710,7 +1775,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         b = await reopen(b, life.why);
         reason = "reopen";
       }
-      if (life.kind === "terminal" || life.kind === "detach") {
+      if ((life.kind === "terminal" || life.kind === "detach") && !(life.kind === "terminal" && awaitingDeploy)) {
         if (b.ending === null) {
           await beginEnding(b, config, playbook, life.kind, observed);
           return;
@@ -1747,6 +1812,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ownPulls = workerInFlight ? await ownPullKeys(b, workers, observed) : new Set<string>();
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
+      changes.push(...deploymentChanges);
       // BB-35 step 2: a fresh unsigned comment by the owner that differs from
       // the recommendation on a decision that cited lessons is a correction,
       // counted once. Anyone else's words never count. Only from the second
@@ -2627,6 +2693,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await serial(`b:${b.id}`, () => reconcileBinding(b.id, "adopted"));
       pushInterest();
       return b;
+    }
+
+    /**
+     * A GitHub Deployment doorbell (BB-53). The entity id is
+     * "owner/repo#<deployment id>" and the deployment object carries the
+     * environment and state. Every open binding whose playbook names that repo
+     * and environment as a deployment target and is awaiting one hears it; the
+     * steward decides from the playbook's rule whether it carries the merge.
+     */
+    async function onDeploymentDoorbell(id: string, deployment: Deployment): Promise<void> {
+      const hash = id.lastIndexOf("#");
+      const repo = hash === -1 ? "" : id.slice(0, hash);
+      if (repo === "") return;
+      const projects = await stewardedProjects();
+      for (const config of projects) {
+        const target = deploymentTargets(config).find((t) => t.repo.toLowerCase() === repo.toLowerCase() && t.environment.toLowerCase() === lc(deployment.environment));
+        if (target === undefined) continue;
+        for (const b of store.open(config.projectId)) {
+          const playbook = bindingPlaybook(config, b);
+          const named = playbook?.deployment;
+          if (named === undefined || named === null || lc(named.repo) !== lc(target.repo) || lc(named.environment) !== lc(target.environment)) continue;
+          const watches = Object.values(b.deployments).filter((w) => lc(w.repo) === lc(target.repo) && lc(w.environment) === lc(target.environment) && w.state !== "deployed" && w.state !== "failed");
+          if (watches.length === 0) continue;
+          const applied = applyDeployment(b.deployments, target, deployment, now());
+          if (applied.changed.length === 0) continue;
+          store.patch(b.id, { deployments: applied.deployments });
+          const state = deployment.state === "" ? "created" : deployment.state;
+          store.note(b.id, `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}; the playbook's rule: ${target.carries}`, false);
+          bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
+          scheduleReconcile(b.id);
+        }
+      }
     }
 
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
@@ -3797,8 +3895,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- the RPC -------------------------------------------------------------------------------------
 
     bb.rpc.register(rpcContract, {
-      async stewardsRing({ source, id }, { experimental_caller: caller }) {
+      async stewardsRing({ source, id, deployment }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
+        if (deployment !== undefined) {
+          if (source !== "github") throw new Error("only the github-watcher plugin sends deployment doorbells");
+          debounce(`deploy:${lc(id)}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));
+          return { ok: true };
+        }
         debounce(`ring:${source}:${lc(id)}`, () => serial(`ring:${source}:${lc(id)}`, () => onRing(source, id)));
         return { ok: true };
       },
@@ -4495,6 +4598,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(600)
           .optional()
           .describe("Only after a terminal state (a wrap-up or follow-through turn): what remains to finish, such as a worker watching the deploy and verifying it. The binding stays open, its workers keep running, and you are woken as usual. Leave it out once the work is done, and the binding ends after this turn."),
+        deployment: deploymentReportSchema
+          .optional()
+          .describe("After a deployment doorbell (BB-53): whether the deployment carries this merge. Use the playbook's rule to decide: `deployed` when it carries it, `not-yet` when it does not, `failed` when it failed. Name the pull request with `key` when the binding watches more than one."),
         opsTickets: z
           .array(
             z.object({
@@ -4566,6 +4672,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             );
           }
           for (const t of opsTickets) store.recordTicket(b.projectId, t.fingerprint, t.ticket, t.did);
+          // BB-53: a deployment verdict the steward reached from the playbook's
+          // rule. `deployed` settles the watch; `not-yet` puts it back to
+          // awaiting; `failed` marks it failed. Once every watch is deployed
+          // the plugin notes it, so the next reconcile wakes the steward for
+          // the one closing comment.
+          let deployments = b.deployments;
+          let deploymentNote = "";
+          if (input.deployment !== undefined) {
+            if (playbook?.deployment === null || playbook?.deployment === undefined) return toolError(new Error(`${b.entityKey}'s playbook names no deployment target, so there is no deployment to report.`));
+            const result = reportDeployment(b.deployments, input.deployment, now());
+            if (result.changed === null) return toolError(new Error(`No deployment is awaiting a verdict for ${b.entityKey}${input.deployment.key === undefined ? "" : ` (${input.deployment.key})`}. A deployment doorbell must arrive first.`));
+            deployments = result.deployments;
+            deploymentNote = ` ${result.changed.key} is ${result.changed.state}.`;
+            if (allDeployed(deployments)) {
+              store.note(b.id, `Every pull request is merged and deployed (${playbook.deployment.repo} ${playbook.deployment.environment})`, false);
+              scheduleReconcile(b.id);
+            }
+          }
           // A Sentry issue with a ticket is leased by itself, so its next event rings even outside the project lease.
           if (opsTickets.length > 0 && parseOpsTargetKey(b.entityId)?.kind === "sentry-project") {
             sentryHooks.added("issue", ...opsTickets.map((t) => t.fingerprint)).catch((error: unknown) => bb.log.warn(`stewards: could not lease a Sentry issue right away: ${errorMessage(error)}`));
@@ -4599,10 +4723,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             status,
             statusAt: now(),
             ...(moved ? { advancedAt: now() } : {}),
-            requeueAt: now() + requeueMs,
+            requeueAt: (() => {
+              const at = now() + requeueMs;
+              const deadline = deploymentDeadline(deployments);
+              return deadline === null ? at : Math.min(at, deadline);
+            })(),
             awaitingReport: false,
             missedReports: 0,
             ready,
+            deployments,
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
@@ -4694,8 +4823,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const askedAbout = store.binding(b.id)?.scheduleAsked ?? b.scheduleAsked;
           if (schedule !== undefined) gateNote += ` Scheduling is with the project steward (${schedule.id}): ${b.entityKey} touches what ${askedAbout.join(", ")} ${askedAbout.length === 1 ? "is" : "are"} already changing. Start no workers and do not move the ticket into a build state until it decides; wait for its guidance or hold.`;
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${refusalNote}${escalated} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${refusalNote}${escalated} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const hidden = archiveWhenIdle && !needsUser(b) ? " Your thread is hidden when the turn ends, and comes back on that wake." : "";
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
@@ -5495,6 +5624,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const deps = config.file.deps;
       const slaText = (v: number | "asap") => (v === "asap" ? "asap" : formatDuration(v));
       lines.push(`deps: sla critical=${slaText(deps.sla.critical)} high=${slaText(deps.sla.high)} medium=${slaText(deps.sla.medium)} low=${slaText(deps.sla.low)}; batch medium=${formatDuration(deps.batch.medium)} low=${formatDuration(deps.batch.low)}; autoAdopt ${deps.autoAdopt.join(", ") || "(none)"}`);
+      const deployTargets = deploymentTargets(config);
+      if (deployTargets.length > 0) lines.push(`deployment: ${deployTargets.map((t) => `${t.repo} ${t.environment} (timeout ${formatDuration(t.timeout)})`).join(", ")}`);
       const depsRepos = depsTargets(config.file, config.repos);
       if (config.depsAlerts !== null && depsRepos.length > 0) {
         lines.push(`deps: watching ${depsRepos.length} repo${depsRepos.length === 1 ? "" : "s"} for alerts: ${depsRepos.map((t) => t.repo).join(", ")}`);
@@ -5672,6 +5803,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const conflicts = conflictsOf(b, store.open(b.projectId));
                 lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
               }
+              for (const line of deploymentLines(b.deployments)) lines.push(`Deployment ${line}`);
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
               for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
               for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);

@@ -6,6 +6,7 @@
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
 import { formatDuration, phaseInstructions, type BigDecision, type Playbook } from "./config.js";
+import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
 import type { DepsFinding, DepsLook } from "./deps.js";
@@ -156,6 +157,8 @@ const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
  */
 function lifecycleInstructions(input: WakeInput): string | undefined {
   const { binding: b, playbook, observed } = input;
+  const deployment = deploymentInstructions(input);
+  if (deployment !== undefined) return deployment;
   if (input.reason === "terminal") {
     return (
       `The entity has reached a terminal state (${observed.entity.state}). This is your wrap-up turn. Running workers have not been stopped. ` +
@@ -172,6 +175,33 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
     );
   }
   return LIFECYCLE_INSTRUCTIONS[input.reason];
+}
+
+/**
+ * What to do about a deployment, when the playbook names a target and a merge
+ * is waiting on one. The plugin does not decide whether a deployment carries a
+ * merge: it hands the steward the deployment and the playbook's rule, and the
+ * steward reports the verdict (BB-53).
+ */
+function deploymentInstructions(input: WakeInput): string | undefined {
+  const target = input.playbook.deployment;
+  const watches = Object.values(input.deployments ?? {});
+  if (target === null || watches.length === 0) return undefined;
+  const settled = watches.every((w) => w.state === "deployed");
+  if (settled) {
+    return (
+      `Every pull request is merged and deployed (${target.repo} ${target.environment}). This is the last turn of the work: post one closing comment saying it is live and move the ticket to its terminal state, then end with steward_report without followThrough. ` +
+      `If a playbook says otherwise, keep it open with followThrough as usual.`
+    );
+  }
+  const pending = watches.filter((w) => w.state === "merged" || w.state === "deploying");
+  if (pending.length === 0) return undefined;
+  const names = pending.map((w) => w.key).join(", ");
+  return (
+    `A merge is awaiting deployment (${names}) through ${target.repo} ${target.environment}. Decide from the playbook's rule whether the deployment carries the merge — ${JSON.stringify(target.carries)} — and report it with ` +
+    `steward_report { deployment: { state: "deployed" } } when it does, "not-yet" when it does not, or "failed" when it failed. ` +
+    `Do not start a worker to watch the deploy, and do not move the ticket on until every pull request is deployed.`
+  );
 }
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
@@ -205,6 +235,8 @@ export type WakeInput = {
   projectApprovedShas?: ReadonlySet<string>;
   /** The project's adoption label. */
   label: string;
+  /** Per-pull-request deployment state (BB-53); empty when the playbook names no deployment target. */
+  deployments?: Deployments;
   /** Open bindings already at work on what this one touches. */
   conflicts?: Conflict[];
   now: number;
@@ -252,6 +284,29 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
   const fresh = newHumanComments(e, cursor, own);
   if (fresh.length > 0) lines.push("", `Comments from others since your last turn (${fresh.length}):`, "", ...commentLines(fresh));
   return lines;
+}
+
+const DEPLOY_STATE_LABEL: Record<DeploymentWatch["state"], string> = { merged: "merged, awaiting deployment", deploying: "deploying", deployed: "deployed", failed: "failed" };
+
+/** The deployment block of a wake: the playbook's target and rule, then each watched pull request. */
+function deploymentLines(input: WakeInput): string[] {
+  const target = input.playbook.deployment;
+  const watches = Object.values(input.deployments ?? {}).sort((a, b) => a.key.localeCompare(b.key));
+  if (target === null || watches.length === 0) return [];
+  const out = ["", `### Deployment (${target.repo} ${target.environment})`, ""];
+  out.push(`- Rule (from the playbook): ${target.carries}`);
+  out.push(`- No matching deployment within ${formatDuration(target.timeout)} wakes you with the run URL.`);
+  for (const w of watches) {
+    const facts = [
+      w.mergeSha === null ? null : `merge ${w.mergeSha.slice(0, 7)}`,
+      w.deploymentId === null ? null : `deployment ${w.deploymentId}`,
+      w.ref === null ? null : `ref ${w.ref}`,
+      w.sha === null ? null : `sha ${w.sha.slice(0, 7)}`,
+      w.url === null ? null : w.url,
+    ].filter((x): x is string => x !== null);
+    out.push(`- ${w.key}: ${DEPLOY_STATE_LABEL[w.state]}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`);
+  }
+  return out;
 }
 
 function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "escalations">): string[] {
@@ -360,6 +415,9 @@ export function formatWake(input: WakeInput): string {
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
+  // The deployment block goes in the head, not the snapshot: a clipped wake
+  // must not lose the deployment's ref and sha, which the rule decides on.
+  out.push(...deploymentLines(input));
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");

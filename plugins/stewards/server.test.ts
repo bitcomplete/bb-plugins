@@ -417,8 +417,8 @@ describe("a Linear ticket steward", () => {
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
-    expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"], dependabot: [] });
-    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [] });
+    expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"], dependabot: [], deployment: [] });
+    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
   it("ignores unlabelled tickets, other teams, and rings from anyone but a source plugin", async () => {
@@ -1012,7 +1012,7 @@ describe("a Linear ticket steward", () => {
     // acme/web#10 has no snapshot: it cannot be read yet.
     await t.ring("linear", "uuid-12");
     const github = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input;
-    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"], dependabot: [] });
+    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"], dependabot: [], deployment: [] });
   });
 
   it("stops leasing a linked pull request once it merges", async () => {
@@ -1022,13 +1022,13 @@ describe("a Linear ticket steward", () => {
     t.entities.set("acme/web#7", pull());
     await t.ring("linear", "uuid-12");
     const github = () => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher");
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"], dependabot: [] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"], dependabot: [], deployment: [] });
     const sent = github().length;
 
     t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
     await t.ring("github", "acme/web#7");
     expect(github()).toHaveLength(sent + 1);
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
   it("counts a worker woken again (by a watch, a reviewer) as running", async () => {
@@ -5407,5 +5407,136 @@ describe("the load-time sidebar thread-list pin (BB-45)", () => {
       expect(t.uiPreferences.get("sidebar.threadListProvider")).toEqual({ value: "__automatic__", revision: 0 });
       expect(t.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("could not pin the sidebar thread list"))).toBe(true);
     }
+  });
+});
+
+// BB-53: a merged pull request whose playbook names a deployment target is
+// recorded as awaiting one; a GitHub Deployment doorbell wakes the bindings
+// awaiting it, and the steward decides from the playbook's rule whether it
+// carries the merge.
+describe("deployment watching (BB-53)", () => {
+  const deploymentPlaybook = () =>
+    LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries: "The pinned BB_PLUGINS_REF contains the merge commit."\n  timeout: 1h',
+    );
+  const merged = (t: Awaited<ReturnType<typeof setup>>, id = "uuid-12", key = "ENG-12", pullKey = "acme/web#7") => {
+    t.files[playbookPath("linear-tickets")] = deploymentPlaybook();
+    t.entities.set(id, issue({ id, key, state: "In Progress", linkedPulls: [{ url: `https://github.com/acme/web/pull/${pullKey.split("#")[1]}`, key: pullKey }] }));
+    t.entities.set(pullKey, pull({ key: pullKey }, { merged: true }));
+  };
+  const doorbell = async (t: Awaited<ReturnType<typeof setup>>, id: string, deployment: Record<string, unknown>) => {
+    await t.harness.callRpc("stewardsRing", { source: "github", id, deployment }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    await t.flush();
+  };
+  const deployment = (over: Record<string, unknown> = {}) => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9", ...over });
+  const githubInterest = (t: Awaited<ReturnType<typeof setup>>) => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)!.input as { deployment: string[] };
+
+  it("records a merge as awaiting deployment, leases the target repo, and shows the state in the wake", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", repo: "acme/bb-gate", environment: "production" });
+    expect(githubInterest(t).deployment).toEqual(["acme/bb-gate"]);
+    const prompt = String(t.spawns[1]!.prompt);
+    expect(prompt).toMatch(/### Deployment \(acme\/bb-gate production\)/u);
+    expect(prompt).toMatch(/The pinned BB_PLUGINS_REF contains the merge commit\./u);
+    expect(prompt).toMatch(/Awaiting deployment: acme\/web#7/u);
+  });
+
+  it("routes a deployment doorbell to the awaiting binding and shows the deployment in the wake", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, sha: "bbbbbbb2" });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
+    expect(wake).toMatch(/### Deployment \(acme\/bb-gate production\)/u);
+    expect(wake).toMatch(/The pinned BB_PLUGINS_REF contains the merge commit\./u);
+    // The rule's inputs: the merged commit and the deployment's ref and sha.
+    expect(wake).toMatch(/merge aaaaaaa/u);
+    expect(wake).toMatch(/ref main/u);
+    expect(wake).toMatch(/sha bbbbbbb/u);
+  });
+
+  it("marks the pull request deployed when the steward reports the rule carried, and wakes for the closing comment", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    const reported = await t.tool("steward_report", { phase: "In Review", summary: "The deployment pins the merge.", nextAction: "Close the ticket", actor: "steward", deployment: { state: "deployed" } }, steward);
+    expect(reported.error).toBe(false);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Every pull request is merged and deployed/u);
+  });
+
+  it("keeps the pull request awaiting when the steward reports the deployment does not carry the merge", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    await t.tool("steward_report", { phase: "In Review", summary: "The pin is behind.", nextAction: "Wait", actor: "other", deployment: { state: "not-yet", note: "BB_PLUGINS_REF does not contain aaaaaaa1" } }, steward);
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged", note: "BB_PLUGINS_REF does not contain aaaaaaa1" });
+  });
+
+  it("wakes the steward with the run URL on a failure deployment", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await doorbell(t, "acme/bb-gate#7", deployment({ state: "failure", url: "https://github.com/acme/bb-gate/actions/runs/12" }));
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "failed" });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployment 7 \(failure\) for acme\/bb-gate production/u);
+    expect(wake).toMatch(/https:\/\/github.com\/acme\/bb-gate\/actions\/runs\/12/u);
+  });
+
+  it("wakes the steward with the run URL when no deployment arrives within the playbook's timeout", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.advance(61 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "failed" });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/No matching deployment for acme\/web#7 within 1h/u);
+    expect(wake).toMatch(/https:\/\/github.com\/acme\/bb-gate\/actions/u);
+  });
+
+  it("releases two tickets with one deployment", async () => {
+    const t = await setup();
+    merged(t);
+    merged(t, "uuid-13", "ENG-13", "acme/web#8");
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const stewards = t.spawns.filter((s) => s.title === "ENG-12: Fix login" || s.title === "ENG-13: Add SSO").map((s) => s.id);
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    for (const key of ["ENG-12", "ENG-13"]) {
+      const deployments = t.hooks.store.find(key)!.deployments;
+      expect(Object.values(deployments)).toEqual([expect.objectContaining({ state: "deploying", deploymentId: 7 })]);
+    }
+    // One doorbell wakes both bindings.
+    for (const id of stewards) expect(t.sends.filter((s) => s.threadId === id).at(-1)!.text).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
+  });
+
+  it("behaves exactly as before for a project with no deployment target", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments).toEqual({});
+    expect(githubInterest(t).deployment).toEqual([]);
+    const before = t.sends.length;
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    expect(t.sends).toHaveLength(before);
   });
 });

@@ -41,7 +41,7 @@ const row = (threadId: string, key: string, over: Partial<WatchRow> = {}): Watch
 
 const target = (r: WatchRow) => ({ id: r.key, key: r.key, kind: r.kind, title: r.snapshot.title, url: `https://github.test/acme/pull/${r.key}` });
 
-const none: InterestView = { nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] }, units: [], dependabot: [], entities: [], unleased: [] };
+const none: InterestView = { nouns: { unit: ["team", "teams"], entity: ["issue", "issues"] }, units: [], dependabot: [], deployment: [], entities: [], unleased: [] };
 
 describe("buildUsage", () => {
   it("puts flagged watches first, noisy before idle before expiring, then the busiest, and sums per thread", () => {

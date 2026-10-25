@@ -44,7 +44,7 @@ import {
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity } from "./source-contract.js";
+import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity, type Deployment } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -70,7 +70,7 @@ export const rpcContract = defineRpcContract({
 
 /** Where the units and entities stewards wants to hear about are kept, so a restart keeps leasing them. */
 export const INTEREST_KEY = "stewards/interest";
-const interestSchema = z.object({ units: z.array(z.string()), entities: z.array(z.string()), dependabot: z.array(z.string()).default([]) });
+const interestSchema = z.object({ units: z.array(z.string()), entities: z.array(z.string()), dependabot: z.array(z.string()).default([]), deployment: z.array(z.string()).default([]) });
 type Interest = z.infer<typeof interestSchema>;
 
 /** How long a token read from gh is reused before gh is asked again. */
@@ -263,12 +263,13 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     // Kept in kv so a restart leases them again before stewards next says.
 
     const storedInterest = interestSchema.safeParse(await bb.storage.kv.get(INTEREST_KEY));
-    let interest: Interest = storedInterest.success ? storedInterest.data : { units: [], entities: [], dependabot: [] };
+    let interest: Interest = storedInterest.success ? storedInterest.data : { units: [], entities: [], dependabot: [], deployment: [] };
     // GitHub's names are case-insensitive, and a doorbell spells them as
     // GitHub does, which need not be how a project file does.
     let interestRepos = new Set(interest.units.map((u) => u.toLowerCase()));
     let interestEntities = new Set(interest.entities.map((e) => e.toLowerCase()));
     let interestDependabot = new Set(interest.dependabot.map((r) => r.toLowerCase()));
+    let interestDeployment = new Set(interest.deployment.map((r) => r.toLowerCase()));
     /** Stewards' leases bb-gate-hooks refused, by `<kind> <lowercased id>`. */
     const refusals = createRefusals(deps.now);
 
@@ -286,6 +287,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       for (const key of interest.entities) add("issue", key);
       for (const repo of interest.units) add("repo", repo);
       for (const repo of interest.dependabot) add("dependabot_repo", repo);
+      for (const repo of interest.deployment) add("deployment_repo", repo);
       return out;
     }
 
@@ -293,6 +295,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     function interesting(kind: string, key: string, unit: string | null): boolean {
       const repo = unit ?? parseRefKey(key)?.repo ?? null;
       if (kind === "dependabot_alert") return repo !== null && interestDependabot.has(repo.toLowerCase());
+      if (kind === "deployment") return repo !== null && interestDeployment.has(repo.toLowerCase());
       if (interestEntities.has(key.toLowerCase())) return true;
       return repo !== null && interestRepos.has(repo.toLowerCase());
     }
@@ -303,6 +306,22 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     const warn = (message: string) => bb.log.warn(message);
     const rings = createCheckQueue((key) => ringStewards(callStewards, { source: "github", id: key }, warn), { onError: (key, error) => warn(`ringing stewards for ${key} failed: ${errorMessage(error)}`) });
     bb.onDispose(() => rings.stop());
+
+    // A deployment doorbell carries its deployment object, which a plain ring
+    // does not; the queue holds the latest per deployment id and the ring
+    // hands it on. A doorbell with no readable object is dropped: there is
+    // nothing to decide carries from.
+    const pendingDeployments = new Map<string, Deployment>();
+    const deploymentRings = createCheckQueue(
+      (id) => {
+        const deployment = pendingDeployments.get(id);
+        pendingDeployments.delete(id);
+        if (deployment === undefined) return Promise.resolve();
+        return ringStewards(callStewards, { source: "github", id, deployment }, warn);
+      },
+      { onError: (id, error) => warn(`ringing stewards for deployment ${id} failed: ${errorMessage(error)}`) },
+    );
+    bb.onDispose(() => deploymentRings.stop());
 
     // The service refusing a lease is not proof the developer lost access:
     // with GitHub rate-limiting the service, or briefly down, every watch
@@ -322,6 +341,13 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           // skip, not an error: the server keeps running without Dependabot
           // doorbells, and `bb stewards check` says which repos it skips.
           if (interestDependabot.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a dependabot_repo lease on ${r.id} (${r.reason}); this server skips Dependabot alerts there`);
+          continue;
+        }
+        if (r.kind === "deployment_repo") {
+          // Reading a repository's deployments needs `deployments:read` (or
+          // the `repo` scope); a token without it is refused here, which is a
+          // skip: the server keeps running without deployment doorbells.
+          if (interestDeployment.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a deployment_repo lease on ${r.id} (${r.reason}); this server skips deployment doorbells there`);
           continue;
         }
         if (r.kind === "repo" || (watching.length === 0 && interestEntities.has(r.id.toLowerCase()))) {
@@ -352,8 +378,19 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       token: accessToken,
       refreshToken: () => refreshToken("was refused by bb-gate-hooks"),
       watchIds: leases,
-      onDoorbell: (kind, key, unit) => {
+      onDoorbell: (kind, key, unit, deployment) => {
         if (kind === "issue") checks.ring(key);
+        if (kind === "deployment") {
+          if (!interesting(kind, key, unit)) return;
+          const parsed = deploymentSchema.safeParse(deployment);
+          if (!parsed.success) {
+            bb.log.warn(`GitHub deployment doorbell ${key} carried no readable deployment; nothing to hand stewards`);
+            return;
+          }
+          pendingDeployments.set(key, parsed.data);
+          deploymentRings.ring(key);
+          return;
+        }
         if (interesting(kind, key, unit)) rings.ring(key);
       },
       onRejected,
@@ -410,10 +447,15 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         const reason = refused.get(`dependabot_repo ${repo.toLowerCase()}`);
         if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); Dependabot alerts are skipped` });
       }
+      for (const repo of interest.deployment) {
+        const reason = refused.get(`deployment_repo ${repo.toLowerCase()}`);
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); deployment doorbells are skipped` });
+      }
       return {
         nouns: { unit: ["repository", "repositories"], entity: ["pull request", "pull requests"] },
         units: interest.units,
         dependabot: [...interest.dependabot].sort((a, b) => a.localeCompare(b)),
+        deployment: [...interest.deployment].sort((a, b) => a.localeCompare(b)),
         entities: [...interest.entities].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).map((key) => {
           const ref = parseRefKey(key);
           // GitHub sends /issues/N on to the pull request when it is one.
@@ -541,17 +583,19 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
 
       // Replaces the previous set. Anything new is leased right away; what
       // was dropped is simply not renewed and lapses within the hour.
-      async sourceSetInterest({ units, entities, dependabot }, { experimental_caller: caller }) {
+      async sourceSetInterest({ units, entities, dependabot, deployment }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== STEWARDS_PLUGIN_ID) throw new Error(`sourceSetInterest is for the ${STEWARDS_PLUGIN_ID} plugin only`);
         const badUnits = units.filter((u) => parseRepo(u) === null);
         const badEntities = entities.filter((e) => parseRef(e) === null);
         const badDependabot = dependabot.filter((r) => parseRepo(r) === null);
-        if (badUnits.length > 0 || badEntities.length > 0 || badDependabot.length > 0) {
+        const badDeployment = deployment.filter((r) => parseRepo(r) === null);
+        if (badUnits.length > 0 || badEntities.length > 0 || badDependabot.length > 0 || badDeployment.length > 0) {
           throw new Error(
             `not GitHub names: ${[
               ...badUnits.map((u) => `${JSON.stringify(u)} (want owner/repo)`),
               ...badEntities.map((e) => `${JSON.stringify(e)} (want owner/repo#12)`),
               ...badDependabot.map((r) => `${JSON.stringify(r)} (want owner/repo)`),
+              ...badDeployment.map((r) => `${JSON.stringify(r)} (want owner/repo)`),
             ]
               .slice(0, 10)
               .join(", ")}`,
@@ -562,12 +606,14 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           units: [...new Set(units.map((u) => u.trim()))],
           entities: [...new Set(entities.map((e) => refKey(parseRef(e)!)))],
           dependabot: [...new Set(dependabot.map((r) => r.trim()))],
+          deployment: [...new Set(deployment.map((r) => r.trim()))],
         };
         await bb.storage.kv.set(INTEREST_KEY, next);
         interest = next;
         interestRepos = new Set(next.units.map((u) => u.toLowerCase()));
         interestEntities = new Set(next.entities.map((e) => e.toLowerCase()));
         interestDependabot = new Set(next.dependabot.map((r) => r.toLowerCase()));
+        interestDeployment = new Set(next.deployment.map((r) => r.toLowerCase()));
         announceWatches();
         const fresh = leases().filter((l) => !before.has(`${l.kind} ${l.id.toLowerCase()}`));
         const lease = (kind: Lease["kind"]) => {
@@ -577,6 +623,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         lease("repo");
         lease("issue");
         lease("dependabot_repo");
+        lease("deployment_repo");
         return { ok: true };
       },
     });

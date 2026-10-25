@@ -441,7 +441,19 @@ stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last
 part is the level only when it names one), `requeue-default`,
 `follow-through` (how long a terminal binding may be kept open, 6h by
-default), `skip-authors`.
+default), `skip-authors`, `deployment`.
+
+`deployment` names where a merge is confirmed live (BB-53): `source`
+(`github`), `repo` (the repo the deployment is created on, e.g.
+`bitcomplete/bb-gate`), `environment`, `carries` (the rule the steward applies
+to decide whether a deployment carries a merge; free text, shown in the wake
+alongside the deployment) and `timeout` (how long to wait for one, 6h by
+default). With it, a merged pull request is recorded as awaiting deployment,
+the github plugin leases the repo as a `deployment_repo` and a `deployment`
+doorbell for the repo and environment wakes the binding, and the steward
+reports the verdict with `steward_report { deployment: { state } }`; a
+failure/error deployment or a timeout wakes it with the run URL. With no
+`deployment`, the playbook behaves exactly as before.
 
 The wake numbers the ready checklist, and `steward_report` takes each item by
 its number (or the playbook's exact words). It stores the playbook's wording,
