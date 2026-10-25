@@ -72,6 +72,7 @@ describe("a steward's wake", () => {
   it("says an unjudged substantiality is passed by a substantial: false report in the same turn", () => {
     const wake = formatWake(wakeInput());
     expect(wake).toContain("- Substantial: not judged yet (treated as yes)");
+    expect(wake).toContain("with every checklist item met");
     expect(wake).toMatch(/report `substantial: false`.*the gate passes immediately on that report.*start the worker in the same turn/u);
   });
 

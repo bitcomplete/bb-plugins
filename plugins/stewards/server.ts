@@ -1930,6 +1930,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The work this binding was holding others behind has landed: lift them.
       if (allPullsMerged(b, observed) && (prev === null || !allPullsMerged(b, prev))) await releaseBehind(b, "merged its pull requests");
       const scheduling = await syncScheduleRequest(b, playbook);
+      // BB-55: the start-now backstop is queued by the report that passed the
+      // gate, but by the time the turn ends the steward may have obeyed: the
+      // ticket is in its build stage, a worker is running, or something now
+      // holds it. Re-check here, with the fresh snapshot and the requests
+      // filed, and drop the note rather than wake a steward that started.
+      if (b.pending.some((n) => n.text === START_WORKER_WAKE)) {
+        const startStillDue =
+          b.stage === "spec" &&
+          gateState(playbook, b.ready, currentSpec).passed &&
+          !anyWorkerInFlight(store.workers(b.id)) &&
+          b.hold === null &&
+          !store.openEscalations(b.id).some((x) => x.kind === "approval" || x.kind === "schedule");
+        if (!startStillDue) {
+          b = store.patch(b.id, { pending: b.pending.filter((n) => n.text !== START_WORKER_WAKE) });
+          for (let i = changes.length - 1; i >= 0; i--) if (changes[i]!.text === START_WORKER_WAKE) changes.splice(i, 1);
+        }
+      }
       /**
        * Keep news for the next turn: what is actionable as a reason for it, the
        * rest as quiet notes. A quiet comment count is not kept: the next wake

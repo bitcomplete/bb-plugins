@@ -516,6 +516,18 @@ describe("a Linear ticket steward", () => {
       expect(startWakes(t)).toHaveLength(1);
     });
 
+    it("drops the backstop wake when the steward obeys and starts the worker in the same turn", async () => {
+      const { t, steward } = await bound();
+      expect((await t.tool("steward_report", { ...base, ready: met }, steward)).text).toBe(startReply);
+      // The steward obeys: the ticket moves to In Progress and a worker is
+      // spawned before the turn ends. The queued note is re-checked at
+      // delivery and dropped, so no wake fires.
+      t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+      await t.created("thr_w1", steward);
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(0);
+    });
+
     it("does not schedule the backstop wake when a hold is open", async () => {
       const { t, project, steward } = await bound();
       expect((await t.tool("steward_update", { binding: "ENG-12", hold: "Wait for the design" }, project)).error).toBe(false);
