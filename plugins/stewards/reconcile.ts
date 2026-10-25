@@ -149,6 +149,20 @@ const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.des
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
 /**
+ * Whether a worker's final message says it moved this entity to a terminal
+ * state (BB-52 rule 4). The entity key and a terminal state name must share a
+ * line, so a passing mention of another ticket's Done is not one.
+ */
+export function workerReportedTerminal(result: string | null, entityKey: string, playbook: Playbook): boolean {
+  if (result === null || entityKey === "") return false;
+  for (const line of result.split("\n")) {
+    if (!line.includes(entityKey)) continue;
+    if (playbook.terminal.some((state) => state !== "" && line.toLowerCase().includes(state.toLowerCase()))) return true;
+  }
+  return false;
+}
+
+/**
  * Whether a pull request is the binding's worker's own: its key or URL is in
  * the set the server built from the worker's head branch and what the worker
  * reported (BB-52 rule 0). A null key and empty URL never match.
@@ -231,10 +245,11 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
   }
   const added = after.linkedPulls.filter((l) => !before.linkedPulls.some((b) => b.url === l.url));
   for (const l of added) {
-    // BB-52 rule 2: only the worker's own pull request is quiet. One the
-    // plugin cannot tie to the worker is foreign, and wakes the steward.
-    const own = ownPull(l.key, l.url, ctx.ownPulls);
-    changes.push({ text: `${p}Pull request linked${own ? "" : " (not this ticket's worker)"}: ${l.key ?? l.url}`, actionable: !own });
+    // BB-52 rule 2: while a worker is in flight, only its own pull request is
+    // quiet; a foreign one wakes the steward. With no worker in flight the
+    // link is a quiet note as before.
+    const foreign = ctx.workerInFlight && !ownPull(l.key, l.url, ctx.ownPulls);
+    changes.push({ text: `${p}Pull request linked${foreign ? " (not this ticket's worker)" : ""}: ${l.key ?? l.url}`, actionable: foreign });
   }
 
   if (before.pull !== null && after.pull !== null) changes.push(...diffPull(before, after, ctx, ctx.workerInFlight && ownPull(after.key, after.url, ctx.ownPulls)));
@@ -306,10 +321,11 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
     const was = beforePulls.get(pull.key.toLowerCase());
     const prefix = `${pull.key}: `;
     if (was === undefined) {
-      // Rule 2 again: a first sight of the worker's own pull request is quiet;
-      // a foreign one wakes, since "Pull request linked" already names it.
-      const own = ctx.workerInFlight && ownPull(pull.key, pull.url, ownPulls);
-      changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: !own });
+      // Rule 2 again: while a worker is in flight, a first sight of its own
+      // pull request is quiet and a foreign one wakes (the link line already
+      // names it); with no worker in flight it is quiet as before.
+      const foreign = ctx.workerInFlight && !ownPull(pull.key, pull.url, ownPulls);
+      changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: foreign });
     } else changes.push(...diffEntity(was, pull, { ...ctx, prefix, viewer: pull.viewer, ownPulls }));
   }
   // Comments are compared with what the steward was last shown, not with the

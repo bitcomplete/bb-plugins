@@ -100,9 +100,20 @@ export function workerQuestion(result: string | null): string | null {
  * 3). Only an explicit marker at the start of a line counts, so a normal
  * report that mentions an error it fixed is not one.
  */
-const ERROR_REPORT = /(?:^|\n)\s*(?:error|failed|failure|exception|traceback)\b|(?:^|\n)\s*(?:I (?:could not|couldn't|was unable to)|Unable to)\b/iu;
+const ERROR_REPORT = /^\s*(?:error|failed|failure|exception|traceback)\b\s*[:—-]\s*\S|^\s*(?:I (?:could not|couldn't|was unable to)|Unable to)\b/imu;
 export function workerReportedError(result: string | null): boolean {
   return result !== null && ERROR_REPORT.test(result);
+}
+
+/**
+ * Whether a worker's final message says it is parked waiting on something
+ * outside it (a reviewer, the owner, a build, a GitHub watch). Such a worker
+ * is left in flight rather than archived: its watch can wake it again, and
+ * its own pull request's activity stays quiet (BB-52 rule 3).
+ */
+const WAITING = /\b(?:waiting|awaits?|awaiting|parked|standing by)\b/iu;
+export function workerWaiting(result: string | null): boolean {
+  return result !== null && WAITING.test(result);
 }
 
 /** One worker's question, first under What changed, with how to answer it. */

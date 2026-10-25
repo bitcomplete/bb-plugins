@@ -812,6 +812,11 @@ describe("a Linear ticket steward", () => {
     await t.idle("thr_w1", "Error: the provider timed out before I could push.");
     expect(t.sends).toHaveLength(sent + 1);
     expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+
+    // A line that merely names an error count is not an error report.
+    const afterError = t.sends.length;
+    await t.idle("thr_w1", "Errors: 0. Failed tests: none.");
+    expect(t.sends).toHaveLength(afterError);
   });
 
   // BB-23: a worker is a top-level thread owned only through its lifecycle
@@ -1613,6 +1618,27 @@ describe("terminal states and follow-through", () => {
     await t.done();
     expect(t.sends).toHaveLength(before + 1);
     expect(t.sends.at(-1)!.text).toMatch(/Terminal: Done/u);
+  });
+
+  // Criterion 2: the canonical build-tickets close, where the worker merges its
+  // own PR and sets Done itself. Rule 4's worker half ends the binding from the
+  // mechanical tier, so the Done state is never its own wrap-up wake.
+  it("ends without a Done wake when the worker merged and set Done itself", async () => {
+    const t = await working();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    await t.ring("linear", "uuid-12");
+
+    // The worker's own PR merges, then the worker sets the ticket Done and ends.
+    t.entities.set("acme/web#7", pull({ author: "jane", state: "merged" }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    const before = t.sends.length;
+    t.entities.set("uuid-12", issue({ state: "Done", stateType: "completed", ...linked }));
+    await t.idle("thr_w1", "Merged acme/web#7 and set ENG-12 to Done.");
+    await t.ring("linear", "uuid-12");
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.sends.slice(before).map((s) => s.text).some((text) => /Terminal: Done/u.test(text))).toBe(false);
   });
 });
 

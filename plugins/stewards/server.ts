@@ -55,7 +55,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -75,7 +75,7 @@ import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -1326,6 +1326,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (needsUser(b)) return;
       for (const w of store.workers(b.id)) {
         if (w.status !== "finished" || workerQuestion(w.result) !== null) continue;
+        // A worker parked on a watch or an approval is left in flight: the
+        // watch wakes it again, and its own pull request's activity stays quiet
+        // (BB-52 rule 3).
+        if (workerWaiting(w.result)) continue;
         // A worker whose reviewer is still unarchived must stay. bb core
         // releases a thread's unarchived children from it when it is archived,
         // so archiving the worker would clear the reviewer's parent: it could
@@ -2433,6 +2437,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * How long after a worker's turn a terminal-state report in its final
+     * message still counts as it having set the state (BB-52 rule 4). A stale
+     * report from an earlier Done does not suppress a later one.
+     */
+    const TERMINAL_WORKER_REPORT_MS = 15 * 60_000;
+
+    /**
      * The one wrap-up (terminal) or stop (detach) turn before the binding
      * ends. A detach stops the workers now: someone took the label off. A
      * terminal state leaves them running through the wrap-up turn, in which
@@ -2441,11 +2452,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
       // BB-52 rule 4: the steward's own last report already named the terminal
-      // state, so its last turn set it and said the work is done. End from the
-      // mechanical tier rather than waking for a wrap-up it has already done. A
-      // terminal state set by anyone else leaves the report non-terminal and
-      // still wakes.
-      const ownDone = kind === "terminal" && b.status !== null && isTerminal(playbook, b.status.phase);
+      // state, or a worker's final message says it moved the entity there, so
+      // the binding's own last turn set it and said the work is done. End from
+      // the mechanical tier rather than waking for a wrap-up it has already
+      // done. A terminal state set by anyone else leaves neither signal and
+      // still wakes. The source contract carries no state-change actor, so
+      // these two reports are the attribution the plugin has.
+      const stewardDone = b.status !== null && isTerminal(playbook, b.status.phase);
+      const workerDone =
+        kind === "terminal" &&
+        store.workers(b.id).some((w) => w.result !== null && (w.endedAt === null || now() - w.endedAt <= TERMINAL_WORKER_REPORT_MS) && workerReportedTerminal(w.result, observed.entity.key, playbook));
+      const ownDone = kind === "terminal" && (stewardDone || workerDone);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
       await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : "was detached");
@@ -2461,7 +2478,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       if (ownDone) {
-        bb.log.info(`stewards: ${b.entityKey} was already reported ${b.status!.phase} by its steward; ending without a wrap-up wake`);
+        bb.log.info(`stewards: ${b.entityKey} was already reported done in its own last turn; ending without a wrap-up wake`);
         await finishEnding(b, "terminal");
         return;
       }
@@ -3398,8 +3415,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const needsSteward = workerQuestion(result) !== null || workerReportedError(result) || followingThrough(b);
         store.note(b.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
         // A quiet finish is consumed here, not by a wake: archive the worker
-        // now (BB-47), keeping one that still has a question or a reviewer.
-        if (!needsSteward) await archiveFinishedWorkers(b);
+        // now (BB-47), keeping one that still has a question, a reviewer, or is
+        // parked waiting on something that will wake it (BB-52 rule 3).
+        if (!needsSteward && !workerWaiting(result)) await archiveFinishedWorkers(b);
         scheduleReconcile(b.id);
         return;
       }

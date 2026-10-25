@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -149,6 +149,20 @@ describe("the worker's own pull requests and state moves (BB-52)", () => {
     expect(isOwnStageMove(stageOf, "In Progress", "Backlog")).toBe(false);
     expect(isOwnStageMove(stageOf, "Todo", "In Progress")).toBe(false);
     expect(isOwnStageMove(undefined, "In Progress", "In Review")).toBe(false);
+  });
+
+  it("keeps a linked pull request quiet when no worker is in flight, as before", () => {
+    const before = { entity: issue({ state: "In Progress", stateType: "started" }), pulls: [] };
+    const after = { entity: issue({ state: "In Progress", stateType: "started", ...linked }), pulls: [pull({ author: "sam" }, { headAuthor: "sam" })] };
+    expect(actionable(diffObserved(before, after, { ...ctx, stageOf }))).toEqual([]);
+  });
+
+  it("reads a worker's final message that moved the entity to a terminal state", () => {
+    expect(workerReportedTerminal("Merged acme/web#7 and set ENG-12 to Done.", "ENG-12", tickets)).toBe(true);
+    expect(workerReportedTerminal("Set ENG-12 to Done", "ENG-12", tickets)).toBe(true);
+    expect(workerReportedTerminal("ENG-12 is still In Review.", "ENG-12", tickets)).toBe(false);
+    expect(workerReportedTerminal("Done for OPS-9.", "ENG-12", tickets)).toBe(false);
+    expect(workerReportedTerminal(null, "ENG-12", tickets)).toBe(false);
   });
 });
 
