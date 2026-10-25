@@ -131,15 +131,6 @@ function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "mute
   return <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
 }
 
-/** The count of everything waiting on the user for one project; rendered only when non-zero. */
-function NeedsBadge({ count }: { count: number }) {
-  return (
-    <span aria-label={`${count} waiting on you`} className="ml-1 inline-flex min-w-4 items-center justify-center rounded-full bg-destructive/10 px-1 text-[10px] font-medium leading-4 text-destructive">
-      {count}
-    </span>
-  );
-}
-
 function EntityLink({ entityKey, url }: { entityKey: string; url: string | null }) {
   const navigate = useBbNavigate();
   if (url === null) return <span className="font-medium">{entityKey}</span>;
@@ -993,18 +984,17 @@ function SidebarCollapsible({ title, count, children }: { title: string; count: 
 }
 
 /**
- * The project dropdown, always a native `<select>`: the per-project needs count
- * in each option and the summed `NeedsBadge` beside it. The plus button opens
- * the composer on the dropdown's project — the host's own New thread button
- * cannot be retargeted from a thread list — then closes the mobile drawer.
+ * The project dropdown, always a native `<select>`, with the per-project needs
+ * count in each option. The plus button opens the composer on the dropdown's
+ * project — the host's own New thread button cannot be retargeted from a thread
+ * list — then closes the mobile drawer.
  */
 function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
-  const total = [...counts.values()].reduce((sum, n) => sum + n, 0);
   return (
-    <div className="flex items-center gap-1 px-1 py-1">
+    <div className="flex items-center gap-1 px-2 py-1.5">
       <select
         aria-label="Project"
-        className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1 text-sm"
+        className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-3 text-sm"
         value={activeId ?? ""}
         onChange={(e) => onPick(e.target.value)}
       >
@@ -1017,13 +1007,12 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
           );
         })}
       </select>
-      {total > 0 ? <NeedsBadge count={total} /> : null}
       {tabs.length > 0 ? (
         <button
           type="button"
           aria-label="New thread"
           title="New thread"
-          className="shrink-0 rounded-md border border-input p-1 text-muted-foreground hover:bg-state-hover hover:text-foreground"
+          className="flex size-8 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-state-hover hover:text-foreground"
           onClick={onNewThread}
         >
           <Icon name="Plus" className="size-4" />
