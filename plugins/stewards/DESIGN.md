@@ -339,6 +339,22 @@ Plugin code. No model turn.
    to change from, does not: the worker's own turn ending carries it, and
    waking on every first review would put back the wake the ticket removes.
    People, merges and closes still do.
+
+   BB-52 narrows that to the worker's own pull request, and quiets three more
+   causes. A pull request is the worker's own when its head branch is one of
+   the binding's worker threads' branches, or a worker named its URL in its
+   final message; anything else — a teammate's pull request, a link the
+   plugin cannot tie to a worker — wakes the steward on the link ("Pull
+   request linked (not this ticket's worker)") and keeps its checks, pushes
+   and comments actionable. A state move between the playbook's `build` and
+   `review` stages (In Progress ↔ In Review) is the worker's own loop, a
+   quiet note; a move to any other stage, or a terminal state, still wakes. A
+   worker's turn ending is a quiet note unless its final message asks a
+   question, reports an error, or its thread is gone (a binding following
+   through still hears the worker, since it waits on that result). And a
+   terminal state the steward's own last report already named ends the
+   binding from the mechanical tier, with the wrap-up written from that
+   report and no wrap-up wake; a terminal state someone else set still wakes.
 4. Otherwise the snapshot is recorded and the ring ends. Most rings end here:
    the steward's own comments, label churn, its workers at work. What
    changed is kept as a quiet note and shown with the next turn something

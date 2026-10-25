@@ -148,6 +148,60 @@ function same(a: readonly string[], b: readonly string[]): boolean {
 const descriptionHash = (e: EntitySnapshot) => createHash("sha256").update(e.description ?? "").digest("hex").slice(0, 16);
 const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
 
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+/** Verbs that say the entity was moved, not that it merely ought to be. */
+const SETTING_VERB = /\b(?:set|sets|setting|moved?|moves?|moving|marked?|marks?|marking|put|puts|changed?|changes?|closed?|closes?|closing|merged?|merges?|merging)\b/iu;
+
+/**
+ * Whether a worker's final message says it moved this entity to a terminal
+ * state (BB-52 rule 4). The entity key and a terminal state name must be near
+ * each other on one line and a setting verb must introduce the move (or the
+ * key must run straight into the state, "ENG-12: Done"), so
+ * "ENG-12 should be Done once the rollout lands" is not one.
+ */
+export function workerReportedTerminal(result: string | null, entityKey: string, playbook: Playbook): boolean {
+  if (result === null || entityKey === "") return false;
+  const key = entityKey.toLowerCase();
+  for (const line of result.split("\n")) {
+    const flat = line.toLowerCase();
+    const ki = flat.indexOf(key);
+    if (ki < 0) continue;
+    for (const state of playbook.terminal) {
+      if (state === "") continue;
+      const term = state.toLowerCase();
+      const si = flat.indexOf(term);
+      if (si < 0 || Math.abs(ki - si) > 60) continue;
+      const from = Math.max(0, Math.min(ki, si) - 30);
+      const span = flat.slice(from, Math.max(ki + key.length, si + term.length));
+      const adjacent = new RegExp(`${escapeRegExp(key)}\\s*[:\\-—]\\s*${escapeRegExp(term)}`, "u").test(flat);
+      if (SETTING_VERB.test(span) || adjacent) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a pull request is the binding's worker's own: its key or URL is in
+ * the set the server built from the worker's head branch and what the worker
+ * reported (BB-52 rule 0). A null key and empty URL never match.
+ */
+const ownPull = (key: string | null, url: string | null, own: ReadonlySet<string>): boolean =>
+  (key !== null && own.has(key.toLowerCase())) || (url !== null && url !== "" && own.has(url.toLowerCase()));
+
+/** The stages a worker of the binding moves an entity between: a move within them is its own (rule 1). */
+const OWN_MOVE_STAGES = new Set(["build", "review"]);
+/**
+ * Whether a state change is the worker's own build/review loop: both states map
+ * to a build or review stage and they differ. A terminal state is handled by
+ * the lifecycle before this, and any other move still wakes the steward.
+ */
+export function isOwnStageMove(stageOf: ((state: string) => string | null) | undefined, before: string, after: string): boolean {
+  if (stageOf === undefined) return false;
+  const a = stageOf(before);
+  const b = stageOf(after);
+  return a !== null && b !== null && a !== b && OWN_MOVE_STAGES.has(a) && OWN_MOVE_STAGES.has(b);
+}
+
 /**
  * Whose pull request events are the steward's own work in progress. While any
  * worker of the binding is in flight (criterion 1: from its spawn until it
@@ -155,9 +209,11 @@ const lc = (s: string | null | undefined) => (s ?? "").toLowerCase();
  * description, posts as the viewer (every thread acts as the developer,
  * signed or not) and waits for checks; none of that is news to the steward,
  * which hears from the worker when it finishes. People and terminal states
- * still wake it.
+ * still wake it. BB-52 narrows this to the worker's own pull requests: a
+ * linked pull request the plugin cannot tie to the worker keeps its activity
+ * actionable.
  */
-type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; viewer: string | null; workerInFlight: boolean; userThread?: (threadId: string) => boolean };
+type DiffContext = Omit<ObservedDiffContext, "ownPulls"> & { prefix: string; viewer: string | null; ownPulls: ReadonlySet<string> };
 
 /**
  * The changes between two observations of one entity, each marked whether it
@@ -167,7 +223,12 @@ type DiffContext = { prefix: string; own: ReadonlySet<string>; stewardThreadId: 
 export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContext): Change[] {
   const changes: Change[] = [];
   const p = ctx.prefix;
-  if (before.state !== after.state) changes.push({ text: `${p}State: ${before.state} → ${after.state}`, actionable: true });
+  if (before.state !== after.state) {
+    // BB-52 rule 1: a worker moving the entity between the playbook's build
+    // and review stages is its own loop, not news.
+    const own = ctx.workerInFlight && isOwnStageMove(ctx.stageOf, before.state, after.state);
+    changes.push({ text: `${p}State: ${before.state} → ${after.state}`, actionable: !own });
+  }
   if ((before.title ?? "") !== (after.title ?? "")) changes.push({ text: `${p}Title: ${after.title ?? "(none)"}`, actionable: false });
   if (!same(before.labels, after.labels)) changes.push({ text: `${p}Labels: ${after.labels.join(", ") || "(none)"}`, actionable: false });
   if (!same(before.assignees, after.assignees)) changes.push({ text: `${p}Assignees: ${after.assignees.join(", ") || "(none)"}`, actionable: false });
@@ -178,7 +239,8 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
     // rewriting a description it signed earlier usually keeps the line.
     const signer = descriptionSignedBy(after);
     const own = signer !== null && ctx.own.has(signer) && descriptionSignedBy(before) !== signer;
-    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !(ctx.workerInFlight && after.pull !== null), ...(own ? { own } : {}) });
+    const ownWork = ctx.workerInFlight && after.pull !== null && ownPull(after.key, after.url, ctx.ownPulls);
+    changes.push({ text: `${p}Description edited${own ? " (by this steward)" : ""}`, actionable: !ownWork, ...(own ? { own } : {}) });
   }
 
   // A spec comment the steward just posted is its own doing; it only matters
@@ -200,15 +262,21 @@ export function diffEntity(before: EntitySnapshot, after: EntitySnapshot, ctx: D
     else if (lc(was.state) !== lc(child.state)) changes.push({ text: `${p}Sub-issue ${child.key}: ${was.state ?? "?"} → ${child.state ?? "?"}`, actionable: true });
   }
   const added = after.linkedPulls.filter((l) => !before.linkedPulls.some((b) => b.url === l.url));
-  for (const l of added) changes.push({ text: `${p}Pull request linked: ${l.key ?? l.url}`, actionable: false });
+  for (const l of added) {
+    // BB-52 rule 2: while a worker is in flight, only its own pull request is
+    // quiet; a foreign one wakes the steward. With no worker in flight the
+    // link is a quiet note as before.
+    const foreign = ctx.workerInFlight && !ownPull(l.key, l.url, ctx.ownPulls);
+    changes.push({ text: `${p}Pull request linked${foreign ? " (not this ticket's worker)" : ""}: ${l.key ?? l.url}`, actionable: foreign });
+  }
 
-  if (before.pull !== null && after.pull !== null) changes.push(...diffPull(before, after, ctx));
+  if (before.pull !== null && after.pull !== null) changes.push(...diffPull(before, after, ctx, ctx.workerInFlight && ownPull(after.key, after.url, ctx.ownPulls)));
   return changes;
 }
 
 const SETTLED = new Set(["success", "failure", "error"]);
 
-function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContext): Change[] {
+function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContext, ownWork: boolean): Change[] {
   const b = before.pull!;
   const a = after.pull!;
   const p = ctx.prefix;
@@ -223,7 +291,7 @@ function diffPull(before: EntitySnapshot, after: EntitySnapshot, ctx: DiffContex
   const bChecks = b.checks?.state ?? null;
   const aChecks = a.checks?.state ?? null;
   if (aChecks !== null && SETTLED.has(aChecks) && (bChecks !== aChecks || !same(b.checks?.failing ?? [], a.checks?.failing ?? []))) {
-    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ctx.workerInFlight });
+    changes.push({ text: `${p}Checks finished: ${aChecks}${a.checks!.failing.length > 0 ? ` (failing: ${a.checks!.failing.join(", ")})` : ""}`, actionable: !ownWork });
   }
   const seen = new Set(b.reviews.map((r) => `${r.author}|${r.submittedAt}|${r.state}`));
   for (const r of a.reviews) {
@@ -248,15 +316,35 @@ export const isCommentNews = (text: string): boolean => /^(?:\S+: )?\d+ new comm
  * (see DiffContext), including the reviewer's `bb-review` markers, except a
  * change of lane (criterion 3).
  */
-export function diffObserved(before: Observed, after: Observed, ctx: { own: ReadonlySet<string>; stewardThreadId: string | null; approved: boolean; cursor: string; workerInFlight: boolean; userThread?: (threadId: string) => boolean }): Change[] {
+/** The context two observations are compared in, and what the server knows about the worker's own pull requests. */
+export type ObservedDiffContext = {
+  own: ReadonlySet<string>;
+  stewardThreadId: string | null;
+  approved: boolean;
+  cursor: string;
+  workerInFlight: boolean;
+  /** Lowercased keys and URLs of the pull requests this binding's worker owns (BB-52 rule 0). */
+  ownPulls?: ReadonlySet<string>;
+  /** The stage an entity state maps to in this binding's playbook, for the build/review move (rule 1). */
+  stageOf?: (state: string) => string | null;
+  userThread?: (threadId: string) => boolean;
+};
+
+export function diffObserved(before: Observed, after: Observed, ctx: ObservedDiffContext): Change[] {
+  const ownPulls = ctx.ownPulls ?? new Set<string>();
   const viewer = after.entity.viewer;
-  const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer });
+  const changes = diffEntity(before.entity, after.entity, { ...ctx, prefix: "", viewer, ownPulls });
   const beforePulls = new Map(before.pulls.map((p) => [p.key.toLowerCase(), p]));
   for (const pull of after.pulls) {
     const was = beforePulls.get(pull.key.toLowerCase());
     const prefix = `${pull.key}: `;
-    if (was === undefined) changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: false });
-    else changes.push(...diffEntity(was, pull, { ...ctx, prefix, viewer: pull.viewer }));
+    if (was === undefined) {
+      // Rule 2 again: while a worker is in flight, a first sight of its own
+      // pull request is quiet and a foreign one wakes (the link line already
+      // names it); with no worker in flight it is quiet as before.
+      const foreign = ctx.workerInFlight && !ownPull(pull.key, pull.url, ownPulls);
+      changes.push({ text: `${prefix}now followed (${pull.state})`, actionable: foreign });
+    } else changes.push(...diffEntity(was, pull, { ...ctx, prefix, viewer: pull.viewer, ownPulls }));
   }
   // Comments are compared with what the steward was last shown, not with the
   // last ring, so a comment that arrived while the binding was held is still
@@ -269,7 +357,7 @@ export function diffObserved(before: Observed, after: Observed, ctx: { own: Read
     // and its reviewers': they post as the developer, often unsigned. The
     // reviewer's markers are the worker's business too, whoever posts them;
     // a round that changes the lane is not.
-    const ownWork = ctx.workerInFlight && e.pull !== null;
+    const ownWork = ctx.workerInFlight && e.pull !== null && ownPull(e.key, e.url, ownPulls);
     const people = ownWork ? fresh.filter((c) => reviewMarker(c.body) === null && lc(c.author) !== lc(e.viewer)) : fresh;
     if (fresh.length > 0) changes.push({ text: commentNews(prefix, fresh), actionable: people.length > 0 });
     if (ownWork) {
