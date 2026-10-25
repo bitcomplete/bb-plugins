@@ -117,14 +117,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   or lets it start (guidance + resolve, not asked again until a new overlap
   appears). A hold placed `behind` lifts itself once every binding named
   has merged its pull requests or ended: the held steward is woken with a
-  note to rebase, and the project steward is told. A binding reaching a
-  terminal state, or detached, releases what waits behind it as its ending
-  begins, so a steward that follows through for hours holds nobody up. A
-  hold that would form a cycle is refused. Work whose pull requests have all
-  merged no longer counts as in flight; a ticket whose gate has passed with
-  nothing holding or scheduling it counts as in flight already, so two
-  tickets going ready in the same minute schedule against each other rather
-  than racing to In Progress. `bb stewards show` prints
+  note to rebase. The project steward is told only when the work waited on
+  is not finished — its ticket not terminal and its steward not reporting
+  `steward_report { noMorePulls: true }` after every linked pull request
+  merged; a finished-work lift is a note on the held binding and the
+  project steward's next digest, and starts no turn. When one lift frees
+  two waiters that overlap each other, the first by priority then age is
+  released and the rest are held behind it. A binding reaching a terminal
+  state, or detached, releases what waits behind it as its ending begins,
+  so a steward that follows through for hours holds nobody up. A hold that
+  would form a cycle is refused. Work whose pull requests have all merged
+  and whose steward reported no more are coming no longer counts as in
+  flight; merged with no such report is still at work, because the next
+  pull request would conflict. Before filing a request the plugin re-reads
+  the conflicting bindings' pull requests from GitHub, and a ticket past
+  its ready gate that links a new pull request re-runs the check. A ticket
+  whose gate has passed with nothing holding or scheduling it counts as in
+  flight already, so two tickets going ready in the same minute schedule
+  against each other rather than racing to In Progress. `bb stewards show` prints
   what a binding touches and overlaps; the project steward's wake lists
   both for every binding. Everything else is the tools every thread has: `linear_*`, `gh`,
   and `bb thread spawn` / `tell` for workers, which stewards recognizes as
@@ -218,7 +228,13 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   the approver declines is not made again until the spec changes, and while
   one is open the steward is told not to ask the user again: the request is
   on the Stewards page, and a report that asks anyway shows as a playbook
-  violation in `bb stewards show`. When the entity changes while one of its
+  violation in `bb stewards show`. The project file's optional
+  `standingRules` list is shown in the approval wake, so the project
+  steward adds only the limits a change needs, in at most three points,
+  instead of restating rules that already bind every pull request. A
+  decline's objections are carried to the ticket steward as a checklist;
+  the same objection declined twice is forwarded to the user rather than a
+  third round. When the entity changes while one of its
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
   status blocked on the project steward or the user with no open

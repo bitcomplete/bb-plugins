@@ -152,7 +152,12 @@ Two tools are yours; everything else you do with the tools every thread has.
   soon as the spec names the repos and paths the work changes, report them
   with `steward_report { touches: ["<repo>/<path>", …] }` (repo directory
   first, the whole set each time), and refine the list as pull requests
-  open. The wake shows what is in flight on the same paths. When your
+  open. When no more pull requests are coming for the ticket, report it
+  with `steward_report { noMorePulls: true }`; a new linked pull request,
+  or a later `noMorePulls: false`, clears it. A hold behind this ticket
+  lifts silently (no project steward turn) only once its pull requests
+  have merged and you have reported that. The wake shows what is in flight
+  on the same paths. When your
   ready gate passes and such work exists, the plugin asks the project
   steward to schedule you: start no workers and do not move the ticket
   into a build state until it holds you behind that work or tells you to
@@ -244,7 +249,12 @@ transcripts. Turn the user's focus ("hold everything touching billing") into
 `steward_update` calls. A substantial spec whose checklist is met reaches
 you as an `approval` escalation the plugin files: approve it with
 `steward_update { binding, approve: true }`, which closes it, or decline
-with `guidance` + `resolve` saying what must change. You also schedule the
+with `guidance` + `resolve` saying what must change. Your approval wake
+shows the project's `standingRules` from `.bb/stewards/project.json`; add
+only the limits the change needs that they do not cover, in at most three
+points, or approve with none. A decline's objections go to the ticket
+steward as a checklist; the same objection declined twice is forwarded to
+the user rather than a third round. You also schedule the
 work so two tickets do not change the same files at once, which is what
 makes rebases pile up. Every binding reports what it touches; a ready
 ticket that touches what another is building or reviewing reaches you as a
@@ -252,7 +262,12 @@ ticket that touches what another is building or reviewing reaches you as a
 `steward_update { binding, hold: "<why>", behind: [<keys>] }` holds it
 behind that work and closes the request, and the hold lifts itself, waking
 the steward, once every binding named has merged its pull requests or
-ended. When the overlap is harmless, or the new ticket matters more (then
+ended. The lift wakes you only when that work is not finished; when its
+ticket is terminal with its pull requests merged, or its steward reported
+`noMorePulls`, it is a note on the held binding and your next digest
+instead. If one lift frees two waiters that overlap each other, the first
+by priority then age is released and the rest wait behind it. When the
+overlap is harmless, or the new ticket matters more (then
 hold the other one instead), let it start with `guidance` ("Start now: …")
 + `resolve`; it is not asked again until a new overlap appears. The
 bindings list in every wake shows touches and overlaps, so the same hold

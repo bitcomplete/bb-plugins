@@ -214,4 +214,18 @@ describe("the nightly prompt", () => {
     const escalation = formatProjectWake({ reason: "escalation", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], records: empty });
     expect(escalation).not.toContain("## The record since");
   });
+
+  it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "project", recommendation: null });
+    const withRules = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], standingRules: ["Migrations are append-only.", "The PR body carries the restart note."] });
+    expect(withRules).toContain("- Migrations are append-only.");
+    expect(withRules).toContain("- The PR body carries the restart note.");
+    expect(withRules).toMatch(/Add only the limits this change needs that this list does not cover, in at most three points/u);
+    expect(withRules).toMatch(/The guidance written to the binding is your additions only/u);
+    const none = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(none).toMatch(/no standing-rules list configured/u);
+    expect(none).toMatch(/Add only the limits this change needs, in at most three points/u);
+  });
 });

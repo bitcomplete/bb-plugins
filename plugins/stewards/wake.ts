@@ -426,6 +426,9 @@ export function formatWake(input: WakeInput): string {
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
+  if (binding.ready.declinedSpecHash !== null && binding.declinedSpecObjections.length > 0) {
+    out.push("", "**Spec declined.** Address each objection in one revision, so the next review can close them all:", "", ...binding.declinedSpecObjections.map((o) => `- [ ] ${o}`));
+  }
   // The deployment block goes in the head, not the snapshot: a clipped wake
   // must not lose the deployment's ref and sha, which the rule decides on.
   out.push(...deploymentLines(input));
@@ -883,6 +886,8 @@ export function formatProjectWake(input: {
   timeZone?: string;
   /** The adoption label, for adopting what an ops steward filed. */
   label?: string;
+  /** The project's standing-rules list from `.bb/stewards/project.json`, shown in an approval wake; empty when none is configured. */
+  standingRules?: string[];
 }): string {
   const day = dayIn(input.timeZone ?? "UTC");
   const out: string[] = [`# Project steward: ${input.reason}`, ""];
@@ -917,8 +922,19 @@ export function formatProjectWake(input: {
       );
     }
     if (input.routed.some((r) => r.escalation.kind === "approval")) {
+      const rules = input.standingRules ?? [];
       out.push(
         "An approval escalation is the plugin's: the ticket's ready gate waits on you. Judge the spec (`bb stewards show <key>`, and the ticket itself) against the project's guidance. Approve it with steward_update { binding, approve: true }, or with approving words in the guidance that resolves it, such as steward_update { binding, guidance: \"Approved\", resolve }; either closes the request. Decline with steward_update { binding, guidance: what must change, resolve }. If the steward also escalated asking for this approval, resolve that one too.",
+        "",
+        rules.length === 0
+          ? "This project has no standing-rules list configured. Add only the limits this change needs, in at most three points, as the guidance; approve with none when nothing needs adding. The guidance written to the binding is your additions only."
+          : [
+              "The project's standing rules already bind every pull request, so do not restate them:",
+              "",
+              ...rules.map((r) => `- ${r}`),
+              "",
+              "Add only the limits this change needs that this list does not cover, in at most three points, as the guidance; approve with none when nothing needs adding. The guidance written to the binding is your additions only.",
+            ].join("\n"),
         "",
       );
     }
@@ -1094,6 +1110,8 @@ export type DigestRecords = {
   stuck: Array<{ escalation: Escalation; from: Binding }>;
   /** Open bindings on hold. */
   held: Binding[];
+  /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
+  notes?: string[];
   /** Lessons that reached `.bb` HEAD in the window. */
   lessonsMerged?: Lesson[];
 };
@@ -1129,6 +1147,8 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.answered.map((q) => `- Answered: ${q.id} "${oneLine(q.question, 200)}" → ${oneLine(q.answer ?? "", 300)} (${q.answeredBy === "user" ? "by the user, on the stewards page" : "recorded by you"})`),
   ];
   out.push("### What moved", "", ...capped(moved, "Nothing moved."), "");
+
+  if ((r.notes ?? []).length > 0) out.push("### Notes", "", ...capped((r.notes ?? []).map((n) => `- ${n}`), "Nothing."), "");
 
   // A question or a need covers the escalation it was made for: list the
   // question or the item, never the raw escalation too.

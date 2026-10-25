@@ -46,6 +46,17 @@ describe("the project file", () => {
     expect(badDuration).toMatchObject({ ok: false });
     if (!badDuration.ok) expect(badDuration.error).toMatch(/deps\.sla\.high/u);
   });
+
+  it("takes the standing-rules list, and rejects an unknown key (BB-54)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.standingRules).toEqual([]);
+    const withRules = parseProjectFile(JSON.stringify({ version: 1, standingRules: ["Migrations are append-only.", "No secrets in logs."] }));
+    if (!withRules.ok) throw new Error(withRules.error);
+    expect(withRules.value.standingRules).toEqual(["Migrations are append-only.", "No secrets in logs."]);
+    expect(parseProjectFile(JSON.stringify({ version: 1, standingRule: ["typo"] }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, standingRules: [""] }))).toMatchObject({ ok: false });
+  });
 });
 
 describe("ops in the project file", () => {
