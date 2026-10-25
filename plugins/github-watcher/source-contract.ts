@@ -30,6 +30,27 @@ export type Source = z.infer<typeof sourceSchema>;
  */
 export const SOURCE_PLUGIN_IDS: Record<Source, string> = { linear: "linear", github: "github-watcher" };
 
+/**
+ * A GitHub Deployment, as bb-gate-hooks forwards it on a `deployment`
+ * doorbell (bb-gate/docs/hooks.md). The doorbell's entity id is
+ * `owner/repo#<id>` and its unit is the repository; this object is the one
+ * piece of a doorbell that is not in the entity name, because a deployment's
+ * ref and state are what a subscriber decides on. `state` is empty on a bare
+ * `deployment` event and one of queued, in_progress, success, failure, error,
+ * inactive or pending on a `deployment_status` event.
+ */
+export const deploymentSchema = z
+  .object({
+    id: z.number().int().nonnegative(),
+    environment: z.string().default(""),
+    ref: z.string().default(""),
+    sha: z.string().default(""),
+    state: z.string().default(""),
+    url: z.string().nullable().default(null),
+  })
+  .loose();
+export type Deployment = z.infer<typeof deploymentSchema>;
+
 /** How much of a comment or description crosses the contract. */
 export const SNAPSHOT_COMMENT_CHARS = 4000;
 export const SNAPSHOT_DESCRIPTION_CHARS = 20_000;
@@ -249,12 +270,19 @@ export const sourceContract = {
    * wants. It is separate from `units` because a repository lease does not
    * receive alert doorbells (bb-gate/docs/hooks.md): the github plugin leases
    * each as a `dependabot_repo`. Linear ignores it.
+   *
+   * `deployment` names repositories whose GitHub Deployment doorbells
+   * stewards wants: the deployment targets the project's playbooks name. It
+   * is separate from `units` for the same reason as `dependabot`: a
+   * repository lease does not receive deployment doorbells, so the github
+   * plugin leases each as a `deployment_repo`. Linear ignores it.
    */
   sourceSetInterest: {
     input: z.object({
       units: z.array(z.string().min(1).max(200)).max(200),
       entities: z.array(z.string().min(1).max(300)).max(2000),
       dependabot: z.array(z.string().min(1).max(200)).max(200).default([]),
+      deployment: z.array(z.string().min(1).max(200)).max(200).default([]),
     }),
     output: z.object({ ok: z.boolean() }),
   },
@@ -324,7 +352,12 @@ export type SessionWake = z.infer<typeof sessionWakeSchema>;
 export const stewardsContract = {
   /** Something about this entity may have changed. Cheap: debounced, then compared with the last snapshot. */
   stewardsRing: {
-    input: z.object({ source: sourceSchema, id: z.string().min(1).max(300) }),
+    /**
+     * A `deployment` doorbell carries its deployment object, which is the one
+     * doorbell whose ref and state are not in the entity name. Every other
+     * doorbell leaves it out.
+     */
+    input: z.object({ source: sourceSchema, id: z.string().min(1).max(300), deployment: deploymentSchema.optional() }),
     output: z.object({ ok: z.boolean() }),
   },
   /**

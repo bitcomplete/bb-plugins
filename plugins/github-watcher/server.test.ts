@@ -582,7 +582,7 @@ describe("stewards' source contract", () => {
       expect(w.hooks.subscribes).toEqual([]);
 
       expect(await w.harness.callRpc("sourceSetInterest", { units: ["acme/gadgets"], entities: ["https://github.com/Acme/Widgets/pull/12"] }, STEWARDS)).toEqual({ ok: true });
-      expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"], dependabot: [] });
+      expect(await w.bb.storage.kv.get("stewards/interest")).toEqual({ units: ["acme/gadgets"], entities: ["Acme/Widgets#12"], dependabot: [], deployment: [] });
       type Interest = { units: string[]; entities: Array<{ key: string; url: string | null }>; unleased: Array<{ key: string; reason: string }> };
       const interestOf = async () => ((await w.harness.callRpc("watches", null)) as { interest: Interest }).interest;
       expect(await interestOf()).toMatchObject({ units: ["acme/gadgets"], entities: [{ key: "Acme/Widgets#12", url: "https://github.com/Acme/Widgets/issues/12" }], unleased: [] });
@@ -636,6 +636,30 @@ describe("stewards' source contract", () => {
       w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
       await tick(30 * 60_000);
       expect(w.harness.logEntries.some((l) => l.message.includes("this server skips Dependabot alerts there"))).toBe(true);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("leases deployment repositories and hands stewards a deployment doorbell's object", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/bb-gate" }]]);
+      const deployment = { id: 7, environment: "production", ref: "main", sha: "abc123", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9" };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/bb-gate#7", unit: "Acme/bb-gate", deployment })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "deployment", id: "Acme/Other#7", unit: "Acme/Other", deployment })}\n\n`);
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#7", deployment } }]);
+      // A refused deployment_repo lease is a skip, logged as one.
+      w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
+      await tick(30 * 60_000);
+      expect(w.harness.logEntries.some((l) => l.message.includes("this server skips deployment doorbells there"))).toBe(true);
+      const interest = ((await w.harness.callRpc("watches", null)) as { interest: { unleased: Array<{ key: string; reason: string }> } }).interest;
+      expect(interest.unleased).toEqual([{ key: "acme/bb-gate", reason: "refused by bb-gate-hooks (forbidden); deployment doorbells are skipped" }]);
       service.controller.abort();
       await service.done;
     });

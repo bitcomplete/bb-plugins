@@ -371,6 +371,32 @@ export type ReadyConfig = z.infer<typeof readySchema>;
 /** The default cap on follow-through: a deploy and its verification, with room to spare. */
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
 
+/**
+ * Where a merge is confirmed live: the deployment source, the target repo and
+ * environment, the rule the steward applies to decide whether a deployment
+ * carries its merge, and how long to wait for one. A playbook with no
+ * `deployment` behaves exactly as before; the plugin records nothing and the
+ * steward follows through however its playbook says.
+ */
+export const deploymentTargetSchema = z
+  .object({
+    source: z.literal("github"),
+    /** The repo the deployment is created on, as GitHub spells it, e.g. bitcomplete/bb-gate. */
+    repo: z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as bitcomplete/bb-gate"),
+    /** The deployment environment that confirms it, matched ignoring case. */
+    environment: z.string().trim().min(1).max(100),
+    /**
+     * The rule the steward applies to decide whether a deployment carries a
+     * merge. Free text, shown in the wake beside the deployment; the plugin
+     * does not evaluate it.
+     */
+    carries: z.string().trim().min(1).max(2000),
+    /** No matching deployment within this long wakes the steward. */
+    timeout: durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
+  })
+  .strict();
+export type DeploymentTarget = z.infer<typeof deploymentTargetSchema>;
+
 export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
 const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };
 
@@ -393,6 +419,8 @@ export const frontMatterSchema = z
     "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
+    /** Where a merge is confirmed live, when the project has a deployment source (BB-53). */
+    deployment: deploymentTargetSchema.optional(),
   })
   .strict();
 
@@ -409,6 +437,8 @@ export type Playbook = {
   requeueDefaultMs: number;
   followThroughMs: number;
   skipAuthors: string[];
+  /** Where a merge is confirmed live, or null when the playbook names no deployment target. */
+  deployment: DeploymentTarget | null;
   /** The text before the first `## ` heading: instructions for every phase. */
   general: string;
   /** Each `## Phase` section's text, keyed by heading as written. */
@@ -477,6 +507,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       requeueDefaultMs: fm["requeue-default"],
       followThroughMs: fm["follow-through"],
       skipAuthors: fm["skip-authors"],
+      deployment: fm.deployment ?? null,
       general,
       sections,
       version: createHash("sha256").update(text).digest("hex").slice(0, 12),

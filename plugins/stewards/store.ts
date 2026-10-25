@@ -11,6 +11,7 @@ import { z } from "zod";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
+import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
 
@@ -350,7 +351,12 @@ export const DECLINED_PR_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN declined_pr_marker TEXT`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS];
+// BB-53: the per-pull-request deployment state a binding keeps between a merge
+// and the deployment that confirms it is live. Additive and defaulted: a
+// binding with no deployment target keeps an empty map and behaves as before.
+export const DEPLOYMENT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN deployments TEXT NOT NULL DEFAULT '{}'`];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -481,6 +487,8 @@ export type Binding = {
   depsLook: DepsLook | null;
   /** A Sentry project binding's last look; null for every other kind. */
   sentryLook: SentryLook | null;
+  /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
+  deployments: Deployments;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -540,6 +548,7 @@ function rowToBinding(r: BindingRow): Binding {
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
+    deployments: json(deploymentsSchema, str("deployments"), {}),
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -589,6 +598,7 @@ const COLUMNS = {
   opsLook: "ops_look",
   depsLook: "deps_look",
   sentryLook: "sentry_look",
+  deployments: "deployments",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;

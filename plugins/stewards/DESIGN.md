@@ -725,10 +725,26 @@ may: [comment, edit-description, set-state, set-labels, create-sub-issue, open-p
 models: { ... }                   # §13
 requeue-default: 2d
 follow-through: 6h                # how long a terminal binding may be kept open (§5)
+deployment:                       # where a merge is confirmed live (BB-53); omit and nothing changes
+  source: github
+  repo: bitcomplete/bb-gate
+  environment: production
+  carries: "The pinned BB_PLUGINS_REF contains the merge commit."   # the steward's rule
+  timeout: 6h
 ```
 
 - **Phases are the entity's own states**, so the playbook needs no state
   machine. A ticket moved by hand is followed.
+- **`deployment` is where a merge is confirmed live (BB-53).** It names the
+  source (`github`), the target repo and environment, the rule the steward
+  applies to decide whether a deployment carries a merge, and the timeout. A
+  merged pull request is recorded as awaiting deployment, the github plugin
+  leases the repo as a `deployment_repo`, and a `deployment` doorbell wakes
+  the binding with the deployment and the rule. The plugin never evaluates the
+  rule: the steward reports the verdict, and the ticket closes with one
+  comment once every pull request is merged and deployed. A failure/error
+  deployment or a timeout wakes the steward with the run URL. No `deployment`
+  is exactly today's behaviour.
 - **Stages** — `spec`, `build`, `review` — are what the plugin acts on (the
   ready gate blocks `build`). State names are what a person sees.
 - **Validation.** Phases must be workflow states of every listed team, labels
@@ -1390,11 +1406,12 @@ own server behind bb-gate, so it is per developer in practice.
 - **One developer per project.** Nothing stops a teammate's server from
   stewarding the same ticket.
 - **`may` is not a wall.** See §11.
-- **Deploys are not observed.** "Merged" is the terminal state for pull
-  requests. A deploy event source (GitHub deployment or workflow-run events
-  through bb-gate-hooks, and the deploy in the snapshot) would be new work in
-  three repos. Until then, a playbook that wants a deploy watched has the
-  steward follow through (§5) while a worker watches and verifies it.
+- **Deploys are observed through the playbook's `deployment` target (BB-53).**
+  A merged pull request whose playbook names one is recorded as awaiting
+  deployment; a GitHub Deployment doorbell wakes the binding, and the steward
+  decides from the playbook's rule whether it carries the merge. A project
+  that names no target keeps "merged" as the terminal state and follows
+  through as before.
 - **One developer's server and machine watch production.** An ops binding
   runs on the server of the developer who runs the project's stewards, and
   looks with kubectl on their machine, as them, like everything else here

@@ -164,6 +164,22 @@ Two tools are yours; everything else you do with the tools every thread has.
   theirs to act on too: the plugin held the words until the owner named
   that request. There is no untrusted form any more: words from anyone
   else are answered by the plugin, never by you.
+- **Deployments (BB-53).** When the playbook names a `deployment` target, a
+  merged pull request is recorded as awaiting one, and a GitHub Deployment
+  doorbell for the target repo and environment wakes you with the deployment
+  (repo, environment, id, ref, sha, state, URL) and the playbook's `carries`
+  rule. Decide from that rule whether the deployment carries the merge and
+  report it with `steward_report { deployment: { state: "deployed" } }` when
+  it does, `"not-yet"` when it does not, or `"failed"` when it failed. Do not
+  start a worker to watch the deploy. A failure/error deployment, or no
+  matching deployment within the playbook's `timeout`, wakes you with the run
+  URL. Once every pull request is merged and deployed you are woken to post
+  one closing comment and move the ticket to its terminal state; report
+  without `followThrough` then. The wake's `merge <sha>` is the pull
+  request's head, and a squash or rebase merge rewrites it, so decide
+  ancestry from the deployment's own `ref`/`sha` and the repository rather
+  than the head sha alone. A playbook with no `deployment` has none of
+  this.
 - **Ending.** When the entity is detached you get one last turn, with your
   workers already stopped: say the work is done here. When it reaches a
   terminal state (Done, merged) you get a wrap-up turn with your workers
