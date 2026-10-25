@@ -331,6 +331,11 @@ function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "esc
   lines.push("  Report each item in steward_report's ready.checklist by its number: { item: 1, met: true, note }.");
   lines.push(`- Substantial: ${gate.substantial === null ? "not judged yet (treated as yes)" : gate.substantial ? "yes" : "no"}${binding.ready.why ? ` — ${binding.ready.why}` : ""}`);
   lines.push(`  Substantial when any of: ${playbook.ready!.substantial.join("; ") || "(none listed)"}`);
+  // BB-55: the stall the ticket names: a steward that has not judged
+  // substantiality waits for an approval it does not need. Saying the
+  // `substantial: false` report passes the gate at once is what makes it
+  // start the worker in that same turn.
+  if (gate.substantial === null && !gate.passed) lines.push("  If none apply, report `substantial: false`: the gate passes immediately on that report, so move the ticket to In Progress and start the worker in the same turn.");
   const approval = playbook.ready!.approval;
   const how = approval === "me" ? "the user" : approval === "project" ? "the project steward" : `the ticket reaching ${approval["linear-state"]}`;
   const request = input.escalations.find((x) => x.status === "open" && x.kind === "approval");

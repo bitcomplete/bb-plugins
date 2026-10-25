@@ -67,6 +67,14 @@ describe("a steward's wake", () => {
     expect(wake).toContain("not yours to choose");
   });
 
+  // BB-55: the Todo wake must say that an unjudged substantiality is settled
+  // by a `substantial: false` report, which passes the gate at once.
+  it("says an unjudged substantiality is passed by a substantial: false report in the same turn", () => {
+    const wake = formatWake(wakeInput());
+    expect(wake).toContain("- Substantial: not judged yet (treated as yes)");
+    expect(wake).toMatch(/report `substantial: false`.*the gate passes immediately on that report.*start the worker in the same turn/u);
+  });
+
   it("lists an open escalation and approval request as on the Stewards page, not to be asked again", () => {
     const { s, bind } = world();
     const binding = bind("ENG-12");

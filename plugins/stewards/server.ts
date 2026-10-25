@@ -138,6 +138,9 @@ export const DEFAULT_TIMING: Timing = {
   approvalLookbackMs: 24 * 60 * 60_000,
 };
 
+/** BB-55: the backstop wake when a report passes the ready gate and the turn ends with no worker started. */
+export const START_WORKER_WAKE = "The ready gate passed on your last turn and nothing holds you: start the worker.";
+
 export interface StewardsDeps {
   now: () => number;
   timing?: Partial<Timing>;
@@ -4733,6 +4736,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async execute(input, { threadId }) {
         try {
           let b = ownBinding(threadId);
+          // The gate as it stood before this report, so the reply can tell a
+          // report that just passed it from one that finds it already passed.
+          const priorReady = b.ready;
+          const priorSnapshot = b.lastSnapshot;
           const opsTickets = input.opsTickets ?? [];
           if (opsTickets.length > 0) {
             if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
@@ -4752,6 +4759,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
+          const priorGate = playbook !== null && playbook.ready !== null ? gateState(playbook, priorReady, priorSnapshot === null ? (priorReady.approval?.specHash ?? "") : specHashFor(b, priorSnapshot.entity)) : null;
           // Follow-through has one deadline from when it was first declared; a
           // requeue past it is a requeue at it.
           const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (input.followThrough === undefined ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
@@ -4921,8 +4929,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const escalated = raised === null ? "" : ` Escalation ${raised.id} is with ${raised.route === "parent" ? "your parent steward" : "the project steward"}; do what you said meanwhile.`;
           // Where the gate stands after this report, so a miss shows now and not at the next wake.
           let gateNote = "";
+          let gateJustPassed = false;
           if (input.ready !== undefined && playbook !== null && playbook.ready !== null) {
             const gate = gateState(playbook, ready, b.lastSnapshot === null ? "" : specHashFor(b, b.lastSnapshot.entity));
+            gateJustPassed = gate.passed && priorGate !== null && !priorGate.passed;
             const unmet = gate.unmet.map((item) => playbook.ready!.checklist.indexOf(item) + 1);
             const why = !gate.checklistMet ? `unmet: ${unmet.join(", ")}` : gate.approvalStale ? "the approval is stale" : "approval is needed";
             gateNote = gate.passed ? " Ready gate: passed." : ` Ready gate: not passed (${why}).`;
@@ -4941,12 +4951,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const schedule = store.openEscalations(b.id).find((x) => x.kind === "schedule");
           const askedAbout = store.binding(b.id)?.scheduleAsked ?? b.scheduleAsked;
           if (schedule !== undefined) gateNote += ` Scheduling is with the project steward (${schedule.id}): ${b.entityKey} touches what ${askedAbout.join(", ")} ${askedAbout.length === 1 ? "is" : "are"} already changing. Start no workers and do not move the ticket into a build state until it decides; wait for its guidance or hold.`;
+          // BB-55: the gate just passed and nothing else is deciding, so the
+          // turn must not end here. The backstop wake fires only when the
+          // ticket is still in its spec stage with no worker running: a hold
+          // or an open approval/schedule request means someone else decides,
+          // and no wake is due. The wake is scheduled at once (a loud note on
+          // the next reconcile), not left to the playbook's requeue.
+          b = store.binding(b.id) ?? b;
+          const nothingPending = request === undefined && specNeed === undefined && schedule === undefined && b.hold === null;
+          const startDue =
+            gateJustPassed &&
+            b.kind === "ticket" &&
+            b.endedAt === null &&
+            b.ending === null &&
+            b.stage === "spec" &&
+            !store.workers(b.id).some((w) => w.status === "running") &&
+            nothingPending;
+          if (startDue) {
+            store.note(b.id, START_WORKER_WAKE, false);
+            scheduleReconcile(b.id);
+          }
           if (b.ending === "terminal") {
             if (b.followThrough === null) return `Reported.${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
             return `Reported.${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const hidden = archiveWhenIdle && !needsUser(b) ? " Your thread is hidden when the turn ends, and comes back on that wake." : "";
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
+          if (gateJustPassed && nothingPending) {
+            return `Reported.${recorded}${refusalNote}${escalated} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+          }
           return `Reported.${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${hidden} End the turn now.`;
         } catch (error) {
           return toolError(error);

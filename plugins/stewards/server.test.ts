@@ -476,7 +476,7 @@ describe("a Linear ticket steward", () => {
     const partly = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3].map((item) => ({ item, met: true })), substantial: false } }, steward);
     expect(partly.text).toMatch(/Ready gate: not passed \(unmet: 4\)/u);
     const met = await t.tool("steward_report", { ...base, ready: { checklist: [1, 2, 3, "Out of scope is stated"].map((item) => ({ item, met: true, note: "in the spec" })), substantial: false } }, steward);
-    expect(met).toMatchObject({ error: false, text: expect.stringMatching(/Ready gate: passed\./u) });
+    expect(met).toMatchObject({ error: false, text: expect.stringMatching(/Ready gate: passed and nothing schedules you\./u) });
 
     // Moving to a build stage now is no conflict, and the wake says the gate passed.
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
@@ -487,6 +487,66 @@ describe("a Linear ticket steward", () => {
     expect(wake).toMatch(/- \[x\] 4\. Out of scope is stated/u);
     expect(wake).toMatch(/Gate: PASSED/u);
     expect(wake).toContain(`Your thread id is ${steward}.`);
+  });
+
+  // BB-55: the stall after a report passes the ready gate. The reply must send
+  // the steward to work in the same turn, and the mechanical tier wakes it
+  // again at once if it still ends without a worker, unless a hold or an
+  // approval/schedule request is deciding instead.
+  describe("BB-55: the ready-gate start-now reply and the backstop wake", () => {
+    const base = { phase: "Todo", summary: "Specified.", nextAction: "Move to In Progress", actor: "steward" };
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: false };
+    const backstop = "The ready gate passed on your last turn and nothing holds you: start the worker.";
+    const startWakes = (t: Awaited<ReturnType<typeof setup>>) => t.sends.filter((s) => s.text.includes(backstop));
+    const startReply = "Reported. Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.";
+
+    async function bound() {
+      const t = await setup();
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+      return { t, project, steward };
+    }
+
+    it("says start now on the report that passes the gate, and wakes it at once when the turn still ends with no worker", async () => {
+      const { t, steward } = await bound();
+      const reported = await t.tool("steward_report", { ...base, ready: met }, steward);
+      expect(reported.text).toBe(startReply);
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(1);
+    });
+
+    it("does not schedule the backstop wake when a hold is open", async () => {
+      const { t, project, steward } = await bound();
+      expect((await t.tool("steward_update", { binding: "ENG-12", hold: "Wait for the design" }, project)).error).toBe(false);
+      const reported = await t.tool("steward_report", { ...base, ready: met }, steward);
+      expect(reported.text).not.toContain("nothing schedules you");
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(0);
+    });
+
+    it("does not schedule the backstop wake when an approval request is open", async () => {
+      const { t, steward } = await bound();
+      const reported = await t.tool("steward_report", { ...base, ready: { ...met, substantial: true } }, steward);
+      expect(reported.text).not.toContain("nothing schedules you");
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(0);
+    });
+
+    it("does not schedule the backstop wake when a scheduling request is open", async () => {
+      const t = await setup();
+      t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+      t.entities.set("acme/web#7", pull());
+      t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Add SSO" }));
+      await t.ring("linear", "uuid-12");
+      await t.ring("linear", "uuid-13");
+      const [, first, second] = t.spawns.map((x) => x.id);
+      await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Open the PR", actor: "steward", touches: ["web/src/login"] }, first!);
+      const reported = await t.tool("steward_report", { ...base, ready: met, touches: ["web/src"] }, second!);
+      expect(reported.text).toMatch(/Scheduling is with the project steward/u);
+      await t.flush();
+      expect(startWakes(t)).toHaveLength(0);
+    });
   });
 
   // BB-7: flagged on every Todo → In Progress, approval seconds old, and on
@@ -1251,8 +1311,10 @@ describe("scheduling overlapping work", () => {
     const toProject = () => t.sends.filter((s) => s.threadId === project);
     // ENG-13 is ready while ENG-12 has not said what it touches: nothing to schedule against.
     const reported = await t.tool("steward_report", ready, second!);
-    expect(reported.text).toBe("Reported. Ready gate: passed. You will be woken when something actionable changes, or in 2d. End the turn now.");
+    expect(reported.text).toBe("Reported. Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.");
     expect(toProject()).toHaveLength(0);
+    // BB-55: the passing report brings the one backstop wake, and nothing else wakes ENG-13.
+    await t.flush();
     // ENG-12 reports its paths; ENG-13's next look (a label touch, nothing actionable) files the request and wakes nobody else.
     await t.tool("steward_report", { ...building, touches: ["web/src/login"] }, first!);
     const sentToSecond = t.sends.filter((s) => s.threadId === second).length;
@@ -1358,7 +1420,7 @@ describe("scheduling overlapping work", () => {
     t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { noMorePulls: true });
     expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toContain("no more pull requests");
     const finished = await t.tool("steward_report", ready, second);
-    expect(finished.text).toMatch(/Ready gate: passed\. You will be woken/u);
+    expect(finished.text).toMatch(/Ready gate: passed and nothing schedules you/u);
     expect(toProject()).toHaveLength(0);
     // The same merged PR, but no "no more coming": still at work, so it asks.
     t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { noMorePulls: null });
