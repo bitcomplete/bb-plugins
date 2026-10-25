@@ -283,7 +283,7 @@ describe("the sidebar-footer toggle (BB-45)", () => {
   });
 });
 
-// BB-46: the sidebar's count badge and "Needs you" block, fed by the
+// BB-46: the sidebar's "Needs you" block, fed by the
 // `stewardsSidebar` call and refreshed over the realtime channel.
 const sidebarProjects = [
   { id: "p1", name: "Acme", isPersonal: false, href: "/projects/p1", settingsHref: "/projects/p1/settings" },
@@ -340,22 +340,33 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
     } as never);
   };
 
-  it("shows the summed count badge beside the picker only when non-zero", async () => {
-    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }, { count: 0, items: [] }) });
+  it("does not render a summed count badge beside the picker", async () => {
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }) });
     await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
-    await waitFor(() => expect(slot.getByLabelText("2 waiting on you")).toBeTruthy());
-    expect(slot.queryByLabelText("0 waiting on you")).toBeNull();
+    await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
+    expect(slot.queryByLabelText("2 waiting on you")).toBeNull();
+    expect(slot.getByRole("option", { name: "Beta" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
-  it.each([false, true])("sums the count beside the picker and shows per-project counts in its options (compact=%s)", async (isCompactViewport) => {
+  it.each([false, true])("shows per-project counts in its options and no summed badge (compact=%s)", async (isCompactViewport) => {
     const slot = await renderSidebar(
       { stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem(), needItem()] }, { count: 1, items: [needItem({ id: "need_2" })] }) },
       { isCompactViewport },
     );
-    await waitFor(() => expect(slot.getByLabelText("3 waiting on you")).toBeTruthy());
-    expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy();
+    await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
     expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy();
+    expect(slot.queryByLabelText("3 waiting on you")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("sizes the picker and the New thread button as h-8 controls", async () => {
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }) });
+    const select = await waitFor(() => slot.getByLabelText("Project"));
+    expect(select.className).toContain("h-8");
+    const button = slot.getByRole("button", { name: "New thread" });
+    expect(button.className).toContain("size-8");
+    expect(button.className).toContain("shrink-0");
     slot.lifecycle.unmount();
   });
 
