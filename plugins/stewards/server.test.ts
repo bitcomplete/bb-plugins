@@ -1382,6 +1382,44 @@ describe("scheduling overlapping work", () => {
     expect(toProject()).toHaveLength(2);
     expect(toProject()[1]!.text).toMatch(/Schedule ENG-13/u);
   });
+
+  // BB-54: a hold behind a ticket whose steward reported noMorePulls lifts
+  // silently on the merge, without waiting for a terminal state, and the tool
+  // path records it.
+  it("lifts a hold silently when the steward reported noMorePulls and the pull requests merged", async () => {
+    const { t, project, first, second, toProject } = await two();
+    await t.tool("steward_report", ready, second);
+    await t.tool("steward_update", { binding: "ENG-13", hold: "After ENG-12", behind: ["ENG-12"] }, project);
+    await t.flush();
+    const reported = await t.tool("steward_report", { ...building, noMorePulls: true }, first);
+    expect(reported.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.noMorePulls).toBe(true);
+    expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toContain("no more pull requests");
+    const wakes = toProject().length;
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("ENG-13")!.hold).toBeNull();
+    // Silent: no project steward turn, but the note is on the digest record.
+    expect(toProject().length).toBe(wakes);
+    expect(t.hooks.store.project("p1").pendingNotes.join("\n")).toMatch(/Lifted the hold on ENG-13: ENG-12, which it waited behind, merged its pull requests, and its work is finished/u);
+  });
+
+  // BB-54 item 5: reporting more pull requests after "none coming" clears the
+  // report and re-runs the overlap check, through the tool.
+  it("re-files a schedule request when a steward reports more pull requests after saying none were coming", async () => {
+    const { t, project, second, toProject } = await two();
+    await t.tool("steward_report", ready, second);
+    const id = /(esc_[\w-]+) from ENG-13 \(schedule\)/u.exec(toProject()[0]!.text)![1]!;
+    await t.tool("steward_update", { binding: "ENG-13", guidance: "Start now: different files.", resolve: id }, project);
+    await t.flush();
+    expect(toProject()).toHaveLength(1);
+    await t.tool("steward_report", { ...ready, noMorePulls: true }, second);
+    expect(t.hooks.store.find("ENG-13")!.noMorePulls).toBe(true);
+    await t.tool("steward_report", { ...ready, noMorePulls: false }, second);
+    expect(t.hooks.store.find("ENG-13")!.noMorePulls).toBeNull();
+    expect(toProject()).toHaveLength(2);
+    expect(toProject()[1]!.text).toMatch(/Schedule ENG-13/u);
+  });
 });
 
 describe("declined specs converge (BB-54)", () => {

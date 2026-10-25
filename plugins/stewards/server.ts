@@ -926,22 +926,32 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /**
      * A binding's pull requests, re-read from GitHub rather than from its last
      * snapshot (BB-54): a schedule request must not ask about work that has
-     * already merged. When the read fails the snapshot is used, so the plugin
-     * still asks rather than silently skipping.
+     * already merged. `complete` is false when the entity or any linked pull
+     * request could not be read fresh, so the caller treats the binding as
+     * still at work: when the plugin cannot tell, it asks rather than skips.
      */
-    async function freshObserved(b: Binding): Promise<Observed | null> {
+    async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
       if (b.lastSnapshot === null) return null;
-      if (b.source === "ops") return b.lastSnapshot;
+      if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
       const entity = await snapshot(b.source, b.entityId).catch(() => null);
-      if (entity === null) return b.lastSnapshot;
-      return { entity, pulls: b.kind === "ticket" ? await linkedPulls(entity) : [] };
+      if (entity === null) return { observed: b.lastSnapshot, complete: false };
+      if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
+      const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
+      const pulls = await linkedPulls(entity);
+      return { observed: { entity, pulls }, complete: pulls.length >= keys.length };
     }
 
     /** Whether `b` is at work, judged from a fresh GitHub read and its running workers (BB-54). */
     async function atWorkFresh(b: Binding): Promise<boolean> {
       const running = store.workers(b.id).some((w) => w.status === "running");
-      const observed = await freshObserved(b);
-      return atWork(observed === null ? b : { ...b, lastSnapshot: observed }, { runningWorker: running });
+      const fresh = await freshObserved(b);
+      if (fresh === null) return atWork(b, { runningWorker: running });
+      // An incomplete read cannot prove the work is finished (a linked pull
+      // request may be open and unread), so drop a "no more coming" report for
+      // this judgement: the project steward is woken rather than a request
+      // skipped.
+      const base = { ...b, lastSnapshot: fresh.observed, ...(fresh.complete ? {} : { noMorePulls: null }) };
+      return atWork(base, { runningWorker: running });
     }
 
     /** The overlapping open bindings at work on `b`'s paths, from a fresh GitHub read (BB-54). */
@@ -2885,6 +2895,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await compactIfLarge(threadId, text.length);
       const sent = await send(threadId, text);
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
+      // The notes were only peeked at, so a failed or skipped send leaves them
+      // queued for the next digest rather than losing them.
+      else if (opts.digestDue) store.clearProjectNotes(projectId);
     }
 
     /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
@@ -2898,7 +2911,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return {
         previous: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
         since,
-        notes: store.takeProjectNotes(projectId),
+        notes: store.peekProjectNotes(projectId),
         moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
@@ -4834,7 +4847,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             deployments,
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
-            ...(input.noMorePulls === false && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
+            ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
             ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
@@ -5331,7 +5344,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           if (approval !== null) {
             const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
             store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);

@@ -1312,7 +1312,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       coalescing(() =>
         db.transaction(() => {
           const b = rowToBinding(getBinding.get(bindingId)!);
-          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
           needsYouChanged(projectIdForBinding(bindingId));
@@ -1807,13 +1807,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const row = toProject(getProject.get(projectId)!);
       db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run(JSON.stringify([...row.pendingNotes, text]), projectId);
     },
-    /** Read and clear the queued digest notes, so each appears in exactly one digest. */
-    takeProjectNotes(projectId: string): string[] {
+    /** The queued digest notes, without clearing them: a failed digest send must not lose them. */
+    peekProjectNotes(projectId: string): string[] {
       upsertProject.run(projectId);
-      const row = toProject(getProject.get(projectId)!);
-      if (row.pendingNotes.length === 0) return [];
+      return toProject(getProject.get(projectId)!).pendingNotes;
+    },
+    /** Drop the queued digest notes once the digest that carried them was sent. */
+    clearProjectNotes(projectId: string): void {
+      upsertProject.run(projectId);
       db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run("[]", projectId);
-      return row.pendingNotes;
     },
 
     // threads put in their project's section
