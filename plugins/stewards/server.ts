@@ -3685,13 +3685,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * out of the sidebar's organisation and unread attention while remaining
      * addressable; the binding stays, and the next wake brings it back
      * (deliverWake). Not while anything needs the user — an open escalation, a
-     * question, or a needs item — which they should still see. The finished
-     * workers and their reviewers are hidden with it, so a row without its
-     * steward is not left behind; a running worker is unaffected, and showing
-     * the steward again shows them (BB-47).
+     * question, or a needs item — which they should still see. Not while a
+     * worker of the binding is in flight either (running or finished): the
+     * sidebar's buildTab roots the effort at the steward thread, so hiding the
+     * steward while its worker runs drops the effort out of In flight and
+     * leaves a bare worker row under Threads. Once no worker is in flight,
+     * hiding cascades to the finished workers and their reviewers, so a row
+     * without its steward is not left behind (BB-47, BB-56).
      */
     async function hideWaiting(b: Binding): Promise<void> {
       store.patch(b.id, { archiveWhenIdle: false });
+      if (anyWorkerInFlight(store.workers(b.id))) return;
       if (b.threadId === null || b.endedAt !== null || b.ending !== null) return;
       if (needsUser(b)) return;
       const info = await threadInfo(b.threadId).catch(() => null);

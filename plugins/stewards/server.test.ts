@@ -2015,7 +2015,7 @@ describe("stewards waiting on others", () => {
     expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
-  it("leaves a steward visible when the user is next, hides it with a worker in flight, and keeps an open escalation visible", async () => {
+  it("leaves a steward visible when the user is next, and keeps it visible with a worker in flight", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -2025,17 +2025,59 @@ describe("stewards waiting on others", () => {
     await t.idle(steward);
     expect(t.threads.get(steward)!.visibility).toBe("visible");
 
-    // The worker-in-flight guard is gone: hiding does not cascade to the
-    // worker, so a steward waiting on someone else hides even while it runs.
+    // The sidebar roots the effort at the steward, so a steward waiting on
+    // someone else stays visible while a worker of its own is in flight —
+    // whether that worker is running or finished (BB-56). Nothing is hidden
+    // with it.
     await t.created("thr_w1", steward);
     await t.created("thr_w2", steward);
     await t.idle("thr_w1", "Done. Should I start the next one?");
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
+    expect(t.hooks.store.worker("thr_w2")!.status).toBe("running");
     expect(t.sends.at(-1)!.text).toMatch(/finished its turn/u);
     await t.tool("steward_report", { phase: "In Progress", summary: "Implementing.", nextAction: "Wait for the second worker", actor: "other" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+    expect(t.threads.get("thr_w1")!.visibility).toBe("visible");
+    expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
     expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
     expect(t.threads.get("thr_w2")!.archivedAt).toBeNull();
+    // No visibility update was made for the steward at all.
+    expect(t.harness.sdk.callsTo("threads.update").some(([a]) => (a as { threadId: string; visibility?: string }).threadId === steward && (a as { visibility?: string }).visibility === "hidden")).toBe(false);
+  });
+
+  it("hides a waiting steward once its last worker has stopped", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Implemented the fix.");
+    await t.harness.behavior.emitThreadEvent("thread.archived", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
+
+    // A stopped worker is not in flight, so the steward hides as before (BB-56).
+    await t.tool("steward_report", { phase: "In Progress", summary: "Implemented.", nextAction: "Wait", actor: "other" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+  });
+
+  it("hides a waiting steward after its worker failed", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Pushed the fix.");
+    await t.harness.behavior.emitThreadEvent("thread.failed", { thread: makeThreadResponse({ id: "thr_w1" }), error: "provider error" });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("failed");
+
+    // A failed worker is not in flight, so the steward hides as before (BB-56).
+    await t.tool("steward_report", { phase: "In Progress", summary: "Implemented.", nextAction: "Wait", actor: "other" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
   it("keeps a steward with an open escalation visible", async () => {
@@ -2077,7 +2119,7 @@ describe("stewards waiting on others", () => {
     expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
-  it("hides even while an idle worker's child is still running, and names the worker's question next wake (BB-11)", async () => {
+  it("keeps a waiting steward visible while its finished worker's child still runs, and names the worker's question next wake (BB-11, BB-56)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -2091,11 +2133,12 @@ describe("stewards waiting on others", () => {
     expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
     expect(t.threads.get("thr_r1")!.status).toBe("active");
 
-    // The steward reports that someone else is next and ends its turn: it is
-    // hidden, not archived, and hiding does not touch the worker or reviewer.
+    // The steward reports that someone else is next and ends its turn: it
+    // stays visible because its finished worker still roots the effort at it,
+    // and nothing is hidden or archived.
     expect((await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward)).error).toBe(false);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
     expect(t.harness.sdk.callsTo("threads.archive").map(([args]) => (args as { threadId: string }).threadId)).not.toContain(steward);
     expect(t.threads.get("thr_w1")!.archivedAt).toBeNull();
     expect(t.threads.get("thr_r1")!.archivedAt).toBeNull();
@@ -2250,7 +2293,7 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     expect(t.sends.find((s) => s.threadId === "thr_w1")!.text).toMatch(/The second one\./u);
   });
 
-  it("hides a waiting steward's finished workers and their reviewers with it, and shows them again", async () => {
+  it("shows a hidden steward's finished workers and their reviewers with it, and leaves a running worker's hidden reviewer hidden", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -2261,22 +2304,26 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     await t.created("thr_r1", "thr_w1", "Review round 1");
     // thr_w1 is finished (it asked a question, so it stays visible), its
     // reviewer is still running, thr_w2 runs, and thr_w3's reviewer is a
-    // build-tickets hidden spawn (a running worker's reviewer is not hidden
+    // build-tickets hidden spawn (a running worker's reviewer is not shown
     // by the cascade and must stay hidden when the steward comes back).
     await t.created("thr_r2", "thr_w3", "Review round 1");
     t.threads.get("thr_r2")!.visibility = "hidden";
     await t.idle("thr_w1", "Should I keep the reviewer open?");
-
     await t.tool("steward_report", { phase: "In Progress", summary: "Implemented.", nextAction: "Wait for the worker", actor: "other", blockedOn: "the worker" }, steward);
     await t.idle(steward);
-    expect(t.threads.get(steward)!.visibility).toBe("hidden");
-    expect(t.threads.get("thr_w1")!.visibility).toBe("hidden");
-    expect(t.threads.get("thr_r1")!.visibility).toBe("hidden");
-    // A running worker is unaffected, and neither is its hidden reviewer.
-    expect(t.threads.get("thr_w2")!.visibility).toBe("visible");
-    expect(t.threads.get("thr_r2")!.visibility).toBe("hidden");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
 
-    // A wake that needs the user brings the steward back, and them with it.
+    // The user hid the steward by hand, and the finished worker and reviewer
+    // went with it: the state the show cascade repairs (BB-47). A waiting
+    // steward is no longer hidden while a worker is in flight (BB-56), so
+    // this is the path that reaches the cascade.
+    t.threads.get(steward)!.visibility = "hidden";
+    t.threads.get("thr_w1")!.visibility = "hidden";
+    t.threads.get("thr_r1")!.visibility = "hidden";
+
+    // A wake that needs the user brings the steward back, and the finished
+    // worker and its reviewer with it; a running worker is unaffected, and
+    // its hidden reviewer stays hidden.
     const b = t.hooks.store.byThread(steward)!;
     t.hooks.store.patch(b.id, { status: { ...b.status!, actor: "me" } });
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
