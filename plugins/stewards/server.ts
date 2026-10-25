@@ -3690,8 +3690,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * sidebar's buildTab roots the effort at the steward thread, so hiding the
      * steward while its worker runs drops the effort out of In flight and
      * leaves a bare worker row under Threads. Once no worker is in flight,
-     * hiding cascades to the finished workers and their reviewers, so a row
-     * without its steward is not left behind (BB-47, BB-56).
+     * hiding cascades to any worker that finished in the meantime, so it is
+     * not left as a bare row without its steward (BB-47, BB-56).
      */
     async function hideWaiting(b: Binding): Promise<void> {
       store.patch(b.id, { archiveWhenIdle: false });
