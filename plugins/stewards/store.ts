@@ -356,7 +356,17 @@ export const DECLINED_PR_MIGRATIONS = [
 // binding with no deployment target keeps an empty map and behaves as before.
 export const DEPLOYMENT_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN deployments TEXT NOT NULL DEFAULT '{}'`];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS];
+// BB-54: a ticket steward's "no more pull requests are coming" report, the
+// objections of the last spec decline, and the silent hold-lift notes waiting
+// for the project steward's next digest. All additive and defaulted: an old
+// row reads as "not reported", no objections, no notes.
+export const FINISHED_AND_DIGEST_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN no_more_pulls INTEGER`,
+  `ALTER TABLE bindings ADD COLUMN declined_spec_objections TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE project_stewards ADD COLUMN pending_notes TEXT NOT NULL DEFAULT '[]'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -481,6 +491,10 @@ export type Binding = {
   declinedPrHeadSha: string | null;
   /** The reviewer marker in force when that head was declined, so a new round asks again. */
   declinedPrMarker: string | null;
+  /** True once the steward reported no more pull requests are coming; null until reported. Cleared by a new PR or a "more coming" report. */
+  noMorePulls: boolean | null;
+  /** The exact objections of the last spec decline, so the ticket steward's wake can list them as a checklist and a repeat forwards. */
+  declinedSpecObjections: string[];
   /** An ops binding's last look; null for every other kind. */
   opsLook: OpsLook | null;
   /** A Dependabot alert binding's last look; null for every other kind. */
@@ -545,6 +559,8 @@ function rowToBinding(r: BindingRow): Binding {
     manualDetach: Number(r.manual_detach) === 1,
     declinedPrHeadSha: str("declined_pr_head_sha"),
     declinedPrMarker: str("declined_pr_marker"),
+    noMorePulls: r.no_more_pulls === null || r.no_more_pulls === undefined ? null : Number(r.no_more_pulls) === 1,
+    declinedSpecObjections: json(z.array(z.string()), str("declined_spec_objections"), []),
     opsLook: json(opsLookSchema.nullable(), str("ops_look"), null),
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
@@ -595,6 +611,8 @@ const COLUMNS = {
   manualDetach: "manual_detach",
   declinedPrHeadSha: "declined_pr_head_sha",
   declinedPrMarker: "declined_pr_marker",
+  noMorePulls: "no_more_pulls",
+  declinedSpecObjections: "declined_spec_objections",
   opsLook: "ops_look",
   depsLook: "deps_look",
   sentryLook: "sentry_look",
@@ -808,7 +826,7 @@ export type Fingerprint = FingerprintRow & { projectId: string; bindingId: strin
 /** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
 export type TicketAction = "filed" | "commented" | "reopened";
 
-export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null };
+export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null; pendingNotes: string[] };
 
 /** Guidance repeated within this window is a retry, not new guidance. */
 export const GUIDANCE_DEDUPE_MS = 5 * 60_000;
@@ -1066,6 +1084,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     digestPending: Number(r.digest_pending) === 1,
     title: r.title === null || r.title === undefined ? null : String(r.title),
     sectionId: r.section_id === null || r.section_id === undefined ? null : String(r.section_id),
+    pendingNotes: json(z.array(z.string()), r.pending_notes === null || r.pending_notes === undefined ? null : String(r.pending_notes), []),
   });
   const toLesson = (r: Record<string, unknown>): Lesson => ({
     id: String(r.id),
@@ -1293,7 +1312,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       coalescing(() =>
         db.transaction(() => {
           const b = rowToBinding(getBinding.get(bindingId)!);
-          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null } });
+          patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
           needsYouChanged(projectIdForBinding(bindingId));
@@ -1774,13 +1793,29 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     patchProject(projectId: string, fields: Partial<Omit<ProjectStewardRow, "projectId">>): ProjectStewardRow {
       upsertProject.run(projectId);
-      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending", title: "title", sectionId: "section_id" };
+      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending", title: "title", sectionId: "section_id", pendingNotes: "pending_notes" };
       const entries = Object.entries(fields).filter(([, v]) => v !== undefined);
       if (entries.length > 0) db.prepare(`UPDATE project_stewards SET ${entries.map(([k]) => `${map[k]} = ?`).join(", ")} WHERE project_id = ?`).run(...entries.map(([, v]) => toColumn(v)), projectId);
       return toProject(getProject.get(projectId)!);
     },
     projects(): ProjectStewardRow[] {
       return db.prepare<[], Record<string, unknown>>("SELECT * FROM project_stewards").all().map(toProject);
+    },
+    /** Queue a silent note for the project steward's next digest; it starts no turn. */
+    noteProject(projectId: string, text: string): void {
+      upsertProject.run(projectId);
+      const row = toProject(getProject.get(projectId)!);
+      db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run(JSON.stringify([...row.pendingNotes, text]), projectId);
+    },
+    /** The queued digest notes, without clearing them: a failed digest send must not lose them. */
+    peekProjectNotes(projectId: string): string[] {
+      upsertProject.run(projectId);
+      return toProject(getProject.get(projectId)!).pendingNotes;
+    },
+    /** Drop the queued digest notes once the digest that carried them was sent. */
+    clearProjectNotes(projectId: string): void {
+      upsertProject.run(projectId);
+      db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run("[]", projectId);
     },
 
     // threads put in their project's section

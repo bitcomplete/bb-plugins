@@ -251,6 +251,12 @@ export const projectFileSchema = z
      */
     bigDecisions: z.array(decideEntrySchema).max(60).default(() => defaultDecideList()),
     /**
+     * The limits that already bind every pull request in this project, shown
+     * in an approval wake so the project steward adds only what they do not
+     * cover. Short rule lines; the plugin hard-codes none.
+     */
+    standingRules: z.array(z.string().trim().min(1).max(400)).max(40).default([]),
+    /**
      * Production to watch: one ops binding per target, which files a Linear
      * ticket for each problem it finds and escalates it to the project
      * steward. `team` is where tickets are filed (the first of linear.teams

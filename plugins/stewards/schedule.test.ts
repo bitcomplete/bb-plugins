@@ -40,19 +40,23 @@ describe("conflicts", () => {
     const held = s.patch(bind("ENG-13", { touches: ["web/src"] }).id, { hold: "Later." });
     bind("ENG-14", { stage: "spec", touches: ["web/src"] });
     bind("ENG-15", { touches: ["api"] });
-    const landed = s.patch(bind("ENG-16", { touches: ["web/src"] }).id, { lastSnapshot: { entity: issue({ linkedPulls: [{ key: "acme/web#7", url: "u" }] }), pulls: [pull({ state: "merged" }, { merged: true })] } });
+    const landed = s.patch(bind("ENG-16", { touches: ["web/src"] }).id, { noMorePulls: true, lastSnapshot: { entity: issue({ linkedPulls: [{ key: "acme/web#7", url: "u" }] }), pulls: [pull({ state: "merged" }, { merged: true })] } });
+    // Merged but not reported finished: a next pull request may still come, so it is still at work (BB-54).
+    const landedNoReport = s.patch(bind("ENG-21", { touches: ["web/src"] }).id, { lastSnapshot: { entity: issue({ linkedPulls: [{ key: "acme/web#8", url: "u" }] }), pulls: [pull({ state: "merged" }, { merged: true })] } });
     const child = bind("ENG-17", { touches: ["web/src"], parent: me.id });
     bind("ENG-18", { touches: ["web/src"], project: "p2" });
     const ended = s.patch(bind("ENG-19", { touches: ["web/src"] }).id, { endedAt: T, endReason: "terminal" });
     expect(atWork(held)).toBe(false);
     expect(atWork(landed)).toBe(false);
+    expect(atWork(landedNoReport)).toBe(true);
     expect(atWork(ended)).toBe(false);
     expect(atWork(child)).toBe(true);
     expect(conflictsOf(me, s.open()).map((c) => [c.with.entityKey, c.on])).toEqual([
       ["ENG-11", ["web/src/login"]],
       ["ENG-12", ["web/src/signup"]],
+      ["ENG-21", ["web/src"]],
     ]);
-    expect(conflictsOf(building, s.open()).map((c) => c.with.entityKey)).toEqual(["ENG-17"]);
+    expect(conflictsOf(building, s.open()).map((c) => c.with.entityKey)).toEqual(["ENG-21", "ENG-17"]);
     expect(conflictsOf(s.patch(me.id, { touches: [] }), s.open())).toEqual([]);
   });
 

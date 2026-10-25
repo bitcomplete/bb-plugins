@@ -73,7 +73,7 @@ import {
 import { allDeployed, applyDeployment, deploymentLines, deploymentReportSchema, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
-import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
+import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
@@ -480,6 +480,21 @@ type ProjectConfig = {
 };
 
 const PRIORITY_ORDER: Record<string, number> = { urgent: 0, high: 1, normal: 2, low: 3 };
+
+/**
+ * A spec decline's objections, one per line or `;`, with list markers
+ * stripped. A single line with no break is one objection (BB-54).
+ */
+function objectionLines(text: string): string[] {
+  const lines = text
+    .split(/\r?\n|;\s+/u)
+    .map((l) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s*/u, "").trim())
+    .filter((l) => l !== "");
+  return lines;
+}
+
+/** An objection compared for "the same objection": case and punctuation ignored. */
+const normObjection = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/gu, " ").trim();
 
 /** Authors whose pull requests the dependency watch adopts under deps-prs. */
 export const DEPENDENCY_BOTS = new Set(["dependabot", "dependabot[bot]"]);
@@ -906,6 +921,46 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       return pulls;
+    }
+
+    /**
+     * A binding's pull requests, re-read from GitHub rather than from its last
+     * snapshot (BB-54): a schedule request must not ask about work that has
+     * already merged. `complete` is false when the entity or any linked pull
+     * request could not be read fresh, so the caller treats the binding as
+     * still at work: when the plugin cannot tell, it asks rather than skips.
+     */
+    async function freshObserved(b: Binding): Promise<{ observed: Observed; complete: boolean } | null> {
+      if (b.lastSnapshot === null) return null;
+      if (b.source === "ops") return { observed: b.lastSnapshot, complete: true };
+      const entity = await snapshot(b.source, b.entityId).catch(() => null);
+      if (entity === null) return { observed: b.lastSnapshot, complete: false };
+      if (b.kind !== "ticket") return { observed: { entity, pulls: [] }, complete: true };
+      const keys = [...new Set(entity.linkedPulls.map((l) => l.key).filter((k): k is string => k !== null))].slice(0, 5);
+      const pulls = await linkedPulls(entity);
+      return { observed: { entity, pulls }, complete: pulls.length >= keys.length };
+    }
+
+    /** Whether `b` is at work, judged from a fresh GitHub read and its running workers (BB-54). */
+    async function atWorkFresh(b: Binding): Promise<boolean> {
+      const running = store.workers(b.id).some((w) => w.status === "running");
+      const fresh = await freshObserved(b);
+      if (fresh === null) return atWork(b, { runningWorker: running });
+      // An incomplete read cannot prove the work is finished (a linked pull
+      // request may be open and unread), so drop a "no more coming" report for
+      // this judgement: the project steward is woken rather than a request
+      // skipped.
+      const base = { ...b, lastSnapshot: fresh.observed, ...(fresh.complete ? {} : { noMorePulls: null }) };
+      return atWork(base, { runningWorker: running });
+    }
+
+    /** The overlapping open bindings at work on `b`'s paths, from a fresh GitHub read (BB-54). */
+    async function conflictsFresh(b: Binding): Promise<Conflict[]> {
+      const conflicts: Conflict[] = [];
+      for (const c of overlapping(b, store.open(b.projectId))) {
+        if (await atWorkFresh(c.with)) conflicts.push(c);
+      }
+      return conflicts;
     }
 
     /**
@@ -1853,6 +1908,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
 
       b = store.patch(b.id, { lastSnapshot: observed, phase, stage, title: entity.title, url: entity.url, entityKey: entity.key, playbookVersion: playbook.version, ready });
+      // BB-54 item 4: a ticket that links a new pull request re-runs the
+      // overlap check, even past its ready gate, and a new pull request clears
+      // a "no more coming" report. The report path clears it too, when a
+      // steward reports more are coming.
+      const linkedBefore = new Set((prev?.entity.linkedPulls ?? []).map((l) => lc(l.key ?? l.url ?? "")));
+      const linkedNew = observed.entity.linkedPulls.some((l) => {
+        const k = lc(l.key ?? l.url ?? "");
+        return k !== "" && !linkedBefore.has(k);
+      });
+      if (linkedNew) {
+        const clear: { noMorePulls?: null; scheduleAsked?: string[] } = {};
+        if (b.noMorePulls === true) clear.noMorePulls = null;
+        if (b.scheduleAsked.length > 0) clear.scheduleAsked = [];
+        if (Object.keys(clear).length > 0) b = store.patch(b.id, clear);
+      }
       await syncNeeds(b, observed, playbook, workerInFlight);
       // The work this binding was holding others behind has landed: lift them.
       if (allPullsMerged(b, observed) && (prev === null || !allPullsMerged(b, prev))) await releaseBehind(b, "merged its pull requests");
@@ -2818,13 +2888,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, questions, needs, lessons: store.lessons(projectId), timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, lessons: store.lessons(projectId), timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
       await compactIfLarge(threadId, text.length);
       const sent = await send(threadId, text);
       if (sent !== "sent") store.undeliver(delivered.ids, delivered.at);
+      // The notes were only peeked at, so a failed or skipped send leaves them
+      // queued for the next digest rather than losing them.
+      else if (opts.digestDue) store.clearProjectNotes(projectId);
     }
 
     /** What the digest is written from, since the last one (or a day back): read from the tables, never from the project steward's memory. */
@@ -2838,6 +2911,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return {
         previous: row.digest === null ? null : { text: row.digest, at: row.digestAt ?? 0 },
         since,
+        notes: store.peekProjectNotes(projectId),
         moved: open.filter((b) => b.advancedAt !== null && b.advancedAt >= since),
         ended: all.filter((b) => b.endedAt !== null && b.endedAt >= since),
         answered: store.answeredSince(projectId, since),
@@ -3068,8 +3142,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b.hold !== null) return withdraw("Held.", false);
       const gate = gateState(playbook, b.ready, specHashFor(b, b.lastSnapshot.entity));
       if (!gate.passed) return withdraw("Withdrawn: the ready gate no longer passes.", false);
+      // Finished work is not scheduled against anything: there is nothing left to start.
+      if (b.lastSnapshot !== null && finished(b, b.lastSnapshot)) return withdraw("Withdrawn: the work is finished.", false);
       if (b.stage === "review" || store.workers(b.id).some((w) => w.status === "running")) return withdraw("Withdrawn: the work has started.", true);
-      const conflicts = conflictsOf(b, store.open(b.projectId));
+      const conflicts = await conflictsFresh(b);
       if (conflicts.length === 0) return withdraw("Withdrawn: nothing in flight overlaps it now.", true);
       const keys = conflicts.map((c) => c.with.entityKey);
       if (open.length > 0) {
@@ -3108,7 +3184,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const key = lc(b.entityKey);
       const waiting = store.open(b.projectId).filter((h) => h.id !== b.id && h.holdBehind.some((k) => lc(k) === key));
       if (waiting.length === 0) return;
-      const lifted: string[] = [];
+      const fullyLifted: Binding[] = [];
       for (const h of waiting) {
         const rest = h.holdBehind.filter((k) => lc(k) !== key);
         if (rest.length > 0) {
@@ -3116,13 +3192,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           store.note(h.id, `${b.entityKey} ${how}; your hold stays until ${rest.join(", ")} ${rest.length === 1 ? "does" : "do"} too.`, true);
           continue;
         }
+        fullyLifted.push(h);
+      }
+      // One lift can free several waiters that overlap each other. Release the
+      // first by priority, then age; re-hold the rest behind it, so two
+      // branches do not start into the same files in one tick (BB-54).
+      const order = [...fullyLifted].sort((x, y) => (PRIORITY_ORDER[x.priority ?? "normal"] ?? 2) - (PRIORITY_ORDER[y.priority ?? "normal"] ?? 2) || x.createdAt - y.createdAt);
+      const released: Binding[] = [];
+      const reheld: string[] = [];
+      for (const h of order) {
+        const blocker = released.find((r) => touchesOverlap(r.touches, h.touches).length > 0);
+        if (blocker !== undefined) {
+          store.patch(h.id, { holdBehind: [blocker.entityKey] });
+          store.note(h.id, `Hold lifted from ${b.entityKey}, but it overlaps ${blocker.entityKey}, which is starting first: the hold now waits behind ${blocker.entityKey} and lifts itself when that work lands.`);
+          reheld.push(h.entityKey);
+          continue;
+        }
         store.patch(h.id, { hold: null, holdBehind: [] });
         store.note(h.id, `Hold lifted: ${b.entityKey}, which it waited behind, ${how}. Rebase anything already branched before building on.`);
-        lifted.push(h.entityKey);
+        released.push(h);
         scheduleReconcile(h.id);
       }
-      bb.log.info(`stewards: ${b.entityKey} ${how}; ${lifted.length === 0 ? "nothing lifted" : `lifted the hold on ${lifted.join(", ")}`}`);
-      if (lifted.length > 0) await wakeProject(b.projectId, `${b.entityKey} ${how}`, { digestDue: false, notes: [`Lifted the hold on ${lifted.join(", ")}: ${b.entityKey}, which ${lifted.length === 1 ? "it" : "they"} waited behind, ${how}. Each is woken; one that still overlaps other work asks you to schedule it again.`] });
+      const lifted = released.map((h) => h.entityKey);
+      bb.log.info(`stewards: ${b.entityKey} ${how}; ${lifted.length === 0 ? "nothing lifted" : `lifted the hold on ${lifted.join(", ")}`}${reheld.length === 0 ? "" : `; re-held ${reheld.join(", ")}`}`);
+      if (lifted.length === 0) return;
+      // Silent only when the work waited on is finished (its ticket is
+      // terminal with its PRs merged, or every linked PR merged and its
+      // steward reported no more coming). Anything else wakes the project
+      // steward, as today: the plugin cannot tell, so it asks.
+      if (b.lastSnapshot !== null && finished(b, b.lastSnapshot)) {
+        store.noteProject(
+          b.projectId,
+          `Lifted the hold on ${lifted.join(", ")}: ${b.entityKey}, which ${lifted.length === 1 ? "it" : "they"} waited behind, ${how}, and its work is finished. No turn needed; this is the record.`,
+        );
+        return;
+      }
+      await wakeProject(b.projectId, `${b.entityKey} ${how}`, { digestDue: false, notes: [`Lifted the hold on ${lifted.join(", ")}: ${b.entityKey}, which ${lifted.length === 1 ? "it" : "they"} waited behind, ${how}. Each is woken; one that still overlaps other work asks you to schedule it again.`] });
     }
 
     const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
@@ -4567,6 +4672,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .max(40)
           .optional()
           .describe('The repo-relative paths this work changes, repo directory first ("bb-plugins/plugins/stewards", "bb-gate/docker/bb-server"); the whole set, replacing what was reported before. The project steward schedules tickets that touch the same paths one after another. Report it once the spec names the affected repos; refine it as pull requests open.'),
+        noMorePulls: z
+          .boolean()
+          .optional()
+          .describe('Ticket stewards: true once no more pull requests are coming for this ticket, so its work is finished when its linked pull requests have merged and its hold can lift silently. Set it again as more pull requests open: reporting false (more are coming), or a new linked pull request, clears it.'),
         needs: z
           .array(
             z.object({
@@ -4737,6 +4846,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ready,
             deployments,
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
+            ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
+            ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
             ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
@@ -5233,7 +5344,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           if (approval !== null) {
             const by = approval.byUser ? ` by the user: "${input.quote}"` : " by the project steward";
-            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null } });
+            store.patch(target.id, { ready: { ...target.ready, approval: { at: now(), specHash: specHashFor(target, approval.entity), by: threadId }, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
             store.closeNeeds(target.id, "approve-spec", "Approved.");
             for (const x of store.openEscalations(target.id).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) store.resolve(x.id, `Approved${by}.`);
             const others = store.openEscalations(target.id).filter((x) => x.id !== resolve);
@@ -5261,7 +5372,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               done.push(`remembered the decline of ${shortSha(resolving.headSha)} so the same head and reviewer marker are not asked again`);
             } else if (resolving.kind === "approval" && resolving.status === "open" && approval === null && target.lastSnapshot !== null) {
               const fresh = store.binding(target.id)!;
-              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) } });
+              const objections = objectionLines(guidance ?? "");
+              const previous = fresh.declinedSpecObjections;
+              const repeated = previous.length > 0 && objections.some((o) => previous.some((p) => normObjection(p) === normObjection(o)));
+              store.patch(target.id, { ready: { ...fresh.ready, declinedSpecHash: specHashFor(fresh, fresh.lastSnapshot!.entity) }, declinedSpecObjections: objections });
+              if (repeated) {
+                // The same objection came back after a revision: a third round
+                // would only repeat it, so the user decides (BB-54).
+                const q = store.ask({
+                  projectId: target.projectId,
+                  bindingId: target.id,
+                  escalationId: resolving.id,
+                  question: `The project steward declined ${target.entityKey}'s spec twice on the same objection: ${objections.join("; ")}. Decide how to proceed.`,
+                  context: `First declined on: ${previous.join("; ")}. The revision did not answer it, so it is forwarded to you instead of a third round.`,
+                  resolutionKind: "text",
+                });
+                done.push(`forwarded the repeated objection to the user as question ${q.id}`);
+              } else if (objections.length > 0) {
+                done.push(`recorded the decline's ${objections.length} objection(s) for the steward's checklist`);
+              }
             }
             if (resolving.status === "open") done.push(`resolved ${resolving.id}${isProjectSteward(threadId, target) ? "; if this is a general judgement the playbook should carry, record it with steward_update { lesson: { text, file, scope } }" : ""}`);
             else if (outcome === "appended") done.push(`recorded the answer on ${resolving.id}, which was already resolved (${resolving.resolution ?? "no answer"})`);
@@ -5371,7 +5500,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   ? `cannot read the target: ${sentry.error}`
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
-          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
+          const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
           return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
