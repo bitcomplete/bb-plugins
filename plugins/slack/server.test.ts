@@ -10,6 +10,7 @@ type ChannelSearchResult = {
   state: "ok" | "signin-required" | "unavailable";
   channels: Array<{ id: string; name: string; private: boolean; extShared: boolean }>;
   botChannels: string[] | null;
+  truncated: boolean;
   message?: string;
 };
 
@@ -447,9 +448,21 @@ describe("Slack plugin", () => {
     ]);
     expect(slack.requests.map((r) => r.cursor)).toEqual([null, "1"]);
     expect(slack.requests[0]!.token).toBe("xoxp-user-1");
+    expect(result.truncated).toBe(false);
     // The bot's membership list rides along, so the picker can flag an invite.
     expect(result.botChannels).toEqual(["C0123", "G0456"]);
     expect(s.hooks.botChannelRequests()).toBe(1);
+    await s.stop();
+  });
+
+  it("flags a channel list cut short by the page cap", async () => {
+    const pages = Array.from({ length: 21 }, (_, i) => [{ id: `C${String(i).padStart(3, "0")}`, name: `chan-${i}` }]);
+    const s = await live({ slack: fakeSlack({ pages }), token: "xoxp-user-1" });
+    const result = (await s.harness.callRpc("searchChannels", { query: "" })) as ChannelSearchResult;
+    expect(result.state).toBe("ok");
+    expect(result.truncated).toBe(true);
+    expect(result.channels).toHaveLength(20);
+    expect(s.slack.requests).toHaveLength(20);
     await s.stop();
   });
 

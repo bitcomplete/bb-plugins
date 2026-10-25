@@ -15,7 +15,7 @@ import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
 import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type SessionEvent } from "./hooks-client.js";
-import { createSlackChannels, SlackTokenError, type SlackChannel } from "./slack-channels.js";
+import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
 import {
   channelEntrySchema,
   chooseConversationProject,
@@ -145,6 +145,8 @@ export const rpcContract = defineRpcContract({
       channels: z.array(channelOptionSchema),
       /** The ids the app's bot is in, or null when that list is unavailable. */
       botChannels: z.array(z.string()).nullable(),
+      /** True when Slack has more channels than the page cap allowed. */
+      truncated: z.boolean(),
       message: z.string().optional(),
     }),
   },
@@ -757,15 +759,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     async function channelSearch(query: string) {
       const cfg = await settings.get();
       const token = (cfg.token ?? "").trim();
-      if (token === "") return { state: "signin-required" as const, channels: [], botChannels: null };
-      let channels: SlackChannel[];
+      if (token === "") return { state: "signin-required" as const, channels: [], botChannels: null, truncated: false };
+      let list: SlackChannelList;
       try {
-        channels = await slackChannels.list(token);
+        list = await slackChannels.list(token);
       } catch (error) {
-        if (error instanceof SlackTokenError) return { state: "signin-required" as const, channels: [], botChannels: null };
+        if (error instanceof SlackTokenError) return { state: "signin-required" as const, channels: [], botChannels: null, truncated: false };
         const message = errorMessage(error);
         bb.log.warn(`Slack channel search failed: ${message}`);
-        return { state: "unavailable" as const, channels: [], botChannels: null, message };
+        return { state: "unavailable" as const, channels: [], botChannels: null, truncated: false, message };
       }
       let botChannels: string[] | null = null;
       if (hooksUrl !== "") {
@@ -776,8 +778,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         }
       }
       const wanted = query.trim().toLowerCase();
-      const filtered = wanted === "" ? channels : channels.filter((c) => c.name.toLowerCase().includes(wanted) || c.id.toLowerCase().includes(wanted));
-      return { state: "ok" as const, channels: filtered, botChannels };
+      const filtered = wanted === "" ? list.channels : list.channels.filter((c) => c.name.toLowerCase().includes(wanted) || c.id.toLowerCase().includes(wanted));
+      return { state: "ok" as const, channels: filtered, botChannels, truncated: list.truncated };
     }
 
     async function prunePending(): Promise<void> {

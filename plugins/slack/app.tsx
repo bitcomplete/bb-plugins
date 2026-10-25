@@ -32,6 +32,7 @@ interface ChannelSearch {
   state: "ok" | "signin-required" | "unavailable";
   channels: ChannelOption[];
   botChannels: string[] | null;
+  truncated: boolean;
   message?: string;
 }
 
@@ -151,10 +152,12 @@ function ChannelPicker({
   };
 
   const wanted = query.trim().toLowerCase();
-  const matches = useMemo(
-    () => (wanted === "" ? options : options.filter((c) => c.name.toLowerCase().includes(wanted) || c.id.toLowerCase().includes(wanted))).slice(0, 50),
+  const allMatches = useMemo(
+    () => (wanted === "" ? options : options.filter((c) => c.name.toLowerCase().includes(wanted) || c.id.toLowerCase().includes(wanted))),
     [options, wanted],
   );
+  const matches = allMatches.slice(0, 50);
+  const capped = allMatches.length > matches.length;
   const rawId = isChannelId(query) && !options.some((c) => c.id === query.trim()) ? query.trim() : null;
 
   if (!canSearch) {
@@ -218,6 +221,7 @@ function ChannelPicker({
             {rawId !== null ? (
               <PickerRow label={`Use id ${rawId}`} meta="not in the list" selected={value.trim() === rawId} onClick={() => { onChange(rawId); close(); }} />
             ) : null}
+            {capped ? <p className="px-2 py-1 text-xs text-muted-foreground">Refine your search to see more.</p> : null}
             {matches.length === 0 && wanted !== "" && rawId === null ? <p className="px-2 py-1 text-muted-foreground">No matching channels.</p> : null}
           </div>
         </div>
@@ -264,6 +268,9 @@ function ChannelMapEditor({
               : "Sign in with Slack to search channels; paste a channel id instead."
             : `Could not search channels right now${search.message !== undefined ? ` (${search.message})` : ""}; paste a channel id instead.`}
         </p>
+      ) : null}
+      {search !== null && search.state === "ok" && search.truncated ? (
+        <p className="text-muted-foreground">Slack has more channels than could be listed here; some may be missing from the search.</p>
       ) : null}
       {rows.length === 0 ? <p className="text-muted-foreground">No channel entries yet.</p> : null}
       {rows.map((row, index) => {

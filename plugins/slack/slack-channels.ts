@@ -57,6 +57,12 @@ export interface SlackChannel {
   extShared: boolean;
 }
 
+/** A page of the developer's channels, and whether the page cap cut it short. */
+export interface SlackChannelList {
+  channels: SlackChannel[];
+  truncated: boolean;
+}
+
 /** How long a channel list is reused before Slack is called again. */
 export const CHANNELS_CACHE_TTL_MS = 5 * 60 * 1000;
 /** Slack's largest page. */
@@ -88,7 +94,7 @@ export interface SlackChannelsDeps {
 
 export interface SlackChannels {
   /** The channels the token can see, cached in memory for a few minutes. */
-  list(token: string): Promise<SlackChannel[]>;
+  list(token: string): Promise<SlackChannelList>;
 }
 
 /**
@@ -97,23 +103,25 @@ export interface SlackChannels {
  * {@link SlackTokenError} or {@link SlackUnavailableError}.
  */
 export function createSlackChannels(deps: SlackChannelsDeps): SlackChannels {
-  let cache: { token: string; at: number; channels: SlackChannel[] } | null = null;
+  let cache: { token: string; at: number; list: SlackChannelList } | null = null;
   return {
-    async list(token: string): Promise<SlackChannel[]> {
-      if (cache !== null && cache.token === token && deps.now() - cache.at < CHANNELS_CACHE_TTL_MS) return cache.channels;
-      const channels = await fetchChannels(deps, token);
-      cache = { token, at: deps.now(), channels };
-      return channels;
+    async list(token: string): Promise<SlackChannelList> {
+      if (cache !== null && cache.token === token && deps.now() - cache.at < CHANNELS_CACHE_TTL_MS) return cache.list;
+      const list = await fetchChannels(deps, token);
+      cache = { token, at: deps.now(), list };
+      return list;
     },
   };
 }
 
-async function fetchChannels(deps: SlackChannelsDeps, token: string): Promise<SlackChannel[]> {
+async function fetchChannels(deps: SlackChannelsDeps, token: string): Promise<SlackChannelList> {
   const out: SlackChannel[] = [];
+  let truncated = false;
   let cursor = "";
   for (let page = 0; ; page += 1) {
     if (page >= CHANNEL_PAGE_CAP) {
       deps.log.warn("slack conversations.list: page cap reached");
+      truncated = true;
       break;
     }
     const params = new URLSearchParams({
@@ -145,5 +153,5 @@ async function fetchChannels(deps: SlackChannelsDeps, token: string): Promise<Sl
     cursor = parsed.data.response_metadata?.next_cursor ?? "";
     if (cursor === "") break;
   }
-  return out;
+  return { channels: out, truncated };
 }
