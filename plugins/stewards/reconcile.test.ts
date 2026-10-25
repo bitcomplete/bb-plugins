@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { parsePlaybook } from "./config.js";
+import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -63,7 +63,7 @@ describe("what changed", () => {
   it("while a worker runs, its own work on a pull request is not news, and people still are", () => {
     // HUB-183 on bithub: the worker pushes, edits the description, posts as
     // the viewer (unsigned, and its reviewer too) and waits for checks.
-    const running = { ...ctx, workerInFlight: true };
+    const running = { ...ctx, workerInFlight: true, ownPulls: new Set(["acme/web#7"]) };
     const before = { entity: issue(), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
     const busy = {
       entity: issue(),
@@ -107,6 +107,51 @@ describe("what changed", () => {
   });
 });
 
+describe("the worker's own pull requests and state moves (BB-52)", () => {
+  const stageOf = (state: string) => phaseOf(tickets, state)?.stage ?? null;
+  const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+  const running = { ...ctx, workerInFlight: true, stageOf };
+  const ownPulls = new Set(["acme/web#7"]);
+
+  it("quiets the worker's own pull request activity, and treats an unknown pull request as foreign", () => {
+    const before = { entity: issue({ ...linked }), pulls: [pull({ author: "jane" }, { headAuthor: "jane" })] };
+    const busy = { entity: issue({ ...linked }), pulls: [pull({ author: "jane", comments: [comment({ id: "r1", author: "jane" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } })] };
+    expect(actionable(diffObserved(before, busy, { ...running, ownPulls }))).toEqual([]);
+    // Ownership the plugin cannot establish is foreign: the same activity wakes.
+    expect(actionable(diffObserved(before, busy, { ...running, ownPulls: new Set() }))).toEqual(["acme/web#7: Checks finished: success", "acme/web#7: 1 new comment from jane"]);
+  });
+
+  it("wakes for a foreign pull request linked while a worker is in flight, and keeps its activity actionable", () => {
+    const before = { entity: issue({ state: "In Progress", stateType: "started" }), pulls: [] };
+    const after = { entity: issue({ state: "In Progress", stateType: "started", ...linked }), pulls: [pull({ author: "sam" }, { headAuthor: "sam" })] };
+    const foreign = actionable(diffObserved(before, after, { ...running, ownPulls: new Set() }));
+    expect(foreign).toContain("Pull request linked (not this ticket's worker): acme/web#7");
+    expect(foreign).toContain("acme/web#7: now followed (open)");
+    // The worker's own link is a quiet note, as the BB-17 quieting always was.
+    expect(actionable(diffObserved(before, after, { ...running, ownPulls }))).toEqual([]);
+  });
+
+  it("quiets a build/review state move while a worker is in flight, and wakes for any other", () => {
+    const before = { entity: issue({ state: "In Progress", stateType: "started" }), pulls: [] };
+    const review = { entity: issue({ state: "In Review", stateType: "started" }), pulls: [] };
+    expect(actionable(diffObserved(before, review, running))).toEqual([]);
+    expect(actionable(diffObserved(review, before, running))).toEqual([]);
+    // A move outside the build/review pair wakes: a non-owner move to another stage.
+    const backlog = { entity: issue({ state: "Backlog", stateType: "backlog" }), pulls: [] };
+    expect(actionable(diffObserved(before, backlog, running))).toEqual(["State: In Progress → Backlog"]);
+    // With no worker in flight the same build/review move wakes.
+    expect(actionable(diffObserved(before, review, ctx))).toEqual(["State: In Progress → In Review"]);
+  });
+
+  it("names the build/review move, so the server can hand the playbook's stages in", () => {
+    expect(isOwnStageMove(stageOf, "In Progress", "In Review")).toBe(true);
+    expect(isOwnStageMove(stageOf, "In Review", "In Progress")).toBe(true);
+    expect(isOwnStageMove(stageOf, "In Progress", "Backlog")).toBe(false);
+    expect(isOwnStageMove(stageOf, "Todo", "In Progress")).toBe(false);
+    expect(isOwnStageMove(undefined, "In Progress", "In Review")).toBe(false);
+  });
+});
+
 describe("a worker in flight between its turns (BB-11)", () => {
   const worker = (status: "running" | "finished" | "failed" | "stopped") => ({ status });
 
@@ -131,10 +176,10 @@ describe("a worker in flight between its turns (BB-11)", () => {
     const before = { entity: pull({ author: "jane" }), pulls: [] };
     const after = { entity: pull({ author: "jane", comments: [marker(1, "no-review")] }), pulls: [] };
     // In flight, the round is the worker's business.
-    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true }))).toEqual([]);
+    expect(actionable(diffObserved(before, after, { ...ctx, workerInFlight: true, ownPulls: new Set(["acme/web#7"]) }))).toEqual([]);
     // A round that changes the lane is not.
     const changed = { entity: pull({ author: "jane", comments: [marker(1, "no-review"), marker(2, "owner-reviewed")] }), pulls: [] };
-    expect(actionable(diffObserved(after, changed, { ...ctx, workerInFlight: true }))).toEqual(["Review lane: no-review → owner-reviewed"]);
+    expect(actionable(diffObserved(after, changed, { ...ctx, workerInFlight: true, ownPulls: new Set(["acme/web#7"]) }))).toEqual(["Review lane: no-review → owner-reviewed"]);
     expect(markerLaneChange(after.entity.comments, changed.entity.comments)).toEqual({ from: "no-review", to: "owner-reviewed" });
     // Once no worker is in flight, the same markers are ordinary comment news.
     expect(actionable(diffObserved(before, after, ctx))).toEqual(["1 new comment from jane"]);
@@ -151,13 +196,13 @@ describe("a worker in flight between its turns (BB-11)", () => {
       entity: issue({ state: "In Progress", stateType: "started", ...linked }),
       pulls: [pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa verdict=approved lane=no-review -->", createdAt: "2026-10-02T00:00:00Z" })] }, { headAuthor: "jane", checks: { state: "success", failing: [] } })],
     };
-    expect(actionable(diffObserved(before, reviewed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    expect(actionable(diffObserved(before, reviewed, { ...ctx, workerInFlight: true, ownPulls: new Set(["acme/web#7"]) }))).toEqual([]);
     // The worker pushes (woken again), still in flight.
     const pushed = { entity: reviewed.entity, pulls: [pull({ author: "jane", comments: reviewed.pulls[0]!.comments }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } })] };
-    expect(actionable(diffObserved(reviewed, pushed, { ...ctx, workerInFlight: true }))).toEqual([]);
+    expect(actionable(diffObserved(reviewed, pushed, { ...ctx, workerInFlight: true, ownPulls: new Set(["acme/web#7"]) }))).toEqual([]);
     // Nothing was actionable while it was in flight, so the steward is woken
     // once, at the finish, with all of it as quiet notes.
-    const changes = diffObserved(before, pushed, { ...ctx, workerInFlight: anyWorkerInFlight([worker("stopped")]) });
+    const changes = diffObserved(before, pushed, { ...ctx, workerInFlight: anyWorkerInFlight([worker("stopped")]), ownPulls: new Set(["acme/web#7"]) });
     expect(actionable(changes)).toEqual(["acme/web#7: Checks finished: success", "acme/web#7: 1 new comment from jane"]);
     expect(changes.map((c) => c.text)).toContain("acme/web#7: Pushed bbbbbbb by jane");
   });

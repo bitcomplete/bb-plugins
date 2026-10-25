@@ -30,7 +30,7 @@ function world() {
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
-  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null }>();
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
   const fileContents = new Map<string, string>();
@@ -170,7 +170,7 @@ function world() {
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
         return {
           ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
-          ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null } }),
+          ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null, branchName: t.branchName ?? null } }),
         };
       },
       // What the server answers: the thread's own execution once a turn ran, and before that the
@@ -334,19 +334,22 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
     id: string,
     parent: string,
     title = "Implement",
-    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; sectionId?: string | null } = {},
+    over: { providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; sectionId?: string | null; branchName?: string | null } = {},
   ) => {
     const providerId = over.providerId ?? "claude-code";
     const model = over.model === undefined ? "claude-opus-5-5" : over.model;
     const reasoningLevel = over.reasoningLevel === undefined ? "high" : over.reasoningLevel;
     const environmentProviderId = over.environmentProviderId === undefined ? "multi-repo-workspace" : over.environmentProviderId;
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId });
+    // The worker's workspace branch; the pull() fixture's head is "retry", so
+    // a worker owns it unless a test says otherwise (BB-52 rule 0).
+    const branchName = over.branchName === undefined ? "retry" : over.branchName;
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: parent, sectionId: over.sectionId ?? null, providerId, ...(model === null ? {} : { model }), ...(reasoningLevel === null ? {} : { reasoningLevel }), environmentProviderId, branchName });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: parent, lifecycleOwnerThreadId: parent, title, originPluginId: null, providerId, sectionId: over.sectionId ?? null }) });
     await flush();
   };
   /** A top-level worker a steward started with only `--lifecycle-owner-thread`: no parent. */
   const createdOwned = async (id: string, owner: string, title = "Implement", sectionId: string | null = null) => {
-    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace" });
+    w.threads.set(id, { status: "active", archivedAt: null, visibility: "visible", parentThreadId: null, sectionId, providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", environmentProviderId: "multi-repo-workspace", branchName: "retry" });
     await harness.behavior.emitThreadEvent("thread.created", { thread: makeThreadResponse({ id, parentThreadId: null, lifecycleOwnerThreadId: owner, title, originPluginId: null, providerId: "claude-code", sectionId }) });
     await flush();
   };
@@ -772,7 +775,7 @@ describe("a Linear ticket steward", () => {
     expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toMatch(/waits on the project steward, with no open escalation/u);
   });
 
-  it("recognizes workers the steward starts with bb thread spawn, and wakes when one finishes", async () => {
+  it("recognizes workers the steward starts with bb thread spawn, and wakes only when one asks", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -780,10 +783,35 @@ describe("a Linear ticket steward", () => {
 
     await t.created("thr_w1", steward, "ENG-12: Implement");
     expect(t.sends).toEqual([]);
-    await t.idle("thr_w1", "Opened acme/web#7.");
+    // BB-52 rule 3: a worker ending its turn waiting is a quiet note, not a wake.
+    await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
+    expect(t.sends).toEqual([]);
+    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true }]);
+
+    // A question wakes it, with the worker's words.
+    await t.idle("thr_w1", "Should I bring the reviewer back once it finishes?");
     const wake = t.sends.at(-1)!.text;
     expect(wake).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
-    expect(wake).toMatch(/Opened acme\/web#7\./u);
+    expect(wake).toMatch(/Should I bring the reviewer back once it finishes\?/u);
+  });
+
+  it("wakes when a worker ends its turn with an error report, and lists a quiet finish in bb stewards show", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    // A waiting finish is kept as a quiet note, and show lists it with the next wake.
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const show = (await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout;
+    expect(show).toMatch(/Pending \(quiet\): Worker "ENG-12: Implement" finished its turn\./u);
+
+    // An error report is not waiting: it wakes the steward.
+    const sent = t.sends.length;
+    await t.idle("thr_w1", "Error: the provider timed out before I could push.");
+    expect(t.sends).toHaveLength(sent + 1);
+    expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
   });
 
   // BB-23: a worker is a top-level thread owned only through its lifecycle
@@ -803,7 +831,7 @@ describe("a Linear ticket steward", () => {
     expect(t.sends).toEqual([]);
 
     // Its finish is the wake: the Workers section carries its final text.
-    await t.idle("thr_w1", "Opened acme/web#7.");
+    await t.idle("thr_w1", "Opened acme/web#7. Should I start the reviewer?");
     const wake = t.sends.at(-1)!.text;
     const workers = wake.slice(wake.indexOf("### Workers"));
     expect(workers).toMatch(/ENG-12: Implement \(thread thr_w1\): finished/u);
@@ -848,6 +876,53 @@ describe("a Linear ticket steward", () => {
     expect(t.hooks.store.open("p1")[0]!.pending).toEqual([]);
   });
 
+  // BB-52 rule 0: "a worker is in flight" is not evidence that a linked pull
+  // request is the worker's. One on another branch is foreign, and its link,
+  // checks and comments all wake the steward.
+  it("wakes for a teammate's pull request linked while a worker is in flight, and keeps its activity actionable", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const sent = t.sends.length;
+
+    // A teammate's pull request, on another branch, gets linked to the ticket.
+    const linked = { linkedPulls: [{ key: "acme/web#9", url: "https://github.com/acme/web/pull/9" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9", id: "acme/web#9", url: "https://github.com/acme/web/pull/9", author: "sam" }, { head: "sam-branch", headAuthor: "sam" }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends).toHaveLength(sent + 1);
+    expect(t.sends.at(-1)!.text).toMatch(/Pull request linked \(not this ticket's worker\): acme\/web#9/u);
+
+    // Its checks and a teammate's comment stay actionable, not quietened by the worker.
+    t.entities.set("acme/web#9", pull({ key: "acme/web#9", id: "acme/web#9", url: "https://github.com/acme/web/pull/9", author: "sam", comments: [comment({ id: "c9", author: "lee", body: "Please rebase.", createdAt: "2026-10-14T17:00:00Z" })] }, { head: "sam-branch", headSha: "bbbbbbb9", headAuthor: "sam", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#9");
+    expect(t.sends).toHaveLength(sent + 2);
+    const activity = t.sends.at(-1)!.text;
+    expect(activity).toMatch(/acme\/web#9: Checks finished: success/u);
+    expect(activity).toMatch(/acme\/web#9: 1 new comment from lee/u);
+  });
+
+  it("treats a pull request as the worker's when the worker named its URL, even on another branch", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { head: "worker-branch", headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+
+    // The worker's branch differs, but its final message names the pull request.
+    await t.created("thr_w1", steward, "ENG-12: Implement", { branchName: "other-branch" });
+    await t.idle("thr_w1", "Opened https://github.com/acme/web/pull/7 and waiting on the reviewer.");
+    const sent = t.sends.length;
+
+    // Its checks are the worker's, so they are a quiet note, not a wake.
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { head: "worker-branch", headAuthor: "jane", checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.sends).toHaveLength(sent);
+  });
+
   // BB-17: BB-11's steward was woken 22 times in four hours because a worker
   // that had ended its turn to wait read as not running, so its reviewer's
   // comments, its checks and its own pushes all woke the steward.
@@ -862,13 +937,10 @@ describe("a Linear ticket steward", () => {
     const before = toSteward().length;
 
     // The worker spawns, opens the PR and goes idle waiting on its reviewer:
-    // the steward is woken once, with the worker's message.
+    // BB-52 rule 3 keeps that a quiet note, and the PR activity is the worker's.
     await t.created("thr_w1", steward, "ENG-12: Implement");
     await t.idle("thr_w1", "Opened acme/web#7; waiting on the reviewer.");
-    expect(toSteward()).toHaveLength(before + 1);
-    expect(toSteward().at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
-    expect(toSteward().at(-1)!.text).toMatch(/Opened acme\/web#7; waiting on the reviewer\./u);
-    const woken = toSteward().length;
+    expect(toSteward()).toHaveLength(before);
 
     // The reviewer posts its marker as the developer (unsigned), checks
     // finish, and the worker pushes: all the worker's, none of it wakes.
@@ -877,7 +949,16 @@ describe("a Linear ticket steward", () => {
     await t.ring("github", "acme/web#7");
     t.entities.set("acme/web#7", pull({ author: "jane", comments: [comment({ id: "r1", author: "jane", body: marker, createdAt: "2026-10-14T16:00:00Z" })] }, { headSha: "bbbbbbb2", headAuthor: "jane", checks: { state: "success", failing: [] } }));
     await t.ring("github", "acme/web#7");
-    expect(toSteward()).toHaveLength(woken);
+    expect(toSteward()).toHaveLength(before);
+
+    // A teammate's comment is the wake, and it carries the quiet notes kept:
+    // the worker's finish and its own PR activity.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked, comments: [comment({ createdAt: "2026-10-14T17:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(toSteward()).toHaveLength(before + 1);
+    const wake = toSteward().at(-1)!.text;
+    expect(wake).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+    expect(wake).toMatch(/Opened acme\/web#7; waiting on the reviewer\./u);
   });
 
   it("wakes for a reviewer round that changes the lane while a worker is in flight", async () => {
@@ -1501,7 +1582,7 @@ describe("terminal states and follow-through", () => {
 
   it("counts a worker woken again as running, so a detach stops it", async () => {
     const t = await working();
-    await t.idle("thr_w1", "Waiting on the review verdict.");
+    await t.idle("thr_w1", "Waiting on the review verdict. Should I ping the reviewer?");
     expect(t.sends.at(-1)!.text).toMatch(/\(thread thr_w1\): finished/u);
     // Its own watch wakes it.
     await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
@@ -1510,6 +1591,28 @@ describe("terminal states and follow-through", () => {
     await t.ring("linear", "uuid-12");
     expect(t.sends.at(-1)!.text).toMatch(/this binding is detached/u);
     expect(t.stops()).toEqual(["thr_w1"]);
+  });
+
+  // BB-52 rule 4: the steward's own last report already named the terminal
+  // state, so it set Done and said the work is done. The binding ends from the
+  // mechanical tier instead of waking for a wrap-up it has already done.
+  it("ends without a wrap-up wake when the steward's own last report already said Done", async () => {
+    const t = await working();
+    await t.report({ phase: "Done" });
+    const before = t.sends.length;
+    await t.done();
+    expect(t.sends).toHaveLength(before);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.archives()).toContain(t.steward);
+  });
+
+  it("still wakes for a terminal state when the steward's last report did not say Done", async () => {
+    const t = await working();
+    await t.report({ phase: "In Review" });
+    const before = t.sends.length;
+    await t.done();
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(/Terminal: Done/u);
   });
 });
 
@@ -1748,7 +1851,7 @@ describe("stewards waiting on others", () => {
     // worker, so a steward waiting on someone else hides even while it runs.
     await t.created("thr_w1", steward);
     await t.created("thr_w2", steward);
-    await t.idle("thr_w1", "Done.");
+    await t.idle("thr_w1", "Done. Should I start the next one?");
     expect(t.sends.at(-1)!.text).toMatch(/finished its turn/u);
     await t.tool("steward_report", { phase: "In Progress", summary: "Implementing.", nextAction: "Wait for the second worker", actor: "other" }, steward);
     await t.idle(steward);

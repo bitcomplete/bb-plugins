@@ -34,6 +34,7 @@ import {
   opsTeam,
   parsePlaybook,
   parseProjectFile,
+  phaseOf,
   playbookNameFor,
   playbookPath,
   playbookStates,
@@ -74,7 +75,7 @@ import { allPullsMerged, conflictsOf, normalizeTouches } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -890,6 +891,65 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         });
     }
 
+    /**
+     * A thread's workspace branch, from its environment, or null when the
+     * environment or its branch cannot be read. Cached once known: a thread's
+     * branch does not change, and a null is left uncached so a worker whose
+     * environment is still provisioning is read again.
+     */
+    const branchCache = new Map<string, string>();
+    async function threadBranch(threadId: string): Promise<string | null> {
+      const cached = branchCache.get(threadId);
+      if (cached !== undefined) return cached;
+      try {
+        const info = (await bb.sdk.threads.get({ threadId, include: "environment" })) as { environment?: { branchName?: string | null } | null };
+        const branch = info.environment?.branchName ?? null;
+        if (branch !== null && branch !== "") branchCache.set(threadId, branch);
+        return branch === "" ? null : branch;
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the branch of ${threadId}: ${errorMessage(error)}`);
+        return null;
+      }
+    }
+
+    /**
+     * The pull requests this binding's worker owns, as lowercased keys and
+     * URLs (BB-52 rule 0): its head branch is one of the binding's worker
+     * threads' branches, or a worker named the URL in its final message. A
+     * pull request the plugin cannot tie to the worker is left out, so it is
+     * treated as foreign and keeps its activity actionable.
+     */
+    async function ownPullKeys(b: Binding, workers: readonly Worker[], observed: Observed): Promise<Set<string>> {
+      /** Whether a worker's message names a key or URL, without matching a longer number's prefix. */
+      const mentions = (text: string, token: string): boolean => {
+        const at = text.indexOf(token);
+        return at >= 0 && (at + token.length >= text.length || !/[0-9]/u.test(text[at + token.length]!));
+      };
+      const branches = new Set<string>();
+      for (const w of workers) {
+        if (!workerInFlight(w)) continue;
+        const branch = await threadBranch(w.threadId);
+        if (branch !== null) branches.add(branch);
+      }
+      const reported = new Set<string>();
+      for (const w of workers) {
+        if (w.result === null || w.result === "") continue;
+        for (const e of [observed.entity, ...observed.pulls]) {
+          if (e.key !== "" && mentions(w.result, e.key)) reported.add(e.key.toLowerCase());
+          if (e.url !== null && e.url !== "" && mentions(w.result, e.url)) reported.add(e.url.toLowerCase());
+        }
+      }
+      const keys = new Set<string>();
+      for (const e of [observed.entity, ...observed.pulls]) {
+        if (e.pull === null) continue;
+        const own = (e.pull.head !== null && branches.has(e.pull.head)) || reported.has(e.key.toLowerCase()) || (e.url !== null && reported.has(e.url.toLowerCase()));
+        if (!own) continue;
+        keys.add(e.key.toLowerCase());
+        if (e.url !== null) keys.add(e.url.toLowerCase());
+      }
+      return keys;
+    }
+
     // The interest set: what linear and github should lease and ring us
     // about. Sent whole, only when it changed, a moment after the change.
     const lastInterest = new Map<Source, string>();
@@ -1675,8 +1735,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ready = { ...ready, approval: { at: now(), specHash: currentSpec, by: "linear" }, voidedAt: null };
         changes.push({ text: `Approved in Linear (now ${entity.state})`, actionable: true });
       }
-      const workerInFlight = anyWorkerInFlight(store.workers(b.id));
-      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, userThread: isUserThread });
+      const workers = store.workers(b.id);
+      const workerInFlight = anyWorkerInFlight(workers);
+      // Rule 0: which linked pull requests are the worker's own. Only read the
+      // branches and reported URLs when a worker is in flight; otherwise the
+      // set is empty and every pull request is foreign.
+      const ownPulls = workerInFlight ? await ownPullKeys(b, workers, observed) : new Set<string>();
+      const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
       // BB-35 step 2: a fresh unsigned comment by the owner that differs from
       // the recommendation on a decision that cited lessons is a correction,
@@ -2375,6 +2440,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * watch, production to verify); they are stopped when it ends.
      */
     async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
+      // BB-52 rule 4: the steward's own last report already named the terminal
+      // state, so its last turn set it and said the work is done. End from the
+      // mechanical tier rather than waking for a wrap-up it has already done. A
+      // terminal state set by anyone else leaves the report non-terminal and
+      // still wakes.
+      const ownDone = kind === "terminal" && b.status !== null && isTerminal(playbook, b.status.phase);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
       await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : "was detached");
@@ -2387,6 +2458,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(b.threadId);
       if (info === null || info.deletedAt !== null) {
         await finishEnding(b, kind);
+        return;
+      }
+      if (ownDone) {
+        bb.log.info(`stewards: ${b.entityKey} was already reported ${b.status!.phase} by its steward; ending without a wrap-up wake`);
+        await finishEnding(b, "terminal");
         return;
       }
       await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : `The ${config.file.label} label was removed`], kind);
@@ -3306,14 +3382,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const worker = store.worker(thread.id);
       if (worker !== null) {
         if (worker.status === "stopped") return;
-        store.setWorker(thread.id, "finished", lastAssistantText === null ? null : clip(lastAssistantText, 4000));
+        const result = lastAssistantText === null ? null : clip(lastAssistantText, 4000);
+        store.setWorker(thread.id, "finished", result);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).
         await archiveConsumedReviewers(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
-        store.note(b.id, `Worker "${worker.title}" finished its turn.`);
+        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
+        // the owner or a build is a quiet note. Only a question, an error
+        // report or a gone thread makes the turn due; a failed turn comes
+        // through thread.failed and wakes on its own. A binding following
+        // through is waiting on this worker's result, so its finish is news.
+        const needsSteward = workerQuestion(result) !== null || workerReportedError(result) || followingThrough(b);
+        store.note(b.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
+        // A quiet finish is consumed here, not by a wake: archive the worker
+        // now (BB-47), keeping one that still has a question or a reviewer.
+        if (!needsSteward) await archiveFinishedWorkers(b);
         scheduleReconcile(b.id);
         return;
       }
@@ -5569,6 +5655,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 lines.push(`Touches: ${b.touches.join(", ") || "not reported"}${conflicts.length === 0 ? "" : `; overlaps ${conflicts.map((c) => `${c.with.entityKey} on ${c.on.join(", ")}`).join("; ")}`}`);
               }
               for (const g of b.guidance) lines.push(`Guidance ${iso(g.at)}: ${g.text}`);
+              for (const n of b.pending) lines.push(`Pending${n.quiet === true ? " (quiet)" : ""}: ${n.text}`);
               for (const x of detail.escalations) lines.push(`Escalation ${x.id} ${x.kind} (${x.status}, ${x.route}): ${x.question}${choicesNote(x.choices)}${x.resolution === null ? "" : ` → ${x.resolution}`}`);
               for (const n of store.needs(b.id, true)) lines.push(`Need ${n.id} ${n.kind} (${n.status}): ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${n.resolution === null ? "" : ` → ${n.resolution}`}`);
               for (const w of detail.workers) lines.push(`Worker ${w.threadId} ${w.title}: ${w.status}`);

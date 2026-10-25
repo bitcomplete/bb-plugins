@@ -66,9 +66,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   between its turns — the worker's own work on a pull request (checks
   finishing, description edits, pushes and comments from your account, which
   every thread posts as, and the reviewer's `bb-review` markers) is not a
-  reason to wake; a reviewer round that changes the lane is. Everything not
+  reason to wake; a reviewer round that changes the lane is. BB-52 scopes
+  that to the worker's own pull request — its head branch is one of the
+  binding's worker threads' branches, or a worker named its URL — and quiets
+  three more causes: a state move between the build and review stages, a
+  worker turn ending to wait (only a question, an error report or a gone
+  thread wakes), and a terminal state the steward's own last report already
+  named (the binding ends from the mechanical tier). A foreign pull request
+  wakes on its link and keeps its activity actionable. Everything not
   actionable is kept as a quiet note and shown in "What changed" at the next
-  turn something else makes due.
+  turn something else makes due, and `bb stewards show` lists it as a pending
+  note.
 - **Wakes are self-contained**: playbook instructions for the phase, the
   ready gate, guidance and holds, the snapshot, and what changed. Each
   woken turn ends with `steward_report`, the status record. A wake past

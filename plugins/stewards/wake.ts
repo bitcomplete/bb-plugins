@@ -93,6 +93,18 @@ export function workerQuestion(result: string | null): string | null {
   return null;
 }
 
+/**
+ * Whether a worker's final message reports an error the steward must see. A
+ * turn that failed outright comes through `thread.failed`; this catches a
+ * worker that ended its turn with an error it could not get past (BB-52 rule
+ * 3). Only an explicit marker at the start of a line counts, so a normal
+ * report that mentions an error it fixed is not one.
+ */
+const ERROR_REPORT = /(?:^|\n)\s*(?:error|failed|failure|exception|traceback)\b|(?:^|\n)\s*(?:I (?:could not|couldn't|was unable to)|Unable to)\b/iu;
+export function workerReportedError(result: string | null): boolean {
+  return result !== null && ERROR_REPORT.test(result);
+}
+
 /** One worker's question, first under What changed, with how to answer it. */
 function workerQuestionLines(q: WorkerQuestion): string[] {
   const asked = `- **Worker ${q.threadId} asked:** ${q.question}`;
