@@ -5,7 +5,7 @@
 // Each wake is self-contained. A steward that has compacted away everything
 // it ever saw can act correctly from one wake alone, which is what lets its
 // transcript stop being the source of truth.
-import { formatDuration, phaseInstructions, type BigDecision, type Playbook } from "./config.js";
+import { formatDuration, phaseInstructions, type BigDecision, type LessonRules, type Playbook } from "./config.js";
 import { anyPending, type Deployments, type DeploymentWatch } from "./deploy.js";
 import { localParts } from "./nightly.js";
 import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } from "./ops.js";
@@ -250,6 +250,8 @@ export type WakeInput = {
   deployments?: Deployments;
   /** Open bindings already at work on what this one touches. */
   conflicts?: Conflict[];
+  /** Trial lessons of the project, already capped to `lessons.trial.max`; candidates never appear. */
+  lessons?: Lesson[];
   now: number;
 };
 
@@ -447,6 +449,7 @@ export function formatWake(input: WakeInput): string {
   out.push(`- Priority: ${binding.priority ?? "normal"}`);
   out.push(holdLine(binding, "take no new actions and start no workers until it is lifted."));
   out.push(...schedulingLines(binding, input.conflicts ?? [], input.escalations));
+  out.push(...trialLessonsLines(input.lessons ?? []));
   if (binding.ready.declinedSpecHash !== null && binding.declinedSpecObjections.length > 0) {
     out.push("", "**Spec declined.** Address each objection in one revision, so the next review can close them all:", "", ...binding.declinedSpecObjections.map((o) => `- [ ] ${o}`));
   }
@@ -884,6 +887,60 @@ export function formatSentryWake(input: SentryWakeInput): string {
   return fit(head, snapshot, out);
 }
 
+/**
+ * The `## Lessons (trial)` block for a binding's steward: the project's trial
+ * lessons, which have not earned a place in `.bb` yet. Candidates never appear.
+ * The list is already capped by the caller.
+ */
+function trialLessonsLines(lessons: Lesson[]): string[] {
+  const trial = lessons.filter((l) => l.tier === "trial");
+  if (trial.length === 0) return [];
+  return [
+    "",
+    "## Lessons (trial)",
+    "",
+    "Project rules that are not in `.bb` yet. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`.",
+    ...trial.map((l) => `- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`),
+  ];
+}
+
+/**
+ * The project steward's lesson blocks (BB-35 step 3): the trial lessons to
+ * decide from, the promoted ones the nightly pass queued for landing, and the
+ * retired ones whose anchored text must come out. Trial is capped at
+ * `lessons.trial.max`; candidates never appear.
+ */
+function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined): string[] {
+  const cap = rules?.trial.max ?? 5;
+  const out: string[] = [];
+  const trial = lessons.filter((l) => l.tier === "trial").slice(0, cap);
+  if (trial.length > 0) {
+    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`.");
+    for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`);
+  }
+  const toLand = lessons.filter((l) => l.tier === "promoted" && l.status === "pending");
+  if (toLand.length > 0) {
+    out.push(
+      "",
+      "## Lessons to land",
+      "",
+      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, commit, and publish with workspace_publish_guidance; then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. A `boundary` one becomes a Merge/Drop item for the user instead. If a merge was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
+    );
+    for (const l of toLand) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  Anchor: \`<!-- lesson:${l.id} -->\`${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
+  }
+  const toRetire = lessons.filter((l) => l.tier === "retired" && l.status === "merged");
+  if (toRetire.length > 0) {
+    out.push(
+      "",
+      "## Lessons to retire",
+      "",
+      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, commit, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. The row is kept.',
+    );
+    for (const l of toRetire) out.push(`- ${l.id} (${l.file}): ${oneLine(l.text)}`);
+  }
+  return out;
+}
+
 /** What the project steward is woken with, at the end of a nightly pass or when an escalation reaches it. */
 export function formatProjectWake(input: {
   reason: string;
@@ -901,6 +958,8 @@ export function formatProjectWake(input: {
   needs?: Array<{ need: Need; binding: Binding }>;
   /** Pending lessons: general rules waiting to be landed in `.bb`. */
   lessons?: Lesson[];
+  /** The project's lesson rules, for the trial cap and the wake headings. */
+  lessonRules?: LessonRules;
   /** With digestDue: the records the digest is written from. */
   records?: DigestRecords;
   /** The project's nightly time zone, which dates are given in; UTC when absent. */
@@ -986,18 +1045,7 @@ export function formatProjectWake(input: {
     out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
   }
   const lessons = input.lessons ?? [];
-  if (lessons.length > 0) {
-    out.push("## Lessons pending", "");
-    for (const l of lessons) {
-      const source = [l.bindingId === null ? null : `from ${l.bindingId}`, l.escalationId === null ? null : `escalation ${l.escalationId}`].filter((x) => x !== null).join(", ");
-      out.push(`- ${l.id} (${l.scope}, ${l.file}${source === "" ? "" : `, ${source}`}): ${oneLine(l.text)}${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
-    }
-    out.push(
-      "",
-      "Apply each to the named file in your `.bb` checkout, commit it, and publish with workspace_publish_guidance. Then complete it with steward_update { lessonAction: { id: \"<id>\", action: \"complete\" } }: a `procedure` lesson is self-merged, a `boundary` one becomes a Merge/Drop item for the user. If a merge was refused, the reason is above: fix the branch and complete it again, or drop it.",
-      "",
-    );
-  }
+  out.push(...projectLessonsLines(lessons, input.lessonRules));
   const head = out.splice(0);
   out.push(`## Bindings (${input.bindings.length} open)`, "");
   const allOpen = input.bindings.map((x) => x.binding);
@@ -1133,8 +1181,6 @@ export type DigestRecords = {
   held: Binding[];
   /** Silent notes queued for this digest (a hold that lifted on finished work), one line each. */
   notes?: string[];
-  /** Lessons that reached `.bb` HEAD in the window. */
-  lessonsMerged?: Lesson[];
 };
 
 function capped(lines: string[], none: string): string[] {
@@ -1192,12 +1238,6 @@ export function formatRecords(r: DigestRecords, questions: Array<{ question: Que
     ...r.held.map((b) => `- ${b.entityKey}: on hold: ${oneLine(b.hold ?? "")}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`),
   ];
   out.push("### Stuck or held", "", ...capped(stuck, "Nothing."), "");
-
-  const lessons = (r.lessonsMerged ?? []).map((l) => {
-    const source = [l.bindingId === null ? null : `from ${l.bindingId}`, l.escalationId === null ? null : `escalation ${l.escalationId}`].filter((x) => x !== null).join(", ");
-    return `- Merged lesson ${l.id} (${l.scope}, ${l.file}) at ${l.mergeSha === null ? "?" : l.mergeSha.slice(0, 8)}${l.branch === null ? "" : ` on ${l.branch}`}${source === "" ? "" : ` (${source})`}: ${oneLine(l.text)}`;
-  });
-  out.push("### Lessons landed", "", ...capped(lessons, "Nothing."));
   return out;
 }
 

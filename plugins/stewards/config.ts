@@ -208,6 +208,52 @@ export const depsSchema = z
   .default({ sla: { critical: "asap", high: 86_400_000, medium: 7 * 86_400_000, low: 30 * 86_400_000 }, batch: { medium: 7 * 86_400_000, low: 30 * 86_400_000 }, autoAdopt: ["critical", "high"] });
 export type DepsConfig = z.infer<typeof depsSchema>;
 
+/**
+ * The mechanical lesson lifecycle's rules (BB-35 step 3): when a trial lesson
+ * is promoted or retired, how many a wake may carry, and how many promoted
+ * lessons a file holds. The defaults are the design's; a project overrides
+ * any part under `lessons` and the rest fall back. `decayHalfLifeDays`
+ * weights a citation by age, so an old burst of use does not keep a lesson
+ * alive when the lowest-scoring one has to be displaced.
+ */
+export const lessonRulesSchema = z
+  .object({
+    trial: z
+      .object({
+        /** At most this many trial lessons in one wake. */
+        max: z.number().int().min(1).max(50).default(5),
+        /** A trial lesson uncited this long is retired. */
+        retireDays: z.number().positive().max(3650).default(30),
+      })
+      .strict()
+      .default({ max: 5, retireDays: 30 }),
+    promote: z
+      .object({
+        /** Distinct bindings a trial lesson must be cited on to be promoted. */
+        hits: z.number().int().min(1).max(50).default(3),
+        /** Days a trial lesson must have been in trial before it may be promoted. */
+        days: z.number().positive().max(3650).default(14),
+      })
+      .strict()
+      .default({ hits: 3, days: 14 }),
+    promoted: z
+      .object({
+        /** At most this many promoted lessons in one file; a promotion into a full file displaces the lowest-scoring one. */
+        maxPerFile: z.number().int().min(1).max(100).default(10),
+        /** A promoted lesson uncited this long is retired. */
+        retireDays: z.number().positive().max(3650).default(90),
+        /** Corrections that retire a promoted lesson. */
+        corrections: z.number().int().min(1).max(50).default(2),
+      })
+      .strict()
+      .default({ maxPerFile: 10, retireDays: 90, corrections: 2 }),
+    /** A citation's weight halves every this many days. */
+    decayHalfLifeDays: z.number().positive().max(3650).default(30),
+  })
+  .strict()
+  .default({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 });
+export type LessonRules = z.infer<typeof lessonRulesSchema>;
+
 export const projectFileSchema = z
   .object({
     version: z.literal(1),
@@ -283,6 +329,8 @@ export const projectFileSchema = z
       .default({ targets: [], autoAdopt: [], sentry: { resolveOnDone: false } }),
     /** The dependency watch: per-severity SLA, the batch window, and what auto-adopts. */
     deps: depsSchema,
+    /** The mechanical lesson lifecycle's thresholds and caps (BB-35 step 3). */
+    lessons: lessonRulesSchema,
   })
   .strict()
   .superRefine((file, ctx) => {

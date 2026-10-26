@@ -187,6 +187,48 @@ describe("the nightly prompt", () => {
     expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
   });
 
+  it("injects trial lessons under their own heading and never a candidate (BB-35 step 3)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const trial = s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: "Auth is the plugin's.", scope: "procedure", branch: null });
+    const candidate = s.addLesson({ projectId: "p1", bindingId: null, escalationId: null, file: "AGENTS.md", text: "Maybe later.", scope: "procedure", branch: null, tier: "candidate" });
+    const wake = formatWake(wakeInput({ binding: b, lessons: [trial, candidate] }));
+    expect(wake).toContain("## Lessons (trial)");
+    expect(wake).toContain(`- ${trial.id} (procedure, AGENTS.md): Auth is the plugin's.`);
+    expect(wake).not.toContain(candidate.id);
+    expect(wake).not.toContain("Maybe later.");
+  });
+
+  it("groups the project's lessons by tier: trial to decide from, promoted to land, retired to remove (BB-35 step 3)", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const trial = s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: "Auth is the plugin's.", scope: "procedure", branch: null });
+    const promoted = s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: "Read SELECT * carefully.", scope: "procedure", branch: null });
+    s.setLessonTier(promoted.id, "promoted");
+    const retired = s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: "An old rule.", scope: "procedure", branch: null });
+    s.markLessonMerged(retired.id, "a".repeat(40), null);
+    s.setLessonTier(retired.id, "retired");
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], lessons: s.allLessons("p1") });
+    expect(wake).toContain("## Lessons (trial)");
+    expect(wake).toContain(`- ${trial.id} (procedure, AGENTS.md): Auth is the plugin's.`);
+    expect(wake).toContain("## Lessons to land");
+    expect(wake).toContain(`<!-- lesson:${promoted.id} -->`);
+    expect(wake).toContain("## Lessons to retire");
+    expect(wake).toContain(`- ${retired.id} (AGENTS.md): An old rule.`);
+    // It is listed once, as to-land, not also under the trial heading.
+    expect(wake.split(`- ${promoted.id} `)).toHaveLength(2);
+  });
+
+  it("caps the trial lessons in a project wake at lessons.trial.max", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const lessons = [1, 2, 3].map((n) => s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: `Rule ${n}.`, scope: "procedure", branch: null }));
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], lessons: s.allLessons("p1"), lessonRules: { trial: { max: 1, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 } });
+    expect(wake).toContain(`- ${lessons[0]!.id} (procedure, AGENTS.md): Rule 1.`);
+    expect(wake).not.toContain(`- ${lessons[1]!.id} `);
+    expect(wake).not.toContain(`- ${lessons[2]!.id} `);
+  });
+
   it("names the five resolution kinds and how a credential is forwarded (BB-51)", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");

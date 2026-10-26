@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -145,8 +145,7 @@ describe("lessons", () => {
     expect(s.lesson(lesson.id)).toMatchObject({ status: "merged", mergeSha: "a".repeat(40), resolvedAt: 1_500 });
     expect(s.lessons("p1")).toEqual([]);
     expect(s.lessons("p1", true)).toHaveLength(1);
-    expect(s.mergedLessonsSince("p1", 1_400).map((l) => l.id)).toEqual([lesson.id]);
-    expect(s.mergedLessonsSince("p1", 1_600)).toEqual([]);
+    expect(s.lesson(lesson.id)).toMatchObject({ tier: "promoted" });
 
     // Marking it merged again is idempotent and does not move resolved_at.
     s.markLessonMerged(lesson.id, "b".repeat(40), null);
@@ -160,8 +159,16 @@ describe("lessons", () => {
     s.noteLesson(lesson.id, "Refused: changes files other than AGENTS.md.");
     expect(s.lesson(lesson.id)).toMatchObject({ branch: "refs/heads/guidance-thr_project", note: "Refused: changes files other than AGENTS.md." });
     s.markLessonDropped(lesson.id, "Dropped on the Stewards page.");
-    expect(s.lesson(lesson.id)).toMatchObject({ status: "dropped", resolvedAt: expect.any(Number) });
+    expect(s.lesson(lesson.id)).toMatchObject({ status: "dropped", tier: "retired", resolvedAt: expect.any(Number) });
     expect(s.lessons("p1")).toEqual([]);
+  });
+
+  it("record which lesson a newer one supersedes", () => {
+    const { s, binding } = store();
+    const older = s.addLesson({ projectId: "p1", bindingId: binding.id, escalationId: null, file: "AGENTS.md", text: "The old rule.", scope: "procedure", branch: null });
+    const newer = s.addLesson({ projectId: "p1", bindingId: binding.id, escalationId: null, file: "AGENTS.md", text: "The new rule.", scope: "procedure", branch: null, supersedes: older.id });
+    expect(s.lesson(older.id)).toMatchObject({ supersededBy: newer.id });
+    expect(s.lesson(newer.id)).toMatchObject({ supersededBy: null });
   });
 });
 
@@ -230,6 +237,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     db.exec(`INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, status, branch, merge_sha, note, created_at, updated_at, resolved_at)
              VALUES ('lsn_old', 'p1', 'bnd_1', NULL, 'AGENTS.md', 'An old rule.', 'boundary', 'pending', 'refs/heads/guidance-thr_x', NULL, 'kept', 1000, 1100, NULL)`);
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
+    for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
     for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.lesson("lsn_old")).toMatchObject({
@@ -240,6 +248,10 @@ describe("lesson citation counts (BB-35 step 2)", () => {
       text: "An old rule.",
       scope: "boundary",
       status: "pending",
+      tier: "trial",
+      tierAt: 1_000,
+      clusterKey: null,
+      supersededBy: null,
       branch: "refs/heads/guidance-thr_x",
       note: "kept",
       createdAt: 1_000,
@@ -251,7 +263,40 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     });
     // The old columns are all still there; nothing was dropped or renamed.
     const columns = (db.prepare("PRAGMA table_info(lessons)").all() as Array<{ name: string }>).map((c) => c.name);
-    expect(columns).toEqual(expect.arrayContaining(["id", "project_id", "binding_id", "escalation_id", "file", "text", "scope", "status", "branch", "merge_sha", "note", "created_at", "updated_at", "resolved_at", "hits", "corrections", "last_cited_at", "cited_bindings"]));
+    expect(columns).toEqual(expect.arrayContaining(["id", "project_id", "binding_id", "escalation_id", "file", "text", "scope", "status", "branch", "merge_sha", "note", "created_at", "updated_at", "resolved_at", "hits", "corrections", "last_cited_at", "cited_bindings", "tier", "tier_at", "cluster_key", "superseded_by"]));
+  });
+});
+
+describe("the lesson tier migration (BB-35 step 3)", () => {
+  const legacy = () => {
+    const db = new Database(":memory:");
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS]) db.exec(sql);
+    db.exec(`INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, status, branch, merge_sha, note, created_at, updated_at, resolved_at)
+             VALUES ('lsn_pending', 'p1', NULL, NULL, 'AGENTS.md', 'A.', 'procedure', 'pending', NULL, NULL, NULL, 1000, 1000, NULL),
+                    ('lsn_merged', 'p1', NULL, NULL, 'AGENTS.md', 'B.', 'procedure', 'merged', NULL, 'abc', NULL, 1100, 1100, 1200),
+                    ('lsn_dropped', 'p1', NULL, NULL, 'AGENTS.md', 'C.', 'procedure', 'dropped', NULL, NULL, NULL, 1300, 1300, 1400)`);
+    for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
+    for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
+    return db;
+  };
+
+  it("maps pending, merged and dropped onto trial, promoted and retired, keeping every old value", () => {
+    const s = createStore(legacy(), () => 5000);
+    expect(s.lesson("lsn_pending")).toMatchObject({ tier: "trial", tierAt: 1_000, status: "pending" });
+    expect(s.lesson("lsn_merged")).toMatchObject({ tier: "promoted", status: "merged", mergeSha: "abc", resolvedAt: 1_200 });
+    expect(s.lesson("lsn_dropped")).toMatchObject({ tier: "retired", status: "dropped", resolvedAt: 1_400 });
+  });
+
+  it("is idempotent: re-running the tier remap does not clobber a tier a transition set", () => {
+    const db = legacy();
+    const s = createStore(db, () => 5000);
+    // The nightly pass promotes a lesson whose file state is still pending.
+    s.setLessonTier("lsn_pending", "promoted");
+    const remap = LESSON_TIER_MIGRATIONS.find((sql) => sql.startsWith("UPDATE lessons SET tier = CASE"))!;
+    db.exec(remap);
+    expect(s.lesson("lsn_pending")).toMatchObject({ tier: "promoted", status: "pending" });
+    expect(s.lesson("lsn_merged")).toMatchObject({ tier: "promoted" });
+    expect(s.lesson("lsn_dropped")).toMatchObject({ tier: "retired" });
   });
 });
 
@@ -273,7 +318,7 @@ describe("a worker's pending model check", () => {
 
   it("reads workers from before the column existed as not pending", () => {
     const db = new Database(":memory:");
-    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS]) db.exec(sql);
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS]) db.exec(sql);
     db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
              VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
     db.exec(`INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES ('thr_old', 'bnd_1', 'ENG-12: Implement', 'running', 1000)`);
@@ -310,6 +355,7 @@ describe("the escalation-chain migration (BB-30)", () => {
              VALUES ('need_approve', 'bnd_1', 'approve-pr', 'https://github.com/acme/web/pull/7', 'Approve the PR.', NULL, '{}', 'plugin', 'open', NULL, 1900, NULL)`);
     for (const sql of CHAIN_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
+    for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
     for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };

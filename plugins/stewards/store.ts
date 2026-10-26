@@ -336,6 +336,24 @@ export const LESSON_COUNTER_MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN corrections_counted INTEGER NOT NULL DEFAULT 0`,
 ];
 
+// BB-35 step 3: the lifecycle tier and the fields the transitions read. The
+// old `status` column is kept and still tracks the file state (pending, merged,
+// dropped); the migration maps it onto the tier once, guarded so a re-run does
+// not clobber a tier a later transition set. Additive and lossless.
+export const LESSON_TIER_MIGRATIONS = [
+  `ALTER TABLE lessons ADD COLUMN tier TEXT NOT NULL DEFAULT 'candidate'`,
+  `ALTER TABLE lessons ADD COLUMN tier_at INTEGER`,
+  `ALTER TABLE lessons ADD COLUMN cluster_key TEXT`,
+  `ALTER TABLE lessons ADD COLUMN superseded_by TEXT`,
+  // pending => trial (with a branch), merged => promoted, dropped => retired.
+  // `WHERE tier = 'candidate'` makes it idempotent: once mapped, a lesson's
+  // tier is never remapped from `status`, so a promoted lesson whose status is
+  // still 'pending' keeps its tier if the migration is applied again.
+  `UPDATE lessons SET tier = CASE status WHEN 'pending' THEN 'trial' WHEN 'merged' THEN 'promoted' WHEN 'dropped' THEN 'retired' ELSE tier END WHERE tier = 'candidate'`,
+  // The tier's start is the row's creation for an already-migrated lesson.
+  `UPDATE lessons SET tier_at = created_at WHERE tier_at IS NULL`,
+];
+
 export const WORKER_CHECK_MIGRATIONS = [
   // 1 while a worker's model and reasoning level are still to be checked:
   // its first turn had not been dispatched when it was created, so the check
@@ -366,7 +384,7 @@ export const FINISHED_AND_DIGEST_MIGRATIONS = [
   `ALTER TABLE project_stewards ADD COLUMN pending_notes TEXT NOT NULL DEFAULT '[]'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -784,6 +802,11 @@ export type LessonScope = (typeof LESSON_SCOPES)[number];
  */
 export const lessonScope = (value: unknown): LessonScope => (value === "procedure" ? "procedure" : "boundary");
 export type LessonStatus = "pending" | "merged" | "dropped";
+/** The mechanical lifecycle a lesson moves through (BB-35 step 3). */
+export const LESSON_TIERS = ["candidate", "trial", "promoted", "retired"] as const;
+export type LessonTier = (typeof LESSON_TIERS)[number];
+/** A tier read from a row, failing closed to `candidate` for a missing or unknown value. */
+export const lessonTier = (value: unknown): LessonTier => (LESSON_TIERS.includes(value as LessonTier) ? (value as LessonTier) : "candidate");
 export type Lesson = {
   id: string;
   projectId: string;
@@ -795,6 +818,14 @@ export type Lesson = {
   text: string;
   scope: LessonScope;
   status: LessonStatus;
+  /** The lifecycle tier (BB-35 step 3). `status` is kept for the file state. */
+  tier: LessonTier;
+  /** When the tier last changed, the start of the current trial or promotion. */
+  tierAt: number | null;
+  /** A clustering key for repeat escalations (BB-35); null until a later step fills it. */
+  clusterKey: string | null;
+  /** The lesson that supersedes this one, or null. */
+  supersededBy: string | null;
   /** The `guidance-<thread>` branch carrying it, once published. */
   branch: string | null;
   /** The canonical `.bb` commit it landed at, once merged. */
@@ -995,18 +1026,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const closeNeedKeyStmt = db.prepare("UPDATE needs SET status = 'done', resolution = ?, resolved_at = ? WHERE binding_id = ? AND kind = ? AND url = ? AND status = 'open'");
 
   const insertLesson = db.prepare(
-    "INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, branch, created_at, updated_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @file, @text, @scope, @branch, @created_at, @updated_at)",
+    "INSERT INTO lessons (id, project_id, binding_id, escalation_id, file, text, scope, status, tier, tier_at, cluster_key, superseded_by, branch, created_at, updated_at) VALUES (@id, @project_id, @binding_id, @escalation_id, @file, @text, @scope, 'pending', @tier, @tier_at, @cluster_key, @superseded_by, @branch, @created_at, @updated_at)",
   );
   const getLesson = db.prepare<[string], Record<string, unknown>>("SELECT * FROM lessons WHERE id = ?");
   const lessonsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND (? = 1 OR status = 'pending') ORDER BY created_at");
-  const mergedLessonsSince = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND status = 'merged' AND resolved_at >= ? ORDER BY resolved_at");
   const setLessonBranchStmt = db.prepare("UPDATE lessons SET branch = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
-  const setLessonNoteStmt = db.prepare("UPDATE lessons SET note = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
+  const setLessonNoteStmt = db.prepare("UPDATE lessons SET note = ?, updated_at = ? WHERE id = ?");
   const resolveLessonStmt = db.prepare(
     "UPDATE lessons SET status = ?, merge_sha = COALESCE(?, merge_sha), branch = COALESCE(?, branch), note = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?) WHERE id = ?",
   );
   const citeLessonStmt = db.prepare("UPDATE lessons SET hits = ?, last_cited_at = ?, cited_bindings = ?, updated_at = ? WHERE id = ?");
   const correctLessonStmt = db.prepare("UPDATE lessons SET corrections = corrections + 1, updated_at = ? WHERE id = ?");
+  const setLessonTierStmt = db.prepare("UPDATE lessons SET tier = ?, tier_at = ?, updated_at = ? WHERE id = ?");
+  const setLessonClusterStmt = db.prepare("UPDATE lessons SET cluster_key = ?, updated_at = ? WHERE id = ?");
+  const setLessonSupersededStmt = db.prepare("UPDATE lessons SET superseded_by = ?, updated_at = ? WHERE id = ?");
+  const lessonsByTierStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND tier = ? ORDER BY created_at");
   const setEscalationCitationsStmt = db.prepare("UPDATE escalations SET cited_lessons = ? WHERE id = ?");
   const markEscalationCorrectedStmt = db.prepare("UPDATE escalations SET corrections_counted = 1 WHERE id = ?");
 
@@ -1095,6 +1129,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     text: String(r.text),
     scope: lessonScope(r.scope),
     status: String(r.status) as LessonStatus,
+    tier: lessonTier(r.tier),
+    tierAt: r.tier_at === null || r.tier_at === undefined ? null : Number(r.tier_at),
+    clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
+    supersededBy: r.superseded_by === null || r.superseded_by === undefined ? null : String(r.superseded_by),
     branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
     mergeSha: r.merge_sha === null || r.merge_sha === undefined ? null : String(r.merge_sha),
     note: r.note === null || r.note === undefined ? null : String(r.note),
@@ -1696,7 +1734,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
      * user drops it. `branch` is the guidance branch it will be published on,
      * computed from the project steward's thread when it has one.
      */
-    addLesson(fields: { projectId: string; bindingId: string | null; escalationId: string | null; file: string; text: string; scope: LessonScope; branch: string | null }): Lesson {
+    addLesson(fields: { projectId: string; bindingId: string | null; escalationId: string | null; file: string; text: string; scope: LessonScope; branch: string | null; tier?: LessonTier; clusterKey?: string | null; supersedes?: string | null }): Lesson {
       const id = newId("lsn");
       const at = now();
       insertLesson.run({
@@ -1707,10 +1745,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
         file: fields.file,
         text: fields.text,
         scope: fields.scope,
+        tier: fields.tier ?? "trial",
+        tier_at: at,
+        cluster_key: fields.clusterKey ?? null,
+        superseded_by: null,
         branch: fields.branch,
         created_at: at,
         updated_at: at,
       });
+      if (fields.supersedes !== undefined && fields.supersedes !== null) setLessonSupersededStmt.run(id, at, fields.supersedes);
       return toLesson(getLesson.get(id)!);
     },
     lesson(id: string): Lesson | null {
@@ -1721,9 +1764,26 @@ export function createStore(db: Database.Database, now: () => number, options: S
     lessons(projectId: string, includeResolved = false): Lesson[] {
       return lessonsFor.all(projectId, includeResolved ? 1 : 0).map(toLesson);
     },
-    /** Lessons that reached `.bb` HEAD in the window, for the digest. */
-    mergedLessonsSince(projectId: string, since: number): Lesson[] {
-      return mergedLessonsSince.all(projectId, since).map(toLesson);
+    /** Every lesson of a project, whatever its file state: what the transitions read. */
+    allLessons(projectId: string): Lesson[] {
+      return db.prepare<[string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? ORDER BY created_at").all(projectId).map(toLesson);
+    },
+    /** The lessons in one tier, oldest first. */
+    lessonsByTier(projectId: string, tier: LessonTier): Lesson[] {
+      return lessonsByTierStmt.all(projectId, tier).map(toLesson);
+    },
+    /** Move a lesson to a tier, stamping when the move happened. */
+    setLessonTier(id: string, tier: LessonTier): void {
+      const at = now();
+      setLessonTierStmt.run(tier, at, at, id);
+    },
+    /** Record the cluster a repeat escalation belongs to (BB-35; filled by a later step). */
+    setLessonCluster(id: string, clusterKey: string | null): void {
+      setLessonClusterStmt.run(clusterKey, now(), id);
+    },
+    /** Name the lesson a newer one supersedes, so the next pass retires the older. */
+    setLessonSupersededBy(id: string, supersededBy: string | null): void {
+      setLessonSupersededStmt.run(supersededBy, now(), id);
     },
     /** Remember the guidance branch a lesson is published on. */
     setLessonBranch(id: string, branch: string): void {
@@ -1733,15 +1793,18 @@ export function createStore(db: Database.Database, now: () => number, options: S
     noteLesson(id: string, note: string | null): void {
       setLessonNoteStmt.run(note, now(), id);
     },
-    /** Mark a lesson merged, keeping any sha and branch already recorded. */
+    /** Mark a lesson merged, keeping any sha and branch already recorded. A retired lesson stays retired: a merge observed after the fact never resurrects it. */
     markLessonMerged(id: string, sha: string | null, branch: string | null, note: string | null = null): void {
       const at = now();
       resolveLessonStmt.run("merged", sha, branch, note, at, at, id);
+      const row = getLesson.get(id);
+      if (row !== undefined && lessonTier(row.tier) !== "retired") setLessonTierStmt.run("promoted", at, at, id);
     },
     /** Mark a lesson dropped by the user or the project steward. */
     markLessonDropped(id: string, note: string | null = null): void {
       const at = now();
       resolveLessonStmt.run("dropped", null, null, note, at, at, id);
+      setLessonTierStmt.run("retired", at, at, id);
     },
     /**
      * Record the lessons one decision cited (BB-35 step 2). A lesson's `hits`

@@ -5,6 +5,7 @@ import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
+import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS } from "./store.js";
@@ -5058,7 +5059,7 @@ describe("lessons", () => {
     await expect(t.tool("steward_update", { lesson: { text: lesson, file: "/etc/passwd", scope: "procedure" } }, t.project)).rejects.toThrow(/relative path/u);
 
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
-    expect(recorded).toMatchObject({ error: false, text: expect.stringMatching(/lesson lsn_\S+ recorded \(procedure\)/u) });
+    expect(recorded).toMatchObject({ error: false, text: expect.stringMatching(/lesson lsn_\S+ recorded \(procedure, trial\)/u) });
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     expect(t.hooks.store.lesson(id)).toMatchObject({
       bindingId: t.hooks.store.find("ENG-12")!.id,
@@ -5085,8 +5086,8 @@ describe("lessons", () => {
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done).toMatchObject({ error: false, text: expect.stringMatching(new RegExp(`${id}: merged at b{8}`, "u")) });
-    expect(t.mergeGuidanceCalls).toEqual([{ projectId: "p1", threadId: t.project, file: "AGENTS.md", text: lesson }]);
-    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", mergeSha: "b".repeat(40), branch: `refs/heads/guidance-${t.project}` });
+    expect(t.mergeGuidanceCalls).toEqual([{ projectId: "p1", threadId: t.project, file: "AGENTS.md", text: withLessonAnchor(lesson, id) }]);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged", tier: "promoted", mergeSha: "b".repeat(40), branch: `refs/heads/guidance-${t.project}` });
   });
 
   it("a refused procedure merge leaves the lesson pending with the reason", async () => {
@@ -5150,7 +5151,7 @@ describe("lessons", () => {
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
   });
 
-  it("names a merged lesson, its sha, branch and source in the digest", async () => {
+  it("keeps the lessons section out of the digest", async () => {
     const t = await adopted();
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
@@ -5158,9 +5159,8 @@ describe("lessons", () => {
     await t.hooks.nightlyPass("p1", "2026-10-18");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
-    expect(wake).toContain("### Lessons landed");
-    expect(wake).toMatch(new RegExp(`- Merged lesson ${id} \\(procedure, AGENTS\\.md\\) at b{8} on refs/heads/guidance-${t.project} \\(from ${t.hooks.store.find("ENG-12")!.id}\\):`, "u"));
-    expect(wake).toContain(lesson);
+    expect(wake).not.toContain("### Lessons landed");
+    expect(wake).not.toContain("Lessons landed");
   });
 
   it("does not let one unreadable lesson file stop the others being checked", async () => {
@@ -5176,25 +5176,89 @@ describe("lessons", () => {
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "merged" });
   });
 
-  it("lists pending lessons in the nightly prompt, and the CLI shows and drops them", async () => {
+  it("lists trial lessons in the nightly prompt, and the CLI shows and drops them", async () => {
     const t = await adopted();
     const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
     const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
     await t.hooks.nightlyPass("p1", "2026-10-18");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
-    expect(wake).toContain("## Lessons pending");
+    expect(wake).toContain("## Lessons (trial)");
     expect(wake).toContain(lesson);
-    expect(wake).toMatch(/workspace_publish_guidance/u);
+    expect(wake).toMatch(new RegExp(`- ${id} \\(procedure, AGENTS\\.md\\)`, "u"));
 
     const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
     expect(list.stdout).toMatch(/Lessons pending \(1\)/u);
     expect(list.stdout).toContain(lesson);
     const lessons = await t.harness.behavior.runCli(["lessons", "--project", "p1"]);
     expect(lessons.stdout).toContain(id);
+    expect(lessons.stdout).toMatch(/trial/u);
     const dropped = await t.harness.behavior.runCli(["drop-lesson", id, "--project", "p1"]);
     expect(dropped.stdout).toMatch(new RegExp(`Dropped ${id}`, "u"));
-    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "dropped" });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "dropped", tier: "retired" });
+  });
+
+  it("promotes a trial lesson the nightly pass finds ready, and lands its anchored block", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    // Three distinct bindings cite it, which is the promotion's hit threshold.
+    for (const key of ["ENG-13", "ENG-14", "ENG-15"]) {
+      const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: key, entityKey: key, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+      t.hooks.store.recordCitations("p1", [id], b.id);
+    }
+    t.advance(15 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted", status: "pending" });
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain("## Lessons to land");
+    expect(wake).toContain(`<!-- lesson:${id} -->`);
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(t.mergeGuidanceCalls.at(-1)).toMatchObject({ file: "AGENTS.md", text: withLessonAnchor(lesson, id) });
+  });
+
+  it("retires an aged promoted lesson, and removes its anchored text through the same path", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted", status: "merged" });
+    t.advance(91 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "retired", status: "merged" });
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toContain("## Lessons to retire");
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "retire" } }, t.project);
+    expect(done).toMatchObject({ error: false, text: expect.stringMatching(/retired at/u) });
+    expect(t.mergeGuidanceCalls.at(-1)).toMatchObject({ file: "AGENTS.md", text: retiredLessonAnchor(id) });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "retired", status: "dropped" });
+  });
+
+  it("never puts a candidate lesson in a wake", async () => {
+    const t = await adopted();
+    const candidate = t.hooks.store.addLesson({ projectId: "p1", bindingId: null, escalationId: null, file: "AGENTS.md", text: "A candidate rule.", scope: "procedure", branch: null, tier: "candidate" });
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).not.toContain(candidate.id);
+    expect(wake).not.toContain("A candidate rule.");
+  });
+
+  it("refuses the project file as a lesson's target, so a lesson cannot widen the decide list (BB-35 limit 1)", async () => {
+    const t = await adopted();
+    await expect(t.tool("steward_update", { lesson: { text: "Move every kind to the project.", file: "stewards/project.json", scope: "procedure" } }, t.project)).rejects.toThrow(/project file/u);
+  });
+
+  it("never lands a retired lesson", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.hooks.store.setLessonTier(id, "retired");
+    const out = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(out).toMatchObject({ error: true, text: expect.stringMatching(/retired/u) });
+    expect(t.mergeGuidanceCalls).toEqual([]);
   });
 });
 

@@ -1285,6 +1285,38 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   Only the owner's own words, or this project's steward or worker threads,
   may create, cite or correct a lesson; a signed or non-owner comment never
   does.
+- **Tiers and transitions (BB-35 step 3).** Every lesson carries a `tier`:
+  `candidate` (store only, never in a wake) → `trial` (in the store, injected
+  into steward and project steward wakes under `## Lessons (trial)` with its
+  id) → `promoted` (committed to `.bb` with a `<!-- lesson:<id> -->` anchor) →
+  `retired` (removed from the file; the row kept). The old `status` column is
+  kept and still tracks the file state (`pending`, `merged`, `dropped`); the
+  migration maps `pending` → `trial`, `merged` → `promoted`, `dropped` →
+  `retired`, once and idempotently. The nightly pass (and every sweep) applies
+  the thresholds under `lessons` in `project.json`, with the design's defaults
+  when the key is absent: trial → promoted at 3 distinct-binding hits, 0
+  corrections and ≥ 14 days in trial; trial → retired at 30 days uncited or
+  any correction; promoted → retired at 90 days uncited or 2 corrections; any
+  lesson → retired when a newer one in the same file supersedes it. A
+  citation's weight halves every `decayHalfLifeDays`, so the lowest-scoring
+  promoted lesson is the one displaced when a file is at `promoted.maxPerFile`.
+  A lesson is `trial` from the moment the project steward records it; the
+  nightly pass is what moves it. The thresholds and caps are the whole
+  mechanism — no model judges a tier.
+- **The promotion and retirement write only the lesson's own anchored text.**
+  A promotion the nightly pass queues is listed under `## Lessons to land`;
+  the project steward adds the block (`<!-- lesson:<id> -->` and the wording)
+  to the named file, commits, publishes with `workspace_publish_guidance`, and
+  completes it. A retirement is listed under `## Lessons to retire`; the
+  project steward replaces the block with `<!-- lesson:<id> retired -->` and
+  publishes, then `steward_update { lessonAction: { action: "retire" } }`
+  fast-forwards the canonical checkout. The same multi-repo guard applies both
+  ways: only the lesson's own file may change, and it must carry the anchor the
+  call names. A lesson's `file` may never be `stewards/project.json`, so a
+  lesson can never move a big decision to the project, loosen the
+  pull-request gate or relax an approval; the decide list, `bigDecisions` and
+  `prGate` are outside a lesson's reach by construction. A boundary-scope
+  lesson still becomes a Merge/Drop item for the user.
 - **Procedure lessons self-merge.** Playbook procedure, sequencing and
   conventions are what the project steward may already decide. It applies
   the text to the file in its `.bb` checkout, commits, and publishes with
@@ -1314,24 +1346,26 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   and the revert below cover.
 - **Status is observed, not assumed.** Every sweep and nightly pass reads
   each pending lesson's file at `.bb` HEAD and marks it `merged` when the
-  normalised text is there, however it got there. `dropped` is set by the
-  user's Drop button, the project steward's `drop` action, or
+  anchored text is there, however it got there; a retired lesson is skipped so
+  an observation never resurrects it. `dropped` is set by the user's Drop
+  button, the project steward's `drop` action, a retirement, or
   `bb stewards drop-lesson <id>`.
 - **The nightly prompt and the digest.** The project steward's nightly wake
-  lists the pending lessons and asks it to apply, commit, publish and
-  complete them, with the last refusal reason where one was refused. The
-  digest lists the lessons that landed in the window with their sha, file
-  and source binding/escalation, and names the branch.
+  lists the trial lessons to decide from, the promoted ones queued to land and
+  the retired ones to remove, with the last refusal reason where one was
+  refused. The digest carries nothing about lessons: the merged-lessons
+  section is gone, and `bb stewards lessons --all` is where their state is
+  read.
 - **Surfaces.** Pending lessons are on the Stewards page's Lessons section
   and in `bb stewards list`; `bb stewards lessons [--all]` lists them,
   `bb stewards drop-lesson <id>` drops one.
 - **Undo.** A merged procedure lesson is an ordinary commit on `.bb` HEAD;
   `bb stewards lessons --all` names its `mergeSha` and branch. To undo it,
   revert that commit in the canonical checkout (`git revert <sha>` in the
-  project's `.bb`, then push) or edit the wording out and let the next pass
-  see it gone; the lesson row stays `merged` until it is dropped, which only
-  closes the record, not the file. A boundary lesson is undone the same way
-  once the user has merged it.
+  project's `.bb`, then push), or let the nightly pass retire it once it is
+  uncited for `promoted.retireDays` and remove the anchored block through
+  `## Lessons to retire`. The row is kept with `tier: retired` either way. A
+  boundary lesson is undone the same way once the user has merged it.
 
 ## 21. The sidebar thread list
 
