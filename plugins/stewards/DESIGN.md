@@ -1491,9 +1491,10 @@ page does not already make.
 
 **One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
 })` builds the board's `questions`, `withUser` and `needs` lists in one place;
-the board calls it unfiltered and the sidebar calls it with `actionableOnly`,
-so the two surfaces cannot drift and a non-actionable need is on the page but
-not in the sidebar's count or items. `stewardsSidebar` carries, per project,
+the board calls it unfiltered, the sidebar calls it with `actionableOnly`, and
+`bb stewards needs` prints it, so the surfaces cannot drift and a non-actionable
+need is on the page but not in the sidebar's count or items. `stewardsSidebar`
+carries, per project,
 `needs: { count, items }` with the same row shapes, each tagged
 `question`/`withUser`/`need` so the app knows how to render the row and which
 one-click action it carries.

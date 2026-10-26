@@ -4077,6 +4077,90 @@ describe("needs you items", () => {
   });
 });
 
+// BB-69: the CLI lists the same "waiting on you" set the Stewards page and the
+// sidebar do, in the same order: open questions, with-user escalations, needs.
+describe("bb stewards needs lists the needsYou set (BB-69)", () => {
+  type BoardView = { questions: Array<{ id: string }>; withUser: Array<{ id: string }>; needs: Array<{ id: string }> };
+
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const binding = () => t.hooks.store.find("ENG-12", "p1")!;
+    const board = async () => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: BoardView }).board;
+    const cli = async () => (await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout;
+    return { ...t, binding, board, cli };
+  }
+
+  it("prints an open question before a need, with its choices and the done command", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Merge or close?", context: null, choices: ["Merge", "Close"] });
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const out = await t.cli();
+    expect(out).toContain(question.id);
+    expect(out).toContain(need.id);
+    // The question comes first.
+    expect(out.indexOf(question.id)).toBeLessThan(out.indexOf(need.id));
+    expect(out).toMatch(new RegExp(`${question.id} — question, ENG-12: Merge or close\\? \\[choices: Merge, Close\\] — bb stewards done ${question.id} --choice "<label>"`, "u"));
+    expect(out).toContain(`${need.id} — configure, ENG-12: Enable the flag — bb stewards done ${need.id}`);
+  });
+
+  it("prints an uncovered with-user escalation between the question and the need", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const out = await t.cli();
+    expect(out.indexOf(question.id)).toBeLessThan(out.indexOf(escalation.id));
+    expect(out.indexOf(escalation.id)).toBeLessThan(out.indexOf(need.id));
+    expect(out).toContain(`${escalation.id} — approval escalation, ENG-12: Approve the spec? — bb stewards done ${escalation.id}`);
+  });
+
+  it("equals the set and order the board's needsYou returns", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const view = await t.board();
+    const expected = [...view.questions, ...view.withUser, ...view.needs].map((x) => x.id);
+    const printed = (await t.cli()).split("\n").map((line) => line.split(" — ")[0]);
+    expect(printed).toEqual(expected);
+  });
+
+  it("extends the old needs array with questions and with-user escalations in --json", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const parsed = JSON.parse((await t.harness.behavior.runCli(["needs", "--project", "p1", "--json"])).stdout) as { questions: Array<{ id: string }>; withUser: Array<{ id: string }>; needs: Array<{ id: string }> };
+    expect(Object.keys(parsed).sort()).toEqual(["needs", "questions", "withUser"]);
+    expect(parsed.questions.map((q) => q.id)).toEqual([question.id]);
+    expect(parsed.withUser.map((x) => x.id)).toEqual([escalation.id]);
+    expect(parsed.needs.map((n) => n.id)).toEqual([need.id]);
+    // `--all` keeps the old array of every need.
+    const all = JSON.parse((await t.harness.behavior.runCli(["needs", "--all", "--project", "p1", "--json"])).stdout) as unknown;
+    expect(Array.isArray(all)).toBe(true);
+  });
+
+  it("the printed done command closes the question and the escalation it names", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const out = await t.cli();
+    expect(out).toContain(`bb stewards done ${question.id}`);
+    expect(out).toContain(`bb stewards done ${escalation.id}`);
+    expect((await t.harness.behavior.runCli(["done", question.id, "--project", "p1"])).exitCode).toBe(0);
+    expect(t.hooks.store.question(question.id)!.status).toBe("answered");
+    expect((await t.harness.behavior.runCli(["done", escalation.id, "--project", "p1"])).exitCode).toBe(0);
+    expect(t.hooks.store.escalation(escalation.id)!.status).toBe("resolved");
+  });
+});
+
 // BB-20: a decide item or forwarded decision question can carry fixed
 // choices, so the page shows a button each instead of asking for a word.
 describe("fixed choices on decide items and questions", () => {
