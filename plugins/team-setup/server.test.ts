@@ -385,6 +385,13 @@ describe("Figma step", () => {
     expect((await status()).steps.figma).toBe("done");
   });
 
+  it("caches the machine state so a poll does not repeat the host check", async () => {
+    const { status, hostCalls } = await setup({ hosts: [{ name: "box" }] });
+    await status();
+    await status();
+    expect(hostCalls.filter((call) => call.method === "state")).toHaveLength(1);
+  });
+
   it("starts a sign-in on the connected machine and proxies completion", async () => {
     const { harness, hostCalls, status } = await setup({ hosts: [{ id: "h1", name: "box" }] });
     expect(await harness.callRpc("figmaSignIn", null)).toEqual({ url: "https://www.figma.com/oauth/mcp?response_type=code", port: 53280 });

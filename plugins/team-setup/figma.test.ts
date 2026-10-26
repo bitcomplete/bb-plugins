@@ -81,14 +81,15 @@ interface Fake {
   started: FakeHandle[];
 }
 
-function fakeRunner(get: Partial<FigmaResult> = {}): Fake {
+function fakeRunner(get: Partial<FigmaResult> = {}, add: Partial<FigmaResult> = {}): Fake {
   const runs: Fake["runs"] = [];
   const started: FakeHandle[] = [];
   const runner: FigmaRunner = {
     run: vi.fn(async (args: string[], timeoutMs: number) => {
       runs.push({ args, timeoutMs });
       if (args[0] === "mcp" && args[1] === "get") return { exitCode: 0, stdout: "", stderr: "", missing: false, ...get };
-      return { exitCode: 0, stdout: "MCP server figma added", stderr: "", missing: false };
+      if (args[0] === "mcp" && args[1] === "add") return { exitCode: 0, stdout: "MCP server figma added", stderr: "", missing: false, ...add };
+      return { exitCode: 0, stdout: "", stderr: "", missing: false };
     }),
     startLogin: vi.fn((): FigmaProcess => {
       const listeners: Array<(chunk: string) => void> = [];
@@ -156,11 +157,36 @@ describe("the Figma host entry", () => {
     const fake = fakeRunner();
     const host = createHarness(fake, vi.fn());
     expect(await startSignIn(fake, host)).toEqual({ url: AUTH_URL, port: 53280 });
-    expect(fake.runs[0].args).toEqual(["mcp", "add", "--transport", "http", "--scope", "user", "--callback-port", "53280", "figma", "https://mcp.figma.com/mcp"]);
+    expect(fake.runs.find((run) => run.args[1] === "add")?.args).toEqual(["mcp", "add", "--transport", "http", "--scope", "user", "--callback-port", "53280", "figma", "https://mcp.figma.com/mcp"]);
     expect(host.experimental_getRetainedWorkerLeaseCount()).toBe(1);
     expect(await host.experimental_call("start", null)).toEqual({ url: AUTH_URL, port: 53280 });
     expect(fake.started).toHaveLength(1);
     expect(await host.experimental_call("state", null)).toMatchObject({ pending: true, url: AUTH_URL });
+    await host.experimental_dispose();
+  });
+
+  it("reuses an existing Figma server instead of re-adding it", async () => {
+    const fake = fakeRunner({ stdout: "figma:\n  Scope: User config\n  Status: ! Needs authentication\n  URL: https://mcp.figma.com/mcp\n" });
+    const host = createHarness(fake, vi.fn());
+    await startSignIn(fake, host);
+    expect(fake.runs.some((run) => run.args[1] === "add")).toBe(false);
+    expect(fake.runs.some((run) => run.args[1] === "remove")).toBe(false);
+    await host.experimental_dispose();
+  });
+
+  it("replaces a figma server configured at another URL", async () => {
+    const fake = fakeRunner({ stdout: "figma:\n  Scope: User config\n  Status: ! Needs authentication\n  URL: https://example.com/mcp\n" });
+    const host = createHarness(fake, vi.fn());
+    await startSignIn(fake, host);
+    expect(fake.runs.find((run) => run.args[1] === "remove")?.args).toEqual(["mcp", "remove", "figma", "-s", "user"]);
+    expect(fake.runs.some((run) => run.args[1] === "add")).toBe(true);
+    await host.experimental_dispose();
+  });
+
+  it("tolerates an add that reports the server already exists", async () => {
+    const fake = fakeRunner({}, { exitCode: 1, stderr: "MCP server figma already exists in user config" });
+    const host = createHarness(fake, vi.fn());
+    expect(await startSignIn(fake, host)).toEqual({ url: AUTH_URL, port: 53280 });
     await host.experimental_dispose();
   });
 

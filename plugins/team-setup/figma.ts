@@ -321,6 +321,29 @@ export function createFigmaHostEntry(deps: FigmaHostDeps) {
     entry.lease.dispose();
   }
 
+  // `claude mcp add` refuses a server that already exists (exit 1, "already
+  // exists in user config"), so a retry after a cancel or a failed sign-in must
+  // not re-add blindly. Read the existing config back: an entry already at our
+  // URL is left alone, anything else named figma is replaced so the sign-in is
+  // against Figma's server. Removing a differently-configured entry only drops
+  // credentials for the wrong server, and the step is only offered while it is
+  // not signed in.
+  async function ensureConfigured(): Promise<void> {
+    const existing = await deps.runner.run(["mcp", "get", FIGMA_SERVER_NAME], getTimeoutMs);
+    if (existing.missing) throw new Error("claude is not installed on this machine.");
+    const output = `${existing.stdout}\n${existing.stderr}`;
+    if (existing.exitCode === 0 && existing.stdout.includes(FIGMA_SERVER_URL)) return;
+    if (!/No MCP server named/iu.test(output)) {
+      await deps.runner.run(["mcp", "remove", FIGMA_SERVER_NAME, "-s", "user"], addTimeoutMs);
+    }
+    const added = await deps.runner.run(
+      ["mcp", "add", "--transport", "http", "--scope", "user", "--callback-port", String(FIGMA_CALLBACK_PORT), FIGMA_SERVER_NAME, FIGMA_SERVER_URL],
+      addTimeoutMs,
+    );
+    if (added.missing) throw new Error("claude is not installed on this machine.");
+    if (added.exitCode !== 0 && !/already exists/iu.test(added.stderr)) throw new Error(tail(added.stderr) || `claude mcp add exited with ${added.exitCode}`);
+  }
+
   return experimental_defineHostEntry({
     contract: figmaHostContract,
     handlers: {
@@ -338,12 +361,7 @@ export function createFigmaHostEntry(deps: FigmaHostDeps) {
 
       async start(_input, context) {
         if (pending !== null) return { url: pending.url, port: pending.port };
-        const added = await deps.runner.run(
-          ["mcp", "add", "--transport", "http", "--scope", "user", "--callback-port", String(FIGMA_CALLBACK_PORT), FIGMA_SERVER_NAME, FIGMA_SERVER_URL],
-          addTimeoutMs,
-        );
-        if (added.missing) throw new Error("claude is not installed on this machine.");
-        if (added.exitCode !== 0) throw new Error(tail(added.stderr) || `claude mcp add exited with ${added.exitCode}`);
+        await ensureConfigured();
         const process = deps.runner.startLogin();
         const authorization = await waitForAuthorization(process, startTimeoutMs);
         const entry: Pending = {
@@ -352,7 +370,9 @@ export function createFigmaHostEntry(deps: FigmaHostDeps) {
           port: authorization.port,
           state: authorization.state,
           lease: context.experimental_retainWorker(),
-          timer: setTimeout(() => clearPending(true), ttlMs),
+          timer: setTimeout(() => {
+            if (pending === entry) clearPending(true);
+          }, ttlMs),
         };
         pending = entry;
         void process.exited.then(() => {
@@ -373,7 +393,7 @@ export function createFigmaHostEntry(deps: FigmaHostDeps) {
           return { ok: false, message: `Could not reach the sign-in listener on this machine: ${errorMessage(error)}` };
         }
         const result = await waitForExit(entry.process.exited, completeTimeoutMs);
-        if (pending === entry) clearPending(false);
+        if (pending === entry) clearPending(result === null);
         if (result === null) return { ok: false, message: "The sign-in did not finish in time. Start it again." };
         if (result.exitCode === 0) return { ok: true, message: null };
         return { ok: false, message: tail(result.stderr || result.stdout) || `claude mcp login exited with ${result.exitCode}` };
