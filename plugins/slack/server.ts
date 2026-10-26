@@ -8,7 +8,7 @@
 // "Slack agent"): the settings page sends the browser to Slack through the
 // service, the callback below runs on this developer's own server, and the
 // exchange happens in bb-gate-hooks, which holds the OAuth client secret. The
-// user token that comes back is stored in a secret setting and presented at
+// user token that comes back is stored in plugin storage and presented at
 // `/v1/identify`; the service binds the Slack user to this server's stream.
 import { randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -314,7 +314,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- identity ----------------------------------------------------------
     //
     // The token is the developer's own "Sign in with Slack" token and lives in
-    // a secret setting. The name bb-gate-hooks answered with is in kv, for the
+    // plugin storage. The name bb-gate-hooks answered with is in kv, for the
     // settings page; it is never the token.
 
     const parsedIdentity = identityRecord.safeParse(await bb.storage.kv.get(IDENTITY_KEY));
@@ -413,8 +413,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       now: deps.now,
       log: bb.log,
       identity: () => {
-        // The loop calls this synchronously on a hello, before settings can be
-        // awaited; the cached token is kept in step by the settings listener.
+        // The loop calls this synchronously on a hello, before storage can be
+        // awaited; the cached token is kept in step by the explicit writes
+        // (sign-in, sign-out, a refused token).
         return cachedToken;
       },
       onSession: (event) => onSession(event),
