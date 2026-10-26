@@ -44,16 +44,32 @@ interface World {
   pool?: unknown;
   devbox?: unknown;
   linear?: unknown;
-  hosts?: Array<{ name: string }>;
+  hosts?: Array<{ id?: string; name: string; status?: string }>;
+  figmaHost?: { claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null; message: string | null };
+  figmaComplete?: { ok: boolean; message: string | null };
   runs?: Record<string, GhResult>;
   settings?: Record<string, string>;
   env?: Record<string, string | undefined>;
   setVariable?: (input: { name: string; value: string; note: string | null }) => Promise<unknown>;
 }
 
+const FIGMA_OPTIONAL = { claude: true, configured: false, authenticated: false, pending: false, url: null, message: null };
+
 async function setup(world: World = {}) {
   const gh = fakeGh(world.runs);
-  const { bb, harness } = createFakePluginHost({ pluginId: "team-setup", settings: world.settings ?? {} });
+  const hostCalls: Array<{ method: string; input: unknown; hostId: string }> = [];
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "team-setup",
+    settings: world.settings ?? {},
+    experimental_callHostRpc: (call) => {
+      hostCalls.push({ method: call.method, input: call.input, hostId: call.hostId });
+      if (call.method === "state") return world.figmaHost ?? FIGMA_OPTIONAL;
+      if (call.method === "start") return { url: "https://www.figma.com/oauth/mcp?response_type=code", port: 53280 };
+      if (call.method === "complete") return world.figmaComplete ?? { ok: true, message: null };
+      if (call.method === "cancel") return { ok: true };
+      throw new Error(`no answer for host ${call.method}`);
+    },
+  });
   harness.sdk.stub("plugins.list", async () => ({
     plugins: (world.plugins ?? [{ id: ACCOUNT_POOL_ID, enabled: true }, { id: DEVBOX_ID, enabled: true }, { id: LINEAR_ID, enabled: true }]).map((p) => ({ ...p, name: p.id })),
   }));
@@ -61,7 +77,7 @@ async function setup(world: World = {}) {
     builtInGit: world.builtInGit ?? { status: "not logged in", statusMessage: "gh is not logged in on the server" },
     variables: [],
   }));
-  harness.sdk.stub("hosts.list", async () => world.hosts ?? []);
+  harness.sdk.stub("hosts.list", async () => (world.hosts ?? []).map((host, index) => ({ id: host.id ?? `host-${index}`, name: host.name, status: host.status ?? "connected" })));
   const setVariables: Array<{ name: string; value: string; note: string | null }> = [];
   harness.sdk.stub("system.setMachineEnvironmentVariable", async (input: { name: string; value: string; note: string | null }) => {
     setVariables.push(input);
@@ -96,7 +112,7 @@ async function setup(world: World = {}) {
   let now = 1_000_000;
   await createTeamSetupPlugin({ gh: gh.runner, now: () => now, env: world.env ?? {} })(bb);
   const status = async () => (await harness.callRpc("status", null)) as Awaited<ReturnType<typeof statusType>>;
-  return { bb, harness, gh, rpcCalls, status, setVariables, advance: (ms: number) => (now += ms) };
+  return { bb, harness, gh, rpcCalls, hostCalls, status, setVariables, advance: (ms: number) => (now += ms) };
 }
 // Only for the inferred return type above.
 declare function statusType(): Promise<{
@@ -104,8 +120,9 @@ declare function statusType(): Promise<{
   github: { status: string; login: string | null; orgMember: boolean | null; pending: { code: string; url: string } | null; lastError: string | null };
   devbox: { available: boolean; connected: boolean; project: string | null; message: string | null };
   linear: { available: boolean; connected: boolean; configured: boolean; user: string | null; organization: string | null; message: string | null };
+  figma: { available: boolean; message: string | null; machine: string | null; claude: boolean; configured: boolean; authenticated: boolean; pending: boolean; url: string | null };
   machines: { names: string[] };
-  steps: { ai: string; github: string; devbox: string; linear: string; machine: string };
+  steps: { ai: string; github: string; devbox: string; linear: string; figma: string; machine: string };
   complete: boolean;
 }>;
 
@@ -118,7 +135,7 @@ describe("status", () => {
   it("starts with everything to do", async () => {
     const { status } = await setup();
     const s = await status();
-    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", machine: "todo" });
+    expect(s.steps).toEqual({ ai: "todo", github: "todo", devbox: "todo", linear: "optional", figma: "unavailable", machine: "todo" });
     expect(s.complete).toBe(false);
     expect(s.github.login).toBeNull();
   });
@@ -133,7 +150,7 @@ describe("status", () => {
       runs: signedIn,
     });
     const s = await status();
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", linear: "done", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "done", linear: "done", figma: "optional", machine: "done" });
     expect(s.complete).toBe(true);
     expect(s.linear).toMatchObject({ connected: true, user: "jane", organization: "Acme" });
     expect(s.github.login).toBe("octocat");
@@ -160,7 +177,7 @@ describe("status", () => {
     const s = await status();
     expect(s.devbox.available).toBe(false);
     expect(s.devbox.message).toContain("turned off");
-    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", machine: "done" });
+    expect(s.steps).toEqual({ ai: "done", github: "done", devbox: "unavailable", linear: "unavailable", figma: "optional", machine: "done" });
     expect(s.complete).toBe(true);
   });
 
@@ -316,6 +333,76 @@ describe("Account Pool and devbox flows", () => {
     expect(s.ai.message).toContain("boom");
     expect(s.devbox.available).toBe(false);
     expect(s.linear.available).toBe(false);
+  });
+});
+
+describe("Figma step", () => {
+  it("is unavailable until a machine is connected", async () => {
+    const { status } = await setup();
+    const s = await status();
+    expect(s.steps.figma).toBe("unavailable");
+    expect(s.figma).toMatchObject({ available: false, machine: null });
+    expect(s.figma.message).toContain("No machine");
+  });
+
+  it("is unavailable when claude is not on the machine", async () => {
+    const { status } = await setup({ hosts: [{ name: "box" }], figmaHost: { claude: false, configured: false, authenticated: false, pending: false, url: null, message: "claude is not installed on this machine." } });
+    const s = await status();
+    expect(s.steps.figma).toBe("unavailable");
+    expect(s.figma).toMatchObject({ available: false, machine: "box", claude: false });
+    expect(s.figma.message).toContain("claude is not installed");
+  });
+
+  it("is optional before Figma is configured, so a server that never uses it stays complete", async () => {
+    const { status } = await setup({
+      builtInGit: { status: "logged in", statusMessage: "ok" },
+      pool: { routing: { claude: true, codex: false }, accounts: [{ id: "a", provider: "claude", label: "me", enabled: true, status: "ready" }] },
+      devbox: { connected: true, project: "dylan" },
+      linear: { connected: true, configured: true, user: { id: "u1", name: "jane", email: null }, organization: { name: "Acme", urlKey: "acme" } },
+      hosts: [{ name: "box" }],
+      runs: signedIn,
+    });
+    const s = await status();
+    expect(s.steps.figma).toBe("optional");
+    expect(s.figma).toMatchObject({ available: true, machine: "box", claude: true, configured: false, authenticated: false });
+    expect(s.complete).toBe(true);
+  });
+
+  it("is a to-do once configured but not signed in", async () => {
+    const { status } = await setup({ hosts: [{ name: "box" }], figmaHost: { claude: true, configured: true, authenticated: false, pending: false, url: null, message: null } });
+    expect((await status()).steps.figma).toBe("todo");
+  });
+
+  it("is a to-do while a sign-in waits for its callback", async () => {
+    const { status } = await setup({ hosts: [{ name: "box" }], figmaHost: { claude: true, configured: true, authenticated: false, pending: true, url: "https://www.figma.com/oauth/mcp?x", message: null } });
+    const s = await status();
+    expect(s.steps.figma).toBe("todo");
+    expect(s.figma.url).toBe("https://www.figma.com/oauth/mcp?x");
+  });
+
+  it("is done once Claude Code is signed in", async () => {
+    const { status } = await setup({ hosts: [{ name: "box" }], figmaHost: { claude: true, configured: true, authenticated: true, pending: false, url: null, message: null } });
+    expect((await status()).steps.figma).toBe("done");
+  });
+
+  it("starts a sign-in on the connected machine and proxies completion", async () => {
+    const { harness, hostCalls, status } = await setup({ hosts: [{ id: "h1", name: "box" }] });
+    expect(await harness.callRpc("figmaSignIn", null)).toEqual({ url: "https://www.figma.com/oauth/mcp?response_type=code", port: 53280 });
+    expect(hostCalls[0]).toEqual({ method: "start", input: null, hostId: "h1" });
+    expect((await status()).figma.pending).toBe(true);
+    expect(await harness.callRpc("figmaComplete", { url: "http://localhost:53280/callback?code=c&state=s" })).toEqual({ ok: true, message: null });
+    expect(hostCalls.find((call) => call.method === "complete")).toMatchObject({ hostId: "h1", input: { url: "http://localhost:53280/callback?code=c&state=s" } });
+    expect(await harness.callRpc("figmaCancel", null)).toEqual({ ok: true });
+  });
+
+  it("passes a rejected callback back to the page", async () => {
+    const { harness } = await setup({ hosts: [{ name: "box" }], figmaComplete: { ok: false, message: "The callback URL has no code in it." } });
+    expect(await harness.callRpc("figmaComplete", { url: "http://localhost:53280/callback" })).toEqual({ ok: false, message: "The callback URL has no code in it." });
+  });
+
+  it("fails the sign-in when no machine is connected", async () => {
+    const { harness } = await setup();
+    await expect(harness.callRpc("figmaSignIn", null)).rejects.toThrow(/No machine/u);
   });
 });
 

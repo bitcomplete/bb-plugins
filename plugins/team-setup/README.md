@@ -12,6 +12,7 @@ none do, what is set up. The full checklist never renders on the home page.
 | GitHub | gh on the server host, read by bb core | The built-in GitHub row in Environment variables is "logged in" (or overridden by your own `GH_TOKEN`) | Runs `gh auth login --web` on the server, shows the device code, waits for GitHub to approve it. |
 | devbox | devbox-provider | Connected | Starts devbox-provider's connect; its callback finishes it. |
 | Linear | linear | Connected. Optional: a server without it is still complete (unavailable until the server has an OAuth client ID) | Starts the linear plugin's connect; its callback finishes it. |
+| Figma | Claude Code on the developer's machine | `figma` is configured at user scope and signed in. Optional: a server that never configures it is still complete (unavailable with no machine, or no `claude` on it) | Runs `claude mcp add --scope user` and `claude mcp login` on the machine, shows the authorization URL, and replays the pasted `http://localhost:<port>/callback` URL against Claude Code's listener. |
 | A machine | bb | Any machine exists | Links to Devbox machines. |
 
 The GitHub step is the point. bb core forwards the server host's gh login to
@@ -26,8 +27,38 @@ No credential passes through this plugin: Claude and Codex tokens go to
 Account Pool through its RPCs, the devbox token to devbox-provider, the
 Linear tokens to the linear plugin, and the GitHub token to gh's own file.
 
+## Figma
+
+Figma hosts a remote MCP server at `https://mcp.figma.com/mcp` that gives
+Claude Code design context from a pasted Figma link. It signs in with browser
+OAuth, and Claude Code's OAuth callback is a loopback listener on the machine
+that runs `claude` — behind bb-gate, the developer's devbox, which has no
+browser. The Figma step closes that gap the way the GitHub step closes the
+terminal gap for `gh auth login`.
+
+The step acts on the primary connected machine through this plugin's host
+entry (`host.ts`), which runs where Claude Code does. It pins
+`oauth.callbackPort` with `claude mcp add --transport http --scope user`, then
+starts `claude mcp login` and shows the authorization URL. The developer opens
+that URL on their laptop and approves it; the browser lands on a dead
+`http://localhost:<port>/callback?code=…` page, and they paste that address
+back into the step. The plugin replays it against Claude Code's own loopback
+listener. Only the one-time code passes through the plugin, and it is useless
+without the PKCE verifier held by Claude Code; the OAuth token lands in Claude
+Code's own store on the machine and is never read by bb.
+
+`claude mcp login` refuses to run without a terminal (it offers the
+paste-the-redirect-URL prompt), so the host entry starts it under `script`,
+which provides a pseudo-terminal. The step is `optional` until Figma is
+configured, `todo` once it is configured or a sign-in is waiting, `done` once
+Claude Code is signed in, and `unavailable` when no machine is connected or
+`claude` is not on it. A server that never configures it is still complete.
+
+No credential passes through this plugin for Figma either: only the one-time
+authorization code, which the browser puts in the callback URL.
+
 The checklist polls only while its page is visible, every ten seconds, or
-every three while a GitHub sign-in is waiting for approval.
+every three while a GitHub or Figma sign-in is waiting for approval.
 
 ## Deployment-wide machine variables
 
