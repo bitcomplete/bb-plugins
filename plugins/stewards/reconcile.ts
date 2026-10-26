@@ -26,16 +26,45 @@ export type Change = { text: string; actionable: boolean; own?: boolean; byUser?
 export const workerInFlight = (w: Pick<Worker, "status">): boolean => w.status === "running" || w.status === "finished";
 export const anyWorkerInFlight = (workers: readonly Pick<Worker, "status">[]): boolean => workers.some(workerInFlight);
 
-/** A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the first line of a comment. */
-export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string };
+/**
+ * A reviewer's machine-readable verdict, as `pr-reviewer` posts it on the
+ * first line of a comment. `lane` is null when the marker did not name one
+ * (the gate then treats the pull request as the owner's).
+ */
+export type ReviewMarker = { round: number; sha: string; verdict: string; lane: string | null };
 
-const REVIEW_MARKER = /^<!--\s*bb-review\s+round=(\d+)\s+sha=(\S+)\s+verdict=(\S+)\s+lane=(\S+)\s*-->/u;
+const REVIEW_MARKER = /^<!--\s*bb-review\b([^>]*?)-->/u;
 
-/** The reviewer's marker on a comment, or null for any other comment. */
+/** The verdict a marker without `verdict=` is read as: never `approved`. */
+export const UNREADABLE_VERDICT = "unreadable";
+
+/**
+ * The reviewer's marker on a comment, or null for any other comment. Any
+ * first line that opens a `bb-review` comment is a marker, however it is
+ * spelled: a round whose keys are missing or misspelled still closes the
+ * gate, because the alternative is to read the previous round's `approved`
+ * as the latest word. A missing `verdict=` is read from a bare word in the
+ * marker (`changes-requested`) and otherwise is `unreadable`; neither is
+ * `approved`.
+ */
 export function reviewMarker(body: string): ReviewMarker | null {
   const first = body.split("\n", 1)[0]!.trim();
   const m = REVIEW_MARKER.exec(first);
-  return m === null ? null : { round: Number(m[1]), sha: m[2]!, verdict: m[3]!, lane: m[4]! };
+  if (m === null) return null;
+  const keyed = new Map<string, string>();
+  const bare: string[] = [];
+  for (const token of m[1]!.trim().split(/\s+/u).filter((t) => t !== "")) {
+    const eq = token.indexOf("=");
+    if (eq > 0) keyed.set(token.slice(0, eq).toLowerCase(), token.slice(eq + 1));
+    else bare.push(token);
+  }
+  const round = Number(keyed.get("round") ?? "");
+  return {
+    round: Number.isInteger(round) && round > 0 ? round : 0,
+    sha: keyed.get("sha") ?? "",
+    verdict: keyed.get("verdict") ?? bare[0] ?? UNREADABLE_VERDICT,
+    lane: keyed.get("lane") ?? null,
+  };
 }
 
 /** The newest reviewer marker in a comment list, by comment time. */
@@ -59,7 +88,7 @@ export function latestReviewMarker(comments: readonly SnapshotComment[]): Review
 export function markerLaneChange(before: readonly SnapshotComment[], after: readonly SnapshotComment[]): { from: string; to: string } | null {
   const b = latestReviewMarker(before);
   const a = latestReviewMarker(after);
-  if (b === null || a === null || b.lane === a.lane) return null;
+  if (b === null || a === null || b.lane === null || a.lane === null || b.lane === a.lane) return null;
   return { from: b.lane, to: a.lane };
 }
 

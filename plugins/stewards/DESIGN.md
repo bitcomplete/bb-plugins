@@ -1116,7 +1116,13 @@ The rules that hold:
   connected user, or, for an entry the decide list marks `project`, a
   project-steward approval recorded in the store and bound to the head sha
   (BB-30); a signed comment is a thread's, never the owner's. An unknown
-  lane is owner-reviewed, not no-review. The merge
+  lane is owner-reviewed, not no-review. Any comment whose first line opens
+  a `bb-review` marker is a round, however it is spelled: a marker missing
+  `verdict=` reads its verdict from a bare word (`changes-requested`) or as
+  `unreadable`, and one missing `lane=` is the owner's, so a malformed later
+  round closes the gate rather than leaving an earlier `approved` as the
+  latest word (bb-plugins#88 asked the owner to approve a head the reviewer
+  had just rejected that way). The merge
   button, the item the plugin files and the wake's "Lane gate" line all read
   it, so a steward is told whether a pull request's gate is met in the same
   words the button acts on.
