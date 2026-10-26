@@ -1465,6 +1465,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function showSteward(b: Binding): Promise<void> {
       if (b.threadId === null) return;
       const info = await threadInfo(b.threadId).catch(() => null);
+      // Already visible: nothing to show and no write to spend. This runs on
+      // every worker registration and turn, so the common case is a no-op. A
+      // lookup that failed is unknown, so the write is still attempted.
+      if (info !== null && info.visibility === "visible") return;
       const wasHidden = info !== null && info.visibility === "hidden";
       await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId: b.threadId!, visibility: "visible" }));
       if (wasHidden) await cascadeVisibility(b, "visible");
