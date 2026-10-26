@@ -4129,6 +4129,36 @@ describe("bb stewards needs lists the needsYou set (BB-69)", () => {
     const printed = (await t.cli()).split("\n").map((line) => line.split(" — ")[0]);
     expect(printed).toEqual(expected);
   });
+
+  it("extends the old needs array with questions and with-user escalations in --json", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const need = t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+    const parsed = JSON.parse((await t.harness.behavior.runCli(["needs", "--project", "p1", "--json"])).stdout) as { questions: Array<{ id: string }>; withUser: Array<{ id: string }>; needs: Array<{ id: string }> };
+    expect(Object.keys(parsed).sort()).toEqual(["needs", "questions", "withUser"]);
+    expect(parsed.questions.map((q) => q.id)).toEqual([question.id]);
+    expect(parsed.withUser.map((x) => x.id)).toEqual([escalation.id]);
+    expect(parsed.needs.map((n) => n.id)).toEqual([need.id]);
+    // `--all` keeps the old array of every need.
+    const all = JSON.parse((await t.harness.behavior.runCli(["needs", "--all", "--project", "p1", "--json"])).stdout) as unknown;
+    expect(Array.isArray(all)).toBe(true);
+  });
+
+  it("the printed done command closes the question and the escalation it names", async () => {
+    const t = await adopted();
+    const b = t.binding();
+    const question = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+    const escalation = t.hooks.store.escalate({ bindingId: b.id, kind: "approval", question: "Approve the spec?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
+    const out = await t.cli();
+    expect(out).toContain(`bb stewards done ${question.id}`);
+    expect(out).toContain(`bb stewards done ${escalation.id}`);
+    expect((await t.harness.behavior.runCli(["done", question.id, "--project", "p1"])).exitCode).toBe(0);
+    expect(t.hooks.store.question(question.id)!.status).toBe("answered");
+    expect((await t.harness.behavior.runCli(["done", escalation.id, "--project", "p1"])).exitCode).toBe(0);
+    expect(t.hooks.store.escalation(escalation.id)!.status).toBe("resolved");
+  });
 });
 
 // BB-20: a decide item or forwarded decision question can carry fixed
