@@ -254,7 +254,8 @@ describe("the dependency playbooks", () => {
     if (!prs.ok) throw new Error(prs.error);
     expect(prs.value).toMatchObject({ kind: "pr", source: "github", terminal: ["merged", "closed"] });
     expect(prs.value.general).toMatch(/never merge/u);
-    expect(prs.value.general).toMatch(/patch or minor bump whose checks are green is escalated for a\s+human merge/u);
+    expect(prs.value.general).toMatch(/files a \*\*Merge\*\* item for it there, and the owner presses it/u);
+    expect(prs.value.general).toMatch(/steward_report \{ replacedBy: "owner\/repo#N" \}/u);
     expect(prs.value.general).toMatch(/major bump/u);
     expect(prs.value.general).toMatch(/owner-reviewed/u);
     expect(prs.value.skipAuthors).toEqual(expect.arrayContaining(["dependabot[bot]"]));

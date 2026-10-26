@@ -162,6 +162,13 @@ Two tools are yours; everything else you do with the tools every thread has.
   steward to schedule you: start no workers and do not move the ticket
   into a build state until it holds you behind that work or tells you to
   start. Do not escalate for it.
+- **A replacement pull request (pull-request stewards).** When the pull
+  request you steward is redone as a new one on its own branch, report
+  `steward_report { replacedBy: "owner/repo#N" }` as soon as the
+  replacement is open. Your binding moves to it: the gate, the Merge item
+  and your wakes follow the replacement, and the old one's close no longer
+  ends you. The replacement must be open, in the same repository, and not
+  already stewarded.
 - **@bb mentions.** A wake headed "Linear mention" is someone's `@bb` on
   your issue. A wake from the owner is their instruction: do what it says,
   end with exactly one `linear_session_reply` for its session, and then

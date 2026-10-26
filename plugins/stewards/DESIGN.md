@@ -1243,10 +1243,24 @@ binding do it.
   missed doorbell costs a night, not a deadline.
 - **`deps-prs` adopts the bot's version-update pull requests.** A
   `dependabot[bot]` pull request in a watched repo gets a `pr` binding under
-  the `deps-prs` playbook whether or not it is labelled. It reviews the bump
-  and escalates for a human merge; it never merges. A patch or minor bump
-  with green checks is escalated for a merge, and a major bump or anything
-  touching an owner-reviewed path is escalated with the reason.
+  the `deps-prs` playbook whether or not it is labelled. It gets the same
+  independent reviewer round a ticket worker's pull request gets, and the
+  ordinary pull-request gate then files the `merge` need for a person to
+  press; the steward never merges. A major bump or anything touching an
+  owner-reviewed path is escalated with the reason.
+- **A replacement pull request moves the binding.** A bump that cannot
+  merge as is (the build breaks, the reviewer blocks on part of it) is
+  redone by a worker as a new pull request on its own branch, and the bot's
+  is closed. The steward reports `steward_report { replacedBy: "owner/repo#N" }`
+  and the plugin moves the binding to the replacement: same id, thread,
+  playbook, guidance, escalations and workers; the entity, snapshot and
+  phase become the replacement's, items filed for the old pull request are
+  withdrawn, an ending begun by the old one's close is undone, the thread is
+  retitled and the leases refreshed. The replacement must be an open pull
+  request in the same repository with no steward of its own. Without this
+  the binding stays on a closed pull request, the gate never looks at the
+  replacement, and nothing files its Merge item, because the plugin never
+  adopts a pull request the signed-in login wrote.
 
 `bb stewards init` writes `deps-alerts.md` and `deps-prs.md`; a project
 that has not written them runs no dependency watch, which is how the feature

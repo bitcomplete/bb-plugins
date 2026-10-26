@@ -573,6 +573,7 @@ function rowToBinding(r: BindingRow): Binding {
 
 /** Field names a caller may patch, and their column. */
 const COLUMNS = {
+  entityId: "entity_id",
   entityKey: "entity_key",
   url: "url",
   title: "title",
