@@ -1364,9 +1364,15 @@ with the entity key (opening the entity), one line of text, and a question's
 or `decide` item's fixed `choices` as small buttons. A choice makes exactly
 the write the page makes (`stewardsAnswerQuestion` with `answer: null` for a
 question, `stewardsNeedAction { action: "choose" }` for a `decide` item) and
-refetches; a row without choices, or a `provide-secret` item, opens the
-Stewards page at that project, where the free-text answer and the secret form
-live. The block adds no write path of its own.
+refetches. An `approve-pr` row carries the page's three actions — **Open the
+pull request** (`navigate.openUrl` on the item's `url`), **Approve**
+(`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
+refusal shown in the row) and **Details** (the board at that project) — and
+its text wraps instead of truncating, so the repository, number and title are
+readable before the click. Every other row's page button is **Details** too: a
+row without choices, or a `provide-secret` item, opens the Stewards page at
+that project, where the free-text answer and the secret form live. The block
+adds no write path of its own.
 
 **One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
 })` builds the board's `questions`, `withUser` and `needs` lists in one place;

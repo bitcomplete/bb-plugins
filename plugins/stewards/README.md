@@ -376,9 +376,15 @@ pill beside it. Above **In flight**, a **Needs you** block lists one row per
 item: the entity key opens the entity, one line of what, and a question's or
 `decide` item's fixed `choices` as small buttons. A choice makes the same
 write the page does (`stewardsAnswerQuestion` for a question,
-`stewardsNeedAction { action: "choose" }` for a `decide` item) and refetches;
-a row without choices, or a `provide-secret` item, opens the Stewards page at
-that project. The block and the board page read one server function
+`stewardsNeedAction { action: "choose" }` for a `decide` item) and refetches.
+An `approve-pr` row carries the page's three actions: **Open the pull
+request** opens the item's `url`, **Approve** makes the page's one-click
+approval (`stewardsNeedAction { action: "approve" }`, no confirmation, the
+server's refusal shown in the row), and **Details** opens the Stewards page at
+that project; its text wraps so the repository, number and title are readable.
+Every other row's page button is **Details** too: a row without choices, or a
+`provide-secret` item, opens the Stewards page at that project. The block and
+the board page read one server function
 (`needsYou`), so the sidebar and the page can never disagree; a
 non-actionable need is on the page but not in the sidebar. The count and the
 items come from `stewardsSidebar`; the plugin publishes
