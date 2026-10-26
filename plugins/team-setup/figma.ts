@@ -334,7 +334,13 @@ export function createFigmaHostEntry(deps: FigmaHostDeps) {
     const output = `${existing.stdout}\n${existing.stderr}`;
     if (existing.exitCode === 0 && existing.stdout.includes(FIGMA_SERVER_URL)) return;
     if (!/No MCP server named/iu.test(output)) {
-      await deps.runner.run(["mcp", "remove", FIGMA_SERVER_NAME, "-s", "user"], addTimeoutMs);
+      const removed = await deps.runner.run(["mcp", "remove", FIGMA_SERVER_NAME, "-s", "user"], addTimeoutMs);
+      // A remove that fails for a reason other than "not found" (say a
+      // differently-scoped entry it cannot touch) would leave an old server in
+      // place; surface it rather than letting the add's "already exists" hide it.
+      if (removed.exitCode !== 0 && !/No MCP server named|not found/iu.test(`${removed.stdout}${removed.stderr}`)) {
+        throw new Error(tail(removed.stderr) || `claude mcp remove exited with ${removed.exitCode}`);
+      }
     }
     const added = await deps.runner.run(
       ["mcp", "add", "--transport", "http", "--scope", "user", "--callback-port", String(FIGMA_CALLBACK_PORT), FIGMA_SERVER_NAME, FIGMA_SERVER_URL],

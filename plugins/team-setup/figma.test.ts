@@ -81,7 +81,7 @@ interface Fake {
   started: FakeHandle[];
 }
 
-function fakeRunner(get: Partial<FigmaResult> = {}, add: Partial<FigmaResult> = {}): Fake {
+function fakeRunner(get: Partial<FigmaResult> = {}, add: Partial<FigmaResult> = {}, remove: Partial<FigmaResult> = {}): Fake {
   const runs: Fake["runs"] = [];
   const started: FakeHandle[] = [];
   const runner: FigmaRunner = {
@@ -89,6 +89,7 @@ function fakeRunner(get: Partial<FigmaResult> = {}, add: Partial<FigmaResult> = 
       runs.push({ args, timeoutMs });
       if (args[0] === "mcp" && args[1] === "get") return { exitCode: 0, stdout: "", stderr: "", missing: false, ...get };
       if (args[0] === "mcp" && args[1] === "add") return { exitCode: 0, stdout: "MCP server figma added", stderr: "", missing: false, ...add };
+      if (args[0] === "mcp" && args[1] === "remove") return { exitCode: 0, stdout: "", stderr: "", missing: false, ...remove };
       return { exitCode: 0, stdout: "", stderr: "", missing: false };
     }),
     startLogin: vi.fn((): FigmaProcess => {
@@ -180,6 +181,17 @@ describe("the Figma host entry", () => {
     await startSignIn(fake, host);
     expect(fake.runs.find((run) => run.args[1] === "remove")?.args).toEqual(["mcp", "remove", "figma", "-s", "user"]);
     expect(fake.runs.some((run) => run.args[1] === "add")).toBe(true);
+    await host.experimental_dispose();
+  });
+
+  it("surfaces a remove that fails for a reason other than not found", async () => {
+    const fake = fakeRunner(
+      { stdout: "figma:\n  Scope: User config\n  Status: ! Needs authentication\n  URL: https://example.com/mcp\n" },
+      {},
+      { exitCode: 1, stderr: "cannot remove figma from project scope" },
+    );
+    const host = createHarness(fake, vi.fn());
+    await expect(host.experimental_call("start", null)).rejects.toThrow(/cannot remove/u);
     await host.experimental_dispose();
   });
 

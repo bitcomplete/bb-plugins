@@ -56,7 +56,7 @@ const IDENTITY_TTL_MS = 60_000;
 // a ten-second status poll does not repeat it.
 const FIGMA_STATE_TTL_MS = 60_000;
 const FIGMA_STATE_TIMEOUT_MS = 15_000;
-const FIGMA_START_TIMEOUT_MS = 40_000;
+const FIGMA_START_TIMEOUT_MS = 90_000;
 const FIGMA_COMPLETE_TIMEOUT_MS = 60_000;
 const FIGMA_CANCEL_TIMEOUT_MS = 10_000;
 
