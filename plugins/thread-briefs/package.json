@@ -23,7 +23,7 @@
   },
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.6.37",
-    "@pierre/diffs": "^1.5.2",
+    "@pierre/diffs": "^1.6.1",
     "@radix-ui/react-alert-dialog": "^1.2.1",
     "@radix-ui/react-context-menu": "^2.4.1",
     "@radix-ui/react-dialog": "^1.1.19",
@@ -52,7 +52,7 @@
     "tailwind-merge": "^3.4.0",
     "typescript": "^7.0.2",
     "vaul": "^1.1.2",
-    "vite": "^8.3.4",
+    "vite": "^8.3.5",
     "vitest": "^5.0.5"
   },
   "scripts": {
