@@ -6092,6 +6092,27 @@ describe("deployment watching (BB-53)", () => {
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 2);
   });
 
+  it("persists a workflow run on an arrival-skipped watch so a repeat delivery does not wake it (BB-61)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    const binding = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    // The watch is recorded after the doorbell arrives: the run cannot concern
+    // it, so it must not wake, but the event must persist on it so a repeat
+    // delivery of the same run and attempt cannot wake it later.
+    const watch = binding.deployments["acme/web#7"]!;
+    t.hooks.store.patch(binding.id, { deployments: { "acme/web#7": { ...watch, at: t.now() + 100_000 } } });
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
   it("ignores a workflow the playbook does not name (BB-61)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = workflowPlaybook();

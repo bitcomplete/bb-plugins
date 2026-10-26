@@ -193,10 +193,12 @@ describe("a failed workflow run (BB-61)", () => {
   it("wakes an awaiting watch once per run and attempt, leaving its state alone", () => {
     const first = applyWorkflowRun(mergedWatch(), "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 1000);
     expect(first.woken).toEqual(["acme/web#7"]);
+    expect(first.recorded).toEqual(["acme/web#7"]);
     expect(first.deployments["acme/web#7"]).toMatchObject({ state: "merged", workflowRuns: ["acme/bb-gate#42#1"] });
     // The same run and attempt is not news, however often it is delivered.
     const repeat = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 2000);
     expect(repeat.woken).toEqual([]);
+    expect(repeat.recorded).toEqual([]);
     expect(repeat.deployments).toEqual(first.deployments);
     // A re-run (a higher attempt) wakes again.
     const again = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run({ run_attempt: 2 }), NOW + 3000);
@@ -213,6 +215,7 @@ describe("a failed workflow run (BB-61)", () => {
     // delivery of the same run and attempt does not wake it later.
     const late = applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW - 1);
     expect(late.woken).toEqual([]);
+    expect(late.recorded).toEqual(["acme/web#7"]);
     expect(late.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
     expect(applyWorkflowRun(late.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
   });

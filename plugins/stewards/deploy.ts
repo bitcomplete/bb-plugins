@@ -164,21 +164,25 @@ export const awaitingOnRepo = (deployments: Deployments, repo: string): Deployme
  * delivery of the same run and attempt does not wake it later. The doorbell
  * carries no run start or completion time, so arrival is the only clock there
  * is, and the run's `sha` is never matched: it is usually the deploying
- * repository's commit, not the merge's. Returns the watches this event is
- * news for.
+ * repository's commit, not the merge's. `woken` is the watches this event is
+ * news for; `recorded` is every watch that now carries the key, which the
+ * caller must persist even when nothing is woken, or a repeat delivery would
+ * wake an arrival-skipped watch later.
  */
-export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number): { deployments: Deployments; woken: string[] } {
+export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number): { deployments: Deployments; woken: string[]; recorded: string[] } {
   const key = workflowRunKey(id, run.run_attempt);
   const next = { ...deployments };
   const woken: string[] = [];
+  const recorded: string[] = [];
   for (const watch of Object.values(next)) {
     if (watch.state !== "merged" && watch.state !== "deploying") continue;
     if (watch.repo.toLowerCase() !== repo.toLowerCase()) continue;
     if (watch.workflowRuns.includes(key)) continue;
     next[watch.key] = { ...watch, workflowRuns: [...watch.workflowRuns, key] };
+    recorded.push(watch.key);
     if (watch.at <= receivedAt) woken.push(watch.key);
   }
-  return { deployments: next, woken };
+  return { deployments: next, woken, recorded };
 }
 
 /**

@@ -2898,8 +2898,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (lc(target.repo) !== lc(repo)) continue;
           if (!matchesWorkflow(target, run)) continue;
           const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt);
-          if (applied.woken.length === 0) continue;
+          if (applied.recorded.length === 0) continue;
+          // Persist the event even when it wakes nobody (an arrival-skipped
+          // watch): a repeat delivery of the same run and attempt must not
+          // wake that watch later (BB-61).
           store.patch(b.id, { deployments: applied.deployments });
+          if (applied.woken.length === 0) continue;
           store.note(b.id, workflowRunLine(repo, run, awaitingOnRepo(applied.deployments, repo)), false);
           bb.log.info(`stewards: workflow run ${id} (${run.conclusion}) on ${repo} concerns ${applied.woken.join(", ")}`);
           scheduleReconcile(b.id);
