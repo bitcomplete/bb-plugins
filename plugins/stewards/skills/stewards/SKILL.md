@@ -300,7 +300,20 @@ with the answer and asks whether it is a general judgement: if it is, record
 it with `steward_update { lesson: { text, file, scope } }` so it is not
 asked again. A resolve carries `cites: [lesson ids]`, the lessons the
 decision rested on; the plugin counts hits (once per distinct binding),
-corrections and last citation from them. Every wake lists the questions still open: list them from
+corrections and last citation from them. A recorded lesson starts as a
+`trial`: it is injected into wakes under `## Lessons (trial)` and stays in
+the store until the nightly pass promotes it (3 distinct-binding hits, no
+corrections, 14 days) or retires it (30 days uncited, or a correction); a
+promoted lesson is retired at 90 days uncited or 2 corrections. The
+thresholds, caps and decay half-life live under `lessons` in
+`stewards/project.json`. When the pass queues a promotion or a retirement
+your wake lists it under `## Lessons to land` or `## Lessons to retire`:
+add or replace the anchored block (`<!-- lesson:<id> -->`) in the named
+file, commit, publish with `workspace_publish_guidance`, then
+`steward_update { lessonAction: { id, action: "complete" } }` or `retire`.
+A lesson may never target `stewards/project.json`, so it cannot widen the
+decide list, loosen the pull-request gate or relax an approval; a boundary
+lesson still goes to the user as Merge/Drop. Every wake lists the questions still open: list them from
 there, never from
 memory, and do not ask one again. At the end of each nightly pass your reply is
 kept as the morning digest; the wake carries the record to write it from

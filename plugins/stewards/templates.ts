@@ -32,6 +32,10 @@ export function projectFileTemplate(teams: string[]): string {
       // Dependabot alerts: a per-severity SLA, the batch window a medium or low
       // alert may wait for company, and the severities adopted when filed.
       deps: { sla: { critical: "asap", high: "1d", medium: "7d", low: "30d" }, batch: { medium: "7d", low: "30d" }, autoAdopt: ["critical", "high"] },
+      // The mechanical lesson lifecycle (BB-35): when a trial lesson is
+      // promoted or retired, how many a wake may carry, and how many promoted
+      // lessons a file holds. Omit the block to take these defaults.
+      lessons: { trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 },
     },
     null,
     2,

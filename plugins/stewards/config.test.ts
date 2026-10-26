@@ -47,6 +47,19 @@ describe("the project file", () => {
     if (!badDuration.ok) expect(badDuration.error).toMatch(/deps\.sla\.high/u);
   });
 
+  it("fills the lesson lifecycle's defaults, and takes explicit thresholds (BB-35 step 3)", () => {
+    const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
+    if (!defaults.ok) throw new Error(defaults.error);
+    expect(defaults.value.lessons).toEqual({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 });
+
+    const explicit = parseProjectFile(JSON.stringify({ version: 1, lessons: { trial: { max: 2 }, promote: { hits: 5, days: 7 }, decayHalfLifeDays: 14 } }));
+    if (!explicit.ok) throw new Error(explicit.error);
+    expect(explicit.value.lessons).toEqual({ trial: { max: 2, retireDays: 30 }, promote: { hits: 5, days: 7 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 14 });
+
+    expect(parseProjectFile(JSON.stringify({ version: 1, lessons: { promote: { hits: 0 } } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, lessons: { unknown: true } }))).toMatchObject({ ok: false });
+  });
+
   it("takes the standing-rules list, and rejects an unknown key (BB-54)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);

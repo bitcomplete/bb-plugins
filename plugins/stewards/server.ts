@@ -43,6 +43,7 @@ import {
   usesKind,
   type BindingKind,
   type EscalationKind,
+  type LessonRules,
   type ModelSpec,
   type Playbook,
   type ProjectFile,
@@ -74,6 +75,7 @@ import {
 } from "./source-contract.js";
 import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
+import { hasLessonAnchor, planLessonTransitions, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
@@ -1758,6 +1760,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
         deployments: b.deployments,
+        lessons: store.lessonsByTier(b.projectId, "trial").slice(0, config.file.lessons.trial.max),
         now: now(),
       });
       if (!(await deliverWake(b, config, playbook, text))) return false;
@@ -2998,7 +3001,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
       const questions = store.openQuestions(projectId).map((question) => ({ question, about: question.bindingId === null ? null : store.binding(question.bindingId) }));
       const needs = open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b })));
-      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, lessons: store.lessons(projectId), timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
+      const text = formatProjectWake({ reason, bindings, routed, withUser, problems: config.problems, digestDue: opts.digestDue, notes: opts.notes ?? [], bigDecisions: config.file.bigDecisions, standingRules: config.file.standingRules, questions, needs, lessons: store.allLessons(projectId), lessonRules: config.file.lessons, timeZone: config.file.nightly.timezone, label: config.file.label, ...(records === undefined ? {} : { records }) });
       const delivered = { ids: routed.filter((r) => r.escalation.deliveredAt === null).map((r) => r.escalation.id), at: 0 };
       delivered.at = store.markDelivered(delivered.ids);
       // A wake can be the thing that pushes the transcript over the limit.
@@ -3029,7 +3032,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         needs: open.flatMap((b) => store.openNeeds(b.id).map((need) => ({ need, binding: b }))),
         stuck: openWith((x) => x.kind === "stuck"),
         held: open.filter((b) => b.hold !== null),
-        lessonsMerged: store.mergedLessonsSince(projectId, since),
       };
     }
 
@@ -3082,7 +3084,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing has been published.");
         return "no project steward thread";
       }
-      const result = await mergeLesson(lesson.projectId, threadId, lesson);
+      // The file carries the lesson's anchor, so the merge's narrow guard can
+      // check the right block landed and the same lesson cannot land twice.
+      const result = await mergeLesson(lesson.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
       if (!result.ok) {
         store.noteLesson(lesson.id, result.message);
         return `merge refused: ${result.message}`;
@@ -3091,18 +3095,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return `merged at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
     }
 
+    /**
+     * Remove a retired lesson's text from `.bb` through the same narrow merge
+     * path, leaving the retired anchor behind. The project steward has already
+     * removed the text and published the branch; this fast-forwards it. A
+     * lesson that never reached the file is retired in the row alone.
+     */
+    async function retireLesson(lesson: Lesson): Promise<string> {
+      if (lesson.status !== "merged") {
+        store.markLessonDropped(lesson.id, "Retired before it reached the file.");
+        return "retired (it was not in the file)";
+      }
+      const threadId = store.project(lesson.projectId).threadId;
+      if (threadId === null) {
+        store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing could be removed.");
+        return "no project steward thread";
+      }
+      const result = await mergeLesson(lesson.projectId, threadId, lesson, retiredLessonAnchor(lesson.id));
+      if (!result.ok) {
+        store.noteLesson(lesson.id, result.message);
+        return `retire refused: ${result.message}`;
+      }
+      store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
+      return `retired at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
+    }
+
     /** Fast-forward the canonical `.bb` to a lesson's published branch, through multi-repo. */
-    async function mergeLesson(projectId: string, threadId: string, lesson: Lesson): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
+    async function mergeLesson(projectId: string, threadId: string, lesson: Lesson, text: string): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
       try {
-        return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text: lesson.text }, mergeGuidanceOutput);
+        return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text }, mergeGuidanceOutput);
       } catch (error) {
         return { ok: false, sha: null, branch: lesson.branch, message: errorMessage(error) };
       }
     }
 
-    /** Each pass, a lesson whose text is already at `.bb` HEAD is merged, however it got there. */
+    /** Each pass, a lesson whose anchored text is already at `.bb` HEAD is merged, however it got there. */
     async function reconcileLessons(config: ProjectConfig): Promise<void> {
-      const pending = store.lessons(config.projectId);
+      const pending = store.lessons(config.projectId).filter((lesson) => lesson.tier !== "retired");
       if (pending.length === 0) return;
       for (const lesson of pending) {
         // One lesson's file being unreadable — a bad path, a transient read
@@ -3114,8 +3143,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           bb.log.warn(`stewards: could not read lesson ${lesson.id}'s file ${lesson.file}: ${errorMessage(error)}`);
           continue;
         }
-        if (content !== null && normalizeLessonText(content).includes(normalizeLessonText(lesson.text))) {
+        // The anchor is the marker; a lesson merged before step 3 has only the
+        // wording, so a plain-text match still counts.
+        if (content !== null && (hasLessonAnchor(content, lesson.id) || normalizeLessonText(content).includes(normalizeLessonText(lesson.text)))) {
           store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch);
+        }
+      }
+    }
+
+    /**
+     * Apply the mechanical tier transitions (BB-35 step 3): promote a trial
+     * that earned it, retire a trial or promoted lesson that aged out or was
+     * corrected, retire a superseded lesson, and displace the lowest-scoring
+     * promoted lesson when a file is full. The decisions are pure (lessons.ts);
+     * this only writes them. A promotion the project steward has not landed
+     * yet is still `pending`, and a retirement of a lesson that is in the file
+     * keeps `merged` until the text is removed.
+     */
+    function applyLessonTransitions(config: ProjectConfig): void {
+      const transitions = planLessonTransitions(store.allLessons(config.projectId), config.file.lessons, now());
+      for (const transition of transitions) {
+        const lesson = store.lesson(transition.id);
+        if (lesson === null || lesson.tier === "retired") continue;
+        if (transition.action === "promote") {
+          store.setLessonTier(transition.id, "promoted");
+          continue;
+        }
+        // A retirement of a lesson that never landed resolves the row here:
+        // there is no anchored text to remove, so nothing waits on the project
+        // steward and the row must not linger as pending. One that is in the
+        // file stays `merged` until its text is removed through the wake.
+        if (lesson.status === "pending") store.markLessonDropped(transition.id, `Retired: ${transition.reason}.`);
+        else {
+          store.setLessonTier(transition.id, "retired");
+          store.noteLesson(transition.id, `Retired: ${transition.reason}.`);
         }
       }
     }
@@ -4557,7 +4618,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (label !== "Merge") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Merge, Drop.` };
           const threadId = store.project(b.projectId).threadId;
           if (threadId === null) return { ok: false, message: "The project steward has no thread yet; nothing has been published." };
-          const result = await mergeLesson(b.projectId, threadId, lesson);
+          const result = await mergeLesson(b.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
           if (!result.ok) {
             store.noteLesson(lesson.id, result.message);
             return { ok: false, message: result.message };
@@ -5187,18 +5248,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 (f) => !f.startsWith("/") && !f.includes("\\") && !f.includes("\0") && f.split("/").every((s) => s !== ".." && s !== "." && s.length > 0),
                 "a .bb-relative path with no leading /, backslash, NUL, or empty/./.. segment",
               )
+              .refine((f) => f !== "stewards/project.json", "a guidance file (AGENTS.md or a playbook), never the project file: a lesson must not be able to move a big decision to the project, loosen the pull-request gate or relax an approval")
               .describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
             scope: z.enum(["procedure", "boundary"]).describe("procedure: playbook wording, sequencing, conventions the steward may already decide, which it self-merges. boundary: credentials and reach, who may direct a server, irreversible production steps — the user decides."),
+            supersedes: z.string().trim().min(1).max(100).optional().describe("An existing lesson id in the same file that this one replaces; the nightly pass retires the older one."),
           })
           .optional()
           .describe("Project steward only: record a general rule drawn from an escalation or your own judgement, so it is made permanent in `.bb` instead of being lost with the ticket. With `binding` and `resolve`, it keeps the binding and escalation it came from. Apply and publish it, then complete it with lessonAction."),
         lessonAction: z
           .object({
             id: z.string().trim().min(1).max(100).describe("The lesson id (lsn_…) from the nightly prompt or `bb stewards lessons`."),
-            action: z.enum(["complete", "drop"]).describe("complete: self-merge a procedure lesson, or file the user's Merge/Drop item for a boundary one. drop: discard it."),
+            action: z.enum(["complete", "drop", "retire"]).describe("complete: self-merge a procedure lesson, or file the user's Merge/Drop item for a boundary one. retire: remove a retired lesson's anchored text from `.bb`. drop: discard it."),
           })
           .optional()
-          .describe("Project steward only: finish a pending lesson after applying and publishing it, or drop it."),
+          .describe("Project steward only: finish a pending lesson after applying and publishing it, retire a retired one, or drop it."),
       }),
       async execute(input, { threadId }) {
         try {
@@ -5258,10 +5321,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined)) {
             return toolError(new Error("Only the project steward records and completes lessons; a steward escalates with steward_report."));
           }
+          if (input.lesson?.supersedes !== undefined) {
+            const older = store.lesson(input.lesson.supersedes);
+            if (older === null || older.projectId !== projectOf) return toolError(new Error(`No lesson ${input.lesson.supersedes} in this project to supersede.`));
+            if (older.file !== input.lesson.file) return toolError(new Error(`Lesson ${older.id} is in ${older.file}, not ${input.lesson.file}; a lesson only supersedes one in the same file.`));
+            if (older.tier === "retired") return toolError(new Error(`Lesson ${older.id} is already retired.`));
+          }
           if (input.lessonAction !== undefined) {
             const lesson = store.lesson(input.lessonAction.id);
             if (lesson === null || lesson.projectId !== projectOf) return toolError(new Error(`No lesson ${input.lessonAction.id} in this project.`));
+            if (input.lessonAction.action === "retire") {
+              if (lesson.tier !== "retired") return toolError(new Error(`Lesson ${lesson.id} is not retired (tier ${lesson.tier}); the nightly pass retires one that aged out or was corrected.`));
+              const outcome = await retireLesson(lesson);
+              return `${lesson.id}: ${outcome}.`;
+            }
             if (lesson.status !== "pending") return toolError(new Error(`Lesson ${lesson.id} is already ${lesson.status}.`));
+            if (lesson.tier === "retired") return toolError(new Error(`Lesson ${lesson.id} is retired; a retired lesson is never landed, only removed with action "retire".`));
             const outcome = await completeLesson(lesson, input.lessonAction.action);
             return `${lesson.id}: ${outcome}.`;
           }
@@ -5269,8 +5344,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const recordLesson = (bindingId: string | null, escalationId: string | null): string => {
             const projectThread = store.project(projectOf!).threadId;
             const branch = projectThread === null ? null : lessonBranchFor(projectThread);
-            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch });
-            return `lesson ${lesson.id} recorded (${lesson.scope}); apply it to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
+            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch, ...(input.lesson!.supersedes === undefined ? {} : { supersedes: input.lesson!.supersedes }) });
+            return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. To land it now, add \`${withLessonAnchor(lesson.text, lesson.id)}\` to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
           };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
@@ -5733,6 +5808,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await keepProjectSteward(config.projectId);
         await syncOpsBindings(config);
         await reconcileLessons(config);
+        applyLessonTransitions(config);
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -5773,6 +5849,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.info(`stewards: nightly pass for ${config.projectId} (${night})`);
         if (!(await settings.get()).paused) await adoptionPass(config);
         await reconcileLessons(config);
+        applyLessonTransitions(config);
         const order = store
           .open(config.projectId)
           .filter((b) => b.hold === null && b.ending === null)
@@ -6056,7 +6133,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const projectId = input.options.project ?? ctx.projectId;
               const rows = input.options.all ? store.all(projectId) : store.open(projectId);
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
-              const lessons = projectId === undefined ? [] : store.lessons(projectId);
+              const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
               return { exitCode: 0, stdout: [formatBindings(rows), ...lessonLines].join("\n") };
             },
@@ -6077,7 +6154,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     const b = l.bindingId === null ? null : store.binding(l.bindingId);
                     const source = [b === null ? null : `from ${b.entityKey}`, l.escalationId].filter((x) => x !== null).join(", ");
                     const landed = l.status === "merged" ? `${l.mergeSha === null ? "merged" : `merged at ${l.mergeSha.slice(0, 8)}`}${l.branch === null ? "" : ` on ${l.branch}`}` : l.status;
-                    return `${l.id} — ${landed}, ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
+                    return `${l.id} — ${l.tier} (${landed}), ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
                   })
                   .join("\n"),
               };
@@ -6251,7 +6328,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 }
                 const threadId = b === null ? null : store.project(b.projectId).threadId;
                 if (threadId === null) throw new PluginCliError("The project steward has no thread yet; nothing has been published.", { code: "no_project_steward" });
-                const result = await mergeLesson(b!.projectId, threadId, lesson);
+                const result = await mergeLesson(b!.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
                 if (!result.ok) {
                   store.noteLesson(lesson.id, result.message);
                   throw new PluginCliError(result.message, { code: "merge_refused" });

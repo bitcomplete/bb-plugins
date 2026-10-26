@@ -277,22 +277,29 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   or the approval code is always yours.
 - **Lessons** are a project steward's general judgements, made permanent in
   `.bb` instead of being lost with the ticket that raised them. It records
-  one with `steward_update { lesson: { text, file, scope } }`; a `procedure`
-  lesson it applies, commits and publishes, then self-merges with
-  `steward_update { lessonAction: { id, action: "complete" } }` (multi-repo
-  fast-forwards the canonical `.bb`, and only that lesson's file). A
-  `boundary` lesson — credentials and reach, who may direct a server,
-  irreversible production steps — is filed on the Stewards page with
-  **Merge** and **Drop**, and only you merge it. A lesson is `merged` when
-  its text is found in its file at `.bb` HEAD. A user's answer to a forwarded
-  escalation on the Stewards page (or from a thread) wakes the project
-  steward with that answer as a lesson candidate: if it is a general
-  judgement the playbook should carry, the project steward records it as a
-  lesson. A resolve carries `cites: [lesson ids]` — the lessons it rested on
-  — and the plugin counts `hits` (once per distinct binding), `corrections`
-  and `lastCitedAt`. Counts only for now: nothing is promoted, retired or
-  written to `.bb` from them yet. `bb stewards lessons [--all]`
-  lists them, `bb stewards drop-lesson <id>` drops one. DESIGN.md §20.
+  one with `steward_update { lesson: { text, file, scope } }`. A lesson
+  moves through tiers: `candidate` → `trial` → `promoted` → `retired`. A
+  recorded lesson starts `trial`; the nightly pass promotes it when it is
+  cited on 3 distinct bindings with no corrections and has been in trial 14
+  days, and retires it at 30 days uncited or on any correction (a promoted
+  one at 90 days uncited or 2 corrections). The thresholds, caps and decay
+  half-life are under `lessons` in `stewards/project.json`; the design's
+  defaults apply when the key is absent. Trial lessons are injected into
+  wakes under `## Lessons (trial)`; only promoted ones reach `.bb`, with a
+  `<!-- lesson:<id> -->` anchor, and only that lesson's own file (multi-repo
+  fast-forwards the canonical `.bb`). A `boundary` lesson — credentials and
+  reach, who may direct a server, irreversible production steps — is filed on
+  the Stewards page with **Merge** and **Drop**, and only you merge it; a
+  lesson can never target `stewards/project.json`, so it cannot move a big
+  decision to the project, loosen the pull-request gate or relax an approval.
+  A user's answer to a forwarded escalation on the Stewards page (or from a
+  thread) wakes the project steward with that answer as a lesson candidate: if
+  it is a general judgement the playbook should carry, the project steward
+  records it as a lesson. A resolve carries `cites: [lesson ids]` — the
+  lessons it rested on — and the plugin counts `hits` (once per distinct
+  binding), `corrections` and `lastCitedAt`. `bb stewards lessons [--all]`
+  lists tiers and counts, `bb stewards drop-lesson <id>` drops one. The
+  digest carries nothing about lessons. DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
