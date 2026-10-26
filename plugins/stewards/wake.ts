@@ -14,7 +14,7 @@ import { dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
 import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
-import type { EntitySnapshot, SessionWake, SnapshotComment } from "./source-contract.js";
+import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
 
 /** A wake longer than this is cut in its snapshot, never in what changed or what to do. */
@@ -318,6 +318,22 @@ function deploymentLines(input: WakeInput): string[] {
     out.push(`- ${w.key}: ${DEPLOY_STATE_LABEL[w.state]}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`);
   }
   return out;
+}
+
+/**
+ * The wake line for a failed workflow run (BB-61): the run's workflow,
+ * conclusion, URL and head sha, and every open watch on the repository it
+ * names. The plugin forwards the fact only, as it does for a deployment
+ * timeout; the playbook says what a failed build means.
+ */
+export function workflowRunLine(repo: string, run: WorkflowRun, watches: readonly DeploymentWatch[]): string {
+  const workflow = run.workflow.trim() === "" ? "a workflow" : `workflow ${run.workflow.trim()}`;
+  const name = run.name.trim() === "" ? "" : ` (${run.name.trim()})`;
+  const conclusion = run.conclusion.trim() === "" ? "completed" : run.conclusion.trim();
+  const url = run.url === null || run.url === "" ? "" : ` — ${run.url}`;
+  const sha = run.sha.trim() === "" ? "" : `, head ${run.sha.slice(0, 7)}`;
+  const names = watches.map((w) => w.key).join(", ");
+  return `${workflow}${name} ${conclusion} on ${repo}${sha}${url}. Merges awaiting deployment: ${names}. Treat this as a deployment timeout: look once, comment on the pull requests, and escalate a decision if the work cannot ship.`;
 }
 
 function gateLines(input: Pick<WakeInput, "gate" | "binding" | "playbook" | "escalations">): string[] {

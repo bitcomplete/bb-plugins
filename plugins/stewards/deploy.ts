@@ -5,7 +5,7 @@
 // is the steward's, from the playbook's rule, and it reports the verdict.
 import { z } from "zod";
 import type { DeploymentTarget } from "./config.js";
-import type { Deployment, EntitySnapshot } from "./source-contract.js";
+import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
 
 /**
@@ -38,6 +38,12 @@ export const deploymentWatchSchema = z.object({
   deadlineAt: z.number().nullable().default(null),
   /** Why, in words: a failure state, or a steward's "does not carry this merge yet". */
   note: z.string().nullable().default(null),
+  /**
+   * The `workflow_run` events this watch has been woken for, as
+   * `<owner/repo#run id>#<attempt>`, so a repeat delivery of one run and
+   * attempt is not news (BB-61). The watch's state is not moved by a run.
+   */
+  workflowRuns: z.array(z.string()).default([]),
 });
 export type DeploymentWatch = z.infer<typeof deploymentWatchSchema>;
 
@@ -75,6 +81,7 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
       at: now,
       deadlineAt: now + target.timeout,
       note: null,
+      workflowRuns: [],
     };
     changed = true;
   }
@@ -118,6 +125,59 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
     changed.push(watch.key);
   }
   return { deployments: next, changed };
+}
+
+/**
+ * Whether a run is one a deployment target names (BB-61). A playbook lists a
+ * workflow by file path (`.github/workflows/bb-server.yaml`), its basename
+ * (`bb-server.yaml`) or its name (`bb-server`), matched ignoring case. An
+ * empty list matches nothing, so a target with no `workflows` behaves exactly
+ * as before.
+ */
+export function matchesWorkflow(target: Pick<DeploymentTarget, "workflows">, run: WorkflowRun): boolean {
+  if (target.workflows.length === 0) return false;
+  const file = run.workflow.trim().toLowerCase();
+  const base = file.split("/").pop() ?? "";
+  const name = run.name.trim().toLowerCase();
+  return target.workflows.some((w) => {
+    const want = w.trim().toLowerCase();
+    return want !== "" && (want === file || want === base || want === name);
+  });
+}
+
+/** One workflow-run event's dedupe key: the run's entity id and its attempt. */
+export const workflowRunKey = (id: string, runAttempt: number): string => `${id.toLowerCase()}#${runAttempt}`;
+
+/** The watches on a repository that are still awaiting a deployment, for a run wake's list. */
+export const awaitingOnRepo = (deployments: Deployments, repo: string): DeploymentWatch[] =>
+  Object.values(deployments).filter((w) => (w.state === "merged" || w.state === "deploying") && w.repo.toLowerCase() === repo.toLowerCase());
+
+/**
+ * Apply a `workflow_run` doorbell to a binding's watches (BB-61): every watch
+ * for the run's repository that is still awaiting a deployment is recorded as
+ * having heard this run and attempt, and the steward is woken once for it.
+ * The watch's deployment state is not moved: the plugin forwards only the
+ * fact that a named workflow failed, and the steward applies its playbook as
+ * for a timeout. `receivedAt` is when the doorbell reached the server; a
+ * watch recorded after that (its merge came later) is left alone, since the
+ * run cannot concern it. The doorbell carries no run start or completion
+ * time, so arrival is the only clock there is, and the run's `sha` is never
+ * matched: it is usually the deploying repository's commit, not the merge's.
+ * Returns the watches this event is news for.
+ */
+export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number): { deployments: Deployments; woken: string[] } {
+  const key = workflowRunKey(id, run.run_attempt);
+  const next = { ...deployments };
+  const woken: string[] = [];
+  for (const watch of Object.values(next)) {
+    if (watch.state !== "merged" && watch.state !== "deploying") continue;
+    if (watch.repo.toLowerCase() !== repo.toLowerCase()) continue;
+    if (watch.at > receivedAt) continue;
+    if (watch.workflowRuns.includes(key)) continue;
+    next[watch.key] = { ...watch, workflowRuns: [...watch.workflowRuns, key] };
+    woken.push(watch.key);
+  }
+  return { deployments: next, woken };
 }
 
 /**

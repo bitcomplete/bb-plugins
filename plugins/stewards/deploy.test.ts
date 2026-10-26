@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { pull } from "./fixtures.js";
 import type { DeploymentTarget } from "./config.js";
-import { allDeployed, applyDeployment, applyDeploymentRead, deploymentLines, deploymentsSchema, matchesTarget, mergedPulls, recordMerged, reportDeployment, timeOut, timeoutsDue, type Deployments } from "./deploy.js";
-import type { Deployment } from "./source-contract.js";
+import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentsSchema, matchesTarget, matchesWorkflow, mergedPulls, recordMerged, reportDeployment, timeOut, timeoutsDue, workflowRunKey, type Deployments } from "./deploy.js";
+import type { Deployment, WorkflowRun } from "./source-contract.js";
 import type { Observed } from "./store.js";
 
-const target: DeploymentTarget = { source: "github", repo: "acme/bb-gate", environment: "production", carries: "the pinned ref contains the merge", timeout: 3_600_000 };
+const target: DeploymentTarget = { source: "github", repo: "acme/bb-gate", environment: "production", carries: "the pinned ref contains the merge", timeout: 3_600_000, workflows: [] };
+const named: DeploymentTarget = { ...target, workflows: ["bb-server.yaml"] };
 const NOW = Date.parse("2026-10-14T15:00:00Z");
 
 const observed = (over: { entity?: ReturnType<typeof pull>; pulls?: Array<ReturnType<typeof pull>> } = {}): Observed => ({
@@ -33,6 +34,7 @@ describe("recording merged pull requests", () => {
         at: NOW,
         deadlineAt: NOW + target.timeout,
         note: null,
+        workflowRuns: [],
       },
     });
     // A second read does not reset the deadline or the merge sha.
@@ -169,6 +171,51 @@ describe("confirming from a deployment read (BB-59)", () => {
     const settled = applyDeployment(recordMerged({}, observed(), target, NOW), target, deployment(), NOW).deployments;
     const done = reportDeployment(settled, { state: "deployed" }, NOW, target.timeout).deployments;
     expect(applyDeploymentRead(done, target, [deployment({ id: 8, state: "success" })], NOW + 1000).changed).toEqual([]);
+  });
+});
+
+// BB-61: a failed (or cancelled/timed-out) run of a workflow a deployment
+// target names wakes every watch still awaiting a deployment, once per run
+// and attempt, without moving the watch's state.
+describe("a failed workflow run (BB-61)", () => {
+  const run = (over: Partial<WorkflowRun> = {}): WorkflowRun => ({ workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "ccccccc3", run_attempt: 1, ...over });
+  const mergedWatch = () => recordMerged({}, observed(), target, NOW);
+
+  it("matches a workflow by path, basename or name, ignoring case, and nothing when the list is empty", () => {
+    expect(matchesWorkflow(named, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: [".github/workflows/bb-server.yaml"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: ["BB-SERVER.YAML"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: ["bb-server"] }, run())).toBe(true);
+    expect(matchesWorkflow({ workflows: ["image.yaml"] }, run())).toBe(false);
+    expect(matchesWorkflow(target, run())).toBe(false);
+  });
+
+  it("wakes an awaiting watch once per run and attempt, leaving its state alone", () => {
+    const first = applyWorkflowRun(mergedWatch(), "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 1000);
+    expect(first.woken).toEqual(["acme/web#7"]);
+    expect(first.deployments["acme/web#7"]).toMatchObject({ state: "merged", workflowRuns: ["acme/bb-gate#42#1"] });
+    // The same run and attempt is not news, however often it is delivered.
+    const repeat = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 2000);
+    expect(repeat.woken).toEqual([]);
+    expect(repeat.deployments).toEqual(first.deployments);
+    // A re-run (a higher attempt) wakes again.
+    const again = applyWorkflowRun(first.deployments, "acme/bb-gate#42", "acme/bb-gate", run({ run_attempt: 2 }), NOW + 3000);
+    expect(again.woken).toEqual(["acme/web#7"]);
+  });
+
+  it("skips another repo, a settled watch, and a watch recorded after the doorbell arrived", () => {
+    const deployments = mergedWatch();
+    expect(applyWorkflowRun(deployments, "acme/other#42", "acme/other", run(), NOW).woken).toEqual([]);
+    const settled: Deployments = { "acme/web#7": { ...deployments["acme/web#7"]!, state: "deployed" } };
+    expect(applyWorkflowRun(settled, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
+    // The watch was recorded after the doorbell arrived: the run cannot concern it.
+    expect(applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW - 1).woken).toEqual([]);
+  });
+
+  it("lists the watches still awaiting a deployment on a repo, and keys an event by run and attempt", () => {
+    const deployments = recordMerged(recordMerged({}, observed(), target, NOW), observed({ entity: pull({ key: "acme/web#8" }, { merged: true }) }), target, NOW);
+    expect(awaitingOnRepo(deployments, "Acme/BB-Gate").map((w) => w.key)).toEqual(["acme/web#7", "acme/web#8"]);
+    expect(workflowRunKey("Acme/BB-Gate#42", 2)).toBe("acme/bb-gate#42#2");
   });
 });
 

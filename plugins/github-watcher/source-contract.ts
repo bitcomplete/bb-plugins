@@ -51,6 +51,29 @@ export const deploymentSchema = z
   .loose();
 export type Deployment = z.infer<typeof deploymentSchema>;
 
+/**
+ * A GitHub Actions workflow run, as bb-gate-hooks forwards it on a
+ * `workflow_run` doorbell (bb-gate/docs/hooks.md). The doorbell's entity id
+ * is `owner/repo#<run id>` and its unit is the repository, leased the same
+ * way as a deployment (`deployment_repo`). `workflow` is the workflow's file
+ * path and `name` its name, either of which a playbook may match;
+ * `conclusion` is failure, cancelled or timed_out -- the only conclusions
+ * that ring the doorbell. `sha` is the run's head commit, which is usually
+ * the deploying repository's commit, not the merge's, so a subscriber must
+ * not match on it. `run_attempt` tells a re-run from the first attempt.
+ */
+export const workflowRunSchema = z
+  .object({
+    workflow: z.string().default(""),
+    name: z.string().default(""),
+    conclusion: z.string().default(""),
+    url: z.string().nullable().default(null),
+    sha: z.string().default(""),
+    run_attempt: z.number().int().positive().default(1),
+  })
+  .loose();
+export type WorkflowRun = z.infer<typeof workflowRunSchema>;
+
 /** How much of a comment or description crosses the contract. */
 export const SNAPSHOT_COMMENT_CHARS = 4000;
 export const SNAPSHOT_DESCRIPTION_CHARS = 20_000;
@@ -275,7 +298,9 @@ export const sourceContract = {
    * stewards wants: the deployment targets the project's playbooks name. It
    * is separate from `units` for the same reason as `dependabot`: a
    * repository lease does not receive deployment doorbells, so the github
-   * plugin leases each as a `deployment_repo`. Linear ignores it.
+   * plugin leases each as a `deployment_repo`. A `workflow_run` doorbell
+   * shares that lease, because only a project that names a deployment target
+   * cares about a workflow run. Linear ignores it.
    */
   sourceSetInterest: {
     input: z.object({
@@ -373,11 +398,11 @@ export const stewardsContract = {
   /** Something about this entity may have changed. Cheap: debounced, then compared with the last snapshot. */
   stewardsRing: {
     /**
-     * A `deployment` doorbell carries its deployment object, which is the one
-     * doorbell whose ref and state are not in the entity name. Every other
-     * doorbell leaves it out.
+     * A `deployment` doorbell carries its deployment object, and a
+     * `workflow_run` doorbell its run object: the two doorbells whose facts
+     * are not in the entity name. Every other doorbell leaves both out.
      */
-    input: z.object({ source: sourceSchema, id: z.string().min(1).max(300), deployment: deploymentSchema.optional() }),
+    input: z.object({ source: sourceSchema, id: z.string().min(1).max(300), deployment: deploymentSchema.optional(), workflow_run: workflowRunSchema.optional() }),
     output: z.object({ ok: z.boolean() }),
   },
   /**

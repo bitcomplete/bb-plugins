@@ -165,6 +165,8 @@ describe("the loop", () => {
     const doorbells: string[] = [];
     const doorbellKinds: string[] = [];
     const units: Array<string | null> = [];
+    const deployments: unknown[] = [];
+    const workflowRuns: unknown[] = [];
     const rejected: Rejection[][] = [];
     let token = "tok-1";
     let refreshes = 0;
@@ -180,10 +182,12 @@ describe("the loop", () => {
         return token;
       },
       watchIds: over.watchIds ?? (() => [{ kind: "issue", id: "i-1" }, { kind: "issue", id: "i-2" }]),
-      onDoorbell: (kind, id, unit) => {
+      onDoorbell: (kind, id, unit, deployment, workflowRun) => {
         doorbellKinds.push(kind);
         doorbells.push(id);
         units.push(unit);
+        deployments.push(deployment);
+        workflowRuns.push(workflowRun);
       },
       onRejected: async (r) => {
         rejected.push(r);
@@ -195,7 +199,7 @@ describe("the loop", () => {
     });
     const controller = new AbortController();
     const done = loop.run(controller.signal);
-    return { loop, logs, sweeps, doorbells, doorbellKinds, units, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
+    return { loop, logs, sweeps, doorbells, doorbellKinds, units, deployments, workflowRuns, rejected, controller, done, setToken: (t: string) => (token = t), refreshes: () => refreshes };
   }
 
   it("subscribes every watch on hello with the current token, sweeps, then rings on doorbells for issues only", async () => {
@@ -214,14 +218,17 @@ describe("the loop", () => {
     hooks.last().send(hooks.doorbell("i-1"));
     hooks.last().send(hooks.doorbell("acme/widgets", { kind: "repo" }));
     hooks.last().send(hooks.doorbell("acme/widgets#4", { kind: "dependabot_alert" }));
+    const workflowRun = { workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "abc123", run_attempt: 1 };
+    hooks.last().send(hooks.doorbell("acme/bb-gate#42", { kind: "workflow_run", unit: "acme/bb-gate", workflow_run: workflowRun }));
     hooks.last().send(hooks.doorbell("i-9", { source: "linear" }));
     hooks.last().send("event: doorbell\ndata: not json\n\n");
     hooks.last().send(hooks.doorbell("i-2", { action: "remove", unit: "" }));
     await tick();
-    expect(s.doorbells).toEqual(["i-1", "acme/widgets#4", "i-2"]);
-    expect(s.doorbellKinds).toEqual(["issue", "dependabot_alert", "issue"]);
-    // The unit comes along when the service names one.
-    expect(s.units).toEqual(["acme/widgets", "acme/widgets", null]);
+    expect(s.doorbells).toEqual(["i-1", "acme/widgets#4", "acme/bb-gate#42", "i-2"]);
+    expect(s.doorbellKinds).toEqual(["issue", "dependabot_alert", "workflow_run", "issue"]);
+    // The unit comes along when the service names one, and the run object with it.
+    expect(s.units).toEqual(["acme/widgets", "acme/widgets", "acme/bb-gate", null]);
+    expect(s.workflowRuns).toEqual([undefined, undefined, workflowRun, undefined]);
     expect(s.logs.join("\n")).not.toContain("tok-1");
 
     s.controller.abort();

@@ -734,6 +734,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   environment: production
   carries: "The pinned BB_PLUGINS_REF contains the merge commit."   # the steward's rule
   timeout: 6h
+  workflows: [bb-server.yaml, image.yaml]   # a failed run of one wakes the steward (BB-61)
 ```
 
 - **Phases are the entity's own states**, so the playbook needs no state
@@ -748,6 +749,16 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   comment once every pull request is merged and deployed. A failure/error
   deployment or a timeout wakes the steward with the run URL. No `deployment`
   is exactly today's behaviour.
+- **`deployment.workflows` names the builds that must not fail while a merge
+  waits (BB-61).** Each entry is matched, ignoring case, against a
+  `workflow_run` doorbell's file path, basename or name. A run of a named
+  workflow that ends in failure, cancellation or timeout wakes every binding
+  on that repo still awaiting a deployment, once per run id and attempt, with
+  the run's URL, conclusion and head sha and the open watches; the watch's
+  state is not moved, and the steward applies its playbook as for a timeout.
+  The plugin assumes nothing about images, tags or pins and never matches the
+  run's `sha`, which is usually the deploying repository's commit. Empty, or
+  absent, wakes nobody: no `workflows` is exactly today's behaviour.
 - **A deployment that predates its watch is read, not waited for (BB-59).**
   A doorbell can be missed, most obviously across the server restart every
   `bb-plugins` merge causes, and a deployment that landed before the watch was
@@ -1430,7 +1441,11 @@ own server behind bb-gate, so it is per developer in practice.
   through as before. A deployment that already exists is read through the
   github plugin's source contract on the first watch and on the sweep
   (BB-59), so a missed doorbell costs a sweep, not the timeout; the read
-  never evaluates `carries`.
+  never evaluates `carries`. A build that fails, is cancelled or times out
+  between merge and deployment is forwarded from a `workflow_run` doorbell
+  when the playbook names it in `deployment.workflows` (BB-61); the plugin
+  only forwards the fact, and a `bb-gate` without the doorbell kind falls
+  back to the timeout as before.
 - **One developer's server and machine watch production.** An ops binding
   runs on the server of the developer who runs the project's stewards, and
   looks with kubectl on their machine, as them, like everything else here

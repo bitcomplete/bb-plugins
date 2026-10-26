@@ -63,14 +63,16 @@ import {
   signatureLine,
   sourceContract,
   stewardsContract,
+  workflowRunSchema,
   type DependabotAlert,
   type DependabotSeverity,
   type Deployment,
   type EntitySnapshot,
   type SessionWake,
   type Source,
+  type WorkflowRun,
 } from "./source-contract.js";
-import { allDeployed, applyDeployment, applyDeploymentRead, deploymentLines, deploymentReportSchema, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
+import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
@@ -78,7 +80,7 @@ import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PRO
 import { NEEDS_YOU_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
-import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
+import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
 export const MULTI_REPO_PLUGIN_ID = "multi-repo";
 /** multi-repo's environment provider: where every thread of a stewards project works. */
@@ -2873,6 +2875,38 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * A GitHub `workflow_run` doorbell (BB-61). The entity id is
+     * "owner/repo#<run id>" and the object carries the workflow, conclusion,
+     * URL, head sha and attempt. A run of a workflow the playbook's
+     * deployment target names wakes every binding on that repo awaiting a
+     * deployment, once per (run id, attempt). The watch's state is not moved:
+     * the plugin forwards the fact that a named workflow failed, and the
+     * steward applies its playbook as for a timeout. The plugin assumes
+     * nothing about images, tags or pins, and never matches the run's sha.
+     */
+    async function onWorkflowRunDoorbell(id: string, run: WorkflowRun, receivedAt: number): Promise<void> {
+      const hash = id.lastIndexOf("#");
+      const repo = hash === -1 ? "" : id.slice(0, hash);
+      if (repo === "") return;
+      const projects = await stewardedProjects();
+      for (const config of projects) {
+        for (const b of store.open(config.projectId)) {
+          const playbook = bindingPlaybook(config, b);
+          const target = playbook?.deployment;
+          if (target === null || target === undefined) continue;
+          if (lc(target.repo) !== lc(repo)) continue;
+          if (!matchesWorkflow(target, run)) continue;
+          const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt);
+          if (applied.woken.length === 0) continue;
+          store.patch(b.id, { deployments: applied.deployments });
+          store.note(b.id, workflowRunLine(repo, run, awaitingOnRepo(applied.deployments, repo)), false);
+          bb.log.info(`stewards: workflow run ${id} (${run.conclusion}) on ${repo} concerns ${applied.woken.join(", ")}`);
+          scheduleReconcile(b.id);
+        }
+      }
+    }
+
     /** A ring from a source: look at the binding(s) it concerns, or consider adopting. */
     async function onRing(source: Source, id: string): Promise<void> {
       const bound = store.byEntity(source, id);
@@ -4092,8 +4126,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- the RPC -------------------------------------------------------------------------------------
 
     bb.rpc.register(rpcContract, {
-      async stewardsRing({ source, id, deployment }, { experimental_caller: caller }) {
+      async stewardsRing({ source, id, deployment, workflow_run }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
+        if (workflow_run !== undefined) {
+          if (source !== "github") throw new Error("only the github-watcher plugin sends workflow_run doorbells");
+          // Arrival is the only clock a workflow_run doorbell has (it carries
+          // no run start time), so capture it here, before the debounce, and
+          // let the handler skip a watch recorded after it (BB-61).
+          const at = now();
+          debounce(`run:${lc(id)}`, () => serial(`run:${lc(id)}`, () => onWorkflowRunDoorbell(id, workflow_run, at)));
+          return { ok: true };
+        }
         if (deployment !== undefined) {
           if (source !== "github") throw new Error("only the github-watcher plugin sends deployment doorbells");
           debounce(`deploy:${lc(id)}`, () => serial(`deploy:${lc(id)}`, () => onDeploymentDoorbell(id, deployment)));

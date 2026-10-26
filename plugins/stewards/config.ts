@@ -399,6 +399,16 @@ export const deploymentTargetSchema = z
     carries: z.string().trim().min(1).max(2000),
     /** No matching deployment within this long wakes the steward. */
     timeout: durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
+    /**
+     * The GitHub Actions workflows whose failure matters while a merge waits
+     * for a deployment (BB-61). Each entry is matched, ignoring case, against
+     * a run's file path (`.github/workflows/bb-server.yaml`), its basename
+     * (`bb-server.yaml`) or its name (`bb-server`). Empty, or absent, wakes
+     * nobody for a `workflow_run` doorbell: today's behaviour exactly. The
+     * plugin forwards the fact that a named workflow failed and leaves what
+     * that means to the playbook; it reads no image, tag or pin.
+     */
+    workflows: z.array(z.string().trim().min(1).max(200)).max(50).default([]),
   })
   .strict();
 export type DeploymentTarget = z.infer<typeof deploymentTargetSchema>;
