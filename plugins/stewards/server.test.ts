@@ -1706,6 +1706,27 @@ describe("terminal states and follow-through", () => {
     expect(t.archives()).toEqual([t.steward]);
   });
 
+  it("keeps a deferred archive through an idle that is still busy, and archives on the next", async () => {
+    const t = await working();
+    await t.done();
+    await t.report();
+    // finishEnding finds the thread busy: the archive is deferred.
+    t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => ({ ...(await t.sdk.threads.get(args)), status: "active" }));
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.archives()).toEqual([]);
+    // Still busy at the next idle: the flag must survive so a later idle retries
+    // instead of clearing it and never archiving (BB-60).
+    await t.idle(t.steward);
+    expect(t.archives()).toEqual([]);
+    expect(t.hooks.store.find("ENG-12")!.archiveWhenIdle).toBe(true);
+
+    t.harness.sdk.stub("threads.get", t.sdk.threads.get);
+    await t.idle(t.steward);
+    expect(t.archives()).toEqual([t.steward]);
+    expect(t.hooks.store.find("ENG-12")!.archiveWhenIdle).toBe(false);
+  });
+
   it("keeps the binding open while the steward follows through, and ends it once the work is done", async () => {
     const t = await working();
     await t.done();
@@ -1766,13 +1787,67 @@ describe("terminal states and follow-through", () => {
     expect((await t.list())[0]).toMatchObject({ ended: true });
   });
 
+  it("keeps a terminal binding open on a report that escalates without a follow-through", async () => {
+    const t = await working();
+    await t.done();
+    // The deps-prs timeline in BB-60: escalate a merge decision in the wrap-up
+    // report without followThrough. The report must not end the binding and
+    // auto-resolve the question the user has not seen.
+    const reported = await t.report({ escalate: { kind: "decision", question: "Merge bb-gate#39?", meanwhile: "Wait.", choices: ["Merge", "Close"] } });
+    expect(reported.error).toBe(false);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    expect(t.hooks.store.escalation(id)).toMatchObject({ status: "open" });
+    const b = t.hooks.store.find("ENG-12")!;
+    expect(b.followThrough).toBe("Merge bb-gate#39?");
+    expect(b.followThroughUntil).not.toBeNull();
+  });
+
+  it("ends an escalation without waking the binding it just ended", async () => {
+    const t = await working();
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Building the rest." } }, t.steward);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
+    await t.done();
+    await t.report({ followThrough: "watch the deploy" });
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+
+    const before = t.sends.filter((x) => x.threadId === t.steward).length;
+    // The follow-through deadline ends the binding and resolves the escalation.
+    t.advance(6 * 3_600_000 + 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.hooks.store.escalation(id)).toMatchObject({ status: "resolved", resolution: "The binding ended." });
+    // finishEnding resolved it quietly: no delivery was queued for the ended
+    // binding.
+    expect(t.hooks.store.pendingDeliveries().some((d) => d.escalationId === id)).toBe(false);
+
+    // flushDeliveries also skips a delivery whose origin binding has ended.
+    t.hooks.db
+      .prepare("INSERT INTO pending_deliveries (id, escalation_id, origin_thread_id, origin_binding_id, text, decided_by, created_at) VALUES ('dlv_manual', ?, ?, ?, ?, 'plugin', ?)")
+      .run(id, t.steward, t.hooks.store.find("ENG-12")!.id, "The binding ended.", t.now());
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends.filter((x) => x.threadId === t.steward)).toHaveLength(before);
+    expect(t.hooks.store.pendingDeliveries().some((d) => d.id === "dlv_manual")).toBe(false);
+  });
+
   it("takes an answer to an escalation the ending resolved, once, keeping what the ending said", async () => {
     const t = await working();
     await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Building the rest." } }, t.steward);
     const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
     await t.done();
+    // The open escalation keeps the binding alive through the wrap-up report
+    // (BB-60); the follow-through deadline is what ends it and resolves the
+    // escalation.
     await t.report();
     await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    t.advance(6 * 3_600_000 + 60_000);
+    await t.hooks.sweep();
+    await t.flush();
     expect((await t.list())[0]).toMatchObject({ ended: true });
     expect(t.hooks.store.escalation(id)).toMatchObject({ status: "resolved", resolution: "The binding ended." });
 
@@ -1791,8 +1866,15 @@ describe("terminal states and follow-through", () => {
     const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((x) => x.threadId === t.project).at(-1)!.text)![1]!;
     const qst = /(qst_[\w-]+)/u.exec((await t.tool("steward_update", { binding: "ENG-12", forward: id }, t.project)).text)![1]!;
     await t.done();
+    // The forwarded escalation keeps the binding alive through the wrap-up
+    // report (BB-60); the follow-through deadline ends it and closes both the
+    // escalation and its question.
     await t.report();
     await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: false });
+    t.advance(6 * 3_600_000 + 60_000);
+    await t.hooks.sweep();
+    await t.flush();
     expect((await t.list())[0]).toMatchObject({ ended: true });
     expect(t.hooks.store.question(qst)).toMatchObject({ status: "answered", answer: "The binding ended." });
 

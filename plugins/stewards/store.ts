@@ -1156,22 +1156,24 @@ export function createStore(db: Database.Database, now: () => number, options: S
    * the escalation a question was forwarded from closes too, so a close on the
    * page (answer, Done, a finished requester, a secret import) resolves the
    * whole pair in one write and the originator hears the answer (BB-51). `by`
-   * is who answered it.
+   * is who answered it. `deliver` is false for a mechanical close of an
+   * escalation whose origin binding has ended: it is resolved, but no wake is
+   * queued for a binding that is already gone (BB-60).
    */
-  function resolve(id: string, resolution: string, by = "plugin"): boolean {
+  function resolve(id: string, resolution: string, by = "plugin", deliver = true): boolean {
     return coalescing(() => {
       const resolved = db.transaction(() => {
         const at = now();
         if (resolveEscalation.run(resolution, at, id).changes === 0) return false;
         answerForEscalation.run(resolution, by, at, id);
         const x = getEscalation.get(id);
-        if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by);
+        if (x !== undefined) recordResolutionDelivery(toEscalation(x), resolution, by, deliver);
         // Follow the link up: a question resolved on the page also resolves the
         // escalation the project steward forwarded it from.
         const parent = forwardedFromOf.get(id);
         if (parent !== undefined && String(parent.status) === "open") {
           resolveEscalation.run(resolution, at, String(parent.id));
-          recordResolutionDelivery(toEscalation(parent), resolution, by);
+          recordResolutionDelivery(toEscalation(parent), resolution, by, deliver);
           answerForEscalation.run(resolution, by, at, String(parent.id));
         }
         return true;
@@ -1189,9 +1191,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
    * (verbatim, with who decided as its author) and a quiet note on each binding
    * the escalation passed through, then queue one delivery to the originating
    * thread. The server flushes the queue; a worker gets a tell, a steward a
-   * wake. This is the one road every resolve takes (BB-30).
+   * wake. This is the one road every resolve takes (BB-30). `deliver` is
+   * false for a resolve that must not wake the origin (BB-60).
    */
-  function recordResolutionDelivery(x: Escalation, resolution: string, by: string): void {
+  function recordResolutionDelivery(x: Escalation, resolution: string, by: string, deliver = true): void {
     const originBindingId = x.origin.bindingId ?? x.bindingId;
     // A mechanical closure (the plugin withdrawing or closing something) is
     // not a decision: it is noted, but it is not written as guidance a worker
@@ -1212,7 +1215,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const b = rowToBinding(raw);
       patch(hop.bindingId, { pending: [...b.pending, { at: now(), text: `Escalation ${x.id} was answered by ${by}: ${resolution}`, quiet: true }].slice(-30) });
     }
-    if (x.origin.threadId !== null && x.origin.threadId !== "") insertDelivery.run(newId("dlv"), x.id, x.origin.threadId, originBindingId === "" ? null : originBindingId, resolution, by, now());
+    if (deliver && x.origin.threadId !== null && x.origin.threadId !== "") insertDelivery.run(newId("dlv"), x.id, x.origin.threadId, originBindingId === "" ? null : originBindingId, resolution, by, now());
   }
 
   function patch(id: string, fields: BindingPatch): Binding {
