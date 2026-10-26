@@ -4727,9 +4727,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const next = parsePullRef(ref);
       if (next === null) return { error: `replacedBy must name a pull request as owner/repo#N or its URL; ${JSON.stringify(ref)} does not.` };
       const own = parsePullRef(b.url ?? b.entityKey);
-      if (own !== null && lc(own.repo) !== lc(next.repo)) return { error: `A replacement is in the same repository: ${b.entityKey} is in ${own.repo}, not ${next.repo}.` };
+      if (own === null) return { error: `replacedBy is for a pull request whose key reads as owner/repo#N; ${JSON.stringify(b.entityKey)} does not.` };
+      if (lc(own.repo) !== lc(next.repo)) return { error: `A replacement is in the same repository: ${b.entityKey} is in ${own.repo}, not ${next.repo}.` };
       const key = `${next.repo}#${next.number}`;
-      if (own !== null && own.number === next.number) return { error: `${key} is this pull request, not a replacement.` };
+      if (own.number === next.number) return { error: `${key} is this pull request, not a replacement.` };
       const entity = await snapshot("github", key).catch(() => null);
       if (entity === null || entity.pull === null) return { error: `${key} could not be read as a pull request.` };
       if (entity.pull.merged || entity.state === "merged" || entity.state === "closed") return { error: `${entity.key} is ${entity.state}; a replacement must be open.` };
@@ -4922,9 +4923,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async execute(input, { threadId }) {
         try {
           let b = ownBinding(threadId);
-          // A replacement pull request moves the binding before anything else
-          // is judged: the terminal state of the one it replaces no longer
-          // ends it, and the gate below reads the replacement.
+          // Validate the input that does not depend on which pull request the
+          // binding is on before a replacement moves it: a wrap-up report that
+          // carries `replacedBy` and `followThrough` (the natural combination
+          // in the turn the old pull request closed) must not move the binding
+          // and then refuse the rest of itself.
+          const opsTickets = input.opsTickets ?? [];
+          if (opsTickets.length > 0) {
+            if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
+            const unknown = opsTickets.filter((t) => store.fingerprint(b.projectId, t.fingerprint) === null).map((t) => JSON.stringify(t.fingerprint));
+            if (unknown.length > 0) {
+              const known = [...(b.opsLook?.findings ?? []), ...(b.sentryLook?.findings ?? []), ...(b.depsLook?.alerts ?? [])].map((f) => `- ${f.fingerprint}`).join("\n");
+              return toolError(new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a fingerprint" : "are not fingerprints"} this project has seen. Use them as the wake gives them${known === "" ? "." : `:\n${known}`}`));
+            }
+          }
+          // `followThrough` is judged against the ending the report found: a
+          // replacement undoes a terminal ending, so the wrap-up report that
+          // moves the binding may still carry it.
+          const endingBefore = b.ending;
+          if (input.followThrough !== undefined && endingBefore !== "terminal") {
+            return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
+          }
+          // Fixed choices are for a decision, as a `decide` need is: they are
+          // what a forwarded escalation turns into a question with buttons.
+          if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
+            return toolError(new Error("choices are for a decision escalation: escalate a decision with choices."));
+          }
+          // A replacement pull request moves the binding before the gate is
+          // judged: the terminal state of the one it replaces no longer ends
+          // it, and the gate below reads the replacement.
           let replacedNote = "";
           if (input.replacedBy !== undefined) {
             const moved = await replaceBinding(b, input.replacedBy);
@@ -4936,23 +4963,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // report that just passed it from one that finds it already passed.
           const priorReady = b.ready;
           const priorSnapshot = b.lastSnapshot;
-          const opsTickets = input.opsTickets ?? [];
-          if (opsTickets.length > 0) {
-            if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
-            const unknown = opsTickets.filter((t) => store.fingerprint(b.projectId, t.fingerprint) === null).map((t) => JSON.stringify(t.fingerprint));
-            if (unknown.length > 0) {
-              const known = [...(b.opsLook?.findings ?? []), ...(b.sentryLook?.findings ?? []), ...(b.depsLook?.alerts ?? [])].map((f) => `- ${f.fingerprint}`).join("\n");
-              return toolError(new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a fingerprint" : "are not fingerprints"} this project has seen. Use them as the wake gives them${known === "" ? "." : `:\n${known}`}`));
-            }
-          }
-          if (input.followThrough !== undefined && b.ending !== "terminal") {
-            return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
-          }
-          // Fixed choices are for a decision, as a `decide` need is: they are
-          // what a forwarded escalation turns into a question with buttons.
-          if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
-            return toolError(new Error("choices are for a decision escalation: escalate a decision with choices."));
-          }
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
           const priorGate = playbook !== null && playbook.ready !== null ? gateState(playbook, priorReady, priorSnapshot === null ? (priorReady.approval?.specHash ?? "") : specHashFor(b, priorSnapshot.entity)) : null;
