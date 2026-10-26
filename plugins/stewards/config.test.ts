@@ -185,6 +185,20 @@ describe("playbooks", () => {
     expect(p.version).toMatch(/^[0-9a-f]{12}$/u);
   });
 
+  it("takes a deployment target's optional workflows list, defaulting to none (BB-61)", () => {
+    const withDeployment = (extra: string) =>
+      LINEAR_TICKETS.replace(
+        "requeue-default: 2d",
+        `requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h${extra}`,
+      );
+    const none = parsePlaybook(withDeployment(""), "linear-tickets");
+    if (!none.ok) throw new Error(none.error);
+    expect(none.value.deployment).toMatchObject({ repo: "bitcomplete/bb-gate", environment: "production", workflows: [] });
+    const named = parsePlaybook(withDeployment("\n  workflows: [bb-server.yaml, image.yaml]"), "linear-tickets");
+    if (!named.ok) throw new Error(named.error);
+    expect(named.value.deployment?.workflows).toEqual(["bb-server.yaml", "image.yaml"]);
+  });
+
   it("refuses what would misbehave", () => {
     expect(parsePlaybook("no front matter", "x")).toMatchObject({ ok: false });
     expect(parsePlaybook(LINEAR_TICKETS, "other-name")).toMatchObject({ ok: false });
@@ -196,6 +210,8 @@ describe("playbooks", () => {
     if (!r.ok) expect(r.error).toMatch(/needs a ready gate/u);
     const overlap = GITHUB_PRS.replace("terminal: [merged, closed]", "terminal: [merged, closed, open]");
     expect(parsePlaybook(overlap, "github-prs")).toMatchObject({ ok: false });
+    const emptyWorkflow = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "x"\n  workflows: [""]');
+    expect(parsePlaybook(emptyWorkflow, "linear-tickets")).toMatchObject({ ok: false });
   });
 });
 

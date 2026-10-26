@@ -697,9 +697,27 @@ describe("stewards' source contract", () => {
       // A refused deployment_repo lease is a skip, logged as one.
       w.hooks.state.answer = (body) => Response.json({ leases: [], rejected: body.watches.map((x) => ({ ...x, reason: "forbidden" })) });
       await tick(30 * 60_000);
-      expect(w.harness.logEntries.some((l) => l.message.includes("this server skips deployment doorbells there"))).toBe(true);
+      expect(w.harness.logEntries.some((l) => l.message.includes("this server skips deployment and workflow-run doorbells there"))).toBe(true);
       const interest = ((await w.harness.callRpc("watches", null)) as { interest: { unleased: Array<{ key: string; reason: string }> } }).interest;
-      expect(interest.unleased).toEqual([{ key: "acme/bb-gate", reason: "refused by bb-gate-hooks (forbidden); deployment doorbells are skipped" }]);
+      expect(interest.unleased).toEqual([{ key: "acme/bb-gate", reason: "refused by bb-gate-hooks (forbidden); deployment and workflow-run doorbells are skipped" }]);
+      service.controller.abort();
+      await service.done;
+    });
+
+    it("hands stewards a workflow_run doorbell's run object for a leased deployment repository (BB-61)", async () => {
+      const w = await setup(WITH_HOOKS);
+      const service = w.harness.runService("watches");
+      await tick();
+      w.hooks.last().send(w.hooks.hello("c_1"));
+      await tick();
+      expect(await w.harness.callRpc("sourceSetInterest", { units: [], entities: [], dependabot: [], deployment: ["acme/bb-gate"] }, STEWARDS)).toEqual({ ok: true });
+      await tick();
+      expect(w.hooks.subscribes.map((s) => s.watches)).toEqual([[{ kind: "deployment_repo", id: "acme/bb-gate" }]]);
+      const workflow_run = { workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "abc123", run_attempt: 1 };
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/bb-gate#42", unit: "Acme/bb-gate", workflow_run })}\n\n`);
+      w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/Other#42", unit: "Acme/Other", workflow_run })}\n\n`);
+      await tick(3000);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#42", workflow_run } }]);
       service.controller.abort();
       await service.done;
     });

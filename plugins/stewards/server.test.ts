@@ -6052,4 +6052,86 @@ describe("deployment watching (BB-53)", () => {
     const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(wake).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
   });
+
+  // BB-61: a named workflow's failure, cancellation or timeout wakes the
+  // steward once per (run id, attempt), without moving the watch's state.
+  const workflowPlaybook = () =>
+    LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries: "The pinned BB_PLUGINS_REF contains the merge commit."\n  timeout: 1h\n  workflows: [bb-server.yaml]',
+    );
+  const workflowRun = (over: Record<string, unknown> = {}) => ({ workflow: ".github/workflows/bb-server.yaml", name: "bb-server", conclusion: "failure", url: "https://github.com/acme/bb-gate/actions/runs/42", sha: "ccccccc3", run_attempt: 1, ...over });
+  const runDoorbell = async (t: Awaited<ReturnType<typeof setup>>, id: string, workflow_run: Record<string, unknown>) => {
+    await t.harness.callRpc("stewardsRing", { source: "github", id, workflow_run }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
+    await t.flush();
+  };
+
+  it("wakes the steward once for a named workflow run, listing the run and the open watch (BB-61)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    // The watch stays awaiting a deployment: the plugin forwards the fact only.
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/bb-server/u);
+    expect(wake).toMatch(/failure/u);
+    expect(wake).toMatch(/https:\/\/github.com\/acme\/bb-gate\/actions\/runs\/42/u);
+    expect(wake).toMatch(/head ccccccc/u);
+    expect(wake).toMatch(/acme\/web#7/u);
+    // A repeat delivery of the same run and attempt is not news.
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+    // A re-run (a higher attempt) wakes again.
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun({ run_attempt: 2 }));
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 2);
+  });
+
+  it("persists a workflow run on an arrival-skipped watch so a repeat delivery does not wake it (BB-61)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    const binding = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    // The watch is recorded after the doorbell arrives: the run cannot concern
+    // it, so it must not wake, but the event must persist on it so a repeat
+    // delivery of the same run and attempt cannot wake it later.
+    const watch = binding.deployments["acme/web#7"]!;
+    t.hooks.store.patch(binding.id, { deployments: { "acme/web#7": { ...watch, at: t.now() + 100_000 } } });
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("ignores a workflow the playbook does not name (BB-61)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun({ workflow: ".github/workflows/image.yaml", name: "image" }));
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("wakes nobody for a workflow run when the deployment target names no workflows (BB-61)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
 });

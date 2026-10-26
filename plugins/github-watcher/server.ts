@@ -48,7 +48,7 @@ import {
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
-import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, type AdoptableEntity, type Deployment } from "./source-contract.js";
+import { deploymentSchema, ringStewards, sourceContract, STEWARDS_PLUGIN_ID, workflowRunSchema, type AdoptableEntity, type Deployment, type WorkflowRun } from "./source-contract.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
 
@@ -299,7 +299,9 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
     function interesting(kind: string, key: string, unit: string | null): boolean {
       const repo = unit ?? parseRefKey(key)?.repo ?? null;
       if (kind === "dependabot_alert") return repo !== null && interestDependabot.has(repo.toLowerCase());
-      if (kind === "deployment") return repo !== null && interestDeployment.has(repo.toLowerCase());
+      // A workflow_run doorbell shares the deployment_repo lease: only a
+      // project that names a deployment target cares about a failed run.
+      if (kind === "deployment" || kind === "workflow_run") return repo !== null && interestDeployment.has(repo.toLowerCase());
       if (interestEntities.has(key.toLowerCase())) return true;
       return repo !== null && interestRepos.has(repo.toLowerCase());
     }
@@ -326,6 +328,21 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       { onError: (id, error) => warn(`ringing stewards for deployment ${id} failed: ${errorMessage(error)}`) },
     );
     bb.onDispose(() => deploymentRings.stop());
+
+    // A workflow_run doorbell carries its run object the same way. It is keyed
+    // by the run id and attempt, so a re-run that fails again is its own ring
+    // rather than being coalesced into the first.
+    const pendingWorkflowRuns = new Map<string, { id: string; run: WorkflowRun }>();
+    const workflowRunRings = createCheckQueue(
+      (eventKey) => {
+        const pending = pendingWorkflowRuns.get(eventKey);
+        pendingWorkflowRuns.delete(eventKey);
+        if (pending === undefined) return Promise.resolve();
+        return ringStewards(callStewards, { source: "github", id: pending.id, workflow_run: pending.run }, warn);
+      },
+      { onError: (eventKey, error) => warn(`ringing stewards for workflow run ${eventKey} failed: ${errorMessage(error)}`) },
+    );
+    bb.onDispose(() => workflowRunRings.stop());
 
     // The service refusing a lease is not proof the developer lost access:
     // with GitHub rate-limiting the service, or briefly down, every watch
@@ -359,7 +376,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           // Reading a repository's deployments needs `deployments:read` (or
           // the `repo` scope); a token without it is refused here, which is a
           // skip: the server keeps running without deployment doorbells.
-          if (interestDeployment.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a deployment_repo lease on ${r.id} (${r.reason}); this server skips deployment doorbells there`);
+          if (interestDeployment.has(r.id.toLowerCase())) bb.log.info(`bb-gate-hooks refused a deployment_repo lease on ${r.id} (${r.reason}); this server skips deployment and workflow-run doorbells there`);
           continue;
         }
         if (r.kind === "repo" || (watching.length === 0 && interestEntities.has(r.id.toLowerCase()))) {
@@ -390,8 +407,20 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       token: accessToken,
       refreshToken: () => refreshToken("was refused by bb-gate-hooks"),
       watchIds: leases,
-      onDoorbell: (kind, key, unit, deployment) => {
+      onDoorbell: (kind, key, unit, deployment, workflowRun) => {
         if (kind === "issue") checks.ring(key);
+        if (kind === "workflow_run") {
+          if (!interesting(kind, key, unit)) return;
+          const parsed = workflowRunSchema.safeParse(workflowRun);
+          if (!parsed.success) {
+            bb.log.warn(`GitHub workflow_run doorbell ${key} carried no readable run; nothing to hand stewards`);
+            return;
+          }
+          const eventKey = `${key.toLowerCase()}#${parsed.data.run_attempt}`;
+          pendingWorkflowRuns.set(eventKey, { id: key, run: parsed.data });
+          workflowRunRings.ring(eventKey);
+          return;
+        }
         if (kind === "deployment") {
           if (!interesting(kind, key, unit)) return;
           const parsed = deploymentSchema.safeParse(deployment);
@@ -461,7 +490,7 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
       }
       for (const repo of interest.deployment) {
         const reason = refused.get(`deployment_repo ${repo.toLowerCase()}`);
-        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); deployment doorbells are skipped` });
+        if (reason !== undefined) unleased.push({ key: repo, reason: `refused by bb-gate-hooks (${reason}); deployment and workflow-run doorbells are skipped` });
       }
       return {
         nouns: { unit: ["repository", "repositories"], entity: ["pull request", "pull requests"] },
