@@ -251,12 +251,14 @@ export const lessonRulesSchema = z
     decayHalfLifeDays: z.number().positive().max(3650).default(30),
     /**
      * Validation escalations (BB-35 step 5): the two rare conditions that ask
-     * the user to confirm a lesson. `perWeek` caps how many the plugin may
-     * file in a rolling week, ordered by score; the rest wait.
+     * the user to confirm a lesson. `perWeek` caps how many of this project's
+     * validation items may be filed in a rolling week, ordered by score; the
+     * rest wait. The budget includes a boundary Merge/Drop the project steward
+     * files by hand, so the user is not asked twice in one week.
      */
     validations: z
       .object({
-        /** At most this many validation escalations (a boundary Merge/Drop, a mixed-evidence Keep/Retire) may be filed per rolling week. */
+        /** At most this many validation escalations (a boundary Merge/Drop, a mixed-evidence Keep/Retire) may be filed per rolling week, per project. */
         perWeek: z.number().int().min(0).max(50).default(1),
       })
       .strict()

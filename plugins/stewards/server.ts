@@ -3255,16 +3255,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * BB-35 step 5: file the rare validation escalations, rate-capped. The
-     * queue is ordered by score; at most `lessons.validations.perWeek` are
-     * filed in a rolling week and the rest wait. Silence is the default: an
-     * unanswered mixed-evidence question retires the lesson on the next pass,
-     * while a boundary Merge/Drop left unanswered leaves the lesson in trial.
+     * queue is ordered by score; at most `lessons.validations.perWeek` of this
+     * project's validation items may be filed in a rolling week and the rest
+     * wait. The budget covers every user-facing lesson question, including the
+     * boundary Merge/Drop the project steward files by hand at `complete` time:
+     * a manual filing is the project steward's explicit override, and it still
+     * spends a slot so the user is not asked twice in one week. Silence is the
+     * default: an unanswered mixed-evidence question retires the lesson on the
+     * next pass, while a boundary Merge/Drop left unanswered leaves the lesson
+     * in trial.
      */
     function applyValidations(config: ProjectConfig): void {
       const at = now();
       const requests = planValidations(store.allLessons(config.projectId), config.file.lessons, at);
       if (requests.length === 0) return;
-      let remaining = Math.max(0, config.file.lessons.validations.perWeek - store.validationsFiledSince(at - 7 * 86_400_000));
+      let remaining = Math.max(0, config.file.lessons.validations.perWeek - store.validationsFiledSince(config.projectId, at - 7 * 86_400_000));
       for (const request of requests) {
         const lesson = store.lesson(request.id);
         if (lesson === null || lesson.tier === "retired") continue;
@@ -3281,7 +3286,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const branch = request.validation === "boundary-promotion" ? lessonBranch(lesson) : null;
         if (branch !== null) store.setLessonBranch(lesson.id, branch);
         const filed = request.validation === "boundary-promotion" ? fileBoundaryLessonNeed(lesson, branch) : fileMixedEvidenceNeed(lesson);
-        if (!filed) continue;
+        if (!filed) {
+          // A lesson with no binding (a hand-edited or pre-guard row) has no
+          // item to live on; say so once rather than skipping it in silence.
+          store.noteLesson(lesson.id, "No binding to file the validation item on; record the lesson with a binding.");
+          continue;
+        }
         store.markLessonValidationFiled(lesson.id, at);
         remaining -= 1;
       }

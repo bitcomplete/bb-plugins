@@ -387,7 +387,7 @@ describe("the validation migration (BB-35 step 5)", () => {
     const s = createStore(db, () => now);
     s.fileNeed({ bindingId: "bnd_1", kind: "decide", url: "lsn_1", what: "Keep or retire?", how: null, data: { lessonId: "lsn_1", choices: ["Keep", "Retire"], validation: "mixed-evidence" } });
     expect(s.openLessonValidationNeed("lsn_1")).toMatchObject({ url: "lsn_1", data: { validation: "mixed-evidence" } });
-    expect(s.validationsFiledSince(0)).toBe(1);
+    expect(s.validationsFiledSince("p1", 0)).toBe(1);
     s.markLessonValidationFiled("lsn_1", now);
     expect(s.lesson("lsn_1")).toMatchObject({ validationFiledAt: 2000, validatedAt: null });
     // A Keep is remembered, so the question is never asked again.
@@ -397,8 +397,20 @@ describe("the validation migration (BB-35 step 5)", () => {
     expect(s.lesson("lsn_1")).toMatchObject({ validatedAt: 3000 });
     // Only a validation item counts toward the weekly cap; an ordinary need does not.
     s.fileNeed({ bindingId: "bnd_1", kind: "decide", url: "x", what: "Other.", how: null });
-    expect(s.validationsFiledSince(0)).toBe(1);
-    expect(s.validationsFiledSince(2500)).toBe(0);
+    expect(s.validationsFiledSince("p1", 0)).toBe(1);
+    expect(s.validationsFiledSince("p1", 2500)).toBe(0);
+  });
+
+  it("scopes the rolling weekly count to the project", () => {
+    const db = legacy();
+    const s = createStore(db, () => 2000);
+    // A second project on the same server has its own binding and budget.
+    const other = s.create({ projectId: "p2", source: "linear", entityId: "uuid-99", entityKey: "ENG-99", url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    s.fileNeed({ bindingId: "bnd_1", kind: "decide", url: "lsn_1", what: "Keep or retire?", how: null, data: { lessonId: "lsn_1", choices: ["Keep", "Retire"], validation: "mixed-evidence" } });
+    expect(s.validationsFiledSince("p1", 0)).toBe(1);
+    expect(s.validationsFiledSince("p2", 0)).toBe(0);
+    s.fileNeed({ bindingId: other.id, kind: "decide", url: "lsn_2", what: "Keep or retire?", how: null, data: { lessonId: "lsn_2", choices: ["Keep", "Retire"], validation: "mixed-evidence" } });
+    expect(s.validationsFiledSince("p2", 0)).toBe(1);
   });
 });
 

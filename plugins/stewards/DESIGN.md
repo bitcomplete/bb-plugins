@@ -1328,13 +1328,19 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   comment) or this project's own steward or worker threads reach it.
 - **Validation escalations (BB-35 step 5).** Only two rare conditions ask the
   user to confirm a lesson, and `lessons.validations.perWeek` (default 1) caps
-  how many the plugin may file in a rolling week, ordered by score, so the rest
-  wait. A **boundary** trial lesson that meets the promotion threshold is not
-  promoted mechanically: the plugin files the existing Merge/Drop item on the
-  Stewards page, and the lesson stays `trial` until the user Merges — silence
-  leaves it in trial, which is safe because a trial lesson widens nothing. A
-  **promoted** lesson with mixed evidence — citations and a correction short of
-  the count that retires it — gets one Keep/Retire question; Keep is remembered
+  how many of one project's validation items may be filed in a rolling week,
+  ordered by score, so the rest wait. The budget covers every user-facing
+  lesson question, including the boundary Merge/Drop the project steward files
+  by hand when it `complete`s a lesson: that filing is the project steward's
+  explicit override, and it still spends a slot so the user is not asked twice
+  in one week. A **boundary** trial lesson that meets the promotion threshold
+  is not promoted mechanically: the plugin files the existing Merge/Drop item
+  on the Stewards page, and the lesson stays `trial` until the user Merges —
+  silence leaves it in trial, which is safe because a trial lesson widens
+  nothing. A **promoted** lesson with mixed evidence — citations and a
+  correction short of the count that retires it, read from the lifetime
+  counters step 2 keeps — gets one Keep/Retire question; the decayed score only
+  orders the queue, it does not gate the condition. Keep is remembered
   (`validated_at`) so it is never asked again, and silence retires it on the
   next nightly pass. Procedure lessons never produce one. The two conditions
   are pure (`planValidations` in `lessons.ts`); the nightly pass enforces the

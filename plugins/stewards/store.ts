@@ -1109,7 +1109,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // the silence default.
   const setLessonValidatedStmt = db.prepare("UPDATE lessons SET validated_at = ?, updated_at = ? WHERE id = ?");
   const markLessonValidationFiledStmt = db.prepare("UPDATE lessons SET validation_filed_at = ?, updated_at = ? WHERE id = ?");
-  const countValidationsSinceStmt = db.prepare<[number], { n: number }>("SELECT COUNT(*) AS n FROM needs WHERE kind = 'decide' AND json_extract(data, '$.validation') IS NOT NULL AND created_at >= ?");
+  const countValidationsSinceStmt = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.kind = 'decide' AND json_extract(n.data, '$.validation') IS NOT NULL AND n.created_at >= ?");
   const openLessonValidationNeedStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE kind = 'decide' AND url = ? AND status = 'open' AND json_extract(data, '$.validation') IS NOT NULL LIMIT 1");
 
   const toNeed = (r: Record<string, unknown>): Need => ({
@@ -1953,9 +1953,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
     markLessonValidationFiled(id: string, at = now()): void {
       markLessonValidationFiledStmt.run(at, at, id);
     },
-    /** How many validation items were filed at or after `at` (BB-35 step 5's rolling weekly cap). */
-    validationsFiledSince(at: number): number {
-      return Number(countValidationsSinceStmt.get(at)?.n ?? 0);
+    /** How many of one project's validation items were filed at or after `at` (BB-35 step 5's rolling weekly cap). */
+    validationsFiledSince(projectId: string, at: number): number {
+      return Number(countValidationsSinceStmt.get(projectId, at)?.n ?? 0);
     },
     /** The open validation item for a lesson, or null (BB-35 step 5). */
     openLessonValidationNeed(lessonId: string): Need | null {
