@@ -13,11 +13,11 @@ token stays on the server; a thread never sees it and needs no API key.
 
 | Tool | Use it to |
 |---|---|
-| `linear_issue` | Read one issue by key (`ENG-123`): state, assignee, labels, project, parent, sub-issues, description, latest comments. |
+| `linear_issue` | Read one issue by key (`ENG-123`): state, assignee, labels, project, parent, sub-issues, description, latest comments, and its relations. |
 | `linear_search` | Find issues by free text and/or team key, state name, assignee (`me` for the connected user). Open issues only by default. |
-| `linear_create_issue` | File a new issue in a team by key: title, Markdown description, and optionally a state, assignee (`me`), labels, priority and parent issue. The description is signed with the thread id. |
+| `linear_create_issue` | File a new issue in a team by key: title, Markdown description, and optionally a state, assignee (`me`), labels, priority, a parent issue and relations to other issues. The description is signed with the thread id. |
 | `linear_comment` | Add a Markdown comment. It is signed with the thread id so a reader can find the conversation. |
-| `linear_update_issue` | Change an issue: state by name, assignee (`me`, a name or email, `nobody`), labels to add or remove, priority, description. Give only the fields to change; a name that does not match is an error listing the choices. A new description replaces the old one whole and is signed with the thread id. |
+| `linear_update_issue` | Change an issue: state by name, assignee (`me`, a name or email, `nobody`), labels to add or remove, priority, description, and relations to add (`relations`) or remove (`removeRelations`). Give only the fields to change; a name that does not match is an error listing the choices. A new description replaces the old one whole and is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query, for projects, cycles, teams, documents and anything the tools above lack. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue by key. This thread is messaged when its state, assignee, priority, labels, title or other fields change, or when someone else comments; the message starts a new turn. Up to ten per thread. |
 | `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session (`response`, `elicitation` or `error`), posted as the bb app and linked to this thread. Use it only when a wake names a session. |
@@ -81,6 +81,14 @@ signs the description with the thread id. If the user did not name a team,
 `linear_search` with `assignee: me` shows which teams they work in. A state,
 label or assignee that does not match is an error that lists the choices,
 so retry with one of those rather than inventing a name.
+
+A dependency between tickets is a relation, not a sentence in the
+description. File a ticket blocked by another with
+`linear_create_issue { relations: [{ type: "blockedBy", issue: "ENG-71" }] }`,
+or add and remove one later with `linear_update_issue { relations |
+removeRelations: [{ type, issue }] }`. `type` is `blockedBy`, `blocks`,
+`related` or `duplicate`. `linear_issue` shows both directions after the
+sub-issues, so a steward reading the ticket sees what it waits on.
 
 ## Answering an @bb mention
 

@@ -58,16 +58,26 @@ already knew, and refreshes it first if it has lapsed.
 
 | Tool | What it does |
 |---|---|
-| `linear_issue` | One issue by key: fields, description, latest comments. |
+| `linear_issue` | One issue by key: fields, description, latest comments, and its relations (blocked by, blocks, related, duplicate). |
 | `linear_search` | Issues by free text, team, state, assignee. |
-| `linear_create_issue` | A new issue in a team: title, description, state, assignee, labels, priority, parent. |
+| `linear_create_issue` | A new issue in a team: title, description, state, assignee, labels, priority, parent, relations. |
 | `linear_comment` | A Markdown comment, signed with the thread id. |
-| `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together. A new description is signed with the thread id. |
+| `linear_update_issue` | Change an issue's state, assignee, labels, priority and description together, and add or remove relations. A new description is signed with the thread id. |
 | `linear_query` | Any read-only GraphQL query. Mutations are refused. |
 | `linear_watch_issue` | Watch an issue: the thread is messaged when it changes or someone else comments. Needs `BB_HOOKS_URL`. |
 | `linear_session_reply` | Answer an `@bb` mention: one reply on its agent session, posted by bb-gate-hooks as the bb app, linking the thread. Needs `BB_HOOKS_URL`. See "@bb mentions". |
 
 Every tool takes an optional `account`; see "Several workspaces".
+
+A dependency between tickets is a **relation**, not a sentence in the
+description. `linear_create_issue` and `linear_update_issue` take
+`relations: [{ type, issue }]`, and update also takes `removeRelations` in
+the same shape. `type` is one of `blockedBy`, `blocks`, `related` or
+`duplicate`, and `issue` is a key such as `ENG-71`; an unresolvable key is
+an error naming it, before anything is changed. `blockedBy X` is stored as
+X blocking this issue, so a ticket that waits on another can be filed
+blocked in one call. `linear_issue` lists both directions — "Blocked by
+ENG-71 (Backlog)", "Blocks ENG-72 (Todo)" — after the sub-issues.
 
 Writes are deliberately named tools rather than a raw mutation tool, so the
 thread's timeline says what changed. Everything runs as the connected user

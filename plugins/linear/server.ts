@@ -40,6 +40,8 @@ import {
   ISSUE_KEYS_QUERY,
   ISSUE_QUERY,
   ISSUE_REF_QUERY,
+  ISSUE_RELATION_CREATE,
+  ISSUE_RELATION_DELETE,
   ISSUE_UPDATE,
   ISSUES_QUERY,
   LinearRequestError,
@@ -56,6 +58,7 @@ import {
   VIEWER_QUERY,
   adoptableFilter,
   findLabels,
+  findRelation,
   findState,
   formatIssue,
   formatIssueList,
@@ -71,15 +74,19 @@ import {
   parseIssueKeys,
   parseIssueList,
   parseIssueRef,
+  parseIssueRelationCreate,
+  parseIssueRelationDelete,
   parseIssueUpdate,
   parseSnapshotIssue,
   parseTeam,
   parseTeams,
   parseUsers,
   parseViewer,
+  relationCreateInput,
   searchLimit,
   snapshotOfIssue,
   type Issue,
+  type RelationType,
   type SearchInput,
   type Viewer,
 } from "./linear.js";
@@ -745,12 +752,20 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       .optional()
       .describe("Which connected Linear workspace, by its URL key (acme in linear.app/acme). Leave out unless several are connected and the issue or team key does not settle it.");
 
+    // A relation names the other issue by key and the kind of dependency;
+    // blockedBy is the inverse of blocks (the other issue blocks this one).
+    const relationParam = z.object({
+      type: z.enum(["blockedBy", "blocks", "related", "duplicate"]).describe("The kind of relation."),
+      issue: issueKey.describe("The other issue's key, such as ENG-123."),
+    });
+    const relationsParam = z.array(relationParam).max(20);
+
     bb.agents.registerTool({
       name: "linear_issue",
       description:
         "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
       instructions:
-        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes. If several Linear workspaces are connected, an issue or team key picks its workspace; pass account only for a search without a team, for linear_query, or when told a key is ambiguous.",
+        "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. A dependency between tickets is a relation, not a line in the description: set one with linear_create_issue or linear_update_issue relations (blockedBy, blocks, related or duplicate) and remove it with removeRelations. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes. If several Linear workspaces are connected, an issue or team key picks its workspace; pass account only for a search without a team, for linear_query, or when told a key is ambiguous.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
       parameters: z.object({ key: issueKey.describe("The issue key, such as ENG-123."), account: accountParam }),
       async execute({ key, account }, { signal }) {
@@ -813,7 +828,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_update_issue",
       description:
-        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, due date, and description. Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id (do not sign it yourself); read the issue first and keep what still holds. A state, label or person that does not match is an error that lists the choices.",
+        "Change a Linear issue: its workflow state (for example In Progress, Done), assignee ('me' for the connected user, a name or email, or 'nobody' to clear), labels to add or remove, priority, due date, description, and relations to add or remove ({ type, issue } with type blockedBy, blocks, related or duplicate). Give only the fields to change; they are applied together. A new description replaces the whole old one and is signed with this thread's id (do not sign it yourself); read the issue first and keep what still holds. A state, label, person or issue key that does not match is an error that lists the choices.",
       presentation: { label: { pending: "Updating a Linear issue", completed: "Updated a Linear issue" } },
       parameters: z
         .object({
@@ -825,17 +840,45 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
           dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/u, "a date such as 2026-10-20").optional().describe("The issue's due date, as YYYY-MM-DD."),
           description: z.string().trim().min(1).max(50_000).optional().describe("The whole new description, in Markdown. Replaces the old one."),
+          relations: relationsParam.optional().describe("Relations to add, as { type, issue } with type blockedBy, blocks, related or duplicate."),
+          removeRelations: relationsParam.optional().describe("Relations to remove, same shape as relations. A relation that is not there is an error."),
           account: accountParam,
         })
         .refine(
-          (v) => v.state !== undefined || v.assignee !== undefined || (v.addLabels?.length ?? 0) > 0 || (v.removeLabels?.length ?? 0) > 0 || v.priority !== undefined || v.dueDate !== undefined || v.description !== undefined,
-          { message: "Give at least one of state, assignee, addLabels, removeLabels, priority, dueDate or description." },
+          (v) =>
+            v.state !== undefined ||
+            v.assignee !== undefined ||
+            (v.addLabels?.length ?? 0) > 0 ||
+            (v.removeLabels?.length ?? 0) > 0 ||
+            v.priority !== undefined ||
+            v.dueDate !== undefined ||
+            v.description !== undefined ||
+            (v.relations?.length ?? 0) > 0 ||
+            (v.removeRelations?.length ?? 0) > 0,
+          { message: "Give at least one of state, assignee, addLabels, removeLabels, priority, dueDate, description, relations or removeRelations." },
         ),
       async execute(input, { threadId, signal }) {
         try {
           const where = await forIssue(input.key, input.account, signal);
           const ref = parseIssueRef(await query(where.key, ISSUE_REF_QUERY, { id: input.key }, signal));
           if (ref === null) return toolError(notFound(input.key, where));
+
+          // Resolve every related key and every relation to remove before any
+          // mutation, so a bad key or a missing relation changes nothing.
+          const addRelations: Array<{ type: RelationType; id: string; identifier: string }> = [];
+          for (const relation of input.relations ?? []) {
+            const found = parseIssueId(await query(where.key, ISSUE_ID_QUERY, { id: relation.issue }, signal));
+            if (found === null) return toolError(notFound(relation.issue, where));
+            addRelations.push({ type: relation.type, id: found.id, identifier: found.identifier });
+          }
+          const existing = [...ref.relations, ...ref.inverseRelations];
+          const removeRelations: Array<{ type: RelationType; relationId: string; identifier: string }> = [];
+          for (const relation of input.removeRelations ?? []) {
+            const found = findRelation(existing, { type: relation.type, issue: relation.issue });
+            if (found === null) return toolError(new Error(`No ${relation.type} relation to ${relation.issue} on ${ref.identifier} to remove.`));
+            removeRelations.push({ type: relation.type, relationId: found.id, identifier: relation.issue });
+          }
+
           const update: Record<string, unknown> = {};
           const changed: string[] = [];
 
@@ -877,14 +920,26 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           if (input.dueDate !== undefined) update.dueDate = input.dueDate;
           if (input.description !== undefined) update.description = signed(input.description, threadId);
 
-          const updated = parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, signal));
-          if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
-          if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
-          if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
-          if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
-          if (input.dueDate !== undefined) changed.push(`due ${input.dueDate}`);
-          if (input.description !== undefined) changed.push("description replaced");
-          return `${updated.identifier}: ${changed.join("; ")}.`;
+          const updated = Object.keys(update).length > 0 ? parseIssueUpdate(await query(where.key, ISSUE_UPDATE, { id: ref.id, input: update }, signal)) : null;
+          if (updated !== null) {
+            if (input.state !== undefined) changed.push(`now ${updated.state ?? input.state}`);
+            if (input.assignee !== undefined) changed.push(updated.assignee === null ? "unassigned" : `assigned to ${updated.assignee}`);
+            if (update.labelIds !== undefined) changed.push(updated.labels.length === 0 ? "no labels" : `labels ${updated.labels.join(", ")}`);
+            if (input.priority !== undefined) changed.push(`priority ${updated.priority === null ? input.priority : (PRIORITY_NAMES[updated.priority] ?? String(updated.priority))}`);
+            if (input.dueDate !== undefined) changed.push(`due ${input.dueDate}`);
+            if (input.description !== undefined) changed.push("description replaced");
+          }
+
+          for (const relation of addRelations) {
+            parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, ref.id) }, signal));
+          }
+          if (addRelations.length > 0) changed.push(`added ${addRelations.map((r) => `${r.type} ${r.identifier}`).join(", ")}`);
+          for (const relation of removeRelations) {
+            parseIssueRelationDelete(await query(where.key, ISSUE_RELATION_DELETE, { id: relation.relationId }, signal));
+          }
+          if (removeRelations.length > 0) changed.push(`removed ${removeRelations.map((r) => `${r.type} ${r.identifier}`).join(", ")}`);
+
+          return `${ref.identifier}: ${changed.join("; ")}.`;
         } catch (error) {
           return toolError(error);
         }
@@ -894,7 +949,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_create_issue",
       description:
-        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, a due date, and a parent issue key. The description is signed with this thread's id; do not sign it yourself. Returns the new issue's key and URL.",
+        "File a new Linear issue in a team, as the connected user. Give the team key and a title; optionally a Markdown description, a state name, an assignee ('me' for the connected user), label names, a priority, a due date, a parent issue key, and relations to other issues ({ type, issue } with type blockedBy, blocks, related or duplicate). The description is signed with this thread's id; do not sign it yourself. Returns the new issue's key and URL.",
       presentation: { label: { pending: "Filing a Linear issue", completed: "Filed a Linear issue" } },
       parameters: z.object({
         team: z.string().trim().min(1).max(20).describe("The team key, such as ENG."),
@@ -906,6 +961,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
         priority: z.enum(["none", "urgent", "high", "medium", "low"]).optional().describe("The priority."),
         dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/u, "a date such as 2026-10-20").optional().describe("The issue's due date, as YYYY-MM-DD."),
         parent: issueKey.optional().describe("The parent issue's key, to file this as a sub-issue."),
+        relations: relationsParam.optional().describe("Relations to make once the issue exists: { type, issue }. blockedBy X makes X block the new issue; blocks X makes the new issue block X."),
         account: accountParam,
       }),
       async execute(input, { threadId, signal }) {
@@ -955,8 +1011,26 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
             create.parentId = parent.id;
           }
 
+          // Every related key is resolved before the issue is filed, so a bad
+          // key changes nothing; the relations themselves wait for its id.
+          const relations: Array<{ type: RelationType; id: string; identifier: string }> = [];
+          for (const relation of input.relations ?? []) {
+            const found = parseIssueId(await query(where.key, ISSUE_ID_QUERY, { id: relation.issue }, signal));
+            if (found === null) return toolError(notFound(relation.issue, where));
+            relations.push({ type: relation.type, id: found.id, identifier: found.identifier });
+          }
+
           const created = parseIssueCreate(await query(where.key, ISSUE_CREATE, { input: create }, signal));
-          return `Filed ${created.identifier}: ${input.title.trim()}${created.url === null ? "" : `\n${created.url}`}`;
+          if (relations.length > 0 && created.id === "") throw new Error(`Filed ${created.identifier}, but Linear did not return its id, so its relations were not made.`);
+          for (const relation of relations) {
+            try {
+              parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, created.id) }, signal));
+            } catch (error) {
+              return toolError(new Error(`Filed ${created.identifier}, but its ${relation.type} relation to ${relation.identifier} was not made: ${errorMessage(error)}`));
+            }
+          }
+          const related = relations.length === 0 ? "" : `\nRelated: ${relations.map((r) => `${r.type} ${r.identifier}`).join(", ")}.`;
+          return `Filed ${created.identifier}: ${input.title.trim()}${created.url === null ? "" : `\n${created.url}`}${related}`;
         } catch (error) {
           return toolError(error);
         }

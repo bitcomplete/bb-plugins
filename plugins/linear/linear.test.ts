@@ -6,6 +6,7 @@ import {
   adoptableFilter,
   dataOf,
   findLabels,
+  findRelation,
   findState,
   formatIssue,
   formatIssueList,
@@ -25,6 +26,7 @@ import {
   parseUsers,
   parseViewer,
   pullKey,
+  relationCreateInput,
   searchLimit,
   snapshotOfIssue,
 } from "./linear.js";
@@ -149,7 +151,7 @@ describe("creating", () => {
       { id: "u1", name: "jane", email: "jane@acme.test", active: true },
       { id: "u2", name: "Old", email: null, active: true },
     ]);
-    expect(parseIssueCreate({ data: { issueCreate: { success: true, issue: { identifier: "ENG-124", url: "https://linear.app/i/ENG-124" } } } })).toEqual({ identifier: "ENG-124", url: "https://linear.app/i/ENG-124" });
+    expect(parseIssueCreate({ data: { issueCreate: { success: true, issue: { id: "uuid-124", identifier: "ENG-124", url: "https://linear.app/i/ENG-124" } } } })).toEqual({ id: "uuid-124", identifier: "ENG-124", url: "https://linear.app/i/ENG-124" });
     expect(() => parseIssueCreate({ data: { issueCreate: { success: false, issue: null } } })).toThrow("did not create");
   });
 });
@@ -231,6 +233,44 @@ describe("formatting", () => {
     const list = formatIssueList([parseIssue({ data: { issue } })!], "Linear issues");
     expect(list).toBe("Linear issues (1):\n- ENG-123 Fix login [In Progress, @jane, High]");
     expect(formatIssueList([], "Linear issues")).toBe("Linear issues: no issues.");
+  });
+
+  it("writes relations and inverse relations, and nothing when there are none", () => {
+    const withRelations = {
+      ...issue,
+      children: { nodes: [{ identifier: "ENG-124", title: "Add test", state: { name: "Todo" } }] },
+      relations: { nodes: [{ id: "r1", type: "blocks", relatedIssue: { identifier: "ENG-72", state: { name: "Todo" } } }, { id: "r2", type: "duplicate", relatedIssue: { identifier: "ENG-74", state: null } }] },
+      inverseRelations: { nodes: [{ id: "r3", type: "blocks", issue: { identifier: "ENG-71", state: { name: "Backlog" } } }] },
+    };
+    const text = formatIssue(parseIssue({ data: { issue: withRelations } })!);
+    expect(text).toContain("Relations:\n- Blocks ENG-72 (Todo)\n- Duplicate of ENG-74\n- Blocked by ENG-71 (Backlog)");
+    expect(text.indexOf("Sub-issues:")).toBeLessThan(text.indexOf("Relations:"));
+    expect(text.indexOf("Relations:")).toBeLessThan(text.indexOf("## Description"));
+    expect(formatIssue(parseIssue({ data: { issue } })!)).not.toContain("Relations:");
+  });
+});
+
+describe("relations", () => {
+  it("maps a requested relation onto issueRelationCreate", () => {
+    expect(relationCreateInput({ type: "blockedBy", issueId: "uuid-71" }, "uuid-1")).toEqual({ issueId: "uuid-71", relatedIssueId: "uuid-1", type: "blocks" });
+    expect(relationCreateInput({ type: "blocks", issueId: "uuid-72" }, "uuid-1")).toEqual({ issueId: "uuid-1", relatedIssueId: "uuid-72", type: "blocks" });
+    expect(relationCreateInput({ type: "related", issueId: "uuid-73" }, "uuid-1")).toEqual({ issueId: "uuid-1", relatedIssueId: "uuid-73", type: "related" });
+    expect(relationCreateInput({ type: "duplicate", issueId: "uuid-74" }, "uuid-1")).toEqual({ issueId: "uuid-1", relatedIssueId: "uuid-74", type: "duplicate" });
+  });
+
+  it("finds an existing relation in either direction", () => {
+    const existing = [
+      { id: "rel-blocks", type: "blocks", issue: "ENG-123", relatedIssue: "ENG-71" },
+      { id: "rel-blocked", type: "blocks", issue: "ENG-70", relatedIssue: "ENG-123" },
+      { id: "rel-related", type: "related", issue: "ENG-123", relatedIssue: "ENG-73" },
+      { id: "rel-duplicate", type: "duplicate", issue: "ENG-123", relatedIssue: "ENG-74" },
+    ];
+    expect(findRelation(existing, { type: "blocks", issue: "ENG-71" })?.id).toBe("rel-blocks");
+    expect(findRelation(existing, { type: "blockedBy", issue: "ENG-70" })?.id).toBe("rel-blocked");
+    expect(findRelation(existing, { type: "related", issue: "ENG-73" })?.id).toBe("rel-related");
+    expect(findRelation(existing, { type: "duplicate", issue: "ENG-74" })?.id).toBe("rel-duplicate");
+    expect(findRelation(existing, { type: "blocks", issue: "ENG-70" })).toBeNull();
+    expect(findRelation(existing, { type: "blockedBy", issue: "ENG-71" })).toBeNull();
   });
 });
 
