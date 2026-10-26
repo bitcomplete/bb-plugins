@@ -5008,7 +5008,112 @@ describe("dependency stewards", () => {
     const prompt = String(pr!.prompt);
     expect(prompt).toMatch(/playbook deps-prs@/u);
     expect(prompt).toMatch(/You steward one Dependabot version-update pull request/u);
-    expect(prompt).toMatch(/never merge it: you adopt it, review it, and escalate it for a\s+human merge/u);
+    expect(prompt).toMatch(/never merge it: you adopt it, get it reviewed, and leave the\s+merge to a person/u);
+  });
+
+  // A Dependabot bump that cannot merge as is comes back as a worker's own
+  // pull request. The binding follows it: same thread, playbook and history,
+  // and the ordinary gate files the replacement's Merge item.
+  async function depsBound() {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [] }, { head: "dependabot/npm/group", headAuthor: "dependabot[bot]" }));
+    await t.hooks.sweep();
+    await t.flush();
+    const steward = t.spawns.find((x) => x.title === "acme/web#9: deps: bump the npm group")!.id;
+    const replacement = (over: Partial<EntitySnapshot> = {}, pullOver: Parameters<typeof pull>[1] = {}) =>
+      pull({ id: "acme/web#10", key: "acme/web#10", url: "https://github.com/acme/web/pull/10", title: "deps: patch/minor-only bumps replacing #9", author: "jane", labels: [], ...over }, { head: "deps-replace-9", headAuthor: "jane", ...pullOver });
+    const report = (over: Record<string, unknown>) => t.tool("steward_report", { phase: "open", summary: "Replaced.", nextAction: "Wait for the review.", actor: "steward", ...over }, steward);
+    return { t, steward, replacement, report };
+  }
+
+  it("moves a deps-prs binding to the replacement pull request its steward reports, and files the replacement's merge item", async () => {
+    const { t, steward, replacement, report } = await depsBound();
+    const before = t.hooks.store.find("acme/web#9")!;
+    t.entities.set("acme/web#10", replacement());
+    const reported = await report({ replacedBy: "acme/web#10" });
+    expect(reported.error).toBe(false);
+    expect(reported.text).toMatch(/acme\/web#10 replaces acme\/web#9: the gate, the Merge item and your wakes now follow it/u);
+    await t.flush();
+    const after = t.hooks.store.find("acme/web#10")!;
+    expect(after.id).toBe(before.id);
+    expect(after.threadId).toBe(steward);
+    expect(after).toMatchObject({ entityId: "acme/web#10", entityKey: "acme/web#10", url: "https://github.com/acme/web/pull/10", title: "deps: patch/minor-only bumps replacing #9", playbook: "deps-prs", ending: null, endedAt: null });
+    expect(t.hooks.store.find("acme/web#9")).toBeNull();
+    // The leases follow: the plugin now wants doorbells for #10, not #9.
+    const github = t.rpcCalls.filter((c) => c.pluginId === "github-watcher" && c.method === "sourceSetInterest").at(-1)!.input as { entities: string[] };
+    expect(github.entities).toContain("acme/web#10");
+    expect(github.entities).not.toContain("acme/web#9");
+
+    // The bot's pull request closing is no longer this binding's end.
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", author: "dependabot[bot]", labels: [], state: "closed" }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.binding(before.id)).toMatchObject({ ending: null, endedAt: null, entityKey: "acme/web#10" });
+
+    // The reviewer approves the replacement on green checks: the ordinary gate files its Merge item.
+    const marker = comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#10", replacement({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#10");
+    const needs = t.hooks.store.openNeeds(before.id);
+    expect(needs.map((n) => [n.kind, n.url])).toEqual([["merge", "https://github.com/acme/web/pull/10"]]);
+  });
+
+  it("undoes an ending begun by the replaced pull request's close when the steward reports the replacement in that wrap-up turn", async () => {
+    const { t, steward, replacement, report } = await depsBound();
+    const before = t.hooks.store.find("acme/web#9")!;
+
+    // The bot's pull request closes: the close doorbell begins the ending, and
+    // the steward wakes for its one last (wrap-up) turn with the binding still
+    // open enough to report.
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "deps: bump the npm group", author: "dependabot[bot]", labels: [], state: "closed" }));
+    await t.ring("github", "acme/web#9");
+    expect(t.hooks.store.binding(before.id)).toMatchObject({ entityKey: "acme/web#9", ending: "terminal", endedAt: null });
+    expect(t.hooks.store.binding(before.id)!.endingAt).not.toBeNull();
+
+    // In that turn the steward reports the replacement, with a follow-through:
+    // the report lands in one round trip and undoes the ending.
+    t.entities.set("acme/web#10", replacement());
+    const reported = await report({ replacedBy: "acme/web#10", followThrough: "thr_w1 is running the review loop on #10." });
+    expect(reported.error).toBe(false);
+    await t.flush();
+    const after = t.hooks.store.binding(before.id)!;
+    expect(after).toMatchObject({ entityId: "acme/web#10", entityKey: "acme/web#10", ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: null });
+    expect(after.threadId).toBe(steward);
+
+    // The replacement's gate still files its Merge item.
+    const marker = comment({ id: "r1", author: "jane", body: "<!-- bb-review round=1 sha=aaaaaaa1 verdict=approved lane=no-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#10", replacement({ comments: [marker] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#10");
+    expect(t.hooks.store.openNeeds(before.id).map((n) => [n.kind, n.url])).toEqual([["merge", "https://github.com/acme/web/pull/10"]]);
+  });
+
+  it("refuses a replacement that is not an open pull request in the same repository, or is already stewarded", async () => {
+    const { t, replacement, report } = await depsBound();
+    expect((await report({ replacedBy: "nonsense" })).text).toMatch(/must name a pull request as owner\/repo#N/u);
+    expect((await report({ replacedBy: "acme/other#10" })).text).toMatch(/same repository: acme\/web#9 is in acme\/web, not acme\/other/u);
+    expect((await report({ replacedBy: "acme/web#9" })).text).toMatch(/is this pull request, not a replacement/u);
+    expect((await report({ replacedBy: "acme/web#10" })).text).toMatch(/acme\/web#10 could not be read as a pull request/u);
+    t.entities.set("acme/web#10", replacement({ state: "closed" }));
+    expect((await report({ replacedBy: "acme/web#10" })).text).toMatch(/acme\/web#10 is closed; a replacement must be open/u);
+    t.entities.set("acme/web#10", replacement({ author: "dependabot[bot]" }, { headAuthor: "dependabot[bot]" }));
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("acme/web#10")).not.toBeNull();
+    expect((await report({ replacedBy: "acme/web#10" })).text).toMatch(/acme\/web#10 already has a steward \(open\)/u);
+    expect(t.hooks.store.find("acme/web#9")).toMatchObject({ entityKey: "acme/web#9", endedAt: null });
+  });
+
+  it("refuses a replacement when its own pull request key cannot be read", async () => {
+    const { t, replacement, report } = await depsBound();
+    const before = t.hooks.store.find("acme/web#9")!;
+    // Defensive: a github pr binding's key is always owner/repo#N, but if one
+    // ever is not, the same-repo and self checks cannot run, so refuse rather
+    // than let store.byEntity find the binding itself.
+    t.hooks.store.patch(before.id, { entityKey: "not-a-pull-request", url: "not-a-pull-request" });
+    t.entities.set("acme/web#10", replacement());
+    expect((await report({ replacedBy: "acme/web#10" })).text).toMatch(/replacedBy is for a pull request whose key reads as owner\/repo#N/u);
+    expect(t.hooks.store.binding(before.id)).toMatchObject({ entityKey: "not-a-pull-request", endedAt: null });
   });
 
   it("ends a deps-prs binding when the playbook disappears rather than falling back to a merge-capable one", async () => {

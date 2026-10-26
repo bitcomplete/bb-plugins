@@ -52,7 +52,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   new alert joins or tightens it. A fixed or dismissed alert trims or closes
   its ticket, and the nightly pass re-lists open alerts as the backstop. A
   `dependabot[bot]` version-update pull request is adopted under `deps-prs`,
-  reviewed, and escalated for a human merge; it is never merged. Reading
+  gets the reviewer round, and once its marker is approved on green checks
+  the plugin files a Merge item for a person to press; the steward never
+  merges. A bump redone as a replacement pull request is reported with
+  `steward_report { replacedBy }`, which moves the binding, its gate and its
+  Merge item to the replacement instead of ending it with the bot's. Reading
   alerts needs the token's alert access; a server whose login cannot read
   them skips the targets, and `bb stewards check` says which. DESIGN.md §19.
 - **The reconcile loop.** linear and github-watcher hold bb-gate-hooks leases for the

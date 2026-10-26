@@ -5002,6 +5002,58 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const toolError = (error: unknown) => ({ content: [{ type: "text" as const, text: errorMessage(error) }], isError: true });
 
+    /**
+     * Move a pull-request binding to the pull request that replaces it (a
+     * Dependabot bump redone on a branch of its own, say). The binding keeps
+     * its id, thread, playbook, guidance, escalations and workers; its entity,
+     * snapshot and phase become the replacement's, and an ending begun by the
+     * replaced pull request's close is undone, so the steward is not archived
+     * out from under the open replacement. Items filed for the old pull
+     * request are withdrawn; the next reconcile files the replacement's.
+     */
+    async function replaceBinding(b: Binding, ref: string): Promise<{ binding: Binding } | { error: string }> {
+      if (b.kind !== "pr" || b.source !== "github") return { error: "replacedBy is for a pull-request steward: this binding is not one." };
+      const next = parsePullRef(ref);
+      if (next === null) return { error: `replacedBy must name a pull request as owner/repo#N or its URL; ${JSON.stringify(ref)} does not.` };
+      const own = parsePullRef(b.url ?? b.entityKey);
+      if (own === null) return { error: `replacedBy is for a pull request whose key reads as owner/repo#N; ${JSON.stringify(b.entityKey)} does not.` };
+      if (lc(own.repo) !== lc(next.repo)) return { error: `A replacement is in the same repository: ${b.entityKey} is in ${own.repo}, not ${next.repo}.` };
+      const key = `${next.repo}#${next.number}`;
+      if (own.number === next.number) return { error: `${key} is this pull request, not a replacement.` };
+      const entity = await snapshot("github", key).catch(() => null);
+      if (entity === null || entity.pull === null) return { error: `${key} could not be read as a pull request.` };
+      if (entity.pull.merged || entity.state === "merged" || entity.state === "closed") return { error: `${entity.key} is ${entity.state}; a replacement must be open.` };
+      const taken = store.byEntity("github", entity.id);
+      if (taken !== null && taken.id !== b.id) return { error: `${entity.key} already has a steward (${taken.endedAt === null ? "open" : "ended"}); it cannot replace ${b.entityKey}.` };
+      const config = await loadConfig(b.projectId);
+      const playbook = config === null ? null : bindingPlaybook(config, b);
+      const { phase, stage } = playbook === null ? { phase: entity.state, stage: null } : phaseAndStage(playbook, entity.state);
+      const oldKey = b.entityKey;
+      const oldUrl = b.url ?? b.entityKey;
+      const why = `Replaced by ${entity.key}.`;
+      for (const kind of ["approve-pr", "merge"] as const) store.closeNeedByKey(b.id, kind, oldUrl, why);
+      for (const x of store.openEscalations(b.id)) if (x.kind === "approval" && x.url === oldUrl) store.resolve(x.id, why);
+      const moved = store.patch(b.id, {
+        entityId: entity.id,
+        entityKey: entity.key,
+        url: entity.url,
+        title: entity.title,
+        phase,
+        stage,
+        lastSnapshot: { entity, pulls: [] },
+        ending: null,
+        endingAt: null,
+        followThrough: null,
+        followThroughUntil: null,
+      });
+      store.note(moved.id, `${entity.key} replaces ${oldKey}; this steward follows ${entity.key} now.`, true);
+      bb.log.info(`stewards: ${oldKey} is replaced by ${entity.key}; the binding follows it`);
+      if (moved.threadId !== null) await quietly(`retitle ${entity.key}'s steward`, () => bb.sdk.threads.update({ threadId: moved.threadId!, title: `${entity.key}: ${entity.title}` }));
+      await sendInterest().catch((error) => bb.log.warn(`stewards: could not refresh leases after ${oldKey} moved to ${entity.key}: ${errorMessage(error)}`));
+      scheduleReconcile(moved.id);
+      return { binding: moved };
+    }
+
     function ownBinding(threadId: string): Binding {
       const b = store.byThread(threadId);
       if (b === null || b.endedAt !== null) throw new Error("This thread is not the steward of an open binding.");
@@ -5100,6 +5152,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .boolean()
           .optional()
           .describe('Ticket stewards: true once no more pull requests are coming for this ticket, so its work is finished when its linked pull requests have merged and its hold can lift silently. Set it again as more pull requests open: reporting false (more are coming), or a new linked pull request, clears it.'),
+        replacedBy: z
+          .string()
+          .trim()
+          .min(1)
+          .max(500)
+          .optional()
+          .describe('Pull-request stewards: the open pull request that replaces this one (owner/repo#N or its URL), opened on its own branch when this one could not merge as is. The binding moves to it: the gate, the Merge item and every later wake are about the replacement, and this pull request is closed by whoever opened the replacement. Report it once, as soon as the replacement is open.'),
         needs: z
           .array(
             z.object({
@@ -5153,10 +5212,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async execute(input, { threadId }) {
         try {
           let b = ownBinding(threadId);
-          // The gate as it stood before this report, so the reply can tell a
-          // report that just passed it from one that finds it already passed.
-          const priorReady = b.ready;
-          const priorSnapshot = b.lastSnapshot;
+          // Validate the input that does not depend on which pull request the
+          // binding is on before a replacement moves it: a wrap-up report that
+          // carries `replacedBy` and `followThrough` (the natural combination
+          // in the turn the old pull request closed) must not move the binding
+          // and then refuse the rest of itself.
           const opsTickets = input.opsTickets ?? [];
           if (opsTickets.length > 0) {
             if (b.kind !== "ops") return toolError(new Error("opsTickets is for an ops steward's report. Report without it."));
@@ -5166,7 +5226,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return toolError(new Error(`Nothing was recorded: ${unknown.join(", ")} ${unknown.length === 1 ? "is not a fingerprint" : "are not fingerprints"} this project has seen. Use them as the wake gives them${known === "" ? "." : `:\n${known}`}`));
             }
           }
-          if (input.followThrough !== undefined && b.ending !== "terminal") {
+          // `followThrough` is judged against the ending the report found: a
+          // replacement undoes a terminal ending, so the wrap-up report that
+          // moves the binding may still carry it.
+          const endingBefore = b.ending;
+          if (input.followThrough !== undefined && endingBefore !== "terminal") {
             return toolError(new Error(`followThrough is only for after a terminal state, and ${b.entityKey} is not in one now. Report without it.`));
           }
           // Fixed choices are for a decision, as a `decide` need is: they are
@@ -5174,6 +5238,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (input.escalate !== undefined && input.escalate.choices !== undefined && input.escalate.kind !== "decision") {
             return toolError(new Error("choices are for a decision escalation: escalate a decision with choices."));
           }
+          // A replacement pull request moves the binding before the gate is
+          // judged: the terminal state of the one it replaces no longer ends
+          // it, and the gate below reads the replacement.
+          let replacedNote = "";
+          if (input.replacedBy !== undefined) {
+            const moved = await replaceBinding(b, input.replacedBy);
+            if ("error" in moved) return toolError(new Error(moved.error));
+            replacedNote = ` ${moved.binding.entityKey} replaces ${b.entityKey}: the gate, the Merge item and your wakes now follow it.`;
+            b = moved.binding;
+          }
+          // The gate as it stood before this report, so the reply can tell a
+          // report that just passed it from one that finds it already passed.
+          const priorReady = b.ready;
+          const priorSnapshot = b.lastSnapshot;
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
           const priorGate = playbook !== null && playbook.ready !== null ? gateState(playbook, priorReady, priorSnapshot === null ? (priorReady.approval?.specHash ?? "") : specHashFor(b, priorSnapshot.entity)) : null;
@@ -5397,15 +5475,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             scheduleReconcile(b.id);
           }
           if (b.ending === "terminal") {
-            if (b.followThrough === null) return `Reported.${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
-            return `Reported.${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
+            if (b.followThrough === null) return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
+            return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
           const hidden = archiveWhenIdle && !needsUser(b) ? " Your thread is hidden when the turn ends, and comes back on that wake." : "";
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
-            return `Reported.${recorded}${refusalNote}${escalated} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
+            return `Reported.${replacedNote}${recorded}${refusalNote}${escalated} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${hidden} End the turn now.`;
+          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${hidden} End the turn now.`;
         } catch (error) {
           return toolError(error);
         }

@@ -396,29 +396,54 @@ skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
 ---
 
 You steward one Dependabot version-update pull request until it is merged or
-closed. You never merge it: you adopt it, review it, and escalate it for a
-human merge. A patch or minor bump whose checks are green is escalated for a
-human merge. A major bump, or anything touching a path the project's
-guidance (AGENTS.md) says is owner-reviewed, is escalated with the reason.
+closed. You never merge it: you adopt it, get it reviewed, and leave the
+merge to a person. A worker you start is told not to merge. The person
+merges from the Stewards page: once a pull request carries the reviewer's
+\`verdict=approved\` marker on its head and its checks are green, the plugin
+files a **Merge** item for it there, and the owner presses it. Do not
+escalate a decision for the merge; the Merge item is the ask. A major bump,
+or anything touching a path the project's guidance (AGENTS.md) says is
+owner-reviewed, is escalated with the reason instead, and gets no reviewer
+until that is decided.
+
+Every pull request gets the independent review the project's reviewer skill
+describes, on a different model from whoever wrote it, exactly as a ticket
+worker's does. For the bot's own pull request, start one worker whose task
+is to run that review loop as the author would: spawn the reviewer thread
+(the pull request's description stands in for the ticket and its acceptance
+criteria), fix what the reviewer blocks only if a fix is needed, and end
+when the marker says approved and checks are green. It never merges.
+
+A grouped bump can break the build, and a reviewer can block on part of it.
+Then the worker redoes it on a branch of its own as a new pull request that
+says which Dependabot pull request it replaces and which bumps it drops,
+closes the Dependabot one with a signed comment (pushing to Dependabot's
+branch stops it rebasing), and runs the review loop on the replacement. As
+soon as the replacement is open, report it with
+\`steward_report { replacedBy: "owner/repo#N" }\`: the binding, the gate and
+the Merge item move to the replacement, and you are woken for it from then
+on. Closing the Dependabot pull request does not end your binding once
+that is reported.
 
 Use gh for everything you do on GitHub, and sign what you write. A merge to
-bb-plugins main rebuilds the bb-server image and stages a restart for every
-developer, so the escalation and the eventual merge comment say so.
+main may rebuild an image and restart what runs it, so the replacement's
+description and the eventual merge comment say so when it does.
 
 ## draft
 
 Get it ready: a worker fixes failing checks and finishes what the description
-says is left. When checks pass, mark it ready (\`gh pr ready\`) and escalate
-for a human merge as above.
+says is left. When checks pass, mark it ready (\`gh pr ready\`) and run the
+review loop as above.
 
 ## open
 
 Review the bump against the project's guidance. When it is a patch or minor
-bump with green checks, escalate a decision for a human merge, saying the
-version and that a merge stages a restart. When it is a major bump, or it
-touches an owner-reviewed path, escalate a decision with the reason and do
-not ask for a merge. Address review comments with a worker and re-request
-review after each round. Do not merge, and do not approve on GitHub.
+bump, start the review-loop worker; the Merge item appears by itself when
+the reviewer approves and checks are green, so say so in your report and
+wait. When it is a major bump, or it touches an owner-reviewed path,
+escalate a decision with the reason and do not ask for a merge. Address a
+human's review comments with a worker and re-request review after each
+round. Do not merge, and do not approve on GitHub.
 `;
 
 export const PLAYBOOK_TEMPLATES: Record<string, string> = {
