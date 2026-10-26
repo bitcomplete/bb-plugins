@@ -248,7 +248,8 @@ function ChannelMapEditor({
   const botChannels = search?.botChannels ?? null;
   const canSearch = search?.state === "ok";
   const trimmed = fallback.trim();
-  const missing = trimmed !== "" && !projectNames.includes(trimmed);
+  const onServer = (name: string) => projectNames.some((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  const missing = trimmed !== "" && !onServer(trimmed);
 
   return (
     <div className="flex flex-col gap-2">
@@ -309,7 +310,7 @@ function ChannelMapEditor({
                 disabled={busy}
                 onChange={(e) => change(index, { project: e.target.value })}
               >
-                {!projectNames.includes(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
+                {!onServer(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
                 {projectNames.map((name) => (
                   <option key={name} value={name}>
                     {name}

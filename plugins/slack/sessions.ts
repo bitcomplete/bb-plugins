@@ -110,6 +110,9 @@ export type ChannelMap = z.infer<typeof channelMapSchema>;
 
 /** Parse a stored map; junk becomes the empty map rather than failing a wake. */
 export function parseChannelMap(raw: unknown): ChannelMap {
+  const parsed = channelMapSchema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  // A hand-edited map with one bad entry keeps its fallback and its good rows.
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { fallback: "", channels: [] };
   const record = raw as Record<string, unknown>;
   const fallback = typeof record.fallback === "string" ? record.fallback.trim().slice(0, 200) : "";
