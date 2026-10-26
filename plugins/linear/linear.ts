@@ -321,7 +321,7 @@ export function findRelation(existing: StoredRelation[], want: { type: RelationT
     if (want.type === "blocks" && rel.type === "blocks" && rel.relatedIssue === key) return rel;
     if (want.type === "blockedBy" && rel.type === "blocks" && rel.issue === key) return rel;
     if (want.type === "related" && rel.type === "related" && (rel.issue === key || rel.relatedIssue === key)) return rel;
-    if (want.type === "duplicate" && rel.type === "duplicate" && rel.relatedIssue === key) return rel;
+    if (want.type === "duplicate" && rel.type === "duplicate" && (rel.relatedIssue === key || rel.issue === key)) return rel;
   }
   return null;
 }

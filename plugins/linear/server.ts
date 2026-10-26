@@ -763,7 +763,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
     bb.agents.registerTool({
       name: "linear_issue",
       description:
-        "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, the description, and the latest comments.",
+        "Read one Linear issue by key (for example ENG-123): title, state, assignee, labels, project, parent and sub-issues, relations, the description, and the latest comments.",
       instructions:
         "Linear is connected to this bb server as the user. Use linear_issue to read a ticket named in the task, a branch or a PR before working on it, and linear_search to find tickets; prefer them over asking the user to paste ticket contents. Use linear_create_issue when the user asks to file, create or open a ticket, and linear_update_issue to move, assign, relabel, reprioritize or rewrite the description of one. A dependency between tickets is a relation, not a line in the description: set one with linear_create_issue or linear_update_issue relations (blockedBy, blocks, related or duplicate) and remove it with removeRelations. When nothing can be done until a ticket changes, linear_watch_issue and then ending the turn beats polling: the thread is messaged when it changes. If several Linear workspaces are connected, an issue or team key picks its workspace; pass account only for a search without a team, for linear_query, or when told a key is ambiguous.",
       presentation: { label: { pending: "Reading a Linear issue", completed: "Read a Linear issue" } },
@@ -931,13 +931,21 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
           }
 
           for (const relation of addRelations) {
-            parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, ref.id) }, signal));
+            try {
+              parseIssueRelationCreate(await query(where.key, ISSUE_RELATION_CREATE, { input: relationCreateInput({ type: relation.type, issueId: relation.id }, ref.id) }, signal));
+            } catch (error) {
+              return toolError(new Error(`${ref.identifier}: ${changed.join("; ")}${changed.length > 0 ? "; " : ""}the ${relation.type} relation to ${relation.identifier} was not added: ${errorMessage(error)}`));
+            }
+            changed.push(`added ${relation.type} ${relation.identifier}`);
           }
-          if (addRelations.length > 0) changed.push(`added ${addRelations.map((r) => `${r.type} ${r.identifier}`).join(", ")}`);
           for (const relation of removeRelations) {
-            parseIssueRelationDelete(await query(where.key, ISSUE_RELATION_DELETE, { id: relation.relationId }, signal));
+            try {
+              parseIssueRelationDelete(await query(where.key, ISSUE_RELATION_DELETE, { id: relation.relationId }, signal));
+            } catch (error) {
+              return toolError(new Error(`${ref.identifier}: ${changed.join("; ")}${changed.length > 0 ? "; " : ""}the ${relation.type} relation to ${relation.identifier} was not removed: ${errorMessage(error)}`));
+            }
+            changed.push(`removed ${relation.type} ${relation.identifier}`);
           }
-          if (removeRelations.length > 0) changed.push(`removed ${removeRelations.map((r) => `${r.type} ${r.identifier}`).join(", ")}`);
 
           return `${ref.identifier}: ${changed.join("; ")}.`;
         } catch (error) {

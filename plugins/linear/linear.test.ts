@@ -264,11 +264,13 @@ describe("relations", () => {
       { id: "rel-blocked", type: "blocks", issue: "ENG-70", relatedIssue: "ENG-123" },
       { id: "rel-related", type: "related", issue: "ENG-123", relatedIssue: "ENG-73" },
       { id: "rel-duplicate", type: "duplicate", issue: "ENG-123", relatedIssue: "ENG-74" },
+      { id: "rel-dupby", type: "duplicate", issue: "ENG-75", relatedIssue: "ENG-123" },
     ];
     expect(findRelation(existing, { type: "blocks", issue: "ENG-71" })?.id).toBe("rel-blocks");
     expect(findRelation(existing, { type: "blockedBy", issue: "ENG-70" })?.id).toBe("rel-blocked");
     expect(findRelation(existing, { type: "related", issue: "ENG-73" })?.id).toBe("rel-related");
     expect(findRelation(existing, { type: "duplicate", issue: "ENG-74" })?.id).toBe("rel-duplicate");
+    expect(findRelation(existing, { type: "duplicate", issue: "ENG-75" })?.id).toBe("rel-dupby");
     expect(findRelation(existing, { type: "blocks", issue: "ENG-70" })).toBeNull();
     expect(findRelation(existing, { type: "blockedBy", issue: "ENG-71" })).toBeNull();
   });

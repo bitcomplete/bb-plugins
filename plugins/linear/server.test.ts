@@ -579,6 +579,32 @@ describe("issue relations", () => {
     expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation("))).toHaveLength(0);
   });
 
+  it("linear_update_issue removes an inverse blockedBy and an inverse duplicated-by relation", async () => {
+    const ref = issue({
+      labels: { nodes: [] },
+      team: { key: "ENG", states: { nodes: [] }, labels: { nodes: [] } },
+      relations: { nodes: [] },
+      inverseRelations: {
+        nodes: [
+          { id: "rel-blocked", type: "blocks", issue: { identifier: "ENG-70" }, relatedIssue: { identifier: "ENG-123" } },
+          { id: "rel-dupby", type: "duplicate", issue: { identifier: "ENG-75" }, relatedIssue: { identifier: "ENG-123" } },
+        ],
+      },
+    });
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($id: String!) { issueRelationDelete")) return { data: { issueRelationDelete: { success: true } } };
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const out = text(await tool("linear_update_issue", { key: "ENG-123", removeRelations: [{ type: "blockedBy", issue: "ENG-70" }, { type: "duplicate", issue: "ENG-75" }] }));
+    expect(out).toBe("ENG-123: removed blockedBy ENG-70; removed duplicate ENG-75.");
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($id: String!) { issueRelationDelete")).map((c) => c.body!.variables)).toEqual([{ id: "rel-blocked" }, { id: "rel-dupby" }]);
+  });
+
   it("linear_update_issue reports a relation Linear refused", async () => {
     const ref = issue({ labels: { nodes: [] }, team: { key: "ENG", states: { nodes: [] }, labels: { nodes: [] } }, relations: { nodes: [] }, inverseRelations: { nodes: [] } });
     const { tool, text } = await setup({
