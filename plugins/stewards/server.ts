@@ -1832,14 +1832,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
           deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTarget.repo} ${deployTarget.environment}`, actionable: true });
         }
-        const late = timeoutsDue(deployments, now());
-        if (late.length > 0) {
-          deployments = timeOut(deployments, late, now());
-          deploymentChanges.push({ text: `No matching deployment for ${late.join(", ")} within ${formatDuration(deployTarget.timeout)}; check the run: https://github.com/${deployTarget.repo}/actions`, actionable: true });
-        }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
         // BB-59: a deployment that already exists confirms a merge whose
-        // doorbell was missed, on the first read and on every sweep. The
+        // doorbell was missed, on the first read and on every sweep. Read
+        // before the timeout check so an existing deployment wins over the
+        // deadline; with none, the timeout path is exactly as before. The
         // github plugin reads it through the source contract; the plugin
         // never evaluates the playbook's carries rule.
         if (Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying")) {
@@ -1855,6 +1852,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             }
           }
         }
+        const late = timeoutsDue(deployments, now());
+        if (late.length > 0) {
+          deployments = timeOut(deployments, late, now());
+          deploymentChanges.push({ text: `No matching deployment for ${late.join(", ")} within ${formatDuration(deployTarget.timeout)}; check the run: https://github.com/${deployTarget.repo}/actions`, actionable: true });
+        }
+        if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
       }
       const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 

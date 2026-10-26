@@ -324,9 +324,12 @@ describe("deployments", () => {
     expect(() => parseDeployments({ message: "Not Found" })).toThrow(/deployment list/u);
   });
 
-  it("reads the newest status, or an empty state when none has been reported", () => {
-    expect(parseDeploymentStatus([{ state: "success" }, { state: "in_progress" }])).toBe("success");
-    expect(parseDeploymentStatus([])).toBe("");
+  it("reads the newest status's state and the best link, with the doorbell's fallbacks", () => {
+    expect(parseDeploymentStatus([{ state: "success", log_url: "https://github.com/Acme/Widgets/actions/runs/9" }, { state: "in_progress" }])).toEqual({ state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" });
+    expect(parseDeploymentStatus([{ state: "success", environment_url: "https://preview.example.com/7" }])).toEqual({ state: "success", url: "https://preview.example.com/7" });
+    expect(parseDeploymentStatus([{ state: "failure", target_url: "https://target.example.com/7" }])).toEqual({ state: "failure", url: "https://target.example.com/7" });
+    expect(parseDeploymentStatus([{ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" }])).toEqual({ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" });
+    expect(parseDeploymentStatus([])).toEqual({ state: "", url: null });
     expect(() => parseDeploymentStatus({ message: "Not Found" })).toThrow(/deployment status list/u);
   });
 });

@@ -545,9 +545,8 @@ export function parseDependabotAlerts(payload: unknown, repo: string): Dependabo
 
 // ---- deployments, for stewards ----------------------------------------------------
 
-/** The REST path for a repository's deployments, newest first, for one environment (BB-59). */
-export const deploymentsPath = (repo: string, environment: string, perPage = 10): string =>
-  `/repos/${repo}/deployments?environment=${encodeURIComponent(environment)}&per_page=${perPage}`;
+/** The REST path for a repository's recent deployments, newest first. */
+export const deploymentsPath = (repo: string, perPage = 100): string => `/repos/${repo}/deployments?per_page=${perPage}`;
 
 /** The REST path for one deployment's statuses, newest first. */
 export const deploymentStatusesPath = (repo: string, id: number, perPage = 1): string => `/repos/${repo}/deployments/${id}/statuses?per_page=${perPage}`;
@@ -570,11 +569,26 @@ export function parseDeployments(payload: unknown): Array<{ id: number; environm
   return parsed.data.map((d) => ({ id: d.id, environment: d.environment ?? "", ref: d.ref ?? "", sha: d.sha ?? "", url: d.url ?? null })).sort((a, b) => b.id - a.id);
 }
 
-const deploymentStatusNode = z.object({ state: z.string() });
+const deploymentStatusNode = z.object({
+  state: z.string(),
+  url: z.string().nullish(),
+  log_url: z.string().nullish(),
+  environment_url: z.string().nullish(),
+  target_url: z.string().nullish(),
+});
 
-/** The newest deployment status's state, from `GET .../deployments/{id}/statuses`; "" when none has been reported. */
-export function parseDeploymentStatus(payload: unknown): string {
+/**
+ * The newest deployment status's state and the best link a person can open,
+ * exactly as bb-gate-hooks builds a `deployment` doorbell's `url`: the
+ * status's `log_url`, then `environment_url`, then `target_url`, then the
+ * status's own API URL; null when it set none (the caller then falls back to
+ * the deployment's API URL). "" state when no status has been reported.
+ */
+export function parseDeploymentStatus(payload: unknown): { state: string; url: string | null } {
   const parsed = z.array(deploymentStatusNode).safeParse(payload);
   if (!parsed.success) throw new Error("GitHub answered with something that is not a deployment status list");
-  return parsed.data[0]?.state ?? "";
+  const status = parsed.data[0];
+  if (status === undefined) return { state: "", url: null };
+  const url = [status.log_url, status.environment_url, status.target_url, status.url].find((u): u is string => typeof u === "string" && u !== "") ?? null;
+  return { state: status.state, url };
 }

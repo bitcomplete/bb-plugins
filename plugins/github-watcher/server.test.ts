@@ -575,23 +575,31 @@ describe("stewards' source contract", () => {
     expect(out.errors).toEqual([]);
   });
 
-  it("reads a repository's deployments for one environment, newest first, each with its latest status (BB-59)", async () => {
+  it("reads a repository's deployments for one environment, newest first, each with its latest status and a person's link (BB-59)", async () => {
     const w = await setup();
+    // GitHub's deployment object carries its own API URL; the link a person
+    // opens is on the status (`log_url`), exactly as bb-gate-hooks builds a
+    // doorbell.
     w.github.state.deployments = [
-      { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", url: "https://github.com/Acme/Widgets/actions/runs/8" },
-      { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+      { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", url: "https://api.github.com/repos/Acme/Widgets/deployments/6" },
+      { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://api.github.com/repos/Acme/Widgets/deployments/7" },
     ];
-    w.github.state.deploymentStatuses = { 7: [{ state: "success" }], 6: [{ state: "failure" }] };
+    w.github.state.deploymentStatuses = {
+      7: [{ state: "success", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9", log_url: "https://github.com/Acme/Widgets/actions/runs/9" }],
+      6: [{ state: "failure", environment_url: "https://preview.example.com/6" }],
+    };
     expect(await w.harness.callRpc("sourceDeployments", { repo: "Acme/Widgets", environment: "production", limit: 10 }, STEWARDS)).toEqual({
       deployments: [
         { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" },
-        { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", state: "failure", url: "https://github.com/Acme/Widgets/actions/runs/8" },
+        { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", state: "failure", url: "https://preview.example.com/6" },
       ],
       error: null,
     });
-    // The list is sorted by id, so a limit keeps the newest, whatever order GitHub returned.
-    const limited = (await w.harness.callRpc("sourceDeployments", { repo: "acme/widgets", environment: "production", limit: 1 }, STEWARDS)) as { deployments: Array<{ id: number; state: string }> };
+    // The environment filter is case-insensitive, as the doorbell path is, and
+    // a limit keeps the newest.
+    const limited = (await w.harness.callRpc("sourceDeployments", { repo: "acme/widgets", environment: "Production", limit: 1 }, STEWARDS)) as { deployments: Array<{ id: number; state: string }> };
     expect(limited.deployments).toEqual([expect.objectContaining({ id: 7, state: "success" })]);
+    expect(await w.harness.callRpc("sourceDeployments", { repo: "Acme/Widgets", environment: "staging", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: null });
     expect(await w.harness.callRpc("sourceDeployments", { repo: "acme/gone", environment: "production", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: "acme/gone: GitHub answered HTTP 404: Not Found" });
     expect(await w.harness.callRpc("sourceDeployments", { repo: "widgets", environment: "production", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: "widgets: not owner/repo" });
   });

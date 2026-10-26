@@ -5985,4 +5985,19 @@ describe("deployment watching (BB-53)", () => {
     expect(wake).toMatch(/Deployment 7 \(failure\) for acme\/bb-gate production/u);
     expect(wake).toMatch(/https:\/\/github.com\/acme\/bb-gate\/actions\/runs\/12/u);
   });
+
+  it("lets an existing deployment win over the deadline at the boundary (BB-59)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The deadline passes, but a carrying deployment is already there to be read.
+    t.advance(61 * 60_000);
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7 });
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
+  });
 });
