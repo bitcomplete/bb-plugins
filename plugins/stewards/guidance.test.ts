@@ -34,6 +34,15 @@ describe("the guidance unit index (BB-35 step 6)", () => {
     expect(units[0]!.heading).toBe("Phases");
   });
 
+  it("does not take a `#` inside a fenced code block for a heading", () => {
+    const content = ["# Real heading", "", "```sh", "# a shell comment", "git commit -m x", "```", "", "After the fence."].join("\n");
+    const units = parseGuidanceUnits("AGENTS.md", content);
+    expect(units.map((u) => ({ heading: u.heading, text: u.text }))).toEqual([
+      { heading: "Real heading", text: "```sh\n# a shell comment\ngit commit -m x\n```" },
+      { heading: "Real heading", text: "After the fence." },
+    ]);
+  });
+
   it("tags an anchored lesson block and keeps it out of the hand-written units", () => {
     const content = `# Guidance\n\nHand-written before.\n\n${withLessonAnchor("A promoted rule.", "lsn_1")}\n\nHand-written after.\n`;
     const units = parseGuidanceUnits("AGENTS.md", content);

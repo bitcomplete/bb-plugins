@@ -78,8 +78,11 @@ export function parseGuidanceUnits(file: string, content: string): GuidanceUnit[
     const lesson = /<!--\s*lesson:([A-Za-z0-9_-]+)(?:\s+retired)?\s*-->/u.exec(text);
     units.push({ id: guidanceUnitId(text), file, heading, text, lessonId: lesson === null ? null : lesson[1]! });
   };
+  // A `#` inside a fenced code block is a comment in an example, not a heading.
+  let fenced = false;
   for (const line of withoutFrontmatter(content).split(/\r?\n/u)) {
-    const headingMatch = /^(#{1,6})\s+(.*\S)\s*$/u.exec(line);
+    if (/^\s*(?:```|~~~)/u.test(line)) fenced = !fenced;
+    const headingMatch = fenced ? null : /^(#{1,6})\s+(.*\S)\s*$/u.exec(line);
     if (headingMatch !== null) {
       flush();
       heading = headingMatch[2]!;

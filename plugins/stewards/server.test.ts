@@ -5762,6 +5762,20 @@ describe("guidance units and the efficacy view (BB-35 step 6)", () => {
     expect(parsed.uncited.filter((u) => u.file === "AGENTS.md").map((u) => u.id)).toEqual([guidanceUnitId(uncited)]);
   });
 
+  it("shows each lesson's hits, corrections, last citation and tier in bb stewards lessons", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "A rule.", file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const lessonId = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    // Two distinct bindings cite it and one reversal counts a correction.
+    const other = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.recordCitations("p1", [lessonId], t.hooks.store.find("ENG-12")!.id);
+    t.hooks.store.recordCitations("p1", [lessonId], other.id);
+    t.hooks.store.recordCorrections([lessonId]);
+    const out = await t.harness.behavior.runCli(["lessons", "--all", "--project", "p1"]);
+    expect(out.stdout).toContain(lessonId);
+    expect(out.stdout).toMatch(/2 bindings, 1 correction, last cited \d{4}-\d{2}-\d{2}, trial since \d{4}-\d{2}-\d{2}/u);
+  });
+
   it("settles a cluster from the after-the-fact thread follow-up, so a much-later page box is not asked", async () => {
     const t = await adopted();
     const first = await forward(t);

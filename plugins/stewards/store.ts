@@ -413,10 +413,9 @@ export const VALIDATION_MIGRATIONS = [
 
 // BB-35 step 6: the hand-written guidance's meter. One row per (project, unit,
 // binding): the distinct-binding count is the number of rows, and the newest
-// `last_cited_at` is when it was last cited. The unit's text is snapshotted so
-// the efficacy view can name a unit whose paragraph was later edited away. A
-// new table, so nothing existing is altered; a live database gains an empty
-// table and behaves exactly as before.
+// `last_cited_at` is when it was last cited. The unit's file and text are kept
+// as an audit trail of what was cited. A new table, so nothing existing is
+// altered; a live database gains an empty table and behaves exactly as before.
 export const GUIDANCE_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS guidance_citations (
      project_id TEXT NOT NULL,
@@ -1141,6 +1140,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const guidanceCitationsForStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM guidance_citations WHERE project_id = ? ORDER BY last_cited_at DESC");
   const escalationsForProjectStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? ORDER BY created_at");
   const escalationsAskedNotGivenStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND rationale_asked = 1 AND rationale_given = 0 ORDER BY created_at DESC");
+  // Settling also sets `rationale_asked`, matching `markEscalationRationaleGiven`:
+  // the two flags never disagree, and a settled cluster is never asked again.
   const settleClusterRationaleStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE project_id = ? AND cluster_key = ?");
   const lessonsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND cluster_key = ? AND tier != 'retired' ORDER BY created_at");
 
