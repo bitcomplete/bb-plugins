@@ -489,6 +489,168 @@ describe("tools", () => {
   });
 });
 
+describe("issue relations", () => {
+  const team = {
+    id: "t-eng",
+    key: "ENG",
+    name: "Engineering",
+    states: { nodes: [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }] },
+    labels: { nodes: [] },
+  };
+  const byKey = (body: { variables?: Record<string, unknown> }) => {
+    const key = String(body.variables!.id);
+    return { data: { issue: { id: `uuid-${key.split("-")[1]}`, identifier: key } } };
+  };
+
+  it("linear_create_issue makes each relation after the issue exists, resolving every key first", async () => {
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($input: IssueCreateInput!)")) return { data: { issueCreate: { success: true, issue: { id: "uuid-124", identifier: "ENG-124", url: "https://linear.app/acme/issue/ENG-124" } } } };
+          if (body.query.startsWith("mutation($input: IssueRelationCreateInput!)")) return { data: { issueRelationCreate: { success: true, issueRelation: { id: "rel-new" } } } };
+          if (body.query.startsWith("query($key: String!) { teams")) return { data: { teams: { nodes: [team] }, issueLabels: { nodes: [] } } };
+          if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) return byKey(body);
+          return { data: {} };
+        },
+      },
+    });
+    const out = text(await tool("linear_create_issue", { team: "ENG", title: "Blocked work", relations: [{ type: "blockedBy", issue: "ENG-71" }, { type: "blocks", issue: "eng-72" }] }));
+    expect(out).toContain("Filed ENG-124: Blocked work");
+    expect(out).toContain("Related: blockedBy ENG-71, blocks ENG-72.");
+    const creates = linear.calls.filter((c) => c.body?.query.startsWith("mutation($input: IssueRelationCreateInput!)")).map((c) => c.body!.variables!.input);
+    expect(creates).toEqual([
+      { issueId: "uuid-71", relatedIssueId: "uuid-124", type: "blocks" },
+      { issueId: "uuid-124", relatedIssueId: "uuid-72", type: "blocks" },
+    ]);
+  });
+
+  it("linear_create_issue refuses an unresolvable relation key without creating anything", async () => {
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("query($key: String!) { teams")) return { data: { teams: { nodes: [team] }, issueLabels: { nodes: [] } } };
+          if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) return { data: { issue: null } };
+          return { data: {} };
+        },
+      },
+    });
+    const result = await tool("linear_create_issue", { team: "ENG", title: "Blocked work", relations: [{ type: "blockedBy", issue: "ENG-999" }] });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("No Linear issue ENG-999");
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation("))).toHaveLength(0);
+  });
+
+  it("linear_update_issue adds and removes relations, without touching the issue when nothing else changed", async () => {
+    const ref = issue({
+      labels: { nodes: [] },
+      team: { key: "ENG", states: { nodes: [{ id: "s-backlog", name: "Backlog", type: "backlog", position: 0 }] }, labels: { nodes: [] } },
+      relations: { nodes: [{ id: "rel-blocks", type: "blocks", issue: { identifier: "ENG-123" }, relatedIssue: { identifier: "ENG-71" } }] },
+      inverseRelations: { nodes: [{ id: "rel-blocked", type: "blocks", issue: { identifier: "ENG-70" }, relatedIssue: { identifier: "ENG-123" } }] },
+    });
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($input: IssueRelationCreateInput!)")) return { data: { issueRelationCreate: { success: true, issueRelation: { id: "rel-new" } } } };
+          if (body.query.startsWith("mutation($id: String!) { issueRelationDelete")) return { data: { issueRelationDelete: { success: true } } };
+          if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) return byKey(body);
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const out = text(await tool("linear_update_issue", { key: "ENG-123", relations: [{ type: "blockedBy", issue: "ENG-72" }], removeRelations: [{ type: "blocks", issue: "ENG-71" }] }));
+    expect(out).toBe("ENG-123: added blockedBy ENG-72; removed blocks ENG-71.");
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($input: IssueRelationCreateInput!)")).map((c) => c.body!.variables!.input)).toEqual([{ issueId: "uuid-72", relatedIssueId: "uuid-1", type: "blocks" }]);
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($id: String!) { issueRelationDelete")).map((c) => c.body!.variables)).toEqual([{ id: "rel-blocks" }]);
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($id: String!, $input: IssueUpdateInput!)"))).toHaveLength(0);
+  });
+
+  it("linear_update_issue refuses a relation that is not there, before any mutation", async () => {
+    const ref = issue({ labels: { nodes: [] }, team: { key: "ENG", states: { nodes: [] }, labels: { nodes: [] } }, relations: { nodes: [] }, inverseRelations: { nodes: [] } });
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: { answer: (body) => (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier labels") ? { data: { issue: ref, issueLabels: { nodes: [] } } } : { data: {} }) },
+    });
+    const result = await tool("linear_update_issue", { key: "ENG-123", state: "Backlog", removeRelations: [{ type: "blocks", issue: "ENG-99" }] });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("No blocks relation to ENG-99 on ENG-123 to remove.");
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation("))).toHaveLength(0);
+  });
+
+  it("linear_update_issue removes an inverse blockedBy and an inverse duplicated-by relation", async () => {
+    const ref = issue({
+      labels: { nodes: [] },
+      team: { key: "ENG", states: { nodes: [] }, labels: { nodes: [] } },
+      relations: { nodes: [] },
+      inverseRelations: {
+        nodes: [
+          { id: "rel-blocked", type: "blocks", issue: { identifier: "ENG-70" }, relatedIssue: { identifier: "ENG-123" } },
+          { id: "rel-dupby", type: "duplicate", issue: { identifier: "ENG-75" }, relatedIssue: { identifier: "ENG-123" } },
+        ],
+      },
+    });
+    const { tool, text, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($id: String!) { issueRelationDelete")) return { data: { issueRelationDelete: { success: true } } };
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const out = text(await tool("linear_update_issue", { key: "ENG-123", removeRelations: [{ type: "blockedBy", issue: "ENG-70" }, { type: "duplicate", issue: "ENG-75" }] }));
+    expect(out).toBe("ENG-123: removed blockedBy ENG-70; removed duplicate ENG-75.");
+    expect(linear.calls.filter((c) => c.body?.query.startsWith("mutation($id: String!) { issueRelationDelete")).map((c) => c.body!.variables)).toEqual([{ id: "rel-blocked" }, { id: "rel-dupby" }]);
+  });
+
+  it("linear_update_issue reports a relation Linear refused", async () => {
+    const ref = issue({ labels: { nodes: [] }, team: { key: "ENG", states: { nodes: [] }, labels: { nodes: [] } }, relations: { nodes: [] }, inverseRelations: { nodes: [] } });
+    const { tool, text } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) => {
+          if (body.query.startsWith("mutation($input: IssueRelationCreateInput!)")) return { data: { issueRelationCreate: { success: false, issueRelation: null } } };
+          if (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier }")) return byKey(body);
+          return { data: { issue: ref, issueLabels: { nodes: [] } } };
+        },
+      },
+    });
+    const result = await tool("linear_update_issue", { key: "ENG-123", relations: [{ type: "blocks", issue: "ENG-72" }] });
+    expect(result).toMatchObject({ isError: true });
+    expect(text(result)).toContain("did not create the issue relation");
+  });
+
+  it("linear_issue lists relations and inverse relations after parent and sub-issues", async () => {
+    const withRelations = issue({
+      children: { nodes: [{ identifier: "ENG-124", title: "Add test", state: { name: "Todo" } }] },
+      relations: {
+        nodes: [
+          { id: "r1", type: "blocks", relatedIssue: { identifier: "ENG-72", state: { name: "Todo" } } },
+          { id: "r2", type: "related", relatedIssue: { identifier: "ENG-73", state: { name: "Backlog" } } },
+          { id: "r3", type: "duplicate", relatedIssue: { identifier: "ENG-74", state: { name: "Done" } } },
+        ],
+      },
+      inverseRelations: {
+        nodes: [
+          { id: "r4", type: "blocks", issue: { identifier: "ENG-71", state: { name: "Backlog" } } },
+          { id: "r5", type: "duplicate", issue: { identifier: "ENG-75", state: { name: "Todo" } } },
+        ],
+      },
+    });
+    const { tool, text } = await setup({ token: "at-0", linear: { answer: (body) => (body.query.startsWith("query($id: String!) { issue(id: $id) { id identifier title") ? { data: { issue: withRelations } } : { data: {} }) } });
+    const out = text(await tool("linear_issue", { key: "ENG-123" }));
+    expect(out).toContain("- Blocks ENG-72 (Todo)");
+    expect(out).toContain("- Related to ENG-73 (Backlog)");
+    expect(out).toContain("- Duplicate of ENG-74 (Done)");
+    expect(out).toContain("- Blocked by ENG-71 (Backlog)");
+    expect(out).toContain("- Duplicated by ENG-75 (Todo)");
+    expect(out.indexOf("Sub-issues:")).toBeLessThan(out.indexOf("Relations:"));
+    expect(out.indexOf("Relations:")).toBeLessThan(out.indexOf("## Description"));
+  });
+});
+
 describe("refresh", () => {
   it("refreshes a token about to expire before using it", async () => {
     const { tool, text, linear, now, stored, setExpiry } = await setup({

@@ -116,15 +116,28 @@ const ISSUE_FIELDS =
 
 const COMMENT_FIELDS = "comments(first: 50) { nodes { body createdAt url user { name displayName } } }";
 
-export const ISSUE_QUERY = `query($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} ${COMMENT_FIELDS} } }`;
+/** The issue's relations and inverse relations, as `linear_issue` shows them: the other issue's key and state. */
+const RELATION_FIELDS =
+  "relations { nodes { id type relatedIssue { identifier state { name } } } } " +
+  "inverseRelations { nodes { id type issue { identifier state { name } } } }";
+
+export const ISSUE_QUERY = `query($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} ${RELATION_FIELDS} ${COMMENT_FIELDS} } }`;
 export const ISSUES_QUERY = `query($filter: IssueFilter, $first: Int!) { issues(filter: $filter, first: $first, orderBy: updatedAt) { nodes { ${ISSUE_FIELDS} } } }`;
 export const SEARCH_QUERY = `query($term: String!, $filter: IssueFilter, $first: Int!) { searchIssues(term: $term, filter: $filter, first: $first) { nodes { ${ISSUE_FIELDS} } } }`;
+/** The relations a mutation matches to add or remove one, with both issues' keys. */
+const RELATION_REF_FIELDS =
+  "relations { nodes { id type issue { identifier } relatedIssue { identifier } } } " +
+  "inverseRelations { nodes { id type issue { identifier } relatedIssue { identifier } } }";
+
 export const ISSUE_REF_QUERY =
-  "query($id: String!) { issue(id: $id) { id identifier labels { nodes { id name } } team { key states { nodes { id name type position } } labels(first: 250) { nodes { id name } } } } " +
-  "issueLabels(filter: { team: { null: true } }, first: 250) { nodes { id name } } }";
+  "query($id: String!) { issue(id: $id) { id identifier labels { nodes { id name } } team { key states { nodes { id name type position } } labels(first: 250) { nodes { id name } } } " +
+  RELATION_REF_FIELDS +
+  " } issueLabels(filter: { team: { null: true } }, first: 250) { nodes { id name } } }";
 export const COMMENT_CREATE = "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { url } } }";
 export const ISSUE_UPDATE = "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { identifier state { name } assignee { name displayName email } labels { nodes { name } } priority } } }";
-export const ISSUE_CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { identifier url } } }";
+export const ISSUE_CREATE = "mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier url } } }";
+export const ISSUE_RELATION_CREATE = "mutation($input: IssueRelationCreateInput!) { issueRelationCreate(input: $input) { success issueRelation { id } } }";
+export const ISSUE_RELATION_DELETE = "mutation($id: String!) { issueRelationDelete(id: $id) { success } }";
 /** A team by key, with the states and labels an issue in it can take. Workspace labels apply to every team. */
 export const TEAM_QUERY =
   "query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1) { nodes { id key name states { nodes { id name type position } } labels(first: 250) { nodes { id name } } } } " +
@@ -141,6 +154,10 @@ const commentSchema = z.object({
   url: z.string().nullish(),
   user: person,
 });
+
+const relationIssueSchema = z.object({ identifier: z.string(), state: z.object({ name: z.string() }).nullish() });
+const relationSchema = z.object({ id: z.string(), type: z.string(), issue: relationIssueSchema.nullish(), relatedIssue: relationIssueSchema.nullish() });
+export type IssueRelation = z.infer<typeof relationSchema>;
 
 export const issueSchema = z.object({
   id: z.string(),
@@ -164,6 +181,8 @@ export const issueSchema = z.object({
   cycle: z.object({ number: z.number(), name: z.string().nullish() }).nullish(),
   parent: z.object({ identifier: z.string(), title: z.string().nullish() }).nullish(),
   children: z.object({ nodes: z.array(z.object({ identifier: z.string(), title: z.string().nullish(), state: z.object({ name: z.string() }).nullish() })) }).nullish(),
+  relations: z.object({ nodes: z.array(relationSchema) }).nullish(),
+  inverseRelations: z.object({ nodes: z.array(relationSchema) }).nullish(),
   comments: z.object({ nodes: z.array(commentSchema) }).nullish(),
 });
 export type Issue = z.infer<typeof issueSchema>;
@@ -182,6 +201,14 @@ export function parseIssueList(payload: unknown, field: "issues" | "searchIssues
 
 const labelNodes = z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string() })) });
 
+/** A relation as Linear stores it, both issues named by key, for matching a requested relation. */
+export type StoredRelation = { id: string; type: string; issue: string; relatedIssue: string };
+
+const relationRefNode = z.object({ id: z.string(), type: z.string(), issue: z.object({ identifier: z.string() }).nullish(), relatedIssue: z.object({ identifier: z.string() }).nullish() });
+const relationRefNodes = z.object({ nodes: z.array(relationRefNode) });
+const storedRelations = (connection: z.infer<typeof relationRefNodes> | null | undefined): StoredRelation[] =>
+  (connection?.nodes ?? []).map((r) => ({ id: r.id, type: r.type, issue: r.issue?.identifier ?? "", relatedIssue: r.relatedIssue?.identifier ?? "" }));
+
 export type IssueRef = {
   id: string;
   identifier: string;
@@ -193,6 +220,9 @@ export type IssueRef = {
     /** The labels the issue may carry: the team's own and the workspace's. */
     labels: Array<{ id: string; name: string }>;
   };
+  /** The relations this issue is the source of, and the inverse ones. */
+  relations: StoredRelation[];
+  inverseRelations: StoredRelation[];
 };
 
 export function parseIssueRef(payload: unknown): IssueRef | null {
@@ -209,6 +239,8 @@ export function parseIssueRef(payload: unknown): IssueRef | null {
           states: z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string(), type: z.string(), position: z.number() })) }),
           labels: labelNodes.nullish(),
         }),
+        relations: relationRefNodes.nullish(),
+        inverseRelations: relationRefNodes.nullish(),
       }),
       issueLabels: labelNodes.nullish(),
     })
@@ -219,6 +251,8 @@ export function parseIssueRef(payload: unknown): IssueRef | null {
     identifier: issue.identifier,
     labels: issue.labels?.nodes ?? [],
     team: { key: issue.team.key, states: issue.team.states.nodes, labels: [...(issue.team.labels?.nodes ?? []), ...(parsed.issueLabels?.nodes ?? [])] },
+    relations: storedRelations(issue.relations),
+    inverseRelations: storedRelations(issue.inverseRelations),
   };
 }
 
@@ -258,13 +292,51 @@ export function parseIssueUpdate(payload: unknown): IssueUpdated {
   return { identifier: issue.identifier, state: issue.state?.name ?? null, assignee: personName(issue.assignee), labels: (issue.labels?.nodes ?? []).map((l) => l.name), priority: issue.priority ?? null };
 }
 
-export function parseIssueCreate(payload: unknown): { identifier: string; url: string | null } {
+export function parseIssueCreate(payload: unknown): { id: string; identifier: string; url: string | null } {
   const data = dataOf(payload);
   const parsed = z
-    .object({ success: z.boolean(), issue: z.object({ identifier: z.string(), url: z.string().nullish() }).nullish() })
+    .object({ success: z.boolean(), issue: z.object({ id: z.string().nullish(), identifier: z.string(), url: z.string().nullish() }).nullish() })
     .parse(data.issueCreate);
   if (!parsed.success || parsed.issue === null || parsed.issue === undefined) throw new Error("Linear did not create the issue");
-  return { identifier: parsed.issue.identifier, url: parsed.issue.url ?? null };
+  return { id: parsed.issue.id ?? "", identifier: parsed.issue.identifier, url: parsed.issue.url ?? null };
+}
+
+/** The relation kinds a caller may set. `blockedBy X` is the inverse of `blocks`: X blocks this issue. */
+export type RelationType = "blockedBy" | "blocks" | "related" | "duplicate";
+
+/** A relation as `issueRelationCreate` takes it, from a requested `{ type, issueId }` on `thisIssueId`. */
+export function relationCreateInput(want: { type: RelationType; issueId: string }, thisIssueId: string): { issueId: string; relatedIssueId: string; type: string } {
+  if (want.type === "blockedBy") return { issueId: want.issueId, relatedIssueId: thisIssueId, type: "blocks" };
+  return { issueId: thisIssueId, relatedIssueId: want.issueId, type: want.type };
+}
+
+/**
+ * The stored relation a requested `{ type, issue }` names, searching both
+ * directions, or null when there is none. `relations` and `inverseRelations`
+ * are combined; each entry names both issues by key.
+ */
+export function findRelation(existing: StoredRelation[], want: { type: RelationType; issue: string }): StoredRelation | null {
+  const key = want.issue.trim().toUpperCase();
+  for (const rel of existing) {
+    if (want.type === "blocks" && rel.type === "blocks" && rel.relatedIssue === key) return rel;
+    if (want.type === "blockedBy" && rel.type === "blocks" && rel.issue === key) return rel;
+    if (want.type === "related" && rel.type === "related" && (rel.issue === key || rel.relatedIssue === key)) return rel;
+    if (want.type === "duplicate" && rel.type === "duplicate" && (rel.relatedIssue === key || rel.issue === key)) return rel;
+  }
+  return null;
+}
+
+export function parseIssueRelationCreate(payload: unknown): { id: string } {
+  const data = dataOf(payload);
+  const parsed = z.object({ success: z.boolean(), issueRelation: z.object({ id: z.string() }).nullish() }).parse(data.issueRelationCreate);
+  if (!parsed.success) throw new Error("Linear did not create the issue relation");
+  return { id: parsed.issueRelation?.id ?? "" };
+}
+
+export function parseIssueRelationDelete(payload: unknown): void {
+  const data = dataOf(payload);
+  const parsed = z.object({ success: z.boolean() }).parse(data.issueRelationDelete);
+  if (!parsed.success) throw new Error("Linear did not remove the issue relation");
 }
 
 export type Team = {
@@ -601,6 +673,25 @@ export function formatIssueList(issues: Issue[], heading: string): string {
   return `${heading} (${issues.length}):\n${issues.map(issueLine).join("\n")}`;
 }
 
+/** One line per relation, from both directions, with the other issue's state. */
+export function formatRelations(issue: Issue): string[] {
+  const other = (node: IssueRelation["issue"]) => `${node?.identifier ?? "(unknown)"}${node?.state?.name ? ` (${node.state.name})` : ""}`;
+  const lines: string[] = [];
+  for (const relation of issue.relations?.nodes ?? []) {
+    if (relation.type === "blocks") lines.push(`Blocks ${other(relation.relatedIssue)}`);
+    else if (relation.type === "duplicate") lines.push(`Duplicate of ${other(relation.relatedIssue)}`);
+    else if (relation.type === "related") lines.push(`Related to ${other(relation.relatedIssue)}`);
+    else if (relation.type === "similar") lines.push(`Similar to ${other(relation.relatedIssue)}`);
+  }
+  for (const relation of issue.inverseRelations?.nodes ?? []) {
+    if (relation.type === "blocks") lines.push(`Blocked by ${other(relation.issue)}`);
+    else if (relation.type === "duplicate") lines.push(`Duplicated by ${other(relation.issue)}`);
+    else if (relation.type === "related") lines.push(`Related to ${other(relation.issue)}`);
+    else if (relation.type === "similar") lines.push(`Similar to ${other(relation.issue)}`);
+  }
+  return lines;
+}
+
 /** The whole issue, as an agent should see it. */
 export function formatIssue(issue: Issue): string {
   const lines: string[] = [];
@@ -630,6 +721,11 @@ export function formatIssue(issue: Issue): string {
     for (const child of issue.children.nodes) {
       lines.push(`- ${child.identifier} ${child.title ?? "(untitled)"}${child.state ? ` [${child.state.name}]` : ""}`);
     }
+  }
+  const relations = formatRelations(issue);
+  if (relations.length > 0) {
+    lines.push("", "Relations:");
+    for (const relation of relations) lines.push(`- ${relation}`);
   }
   lines.push("", "## Description", issue.description && issue.description.trim() !== "" ? clip(issue.description, DESCRIPTION_CHARS) : "(none)");
   const comments = [...(issue.comments?.nodes ?? [])].sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
