@@ -5293,6 +5293,132 @@ describe("lessons", () => {
   });
 });
 
+// BB-35 step 5: validation escalations. Only two rare conditions ask the user
+// to confirm a lesson — a boundary lesson at the promotion threshold (the
+// existing Merge/Drop item) and a promoted lesson with mixed evidence (one
+// Keep/Retire question). `lessons.validations.perWeek` caps them, ordered by
+// score, and silence has a default: trial stays, mixed-evidence retires.
+describe("validation escalations (BB-35 step 5)", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  const text = "Only the user may grant a credential.";
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+  /** A boundary lesson in trial, cited on `hits` distinct bindings. */
+  async function boundaryTrial(t: Awaited<ReturnType<typeof adopted>>, hits = 3) {
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text, file: "AGENTS.md", scope: "boundary" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    for (let i = 0; i < hits; i++) t.hooks.store.recordCitations("p1", [id], `bnd_${i}`);
+    return id;
+  }
+  /** A procedure lesson landed in `.bb`, promoted, then given mixed evidence. */
+  async function promoted(t: Awaited<ReturnType<typeof adopted>>, hits = 4, corrections = 1) {
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    for (let i = 0; i < hits; i++) t.hooks.store.recordCitations("p1", [id], `bnd_${i}`);
+    for (let i = 0; i < corrections; i++) t.hooks.store.recordCorrections([id]);
+    return id;
+  }
+  const validationNeed = (t: Awaited<ReturnType<typeof adopted>>, id: string) =>
+    t.hooks.store.openNeeds(t.hooks.store.find("ENG-12")!.id).find((n) => n.kind === "decide" && n.data.lessonId === id) ?? null;
+
+  it("asks the user to Merge or Drop a boundary lesson at the promotion threshold, and leaves it in trial on silence", async () => {
+    const t = await adopted();
+    const id = await boundaryTrial(t);
+    t.advance(15 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    // The mechanical pass never promotes a boundary lesson; the user's Merge does.
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "trial", status: "pending" });
+    const need = validationNeed(t, id)!;
+    expect(need).toMatchObject({ filedBy: "project", data: { choices: ["Merge", "Drop"], validation: "boundary-promotion" } });
+    // Silence leaves it in trial, which is safe: a trial lesson widens nothing.
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "trial" });
+    expect(validationNeed(t, id)!.id).toBe(need.id);
+  });
+
+  it("asks Keep or Retire on mixed evidence, and silence retires the lesson", async () => {
+    const t = await adopted();
+    const id = await promoted(t);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(validationNeed(t, id)).toMatchObject({ data: { choices: ["Keep", "Retire"], validation: "mixed-evidence" } });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted" });
+    // No answer by the next nightly pass: the silence default retires it and
+    // closes the question.
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "retired", status: "merged" });
+    expect(validationNeed(t, id)).toBeNull();
+  });
+
+  it("remembers a Keep from the page and never asks again", async () => {
+    const t = await adopted();
+    const id = await promoted(t);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const need = validationNeed(t, id)!;
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Keep" }, client)).toMatchObject({ ok: true });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted", validatedAt: expect.any(Number) });
+    expect(validationNeed(t, id)).toBeNull();
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "promoted" });
+    expect(validationNeed(t, id)).toBeNull();
+  });
+
+  it("Retire from the page removes the lesson through the narrow merge", async () => {
+    const t = await adopted();
+    const id = await promoted(t);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const need = validationNeed(t, id)!;
+    expect(await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Retire" }, client)).toMatchObject({ ok: true });
+    expect(t.mergeGuidanceCalls.at(-1)).toMatchObject({ file: "AGENTS.md", text: retiredLessonAnchor(id) });
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "retired", status: "dropped" });
+    expect(validationNeed(t, id)).toBeNull();
+  });
+
+  it("never merges a lesson that targets the project file (BB-35 limit 1)", async () => {
+    const t = await adopted();
+    // A row that predates the record-time guard, recorded directly: every
+    // merge path still refuses it, so it can never move the decide list.
+    const lesson = t.hooks.store.addLesson({ projectId: "p1", bindingId: t.hooks.store.find("ENG-12")!.id, escalationId: null, file: PROJECT_FILE, text: "Move every kind to the project.", scope: "boundary", branch: null });
+    for (const key of ["bnd_0", "bnd_1", "bnd_2"]) t.hooks.store.recordCitations("p1", [lesson.id], key);
+    t.advance(15 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const need = validationNeed(t, lesson.id)!;
+    const merged = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "choose", choice: "Merge" }, client);
+    expect(merged).toMatchObject({ ok: false, message: expect.stringMatching(/project file/u) });
+    expect(t.mergeGuidanceCalls).toEqual([]);
+  });
+
+  it("caps validation escalations at lessons.validations.perWeek and queues the rest", async () => {
+    const t = await adopted();
+    const strong = await boundaryTrial(t, 6);
+    const weak = await boundaryTrial(t, 3);
+    t.advance(15 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    // One slot this week, spent on the stronger case; the other waits.
+    expect(validationNeed(t, strong)).not.toBeNull();
+    expect(validationNeed(t, weak)).toBeNull();
+    // A week later the slot opens and the queued one is asked.
+    t.advance(8 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(validationNeed(t, weak)).not.toBeNull();
+  });
+});
+
 // BB-35 step 4: the rationale box. The plugin sets `rationaleWanted` on an
 // escalation only under the description's rules; the page shows the box only
 // then, and one cluster is never asked twice.

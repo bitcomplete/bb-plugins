@@ -223,7 +223,7 @@ describe("the nightly prompt", () => {
     const { s, bind } = world();
     const b = bind("ENG-12");
     const lessons = [1, 2, 3].map((n) => s.addLesson({ projectId: "p1", bindingId: b.id, escalationId: null, file: "AGENTS.md", text: `Rule ${n}.`, scope: "procedure", branch: null }));
-    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], lessons: s.allLessons("p1"), lessonRules: { trial: { max: 1, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 } });
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], lessons: s.allLessons("p1"), lessonRules: { trial: { max: 1, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30, validations: { perWeek: 1 } } });
     expect(wake).toContain(`- ${lessons[0]!.id} (procedure, AGENTS.md): Rule 1.`);
     expect(wake).not.toContain(`- ${lessons[1]!.id} `);
     expect(wake).not.toContain(`- ${lessons[2]!.id} `);

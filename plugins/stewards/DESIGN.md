@@ -1301,11 +1301,14 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   citation's weight halves every `decayHalfLifeDays`, so the lowest-scoring
   promoted lesson is the one displaced when a file is at `promoted.maxPerFile`.
   A lesson is `trial` from the moment the project steward records it; the
-  nightly pass is what moves it. The thresholds and caps are the whole
-  mechanism — no model judges a tier. The project steward may still
-  `complete` a trial by hand, which promotes it at once and bypasses
-  `promoted.maxPerFile`; that is an explicit override, and the nightly pass is
-  the mechanical path, not the only one.
+  nightly pass is what moves it. A `boundary` lesson is the exception: the
+  pass never promotes it, because it changes the escalation boundary, so it
+  waits for the user's Merge through the validation escalation below. The
+  thresholds and caps are the whole mechanism — no model judges a tier. The
+  project steward may still `complete` a trial by hand, which promotes a
+  procedure lesson at once and bypasses `promoted.maxPerFile`; that is an
+  explicit override, and the nightly pass is the mechanical path, not the only
+  one.
 - **The rationale box (BB-35 step 4).** The plugin sets `rationaleWanted` on
   an escalation only when the page should ask the user why, and the page shows
   the box only then, with a one-line placeholder naming the reason. It asks
@@ -1323,6 +1326,21 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   the project steward is woken once, in its thread, to ask why — one follow-up,
   never repeated. Only the owner's words (the page answer or an unsigned
   comment) or this project's own steward or worker threads reach it.
+- **Validation escalations (BB-35 step 5).** Only two rare conditions ask the
+  user to confirm a lesson, and `lessons.validations.perWeek` (default 1) caps
+  how many the plugin may file in a rolling week, ordered by score, so the rest
+  wait. A **boundary** trial lesson that meets the promotion threshold is not
+  promoted mechanically: the plugin files the existing Merge/Drop item on the
+  Stewards page, and the lesson stays `trial` until the user Merges — silence
+  leaves it in trial, which is safe because a trial lesson widens nothing. A
+  **promoted** lesson with mixed evidence — citations and a correction short of
+  the count that retires it — gets one Keep/Retire question; Keep is remembered
+  (`validated_at`) so it is never asked again, and silence retires it on the
+  next nightly pass. Procedure lessons never produce one. The two conditions
+  are pure (`planValidations` in `lessons.ts`); the nightly pass enforces the
+  cap and the silence default. A validation escalation is a `needs` item of
+  kind `decide` whose `data.validation` names the condition, so it renders with
+  the page's existing choices and writes only the lesson's own anchored text.
 - **The promotion and retirement write only the lesson's own anchored text.**
   A promotion the nightly pass queues is listed under `## Lessons to land`;
   the project steward adds the block (`<!-- lesson:<id> -->` and the wording)

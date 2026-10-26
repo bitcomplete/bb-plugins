@@ -399,7 +399,18 @@ export const RATIONALE_MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN cluster_key TEXT`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS];
+// BB-35 step 5: validation escalations. `validated_at` records the user's Keep
+// on a mixed-evidence question, so it is never asked again; `validation_filed_at`
+// records when the plugin filed a validation item, so the next pass can apply
+// the silence default (a mixed-evidence question retires; a boundary Merge/Drop
+// leaves the lesson in trial). Additive and defaulted: a lesson from before this
+// step behaves as before.
+export const VALIDATION_MIGRATIONS = [
+  `ALTER TABLE lessons ADD COLUMN validated_at INTEGER`,
+  `ALTER TABLE lessons ADD COLUMN validation_filed_at INTEGER`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -869,6 +880,10 @@ export type Lesson = {
   lastCitedAt: number | null;
   /** The bindings whose decisions cited it; one `hits` each, plus the project sentinel for a citation with no binding. */
   citedBindings: string[];
+  /** When the user answered Keep on the mixed-evidence question, or null (BB-35 step 5). */
+  validatedAt: number | null;
+  /** When the plugin last filed a validation item for this lesson, or null (BB-35 step 5). */
+  validationFiledAt: number | null;
   createdAt: number;
   updatedAt: number;
   resolvedAt: number | null;
@@ -1088,6 +1103,14 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const openUserEscalationsStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND route = 'me' AND status = 'open' ORDER BY created_at");
   const escalationsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND cluster_key = ? ORDER BY created_at");
   const escalationsWithRationaleStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND rationale_wanted = ? AND rationale_asked = 0 ORDER BY created_at");
+  // BB-35 step 5: validation escalations are `needs` of kind `decide` whose
+  // `data.validation` names the rare condition they ask about. `validated_at`
+  // records the user's Keep; `validation_filed_at` lets the next pass apply
+  // the silence default.
+  const setLessonValidatedStmt = db.prepare("UPDATE lessons SET validated_at = ?, updated_at = ? WHERE id = ?");
+  const markLessonValidationFiledStmt = db.prepare("UPDATE lessons SET validation_filed_at = ?, updated_at = ? WHERE id = ?");
+  const countValidationsSinceStmt = db.prepare<[number], { n: number }>("SELECT COUNT(*) AS n FROM needs WHERE kind = 'decide' AND json_extract(data, '$.validation') IS NOT NULL AND created_at >= ?");
+  const openLessonValidationNeedStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE kind = 'decide' AND url = ? AND status = 'open' AND json_extract(data, '$.validation') IS NOT NULL LIMIT 1");
 
   const toNeed = (r: Record<string, unknown>): Need => ({
     id: String(r.id),
@@ -1185,6 +1208,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
     corrections: Number(r.corrections ?? 0),
     lastCitedAt: r.last_cited_at === null || r.last_cited_at === undefined ? null : Number(r.last_cited_at),
     citedBindings: json(z.array(z.string()), r.cited_bindings === null || r.cited_bindings === undefined ? null : String(r.cited_bindings), []),
+    validatedAt: r.validated_at === null || r.validated_at === undefined ? null : Number(r.validated_at),
+    validationFiledAt: r.validation_filed_at === null || r.validation_filed_at === undefined ? null : Number(r.validation_filed_at),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
@@ -1919,6 +1944,23 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Escalations whose rationale box has not been shown yet, by the reason it was set. */
     escalationsWithPendingRationale(projectId: string, reason: string): Escalation[] {
       return escalationsWithRationaleStmt.all(projectId, reason).map(toEscalation);
+    },
+    /** Record the user's Keep on a mixed-evidence question, so it is never asked again (BB-35 step 5). */
+    markLessonValidated(id: string): void {
+      setLessonValidatedStmt.run(now(), now(), id);
+    },
+    /** Record that a validation item was filed for a lesson, so the next pass can apply the silence default (BB-35 step 5). */
+    markLessonValidationFiled(id: string, at = now()): void {
+      markLessonValidationFiledStmt.run(at, at, id);
+    },
+    /** How many validation items were filed at or after `at` (BB-35 step 5's rolling weekly cap). */
+    validationsFiledSince(at: number): number {
+      return Number(countValidationsSinceStmt.get(at)?.n ?? 0);
+    },
+    /** The open validation item for a lesson, or null (BB-35 step 5). */
+    openLessonValidationNeed(lessonId: string): Need | null {
+      const r = openLessonValidationNeedStmt.get(lessonId);
+      return r === undefined ? null : toNeed(r);
     },
 
     // project stewards

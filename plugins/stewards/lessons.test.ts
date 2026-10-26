@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasLessonAnchor, lessonAnchor, lessonScore, planLessonTransitions, removeLessonAnchor, retireLessonAnchor, retiredLessonAnchor, withLessonAnchor, type ScoreableLesson } from "./lessons.js";
+import { hasLessonAnchor, lessonAnchor, lessonScore, planLessonTransitions, planValidations, removeLessonAnchor, retireLessonAnchor, retiredLessonAnchor, withLessonAnchor, type ScoreableLesson } from "./lessons.js";
 import type { LessonRules } from "./config.js";
 
 const DAY = 86_400_000;
@@ -10,10 +10,11 @@ const rules: LessonRules = {
   promote: { hits: 3, days: 14 },
   promoted: { maxPerFile: 2, retireDays: 90, corrections: 2 },
   decayHalfLifeDays: 30,
+  validations: { perWeek: 1 },
 };
 
 function lesson(over: Partial<ScoreableLesson> = {}): ScoreableLesson {
-  return { id: "lsn_a", tier: "trial", file: "AGENTS.md", hits: 0, corrections: 0, lastCitedAt: null, createdAt: T - 20 * DAY, tierAt: T - 20 * DAY, supersededBy: null, ...over };
+  return { id: "lsn_a", tier: "trial", file: "AGENTS.md", scope: "procedure", hits: 0, corrections: 0, lastCitedAt: null, createdAt: T - 20 * DAY, tierAt: T - 20 * DAY, supersededBy: null, validatedAt: null, ...over };
 }
 
 describe("the lesson anchor", () => {
@@ -106,5 +107,33 @@ describe("the nightly transitions", () => {
   it("ignores candidates and retired lessons", () => {
     expect(planLessonTransitions([lesson({ tier: "candidate", hits: 9 })], rules, T)).toEqual([]);
     expect(planLessonTransitions([lesson({ tier: "retired", hits: 9 })], rules, T)).toEqual([]);
+  });
+});
+
+describe("the validation queue (BB-35 step 5)", () => {
+  it("never promotes a boundary lesson mechanically; it queues the user's Merge instead", () => {
+    const boundary = lesson({ scope: "boundary", hits: 3, lastCitedAt: T - 1 * DAY, tierAt: T - 20 * DAY });
+    expect(planLessonTransitions([boundary], rules, T)).toEqual([]);
+    expect(planValidations([boundary], rules, T)).toEqual([{ id: "lsn_a", validation: "boundary-promotion", score: expect.any(Number), reason: expect.stringContaining("3 bindings") }]);
+    // A procedure lesson at the same counts still promotes, and is not a question.
+    expect(planLessonTransitions([lesson({ hits: 3, lastCitedAt: T - 1 * DAY, tierAt: T - 20 * DAY })], rules, T)).toContainEqual({ id: "lsn_a", action: "promote", reason: expect.stringContaining("3 bindings") });
+    expect(planValidations([lesson({ hits: 3, lastCitedAt: T - 1 * DAY, tierAt: T - 20 * DAY })], rules, T)).toEqual([]);
+  });
+
+  it("asks about a promoted lesson with mixed evidence, once", () => {
+    const mixed = lesson({ tier: "promoted", hits: 4, corrections: 1, lastCitedAt: T - 1 * DAY });
+    expect(planValidations([mixed], rules, T)).toEqual([{ id: "lsn_a", validation: "mixed-evidence", score: expect.any(Number), reason: "4 bindings and 1 correction" }]);
+    // Two corrections is the retire rule, not a question.
+    expect(planValidations([lesson({ tier: "promoted", hits: 4, corrections: 2, lastCitedAt: T - 1 * DAY })], rules, T)).toEqual([]);
+    // No citations is not mixed evidence.
+    expect(planValidations([lesson({ tier: "promoted", hits: 0, corrections: 1, lastCitedAt: T - 1 * DAY })], rules, T)).toEqual([]);
+    // A kept lesson is never asked again.
+    expect(planValidations([lesson({ tier: "promoted", hits: 4, corrections: 1, lastCitedAt: T - 1 * DAY, validatedAt: T })], rules, T)).toEqual([]);
+  });
+
+  it("orders the queue by score, strongest first", () => {
+    const strong = lesson({ id: "lsn_strong", scope: "boundary", hits: 6, lastCitedAt: T - 1 * DAY, tierAt: T - 20 * DAY });
+    const weak = lesson({ id: "lsn_weak", scope: "boundary", hits: 3, lastCitedAt: T - 20 * DAY, tierAt: T - 20 * DAY });
+    expect(planValidations([weak, strong], rules, T).map((r) => r.id)).toEqual(["lsn_strong", "lsn_weak"]);
   });
 });

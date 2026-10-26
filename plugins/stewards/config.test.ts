@@ -50,12 +50,18 @@ describe("the project file", () => {
   it("fills the lesson lifecycle's defaults, and takes explicit thresholds (BB-35 step 3)", () => {
     const defaults = parseProjectFile(JSON.stringify({ version: 1 }));
     if (!defaults.ok) throw new Error(defaults.error);
-    expect(defaults.value.lessons).toEqual({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 });
+    expect(defaults.value.lessons).toEqual({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30, validations: { perWeek: 1 } });
 
     const explicit = parseProjectFile(JSON.stringify({ version: 1, lessons: { trial: { max: 2 }, promote: { hits: 5, days: 7 }, decayHalfLifeDays: 14 } }));
     if (!explicit.ok) throw new Error(explicit.error);
-    expect(explicit.value.lessons).toEqual({ trial: { max: 2, retireDays: 30 }, promote: { hits: 5, days: 7 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 14 });
+    expect(explicit.value.lessons).toEqual({ trial: { max: 2, retireDays: 30 }, promote: { hits: 5, days: 7 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 14, validations: { perWeek: 1 } });
 
+    // The validation cap is part of the same block (BB-35 step 5): zero turns
+    // the queue off, and an out-of-range cap is refused.
+    const capped = parseProjectFile(JSON.stringify({ version: 1, lessons: { validations: { perWeek: 0 } } }));
+    if (!capped.ok) throw new Error(capped.error);
+    expect(capped.value.lessons.validations).toEqual({ perWeek: 0 });
+    expect(parseProjectFile(JSON.stringify({ version: 1, lessons: { validations: { perWeek: 99 } } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, lessons: { promote: { hits: 0 } } }))).toMatchObject({ ok: false });
     expect(parseProjectFile(JSON.stringify({ version: 1, lessons: { unknown: true } }))).toMatchObject({ ok: false });
   });
