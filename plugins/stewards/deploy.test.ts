@@ -208,8 +208,13 @@ describe("a failed workflow run (BB-61)", () => {
     expect(applyWorkflowRun(deployments, "acme/other#42", "acme/other", run(), NOW).woken).toEqual([]);
     const settled: Deployments = { "acme/web#7": { ...deployments["acme/web#7"]!, state: "deployed" } };
     expect(applyWorkflowRun(settled, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
-    // The watch was recorded after the doorbell arrived: the run cannot concern it.
-    expect(applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW - 1).woken).toEqual([]);
+    // The watch was recorded after the doorbell arrived: the run cannot concern
+    // it, so it is not woken, but the event is recorded on it so a repeat
+    // delivery of the same run and attempt does not wake it later.
+    const late = applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW - 1);
+    expect(late.woken).toEqual([]);
+    expect(late.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    expect(applyWorkflowRun(late.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
   });
 
   it("lists the watches still awaiting a deployment on a repo, and keys an event by run and attempt", () => {

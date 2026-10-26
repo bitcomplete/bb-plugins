@@ -159,11 +159,13 @@ export const awaitingOnRepo = (deployments: Deployments, repo: string): Deployme
  * The watch's deployment state is not moved: the plugin forwards only the
  * fact that a named workflow failed, and the steward applies its playbook as
  * for a timeout. `receivedAt` is when the doorbell reached the server; a
- * watch recorded after that (its merge came later) is left alone, since the
- * run cannot concern it. The doorbell carries no run start or completion
- * time, so arrival is the only clock there is, and the run's `sha` is never
- * matched: it is usually the deploying repository's commit, not the merge's.
- * Returns the watches this event is news for.
+ * watch recorded after that (its merge came later) is not woken, since the
+ * run cannot concern it, but the event is still recorded on it so a repeat
+ * delivery of the same run and attempt does not wake it later. The doorbell
+ * carries no run start or completion time, so arrival is the only clock there
+ * is, and the run's `sha` is never matched: it is usually the deploying
+ * repository's commit, not the merge's. Returns the watches this event is
+ * news for.
  */
 export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number): { deployments: Deployments; woken: string[] } {
   const key = workflowRunKey(id, run.run_attempt);
@@ -172,10 +174,9 @@ export function applyWorkflowRun(deployments: Deployments, id: string, repo: str
   for (const watch of Object.values(next)) {
     if (watch.state !== "merged" && watch.state !== "deploying") continue;
     if (watch.repo.toLowerCase() !== repo.toLowerCase()) continue;
-    if (watch.at > receivedAt) continue;
     if (watch.workflowRuns.includes(key)) continue;
     next[watch.key] = { ...watch, workflowRuns: [...watch.workflowRuns, key] };
-    woken.push(watch.key);
+    if (watch.at <= receivedAt) woken.push(watch.key);
   }
   return { deployments: next, woken };
 }
