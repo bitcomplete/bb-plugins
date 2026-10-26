@@ -545,7 +545,13 @@ export function parseDependabotAlerts(payload: unknown, repo: string): Dependabo
 
 // ---- deployments, for stewards ----------------------------------------------------
 
-/** The REST path for a repository's recent deployments, newest first. */
+/**
+ * The REST path for a repository's recent deployments, newest first. The
+ * environment is filtered client-side because GitHub's `environment` query is
+ * an exact match; a page of 100 is assumed wide enough that the newest
+ * deployment for any one environment sits in it, which holds while a repo
+ * does not interleave a busier second environment.
+ */
 export const deploymentsPath = (repo: string, perPage = 100): string => `/repos/${repo}/deployments?per_page=${perPage}`;
 
 /** The REST path for one deployment's statuses, newest first. */
