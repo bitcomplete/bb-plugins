@@ -284,7 +284,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   days, and retires it at 30 days uncited or on any correction (a promoted
   one at 90 days uncited or 2 corrections). The thresholds, caps and decay
   half-life are under `lessons` in `stewards/project.json`; the design's
-  defaults apply when the key is absent. Trial lessons are injected into
+  defaults apply when the key is absent. Only a `procedure` lesson is promoted
+  mechanically; a `boundary` one stays `trial` until you Merge it, and two
+  rare validation escalations are capped at `lessons.validations.perWeek`
+  (default 1) per week, ordered by score: the boundary Merge/Drop, and one
+  Keep/Retire question when a promoted lesson has citations and a correction
+  short of the retire count. Silence leaves a boundary lesson in trial and
+  retires a mixed-evidence one on the next nightly pass; a Keep is remembered.
+  Trial lessons are injected into
   wakes under `## Lessons (trial)`; only promoted ones reach `.bb`, with a
   `<!-- lesson:<id> -->` anchor, and only that lesson's own file (multi-repo
   fast-forwards the canonical `.bb`). A `boundary` lesson — credentials and

@@ -3,7 +3,7 @@
 // lessons, and the thresholds and caps that decide which tier a lesson moves
 // to. Nothing here touches the store or a plugin; server.ts applies what this
 // returns. Keeping it pure is what makes every transition a unit test.
-import type { LessonTier } from "./store.js";
+import type { LessonScope, LessonTier } from "./store.js";
 import type { LessonRules } from "./config.js";
 
 const DAY_MS = 86_400_000;
@@ -62,6 +62,8 @@ export type ScoreableLesson = {
   id: string;
   tier: LessonTier;
   file: string;
+  /** `procedure` may self-merge; `boundary` always waits for the user's Merge (BB-35 step 5). */
+  scope: LessonScope;
   hits: number;
   corrections: number;
   lastCitedAt: number | null;
@@ -70,6 +72,8 @@ export type ScoreableLesson = {
   tierAt: number | null;
   /** The lesson that superseded this one, or null. */
   supersededBy: string | null;
+  /** When the user answered Keep on the mixed-evidence question, or null (BB-35 step 5). */
+  validatedAt: number | null;
 };
 
 /**
@@ -134,9 +138,12 @@ export function planLessonTransitions(lessons: readonly ScoreableLesson[], rules
   }
 
   // Promotions, best-scoring first, displacing the lowest-scoring promoted
-  // lesson in a file once the cap is reached.
+  // lesson in a file once the cap is reached. A boundary lesson is never
+  // promoted here (BB-35 step 5): it changes the escalation boundary, so it
+  // waits for the user's Merge via a validation escalation and stays trial
+  // until then. `planValidations` is what queues that.
   const eligible = lessons
-    .filter((lesson) => lesson.tier === "trial" && !retired.has(lesson.id) && lesson.corrections === 0)
+    .filter((lesson) => lesson.tier === "trial" && lesson.scope === "procedure" && !retired.has(lesson.id) && lesson.corrections === 0)
     .filter((lesson) => lesson.hits >= rules.promote.hits && now - (lesson.tierAt ?? lesson.createdAt) >= rules.promote.days * DAY_MS)
     .sort((a, b) => lessonScore(b, now, halfLifeMs) - lessonScore(a, now, halfLifeMs));
   const byFile = new Map<string, ScoreableLesson[]>();
@@ -157,4 +164,53 @@ export function planLessonTransitions(lessons: readonly ScoreableLesson[], rules
     out.push({ id: lesson.id, action: "promote", reason: `${lesson.hits} bindings over ${days(now - (lesson.tierAt ?? lesson.createdAt))}d`, ...(displacedId === undefined ? {} : { displacedId }) });
   }
   return out;
+}
+
+/** The two rare conditions a validation escalation asks the user about (BB-35 step 5). */
+export const VALIDATION_KINDS = ["boundary-promotion", "mixed-evidence"] as const;
+export type ValidationKind = (typeof VALIDATION_KINDS)[number];
+
+/** One lesson the validation queue should ask the user about, best-scoring first. */
+export type ValidationRequest = {
+  id: string;
+  validation: ValidationKind;
+  score: number;
+  reason: string;
+};
+
+/**
+ * The validation queue (BB-35 step 5): the rare lessons that need the user's
+ * confirmation, ordered by score so the weekly cap spends its one slot on the
+ * strongest case and the rest wait. There are exactly two conditions:
+ *
+ * - `boundary-promotion`: a boundary trial lesson that met the promotion
+ *   threshold. The user's Merge is what promotes it; silence leaves it in
+ *   trial, which is safe because a trial lesson never widens anything.
+ * - `mixed-evidence`: a promoted lesson with citations and a correction short
+ *   of the count that retires it. The user is asked once to keep or retire it;
+ *   silence retires it.
+ *
+ * A lesson the user already kept (`validatedAt`) is never asked about again.
+ * The caller enforces the weekly cap and the silence default; this is pure.
+ */
+export function planValidations(lessons: readonly ScoreableLesson[], rules: LessonRules, now: number): ValidationRequest[] {
+  const halfLifeMs = rules.decayHalfLifeDays * DAY_MS;
+  const out: ValidationRequest[] = [];
+  for (const lesson of lessons) {
+    if (lesson.tier === "retired" || lesson.supersededBy !== null) continue;
+    if (
+      lesson.scope === "boundary" &&
+      lesson.tier === "trial" &&
+      lesson.corrections === 0 &&
+      lesson.hits >= rules.promote.hits &&
+      now - (lesson.tierAt ?? lesson.createdAt) >= rules.promote.days * DAY_MS
+    ) {
+      out.push({ id: lesson.id, validation: "boundary-promotion", score: lessonScore(lesson, now, halfLifeMs), reason: `${lesson.hits} bindings over ${days(now - (lesson.tierAt ?? lesson.createdAt))}d` });
+      continue;
+    }
+    if (lesson.tier === "promoted" && lesson.validatedAt === null && lesson.hits > 0 && lesson.corrections >= 1 && lesson.corrections < rules.promoted.corrections) {
+      out.push({ id: lesson.id, validation: "mixed-evidence", score: lessonScore(lesson, now, halfLifeMs), reason: `${lesson.hits} bindings and ${lesson.corrections} correction${lesson.corrections === 1 ? "" : "s"}` });
+    }
+  }
+  return out.sort((a, b) => b.score - a.score);
 }

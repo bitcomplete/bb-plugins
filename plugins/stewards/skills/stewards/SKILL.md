@@ -312,7 +312,15 @@ the store until the nightly pass promotes it (3 distinct-binding hits, no
 corrections, 14 days) or retires it (30 days uncited, or a correction); a
 promoted lesson is retired at 90 days uncited or 2 corrections. The
 thresholds, caps and decay half-life live under `lessons` in
-`stewards/project.json`. When the pass queues a promotion or a retirement
+`stewards/project.json`. A `procedure` lesson is promoted mechanically; a
+`boundary` one is not — the pass files the user's Merge/Drop item and the
+lesson stays `trial` until they Merge. Two rare validation escalations exist,
+capped at `lessons.validations.perWeek` (default 1) per rolling week and
+ordered by score: the boundary Merge/Drop, and one Keep/Retire question for a
+promoted lesson with mixed evidence (citations and a correction short of the
+retire count). Silence has a default: an unanswered boundary item leaves the
+lesson in trial, while an unanswered Keep/Retire retires it on the next
+nightly pass; a Keep is remembered, so it is never asked again. When the pass queues a promotion or a retirement
 your wake lists it under `## Lessons to land` or `## Lessons to retire`:
 add or replace the anchored block (`<!-- lesson:<id> -->`) in the named
 file, commit, publish with `workspace_publish_guidance`, then

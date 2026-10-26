@@ -75,7 +75,7 @@ import {
 } from "./source-contract.js";
 import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
-import { hasLessonAnchor, planLessonTransitions, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { hasLessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
@@ -3083,22 +3083,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (lesson.bindingId === null) return "a boundary lesson needs the binding it came from; record it with binding.";
         const branch = lesson.branch ?? (threadId === null ? null : lessonBranchFor(threadId));
         if (branch !== null) store.setLessonBranch(lesson.id, branch);
-        store.fileNeed({
-          bindingId: lesson.bindingId,
-          kind: "decide",
-          url: lesson.id,
-          what: `Merge or drop the boundary lesson for ${lesson.file}`,
-          how: [
-            "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
-            "",
-            `> ${lesson.text}`,
-            "",
-            `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
-            "Merge fast-forwards the canonical `.bb`; Drop discards it.",
-          ].join("\n"),
-          data: { lessonId: lesson.id, branch, file: lesson.file, choices: ["Merge", "Drop"] },
-          filedBy: "project",
-        });
+        fileBoundaryLessonNeed(lesson, branch);
         return `boundary lesson; Merge/Drop filed for the user${branch === null ? "" : ` on ${branch}`}`;
       }
       if (threadId === null) {
@@ -3143,6 +3128,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** Fast-forward the canonical `.bb` to a lesson's published branch, through multi-repo. */
     async function mergeLesson(projectId: string, threadId: string, lesson: Lesson, text: string): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
+      // Defence in depth for the self-widening guard (BB-35 limit 1): the tool
+      // refuses a project-file lesson, and every merge path refuses one too, so
+      // a row that predates the guard can never move the decide list.
+      if (lesson.file === PROJECT_FILE) return { ok: false, sha: null, branch: lesson.branch, message: "a lesson may never target the project file" };
       try {
         return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text }, mergeGuidanceOutput);
       } catch (error) {
@@ -3190,15 +3179,121 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           store.setLessonTier(transition.id, "promoted");
           continue;
         }
-        // A retirement of a lesson that never landed resolves the row here:
-        // there is no anchored text to remove, so nothing waits on the project
-        // steward and the row must not linger as pending. One that is in the
-        // file stays `merged` until its text is removed through the wake.
-        if (lesson.status === "pending") store.markLessonDropped(transition.id, `Retired: ${transition.reason}.`);
-        else {
-          store.setLessonTier(transition.id, "retired");
-          store.noteLesson(transition.id, `Retired: ${transition.reason}.`);
+        retireLessonByRule(lesson, transition.reason);
+      }
+    }
+
+    /** Retire a lesson the mechanical rules decided against, keeping the row and the file state. */
+    function retireLessonByRule(lesson: Lesson, reason: string): void {
+      // A retirement of a lesson that never landed resolves the row here:
+      // there is no anchored text to remove, so nothing waits on the project
+      // steward and the row must not linger as pending. One that is in the
+      // file stays `merged` until its text is removed through the wake.
+      if (lesson.status === "pending") store.markLessonDropped(lesson.id, `Retired: ${reason}.`);
+      else {
+        store.setLessonTier(lesson.id, "retired");
+        store.noteLesson(lesson.id, `Retired: ${reason}.`);
+      }
+      // A validation item that asked about a lesson the rules retired anyway
+      // must not linger as a question the user can still answer.
+      const open = store.openLessonValidationNeed(lesson.id);
+      if (open !== null) store.closeNeed(open.id, `Retired: ${reason}.`, "plugin");
+    }
+
+    /** The branch a lesson is published on, from its record or the project steward's thread. */
+    function lessonBranch(lesson: Lesson): string | null {
+      const threadId = store.project(lesson.projectId).threadId;
+      return lesson.branch ?? (threadId === null ? null : lessonBranchFor(threadId));
+    }
+
+    /**
+     * File the boundary lesson's Merge/Drop item (BB-35 steps 3/5). It is the
+     * existing validation escalation: only the user's Merge makes a boundary
+     * lesson permanent, and an unanswered item leaves the lesson in trial.
+     */
+    function fileBoundaryLessonNeed(lesson: Lesson, branch: string | null): boolean {
+      if (lesson.bindingId === null) return false;
+      store.fileNeed({
+        bindingId: lesson.bindingId,
+        kind: "decide",
+        url: lesson.id,
+        what: `Merge or drop the boundary lesson for ${lesson.file}`,
+        how: [
+          "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
+          "",
+          `> ${lesson.text}`,
+          "",
+          `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
+          "Merge fast-forwards the canonical `.bb`; Drop discards it.",
+        ].join("\n"),
+        data: { lessonId: lesson.id, branch, file: lesson.file, choices: ["Merge", "Drop"], validation: "boundary-promotion" },
+        filedBy: "project",
+      });
+      return true;
+    }
+
+    /** File the mixed-evidence Keep/Retire question (BB-35 step 5). Silence retires the lesson. */
+    function fileMixedEvidenceNeed(lesson: Lesson): boolean {
+      if (lesson.bindingId === null) return false;
+      store.fileNeed({
+        bindingId: lesson.bindingId,
+        kind: "decide",
+        url: lesson.id,
+        what: `Keep or retire the lesson for ${lesson.file}`,
+        how: [
+          `This promoted lesson has ${lesson.hits} citation${lesson.hits === 1 ? "" : "s"} and ${lesson.corrections} correction${lesson.corrections === 1 ? "" : "s"}, so its evidence is mixed.`,
+          "",
+          `> ${lesson.text}`,
+          "",
+          `File: \`${lesson.file}\`. Keep leaves it in \`.bb\`; Retire removes its anchored text. Silence retires it on the next nightly pass.`,
+        ].join("\n"),
+        data: { lessonId: lesson.id, file: lesson.file, choices: ["Keep", "Retire"], validation: "mixed-evidence" },
+        filedBy: "plugin",
+      });
+      return true;
+    }
+
+    /**
+     * BB-35 step 5: file the rare validation escalations, rate-capped. The
+     * queue is ordered by score; at most `lessons.validations.perWeek` of this
+     * project's validation items may be filed in a rolling week and the rest
+     * wait. The budget covers every user-facing lesson question, including the
+     * boundary Merge/Drop the project steward files by hand at `complete` time:
+     * a manual filing is the project steward's explicit override, and it still
+     * spends a slot so the user is not asked twice in one week. Silence is the
+     * default: an unanswered mixed-evidence question retires the lesson on the
+     * next pass, while a boundary Merge/Drop left unanswered leaves the lesson
+     * in trial.
+     */
+    function applyValidations(config: ProjectConfig): void {
+      const at = now();
+      const requests = planValidations(store.allLessons(config.projectId), config.file.lessons, at);
+      if (requests.length === 0) return;
+      let remaining = Math.max(0, config.file.lessons.validations.perWeek - store.validationsFiledSince(config.projectId, at - 7 * 86_400_000));
+      for (const request of requests) {
+        const lesson = store.lesson(request.id);
+        if (lesson === null || lesson.tier === "retired") continue;
+        // A mixed-evidence question filed on an earlier pass and still
+        // unanswered retires the lesson: silence is the default. A boundary
+        // Merge/Drop left open leaves the lesson in trial. The question is
+        // closed with the lesson by `retireLessonByRule`.
+        if (request.validation === "mixed-evidence" && lesson.validationFiledAt !== null) {
+          retireLessonByRule(lesson, "no answer to the keep/retire question");
+          continue;
         }
+        if (store.openLessonValidationNeed(lesson.id) !== null) continue;
+        if (remaining <= 0) continue;
+        const branch = request.validation === "boundary-promotion" ? lessonBranch(lesson) : null;
+        if (branch !== null) store.setLessonBranch(lesson.id, branch);
+        const filed = request.validation === "boundary-promotion" ? fileBoundaryLessonNeed(lesson, branch) : fileMixedEvidenceNeed(lesson);
+        if (!filed) {
+          // A lesson with no binding (a hand-edited or pre-guard row) has no
+          // item to live on; say so once rather than skipping it in silence.
+          store.noteLesson(lesson.id, "No binding to file the validation item on; record the lesson with a binding.");
+          continue;
+        }
+        store.markLessonValidationFiled(lesson.id, at);
+        remaining -= 1;
       }
     }
 
@@ -4710,13 +4805,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { ok: true, message: `Opening the secure form for ${named} in a new thread.`, threadId: requesterId };
         }
 
-        // A boundary lesson's Merge/Drop. Merge goes through the same
-        // multi-repo fast-forward the project steward's own self-merge uses;
-        // Drop discards it. Neither is a free-text answer.
+        // A lesson's validation item (BB-35 steps 3/5). A boundary one is
+        // Merge/Drop: Merge goes through the same multi-repo fast-forward the
+        // project steward's own self-merge uses; Drop discards it. A
+        // mixed-evidence one is Keep/Retire: Keep records that the user
+        // confirmed it, Retire removes it. Neither is a free-text answer.
         if (need.kind === "decide" && action === "choose" && typeof need.data.lessonId === "string") {
           const lesson = store.lesson(need.data.lessonId);
           const label = choice === undefined || choice === null || choice === "" ? null : choice;
-          if (lesson === null || lesson.status !== "pending") {
+          if (lesson === null || lesson.tier === "retired") {
+            store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
+            return { ok: false, message: "That lesson is already resolved." };
+          }
+          if (need.data.validation === "mixed-evidence") {
+            if (label === "Keep") {
+              store.markLessonValidated(lesson.id);
+              store.closeNeedByKey(b.id, "decide", need.url, "Kept on the Stewards page.");
+              after(`The user kept lesson ${lesson.id} (${lesson.file}) on the Stewards page.`);
+              return { ok: true, message: `Kept; ${b.entityKey}'s steward has been told.` };
+            }
+            if (label !== "Retire") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Keep, Retire.` };
+            const removed = await retireLesson(lesson);
+            // A refused removal still retires the row, so the project steward
+            // gets the anchored text out through `## Lessons to retire`.
+            if (removed.startsWith("retire refused")) retireLessonByRule(store.lesson(lesson.id) ?? lesson, "retired by the user");
+            store.closeNeedByKey(b.id, "decide", need.url, "Retired on the Stewards page.");
+            after(`The user retired lesson ${lesson.id} (${lesson.file}) on the Stewards page: ${removed}.`);
+            return { ok: true, message: `Retired; ${b.entityKey}'s steward has been told.` };
+          }
+          if (lesson.status !== "pending") {
             store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
             return { ok: false, message: "That lesson is already resolved." };
           }
@@ -5981,6 +6098,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (!(await settings.get()).paused) await adoptionPass(config);
         await reconcileLessons(config);
         applyLessonTransitions(config);
+        applyValidations(config);
         applyRationaleClustering(config);
         // BB-35 step 4: an answer that went against a recommendation and has not
         // had its one follow-up yet is asked in the digest wake.
@@ -6458,13 +6576,37 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const n = store.need(id);
               if (n === null) throw new PluginCliError(`No waiting item ${id}.`, { code: "need_not_found", hint: "bb stewards needs lists them." });
               if (n.status !== "open") return { exitCode: 0, stdout: `${id} is already closed.` };
-              // A boundary lesson's Merge/Drop is not a free-text choice: Merge
-              // runs the multi-repo fast-forward, Drop discards it, and both
-              // close the item and wake the steward.
+              // A lesson's validation item is not a free-text choice: a
+              // boundary Merge runs the multi-repo fast-forward and Drop
+              // discards it; a mixed-evidence Keep records the user's
+              // confirmation and Retire removes it. Each closes the item and
+              // wakes the steward.
               if (n.kind === "decide" && typeof n.data.lessonId === "string") {
                 const lesson = store.lesson(n.data.lessonId);
-                if (lesson === null || lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
+                if (lesson === null || lesson.tier === "retired") return { exitCode: 0, stdout: "That lesson is already resolved." };
                 const label = choice ?? null;
+                if (n.data.validation === "mixed-evidence") {
+                  if (label !== "Keep" && label !== "Retire") throw new PluginCliError(`Lesson ${lesson.id} is Keep or Retire; pass --choice Keep or --choice Retire.`, { code: "choice_required" });
+                  const b = store.binding(n.bindingId);
+                  if (label === "Keep") {
+                    store.markLessonValidated(lesson.id);
+                    store.closeNeedByKey(n.bindingId, "decide", n.url, "Kept from a thread.");
+                    if (b !== null) {
+                      store.note(b.id, `The user kept lesson ${lesson.id} from a thread.`);
+                      scheduleReconcile(b.id);
+                    }
+                    return { exitCode: 0, stdout: `Kept ${lesson.id}.` };
+                  }
+                  const removed = await retireLesson(lesson);
+                  if (removed.startsWith("retire refused")) retireLessonByRule(store.lesson(lesson.id) ?? lesson, "retired by the user");
+                  store.closeNeedByKey(n.bindingId, "decide", n.url, "Retired from a thread.");
+                  if (b !== null) {
+                    store.note(b.id, `The user retired lesson ${lesson.id} from a thread: ${removed}.`);
+                    scheduleReconcile(b.id);
+                  }
+                  return { exitCode: 0, stdout: `Retired ${lesson.id}.` };
+                }
+                if (lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
                 if (label !== "Merge" && label !== "Drop") throw new PluginCliError(`Lesson ${lesson.id} is Merge or Drop; pass --choice Merge or --choice Drop.`, { code: "choice_required" });
                 const b = store.binding(n.bindingId);
                 if (label === "Drop") {

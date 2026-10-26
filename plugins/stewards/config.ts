@@ -249,9 +249,23 @@ export const lessonRulesSchema = z
       .default({ maxPerFile: 10, retireDays: 90, corrections: 2 }),
     /** A citation's weight halves every this many days. */
     decayHalfLifeDays: z.number().positive().max(3650).default(30),
+    /**
+     * Validation escalations (BB-35 step 5): the two rare conditions that ask
+     * the user to confirm a lesson. `perWeek` caps how many of this project's
+     * validation items may be filed in a rolling week, ordered by score; the
+     * rest wait. The budget includes a boundary Merge/Drop the project steward
+     * files by hand, so the user is not asked twice in one week.
+     */
+    validations: z
+      .object({
+        /** At most this many validation escalations (a boundary Merge/Drop, a mixed-evidence Keep/Retire) may be filed per rolling week, per project. */
+        perWeek: z.number().int().min(0).max(50).default(1),
+      })
+      .strict()
+      .default({ perWeek: 1 }),
   })
   .strict()
-  .default({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30 });
+  .default({ trial: { max: 5, retireDays: 30 }, promote: { hits: 3, days: 14 }, promoted: { maxPerFile: 10, retireDays: 90, corrections: 2 }, decayHalfLifeDays: 30, validations: { perWeek: 1 } });
 export type LessonRules = z.infer<typeof lessonRulesSchema>;
 
 export const projectFileSchema = z
