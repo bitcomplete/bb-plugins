@@ -1,8 +1,8 @@
 // The plugin's settings section: whether this server is signed in to Slack as
-// you, which bb project a Slack conversation starts its thread in by default,
-// and the channel → project map. The channel box is a typeahead over the
-// channels you can see, read from Slack with your own sign-in token; the id is
-// what is stored. The token itself is never shown.
+// you, and the routing map that decides which bb project a Slack conversation
+// starts its thread in. The channel box is a typeahead over the channels you
+// can see, read from Slack with your own sign-in token; the id is what is
+// stored. The token itself is never shown.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -39,18 +39,15 @@ interface ChannelSearch {
 interface Status {
   signedIn: boolean;
   user: { id: string; name: string } | null;
-  project: { id: string; name: string } | null;
+  fallback: string;
   projects: Project[];
   channels: ChannelEntry[];
   hooks: { configured: boolean; connected: boolean; state: string };
 }
 
-/** The reserved channel-map key for a direct message with the app. */
-const DM_CHANNEL = "dm";
 /** A Slack channel id: `C…` or `G…`, never a name. */
 const CHANNEL_ID = /^[CG][A-Z0-9]+$/i;
 
-const isDm = (channel: string): boolean => channel.trim().toLowerCase() === DM_CHANNEL;
 const isChannelId = (channel: string): boolean => CHANNEL_ID.test(channel.trim());
 
 /** Whether the map key is a channel id bb's bot is not a member of. */
@@ -60,7 +57,7 @@ function needsInvite(channel: string, botChannels: string[] | null): boolean {
 
 /** The one-line note under a row: private, Slack Connect, or not invited yet. */
 function channelNote(channel: string, options: ChannelOption[], botChannels: string[] | null): string | null {
-  if (isDm(channel) || channel.trim() === "") return null;
+  if (channel.trim() === "") return null;
   if (needsInvite(channel, botChannels)) return "bb is not in this channel yet; invite it";
   const known = options.find((c) => c.id === channel.trim());
   if (known === null || known === undefined) return null;
@@ -99,8 +96,8 @@ function PickerRow({ label, meta, selected, onClick }: { label: string; meta: st
 /**
  * The channel box. With a searchable token it is a typeahead over the
  * developer's channels, showing `#name` and a lock for a private channel, and
- * storing the id; a pasted `C…`/`G…` id and `dm` are still accepted. Without
- * one it is the plain id box the picker falls back to.
+ * storing the id; a pasted `C…`/`G…` id is still accepted. Without one it is
+ * the plain id box the picker falls back to.
  */
 function ChannelPicker({
   value,
@@ -120,20 +117,16 @@ function ChannelPicker({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const selected = options.find((c) => c.id === value.trim()) ?? null;
-  const label = isDm(value) ? "Direct message" : selected !== null ? `#${selected.name}` : value;
+  const label = selected !== null ? `#${selected.name}` : value;
   const close = () => {
     setOpen(false);
     setQuery("");
   };
 
-  /** Store what was typed: an exact id, an exact name, a pasted id, or `dm`. */
+  /** Store what was typed: an exact id, an exact name, or a pasted id. */
   const accept = (text: string) => {
     const typed = text.trim();
     if (typed === "") return close();
-    if (typed.toLowerCase() === DM_CHANNEL) {
-      onChange(DM_CHANNEL);
-      return close();
-    }
     const byId = options.find((c) => c.id === typed);
     if (byId !== undefined) {
       onChange(byId.id);
@@ -164,7 +157,7 @@ function ChannelPicker({
     return (
       <input
         className="h-8 w-44 rounded-md border border-input bg-transparent px-2 text-sm"
-        placeholder="C0123 or dm"
+        placeholder="C0123"
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
@@ -203,9 +196,6 @@ function ChannelPicker({
       {open ? (
         <div className="absolute z-10 mt-1 w-72 rounded-md border border-input bg-popover p-1 text-sm shadow-md">
           <div className="max-h-56 overflow-auto">
-            {wanted === "" || "direct message".includes(wanted) ? (
-              <PickerRow label="Direct message" meta="dm" selected={isDm(value)} onClick={() => { onChange(DM_CHANNEL); close(); }} />
-            ) : null}
             {matches.map((option) => (
               <PickerRow
                 key={option.id}
@@ -230,7 +220,7 @@ function ChannelPicker({
   );
 }
 
-/** The channel → project map: a row per channel, saved together. */
+/** The routing map: a pinned fallback row, then a row per channel, saved together. */
 function ChannelMapEditor({
   status,
   search,
@@ -240,25 +230,32 @@ function ChannelMapEditor({
   status: Status;
   search: ChannelSearch | null;
   busy: boolean;
-  save: (entries: ChannelEntry[]) => void;
+  save: (map: { fallback: string; channels: ChannelEntry[] }) => void;
 }) {
+  const [fallback, setFallback] = useState(status.fallback);
   const [rows, setRows] = useState<ChannelEntry[]>(status.channels);
-  useEffect(() => setRows(status.channels), [status.channels]);
+  useEffect(() => {
+    setFallback(status.fallback);
+    setRows(status.channels);
+  }, [status.fallback, status.channels]);
   const projectNames = status.projects.map((p) => p.name);
   const valid = rows.filter((row) => row.channel.trim() !== "" && row.project.trim() !== "");
-  const dirty = JSON.stringify(valid) !== JSON.stringify(status.channels);
+  const dirty = fallback.trim() !== status.fallback.trim() || JSON.stringify(valid) !== JSON.stringify(status.channels);
   const change = (index: number, patch: Partial<ChannelEntry>) =>
     setRows((all) => all.map((row, i) => (i === index ? { ...row, ...patch } : row)));
 
   const options = search?.channels ?? [];
   const botChannels = search?.botChannels ?? null;
   const canSearch = search?.state === "ok";
+  const trimmed = fallback.trim();
+  const onServer = (name: string) => projectNames.some((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  const missing = trimmed !== "" && !onServer(trimmed);
 
   return (
     <div className="flex flex-col gap-2">
       <p className="text-muted-foreground">
-        A mention in a channel starts its thread in the project beside it. The channel is a Slack channel id (<code>C…</code> or <code>G…</code>), never a name, so
-        renaming a channel does not break its entry; the reserved <code>dm</code> is a direct message with the app. A channel or DM with no entry uses the project above.
+        A mention in a channel starts its thread in the project beside it; everything else, DMs included, starts in the project on the first row. The channel is a Slack
+        channel id (<code>C…</code> or <code>G…</code>), never a name, so renaming a channel does not break its entry.
       </p>
       {search !== null && search.state !== "ok" ? (
         <p className="text-muted-foreground">
@@ -272,6 +269,27 @@ function ChannelMapEditor({
       {search !== null && search.state === "ok" && search.truncated ? (
         <p className="text-muted-foreground">Slack has more channels than could be listed here; some may be missing from the search.</p>
       ) : null}
+      <div className="flex flex-col gap-0.5">
+        <div className="flex items-center gap-2">
+          <span className="w-44 shrink-0 text-muted-foreground">Everything else</span>
+          <select
+            className="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm"
+            value={fallback}
+            disabled={busy}
+            onChange={(e) => setFallback(e.target.value)}
+          >
+            <option value="">Choose a project…</option>
+            {missing ? <option value={fallback}>{fallback} (not on this server)</option> : null}
+            {projectNames.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </div>
+        {missing ? <span className="text-xs text-destructive">This project is not on this server; conversations fall back to the personal project, or the first one.</span> : null}
+        {trimmed === "" ? <span className="text-xs text-muted-foreground">Choose a project for conversations that are not in a mapped channel.</span> : null}
+      </div>
       {rows.length === 0 ? <p className="text-muted-foreground">No channel entries yet.</p> : null}
       {rows.map((row, index) => {
         const note = channelNote(row.channel, options, botChannels);
@@ -292,7 +310,7 @@ function ChannelMapEditor({
                 disabled={busy}
                 onChange={(e) => change(index, { project: e.target.value })}
               >
-                {!projectNames.includes(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
+                {!onServer(row.project) ? <option value={row.project}>{row.project} (not on this server)</option> : null}
                 {projectNames.map((name) => (
                   <option key={name} value={name}>
                     {name}
@@ -316,7 +334,7 @@ function ChannelMapEditor({
         >
           Add channel
         </Button>
-        <Button size="sm" disabled={busy || !dirty} onClick={() => save(valid)}>
+        <Button size="sm" disabled={busy || trimmed === "" || !dirty} onClick={() => save({ fallback: trimmed, channels: valid })}>
           Save map
         </Button>
       </div>
@@ -409,25 +427,7 @@ function SlackSection() {
         )}
       </div>
       {status.projects.length > 0 ? (
-        <label className="flex items-center justify-between gap-4">
-          <span className="text-muted-foreground">Project a Slack conversation starts its bb thread in</span>
-          <select
-            className="h-8 rounded-md border border-input bg-transparent px-2 text-sm"
-            disabled={busy}
-            value={status.project?.id ?? ""}
-            onChange={(e) => void act(() => rpc.call("setProject", { projectId: e.target.value }))}
-          >
-            {status.projects.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-                {p.kind === "personal" ? " (personal)" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-      ) : null}
-      {status.projects.length > 0 ? (
-        <ChannelMapEditor status={status} search={search} busy={busy} save={(entries) => void act(() => rpc.call("setChannels", { entries }))} />
+        <ChannelMapEditor status={status} search={search} busy={busy} save={(map) => void act(() => rpc.call("setMap", map))} />
       ) : null}
       {!status.hooks.connected && status.hooks.configured ? <p className="text-muted-foreground">Connecting to bb-gate-hooks…</p> : null}
       {error !== null ? <p className="text-destructive">{error}</p> : null}

@@ -1,6 +1,6 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import serverEntry, { CALLBACK_PATH, createSlackPlugin } from "./server.js";
+import serverEntry, { CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -158,8 +158,8 @@ async function setup(
     hooks?: ReturnType<typeof fakeHooks>;
     slack?: ReturnType<typeof fakeSlack>;
     token?: string;
-    project?: string;
-    channels?: string;
+    settings?: { token?: string; project?: string; channels?: string };
+    map?: { fallback: string; channels: Array<{ channel: string; project: string }> };
     projects?: typeof PROJECTS;
     hosts?: Array<{ id: string; status: string }>;
     sources?: Array<{ type: string; hostId: string; isDefault: boolean }>;
@@ -177,10 +177,11 @@ async function setup(
   const fetchImpl = vi.fn((url: string | URL, init?: RequestInit): Promise<Response> =>
     String(url).startsWith("https://slack.com/") ? slack.fetchImpl(url, init) : hooks.fetchImpl(url, init),
   ) as unknown as typeof fetch;
+  const settings = options.settings ?? { token: options.token ?? "", project: "", channels: "[]" };
   const { bb, harness } = createFakePluginHost({
     pluginId: "slack",
     appUrl: APP_URL,
-    settings: { token: options.token ?? "", project: options.project ?? "", channels: options.channels ?? "[]" },
+    settings,
     sdk: {
       projects: {
         list: async () => options.projects ?? PROJECTS,
@@ -197,11 +198,13 @@ async function setup(
     },
   });
   let now = 1_000_000_000_000;
-  await createSlackPlugin({ fetch: fetchImpl, now: () => now, env: { BB_HOOKS_URL: HOOKS_URL } })(bb);
+  const factory = createSlackPlugin({ fetch: fetchImpl, now: () => now, env: { BB_HOOKS_URL: HOOKS_URL } });
+  await factory(bb);
+  if (options.map !== undefined) await harness.callRpc("setMap", options.map);
   const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
-  return { bb, harness, hooks, slack, tool, text, advance: (ms: number) => (now += ms), now: () => now };
+  return { bb, harness, hooks, slack, tool, text, advance: (ms: number) => (now += ms), now: () => now, factory };
 }
 
 describe("Slack plugin", () => {
@@ -223,12 +226,12 @@ describe("Slack plugin", () => {
     return { ...s, service, stop: async () => void (service.controller.abort(), await service.done) };
   }
 
-  it("shows the project, the projects and a disconnected hooks service before sign-in", async () => {
+  it("shows the projects and a disconnected hooks service before sign-in", async () => {
     const s = await live();
     expect(await s.harness.callRpc("status")).toEqual({
       signedIn: false,
       user: null,
-      project: { id: "prj-2", name: "Personal" },
+      fallback: "",
       projects: PROJECTS,
       channels: [],
       hooks: { configured: true, connected: true, state: "connected" },
@@ -362,69 +365,57 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("starts a mention in the project its channel is mapped to, and the default when it is not", async () => {
-    const channels = JSON.stringify([{ channel: "C0123", project: "Project One" }]);
-    const mapped = await live({ channels });
+  it("starts a mention in the project its channel is mapped to, and the fallback when it is not", async () => {
+    const map = { fallback: "Personal", channels: [{ channel: "C0123", project: "Project One" }] };
+    const mapped = await live({ map });
     mapped.hooks.last().send(mapped.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
     await tick();
     expect((mapped.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
     await mapped.stop();
 
-    const unmapped = await live({ channels });
+    const unmapped = await live({ map });
     unmapped.hooks.last().send(unmapped.hooks.session({ session: "C9999:1.2", channel: "C9999", mention: true, comment: { text: "build this", untrusted: false } }));
     await tick();
     expect((unmapped.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
     await unmapped.stop();
   });
 
-  it("never uses the dm entry for an unmapped channel, which uses the default", async () => {
-    const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
-    s.hooks.last().send(s.hooks.session({ session: "C9999:1.2", channel: "C9999", mention: true, comment: { text: "build this", untrusted: false } }));
-    await tick();
-    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
-    await s.stop();
-  });
-
-  it("uses the dm entry for a direct message", async () => {
-    const s = await live({ channels: JSON.stringify([{ channel: "dm", project: "Project One" }]) });
+  it("uses the fallback for a direct message", async () => {
+    const s = await live({ map: { fallback: "Project One", channels: [] } });
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
     await s.stop();
   });
 
-  it("uses the channel a DM was typed while viewing, over the dm entry", async () => {
-    const s = await live({
-      channels: JSON.stringify([
-        { channel: "C0123", project: "Project One" },
-        { channel: "dm", project: "Project Two" },
-      ]),
-      projects: [
-        { id: "prj-1", name: "Project One", kind: "standard" },
-        { id: "prj-3", name: "Project Two", kind: "standard" },
-        { id: "prj-2", name: "Personal", kind: "personal" },
-      ],
-    });
-    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_context_changed", contextChannel: "C0123", comment: { text: "", untrusted: false } }));
+  it("ignores the channel map for a DM, even when the DM's own id is mapped", async () => {
+    const s = await live({ map: { fallback: "Personal", channels: [{ channel: "D0123", project: "Project One" }] } });
+    s.hooks.last().send(s.hooks.session());
     await tick();
-    s.hooks.last().send(s.hooks.session({ comment: { text: "build this", untrusted: false } }));
-    await tick();
-    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
+    expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
     await s.stop();
   });
 
-  it("falls back to the default when a map entry names a project this server lacks", async () => {
-    const s = await live({ channels: JSON.stringify([{ channel: "C0123", project: "Nope" }]) });
+  it("falls back to the fallback when a map entry names a project this server lacks", async () => {
+    const s = await live({ map: { fallback: "Personal", channels: [{ channel: "C0123", project: "Nope" }] } });
     s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
     await s.stop();
   });
 
-  it("saves the channel map through the settings RPC", async () => {
+  it("saves the routing map through the RPC", async () => {
     const s = await live();
-    expect((await s.harness.callRpc("setChannels", { entries: [{ channel: "C0123", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
-    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "C0123", project: "Project One" }]);
+    expect((await s.harness.callRpc("setMap", { fallback: "Project One", channels: [{ channel: "C0123", project: "Project Two" }] })) as { ok: boolean }).toEqual({ ok: true });
+    const status = (await s.harness.callRpc("status")) as { fallback: string; channels: unknown };
+    expect(status.fallback).toBe("Project One");
+    expect(status.channels).toEqual([{ channel: "C0123", project: "Project Two" }]);
+    await s.stop();
+  });
+
+  it("refuses a map with no fallback", async () => {
+    const s = await live();
+    await expect(s.harness.callRpc("setMap", { fallback: "", channels: [] })).rejects.toThrow();
     await s.stop();
   });
 
@@ -525,7 +516,7 @@ describe("Slack plugin", () => {
 
   it("still saves the map when the picker has no channel list", async () => {
     const s = await live({ token: "xoxp-old-openid", slack: fakeSlack({ tokenError: "missing_scope" }) });
-    expect((await s.harness.callRpc("setChannels", { entries: [{ channel: "G0456", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
+    expect((await s.harness.callRpc("setMap", { fallback: "Project One", channels: [{ channel: "G0456", project: "Project One" }] })) as { ok: boolean }).toEqual({ ok: true });
     expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "G0456", project: "Project One" }]);
     await s.stop();
   });
@@ -565,7 +556,7 @@ describe("Slack plugin", () => {
   });
 
   it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {
-    const s = await live({ project: "prj-1", environments: [] });
+    const s = await live({ map: { fallback: "prj-1", channels: [] }, environments: [] });
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect(s.harness.sdk.callsTo("threads.spawn")[0]![0]).toMatchObject({
@@ -605,30 +596,30 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("changes the project the next Slack conversation goes to", async () => {
+  it("changes the fallback the next Slack conversation goes to", async () => {
     const s = await live();
-    // prj-1 is the standard project; the empty setting would pick the personal
-    // prj-2, so this proves the setting wins over the default.
-    expect((await s.harness.callRpc("setProject", { projectId: "prj-1" })) as { ok: boolean }).toEqual({ ok: true });
-    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-1");
+    // prj-1 is the standard project; the empty fallback would pick the personal
+    // prj-2, so this proves the saved fallback wins over the default.
+    expect((await s.harness.callRpc("setMap", { fallback: "Project One", channels: [] })) as { ok: boolean }).toEqual({ ok: true });
+    expect(((await s.harness.callRpc("status")) as { fallback: string }).fallback).toBe("Project One");
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
     await s.stop();
   });
 
-  it("starts a conversation in the personal project when the setting is empty, even when it is not first", async () => {
+  it("starts a conversation in the personal project when the fallback is empty, even when it is not first", async () => {
     const s = await live();
-    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-2");
+    expect(((await s.harness.callRpc("status")) as { fallback: string }).fallback).toBe("");
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
     await s.stop();
   });
 
-  it("falls back to the personal project when the setting names no project", async () => {
-    const s = await live({ project: "not-a-project" });
-    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-2");
+  it("falls back to the personal project when the fallback names no project", async () => {
+    const s = await live({ map: { fallback: "not-a-project", channels: [] } });
+    expect(((await s.harness.callRpc("status")) as { fallback: string }).fallback).toBe("not-a-project");
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-2");
@@ -642,7 +633,7 @@ describe("Slack plugin", () => {
         { id: "prj-3", name: "Project Two", kind: "standard" },
       ],
     });
-    expect(((await s.harness.callRpc("status")) as { project: { id: string } }).project.id).toBe("prj-1");
+    expect(((await s.harness.callRpc("status")) as { fallback: string }).fallback).toBe("");
     s.hooks.last().send(s.hooks.session());
     await tick();
     expect((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { projectId: string }).projectId).toBe("prj-1");
@@ -718,7 +709,7 @@ describe("Slack plugin", () => {
       return new Response("token refused", { status: 401 });
     };
     const s = await setup({ hooks, token: "xoxp-old" });
-    setToken = (token) => s.harness.setSettings({ token });
+    setToken = (token) => s.bb.storage.kv.set("signin/token", token);
     const service = s.harness.runService("slack");
     await tick();
     hooks.last().send(hooks.hello("c_1"));
@@ -726,5 +717,49 @@ describe("Slack plugin", () => {
     expect((await s.harness.callRpc("status")) as { signedIn: boolean }).toMatchObject({ signedIn: true });
     await service.controller.abort();
     await service.done;
+  });
+
+  it("moves the old token and map into kv once, clearing only the token setting", async () => {
+    const s = await setup({
+      settings: {
+        token: "xoxp-old",
+        project: "Project One",
+        channels: JSON.stringify([
+          { channel: "C0123", project: "Project Two" },
+          { channel: "dm", project: "Personal" },
+        ]),
+      },
+    });
+    expect(await s.bb.storage.kv.get("signin/token")).toBe("xoxp-old");
+    expect(await s.bb.storage.kv.get("routing/map")).toEqual({ fallback: "Personal", channels: [{ channel: "C0123", project: "Project Two" }] });
+
+    // A second start with the marker set does not touch the map or the token.
+    await s.bb.storage.kv.set("routing/map", { fallback: "Project Two", channels: [] });
+    const next = await s.harness.lifecycle.reload(s.factory);
+    expect(await next.bb.storage.kv.get("routing/map")).toEqual({ fallback: "Project Two", channels: [] });
+    expect(await next.bb.storage.kv.get("signin/token")).toBe("xoxp-old");
+
+    // Only the token setting was cleared; the old project and channels settings
+    // stay in place for a rollback to the previous build.
+    const legacy = next.bb.settings.define(legacySettingDescriptors);
+    const old = await legacy.get();
+    expect(old.token).toBeUndefined();
+    expect(old.project).toBe("Project One");
+    expect(old.channels).toBe(JSON.stringify([{ channel: "C0123", project: "Project Two" }, { channel: "dm", project: "Personal" }]));
+  });
+
+  it("never puts the token in the status or a settings RPC, and declares no settings after the migration", async () => {
+    const s = await live({ token: "xoxp-secret-token" });
+    const status = (await s.harness.callRpc("status")) as Record<string, unknown>;
+    expect(status).not.toHaveProperty("token");
+    expect(status).not.toHaveProperty("project");
+    expect(JSON.stringify(status)).not.toContain("xoxp-secret-token");
+    expect(JSON.stringify(await s.harness.callRpc("setMap", { fallback: "Project One", channels: [] }))).not.toContain("xoxp-secret-token");
+    expect(JSON.stringify(await s.harness.callRpc("searchChannels", { query: "" }))).not.toContain("xoxp-secret-token");
+    // The migration declares the old descriptors only on its own load; a later
+    // load declares none, so bb core's declarative settings panel is empty.
+    const next = await s.harness.lifecycle.reload(s.factory);
+    expect(next.harness.registrations.settingsDescriptors).toEqual({});
+    await s.stop();
   });
 });

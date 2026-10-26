@@ -8,7 +8,7 @@
 // "Slack agent"): the settings page sends the browser to Slack through the
 // service, the callback below runs on this developer's own server, and the
 // exchange happens in bb-gate-hooks, which holds the OAuth client secret. The
-// user token that comes back is stored in a secret setting and presented at
+// user token that comes back is stored in plugin storage and presented at
 // `/v1/identify`; the service binds the Slack user to this server's stream.
 import { randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -18,6 +18,7 @@ import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
 import {
   channelEntrySchema,
+  channelMapFromLegacy,
   chooseConversationProject,
   chooseProject,
   clipMention,
@@ -26,9 +27,11 @@ import {
   isUntrusted,
   parseChannelMap,
   parseConfirm,
+  parseLegacyChannelEntries,
   pendingRecordSchema,
   sessionsSchema,
   wakeText,
+  type ChannelMap,
   type PendingRequest,
   type Project,
   type SessionRecord,
@@ -48,6 +51,12 @@ export const PENDING_TTL_MS = 10 * 60 * 1000;
 const SESSIONS_KEY = "sessions";
 const IDENTITY_KEY = "identity";
 const PENDING_PREFIX = "signin/pending/";
+/** The sign-in token, moved out of settings into kv. Never read out of the plugin. */
+const TOKEN_KEY = "signin/token";
+/** The routing map: `{ fallback, channels }`, moved out of settings into kv. */
+const CHANNEL_MAP_KEY = "routing/map";
+/** Set once the old settings have been moved into kv, so the migration is idempotent. */
+const MIGRATION_KEY = "settings/migrated";
 
 const identityRecord = z.object({ id: z.string(), name: z.string(), at: z.number() });
 type Identity = z.infer<typeof identityRecord>;
@@ -61,36 +70,43 @@ export interface SlackPluginDeps {
   env: Record<string, string | undefined>;
 }
 
+/**
+ * The plugin declares no bb settings. The sign-in token and the routing map
+ * live in `bb.storage.kv` and are managed only by the plugin's own Slack
+ * section. bb core's Configuration section still renders because the plugin
+ * registers a settings section, but it renders no declarative settings panel
+ * and so no empty box.
+ */
 export function settingDescriptors(_env: Record<string, string | undefined>) {
-  return {
-    token: {
-      type: "string",
-      secret: true,
-      label: "Slack sign-in token",
-      description: "Filled in by Sign in with Slack below; it proves who you are and reads the channel list you can see. Do not edit or paste by hand.",
-    },
-    project: {
-      type: "string",
-      label: "Project",
-      description: "Which bb project a Slack conversation starts its thread in when the channel map below has no entry. Leave empty to use the personal project, or the first project when this server has none.",
-    },
-    channels: {
-      type: "string",
-      label: "Channel map",
-      description: 'A JSON array of {"channel":"C…","project":"name"} entries. The channel is a Slack channel id, never a name; the reserved key "dm" is a direct message with the app. A channel or DM with no entry uses the Project above.',
-      experimental_multiline: true,
-      default: "[]",
-      experimental_schema: z.string().refine((value) => {
-        try {
-          const parsed: unknown = JSON.parse(value);
-          return Array.isArray(parsed) && parsed.every((item) => channelEntrySchema.safeParse(item).success);
-        } catch {
-          return false;
-        }
-      }, "Use a JSON array of {channel, project} entries."),
-    },
-  } as const;
+  return {} as const;
 }
+
+/**
+ * The settings the plugin used before the token and the map moved to kv.
+ * Declared only by the one-time migration, which reads them and clears the
+ * token; the plugin declares no settings otherwise. Exported so the migration
+ * test can read the values back after the migration.
+ */
+export const legacySettingDescriptors = {
+  token: {
+    type: "string",
+    secret: true,
+    label: "Slack sign-in token",
+    description: "Filled in by Sign in with Slack; it proves who you are and reads the channel list you can see. Do not edit or paste by hand.",
+  },
+  project: {
+    type: "string",
+    label: "Project",
+    description: "Which bb project a Slack conversation starts its thread in when the channel map has no entry.",
+  },
+  channels: {
+    type: "string",
+    label: "Channel map",
+    description: 'A JSON array of {"channel":"C…","project":"name"} entries.',
+    experimental_multiline: true,
+    default: "[]",
+  },
+} as const;
 
 /** One channel the settings picker can show. */
 const channelOptionSchema = z.object({
@@ -106,7 +122,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       signedIn: z.boolean(),
       user: z.object({ id: z.string(), name: z.string() }).nullable(),
-      project: z.object({ id: z.string(), name: z.string() }).nullable(),
+      fallback: z.string(),
       projects: z.array(z.object({ id: z.string(), name: z.string(), kind: z.string() })),
       channels: z.array(channelEntrySchema),
       hooks: z.object({ configured: z.boolean(), connected: z.boolean(), state: z.string() }),
@@ -122,14 +138,9 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ ok: z.boolean() }),
   },
-  /** Choose the project a Slack conversation starts its bb thread in. */
-  setProject: {
-    input: z.object({ projectId: z.string().min(1) }),
-    output: z.object({ ok: z.boolean() }),
-  },
-  /** Replace the channel → project map. */
-  setChannels: {
-    input: z.object({ entries: z.array(channelEntrySchema).max(200) }),
+  /** Replace the routing map. The fallback is required; the editor refuses to save without one. */
+  setMap: {
+    input: z.object({ fallback: z.string().trim().min(1).max(200), channels: z.array(channelEntrySchema).max(200) }),
     output: z.object({ ok: z.boolean() }),
   },
   /**
@@ -178,9 +189,26 @@ type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["e
 
 export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => Promise<void> {
   return async (bb) => {
-    const settings = bb.settings.define(settingDescriptors(deps.env));
+    bb.settings.define(settingDescriptors(deps.env));
     const hooksUrl = deps.env[HOOKS_URL_ENV]?.trim() ?? "";
     const checkSignal = () => AbortSignal.timeout(30_000);
+
+    // One-time move of the sign-in token and the routing map out of settings
+    // and into kv. Idempotent: the marker means a later start does nothing. The
+    // old descriptors are declared only here, so the token can be read and
+    // cleared through the settings API; the plugin declares none otherwise.
+    if ((await bb.storage.kv.get(MIGRATION_KEY)) === undefined) {
+      const legacy = bb.settings.define(legacySettingDescriptors);
+      const old = await legacy.get();
+      const oldToken = (old.token ?? "").trim();
+      if (oldToken !== "") await bb.storage.kv.set(TOKEN_KEY, oldToken);
+      await bb.storage.kv.set(CHANNEL_MAP_KEY, channelMapFromLegacy(parseLegacyChannelEntries(old.channels), old.project));
+      // Clear only the token: the old project and channels settings stay, so a
+      // rollback to the previous build finds them (and asks for sign-in again).
+      await legacy.experimental_set({ token: null });
+      await bb.storage.kv.set(MIGRATION_KEY, true);
+      bb.log.info("moved the Slack sign-in token and channel map from settings to plugin storage");
+    }
 
     // The developer's own Slack channel list, called with the stored user
     // token and cached per server. The token is never logged.
@@ -286,7 +314,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- identity ----------------------------------------------------------
     //
     // The token is the developer's own "Sign in with Slack" token and lives in
-    // a secret setting. The name bb-gate-hooks answered with is in kv, for the
+    // plugin storage. The name bb-gate-hooks answered with is in kv, for the
     // settings page; it is never the token.
 
     const parsedIdentity = identityRecord.safeParse(await bb.storage.kv.get(IDENTITY_KEY));
@@ -312,8 +340,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * while the old identify was in flight), it is left alone.
      */
     async function forgetSignin(reason: string, refused?: string): Promise<void> {
-      if (refused !== undefined && ((await settings.get()).token ?? "").trim() !== refused) return;
-      await settings.experimental_set({ token: null });
+      if (refused !== undefined && ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim() !== refused) return;
+      await bb.storage.kv.delete(TOKEN_KEY);
       cachedToken = "";
       identity = null;
       await bb.storage.kv.delete(IDENTITY_KEY);
@@ -335,9 +363,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       }
     }
 
-    async function targetProject(event: SessionEvent, record: SessionRecord): Promise<Project | null> {
-      const cfg = await settings.get();
-      return chooseConversationProject(await projects(), parseChannelMap(cfg.channels), cfg.project ?? "", event.channel, record.contextChannel, !event.mention);
+    async function targetProject(event: SessionEvent): Promise<Project | null> {
+      const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
+      return chooseConversationProject(await projects(), map, event.channel, event.mention);
     }
 
     /**
@@ -375,8 +403,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- the hooks stream --------------------------------------------------
 
     // The cached sign-in token, so the stream's identify can answer without an
-    // await. Kept in step with the setting.
-    let cachedToken = ((await settings.get()).token ?? "").trim();
+    // await. Read once here and updated by the explicit writes (sign-in,
+    // sign-out, a refused token).
+    let cachedToken = ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim();
 
     const hooks = createHooksLoop({
       fetch: deps.fetch,
@@ -384,21 +413,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       now: deps.now,
       log: bb.log,
       identity: () => {
-        // The loop calls this synchronously on a hello, before settings can be
-        // awaited; the cached token is kept in step by the settings listener.
+        // The loop calls this synchronously on a hello, before storage can be
+        // awaited; the cached token is kept in step by the explicit writes
+        // (sign-in, sign-out, a refused token).
         return cachedToken;
       },
       onSession: (event) => onSession(event),
       onIdentified: (who) => rememberIdentity(who),
       onHello: () => void prunePending(),
       onTokenRefused: (token) => void forgetSignin("bb-gate-hooks refused the sign-in token", token),
-    });
-
-    settings.onChange((next, prev) => {
-      const before = (prev.token ?? "").trim();
-      const after = (next.token ?? "").trim();
-      cachedToken = after;
-      if ((before === "") !== (after === "")) announceConnection(after !== "");
     });
 
     // ---- posting back ------------------------------------------------------
@@ -531,7 +554,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     /** Start the bb thread for a conversation, or answer with the reason it cannot. */
     async function spawnThread(event: SessionEvent, text: string, title: string, handedAt: number, record: SessionRecord): Promise<void> {
-      const project = await targetProject(event, record);
+      const project = await targetProject(event);
       if (project === null) {
         await backstop(event.session, "No bb project is available on this server, so a Slack thread cannot be started. Create a project in bb, then DM again.");
         return;
@@ -550,22 +573,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * thread; a follow-up is sent to the same one. Words from anyone but the
      * owner never run a turn: they are held until the owner confirms one by id.
      * A context change carries no words and needs no reply: it keeps the
-     * conversation mapped, remembers the channel the user was viewing, and runs
-     * no turn, so it never trips the backstop.
+     * conversation mapped and runs no turn, so it never trips the backstop.
      */
     async function handleSession(event: SessionEvent): Promise<void> {
       const previous = sessions.get(event.session);
       const needsReply = event.action !== "assistant_thread_context_changed";
-      const contextChannel =
-        event.action === "assistant_thread_context_changed" && event.contextChannel !== ""
-          ? event.contextChannel
-          : (previous?.contextChannel ?? null);
       const record: SessionRecord = {
         channel: event.channel,
         thread: event.thread,
         threadId: previous?.threadId ?? null,
         projectId: previous?.projectId ?? null,
-        contextChannel,
         eventAt: deps.now(),
         events: (previous?.events ?? 0) + (needsReply ? 1 : 0),
         answered: previous?.answered ?? 0,
@@ -575,7 +592,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       sessions.set(event.session, record);
       await saveSessions();
       if (!needsReply) {
-        bb.log.info(`Slack session ${event.session} context changed to ${contextChannel ?? "(none)"}; nothing to answer`);
+        bb.log.info(`Slack session ${event.session} context changed; nothing to answer`);
         return;
       }
       bb.log.info(`Slack session ${event.session} (${event.action}) from ${isFromOwner(event) ? "the owner" : "someone else"}; handing it to a bb thread`);
@@ -704,15 +721,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // ---- the settings and sign-in surface ----------------------------------
 
     async function status() {
-      const cfg = await settings.get();
+      const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
+      const token = ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim();
       const all = await projects();
-      const chosen = chooseProject(all, cfg.project ?? "");
       return {
-        signedIn: (cfg.token ?? "").trim() !== "",
+        signedIn: token !== "",
         user: identity === null ? null : { id: identity.id, name: identity.name },
-        project: chosen === null ? null : { id: chosen.id, name: chosen.name },
+        fallback: map.fallback,
         projects: all,
-        channels: parseChannelMap(cfg.channels),
+        channels: map.channels,
         hooks: { configured: hooksUrl !== "", connected: hooks.connected, state: hooks.state().state },
       };
     }
@@ -736,15 +753,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await forgetSignin("the developer signed out");
         return { ok: true };
       },
-      async setProject({ projectId }) {
-        const all = await projects();
-        const found = all.find((p) => p.id === projectId);
-        if (found === undefined) throw new Error(`No bb project ${JSON.stringify(projectId)} on this server.`);
-        await settings.experimental_set({ project: found.id });
-        return { ok: true };
-      },
-      async setChannels({ entries }) {
-        await settings.experimental_set({ channels: JSON.stringify(entries) });
+      async setMap({ fallback, channels }) {
+        await bb.storage.kv.set(CHANNEL_MAP_KEY, { fallback, channels } satisfies ChannelMap);
         return { ok: true };
       },
     });
@@ -757,8 +767,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * so the picker flags nothing rather than flagging every channel.
      */
     async function channelSearch(query: string) {
-      const cfg = await settings.get();
-      const token = (cfg.token ?? "").trim();
+      const token = ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim();
       if (token === "") return { state: "signin-required" as const, channels: [], botChannels: null, truncated: false };
       let list: SlackChannelList;
       try {
@@ -811,7 +820,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (code === "") return resultPage("Not signed in", "Slack sent no code. Start again from bb's settings.", 400);
         try {
           const { token } = await hooks.signinExchange(pending.connection, state, code, checkSignal());
-          await settings.experimental_set({ token });
+          await bb.storage.kv.set(TOKEN_KEY, token);
           cachedToken = token;
           // Prove it right away so the settings page can say who.
           await hooks.reidentify();

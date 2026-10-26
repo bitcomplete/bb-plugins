@@ -21,7 +21,7 @@ on the pod.
   `/api/v1/plugins/slack/http/signin/callback`; the router's tsjwt sends it to
   the browser owner's own server. The plugin asks bb-gate-hooks to exchange
   the code (the client secret never leaves the service), stores the returned
-  user token in a secret setting, and presents it at `POST /v1/identify`. The
+  user token in plugin storage, and presents it at `POST /v1/identify`. The
   service reads the token's own Slack user and binds it to this server's
   stream. The token also carries the user scopes `channels:read` and
   `groups:read`, so the settings page can list the channels *this developer*
@@ -41,30 +41,40 @@ on the pod.
 
 ## Settings
 
-| Setting | What it is |
+The plugin declares no bb settings: the Slack section under
+Settings → Plugins → Slack manages everything, and the sign-in token and the
+routing map live in the plugin's own storage (`bb.storage.kv`), not in the
+settings table. The token is never sent to the settings page or the status RPC.
+
+| In the Slack section | What it is |
 |---|---|
-| Slack sign-in token | Filled in by Sign in with Slack. A secret; do not edit or paste by hand. |
-| Project | The bb project a Slack conversation starts its thread in when the channel map has no entry for it. Empty uses the personal project, or the first project when this server has none. |
-| Channel map | A JSON array of `{"channel":"C…","project":"name"}` entries. A channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry; the reserved key `dm` is a direct message with the app. A channel or DM with no entry uses the Project above. The settings page edits the same map as a list: the channel box is a typeahead over the channels the signed-in developer can see, showing `#name` and a lock for a private channel, and storing the id. A pasted `C…`/`G…` id and `dm` are still accepted. A channel the app's bot is not a member of is flagged "bb is not in this channel yet; invite it". |
+| Sign in with Slack / Sign out | The developer's own Slack sign-in. The token it returns proves who they are and reads the channel list they can see. |
+| Routing map | A pinned first row, **Everything else**, then a row per channel. A mention in a mapped channel starts its thread in that channel's project; everything else, DMs included, starts in the project on the first row. The channel is a Slack channel id (`C…`/`G…`), never a name, so renaming a channel does not move its entry. The editor refuses to save without a fallback. A fallback or row naming a project this server does not have is skipped at run time — the conversation falls to the personal project, or the first one — and the page warns beside the row, since one map is meant to work on every server. |
 
 The channel typeahead calls Slack's `conversations.list` directly with the
 stored user token, paginated and cached in memory for a few minutes per
 server; filtering by name is local. A still-valid OpenID token from a sign-in
 before this change cannot list channels, so the picker says "Sign in again to
-search channels" and falls back to the id box.
-
-A DM typed while the assistant pane is showing a mapped channel uses that
-channel's project: the plugin remembers the latest
-`assistant_thread_context_changed` channel per DM conversation and consults it
-before the `dm` entry. Context is read only when a thread is started; an
-existing Slack thread keeps its bb thread.
+search channels" and falls back to the id box. A channel the app's bot is not a
+member of is flagged "bb is not in this channel yet; invite it".
 
 Words from anyone but the owner never run a turn. A channel mention by someone
 else is held under a short id and the owner releases it by mentioning the app
 with `confirm <id>`; only then does the text reach a bb thread.
 
-**Sign out** forgets the token and reconnects the stream, so the service drops
-the identity bound to the old connection.
+**Sign out** deletes the token from plugin storage and reconnects the stream,
+so the service drops the identity bound to the old connection.
+
+### Upgrade
+
+The first start after this version moves the old `token`, `project` and
+`channels` settings into plugin storage. The old `channels` array becomes the
+map's channel rows, and the fallback is the old `dm` entry if there was one,
+else the old `project` setting; when both existed and differed, `dm` won. The
+old `dm` entry is dropped from the rows. Only the old token setting is cleared;
+the old `project` and `channels` settings are left in place, so rolling back to
+the previous version asks the developer to sign in again and then applies the
+old project and channels settings.
 
 ## By hand (a Slack admin)
 

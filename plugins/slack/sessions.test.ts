@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  channelMapFromLegacy,
   channelProject,
   chooseConversationProject,
   conversationOf,
@@ -7,9 +8,11 @@ import {
   isUntrusted,
   parseChannelMap,
   parseConfirm,
+  parseLegacyChannelEntries,
   SESSION_TEXT_CHARS,
   sessionsSchema,
   wakeText,
+  type ChannelMap,
   type ChannelEntry,
   type Project,
 } from "./sessions.js";
@@ -103,61 +106,80 @@ describe("wakeText", () => {
 });
 
 describe("sessionsSchema", () => {
-  it("fills the title and context defaults and tolerates junk", () => {
+  it("fills the title default and tolerates junk", () => {
     const parsed = sessionsSchema.parse({ a: { channel: "D1", thread: "1", threadId: "thr-1", projectId: "prj-1", eventAt: 1, events: 2, answered: 1, handedAt: 1 } });
     expect(parsed.a?.title).toBeNull();
-    expect(parsed.a?.contextChannel).toBeNull();
     expect(sessionsSchema.parse("nonsense")).toEqual({});
   });
 });
 
-describe("the channel map", () => {
-  const entries: ChannelEntry[] = [
-    { channel: "C0123", project: "Project One" },
-    { channel: "dm", project: "Personal" },
-  ];
+describe("the routing map", () => {
+  const map: ChannelMap = { fallback: "Personal", channels: [{ channel: "C0123", project: "Project One" }] };
 
   it("keys by channel id, so a rename does not move it", () => {
-    expect(channelProject(entries, "C0123")).toBe("Project One");
+    expect(channelProject(map.channels, "C0123")).toBe("Project One");
     // A name never matches: the map is keyed by id, not by the channel's name.
-    expect(channelProject(entries, "hiringloop")).toBeNull();
-    expect(channelProject(entries, "renamed-channel")).toBeNull();
+    expect(channelProject(map.channels, "hiringloop")).toBeNull();
+    expect(channelProject(map.channels, "renamed-channel")).toBeNull();
   });
 
-  it("matches the reserved dm key case-insensitively", () => {
-    expect(channelProject(entries, "dm")).toBe("Personal");
-    expect(channelProject([{ channel: "DM", project: "Project One" }], "dm")).toBe("Project One");
+  it("parses a stored map, and junk becomes the empty map", () => {
+    expect(parseChannelMap({ fallback: "P", channels: [{ channel: "C1", project: "P" }] })).toEqual({ fallback: "P", channels: [{ channel: "C1", project: "P" }] });
+    expect(parseChannelMap({ fallback: "P", channels: [{ channel: "C1" }, "x"] })).toEqual({ fallback: "P", channels: [] });
+    expect(parseChannelMap("nonsense")).toEqual({ fallback: "", channels: [] });
+    expect(parseChannelMap(undefined)).toEqual({ fallback: "", channels: [] });
   });
 
-  it("drops junk rather than failing a wake", () => {
-    expect(parseChannelMap("not json")).toEqual([]);
-    expect(parseChannelMap(JSON.stringify([{ channel: "C1" }, { channel: "C2", project: "P" }, "x"]))).toEqual([{ channel: "C2", project: "P" }]);
-    expect(parseChannelMap("")).toEqual([]);
+  it("uses the channel entry for a mention, else the fallback", () => {
+    // The conversation's own channel wins for a mention.
+    expect(chooseConversationProject(PROJECTS, map, "C0123", true)?.id).toBe("prj-1");
+    // An unmapped channel uses the fallback.
+    expect(chooseConversationProject(PROJECTS, map, "C9999", true)?.id).toBe("prj-p");
+    // A DM ignores the map's channel ids and uses the fallback.
+    expect(chooseConversationProject(PROJECTS, map, "D0123", false)?.id).toBe("prj-p");
+    expect(chooseConversationProject(PROJECTS, { fallback: "Project One", channels: [] }, "D0123", false)?.id).toBe("prj-1");
   });
 
-  it("chooses by channel id, then context, then dm, then the default", () => {
-    // The conversation's own channel wins.
-    expect(chooseConversationProject(PROJECTS, entries, "", "C0123", "C0456", false)?.id).toBe("prj-1");
-    // A DM with a remembered context channel uses that channel's project.
-    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", "C0123", true)?.id).toBe("prj-1");
-    // No context: the dm entry.
-    expect(chooseConversationProject(PROJECTS, entries, "", "D0123", null, true)?.id).toBe("prj-p");
-    // Nothing mapped: the default.
-    expect(chooseConversationProject(PROJECTS, entries.slice(0, 1), "Project One", "D9999", null, true)?.id).toBe("prj-1");
+  it("skips an entry or fallback naming a project this server lacks, matching names ignoring case", () => {
+    expect(chooseConversationProject(PROJECTS, { fallback: "Nope", channels: [{ channel: "C0123", project: "Nope" }] }, "C0123", true)?.id).toBe("prj-p");
+    expect(chooseConversationProject(PROJECTS, { fallback: "project one", channels: [] }, "D1", false)?.id).toBe("prj-1");
   });
 
-  it("never uses the dm entry for a channel, so an unmapped channel uses the default", () => {
-    const dmOnly: ChannelEntry[] = [{ channel: "dm", project: "Personal" }];
-    expect(chooseConversationProject(PROJECTS, dmOnly, "Project One", "C9999", null, false)?.id).toBe("prj-1");
+  it("with no fallback is exactly the personal-or-first rule", () => {
+    expect(chooseConversationProject(PROJECTS, { fallback: "", channels: [] }, "D0123", false)?.id).toBe("prj-p");
+    expect(chooseConversationProject(PROJECTS, { fallback: "", channels: [] }, "C0123", true)?.id).toBe("prj-p");
+  });
+});
+
+describe("the migration from the old settings", () => {
+  it("parses the old channels JSON and drops junk", () => {
+    expect(parseLegacyChannelEntries(JSON.stringify([{ channel: "C1" }, { channel: "C2", project: "P" }, "x"]))).toEqual([{ channel: "C2", project: "P" }]);
+    expect(parseLegacyChannelEntries("not json")).toEqual([]);
+    expect(parseLegacyChannelEntries("")).toEqual([]);
   });
 
-  it("skips an entry naming a project this server lacks, and matches names ignoring case", () => {
-    const missing: ChannelEntry[] = [{ channel: "C0123", project: "Nope" }, { channel: "dm", project: "project one" }];
-    expect(chooseConversationProject(PROJECTS, missing, "", "D0123", null, true)?.id).toBe("prj-1");
+  it("makes the old dm entry the fallback and drops it from the channels", () => {
+    const entries: ChannelEntry[] = [
+      { channel: "C0123", project: "Project One" },
+      { channel: "DM", project: "Personal" },
+    ];
+    expect(channelMapFromLegacy(entries, "Project One")).toEqual({ fallback: "Personal", channels: [{ channel: "C0123", project: "Project One" }] });
   });
 
-  it("with an empty map is exactly the old default", () => {
-    expect(chooseConversationProject(PROJECTS, [], "", "D0123", null, true)?.id).toBe("prj-p");
+  it("falls back to the old project setting when there was no dm entry", () => {
+    expect(channelMapFromLegacy([{ channel: "C0123", project: "Project One" }], "Personal")).toEqual({
+      fallback: "Personal",
+      channels: [{ channel: "C0123", project: "Project One" }],
+    });
+  });
+
+  it("leaves the fallback unset when neither existed", () => {
+    expect(channelMapFromLegacy([], undefined)).toEqual({ fallback: "", channels: [] });
+    expect(channelMapFromLegacy([], "")).toEqual({ fallback: "", channels: [] });
+  });
+
+  it("lets dm win when it and the project setting differ", () => {
+    expect(channelMapFromLegacy([{ channel: "dm", project: "Project One" }], "Personal").fallback).toBe("Project One");
   });
 });
 

@@ -16,8 +16,10 @@ who sent them. A channel mention by someone other than the server's owner is
 held: no turn runs, and the plugin posts one reply asking the owner to
 `confirm <id>`. Only the owner's mention that names the id releases the held
 text into a thread. Which bb project a conversation starts in is chosen from
-the channel map (Settings → Plugins → Slack), then the channel the assistant
-pane was showing, then the `dm` entry, then the Project setting.
+the routing map (Settings → Plugins → Slack): a mention in a mapped channel
+uses that channel's project; everything else, DMs included, uses the fallback.
+The sign-in token and the map live in the plugin's own storage, not in bb's
+settings table.
 
 ## Replying
 
@@ -52,7 +54,7 @@ reply per Slack message:
   the server has no `BB_HOOKS_URL`. Try again, or ask the developer to check
   Settings → Plugins → Slack.
 - Settings → Plugins → Slack shows the connection as "Signed in as …" and the
-  channel map. Sign out forgets the token; sign in again with Sign in with
+  routing map. Sign out forgets the token; sign in again with Sign in with
   Slack.
 - "confirm r-…": a mention from anyone but the owner does not run a turn. The
   plugin replies with the id to confirm; the owner mentions the app with
