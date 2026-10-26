@@ -65,6 +65,7 @@ const STEP_TITLES: Record<keyof Status["steps"], string> = {
   github: "GitHub",
   devbox: "devbox",
   linear: "Linear",
+  figma: "Figma",
   machine: "a machine",
 };
 
@@ -147,6 +148,10 @@ interface CodexFlow {
   expiresAt: number;
   intervalMs: number;
 }
+interface FigmaFlow {
+  url: string;
+  port: number;
+}
 
 function Checklist({ compact }: { compact: boolean }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -158,6 +163,9 @@ function Checklist({ compact }: { compact: boolean }) {
   const [pasted, setPasted] = useState("");
   const [codex, setCodex] = useState<CodexFlow | null>(null);
   const [codexError, setCodexError] = useState<string | null>(null);
+  const [figma, setFigma] = useState<FigmaFlow | null>(null);
+  const [figmaPasted, setFigmaPasted] = useState("");
+  const [figmaError, setFigmaError] = useState<string | null>(null);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -183,7 +191,8 @@ function Checklist({ compact }: { compact: boolean }) {
 
   const complete = status?.complete ?? false;
   const githubPending = status?.github.pending !== null && status?.github.pending !== undefined;
-  useVisiblePolling(refetch, status !== null && !complete, githubPending ? PENDING_POLL_MS : IDLE_POLL_MS);
+  const figmaPending = status?.figma.pending ?? false;
+  useVisiblePolling(refetch, status !== null && !complete, githubPending || figmaPending ? PENDING_POLL_MS : IDLE_POLL_MS);
 
   // Codex: Account Pool holds the device-flow session; this page polls it.
   useEffect(() => {
@@ -235,7 +244,7 @@ function Checklist({ compact }: { compact: boolean }) {
     return <p className="text-sm text-muted-foreground">{error ?? "Checking…"}</p>;
   }
 
-  const { ai, github, devbox, linear, machines, steps } = status;
+  const { ai, github, devbox, linear, machines, steps, figma: figmaStatus } = status;
 
   if (compact && !complete) return <Remaining steps={steps} />;
 
@@ -250,6 +259,7 @@ function Checklist({ compact }: { compact: boolean }) {
         {github.login !== null ? `GitHub as ${github.login}; ` : steps.github === "done" ? "GitHub; " : ""}
         {devbox.project !== null ? `devbox project ${devbox.project}; ` : steps.devbox === "done" ? "devbox; " : ""}
         {linear.user !== null ? `Linear as ${linear.user}; ` : steps.linear === "done" ? "Linear; " : ""}
+        {steps.figma === "done" ? "Figma; " : ""}
         {machines.names.length === 1 ? "1 machine" : `${machines.names.length} machines`}.{" "}
         <SettingsLink pluginId="team-setup">Details</SettingsLink>
       </p>
@@ -257,6 +267,7 @@ function Checklist({ compact }: { compact: boolean }) {
   }
 
   const enabledAccounts = ai.accounts.filter((a) => a.enabled);
+  const figmaUrl = figma?.url ?? figmaStatus.url;
 
   return (
     <div className="flex flex-col gap-4 text-sm">
@@ -474,6 +485,92 @@ function Checklist({ compact }: { compact: boolean }) {
               here. Skip it if you do not use Linear.
             </p>
           )}
+        </Step>
+
+        <Step
+          state={steps.figma}
+          title="Figma (optional)"
+          action={
+            figmaStatus.available && !figmaStatus.authenticated && !figmaStatus.pending ? (
+              <Button size="sm" variant={steps.figma === "todo" ? "default" : "outline"} disabled={busy !== null} onClick={() => void run("figma", async () => {
+                const s = await rpc.call("figmaSignIn");
+                setFigmaPasted("");
+                setFigmaError(null);
+                setFigma(s);
+                open(s.url);
+              })}>
+                Connect Figma
+              </Button>
+            ) : null
+          }
+        >
+          {!figmaStatus.available ? (
+            <p>{figmaStatus.message ?? "Figma is unavailable."}</p>
+          ) : figmaStatus.authenticated ? (
+            <p>Signed in on {figmaStatus.machine}. Claude Code threads on that machine can use Figma's remote MCP server.</p>
+          ) : figmaStatus.pending ? (
+            <p>Sign-in started. Approve it in the browser, then paste the address the browser lands on.</p>
+          ) : figmaStatus.configured ? (
+            <p>Figma is configured on {figmaStatus.machine}, but Claude Code is not signed in to it yet. Finish the sign-in to use it.</p>
+          ) : (
+            <p>Give Claude Code design context from a Figma link. Figma's remote MCP server signs in with your browser; skip this if you do not use Figma.</p>
+          )}
+          {figmaStatus.available && figmaStatus.message !== null ? <p className="text-muted-foreground">{figmaStatus.message}</p> : null}
+          {figmaStatus.pending || figma !== null ? (
+            <form
+              className="flex flex-col gap-2 rounded-lg border border-border p-3"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (figmaPasted.trim() === "") return;
+                void run("figma-complete", async () => {
+                  const result = await rpc.call("figmaComplete", { url: figmaPasted.trim() });
+                  if (!result.ok) {
+                    setFigmaError(result.message ?? "The sign-in did not complete.");
+                    return;
+                  }
+                  setFigma(null);
+                  setFigmaPasted("");
+                  setFigmaError(null);
+                  refetch();
+                });
+              }}
+            >
+              <p className="text-foreground">
+                Open the URL, approve the sign-in, then paste the <code>http://localhost:…/callback</code> address from the page it
+                lands on. The page itself will not load; only the address is needed.
+              </p>
+              <div className="flex items-center gap-2">
+                <Button type="button" size="sm" variant="outline" disabled={figmaUrl === null} onClick={() => figmaUrl !== null && open(figmaUrl)}>
+                  Open Figma again
+                </Button>
+                <input
+                  className="h-8 flex-1 rounded-md border border-border bg-transparent px-2 text-sm text-foreground"
+                  aria-label="Figma callback URL"
+                  placeholder="Paste the http://localhost:.../callback address"
+                  value={figmaPasted}
+                  onChange={(e) => setFigmaPasted(e.target.value)}
+                />
+                <Button size="sm" type="submit" disabled={busy !== null || figmaPasted.trim() === ""}>
+                  Finish
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void run("figma-cancel", async () => {
+                    await rpc.call("figmaCancel");
+                    setFigma(null);
+                    setFigmaPasted("");
+                    setFigmaError(null);
+                    refetch();
+                  })}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </form>
+          ) : null}
+          {figmaError !== null ? <p className="text-destructive">{figmaError}</p> : null}
         </Step>
 
         <Step state={steps.machine} title="A machine">

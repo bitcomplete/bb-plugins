@@ -4,8 +4,8 @@
   "type": "module",
   "description": "First-run checklist for a bb-gate server: Claude or Codex, GitHub, devbox, first machine",
   "engines": {
-    "bb": ">=0.45",
-    "bbPluginSdk": ">=0.6.15"
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
   },
   "bb": {
     "name": "Team setup",
@@ -14,6 +14,7 @@
       "icon": "ListTodo"
     },
     "server": "./server.ts",
+    "host": "./host.ts",
     "app": "./app.tsx"
   },
   "keywords": [

@@ -27,6 +27,7 @@ import {
   type GhProcess,
   type GhRunner,
 } from "./gh.js";
+import { figmaHostContract, type FigmaHostState } from "./figma-contract.js";
 
 export const ACCOUNT_POOL_ID = "account-pool";
 export const DEVBOX_ID = "devbox-provider";
@@ -50,6 +51,15 @@ const PROMPT_TIMEOUT_MS = 20_000;
 const GH_TIMEOUT_MS = 15_000;
 const IDENTITY_TTL_MS = 60_000;
 
+// The Figma step reads its state from Claude Code on the machine, and that
+// check may connect to Figma to answer. Bound the call and cache the answer so
+// a ten-second status poll does not repeat it.
+const FIGMA_STATE_TTL_MS = 60_000;
+const FIGMA_STATE_TIMEOUT_MS = 15_000;
+const FIGMA_START_TIMEOUT_MS = 90_000;
+const FIGMA_COMPLETE_TIMEOUT_MS = 60_000;
+const FIGMA_CANCEL_TIMEOUT_MS = 10_000;
+
 // "optional" is a step the developer may do but does not have to; like
 // "unavailable" it never blocks completion.
 const stepStateSchema = z.enum(["done", "todo", "optional", "unavailable"]);
@@ -66,6 +76,16 @@ const accountRowSchema = z.object({
 
 const githubStatusSchema = z.enum(["logged in", "not logged in", "overridden", "disabled", "unknown"]);
 const pendingLoginSchema = z.object({ code: z.string(), url: z.string(), expiresAt: z.number() });
+const figmaStatusSchema = z.object({
+  available: z.boolean(),
+  message: z.string().nullable(),
+  machine: z.string().nullable(),
+  claude: z.boolean(),
+  configured: z.boolean(),
+  authenticated: z.boolean(),
+  pending: z.boolean(),
+  url: z.string().nullable(),
+});
 
 export const rpcContract = defineRpcContract({
   status: {
@@ -101,7 +121,8 @@ export const rpcContract = defineRpcContract({
         organization: z.string().nullable(),
       }),
       machines: z.object({ names: z.array(z.string()) }),
-      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, machine: stepStateSchema }),
+      figma: figmaStatusSchema,
+      steps: z.object({ ai: stepStateSchema, github: stepStateSchema, devbox: stepStateSchema, linear: stepStateSchema, figma: stepStateSchema, machine: stepStateSchema }),
       complete: z.boolean(),
     }),
   },
@@ -111,6 +132,15 @@ export const rpcContract = defineRpcContract({
   githubSignIn: { input: z.null(), output: pendingLoginSchema },
   githubCancel: { input: z.null(), output: z.object({ ok: z.boolean() }) },
   githubSignOut: { input: z.null(), output: z.object({ ok: z.boolean() }) },
+  // Figma: Claude Code's OAuth on the machine. The step shows the
+  // authorization URL, the developer pastes the dead localhost callback back,
+  // and the plugin replays it against Claude Code's own loopback listener.
+  figmaSignIn: { input: z.null(), output: z.object({ url: z.string(), port: z.number().int() }) },
+  figmaComplete: {
+    input: z.object({ url: z.string().trim().min(1) }).strict(),
+    output: z.object({ ok: z.boolean(), message: z.string().nullable() }),
+  },
+  figmaCancel: { input: z.null(), output: z.object({ ok: z.boolean() }) },
   // Claude: Account Pool's browser sign-in. Open the URL, paste the code
   // from its final page back here.
   claudeSignIn: { input: z.null(), output: z.object({ sessionId: z.string(), url: z.string() }) },
@@ -379,6 +409,40 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
       });
     }
 
+    // ---- Figma ------------------------------------------------------------
+
+    // The step acts on the machine that runs Claude Code, through this
+    // plugin's own host entry. The state is cached because reading it may
+    // connect to Figma; it is dropped when a sign-in starts or finishes.
+    const figmaHost = bb.hosts.experimental_client({ contract: figmaHostContract });
+    let figmaCache: { hostId: string; at: number; state: FigmaHostState } | null = null;
+    let figmaPending: { hostId: string; url: string; port: number } | null = null;
+
+    async function primaryMachine(): Promise<{ id: string; name: string } | null> {
+      const hosts = await bb.sdk.hosts.list();
+      const connected = hosts.find((host) => host.status === "connected");
+      return connected === undefined ? null : { id: connected.id, name: connected.name };
+    }
+
+    async function machineFigmaState(machine: { id: string; name: string }): Promise<FigmaHostState> {
+      if (figmaCache !== null && figmaCache.hostId === machine.id && deps.now() - figmaCache.at < FIGMA_STATE_TTL_MS) return figmaCache.state;
+      try {
+        const state = await figmaHost.call("state", null, { hostId: machine.id, timeoutMs: FIGMA_STATE_TIMEOUT_MS });
+        if (!state.pending) figmaCache = { hostId: machine.id, at: deps.now(), state };
+        return state;
+      } catch (error) {
+        if (figmaCache !== null && figmaCache.hostId === machine.id) return figmaCache.state;
+        return {
+          claude: true,
+          configured: false,
+          authenticated: false,
+          pending: false,
+          url: null,
+          message: `Could not read the Figma setup on ${machine.name}: ${errorMessage(error)}`,
+        };
+      }
+    }
+
     // ---- the checklist ----------------------------------------------------
 
     bb.rpc.register(rpcContract, {
@@ -389,13 +453,14 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           pluginState(LINEAR_ID),
           githubStatus(),
           bb.sdk.hosts.list().then(
-            (list) => list.map((h) => h.name),
+            (list) => list,
             (error: unknown) => {
               bb.log.warn(`could not list machines: ${errorMessage(error)}`);
-              return [] as string[];
+              return [] as Array<{ id: string; name: string; status: string }>;
             },
           ),
         ]);
+        const machineNames = hosts.map((h) => h.name);
 
         const ai = { ...poolState, routing: { claude: false, codex: false }, accounts: [] as z.infer<typeof accountRowSchema>[] };
         if (poolState.available) {
@@ -436,6 +501,34 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
         }
 
         const aiReady = ai.accounts.some((a) => a.enabled && ai.routing[a.provider]);
+        // The Figma step runs on the machine that runs Claude Code, so it can
+        // only be offered while one is connected and only be acted on while
+        // `claude` is installed there. It is optional until it is configured.
+        const machine = hosts.find((h) => h.status === "connected") ?? null;
+        const figma = {
+          available: machine !== null,
+          message: machine === null ? "No machine is connected." : (null as string | null),
+          machine: machine?.name ?? null,
+          claude: false,
+          configured: false,
+          authenticated: false,
+          pending: figmaPending !== null,
+          url: figmaPending?.url ?? (null as string | null),
+        };
+        if (machine !== null) {
+          const state = await machineFigmaState(machine);
+          figma.claude = state.claude;
+          figma.configured = state.configured;
+          figma.authenticated = state.authenticated;
+          figma.pending = state.pending || figmaPending !== null;
+          figma.url = state.url ?? figmaPending?.url ?? null;
+          if (!state.claude) {
+            figma.available = false;
+            figma.message = state.message ?? `claude is not installed on ${machine.name}.`;
+          } else if (state.message !== null) {
+            figma.message = state.message;
+          }
+        }
         const steps = {
           ai: !ai.available ? "unavailable" : aiReady ? "done" : "todo",
           github:
@@ -449,6 +542,9 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           // cannot connect, and that is not the developer's to-do. Even when
           // it can, Linear is optional: not connecting it is not incomplete.
           linear: !linear.available || !linear.configured ? "unavailable" : linear.connected ? "done" : "optional",
+          // Figma is optional while it is not configured; once it is, or while
+          // a sign-in waits for its callback, finishing it is a to-do.
+          figma: !figma.available ? "unavailable" : figma.authenticated ? "done" : figma.configured || figma.pending ? "todo" : "optional",
           machine: hosts.length > 0 ? "done" : "todo",
         } as const;
         return {
@@ -456,7 +552,8 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           github,
           devbox,
           linear,
-          machines: { names: hosts },
+          machines: { names: machineNames },
+          figma,
           steps,
           complete: Object.values(steps).every((s) => s !== "todo"),
         };
@@ -477,6 +574,40 @@ export function createTeamSetupPlugin(deps: TeamSetupDeps): (bb: BbPluginApi) =>
           throw new Error(tail(result.stderr) || `gh auth logout exited with ${result.exitCode}`);
         }
         bb.realtime.publish(CHANGED, { github: "signed out" });
+        return { ok: true };
+      },
+
+      async figmaSignIn() {
+        const machine = await primaryMachine();
+        if (machine === null) throw new Error("No machine is connected. Create one first.");
+        const started = await figmaHost.call("start", null, { hostId: machine.id, timeoutMs: FIGMA_START_TIMEOUT_MS });
+        figmaPending = { hostId: machine.id, url: started.url, port: started.port };
+        figmaCache = null;
+        bb.realtime.publish(CHANGED, { figma: "started" });
+        return { url: started.url, port: started.port };
+      },
+      async figmaComplete({ url }) {
+        const hostId = figmaPending?.hostId ?? (await primaryMachine())?.id;
+        if (hostId === undefined) throw new Error("No machine is connected.");
+        const result = await figmaHost.call("complete", { url }, { hostId, timeoutMs: FIGMA_COMPLETE_TIMEOUT_MS });
+        if (result.ok) {
+          figmaPending = null;
+          figmaCache = null;
+          bb.realtime.publish(CHANGED, { figma: "signed in" });
+        }
+        return result;
+      },
+      async figmaCancel() {
+        const hostId = figmaPending?.hostId ?? (await primaryMachine())?.id;
+        if (hostId !== undefined) {
+          try {
+            await figmaHost.call("cancel", null, { hostId, timeoutMs: FIGMA_CANCEL_TIMEOUT_MS });
+          } catch (error) {
+            bb.log.warn(`could not cancel the Figma sign-in: ${errorMessage(error)}`);
+          }
+        }
+        figmaPending = null;
+        figmaCache = null;
         return { ok: true };
       },
 
