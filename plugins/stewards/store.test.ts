@@ -298,6 +298,12 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     expect(s.lesson("lsn_merged")).toMatchObject({ tier: "promoted" });
     expect(s.lesson("lsn_dropped")).toMatchObject({ tier: "retired" });
   });
+
+  it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
+    // `bb.storage.migrate` records each statement by index and refuses a changed
+    // one; a group spliced in mid-array would fail every live database on load.
+    expect(MIGRATIONS.slice(-LESSON_TIER_MIGRATIONS.length)).toEqual([...LESSON_TIER_MIGRATIONS]);
+  });
 });
 
 describe("a worker's pending model check", () => {

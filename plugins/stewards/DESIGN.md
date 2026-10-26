@@ -1302,7 +1302,10 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   promoted lesson is the one displaced when a file is at `promoted.maxPerFile`.
   A lesson is `trial` from the moment the project steward records it; the
   nightly pass is what moves it. The thresholds and caps are the whole
-  mechanism — no model judges a tier.
+  mechanism — no model judges a tier. The project steward may still
+  `complete` a trial by hand, which promotes it at once and bypasses
+  `promoted.maxPerFile`; that is an explicit override, and the nightly pass is
+  the mechanical path, not the only one.
 - **The promotion and retirement write only the lesson's own anchored text.**
   A promotion the nightly pass queues is listed under `## Lessons to land`;
   the project steward adds the block (`<!-- lesson:<id> -->` and the wording)
@@ -1316,7 +1319,9 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   lesson can never move a big decision to the project, loosen the
   pull-request gate or relax an approval; the decide list, `bigDecisions` and
   `prGate` are outside a lesson's reach by construction. A boundary-scope
-  lesson still becomes a Merge/Drop item for the user.
+  lesson still becomes a Merge/Drop item for the user. `retireLessonAnchor`
+  in `lessons.ts` is the normative definition of the retirement edit; the
+  project steward makes it by hand and the helper is what the tests pin.
 - **Procedure lessons self-merge.** Playbook procedure, sequencing and
   conventions are what the project steward may already decide. It applies
   the text to the file in its `.bb` checkout, commits, and publishes with
@@ -1365,7 +1370,11 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   project's `.bb`, then push), or let the nightly pass retire it once it is
   uncited for `promoted.retireDays` and remove the anchored block through
   `## Lessons to retire`. The row is kept with `tier: retired` either way. A
-  boundary lesson is undone the same way once the user has merged it.
+  boundary lesson is undone the same way once the user has merged it. A
+  lesson recorded by an image before this step gets the column default
+  `candidate`, and the remap has already run at its own index, so after a
+  roll-forward it is invisible to wakes; `bb stewards lessons --all` still
+  shows it, and re-recording it as a fresh trial is the way back.
 
 ## 21. The sidebar thread list
 

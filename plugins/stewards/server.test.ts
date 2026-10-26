@@ -5260,6 +5260,37 @@ describe("lessons", () => {
     expect(out).toMatchObject({ error: true, text: expect.stringMatching(/retired/u) });
     expect(t.mergeGuidanceCalls).toEqual([]);
   });
+
+  it("drops an aged-out trial that never landed, instead of leaving it pending", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.advance(31 * 86_400_000);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    expect(t.hooks.store.lesson(id)).toMatchObject({ tier: "retired", status: "dropped" });
+    expect(t.mergeGuidanceCalls).toEqual([]);
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).not.toContain("## Lessons to retire");
+  });
+
+  it("validates a supersedes: same project, same file, not already retired", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "The old rule.", file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const olderId = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    // A lesson in another project is never touched.
+    const foreign = t.hooks.store.addLesson({ projectId: "p2", bindingId: null, escalationId: null, file: "AGENTS.md", text: "Foreign rule.", scope: "procedure", branch: null });
+    const foreignAttempt = await t.tool("steward_update", { lesson: { text: "The new rule.", file: "AGENTS.md", scope: "procedure", supersedes: foreign.id } }, t.project);
+    expect(foreignAttempt).toMatchObject({ error: true, text: expect.stringMatching(/No lesson/u) });
+    expect(t.hooks.store.lesson(foreign.id)).toMatchObject({ supersededBy: null });
+    // A different file is refused: a lesson only supersedes one in its own file.
+    const otherFile = await t.tool("steward_update", { lesson: { text: "The new rule.", file: "stewards/linear-tickets.md", scope: "procedure", supersedes: olderId } }, t.project);
+    expect(otherFile).toMatchObject({ error: true, text: expect.stringMatching(/same file/u) });
+    // The valid one records and marks the older lesson.
+    const good = await t.tool("steward_update", { lesson: { text: "The new rule.", file: "AGENTS.md", scope: "procedure", supersedes: olderId } }, t.project);
+    expect(good).toMatchObject({ error: false });
+    expect(t.hooks.store.lesson(olderId)).toMatchObject({ supersededBy: expect.stringMatching(/^lsn_/u) });
+  });
 });
 
 describe("Sentry stewards", () => {

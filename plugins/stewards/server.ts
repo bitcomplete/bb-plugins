@@ -3165,8 +3165,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const transition of transitions) {
         const lesson = store.lesson(transition.id);
         if (lesson === null || lesson.tier === "retired") continue;
-        store.setLessonTier(transition.id, transition.action === "promote" ? "promoted" : "retired");
-        if (transition.action === "retire") store.noteLesson(transition.id, `Retired: ${transition.reason}.`);
+        if (transition.action === "promote") {
+          store.setLessonTier(transition.id, "promoted");
+          continue;
+        }
+        // A retirement of a lesson that never landed resolves the row here:
+        // there is no anchored text to remove, so nothing waits on the project
+        // steward and the row must not linger as pending. One that is in the
+        // file stays `merged` until its text is removed through the wake.
+        if (lesson.status === "pending") store.markLessonDropped(transition.id, `Retired: ${transition.reason}.`);
+        else {
+          store.setLessonTier(transition.id, "retired");
+          store.noteLesson(transition.id, `Retired: ${transition.reason}.`);
+        }
       }
     }
 
@@ -5309,6 +5320,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }
           if (projectOf === null && (input.lesson !== undefined || input.lessonAction !== undefined)) {
             return toolError(new Error("Only the project steward records and completes lessons; a steward escalates with steward_report."));
+          }
+          if (input.lesson?.supersedes !== undefined) {
+            const older = store.lesson(input.lesson.supersedes);
+            if (older === null || older.projectId !== projectOf) return toolError(new Error(`No lesson ${input.lesson.supersedes} in this project to supersede.`));
+            if (older.file !== input.lesson.file) return toolError(new Error(`Lesson ${older.id} is in ${older.file}, not ${input.lesson.file}; a lesson only supersedes one in the same file.`));
+            if (older.tier === "retired") return toolError(new Error(`Lesson ${older.id} is already retired.`));
           }
           if (input.lessonAction !== undefined) {
             const lesson = store.lesson(input.lessonAction.id);
