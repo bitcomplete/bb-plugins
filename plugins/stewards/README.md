@@ -297,9 +297,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   it is a general judgement the playbook should carry, the project steward
   records it as a lesson. A resolve carries `cites: [lesson ids]` — the
   lessons it rested on — and the plugin counts `hits` (once per distinct
-  binding), `corrections` and `lastCitedAt`. `bb stewards lessons [--all]`
-  lists tiers and counts, `bb stewards drop-lesson <id>` drops one. The
-  digest carries nothing about lessons. DESIGN.md §20.
+  binding), `corrections` and `lastCitedAt`. A forwarded escalation the
+  guidance did not settle (one the project steward did not name with `entry`)
+  asks you why on the page, and so does a repeat the nightly pass clusters
+  under one playbook; the box's one-line placeholder says which. It never
+  appears on a `bigDecisions` kind, a credential or a gate item, and one
+  cluster is asked once. An empty box is always accepted, and only the owner's
+  words — the page answer or an unsigned comment — or this project's own
+  steward or worker threads teach. When your answer contradicts the
+  recommendation, the project steward is woken once, in its thread, to ask why.
+  `bb stewards lessons [--all]` lists tiers and counts, `bb stewards
+  drop-lesson <id>` drops one. The digest carries nothing about lessons.
+  DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
@@ -309,8 +318,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   buttons, questions the project steward put to you, which you can answer
   and close there, forwarded escalations and approval requests), what is in
   flight by stage with each status record and running workers, what is stuck
-  or held, what ended in the last two weeks, and the latest digest with its
-  date.
+  or held, what ended in the last two weeks, the latest digest with its date,
+  and one collapsed lessons details block at the bottom (counts by tier, rows
+  behind the disclosure, no buttons of its own).
 - **Questions and asks to you** are escalations with `route: me`, kept in
   the store from the moment the project steward asks
   (`steward_update { ask }`, or forwarding an escalation) until it records

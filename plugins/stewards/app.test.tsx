@@ -34,6 +34,7 @@ type Question = {
   url: string | null;
   escalationId: string | null;
   createdAt: number;
+  rationaleWanted: string | null;
 };
 
 const need = (over: Partial<Need> = {}): Need => ({
@@ -64,6 +65,7 @@ const question = (over: Partial<Question> = {}): Question => ({
   url: null,
   escalationId: null,
   createdAt: 1_000,
+  rationaleWanted: null,
   ...over,
 });
 
@@ -91,6 +93,7 @@ const renderBoard = async (needs: Need[], questions: Question[]): Promise<Render
           withUser: [],
           needs,
           lessons: [],
+          lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
           stewards: [],
           stuck: [],
           ended: [],
@@ -177,6 +180,78 @@ describe("the Stewards page's need links (BB-29)", () => {
     const slot = await renderBoard([need({ kind: "decide", url: ticket, entityUrl: ticket })], []);
     await waitFor(() => expect(slot.getByRole("button", { name: "Answer" })).toBeTruthy());
     expect(slot.queryByRole("button", { name: "Open the pull request" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-35 step 4: the rationale box on an escalation, shown only when the plugin
+// set `rationaleWanted`, and the collapsed lessons details block at the bottom
+// of the project tab.
+describe("the rationale box and lessons block (BB-35 step 4)", () => {
+  const renderBoardWith = async (over: { questions?: Question[]; lessons?: unknown[]; lessonCounts?: unknown }) => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    return renderSlot(panel, { subPath: "" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: [{ projectId: "p1", name: "Acme" }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            paused: false,
+            projectStewardThreadId: null,
+            stages: [],
+            digest: null,
+            questions: over.questions ?? [],
+            withUser: [],
+            needs: [],
+            lessons: over.lessons ?? [],
+            lessonCounts: over.lessonCounts ?? { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+          },
+        }),
+        stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+  };
+
+  it("shows the box only when rationaleWanted is set, with its one-line why", async () => {
+    const none = await renderBoardWith({ questions: [question()] });
+    await waitFor(() => expect(none.getByRole("button", { name: "Answer" })).toBeTruthy());
+    expect(none.queryByLabelText(/^Why:/u)).toBeNull();
+    none.lifecycle.unmount();
+
+    const boxed = await renderBoardWith({ questions: [question({ rationaleWanted: "The guidance did not settle this." })] });
+    const box = (await waitFor(() => boxed.getByLabelText(/^Why:/u))) as HTMLTextAreaElement;
+    expect(box.placeholder).toBe("The guidance did not settle this.");
+    boxed.lifecycle.unmount();
+  });
+
+  it("sends the rationale with the answer, and an empty box is accepted", async () => {
+    const slot = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
+    const box = await waitFor(() => slot.getByLabelText(/^Why:/u));
+    fireEvent.change(box, { target: { value: "Because the plugin owns auth." } });
+    fireEvent.click(slot.getByRole("button", { name: "Answer" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, rationale: "Because the plugin owns auth." } }));
+    slot.lifecycle.unmount();
+
+    const empty = await renderBoardWith({ questions: [question({ rationaleWanted: "Why?" })] });
+    fireEvent.click(await waitFor(() => empty.getByRole("button", { name: "Answer" })));
+    await waitFor(() => expect(empty.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null } }));
+    empty.lifecycle.unmount();
+  });
+
+  it("is a collapsed details block with the tier counts and no action buttons", async () => {
+    const lesson = { id: "lsn_1", bindingId: null, key: null, file: "AGENTS.md", text: "A rule.", scope: "procedure", status: "pending", tier: "trial", hits: 2, corrections: 0, lastCitedAt: null, branch: null, mergeSha: null, note: null, escalationId: null, createdAt: 1_000 };
+    const slot = await renderBoardWith({ lessons: [lesson], lessonCounts: { candidate: 0, trial: 1, promoted: 0, retired: 0 } });
+    await waitFor(() => expect(slot.getByText(/candidate 0 · trial 1 · promoted 0 · retired 0/u)).toBeTruthy());
+    const details = slot.container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(slot.getByText("A rule.")).toBeTruthy();
+    expect(slot.queryByRole("button")).toBeNull();
     slot.lifecycle.unmount();
   });
 });
@@ -502,7 +577,7 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
           calls += 1;
           return {
             projects: [{ projectId: "p1", name: "Acme" }],
-            board: { projectId: "p1", name: "Acme", paused: false, projectStewardThreadId: null, stages: [], digest: null, questions: [], withUser: [], needs: [], lessons: [], stewards: [], stuck: [], ended: [] },
+            board: { projectId: "p1", name: "Acme", paused: false, projectStewardThreadId: null, stages: [], digest: null, questions: [], withUser: [], needs: [], lessons: [], lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 }, stewards: [], stuck: [], ended: [] },
           };
         },
       },

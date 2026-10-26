@@ -982,7 +982,7 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons it rested on with `cites: [lesson ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [lesson ids] }) only when it is one of these big decisions, and say which entry you matched:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons it rested on with `cites: [lesson ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [lesson ids] }) only when it is one of these big decisions, and name the entry you matched with `entry: \"<the entry>\"` so the page knows not to ask why; a routine escalation the guidance did not settle is forwarded without `entry`, and the page asks the user why:",
       "",
       ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
