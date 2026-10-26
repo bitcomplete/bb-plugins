@@ -1484,6 +1484,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function showSteward(b: Binding): Promise<void> {
       if (b.threadId === null) return;
       const info = await threadInfo(b.threadId).catch(() => null);
+      // Already visible: nothing to show and no write to spend. This runs on
+      // every worker registration and turn, so the common case is a no-op. A
+      // lookup that failed is unknown, so the write is still attempted.
+      if (info !== null && info.visibility === "visible") return;
       const wasHidden = info !== null && info.visibility === "hidden";
       await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId: b.threadId!, visibility: "visible" }));
       if (wasHidden) await cascadeVisibility(b, "visible");
@@ -1649,6 +1653,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       store.setSecretRequester(thread.id, need.id);
       store.addWorker(thread.id, b.id, title);
+      // A requester is a worker of the binding: a steward hidden by hideWaiting
+      // comes back so the effort roots at it (BB-64).
+      await showSteward(b);
       bb.log.info(`stewards: started a requester thread for ${b.entityKey}'s ${variable} (${thread.id})`);
       return thread.id;
     }
@@ -3656,6 +3663,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const runaway = store.spawnsSince(owner.id, now() - 3_600_000) >= limit;
       store.addWorker(thread.id, owner.id, thread.title ?? thread.titleFallback ?? thread.id);
       if (!runaway) {
+        // A hidden steward (hideWaiting, "waits on others") comes back when a
+        // worker of its binding starts, so the sidebar roots the effort at it
+        // and the worker is not a bare row under Threads (BB-64).
+        await showSteward(owner);
         await validateWorkerSpawn(thread, owner);
         return;
       }
@@ -3865,10 +3876,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // A worker the waiting cascade hid is shown again once it runs (BB-47).
       if (thread.visibility === "hidden") await quietly(`show running worker ${thread.id}`, () => bb.sdk.threads.update({ threadId: thread.id, visibility: "visible" }));
       if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
+      const owner = store.binding(worker.bindingId);
+      // A hidden steward comes back when a worker of its binding runs again,
+      // so the effort stays rooted at it (BB-64).
+      if (owner !== null && owner.endedAt === null) await showSteward(owner);
       // The first turn is dispatched now, so the spawn's model can be read.
       if (worker.modelCheckPending && worker.status !== "stopped") {
         store.setWorkerModelCheckPending(thread.id, false);
-        const owner = store.binding(worker.bindingId);
         if (owner !== null && owner.endedAt === null) await validateWorkerSpawn(thread, owner);
       }
     });

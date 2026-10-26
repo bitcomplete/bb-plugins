@@ -2250,6 +2250,58 @@ describe("stewards waiting on others", () => {
     expect(t.threads.get(steward)!.visibility).toBe("hidden");
   });
 
+  it("shows a hidden steward when a worker of its binding starts (BB-64)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The steward waits on someone else and its turn ends: hidden.
+    await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+
+    // Its hold lifts and it starts a worker: the steward comes back so the
+    // effort roots at it, not a bare worker row under Threads.
+    await t.created("thr_w1", steward);
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+    expect(t.threads.get("thr_w1")!.visibility).toBe("visible");
+  });
+
+  it("shows a hidden steward when its finished worker runs again (BB-64)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward);
+    await t.idle("thr_w1", "Should I keep the reviewer open?");
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("finished");
+
+    // The steward is hidden (a hold lift with the worker parked), and its
+    // worker is woken again: the steward comes back with it.
+    t.threads.get(steward)!.visibility = "hidden";
+    await t.harness.behavior.emitThreadEvent("thread.active", { thread: makeThreadResponse({ id: "thr_w1" }) });
+    await t.flush();
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("running");
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+  });
+
+  it("leaves a hidden steward with no worker hidden on a wake that needs nobody (BB-64)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.tool("steward_report", { ...waiting, phase: "In Progress" }, steward);
+    await t.idle(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+
+    // A hold-lift wake reaches the steward, but it needs no user and has no
+    // worker in flight, so it stays hidden until it starts one.
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.sends.at(-1)!.threadId).toBe(steward);
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+  });
+
   it("keeps a steward with an open escalation visible", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
