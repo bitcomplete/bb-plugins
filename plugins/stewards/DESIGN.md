@@ -1372,7 +1372,7 @@ its text wraps instead of truncating, so the repository, number and title are
 readable before the click. Every other row's page button is **Details** too: a
 row without choices, or a `provide-secret` item, opens the Stewards page at
 that project, where the free-text answer and the secret form live. The block
-adds no write path of its own.
+adds no write path the page does not already make.
 
 **One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
 })` builds the board's `questions`, `withUser` and `needs` lists in one place;
