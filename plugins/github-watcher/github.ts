@@ -542,3 +542,39 @@ export function parseDependabotAlerts(payload: unknown, repo: string): Dependabo
     updatedAt: a.updated_at ?? null,
   }));
 }
+
+// ---- deployments, for stewards ----------------------------------------------------
+
+/** The REST path for a repository's deployments, newest first, for one environment (BB-59). */
+export const deploymentsPath = (repo: string, environment: string, perPage = 10): string =>
+  `/repos/${repo}/deployments?environment=${encodeURIComponent(environment)}&per_page=${perPage}`;
+
+/** The REST path for one deployment's statuses, newest first. */
+export const deploymentStatusesPath = (repo: string, id: number, perPage = 1): string => `/repos/${repo}/deployments/${id}/statuses?per_page=${perPage}`;
+
+const deploymentNode = z.object({
+  id: z.number(),
+  environment: z.string().nullish(),
+  ref: z.string().nullish(),
+  sha: z.string().nullish(),
+  url: z.string().nullish(),
+});
+
+/**
+ * The deployments GitHub returned, newest first. The list has no `state`;
+ * the latest status of each carries it, read separately.
+ */
+export function parseDeployments(payload: unknown): Array<{ id: number; environment: string; ref: string; sha: string; url: string | null }> {
+  const parsed = z.array(deploymentNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a deployment list");
+  return parsed.data.map((d) => ({ id: d.id, environment: d.environment ?? "", ref: d.ref ?? "", sha: d.sha ?? "", url: d.url ?? null })).sort((a, b) => b.id - a.id);
+}
+
+const deploymentStatusNode = z.object({ state: z.string() });
+
+/** The newest deployment status's state, from `GET .../deployments/{id}/statuses`; "" when none has been reported. */
+export function parseDeploymentStatus(payload: unknown): string {
+  const parsed = z.array(deploymentStatusNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a deployment status list");
+  return parsed.data[0]?.state ?? "";
+}

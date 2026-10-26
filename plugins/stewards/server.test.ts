@@ -26,6 +26,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
+  const sourceDeployments = new Map<string, unknown[]>();
   const rpcCalls: Call[] = [];
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
@@ -87,6 +89,10 @@ function world() {
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
       out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
+    }
+    else if (args.method === "sourceDeployments") {
+      const key = `${String(input.repo).toLowerCase()} ${String(input.environment).toLowerCase()}`;
+      out = { deployments: sourceDeployments.get(key) ?? [], error: null };
     }
     else if (args.method === "mergeGuidance") {
       mergeGuidanceCalls.push(input);
@@ -245,7 +251,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, sourceDeployments, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -5923,5 +5929,60 @@ describe("deployment watching (BB-53)", () => {
     await t.ring("linear", "uuid-12");
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/A merge is awaiting deployment/u);
+  });
+
+  // BB-59: a deployment that already exists confirms the merge on the first
+  // read and on the sweep, so a doorbell missed across a restart (or any
+  // other miss) costs a sweep, not the timeout.
+  it("confirms a merge from a deployment that already exists when the watch is recorded (BB-59)", async () => {
+    const t = await setup();
+    merged(t);
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success", sha: "bbbbbbb2" });
+    const wake = String(t.spawns[1]!.prompt);
+    expect(wake).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
+    expect(wake).toMatch(/### Deployment \(acme\/bb-gate production\)/u);
+    expect(wake).toMatch(/The pinned BB_PLUGINS_REF contains the merge commit\./u);
+  });
+
+  it("picks up a deployment whose doorbell was missed on the sweep (BB-59)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    // The deployment lands, but its doorbell never reaches the server.
+    t.sourceDeployments.set("acme/bb-gate production", [deployment()]);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7 });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+    expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/Deployment 7 \(success\) for acme\/bb-gate production/u);
+  });
+
+  it("wakes nobody when the target has no deployments, and keeps the deadline (BB-59)", async () => {
+    const t = await setup();
+    merged(t);
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "merged" });
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.deadlineAt).not.toBeNull();
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("wakes with the failure when the latest deployment failed (BB-59)", async () => {
+    const t = await setup();
+    merged(t);
+    t.sourceDeployments.set("acme/bb-gate production", [deployment({ state: "failure", url: "https://github.com/acme/bb-gate/actions/runs/12" })]);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "failed", deploymentState: "failure" });
+    const wake = String(t.spawns[1]!.prompt);
+    expect(wake).toMatch(/Deployment 7 \(failure\) for acme\/bb-gate production/u);
+    expect(wake).toMatch(/https:\/\/github.com\/acme\/bb-gate\/actions\/runs\/12/u);
   });
 });

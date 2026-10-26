@@ -70,7 +70,7 @@ import {
   type SessionWake,
   type Source,
 } from "./source-contract.js";
-import { allDeployed, applyDeployment, deploymentLines, deploymentReportSchema, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
+import { allDeployed, applyDeployment, applyDeploymentRead, deploymentLines, deploymentReportSchema, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
@@ -902,6 +902,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         .filter((w) => (w.state === "merged" || w.state === "deploying") && w.deadlineAt !== null)
         .map((w) => w.deadlineAt!);
       return deadlines.length === 0 ? null : Math.min(...deadlines);
+    }
+
+    /**
+     * A deployment target's recent deployments, read through the github
+     * plugin's source contract (BB-59), never `gh` here. Null when the read
+     * failed, so the caller leaves the deadline and timeout path alone.
+     */
+    async function readDeployments(target: DeploymentTarget): Promise<Deployment[] | null> {
+      try {
+        const out = await sourceRpc("github", "sourceDeployments", { repo: target.repo, environment: target.environment, limit: 10 }, sourceContract.sourceDeployments.output);
+        if (out.error !== null) {
+          bb.log.warn(`stewards: could not read deployments for ${target.repo} ${target.environment}: ${out.error}`);
+          return null;
+        }
+        return out.deployments;
+      } catch (error) {
+        bb.log.warn(`stewards: could not read deployments for ${target.repo} ${target.environment}: ${errorMessage(error)}`);
+        return null;
+      }
     }
 
     // ---- the sources ---------------------------------------------------------------------
@@ -1819,6 +1838,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           deploymentChanges.push({ text: `No matching deployment for ${late.join(", ")} within ${formatDuration(deployTarget.timeout)}; check the run: https://github.com/${deployTarget.repo}/actions`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
+        // BB-59: a deployment that already exists confirms a merge whose
+        // doorbell was missed, on the first read and on every sweep. The
+        // github plugin reads it through the source contract; the plugin
+        // never evaluates the playbook's carries rule.
+        if (Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying")) {
+          const read = await readDeployments(deployTarget);
+          if (read !== null) {
+            const applied = applyDeploymentRead(deployments, deployTarget, read, now());
+            if (applied.changed.length > 0 && applied.deployment !== null) {
+              deployments = applied.deployments;
+              b = store.patch(b.id, { deployments });
+              const state = applied.deployment.state === "" ? "created" : applied.deployment.state;
+              b = store.note(b.id, `Deployment ${applied.deployment.id} (${state}) for ${deployTarget.repo} ${deployTarget.environment}${applied.deployment.url === null ? "" : ` — ${applied.deployment.url}`}; the playbook's rule: ${deployTarget.carries}`, false);
+              bb.log.info(`stewards: deployment ${applied.deployment.id} (${state}) on ${deployTarget.repo} ${deployTarget.environment} concerns ${applied.changed.join(", ")} (read)`);
+            }
+          }
+        }
       }
       const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 

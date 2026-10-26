@@ -38,11 +38,22 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden" };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
     const u = String(url);
+    const deployments = /\/repos\/([^/]+)\/([^/]+)\/deployments(?:\?|$)/u.exec(u);
+    if (deployments !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      if (`${deployments[1]}/${deployments[2]}`.toLowerCase() !== "acme/widgets") return Response.json({ message: "Not Found" }, { status: 404 });
+      return Response.json(state.deployments);
+    }
+    const statuses = /\/repos\/([^/]+)\/([^/]+)\/deployments\/(\d+)\/statuses(?:\?|$)/u.exec(u);
+    if (statuses !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      return Response.json(state.deploymentStatuses[Number(statuses[3])] ?? []);
+    }
     const dependabot = /\/repos\/([^/]+)\/([^/]+)\/dependabot\/alerts(?:\?|$)/u.exec(u);
     if (dependabot !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
@@ -562,6 +573,27 @@ describe("stewards' source contract", () => {
     const out = (await w.harness.callRpc("sourceDependabotAlerts", { units: ["Acme/Widgets"], state: "open" }, STEWARDS)) as { alerts: Array<{ id: string }>; errors: string[] };
     expect(out.alerts.map((a) => a.id)).toEqual(["Acme/Widgets#1", "Acme/Widgets#2"]);
     expect(out.errors).toEqual([]);
+  });
+
+  it("reads a repository's deployments for one environment, newest first, each with its latest status (BB-59)", async () => {
+    const w = await setup();
+    w.github.state.deployments = [
+      { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", url: "https://github.com/Acme/Widgets/actions/runs/8" },
+      { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+    ];
+    w.github.state.deploymentStatuses = { 7: [{ state: "success" }], 6: [{ state: "failure" }] };
+    expect(await w.harness.callRpc("sourceDeployments", { repo: "Acme/Widgets", environment: "production", limit: 10 }, STEWARDS)).toEqual({
+      deployments: [
+        { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+        { id: 6, environment: "production", ref: "main", sha: "aaaaaaa1", state: "failure", url: "https://github.com/Acme/Widgets/actions/runs/8" },
+      ],
+      error: null,
+    });
+    // The list is sorted by id, so a limit keeps the newest, whatever order GitHub returned.
+    const limited = (await w.harness.callRpc("sourceDeployments", { repo: "acme/widgets", environment: "production", limit: 1 }, STEWARDS)) as { deployments: Array<{ id: number; state: string }> };
+    expect(limited.deployments).toEqual([expect.objectContaining({ id: 7, state: "success" })]);
+    expect(await w.harness.callRpc("sourceDeployments", { repo: "acme/gone", environment: "production", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: "acme/gone: GitHub answered HTTP 404: Not Found" });
+    expect(await w.harness.callRpc("sourceDeployments", { repo: "widgets", environment: "production", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: "widgets: not owner/repo" });
   });
 
   describe("interest", () => {

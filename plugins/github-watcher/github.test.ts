@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDependabotAlerts, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -306,5 +306,27 @@ describe("Dependabot alerts", () => {
 
   it("throws on anything that is not an alert list", () => {
     expect(() => parseDependabotAlerts({ message: "Not Found" }, "Acme/Widgets")).toThrow(/Dependabot alert list/u);
+  });
+});
+
+describe("deployments", () => {
+  const node = (over: Record<string, unknown> = {}) => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9", ...over });
+
+  it("reads a page newest first, tolerating a bare deployment", () => {
+    expect(parseDeployments([node({ id: 6 }), node({ id: 7 })])).toEqual([
+      { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+      { id: 6, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+    ]);
+    expect(parseDeployments([node({ environment: null, ref: null, sha: null, url: null })])[0]).toEqual({ id: 7, environment: "", ref: "", sha: "", url: null });
+  });
+
+  it("throws on anything that is not a deployment list", () => {
+    expect(() => parseDeployments({ message: "Not Found" })).toThrow(/deployment list/u);
+  });
+
+  it("reads the newest status, or an empty state when none has been reported", () => {
+    expect(parseDeploymentStatus([{ state: "success" }, { state: "in_progress" }])).toBe("success");
+    expect(parseDeploymentStatus([])).toBe("");
+    expect(() => parseDeploymentStatus({ message: "Not Found" })).toThrow(/deployment status list/u);
   });
 });
