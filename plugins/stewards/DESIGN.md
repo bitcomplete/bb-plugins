@@ -1495,7 +1495,8 @@ the board calls it unfiltered and the sidebar calls it with `actionableOnly`,
 so the two surfaces cannot drift and a non-actionable need is on the page but
 not in the sidebar's count or items. `stewardsSidebar` carries, per project,
 `needs: { count, items }` with the same row shapes, each tagged
-`question`/`withUser`/`need` so the app knows which RPC a choice calls.
+`question`/`withUser`/`need` so the app knows how to render the row and which
+one-click action it carries.
 
 **Realtime, not the poll.** The store takes an optional
 `onNeedsYouChange(projectId)` callback, wired in `server.ts` to
