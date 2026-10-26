@@ -5293,6 +5293,185 @@ describe("lessons", () => {
   });
 });
 
+// BB-35 step 4: the rationale box. The plugin sets `rationaleWanted` on an
+// escalation only under the description's rules; the page shows the box only
+// then, and one cluster is never asked twice.
+describe("the rationale box (BB-35 step 4)", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const board = async () =>
+      (
+        (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as {
+          board: {
+            questions: Array<{ id: string; rationaleWanted: string | null }>;
+            withUser: Array<{ id: string; rationaleWanted: string | null }>;
+            needs: Array<{ id: string; kind: string }>;
+            lessons: Array<{ id: string; text: string; tier: string; hits: number; corrections: number }>;
+            lessonCounts: { candidate: number; trial: number; promoted: number; retired: number };
+          };
+        }
+      ).board!;
+    const qid = (text: string) => /(qst_[\w-]+)/u.exec(text)![1]!;
+    return { ...t, project, steward, board, qid };
+  }
+  /** A decision escalation on ENG-12 the project steward forwards to the user. */
+  async function escalateAndForward(t: Awaited<ReturnType<typeof adopted>>, forward: Record<string, unknown> = {}) {
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc, recommendation: "Leave SSO out.", ...forward }, t.project);
+    return { esc, out };
+  }
+
+  it("asks why on a routine decision the guidance did not settle, and the page shows the box", async () => {
+    const t = await adopted();
+    const { out } = await escalateAndForward(t);
+    const q = (await t.board()).questions[0]!;
+    expect(q.id).toBe(t.qid(out.text));
+    expect(q.rationaleWanted).toMatch(/guidance did not settle/u);
+  });
+
+  it("never asks on a gate item: a forwarded spec approval is an approve-spec item", async () => {
+    const t = await adopted();
+    const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true };
+    await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Wait", actor: "other", ready: met }, t.steward);
+    const approval = /(esc_[\w-]+) from ENG-12 \(approval\)/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    await t.tool("steward_update", { binding: "ENG-12", forward: approval }, t.project);
+    expect(t.hooks.store.escalation(approval)).toMatchObject({ rationaleWanted: null });
+    expect((await t.board()).questions).toEqual([]);
+  });
+
+  it("never asks on a credential", async () => {
+    const t = await adopted();
+    const { esc } = await escalateAndForward(t, { resolution: "secret", variable: "API_TOKEN", purpose: "deploys" });
+    expect(t.hooks.store.escalation(esc)).toMatchObject({ rationaleWanted: null });
+  });
+
+  it("never asks on a big decision the project named with entry", async () => {
+    const t = await adopted();
+    const { out } = await escalateAndForward(t, { entry: "New vendors, services or spending" });
+    const q = (await t.board()).questions[0]!;
+    expect(q.id).toBe(t.qid(out.text));
+    expect(q.rationaleWanted).toBeNull();
+  });
+
+  it("carries the page's rationale with the lesson candidate", async () => {
+    const t = await adopted();
+    const { out } = await escalateAndForward(t);
+    const qst = t.qid(out.text);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qst, answer: "Keep SSO.", rationale: "The plugin owns auth." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toMatch(/The plugin owns auth\./u);
+    expect(wake).toMatch(/general judgement the playbook should carry/u);
+    expect(t.hooks.store.question(qst)).toMatchObject({ rationaleWanted: expect.stringMatching(/guidance did not settle/u) });
+  });
+
+  it("asks the project steward once after the fact when the answer contradicts the recommendation", async () => {
+    const t = await adopted();
+    const { esc, out } = await escalateAndForward(t);
+    const before = t.sends.filter((s) => s.threadId === t.project).length;
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qid(out.text), answer: "Actually, include SSO." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    const wakes = t.sends.filter((s) => s.threadId === t.project);
+    expect(wakes.length).toBeGreaterThan(before);
+    const wake = wakes.at(-1)!.text;
+    expect(wake).toMatch(/went against your recommendation/u);
+    expect(wake).toMatch(/one follow-up/u);
+    expect(t.hooks.store.escalation(esc)).toMatchObject({ rationaleWanted: expect.stringMatching(/went against/u), rationaleAsked: true });
+  });
+
+  it("asks why on a nightly-clustered repeat, and one cluster is asked once", async () => {
+    const t = await adopted();
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const qs = (await t.board()).questions;
+    expect(qs).toHaveLength(2);
+    expect(qs[0]!.rationaleWanted).toBeNull();
+    expect(qs[1]!.rationaleWanted).toMatch(/reached you before/u);
+    // A third repeat does not ask again: one cluster is asked once.
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-19");
+    await t.flush();
+    expect((await t.board()).questions[2]!.rationaleWanted).toBeNull();
+    // The page's rationale on a repeat question (no escalation behind it)
+    // reaches the project steward, which records the lesson.
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qs[1]!.id, answer: "Yes.", rationale: "Auth is the plugin's." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/Auth is the plugin's\./u);
+  });
+
+  it("puts at most one box on a cluster, however many open questions it holds", async () => {
+    const t = await adopted();
+    for (let i = 0; i < 3; i += 1) await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const qs = (await t.board()).questions;
+    expect(qs.map((q) => q.rationaleWanted)).toEqual([null, expect.stringMatching(/reached you before/u), null]);
+  });
+
+  it("never asks a cluster again once a rationale was supplied, even after the boxed question closed", async () => {
+    const t = await adopted();
+    const first = await escalateAndForward(t);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qid(first.out.text), answer: "Keep SSO.", rationale: "The plugin owns auth." }, client)).toMatchObject({ ok: true });
+    expect(t.hooks.store.escalation(first.esc)).toMatchObject({ rationaleGiven: true });
+    // A later forward of the same wording under the same playbook does not ask again.
+    const second = await escalateAndForward(t);
+    expect((await t.board()).questions.find((q) => q.id === t.qid(second.out.text))!.rationaleWanted).toBeNull();
+  });
+
+  it("does not also ask the after-the-fact follow-up when the box already collected the reasoning", async () => {
+    const t = await adopted();
+    const { esc, out } = await escalateAndForward(t);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qid(out.text), answer: "Actually, include SSO.", rationale: "The plugin owns auth." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toMatch(/The plugin owns auth\./u);
+    expect(wake).not.toMatch(/one follow-up/u);
+    expect(t.hooks.store.escalation(esc)).toMatchObject({ rationaleGiven: true, rationaleWanted: null });
+  });
+
+  it("marks a boxed question asked when it is closed from a thread", async () => {
+    const t = await adopted();
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const boxed = (await t.board()).questions[1]!;
+    expect(boxed.rationaleWanted).not.toBeNull();
+    await t.harness.behavior.runCli(["done", boxed.id, "--project", "p1"]);
+    expect(t.hooks.store.question(boxed.id)).toMatchObject({ status: "answered", rationaleAsked: true, rationaleGiven: false });
+  });
+
+  it("sets the after-the-fact ask from the owner's own unsigned comment, never from someone else's", async () => {
+    const owner = await adopted();
+    const { esc: ownerEsc } = await escalateAndForward(owner);
+    owner.entities.set("uuid-12", issue({ comments: [comment({ author: "Jane", body: "Actually, keep SSO.", signedBy: null })] }));
+    await owner.ring("linear", "uuid-12");
+    expect(owner.hooks.store.escalation(ownerEsc)).toMatchObject({ rationaleWanted: expect.stringMatching(/went against/u), rationaleAsked: false });
+
+    const other = await adopted();
+    const { esc: otherEsc } = await escalateAndForward(other);
+    other.entities.set("uuid-12", issue({ comments: [comment({ author: "Sam", body: "Actually, keep SSO.", signedBy: null })] }));
+    await other.ring("linear", "uuid-12");
+    expect(other.hooks.store.escalation(otherEsc)).toMatchObject({ rationaleWanted: null, rationaleAsked: false });
+  });
+
+  it("shows every lesson with its tier and the counts by tier on the board", async () => {
+    const t = await adopted();
+    t.hooks.store.addLesson({ projectId: "p1", bindingId: null, escalationId: null, file: "AGENTS.md", text: "A rule.", scope: "procedure", branch: null, tier: "trial" });
+    t.hooks.store.addLesson({ projectId: "p1", bindingId: null, escalationId: null, file: "AGENTS.md", text: "An old rule.", scope: "procedure", branch: null, tier: "retired" });
+    const b = await t.board();
+    expect(b.lessonCounts).toEqual({ candidate: 0, trial: 1, promoted: 0, retired: 1 });
+    expect(b.lessons).toMatchObject([{ text: "A rule.", tier: "trial" }, { text: "An old rule.", tier: "retired" }]);
+  });
+});
+
 describe("Sentry stewards", () => {
   const TARGET = "sentry-project/acme/web";
   const ISSUE_ID = "6081234567";

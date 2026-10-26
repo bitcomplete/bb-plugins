@@ -486,30 +486,6 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         )}
       </Section>
 
-      <Section title="Lessons" count={b.lessons.length}>
-        {b.lessons.length === 0 ? (
-          <None>No lessons are waiting to be landed.</None>
-        ) : (
-          <List>
-            {b.lessons.map((l) => (
-              <li key={l.id} className="flex flex-col gap-1 p-3">
-                <p className="flex flex-wrap items-center gap-2">
-                  <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
-                  <span className="font-medium">{l.file}</span>
-                  {l.key !== null ? <EntityLink entityKey={l.key} url={null} /> : null}
-                  <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
-                </p>
-                <p>{l.text}</p>
-                <p className="text-xs text-muted-foreground">
-                  {l.scope === "boundary" ? "Waiting on your Merge or Drop above." : "The project steward applies, commits and self-merges this."}
-                  {l.note !== null ? ` Last attempt: ${l.note}` : ""}
-                </p>
-              </li>
-            ))}
-          </List>
-        )}
-      </Section>
-
       <Section title="In flight" count={b.stewards.length}>
         {b.stewards.length === 0 ? (
           <None>No open stewards. Label a Linear ticket or pull request to adopt it.</None>
@@ -586,7 +562,50 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
           </div>
         )}
       </Section>
+
+      <LessonsBlock lessons={b.lessons} counts={b.lessonCounts} now={now} />
     </>
+  );
+}
+
+/**
+ * BB-35 step 4: one collapsed details block at the bottom of the project tab,
+ * counts by tier and the rows behind a disclosure. No buttons of its own: the
+ * boundary Merge / Drop stays the need in "Waiting on you".
+ */
+function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; counts: Board["lessonCounts"]; now: number }) {
+  const total = counts.candidate + counts.trial + counts.promoted + counts.retired;
+  return (
+    <details className="rounded-lg border border-border">
+      <summary className="cursor-pointer px-3 py-2 text-base font-medium">
+        Lessons <span className="text-sm font-normal text-muted-foreground">{total}</span>
+        <span className="ml-2 text-xs font-normal text-muted-foreground">
+          candidate {counts.candidate} · trial {counts.trial} · promoted {counts.promoted} · retired {counts.retired}
+        </span>
+      </summary>
+      {lessons.length === 0 ? (
+        <p className="border-t border-border p-3 text-muted-foreground">No lessons yet.</p>
+      ) : (
+        <ul className="flex flex-col divide-y divide-border border-t border-border">
+          {lessons.map((l) => (
+            <li key={l.id} className="flex flex-col gap-1 p-3">
+              <p className="flex flex-wrap items-center gap-2">
+                <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
+                <Badge>{l.tier}</Badge>
+                <span className="font-medium">{l.file}</span>
+                {l.key !== null ? <span className="text-muted-foreground">{l.key}</span> : null}
+                <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
+              </p>
+              <p>{l.text}</p>
+              <p className="text-xs text-muted-foreground">
+                {l.hits} citation{l.hits === 1 ? "" : "s"} · {l.corrections} correction{l.corrections === 1 ? "" : "s"} · last cited {ago(l.lastCitedAt, now)}
+                {l.note !== null ? ` · ${l.note}` : ""}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </details>
   );
 }
 
@@ -711,19 +730,30 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
 function QuestionRow({ question: q, now, onClosed }: { question: Board["questions"][number]; now: number; onClosed: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [answer, setAnswer] = useState("");
+  // BB-35 step 4: the rationale box appears only when the plugin set
+  // `rationaleWanted`, with its one-line why as the placeholder. An empty box
+  // is always accepted.
+  const [rationale, setRationale] = useState("");
   // With choices, the text box is the choice's note until Other… turns it
   // into the free-text answer.
   const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "closing" | { error: string }>("idle");
   const close = (choice?: string) => {
     setState("closing");
-    rpc.call("stewardsAnswerQuestion", { questionId: q.id, answer: answer.trim() === "" ? null : answer.trim(), ...(choice === undefined ? {} : { choice }) }).then(
-      (r) => {
-        if (r.ok) onClosed();
-        else setState({ error: r.message });
-      },
-      (e: unknown) => setState({ error: message(e) }),
-    );
+    rpc
+      .call("stewardsAnswerQuestion", {
+        questionId: q.id,
+        answer: answer.trim() === "" ? null : answer.trim(),
+        ...(choice === undefined ? {} : { choice }),
+        ...(q.rationaleWanted === null || rationale.trim() === "" ? {} : { rationale: rationale.trim() }),
+      })
+      .then(
+        (r) => {
+          if (r.ok) onClosed();
+          else setState({ error: r.message });
+        },
+        (e: unknown) => setState({ error: message(e) }),
+      );
   };
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
@@ -735,6 +765,16 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
       </p>
       <p>{q.question}</p>
       {q.context !== null ? <p className="text-muted-foreground">{q.context}</p> : null}
+      {q.rationaleWanted !== null ? (
+        <textarea
+          value={rationale}
+          onChange={(e) => setRationale(e.target.value)}
+          rows={2}
+          placeholder={q.rationaleWanted}
+          aria-label={`Why: ${q.question}`}
+          className="min-w-0 rounded-md border border-input bg-transparent px-2 py-1"
+        />
+      ) : null}
       <div className="flex flex-wrap items-start gap-2">
         <textarea
           value={answer}

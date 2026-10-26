@@ -76,6 +76,7 @@ import {
 import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, planLessonTransitions, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
@@ -230,6 +231,8 @@ const questionViewSchema = z.object({
   url: z.string().nullable(),
   escalationId: z.string().nullable(),
   createdAt: z.number(),
+  /** Why the page shows a rationale box, or null when it must not (BB-35 step 4). */
+  rationaleWanted: z.string().nullable(),
 });
 const withUserViewSchema = z.object({
   id: z.string(),
@@ -240,6 +243,7 @@ const withUserViewSchema = z.object({
   url: z.string().nullable(),
   threadId: z.string().nullable(),
   createdAt: z.number(),
+  rationaleWanted: z.string().nullable(),
 });
 const needViewSchema = z.object({
   id: z.string(),
@@ -366,7 +370,11 @@ export const rpcContract = defineRpcContract({
           withUser: z.array(withUserViewSchema),
           /** "Needs you" items: links and the one-click action each supports. */
           needs: z.array(needViewSchema),
-          /** Pending lessons: general rules the project steward has recorded and not yet landed. */
+          /**
+           * Every lesson, whatever its tier: the collapsed details block at
+           * the bottom of the project tab, rows behind a disclosure, no
+           * buttons (BB-35 step 4).
+           */
           lessons: z.array(
             z.object({
               id: z.string(),
@@ -376,6 +384,11 @@ export const rpcContract = defineRpcContract({
               text: z.string(),
               scope: z.string(),
               status: z.string(),
+              /** The lifecycle tier (BB-35 step 3): candidate, trial, promoted, retired. */
+              tier: z.string(),
+              hits: z.number(),
+              corrections: z.number(),
+              lastCitedAt: z.number().nullable(),
               branch: z.string().nullable(),
               mergeSha: z.string().nullable(),
               note: z.string().nullable(),
@@ -383,6 +396,8 @@ export const rpcContract = defineRpcContract({
               createdAt: z.number(),
             }),
           ),
+          /** Lessons by tier, for the collapsed block's summary (BB-35 step 4). */
+          lessonCounts: z.object({ candidate: z.number(), trial: z.number(), promoted: z.number(), retired: z.number() }),
           stewards: z.array(
             z.object({
               key: z.string(),
@@ -450,7 +465,13 @@ export const rpcContract = defineRpcContract({
   // The user closes a question from the page, with or without an answer, or
   // picks one of its fixed choices.
   stewardsAnswerQuestion: {
-    input: z.object({ questionId: z.string().min(1).max(100), answer: z.string().trim().max(4000).nullable().optional(), choice: z.string().trim().min(1).max(100).nullable().optional() }),
+    input: z.object({
+      questionId: z.string().min(1).max(100),
+      answer: z.string().trim().max(4000).nullable().optional(),
+      choice: z.string().trim().min(1).max(100).nullable().optional(),
+      /** The rationale the page collected, when it showed the box (BB-35 step 4); empty is accepted. */
+      rationale: z.string().trim().max(4000).nullable().optional(),
+    }),
     output: z.object({ ok: z.boolean(), message: z.string() }),
   },
   // The user presses a button on a "needs you" item: approve or decline a spec,
@@ -3182,14 +3203,53 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-35 step 4: cluster the escalations routed to the user under their
+     * playbook. A question that repeats an earlier one is a repeat: the page
+     * asks why, once per cluster, so the answer becomes a lesson. A cluster
+     * that already shows a box, or has been asked, is left alone — never twice
+     * for one cluster.
+     */
+    function applyRationaleClustering(config: ProjectConfig): void {
+      const rows = store.openUserEscalations(config.projectId);
+      const byKey = new Map<string, Escalation[]>();
+      for (const x of rows) {
+        // Only a question has the page's box; a raw route-`me` escalation
+        // (an approval request) never asks.
+        if (!x.isQuestion) continue;
+        // A question with no binding (the project steward's own) has no
+        // playbook, but still clusters by its wording.
+        const b = x.bindingId === "" ? null : store.binding(x.bindingId);
+        const key = x.clusterKey ?? clusterKey(b?.playbook ?? null, x.question);
+        store.setEscalationCluster(x.id, key);
+        byKey.set(key, [...(byKey.get(key) ?? []), x]);
+      }
+      for (const [key, members] of byKey) {
+        if (members.length < 2) continue;
+        // A rationale supplied anywhere in the cluster settles it for good, so
+        // a repeat after the box was answered is not asked again.
+        if (store.escalationsByCluster(config.projectId, key).some((x) => x.rationaleGiven)) continue;
+        // One box at a time: if any open member already shows the box or has
+        // been asked, the repeats are left alone.
+        if (members.some((x) => x.rationaleWanted !== null || x.rationaleAsked)) continue;
+        // One box per cluster: the oldest is the first, the next is the repeat.
+        store.setEscalationRationale(members[1]!.id, REPEAT_RATIONALE_WHY);
+      }
+    }
+
+    /**
      * Count a correction when the owner's answer to an escalation differs from
      * the steward's recommendation on it and the decision cited lessons
      * (BB-35 step 2). Observed, never asked for; `correctionsCounted` keeps one
      * reversal to one count.
      */
     function countCorrections(x: Escalation, answer: string): void {
-      if (x.correctionsCounted || x.recommendation === null || x.citedLessons.length === 0) return;
-      if (!answerDiffers(answer, x.recommendation)) return;
+      if (x.recommendation === null || !answerDiffers(answer, x.recommendation)) return;
+      // BB-35 step 4: the answer went against the recommendation, so the
+      // project steward asks why once after the fact, cited or not — unless
+      // the page box already collected their reasoning.
+      const fresh = store.escalation(x.id) ?? x;
+      if (!fresh.rationaleAsked && !fresh.rationaleGiven) store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+      if (x.correctionsCounted || x.citedLessons.length === 0) return;
       store.recordCorrections(x.citedLessons);
       store.markEscalationCorrected(x.id);
     }
@@ -3206,8 +3266,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const comments = newHumanComments(observed.entity, b.commentCursor, ownThreads(b));
       if (comments.length === 0) return;
       for (const x of store.openEscalations(b.id)) {
-        if (x.correctionsCounted || x.recommendation === null || x.citedLessons.length === 0) continue;
+        if (x.recommendation === null) continue;
         if (!comments.some((c) => commentDiffersFromRecommendation(c, viewer, x.recommendation))) continue;
+        // BB-35 step 4: the owner's own unsigned comment that goes against the
+        // recommendation is the after-the-fact case too. Only the owner's words
+        // reach here; anyone else's comment never sets an ask.
+        if (!x.rationaleAsked) store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+        if (x.correctionsCounted || x.citedLessons.length === 0) continue;
         store.recordCorrections(x.citedLessons);
         store.markEscalationCorrected(x.id);
       }
@@ -3496,11 +3561,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function wakeProjectOnForwardedAnswer(b: Binding, closure: string, forwarded: Escalation[], lessonCandidate = true): Promise<void> {
       if (forwarded.length === 0) return;
+      // BB-35 step 4: one after-the-fact follow-up when the user's answer went
+      // against the recommendation. Re-read each escalation, since the answer
+      // just set the ask on it; `rationaleAsked` keeps it to one.
+      const followUps: string[] = [];
+      for (const f of forwarded) {
+        const fresh = store.escalation(f.id);
+        if (fresh === null || fresh.rationaleAsked || fresh.rationaleGiven || fresh.rationaleWanted !== AFTER_THE_FACT_RATIONALE_WHY) continue;
+        store.markEscalationRationaleAsked(fresh.id);
+        followUps.push(`The user's answer went against your recommendation on ${fresh.id}. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`);
+      }
       await wakeProject(b.projectId, `${b.entityKey}'s forwarded escalation was answered`, {
         digestDue: false,
         notes: [
           `${closure} ${forwarded.map((x) => `Escalation ${x.id}`).join(", ")} ${forwarded.length === 1 ? "is" : "are"} resolved.`,
           ...(lessonCandidate ? ["If the answer is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }."] : []),
+          ...followUps,
         ],
       });
     }
@@ -4316,10 +4392,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             questions,
             withUser,
             needs,
-            lessons: store.lessons(projectId).map((l) => {
+            lessons: store.allLessons(projectId).map((l) => {
               const b = l.bindingId === null ? null : store.binding(l.bindingId);
-              return { id: l.id, bindingId: l.bindingId, key: b?.entityKey ?? null, file: l.file, text: l.text, scope: l.scope, status: l.status, branch: l.branch, mergeSha: l.mergeSha, note: l.note, escalationId: l.escalationId, createdAt: l.createdAt };
+              return { id: l.id, bindingId: l.bindingId, key: b?.entityKey ?? null, file: l.file, text: l.text, scope: l.scope, status: l.status, tier: l.tier, hits: l.hits, corrections: l.corrections, lastCitedAt: l.lastCitedAt, branch: l.branch, mergeSha: l.mergeSha, note: l.note, escalationId: l.escalationId, createdAt: l.createdAt };
             }),
+            lessonCounts: (() => {
+              const counts = { candidate: 0, trial: 0, promoted: 0, retired: 0 };
+              for (const l of store.allLessons(projectId)) counts[l.tier] += 1;
+              return counts;
+            })(),
             stewards: open.map((b) => ({
               key: b.entityKey,
               url: b.url,
@@ -4403,13 +4484,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
         };
       },
-      async stewardsAnswerQuestion({ questionId, answer, choice }, { experimental_caller: caller }) {
+      async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
         const q = store.question(questionId);
         if (q === null || q.status !== "open") return { ok: false, message: "That question is already closed." };
         const text = answer === undefined || answer === null || answer === "" ? null : answer;
         const x = q.escalationId === null ? null : store.escalation(q.escalationId);
         const b = x === null ? null : store.binding(x.bindingId);
+        // BB-35 step 4: the rationale the page collected, if any. Empty is
+        // always accepted; the box was shown, so the cluster is not asked
+        // again. The reasoning rides with the closure so the project steward
+        // records it as the lesson candidate's text.
+        const rationaleText = rationale === undefined || rationale === null || rationale.trim() === "" ? null : rationale.trim();
+        const withRationale = (closure: string): string => {
+          if (q.rationaleWanted === null) return closure;
+          // The box was shown. A supplied rationale settles the cluster for
+          // good; an empty one leaves it open for a later repeat. The forwarded
+          // escalation keeps its own flags for the after-the-fact follow-up.
+          store.markEscalationRationaleAsked(q.id);
+          if (rationaleText === null) return closure;
+          store.markEscalationRationaleGiven(q.id);
+          if (x !== null) store.markEscalationRationaleGiven(x.id);
+          return `${closure} Their reasoning: ${JSON.stringify(rationaleText)}.`;
+        };
+        // A plain question has no forwarded escalation to carry the rationale,
+        // so wake the project steward with it directly, once.
+        const wakePlainRationale = async (): Promise<void> => {
+          if (x !== null || rationaleText === null || q.rationaleWanted === null) return;
+          store.markEscalationRationaleGiven(q.id);
+          await wakeProject(q.projectId, "a rationale on a repeat question", {
+            digestDue: false,
+            notes: [`The user answered question ${q.id} with a rationale: ${JSON.stringify(rationaleText)}. If it is a general judgement the playbook should carry, record it as a lesson with steward_update { lesson: { text, file, scope } }.`],
+          });
+        };
         // A fixed choice: the label is the answer, saved as guidance, and a
         // forwarded escalation resolves with that guidance, exactly as
         // steward_update { guidance, resolve } records it (BB-20).
@@ -4420,7 +4527,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const guidance = text === null ? chosen : `${chosen} — ${text}`;
           store.answer(q.id, `Chose: ${chosen}${text === null ? "" : ` — ${text}`}`, "user", guidance);
           if (x !== null && b !== null && b.endedAt === null) {
-            const closure = `The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`;
+            const closure = withRationale(`The user chose ${chosen} for ${b.entityKey}'s forwarded escalation on the Stewards page${text === null ? "" : `: ${text}`}.`);
             store.addGuidance(b.id, guidance, "user");
             countCorrections(x, guidance);
             store.note(b.id, `The user chose ${chosen} for ${q.question}${text === null ? "" : `: ${text}`}.`);
@@ -4428,6 +4535,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             await wakeProjectOnForwardedAnswer(b, closure, [x]);
             return { ok: true, message: `Recorded; ${b.entityKey}'s steward has been told.` };
           }
+          await wakePlainRationale();
           return { ok: true, message: "Closed." };
         }
         // Criterion 1: an approval request answered on the page approves or
@@ -4469,9 +4577,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // lesson candidate for its next wake (BB-35 step 1).
         store.answer(q.id, text ?? "Closed by the user on the stewards page, without an answer.", "user");
         if (x !== null && b !== null && b.endedAt === null) {
-          const closure = text === null
-            ? `The user closed ${b.entityKey}'s forwarded escalation on the Stewards page without an answer.`
-            : `The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`;
+          const closure = withRationale(
+            text === null
+              ? `The user closed ${b.entityKey}'s forwarded escalation on the Stewards page without an answer.`
+              : `The user answered ${b.entityKey}'s forwarded escalation on the Stewards page: ${JSON.stringify(text)}.`,
+          );
           if (text !== null) store.addGuidance(b.id, text, "user");
           if (text !== null) countCorrections(x, text);
           store.note(b.id, text === null ? `Escalation ${x.id} was closed by the user without an answer: carry on as you said you would meanwhile, or escalate again if you still need it.` : `Escalation ${x.id} decided by the user: ${text}`);
@@ -4479,6 +4589,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           await wakeProjectOnForwardedAnswer(b, closure, [x], text !== null);
           return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
         }
+        await wakePlainRationale();
         return { ok: true, message: "Closed." };
       },
       // The page's buttons. Each action runs on the server as the connected user
@@ -5223,7 +5334,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         setting: z.string().trim().max(200).optional().describe('With forward and resolution "secret": the stewards plugin secret setting the value goes to.'),
         writeEnv: z.string().trim().max(500).optional().describe('With forward and resolution "secret": the dotenv path the requester writes.'),
         worker: z.string().trim().max(200).optional().describe('With forward and resolution "secret": the worker thread that will request it.'),
-        entry: z.string().trim().min(1).max(300).optional().describe("With approve on an owner-reviewed pull request: the decide-list entry from the project file that you classified it under. A missing, unknown or `user` entry, or a change to the decide list or the code that enforces it, is the user's, and the approval is refused."),
+        entry: z.string().trim().min(1).max(300).optional().describe("With approve on an owner-reviewed pull request: the decide-list entry from the project file that you classified it under. A missing, unknown or `user` entry, or a change to the decide list or the code that enforces it, is the user's, and the approval is refused. With forward to the user: the decide-list entry you matched, when the escalation is one of those big decisions; leave it out for a routine escalation the guidance did not settle, and the page asks the user why (BB-35 step 4)."),
         recommendation: z.string().trim().max(1500).optional().describe("Your recommendation, when forwarding."),
         priority: z.enum(["urgent", "high", "normal", "low"]).optional(),
         hold: z.string().trim().max(300).optional().describe('Why it is held; "" lifts the hold. A held steward takes no new actions and starts no workers.'),
@@ -5272,6 +5383,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const out: string[] = [];
             if (closing !== null) {
               const closed = store.answer(closing.question.id, closing.answer, threadId);
+              // A question the page boxed was asked; closing it from a thread
+              // marks it shown, so a later repeat is not a second box at once.
+              if (closing.question.rationaleWanted !== null) store.markEscalationRationaleAsked(closing.question.id);
               const dropped = closing.guidanceDropped ? " (guidance not saved: it is kept per binding, so name one with binding to give it)" : "";
               out.push(`${closed ? `closed ${closing.question.id}` : `${closing.question.id} already closed with this answer`}${dropped}`);
             }
@@ -5569,6 +5683,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                       ...(input.worker === undefined ? {} : { workerThreadId: input.worker }),
                     },
                   });
+            // BB-35 step 4: a routine decision the guidance did not settle asks
+            // why, so the answer can become a lesson. A named decide-list entry
+            // is a big decision, and the gate items and a credential never ask.
+            // One cluster is never asked twice.
+            if (q !== null) {
+              const key = clusterKey(target.playbook, forwarding.question);
+              store.setEscalationCluster(q.id, key);
+              const cluster = store.escalationsByCluster(target.projectId, key);
+              // A rationale supplied anywhere in the cluster settles it for good;
+              // an open box (or a shown one) means one is already being asked.
+              const settled = cluster.some((x) => x.rationaleGiven);
+              const pending = cluster.some((x) => x.status === "open" && (x.rationaleWanted !== null || x.rationaleAsked));
+              if (routineRationaleWanted({ kind: forwarding.kind, resolutionKind, entry: input.entry ?? null }) && !settled && !pending) {
+                store.setEscalationRationale(q.id, ROUTINE_RATIONALE_WHY);
+              }
+            }
             if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
             if (prToUser) {
               const key = forwarding.question.replace(/^Approve\s+/u, "");
@@ -5721,12 +5851,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The board's question row; the sidebar reuses it, tagged. */
     function questionView(q: Question) {
       const b = q.bindingId === null ? null : store.binding(q.bindingId);
-      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt };
+      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted };
     }
 
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
-      return { id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt };
+      return { id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted };
     }
 
     function formatBindings(rows: Binding[]): string {
@@ -5809,6 +5939,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await syncOpsBindings(config);
         await reconcileLessons(config);
         applyLessonTransitions(config);
+        applyRationaleClustering(config);
         for (const b of store.open(config.projectId)) {
           if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
           const deadline = endingDeadline(b, timing.endingTimeoutMs);
@@ -5850,6 +5981,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (!(await settings.get()).paused) await adoptionPass(config);
         await reconcileLessons(config);
         applyLessonTransitions(config);
+        applyRationaleClustering(config);
+        // BB-35 step 4: an answer that went against a recommendation and has not
+        // had its one follow-up yet is asked in the digest wake.
+        const followUps = store.escalationsWithPendingRationale(config.projectId, AFTER_THE_FACT_RATIONALE_WHY);
         const order = store
           .open(config.projectId)
           .filter((b) => b.hold === null && b.ending === null)
@@ -5867,7 +6002,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (!states.some((s) => s !== null && busy(s.status))) break;
           await new Promise((r) => setTimeout(r, 30_000));
         }
-        if (!disposed) await wakeProject(config.projectId, `nightly pass ${night}`, { digestDue: true, notes: [`${woken.length} binding(s) had a turn tonight.`] });
+        if (!disposed) {
+          // Mark only once the wake is really sent, so a disposed pass leaves
+          // the follow-up for the next one.
+          for (const x of followUps) store.markEscalationRationaleAsked(x.id);
+          await wakeProject(config.projectId, `nightly pass ${night}`, {
+            digestDue: true,
+            notes: [
+              `${woken.length} binding(s) had a turn tonight.`,
+              ...followUps.map((x) => `The user's answer on ${x.id} went against your recommendation. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`),
+            ],
+          });
+        }
       } finally {
         running.delete(config.projectId);
       }
@@ -6275,6 +6421,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   if (!q.choices.includes(choice)) throw new PluginCliError(`"${choice}" is not one of ${id}'s choices: ${q.choices.join(", ")}.`, { code: "bad_choice", hint: `bb stewards needs prints them.` });
                   const guidance = note === null ? choice : `${choice} — ${note}`;
                   store.answer(q.id, `Chose: ${choice}${note === null ? "" : ` — ${note}`}`, "user", guidance);
+                  // The box was shown (there is no rationale input from the CLI):
+                  // mark it asked so a later repeat is not a second box at once.
+                  if (q.rationaleWanted !== null) store.markEscalationRationaleAsked(q.id);
                   if (x !== null) {
                     const b = store.binding(x.bindingId);
                     if (b !== null) {
@@ -6290,6 +6439,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 }
                 const answer = note ?? "Closed from a thread.";
                 store.answer(q.id, answer, "user");
+                if (q.rationaleWanted !== null) store.markEscalationRationaleAsked(q.id);
                 if (x !== null) {
                   const b = store.binding(x.bindingId);
                   if (b !== null) {

@@ -298,7 +298,13 @@ question. The user may also close a question on the Stewards page. A
 forwarded escalation they answer on the page or from a thread wakes you
 with the answer and asks whether it is a general judgement: if it is, record
 it with `steward_update { lesson: { text, file, scope } }` so it is not
-asked again. A resolve carries `cites: [lesson ids]`, the lessons the
+asked again. When you forward a routine escalation the guidance did not
+settle, leave `entry` out: the page asks the user why, and their reasoning
+arrives with the answer. When you forward one of the project's big
+decisions, name it with `entry: "<the entry>"` so the page does not ask. When
+their answer goes against your recommendation you are woken once, in your
+thread, to ask why — one follow-up, then record the reasoning as a lesson
+candidate. A resolve carries `cites: [lesson ids]`, the lessons the
 decision rested on; the plugin counts hits (once per distinct binding),
 corrections and last citation from them. A recorded lesson starts as a
 `trial`: it is injected into wakes under `## Lessons (trial)` and stays in

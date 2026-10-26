@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -239,6 +239,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
     for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
+    for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.lesson("lsn_old")).toMatchObject({
       id: "lsn_old",
@@ -277,6 +278,7 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
                     ('lsn_dropped', 'p1', NULL, NULL, 'AGENTS.md', 'C.', 'procedure', 'dropped', NULL, NULL, NULL, 1300, 1300, 1400)`);
     for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
     for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
+    for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -302,7 +304,53 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
     // `bb.storage.migrate` records each statement by index and refuses a changed
     // one; a group spliced in mid-array would fail every live database on load.
-    expect(MIGRATIONS.slice(-LESSON_TIER_MIGRATIONS.length)).toEqual([...LESSON_TIER_MIGRATIONS]);
+    // BB-35 step 4 appended the rationale group after this one.
+    expect(MIGRATIONS.slice(-RATIONALE_MIGRATIONS.length)).toEqual([...RATIONALE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(RATIONALE_MIGRATIONS.length + LESSON_TIER_MIGRATIONS.length), -RATIONALE_MIGRATIONS.length)).toEqual([...LESSON_TIER_MIGRATIONS]);
+  });
+});
+
+describe("the rationale migration (BB-35 step 4)", () => {
+  const legacy = () => {
+    const db = new Database(":memory:");
+    // Everything before this step, then the new group: the state of a live
+    // database the migration is applied to.
+    for (const sql of MIGRATIONS.slice(0, MIGRATIONS.length - RATIONALE_MIGRATIONS.length)) db.exec(sql);
+    db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
+             VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
+    db.exec(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at)
+             VALUES ('esc_1', 'bnd_1', 'decision', 'Include SSO?', 'Wait.', 'me', 'open', 1000)`);
+    for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
+    return db;
+  };
+
+  it("is additive and lossless: an existing escalation keeps its values and reads as not asked", () => {
+    const s = createStore(legacy(), () => 2000);
+    expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", route: "me", status: "open", rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null });
+  });
+
+  it("keeps every escalation column, dropping nothing", () => {
+    const db = legacy();
+    const columns = (db.prepare("PRAGMA table_info(escalations)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(["id", "binding_id", "kind", "question", "meanwhile", "route", "recommendation", "choices", "status", "resolution", "created_at", "resolved_at", "cited_lessons", "corrections_counted", "rationale_wanted", "rationale_asked", "rationale_given", "cluster_key"]));
+  });
+
+  it("sets, clears and records the ask and the supplied rationale without disturbing the other columns", () => {
+    const s = createStore(legacy(), () => 2000);
+    s.setEscalationRationale("esc_1", "why");
+    s.setEscalationCluster("esc_1", "cluster");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: "why", rationaleAsked: false, rationaleGiven: false, clusterKey: "cluster", question: "Include SSO?" });
+    s.markEscalationRationaleAsked("esc_1");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: false });
+    // Supplying reasoning also marks it asked, so the two can never disagree.
+    s.markEscalationRationaleGiven("esc_1");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: true });
+    s.setEscalationRationale("esc_1", null);
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: null, rationaleAsked: true, rationaleGiven: true, clusterKey: "cluster" });
+    // A second set is stable, so the migration's values never drift on a re-run.
+    s.markEscalationRationaleAsked("esc_1");
+    s.markEscalationRationaleGiven("esc_1");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: true });
   });
 });
 
@@ -324,7 +372,7 @@ describe("a worker's pending model check", () => {
 
   it("reads workers from before the column existed as not pending", () => {
     const db = new Database(":memory:");
-    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS]) db.exec(sql);
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS]) db.exec(sql);
     db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
              VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
     db.exec(`INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES ('thr_old', 'bnd_1', 'ENG-12: Implement', 'running', 1000)`);
@@ -363,6 +411,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     for (const sql of LESSON_COUNTER_MIGRATIONS) db.exec(sql);
     for (const sql of LESSON_TIER_MIGRATIONS) db.exec(sql);
     for (const sql of WORKER_CHECK_MIGRATIONS) db.exec(sql);
+    for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }

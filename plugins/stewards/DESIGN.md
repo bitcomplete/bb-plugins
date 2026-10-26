@@ -1306,6 +1306,23 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   `complete` a trial by hand, which promotes it at once and bypasses
   `promoted.maxPerFile`; that is an explicit override, and the nightly pass is
   the mechanical path, not the only one.
+- **The rationale box (BB-35 step 4).** The plugin sets `rationaleWanted` on
+  an escalation only when the page should ask the user why, and the page shows
+  the box only then, with a one-line placeholder naming the reason. It asks
+  when the project steward forwards a routine decision the guidance did not
+  settle — a forward with no `entry` naming a decide-list entry — and when the
+  nightly pass clusters a question with an earlier one under the same playbook
+  (`clusterKey` normalises the wording; the playbook keeps kinds apart). It
+  never asks on a `bigDecisions` kind the project could never decide, on a
+  credential or a plain step, or on a gate item (`approve-pr`, `merge`,
+  `approve-spec`); and one cluster is never asked twice — a supplied rationale
+  (`rationale_given`) settles it for good, while an empty box leaves it open
+  for a later repeat. An empty box is always accepted, and the answer rides
+  with the lesson candidate the project steward is woken for. When the user's answer
+  contradicts the recommendation, the plugin sets the after-the-fact ask and
+  the project steward is woken once, in its thread, to ask why — one follow-up,
+  never repeated. Only the owner's words (the page answer or an unsigned
+  comment) or this project's own steward or worker threads reach it.
 - **The promotion and retirement write only the lesson's own anchored text.**
   A promotion the nightly pass queues is listed under `## Lessons to land`;
   the project steward adds the block (`<!-- lesson:<id> -->` and the wording)
@@ -1361,9 +1378,12 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   refused. The digest carries nothing about lessons: the merged-lessons
   section is gone, and `bb stewards lessons --all` is where their state is
   read.
-- **Surfaces.** Pending lessons are on the Stewards page's Lessons section
-  and in `bb stewards list`; `bb stewards lessons [--all]` lists them,
-  `bb stewards drop-lesson <id>` drops one.
+- **Surfaces.** Every lesson is in one collapsed details block at the bottom
+  of the Stewards page's project tab, with counts by tier and the rows behind
+  the disclosure (no buttons of its own; the boundary Merge / Drop stays the
+  need in "Waiting on you"); `bb stewards list` names the pending ones and
+  `bb stewards lessons [--all]` lists them all, `bb stewards drop-lesson <id>`
+  drops one.
 - **Undo.** A merged procedure lesson is an ordinary commit on `.bb` HEAD;
   `bb stewards lessons --all` names its `mergeSha` and branch. To undo it,
   revert that commit in the canonical checkout (`git revert <sha>` in the
