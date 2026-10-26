@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { pull } from "./fixtures.js";
 import type { DeploymentTarget } from "./config.js";
-import { allDeployed, applyDeployment, deploymentLines, deploymentsSchema, matchesTarget, mergedPulls, recordMerged, reportDeployment, timeOut, timeoutsDue, type Deployments } from "./deploy.js";
+import { allDeployed, applyDeployment, applyDeploymentRead, deploymentLines, deploymentsSchema, matchesTarget, mergedPulls, recordMerged, reportDeployment, timeOut, timeoutsDue, type Deployments } from "./deploy.js";
 import type { Deployment } from "./source-contract.js";
 import type { Observed } from "./store.js";
 
@@ -26,6 +26,7 @@ describe("recording merged pull requests", () => {
         repo: "acme/bb-gate",
         environment: "production",
         deploymentId: null,
+        deploymentState: null,
         ref: null,
         sha: null,
         url: null,
@@ -121,6 +122,53 @@ describe("the steward's verdict", () => {
     expect(reportDeployment(withDeployment, { state: "deployed", deploymentId: 7 }, NOW, target.timeout).changed?.key).toBe("acme/web#7");
     // No key and more than one unsettled watch: nothing is picked.
     expect(reportDeployment(two, { state: "deployed" }, NOW, target.timeout).changed).toBeNull();
+  });
+});
+
+describe("confirming from a deployment read (BB-59)", () => {
+  it("applies the newest deployment for the target and records its facts", () => {
+    const deployments = recordMerged({}, observed(), target, NOW);
+    const read = [deployment({ id: 6, state: "failure", url: "https://example.test/6" }), deployment({ id: 7, state: "success" })];
+    const applied = applyDeploymentRead(deployments, target, read, NOW + 60_000);
+    expect(applied.changed).toEqual(["acme/web#7"]);
+    expect(applied.deployment).toMatchObject({ id: 7, state: "success" });
+    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentId: 7, deploymentState: "success", ref: "main", sha: "bbbbbbb2", url: "https://github.com/acme/bb-gate/actions/runs/9", deadlineAt: NOW + 60_000 + target.timeout });
+  });
+
+  it("treats a failed newest deployment as the failure it is", () => {
+    const deployments = recordMerged({}, observed(), target, NOW);
+    const applied = applyDeploymentRead(deployments, target, [deployment({ state: "failure", url: "https://example.test/12" })], NOW);
+    expect(applied.changed).toEqual(["acme/web#7"]);
+    expect(applied.deployments["acme/web#7"]).toMatchObject({ state: "failed", deploymentState: "failure", deadlineAt: null, note: "Deployment 7 reported failure" });
+  });
+
+  it("changes nothing when the target's environment has no deployments", () => {
+    const deployments = recordMerged({}, observed(), target, NOW);
+    expect(applyDeploymentRead(deployments, target, [], NOW)).toEqual({ deployments, changed: [], deployment: null });
+    expect(applyDeploymentRead(deployments, target, [deployment({ environment: "staging" })], NOW).changed).toEqual([]);
+  });
+
+  it("does not re-wake for a deployment it already recorded with the same state, but does for a new state", () => {
+    const first = applyDeploymentRead(recordMerged({}, observed(), target, NOW), target, [deployment({ state: "in_progress" })], NOW);
+    expect(first.changed).toEqual(["acme/web#7"]);
+    // The same deployment, same state: a repeat read is not news.
+    expect(applyDeploymentRead(first.deployments, target, [deployment({ state: "in_progress" })], NOW + 1000).changed).toEqual([]);
+    // The same deployment reaching success is news.
+    const second = applyDeploymentRead(first.deployments, target, [deployment({ state: "success" })], NOW + 2000);
+    expect(second.changed).toEqual(["acme/web#7"]);
+    expect(second.deployments["acme/web#7"]).toMatchObject({ state: "deploying", deploymentState: "success" });
+  });
+
+  it("never moves a watch backwards to an older deployment", () => {
+    const held = applyDeploymentRead(recordMerged({}, observed(), target, NOW), target, [deployment({ id: 9, state: "success" })], NOW).deployments;
+    expect(applyDeploymentRead(held, target, [deployment({ id: 7, state: "success" })], NOW + 1000).changed).toEqual([]);
+    expect(held["acme/web#7"]).toMatchObject({ deploymentId: 9 });
+  });
+
+  it("leaves a settled watch alone", () => {
+    const settled = applyDeployment(recordMerged({}, observed(), target, NOW), target, deployment(), NOW).deployments;
+    const done = reportDeployment(settled, { state: "deployed" }, NOW, target.timeout).deployments;
+    expect(applyDeploymentRead(done, target, [deployment({ id: 8, state: "success" })], NOW + 1000).changed).toEqual([]);
   });
 });
 

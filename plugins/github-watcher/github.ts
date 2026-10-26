@@ -542,3 +542,59 @@ export function parseDependabotAlerts(payload: unknown, repo: string): Dependabo
     updatedAt: a.updated_at ?? null,
   }));
 }
+
+// ---- deployments, for stewards ----------------------------------------------------
+
+/**
+ * The REST path for a repository's recent deployments, newest first. The
+ * environment is filtered client-side because GitHub's `environment` query is
+ * an exact match; a page of 100 is assumed wide enough that the newest
+ * deployment for any one environment sits in it, which holds while a repo
+ * does not interleave a busier second environment.
+ */
+export const deploymentsPath = (repo: string, perPage = 100): string => `/repos/${repo}/deployments?per_page=${perPage}`;
+
+/** The REST path for one deployment's statuses, newest first. */
+export const deploymentStatusesPath = (repo: string, id: number, perPage = 1): string => `/repos/${repo}/deployments/${id}/statuses?per_page=${perPage}`;
+
+const deploymentNode = z.object({
+  id: z.number(),
+  environment: z.string().nullish(),
+  ref: z.string().nullish(),
+  sha: z.string().nullish(),
+  url: z.string().nullish(),
+});
+
+/**
+ * The deployments GitHub returned, newest first. The list has no `state`;
+ * the latest status of each carries it, read separately.
+ */
+export function parseDeployments(payload: unknown): Array<{ id: number; environment: string; ref: string; sha: string; url: string | null }> {
+  const parsed = z.array(deploymentNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a deployment list");
+  return parsed.data.map((d) => ({ id: d.id, environment: d.environment ?? "", ref: d.ref ?? "", sha: d.sha ?? "", url: d.url ?? null })).sort((a, b) => b.id - a.id);
+}
+
+const deploymentStatusNode = z.object({
+  state: z.string(),
+  url: z.string().nullish(),
+  log_url: z.string().nullish(),
+  environment_url: z.string().nullish(),
+  target_url: z.string().nullish(),
+});
+
+/**
+ * The newest deployment status's state and the best link a person can open,
+ * exactly as bb-gate-hooks builds a `deployment` doorbell's `url`: the
+ * status's `log_url`, then `environment_url`, then `target_url`, then the
+ * status's own API URL; null when it set none (the caller then falls back to
+ * the deployment's API URL). "" state when no status has been reported.
+ */
+export function parseDeploymentStatus(payload: unknown): { state: string; url: string | null } {
+  const parsed = z.array(deploymentStatusNode).safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a deployment status list");
+  const status = parsed.data[0];
+  if (status === undefined) return { state: "", url: null };
+  const url = [status.log_url, status.environment_url, status.target_url, status.url].find((u): u is string => typeof u === "string" && u !== "") ?? null;
+  return { state: status.state, url };
+}

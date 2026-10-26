@@ -304,6 +304,26 @@ export const sourceContract = {
       errors: z.array(z.string()),
     }),
   },
+  /**
+   * A repository's recent GitHub Deployments for one environment, newest
+   * first, each with its latest status as `state` (BB-59). Stewards reads
+   * this to confirm a merge carried by a deployment that already exists, not
+   * only by a `deployment` doorbell; the plugin never evaluates the
+   * playbook's `carries` rule. Linear has no deployments and answers with an
+   * error. `limit` caps how many are returned.
+   */
+  sourceDeployments: {
+    input: z.object({
+      repo: z.string().min(1).max(200),
+      environment: z.string().min(1).max(200),
+      limit: z.number().int().min(1).max(100).default(10),
+    }),
+    output: z.object({
+      deployments: z.array(deploymentSchema),
+      /** Set when the repository could not be read (not visible, no access). */
+      error: z.string().nullable(),
+    }),
+  },
 } as const;
 
 // ---- what stewards serves ---------------------------------------------------

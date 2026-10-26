@@ -29,9 +29,13 @@ import {
   TARGET_QUERY,
   VIEWER_QUERY,
   dependabotAlertsPath,
+  deploymentStatusesPath,
+  deploymentsPath,
   graphql,
   kindName,
   parseDependabotAlerts,
+  parseDeploymentStatus,
+  parseDeployments,
   parseOpenPulls,
   parseRef,
   parseRefKey,
@@ -587,6 +591,42 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           }
         }
         return { viewer, alerts, errors };
+      },
+
+      // A repository's recent deployments, newest first, read with the token
+      // through the REST API (GraphQL does not expose deployments) and
+      // filtered to the requested environment here: GitHub's `environment`
+      // query is an exact match, while the playbook's environment and the
+      // doorbell path match ignoring case. Each deployment's latest status is
+      // its `state` and its `url`, as a `deployment` doorbell builds them; a
+      // repository the token cannot read is named in `error` rather than
+      // failing the call. Stewards uses this to confirm a merge carried by a
+      // deployment that already exists, not only by a doorbell (BB-59).
+      async sourceDeployments({ repo, environment, limit }) {
+        const parsed = parseRepo(repo);
+        if (parsed === null) return { deployments: [], error: `${repo}: not owner/repo` };
+        const name = `${parsed.owner}/${parsed.name}`;
+        try {
+          const page = await restPage(deploymentsPath(name), checkSignal());
+          const nodes = parseDeployments(page.body)
+            .filter((d) => d.environment.toLowerCase() === environment.toLowerCase())
+            .slice(0, limit);
+          const deployments: Deployment[] = [];
+          for (const node of nodes) {
+            const status = parseDeploymentStatus((await restPage(deploymentStatusesPath(name, node.id), checkSignal())).body);
+            deployments.push({
+              id: node.id,
+              environment: node.environment === "" ? environment : node.environment,
+              ref: node.ref,
+              sha: node.sha,
+              state: status.state,
+              url: status.url ?? node.url,
+            });
+          }
+          return { deployments, error: null };
+        } catch (error) {
+          return { deployments: [], error: `${repo}: ${errorMessage(error)}` };
+        }
       },
 
       // Replaces the previous set. Anything new is leased right away; what

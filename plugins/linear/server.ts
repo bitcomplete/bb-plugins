@@ -610,6 +610,11 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       async sourceDependabotAlerts() {
         return { viewer: null, alerts: [], errors: ["Dependabot alerts are read from github, not linear"] };
       },
+      // Deployments are a GitHub thing; linear has none. Stewards only asks
+      // github, so this is a plain answer rather than a throw.
+      async sourceDeployments() {
+        return { deployments: [], error: "deployments are read from github, not linear" };
+      },
       async sourceSetInterest({ units, entities }, { experimental_caller: caller }) {
         // The interest decides what this server leases and whom it rings, so
         // only stewards itself may set it; the app and the CLI are clients.

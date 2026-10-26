@@ -27,6 +27,8 @@ export const deploymentWatchSchema = z.object({
   repo: z.string(),
   environment: z.string(),
   deploymentId: z.number().int().nullable().default(null),
+  /** The deployment's own last status (success, failure, in_progress…), so a repeat read is not news. */
+  deploymentState: z.string().nullable().default(null),
   ref: z.string().nullable().default(null),
   sha: z.string().nullable().default(null),
   url: z.string().nullable().default(null),
@@ -66,6 +68,7 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
       repo: target.repo,
       environment: target.environment,
       deploymentId: null,
+      deploymentState: null,
       ref: null,
       sha: null,
       url: null,
@@ -102,6 +105,7 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
       ...watch,
       state: failed ? "failed" : "deploying",
       deploymentId: deployment.id,
+      deploymentState: deployment.state,
       ref: deployment.ref === "" ? null : deployment.ref,
       sha: deployment.sha === "" ? null : deployment.sha,
       url: deployment.url,
@@ -114,6 +118,51 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
     changed.push(watch.key);
   }
   return { deployments: next, changed };
+}
+
+/**
+ * Apply the newest deployment from a source read (BB-59). A merge carried by a
+ * deployment that already exists is confirmed on the steward's next read, not
+ * only by a doorbell, so a missed doorbell costs a sweep rather than the
+ * timeout. Unlike a doorbell, a read repeats what it finds: a deployment
+ * already recorded with the same state is not news, and a deployment older
+ * than the one a watch holds never moves it backwards. Returns the deployment
+ * that was news, or null when nothing changed.
+ */
+export function applyDeploymentRead(
+  deployments: Deployments,
+  target: Pick<DeploymentTarget, "repo" | "environment" | "timeout">,
+  read: readonly Deployment[],
+  now: number,
+): { deployments: Deployments; changed: string[]; deployment: Deployment | null } {
+  const latest = read.filter((d) => d.environment.toLowerCase() === target.environment.toLowerCase()).sort((a, b) => b.id - a.id)[0];
+  if (latest === undefined) return { deployments, changed: [], deployment: null };
+  const failed = latest.state === "failure" || latest.state === "error";
+  const next = { ...deployments };
+  const changed: string[] = [];
+  for (const watch of Object.values(next)) {
+    if (watch.state === "deployed" || watch.state === "failed") continue;
+    if (!matchesTarget(target, watch.repo, watch.environment)) continue;
+    if (latest.environment.toLowerCase() !== watch.environment.toLowerCase()) continue;
+    // The read repeats; the same deployment in the same state is not news.
+    if (watch.deploymentId === latest.id && watch.deploymentState === latest.state) continue;
+    // A read can only move a watch forward; an older deployment is stale.
+    if (watch.deploymentId !== null && latest.id < watch.deploymentId) continue;
+    next[watch.key] = {
+      ...watch,
+      state: failed ? "failed" : "deploying",
+      deploymentId: latest.id,
+      deploymentState: latest.state,
+      ref: latest.ref === "" ? null : latest.ref,
+      sha: latest.sha === "" ? null : latest.sha,
+      url: latest.url,
+      at: now,
+      deadlineAt: failed ? null : now + target.timeout,
+      note: failed ? `Deployment ${latest.id} reported ${latest.state}` : watch.note,
+    };
+    changed.push(watch.key);
+  }
+  return changed.length === 0 ? { deployments, changed, deployment: null } : { deployments: next, changed, deployment: latest };
 }
 
 /** The watches still awaiting a deployment whose deadline has passed. */

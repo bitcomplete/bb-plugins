@@ -745,6 +745,19 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   comment once every pull request is merged and deployed. A failure/error
   deployment or a timeout wakes the steward with the run URL. No `deployment`
   is exactly today's behaviour.
+- **A deployment that predates its watch is read, not waited for (BB-59).**
+  A doorbell can be missed, most obviously across the server restart every
+  `bb-plugins` merge causes, and a deployment that landed before the watch was
+  recorded never rings. So when a `merged` watch is first recorded, and on
+  every sweep for a watch still in `merged` or `deploying`, the plugin reads
+  the target repo's recent deployments for the playbook's environment through
+  the github plugin's source contract (`sourceDeployments`, never `gh` in the
+  server). The newest one is applied exactly as a doorbell would be: a success
+  moves the watch to `deploying` with its id, ref, sha and URL and wakes the
+  steward with the playbook's rule; a failure or error gives the failure wake.
+  A read that repeats what a watch already recorded is not news, so the sweep
+  does not re-wake for the same deployment. No deployments leaves the deadline
+  and the timeout path untouched. The plugin still never evaluates `carries`.
 - **Stages** — `spec`, `build`, `review` — are what the plugin acts on (the
   ready gate blocks `build`). State names are what a person sees.
 - **Validation.** Phases must be workflow states of every listed team, labels
@@ -1411,7 +1424,10 @@ own server behind bb-gate, so it is per developer in practice.
   deployment; a GitHub Deployment doorbell wakes the binding, and the steward
   decides from the playbook's rule whether it carries the merge. A project
   that names no target keeps "merged" as the terminal state and follows
-  through as before.
+  through as before. A deployment that already exists is read through the
+  github plugin's source contract on the first watch and on the sweep
+  (BB-59), so a missed doorbell costs a sweep, not the timeout; the read
+  never evaluates `carries`.
 - **One developer's server and machine watch production.** An ops binding
   runs on the server of the developer who runs the project's stewards, and
   looks with kubectl on their machine, as them, like everything else here

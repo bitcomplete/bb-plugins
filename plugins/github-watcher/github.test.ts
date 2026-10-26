@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDependabotAlerts, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -306,5 +306,30 @@ describe("Dependabot alerts", () => {
 
   it("throws on anything that is not an alert list", () => {
     expect(() => parseDependabotAlerts({ message: "Not Found" }, "Acme/Widgets")).toThrow(/Dependabot alert list/u);
+  });
+});
+
+describe("deployments", () => {
+  const node = (over: Record<string, unknown> = {}) => ({ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9", ...over });
+
+  it("reads a page newest first, tolerating a bare deployment", () => {
+    expect(parseDeployments([node({ id: 6 }), node({ id: 7 })])).toEqual([
+      { id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+      { id: 6, environment: "production", ref: "main", sha: "bbbbbbb2", url: "https://github.com/Acme/Widgets/actions/runs/9" },
+    ]);
+    expect(parseDeployments([node({ environment: null, ref: null, sha: null, url: null })])[0]).toEqual({ id: 7, environment: "", ref: "", sha: "", url: null });
+  });
+
+  it("throws on anything that is not a deployment list", () => {
+    expect(() => parseDeployments({ message: "Not Found" })).toThrow(/deployment list/u);
+  });
+
+  it("reads the newest status's state and the best link, with the doorbell's fallbacks", () => {
+    expect(parseDeploymentStatus([{ state: "success", log_url: "https://github.com/Acme/Widgets/actions/runs/9" }, { state: "in_progress" }])).toEqual({ state: "success", url: "https://github.com/Acme/Widgets/actions/runs/9" });
+    expect(parseDeploymentStatus([{ state: "success", environment_url: "https://preview.example.com/7" }])).toEqual({ state: "success", url: "https://preview.example.com/7" });
+    expect(parseDeploymentStatus([{ state: "failure", target_url: "https://target.example.com/7" }])).toEqual({ state: "failure", url: "https://target.example.com/7" });
+    expect(parseDeploymentStatus([{ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" }])).toEqual({ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" });
+    expect(parseDeploymentStatus([])).toEqual({ state: "", url: null });
+    expect(() => parseDeploymentStatus({ message: "Not Found" })).toThrow(/deployment status list/u);
   });
 });
