@@ -392,11 +392,86 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("opens the board for a row without choices", async () => {
+  it("opens the board for a row without choices, under a Details label", async () => {
     const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "configure", choices: [] })] }) });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Open" })).toBeTruthy());
-    fireEvent.click(slot.getByRole("button", { name: "Open" }));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Open" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Details" }));
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("offers Open the pull request, Approve and Details on an approve-pr row, with wrapped text", async () => {
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17", what: "Approve bitcomplete/bb-gate#17" })] }),
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Open the pull request" })).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Approve" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
+    const text = slot.getByText("Approve bitcomplete/bb-gate#17");
+    expect(text.className).not.toContain("truncate");
+    expect(text.className).toContain("break-words");
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the pull request's url from the row and makes no RPC", async () => {
+    const url = "https://github.com/bitcomplete/bb-gate/pull/17";
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url })] }),
+      stewardsNeedAction: () => ({ ok: true, message: "done" }),
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Open the pull request" })));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url }));
+    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsNeedAction")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("sends the approve action with no note or choice, and refetches on success", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      stewardsSidebar: () => {
+        calls += 1;
+        return sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] });
+      },
+      stewardsNeedAction: () => ({ ok: true, message: "approved" }),
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Approve" })));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "approve", note: null, choice: null } }));
+    await waitFor(() => expect(calls).toBe(2));
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the server's refusal in the row and re-enables the buttons", async () => {
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] }),
+      stewardsNeedAction: () => ({ ok: false, message: "the owner must approve first" }),
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Approve" })));
+    await waitFor(() => expect(slot.getByText("the owner must approve first")).toBeTruthy());
+    expect((slot.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("opens the board at the project from Details on an approve-pr row", async () => {
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] }),
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Details" })));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("labels the page button Details on every other row, with no Open label", async () => {
+    const items = [
+      needItem({ id: "need_merge", kind: "merge", url: "https://github.com/bitcomplete/bb-gate/pull/17" }),
+      needItem({ id: "need_secret", kind: "provide-secret", choices: [] }),
+      needItem({ id: "need_config", kind: "configure", choices: [] }),
+      needItem({ id: "need_decide", kind: "decide", choices: [] }),
+      questionItem({ id: "qst_1", choices: [] }),
+    ];
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: items.length, items }) });
+    await waitFor(() => expect(slot.getAllByRole("button", { name: "Details" })).toHaveLength(5));
+    expect(slot.queryByRole("button", { name: "Open" })).toBeNull();
     slot.lifecycle.unmount();
   });
 
