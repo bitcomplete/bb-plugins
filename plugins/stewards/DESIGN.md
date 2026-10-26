@@ -271,7 +271,10 @@ plugins.
   stays addressable, and the next wake reaches it. It is made visible again
   when it needs the user — the report puts the user next, an escalation is
   open, a question is unanswered, or a needs item is on the Stewards page —
-  and stays hidden across "nothing changed" wakes. Hiding cascades to the
+  and stays hidden across "nothing changed" wakes. A steward is shown again
+  when a worker of its binding starts or runs, so the sidebar's effort stays
+  rooted at it instead of dropping the worker to a bare row under Threads.
+  Hiding cascades to the
   steward's finished workers and their reviewers, so a row is not left
   behind without its steward; a running worker is unaffected, and showing the
   steward again shows them. The open-escalation rule stays. A report that
