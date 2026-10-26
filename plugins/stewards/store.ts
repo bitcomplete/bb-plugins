@@ -14,6 +14,7 @@ import { depsLookSchema, type DepsLook } from "./deps.js";
 import { deploymentsSchema, type Deployments } from "./deploy.js";
 import { opsLookSchema, type FingerprintRow, type OpsLook } from "./ops.js";
 import { sentryLookSchema, type SentryLook } from "./sentry.js";
+import type { GuidanceCitation } from "./guidance.js";
 
 // Append-only: bb.storage.migrate records each statement's hash and refuses a
 // changed one, so a schema change is a new statement at the end.
@@ -410,7 +411,27 @@ export const VALIDATION_MIGRATIONS = [
   `ALTER TABLE lessons ADD COLUMN validation_filed_at INTEGER`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS];
+// BB-35 step 6: the hand-written guidance's meter. One row per (project, unit,
+// binding): the distinct-binding count is the number of rows, and the newest
+// `last_cited_at` is when it was last cited. The unit's text is snapshotted so
+// the efficacy view can name a unit whose paragraph was later edited away. A
+// new table, so nothing existing is altered; a live database gains an empty
+// table and behaves exactly as before.
+export const GUIDANCE_MIGRATIONS = [
+  `CREATE TABLE IF NOT EXISTS guidance_citations (
+     project_id TEXT NOT NULL,
+     unit_id TEXT NOT NULL,
+     binding_id TEXT NOT NULL,
+     file TEXT NOT NULL,
+     text TEXT NOT NULL,
+     first_cited_at INTEGER NOT NULL,
+     last_cited_at INTEGER NOT NULL,
+     PRIMARY KEY (project_id, unit_id, binding_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS guidance_citations_project ON guidance_citations (project_id)`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -1112,6 +1133,16 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const markLessonValidationFiledStmt = db.prepare("UPDATE lessons SET validation_filed_at = ?, updated_at = ? WHERE id = ?");
   const countValidationsSinceStmt = db.prepare<[string, number], { n: number }>("SELECT COUNT(*) AS n FROM needs n JOIN bindings b ON b.id = n.binding_id WHERE b.project_id = ? AND n.kind = 'decide' AND json_extract(n.data, '$.validation') IS NOT NULL AND n.created_at >= ?");
   const openLessonValidationNeedStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM needs WHERE kind = 'decide' AND url = ? AND status = 'open' AND json_extract(data, '$.validation') IS NOT NULL LIMIT 1");
+  // BB-35 step 6: the hand-written guidance's citations, one row per (project,
+  // unit, binding), and the queries the efficacy view and the cluster linkage read.
+  const upsertGuidanceCitationStmt = db.prepare(
+    "INSERT INTO guidance_citations (project_id, unit_id, binding_id, file, text, first_cited_at, last_cited_at) VALUES (@project_id, @unit_id, @binding_id, @file, @text, @at, @at) ON CONFLICT(project_id, unit_id, binding_id) DO UPDATE SET file = excluded.file, text = excluded.text, last_cited_at = excluded.last_cited_at",
+  );
+  const guidanceCitationsForStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM guidance_citations WHERE project_id = ? ORDER BY last_cited_at DESC");
+  const escalationsForProjectStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? ORDER BY created_at");
+  const escalationsAskedNotGivenStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE binding_id = ? AND rationale_asked = 1 AND rationale_given = 0 ORDER BY created_at DESC");
+  const settleClusterRationaleStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE project_id = ? AND cluster_key = ?");
+  const lessonsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND cluster_key = ? AND tier != 'retired' ORDER BY created_at");
 
   const toNeed = (r: Record<string, unknown>): Need => ({
     id: String(r.id),
@@ -1962,6 +1993,41 @@ export function createStore(db: Database.Database, now: () => number, options: S
     openLessonValidationNeed(lessonId: string): Need | null {
       const r = openLessonValidationNeedStmt.get(lessonId);
       return r === undefined ? null : toNeed(r);
+    },
+
+    // the hand-written guidance's meter (BB-35 step 6)
+    /**
+     * Record the hand-written guidance units one decision cited. One row per
+     * (project, unit, binding): a second citation from the same binding
+     * refreshes `lastCitedAt` but does not add a hit, exactly as a lesson's
+     * `hits` counts distinct bindings. `bindingId` null is a project-level
+     * decision and counts once per project.
+     */
+    recordGuidanceCitations(projectId: string, units: ReadonlyArray<{ id: string; file: string; text: string }>, bindingId: string | null): number {
+      const at = now();
+      const key = bindingId ?? `project:${projectId}`;
+      for (const unit of units) upsertGuidanceCitationStmt.run({ project_id: projectId, unit_id: unit.id, binding_id: key, file: unit.file, text: unit.text, at });
+      return units.length;
+    },
+    /** Every guidance-unit citation of a project, newest first; the distinct-binding count is the rows per unit. */
+    guidanceCitations(projectId: string): GuidanceCitation[] {
+      return guidanceCitationsForStmt.all(projectId).map((r) => ({ unitId: String(r.unit_id), lastCitedAt: Number(r.last_cited_at) }));
+    },
+    /** Every escalation of a project, oldest first: the efficacy view's trend. */
+    escalationsForProject(projectId: string): Escalation[] {
+      return escalationsForProjectStmt.all(projectId).map(toEscalation);
+    },
+    /** A binding's escalations whose after-the-fact ask is still unanswered, newest first. */
+    escalationsAskedNotGiven(bindingId: string): Escalation[] {
+      return escalationsAskedNotGivenStmt.all(bindingId).map(toEscalation);
+    },
+    /** Settle a cluster for good: the user supplied reasoning in a thread, so a later page box is not asked. */
+    settleClusterRationale(projectId: string, clusterKey: string): void {
+      settleClusterRationaleStmt.run(projectId, clusterKey);
+    },
+    /** The lessons linked to a cluster, so a repeat is never asked about again. */
+    lessonsByCluster(projectId: string, clusterKey: string): Lesson[] {
+      return lessonsByClusterStmt.all(projectId, clusterKey).map(toLesson);
     },
 
     // project stewards

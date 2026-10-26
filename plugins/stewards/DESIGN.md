@@ -1361,6 +1361,27 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   cap and the silence default. A validation escalation is a `needs` item of
   kind `decide` whose `data.validation` names the condition, so it renders with
   the page's existing choices and writes only the lesson's own anchored text.
+- **Guidance-unit indexing and the efficacy view (BB-35 step 6).** The
+  hand-written guidance gets the same meter. Every paragraph of `AGENTS.md`
+  and the playbooks at `.bb` HEAD is a *guidance unit* keyed by a hash of its
+  own text (`gu_…`), read on demand and never stored: a citation names it in
+  `cites` alongside a lesson id, and the plugin counts distinct bindings and
+  `lastCitedAt` per unit (`guidance_citations`, one row per project, unit and
+  binding). A hand-written unit is never written or retired by the plugin;
+  only an anchored `<!-- lesson:<id> -->` block is ever auto-written or
+  auto-removed, and a retirement touches only that block. `bb stewards lessons
+  [--all]` shows each lesson's hits (distinct bindings), corrections and last
+  citation; `bb stewards lessons --efficacy` prints the project line —
+  escalations reaching the user per week, and the hand-written units uncited
+  for 90 days with a suggested removal. Nothing appears in the digest or on
+  the page beyond the collapsed block.
+- **The lesson settles the cluster it answers (BB-35 step 6).** A lesson the
+  project steward records from an escalation (or from the binding's
+  outstanding after-the-fact ask) carries that escalation's cluster key and
+  settles the cluster for good (`rationale_given` on every escalation of the
+  cluster). A much-later forward of the same wording under the same playbook
+  therefore gets no page box for a why the user already gave in the project
+  steward's thread — the suggestion step 4 deferred.
 - **The promotion and retirement write only the lesson's own anchored text.**
   A promotion the nightly pass queues is listed under `## Lessons to land`;
   the project steward adds the block (`<!-- lesson:<id> -->` and the wording)
@@ -1419,9 +1440,10 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 - **Surfaces.** Every lesson is in one collapsed details block at the bottom
   of the Stewards page's project tab, with counts by tier and the rows behind
   the disclosure (no buttons of its own; the boundary Merge / Drop stays the
-  need in "Waiting on you"); `bb stewards list` names the pending ones and
-  `bb stewards lessons [--all]` lists them all, `bb stewards drop-lesson <id>`
-  drops one.
+  need in "Waiting on you"); `bb stewards list` names the pending ones,
+  `bb stewards lessons [--all]` lists them all with their counts, and
+  `bb stewards lessons --efficacy` prints the escalation-to-user trend and the
+  uncited guidance units; `bb stewards drop-lesson <id>` drops one.
 - **Undo.** A merged procedure lesson is an ordinary commit on `.bb` HEAD;
   `bb stewards lessons --all` names its `mergeSha` and branch. To undo it,
   revert that commit in the canonical checkout (`git revert <sha>` in the

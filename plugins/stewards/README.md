@@ -306,9 +306,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   A user's answer to a forwarded escalation on the Stewards page (or from a
   thread) wakes the project steward with that answer as a lesson candidate: if
   it is a general judgement the playbook should carry, the project steward
-  records it as a lesson. A resolve carries `cites: [lesson ids]` — the
-  lessons it rested on — and the plugin counts `hits` (once per distinct
-  binding), `corrections` and `lastCitedAt`. A forwarded escalation the
+  records it as a lesson. A resolve carries `cites: [ids]` — the lessons (and
+  hand-written guidance units, below) it rested on — and the plugin counts
+  `hits` (once per distinct binding), `corrections` and `lastCitedAt`. A forwarded escalation the
   guidance did not settle (one the project steward did not name with `entry`)
   asks you why on the page, and so does a repeat the nightly pass clusters
   under one playbook; the box's one-line placeholder says which. It never
@@ -317,7 +317,15 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   words — the page answer or an unsigned comment — or this project's own
   steward or worker threads teach. When your answer contradicts the
   recommendation, the project steward is woken once, in its thread, to ask why.
-  `bb stewards lessons [--all]` lists tiers and counts, `bb stewards
+  `cites` may also name a hand-written guidance unit (`gu_…`, a paragraph of
+  `AGENTS.md` or a playbook keyed by a hash of its own text), counted the same
+  way; only an anchored `<!-- lesson:<id> -->` block is ever auto-written or
+  auto-removed, and a hand-written unit is never retired. A lesson recorded
+  from an after-the-fact thread follow-up settles that cluster for good, so the
+  same why is never asked on the page again. `bb stewards lessons [--all]`
+  lists tiers and counts with each lesson's hits, corrections and last
+  citation; `bb stewards lessons --efficacy` prints the escalation-to-user
+  trend and the hand-written units uncited for 90 days; `bb stewards
   drop-lesson <id>` drops one. The digest carries nothing about lessons.
   DESIGN.md §20.
 - **The nightly pass** (01:00 in the project's time zone by default, done by

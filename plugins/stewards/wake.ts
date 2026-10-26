@@ -481,7 +481,7 @@ export function formatWake(input: WakeInput): string {
     for (const x of open) out.push(`- ${x.id} (${x.kind}, with ${x.route === "me" ? "the user" : x.route === "steward" ? "you" : x.route === "parent" ? "your parent steward" : "the project steward"}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
     for (const { escalation: x, from } of input.routedToMe) {
       out.push(`- ${x.id} from ${from.entityKey} (${x.kind}) — routed to you: ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`);
-      out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids] }.");
+      out.push("  Decide it with steward_update { binding, guidance, resolve, cites: [lesson ids or guidance unit ids] }, or pass it up with steward_update { binding, forward, recommendation, cites: [lesson ids or guidance unit ids] }.");
     }
     out.push("", OPEN_REQUESTS_NOTE, "Asking for one that is already open counts like a missed report toward `stuck`.");
   }
@@ -899,7 +899,7 @@ function trialLessonsLines(lessons: Lesson[]): string[] {
     "",
     "## Lessons (trial)",
     "",
-    "Project rules that are not in `.bb` yet. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`.",
+    "Project rules that are not in `.bb` yet. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.",
     ...trial.map((l) => `- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`),
   ];
 }
@@ -915,7 +915,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   const out: string[] = [];
   const trial = lessons.filter((l) => l.tier === "trial").slice(0, cap);
   if (trial.length > 0) {
-    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`.");
+    out.push("", "## Lessons (trial)", "", "Project rules not yet in `.bb`. Decide from them, and cite the ones a decision rested on with `cites: [lesson ids]`. A decision from hand-written guidance may cite its unit id (`gu_…`) the same way.");
     for (const l of trial) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}`);
   }
   const toLand = lessons.filter((l) => l.tier === "promoted" && l.status === "pending");
@@ -982,7 +982,7 @@ export function formatProjectWake(input: {
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
-      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons it rested on with `cites: [lesson ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [lesson ids] }) only when it is one of these big decisions, and name the entry you matched with `entry: \"<the entry>\"` so the page knows not to ask why; a routine escalation the guidance did not settle is forwarded without `entry`, and the page asks the user why:",
+      "Decide each from the project's guidance (AGENTS.md, architecture and design docs) with steward_update { binding, guidance, resolve }, citing the lessons or hand-written guidance units it rested on with `cites: [ids]` — a decision must cite what it was decided from. Forward one to the user (steward_update { binding, forward, recommendation, cites: [ids] }) only when it is one of these big decisions, and name the entry you matched with `entry: \"<the entry>\"` so the page knows not to ask why; a routine escalation the guidance did not settle is forwarded without `entry`, and the page asks the user why:",
       "",
       ...input.bigDecisions.map((d) => `- ${d.text}${d.decide === "user" ? " [user]" : " [project]"}`),
       "",
@@ -1023,7 +1023,7 @@ export function formatProjectWake(input: {
   if (withUser.length > 0) {
     out.push("## Escalations with the user", "");
     for (const { escalation: x, from } of withUser) out.push(`- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)}${x.recommendation === null ? "" : ` Your recommendation: ${x.recommendation}`}`);
-    out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve, cites: [lesson ids] }, citing the lessons the decision rested on.", "");
+    out.push("", "When the user answers one — here, or on the entity itself — record it with steward_update { binding, guidance, resolve, cites: [ids] }, citing the lessons or hand-written guidance units the decision rested on.", "");
   }
   const questions = input.questions ?? [];
   if (questions.length > 0) {

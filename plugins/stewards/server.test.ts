@@ -6,6 +6,7 @@ import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { guidanceUnitId } from "./guidance.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS } from "./store.js";
@@ -5684,13 +5685,14 @@ describe("the rationale box (BB-35 step 4)", () => {
     const { esc: ownerEsc } = await escalateAndForward(owner);
     owner.entities.set("uuid-12", issue({ comments: [comment({ author: "Jane", body: "Actually, keep SSO.", signedBy: null })] }));
     await owner.ring("linear", "uuid-12");
-    expect(owner.hooks.store.escalation(ownerEsc)).toMatchObject({ rationaleWanted: expect.stringMatching(/went against/u), rationaleAsked: false });
+    expect(owner.hooks.store.escalation(ownerEsc)).toMatchObject({ rationaleWanted: expect.stringMatching(/went against/u), rationaleAsked: false, clusterKey: expect.any(String) });
 
     const other = await adopted();
     const { esc: otherEsc } = await escalateAndForward(other);
     other.entities.set("uuid-12", issue({ comments: [comment({ author: "Sam", body: "Actually, keep SSO.", signedBy: null })] }));
     await other.ring("linear", "uuid-12");
-    expect(other.hooks.store.escalation(otherEsc)).toMatchObject({ rationaleWanted: null, rationaleAsked: false });
+    // A non-owner's words teach nothing: no ask, and no cluster for a lesson to settle.
+    expect(other.hooks.store.escalation(otherEsc)).toMatchObject({ rationaleWanted: null, rationaleAsked: false, clusterKey: null });
   });
 
   it("shows every lesson with its tier and the counts by tier on the board", async () => {
@@ -5700,6 +5702,84 @@ describe("the rationale box (BB-35 step 4)", () => {
     const b = await t.board();
     expect(b.lessonCounts).toEqual({ candidate: 0, trial: 1, promoted: 0, retired: 1 });
     expect(b.lessons).toMatchObject([{ text: "A rule.", tier: "trial" }, { text: "An old rule.", tier: "retired" }]);
+  });
+});
+
+describe("guidance units and the efficacy view (BB-35 step 6)", () => {
+  const client = { experimental_caller: { kind: "client" } } as const;
+  async function adopted() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const board = async () =>
+      (
+        (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as {
+          board: { questions: Array<{ id: string; rationaleWanted: string | null }> };
+        }
+      ).board!;
+    return { ...t, project, steward, board };
+  }
+  /** A decision escalation on ENG-12 the project steward forwards to the user. */
+  async function forward(t: Awaited<ReturnType<typeof adopted>>): Promise<{ esc: string; question: string }> {
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc, recommendation: "Leave SSO out." }, t.project);
+    return { esc, question: /(qst_[\w-]+)/u.exec(out.text)![1]! };
+  }
+
+  it("cites a hand-written guidance unit by its content hash, and reports an unknown one", async () => {
+    const t = await adopted();
+    const text = "A new column read with SELECT * breaks the previous image.";
+    t.files["AGENTS.md"] = `# Guidance\n\n${text}\n`;
+    const unitId = guidanceUnitId(text);
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, t.steward);
+    const esc = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text)![1]!;
+    const out = await t.tool("steward_update", { binding: "ENG-12", guidance: "SSO is out.", resolve: esc, cites: [unitId, "gu_ffffffffffffffff"] }, t.project);
+    expect(out.text).toMatch(new RegExp(`cited 1 guidance unit: ${unitId} \\(AGENTS\\.md\\)`, "u"));
+    expect(out.text).toMatch(/not counted \(no such guidance unit at .bb HEAD\): gu_ffffffffffffffff/u);
+    expect(t.hooks.store.guidanceCitations("p1")).toEqual([{ unitId, lastCitedAt: expect.any(Number) }]);
+  });
+
+  it("prints the escalation trend and the uncited guidance units", async () => {
+    const t = await adopted();
+    const cited = "Cited recently.";
+    const uncited = "Nothing cites this yet.";
+    t.files["AGENTS.md"] = `# Guidance\n\n${cited}\n\n${uncited}\n`;
+    // One forwarded decision (its escalation and the page's question are one
+    // item), and one unit cited so it is not uncited.
+    await forward(t);
+    t.hooks.store.recordGuidanceCitations("p1", [{ id: guidanceUnitId(cited), file: "AGENTS.md", text: cited }], null);
+    const out = await t.harness.behavior.runCli(["lessons", "--efficacy", "--project", "p1"]);
+    expect(out.stdout).toMatch(/Escalations reaching the user, per week/u);
+    expect(out.stdout).toContain(guidanceUnitId(uncited));
+    expect(out.stdout).toMatch(/\(never cited\)/u);
+    expect(out.stdout).not.toContain(guidanceUnitId(cited));
+    const json = await t.harness.behavior.runCli(["lessons", "--efficacy", "--json", "--project", "p1"]);
+    const parsed = JSON.parse(json.stdout) as { weeks: Array<{ count: number }>; uncited: Array<{ id: string; file: string }> };
+    // The forwarded escalation and its question are one user-facing item, not two.
+    expect(parsed.weeks.at(-1)!.count).toBe(1);
+    expect(parsed.uncited.filter((u) => u.file === "AGENTS.md").map((u) => u.id)).toEqual([guidanceUnitId(uncited)]);
+  });
+
+  it("settles a cluster from the after-the-fact thread follow-up, so a much-later page box is not asked", async () => {
+    const t = await adopted();
+    const first = await forward(t);
+    // The answer contradicts the recommendation with no rationale: the project
+    // steward is woken once to ask why in its thread.
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: first.question, answer: "Actually, include SSO." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    expect(t.hooks.store.escalation(first.esc)).toMatchObject({ rationaleAsked: true, rationaleGiven: false, clusterKey: expect.any(String) });
+    // The project steward records the reasoning as a lesson for the binding.
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: "SSO belongs to the plugin.", file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const lessonId = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    const cluster = t.hooks.store.escalation(first.esc)!.clusterKey!;
+    expect(t.hooks.store.lesson(lessonId)).toMatchObject({ clusterKey: cluster });
+    expect(t.hooks.store.lessonsByCluster("p1", cluster).map((l) => l.id)).toContain(lessonId);
+    expect(t.hooks.store.escalationsByCluster("p1", cluster).every((x) => x.rationaleGiven)).toBe(true);
+    // A much-later forward of the same wording under the same playbook gets no box.
+    const second = await forward(t);
+    expect((await t.board()).questions.find((q) => q.id === second.question)!.rationaleWanted).toBeNull();
   });
 });
 
