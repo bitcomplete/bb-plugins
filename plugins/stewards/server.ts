@@ -2658,7 +2658,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function finishEnding(b: Binding, reason: string): Promise<void> {
       b = store.patch(b.id, { ending: null, endingAt: null, followThrough: null, followThroughUntil: null, endedAt: now(), endReason: reason, awaitingReport: false, requeueAt: null });
-      for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.");
+      // Mechanical cleanup, not a decision: the origin binding has ended, so
+      // resolve its escalations without queuing a wake it would never read
+      // (BB-60).
+      for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The binding ended.", "plugin", false);
       await releaseBehind(b, `ended (${reason})`);
       await stopWorkers(b);
       const info = b.threadId === null ? null : await threadInfo(b.threadId).catch(() => null);
@@ -3664,13 +3667,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b === null) return;
       if (b.endedAt !== null) {
         // The binding ended while this turn was running: finishEnding left the
-        // archive to this idle. Once only, so a later turn the owner starts in
-        // the ended steward is not archived under them.
+        // archive to this idle. Clear the flag only once the archive actually
+        // happens, so a thread still busy here (or an archive that fails) is
+        // retried on the next idle rather than never archived (BB-60).
         if (b.archiveWhenIdle) {
-          store.patch(b.id, { archiveWhenIdle: false });
           const info = await threadInfo(thread.id).catch(() => null);
           if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
-            await quietly(`archive ${b.entityKey}'s ended steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+            try {
+              await bb.sdk.threads.archive({ threadId: info.id });
+              store.patch(b.id, { archiveWhenIdle: false });
+            } catch (error) {
+              bb.log.warn(`stewards: could not archive ${b.entityKey}'s ended steward: ${errorMessage(error)}`);
+            }
           }
         }
         return;
@@ -4780,9 +4788,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const config = await loadConfig(b.projectId);
           const playbook = config === null ? null : bindingPlaybook(config, b);
           const priorGate = playbook !== null && playbook.ready !== null ? gateState(playbook, priorReady, priorSnapshot === null ? (priorReady.approval?.specHash ?? "") : specHashFor(b, priorSnapshot.entity)) : null;
+          // A terminal binding that raises an escalation, or already has one
+          // open, keeps the binding open on that question: the report must not
+          // reset its follow-through to null, or the plugin ends the binding,
+          // auto-resolves the escalation and leaves the user's question
+          // unanswered (BB-60).
+          const openBeforeReport = b.ending === "terminal" ? store.openEscalations(b.id) : [];
+          const escalationFollowThrough = b.ending !== "terminal" ? null : (input.escalate?.question ?? openBeforeReport[0]?.question ?? null);
+          const followThrough = input.followThrough ?? escalationFollowThrough;
           // Follow-through has one deadline from when it was first declared; a
           // requeue past it is a requeue at it.
-          const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (input.followThrough === undefined ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
+          const followThroughUntil = b.ending !== "terminal" ? null : (b.followThroughUntil ?? (followThrough === null ? null : now() + (playbook?.followThroughMs ?? DEFAULT_FOLLOW_THROUGH_MS)));
           const requeueMs = Math.min(input.requeueAfter ?? playbook?.requeueDefaultMs ?? 2 * 86_400_000, followThroughUntil === null ? Infinity : Math.max(60_000, followThroughUntil - now()));
           let ready = b.ready;
           if (input.ready !== undefined) {
@@ -4880,7 +4896,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
             ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
-            ...(b.ending === "terminal" ? { followThrough: input.followThrough ?? null, followThroughUntil } : {}),
+            ...(b.ending === "terminal" ? { followThrough, followThroughUntil } : {}),
           });
           const requested = playbook === null ? null : await syncApprovalRequest(b, playbook);
           const scheduling = playbook === null ? null : await syncScheduleRequest(b, playbook);
@@ -5581,23 +5597,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function flushDeliveries(): Promise<void> {
       for (const d of store.pendingDeliveries()) {
         const origin = d.originBindingId === null ? null : store.binding(d.originBindingId);
-        try {
-          if (origin !== null && origin.threadId !== null && origin.threadId === d.originThreadId) {
-            const config = await loadConfig(origin.projectId);
-            const playbook = config === null ? null : bindingPlaybook(config, origin);
-            let observed: Observed | null = origin.lastSnapshot;
-            if (observed === null && origin.source !== "ops") {
-              const entity = await snapshot(origin.source, origin.entityId).catch(() => null);
-              if (entity !== null) observed = { entity, pulls: [] };
+        // A binding the plugin already ended is not woken for an answer to an
+        // escalation it resolved on the way out (BB-60).
+        if (origin === null || origin.endedAt === null) {
+          try {
+            if (origin !== null && origin.threadId !== null && origin.threadId === d.originThreadId) {
+              const config = await loadConfig(origin.projectId);
+              const playbook = config === null ? null : bindingPlaybook(config, origin);
+              let observed: Observed | null = origin.lastSnapshot;
+              if (observed === null && origin.source !== "ops") {
+                const entity = await snapshot(origin.source, origin.entityId).catch(() => null);
+                if (entity !== null) observed = { entity, pulls: [] };
+              }
+              if (config !== null && playbook !== null && observed !== null) {
+                await wake(origin, config, playbook, observed, [`Escalation ${d.escalationId} was answered by ${d.decidedBy}: ${d.text}`], "changed");
+              }
+            } else if (d.originThreadId !== null) {
+              await sendTo(d.originThreadId, `An escalation you raised was answered by ${d.decidedBy}: ${d.text}`);
             }
-            if (config !== null && playbook !== null && observed !== null) {
-              await wake(origin, config, playbook, observed, [`Escalation ${d.escalationId} was answered by ${d.decidedBy}: ${d.text}`], "changed");
-            }
-          } else if (d.originThreadId !== null) {
-            await sendTo(d.originThreadId, `An escalation you raised was answered by ${d.decidedBy}: ${d.text}`);
+          } catch (error) {
+            bb.log.warn(`stewards: could not deliver an answer to ${d.originThreadId ?? d.originBindingId ?? "?"}: ${errorMessage(error)}`);
           }
-        } catch (error) {
-          bb.log.warn(`stewards: could not deliver an answer to ${d.originThreadId ?? d.originBindingId ?? "?"}: ${errorMessage(error)}`);
         }
         store.markDeliveryDone(d.id);
       }
