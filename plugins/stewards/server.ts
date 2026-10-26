@@ -6544,24 +6544,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           needs: cliCommand({
-            summary: "Things waiting on the user: links and the action each supports",
-            description: "The same items as the Stewards page's \"Waiting on you\" section. `done <id>` closes one from a thread.",
-            options: { all: { type: "boolean", description: "Include closed items" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            summary: "Things waiting on the user: open questions, escalations with the user, then needs",
+            description: "The same items as the Stewards page's \"Waiting on you\" section and the sidebar, in the same order: open questions, route-`me` escalations no question or need covers, then needs. Each line ends with the `bb stewards done` command that answers it.",
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const projectId = projectOf(input.options.project, ctx);
-              const rows = input.options.all ? store.allNeedsForProject(projectId) : store.openNeedsForProject(projectId);
-              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
-              if (rows.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
-              return {
-                exitCode: 0,
-                stdout: rows
-                  .map((n) => {
-                    const b = store.binding(n.bindingId);
-                    const view = b === null ? null : needView(n, b);
-                    return `${n.id} — ${n.kind}, ${b?.entityKey ?? n.bindingId}: ${n.what}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` (${n.url})`}${view !== null && !view.actionable ? ` [not actionable: ${view.why}]` : ""}`;
-                  })
-                  .join("\n"),
-              };
+              // One builder for the three surfaces, so the CLI, the page and the
+              // sidebar cannot drift (BB-69).
+              const { questions, withUser, needs } = needsYou(projectId);
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ questions, withUser, needs }) };
+              if (questions.length + withUser.length + needs.length === 0) return { exitCode: 0, stdout: "Nothing is waiting on the user." };
+              const oneLine = (text: string) => text.replace(/\s+/gu, " ").trim();
+              const done = (id: string, choices: readonly string[]) => `bb stewards done ${id}${choices.length === 0 ? "" : ` --choice "<label>"`}`;
+              const lines = [
+                ...questions.map((q) => `${q.id} — question, ${q.key ?? "project"}: ${oneLine(q.question)}${choicesNote(q.choices)} — ${done(q.id, q.choices)}`),
+                ...withUser.map((x) => `${x.id} — ${x.kind} escalation, ${x.key}: ${oneLine(x.question)} — ${done(x.id, [])}`),
+                ...needs.map((n) => `${n.id} — ${n.kind}, ${n.key}: ${oneLine(n.what)}${choicesNote(n.choices)}${n.url === null ? "" : ` (${n.url})`}${n.actionable ? "" : ` [not actionable: ${n.why ?? "unknown"}]`} — ${done(n.id, n.choices)}`),
+              ];
+              return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
 

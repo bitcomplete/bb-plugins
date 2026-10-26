@@ -378,7 +378,7 @@ project.
 | `bb stewards spawn-flags [<binding>] [--project <id>]` | The full runnable `bb thread spawn …` command for a steward's workers, from the playbook's `models.worker` and the project environment |
 | `bb stewards list [--all] [--json]` | Bindings and their status records |
 | `bb stewards show <ENG-12 \| owner/repo#3 \| k8s-namespace/name>` | One binding in full: gate, guidance, escalations, needs, workers, fingerprints |
-| `bb stewards needs [--all] [--json]` | What waits on the user, with links and the action each supports |
+| `bb stewards needs [--json]` | What waits on the user, in the sidebar's order: open questions, escalations with the user, then needs; each line ends with the `bb stewards done` command that answers it |
 | `bb stewards done <need_… \| qst_…> [--choice <label>] [--note <text>]` | Close a waiting item from a thread; `--choice` records the label the user gave in chat (it must be one of the item's choices) and saves it as guidance; an `approve-spec` item records the approval on the gate and resolves its escalation; wakes the steward with it |
 | `bb stewards detach <key>` | One stop turn; stays detached until the label is removed and re-added |
 | `bb stewards secret import --from <dotenv> --setting <name>` | A requester thread's own command: read a dotenv on its machine into a declared secret setting and delete the file |
