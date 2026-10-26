@@ -445,25 +445,45 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("sends a question's choice through stewardsAnswerQuestion with the page's arguments", async () => {
+  it("renders only Details for a question with choices, never the choices", async () => {
     const slot = await renderSidebar({
       stewardsSidebar: () => sidebarData({ count: 1, items: [questionItem({ choices: ["Merge", "Close"] })] }),
       stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
-    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Merge" } }));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Merge" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Close" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Details" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsAnswerQuestion")).toBe(false);
     slot.lifecycle.unmount();
   });
 
-  it("sends a decide need's choice through stewardsNeedAction with the page's arguments", async () => {
+  it("renders only Details for a decide need with choices, never the choices", async () => {
     const slot = await renderSidebar({
       stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ choices: ["Hold", "Start"] })] }),
       stewardsNeedAction: () => ({ ok: true, message: "done" }),
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Hold" })).toBeTruthy());
-    fireEvent.click(slot.getByRole("button", { name: "Hold" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "choose", note: null, choice: "Hold" } }));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
+    expect(slot.queryByRole("button", { name: "Hold" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Start" })).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Details" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsNeedAction")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("offers Merge, Open the pull request and Details on a merge row, and sends the merge action", async () => {
+    const url = "https://github.com/bitcomplete/bb-gate/pull/17";
+    const slot = await renderSidebar({
+      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "merge", url })] }),
+      stewardsNeedAction: () => ({ ok: true, message: "merged" }),
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Open the pull request" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "merge", note: null, choice: null } }));
     slot.lifecycle.unmount();
   });
 
@@ -538,14 +558,13 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
 
   it("labels the page button Details on every other row, with no Open label", async () => {
     const items = [
-      needItem({ id: "need_merge", kind: "merge", url: "https://github.com/bitcomplete/bb-gate/pull/17" }),
       needItem({ id: "need_secret", kind: "provide-secret", choices: [] }),
       needItem({ id: "need_config", kind: "configure", choices: [] }),
       needItem({ id: "need_decide", kind: "decide", choices: [] }),
       questionItem({ id: "qst_1", choices: [] }),
     ];
     const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: items.length, items }) });
-    await waitFor(() => expect(slot.getAllByRole("button", { name: "Details" })).toHaveLength(5));
+    await waitFor(() => expect(slot.getAllByRole("button", { name: "Details" })).toHaveLength(4));
     expect(slot.queryByRole("button", { name: "Open" })).toBeNull();
     slot.lifecycle.unmount();
   });

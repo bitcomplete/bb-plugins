@@ -1064,22 +1064,23 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
 
 /**
  * One item in the sidebar's "Needs you" block: the key, one line of text, and
- * the fixed choices as buttons. A choice writes through the page's own RPC; a
- * row without choices (or a provide-secret item) opens the board, where the
- * free-text answer or the secret form lives.
+ * Details, which opens the board at the project. The board carries the full
+ * question, its context and its choices, so a `question` or `decide` row does
+ * not render them here. An `approve-pr` or `merge` row keeps its one-click
+ * button — the server re-checks the gate before acting — beside Open the pull
+ * request; every other row opens the page.
  */
 function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedItem; onChanged: () => void; onOpenBoard: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  // Choices are a decide item's or a question's; every other item opens the page.
-  const choices = item.type === "question" ? item.choices : item.type === "need" && item.kind === "decide" ? item.choices : [];
   const text = item.type === "need" ? item.what : item.question;
   const entityUrl = item.type === "need" ? item.entityUrl : item.url;
   const prUrl = item.url;
-  // An approve-pr row offers the page's one-click approval and the pull
-  // request beside Details; every other row without choices opens the page.
+  // approve-pr and merge are the mechanical items the server verifies before
+  // acting; every other row opens the page.
   const isApprovePr = item.type === "need" && item.kind === "approve-pr";
+  const isMerge = item.type === "need" && item.kind === "merge";
   const run = (call: Promise<{ ok: boolean; message: string }>) => {
     setState("running");
     call.then(
@@ -1090,13 +1091,8 @@ function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedIte
       (e: unknown) => setState({ error: message(e) }),
     );
   };
-  const choose = (choice: string) =>
-    run(
-      item.type === "question"
-        ? rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice })
-        : rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice }),
-    );
   const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
+  const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
   return (
     <li className="flex flex-col gap-1 px-2 py-1.5">
       <p className="flex flex-wrap items-center gap-2">
@@ -1106,7 +1102,7 @@ function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedIte
       </p>
       <p className={isApprovePr ? "min-w-0 break-words" : "min-w-0 truncate"}>{text}</p>
       <div className="flex flex-wrap items-center gap-1">
-        {isApprovePr ? (
+        {isApprovePr || isMerge ? (
           <>
             {prUrl !== null ? (
               <button
@@ -1121,26 +1117,14 @@ function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedIte
               type="button"
               disabled={state === "running"}
               className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50"
-              onClick={approve}
+              onClick={isApprovePr ? approve : merge}
             >
-              Approve
+              {isApprovePr ? "Approve" : "Merge"}
             </button>
             <button type="button" className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover" onClick={onOpenBoard}>
               Details
             </button>
           </>
-        ) : choices.length > 0 ? (
-          choices.map((choice) => (
-            <button
-              key={choice}
-              type="button"
-              disabled={state === "running"}
-              className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50"
-              onClick={() => choose(choice)}
-            >
-              {choice}
-            </button>
-          ))
         ) : (
           <button type="button" className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover" onClick={onOpenBoard}>
             Details

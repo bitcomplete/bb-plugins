@@ -401,16 +401,18 @@ plugins baked into the `bb-server` image.)
 **The Needs you block and the picker badge (BB-46).** The project dropdown
 shows each project's count in its option label and the summed count in a small
 pill beside it. Above **In flight**, a **Needs you** block lists one row per
-item: the entity key opens the entity, one line of what, and a question's or
-`decide` item's fixed `choices` as small buttons. A choice makes the same
-write the page does (`stewardsAnswerQuestion` for a question,
-`stewardsNeedAction { action: "choose" }` for a `decide` item) and refetches.
-An `approve-pr` row carries the page's three actions: **Open the pull
-request** opens the item's `url`, **Approve** makes the page's one-click
-approval (`stewardsNeedAction { action: "approve" }`, no confirmation, the
-server's refusal shown in the row), and **Details** opens the Stewards page at
-that project; its text wraps so the repository, number and title are readable.
-Every other row's page button is **Details** too: a row without choices, or a
+item: the entity key opens the entity, one line of what, and **Details**, which
+opens the Stewards page at that project. A question's or `decide` item's fixed
+`choices` are not rendered here: the page shows the full question, its context
+and the choices, so a one-line row never asks the user to pick blind. An
+`approve-pr` row carries the page's three actions: **Open the pull request**
+opens the item's `url`, **Approve** makes the page's one-click approval
+(`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
+refusal shown in the row), and **Details** opens the Stewards page at that
+project; its text wraps so the repository, number and title are readable. A
+`merge` row adds **Merge** (`stewardsNeedAction { action: "merge" }`, the gate
+re-checked server-side) beside **Open the pull request** and **Details**. Every
+other row's page button is **Details** too: a row without choices, or a
 `provide-secret` item, opens the Stewards page at that project. The block and
 the board page read one server function
 (`needsYou`), so the sidebar and the page can never disagree; a
