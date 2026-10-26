@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -431,6 +431,25 @@ describe("the pull request gate (build-tickets)", () => {
     expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review"), later] }, green)).missing).toMatch(/reviewer verdict: changes-requested/u);
     // Checks failing on the head close it whatever the marker says.
     expect(prGate(pull({ comments: [marker(earlier, "approved", "no-review")] }, { checks: { state: "failure", failing: ["ci"] } })).missing).toMatch(/checks failure/u);
+  });
+
+  it("reads a malformed later marker as a round that is not approved, never as the earlier approval (bb-plugins#88)", () => {
+    // The reviewer's round 2 on bb-plugins#88 was `<!-- bb-review round=2 sha=S changes-requested -->`:
+    // no `verdict=`, no `lane=`. Skipping it would make round 1's `approved` the latest word
+    // and file an approve-pr item for the owner on a head the reviewer had just rejected.
+    const bad = comment({ id: "m-bad", author: "trotterdylan", body: "<!-- bb-review round=2 sha=ccccccc3 changes-requested -->\n\n## Review round 2", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:30:00Z" });
+    expect(reviewMarker(bad.body)).toEqual({ round: 2, sha: "ccccccc3", verdict: "changes-requested", lane: null });
+    const gate = prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), bad] }, green));
+    expect(gate).toMatchObject({ gateMet: false, needsOwnerApproval: false, lane: null, missing: "reviewer verdict: changes-requested" });
+    // A marker with nothing readable at all still closes the gate, in the owner's lane.
+    const empty = comment({ id: "m-empty", author: "trotterdylan", body: "<!-- bb-review -->", signedBy: "thr_reviewer", createdAt: "2026-10-14T16:40:00Z" });
+    expect(reviewMarker(empty.body)).toEqual({ round: 0, sha: "", verdict: UNREADABLE_VERDICT, lane: null });
+    expect(prGate(pull({ comments: [marker(head, "approved", "no-review"), empty] }, green))).toMatchObject({ gateMet: false, needsOwnerApproval: false, missing: `reviewer verdict: ${UNREADABLE_VERDICT}` });
+    // A marker that names no lane is not a lane change.
+    expect(markerLaneChange([marker(head, "approved", "owner-reviewed")], [marker(head, "approved", "owner-reviewed"), bad])).toBeNull();
+    // Keys in another order, or a verdict that is not approved, still read.
+    expect(reviewMarker("<!-- bb-review lane=no-review verdict=approved sha=abc round=3 -->")).toEqual({ round: 3, sha: "abc", verdict: "approved", lane: "no-review" });
+    expect(reviewMarker("<!-- bb-reviewer round=1 -->")).toBeNull();
   });
 
   it("waits on the owner in the owner-reviewed lane, and closes once they approve", () => {
