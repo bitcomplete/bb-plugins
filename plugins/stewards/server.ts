@@ -3667,14 +3667,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (b === null) return;
       if (b.endedAt !== null) {
         // The binding ended while this turn was running: finishEnding left the
-        // archive to this idle. Clear the flag only when the archive actually
-        // happens, so a thread still busy here is retried on the next idle (or
-        // the ten-minute sweep) rather than never archived (BB-60).
+        // archive to this idle. Clear the flag only once the archive actually
+        // happens, so a thread still busy here (or an archive that fails) is
+        // retried on the next idle rather than never archived (BB-60).
         if (b.archiveWhenIdle) {
           const info = await threadInfo(thread.id).catch(() => null);
           if (info !== null && info.deletedAt === null && info.archivedAt === null && !busy(info.status)) {
-            store.patch(b.id, { archiveWhenIdle: false });
-            await quietly(`archive ${b.entityKey}'s ended steward`, () => bb.sdk.threads.archive({ threadId: info.id }));
+            try {
+              await bb.sdk.threads.archive({ threadId: info.id });
+              store.patch(b.id, { archiveWhenIdle: false });
+            } catch (error) {
+              bb.log.warn(`stewards: could not archive ${b.entityKey}'s ended steward: ${errorMessage(error)}`);
+            }
           }
         }
         return;
