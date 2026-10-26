@@ -1472,19 +1472,22 @@ user already looks, so what waits on them is shown there, not only on the
 Stewards page. The project dropdown carries each project's count in its option
 label and the summed count in a pill beside it. Above In flight, a **Needs you**
 block lists one row per item
-with the entity key (opening the entity), one line of text, and a question's
-or `decide` item's fixed `choices` as small buttons. A choice makes exactly
-the write the page makes (`stewardsAnswerQuestion` with `answer: null` for a
-question, `stewardsNeedAction { action: "choose" }` for a `decide` item) and
-refetches. An `approve-pr` row carries the page's three actions — **Open the
-pull request** (`navigate.openUrl` on the item's `url`), **Approve**
+with the entity key (opening the entity), one line of text, and **Details**,
+which opens the board at that project. A question's or `decide` item's fixed
+`choices` are not rendered here: the board carries the full question, its
+context and the choices, so a truncated one-line row never asks the user to
+pick blind. An `approve-pr` row carries the page's actions — **Open the pull
+request** (`navigate.openUrl` on the item's `url`), **Approve**
 (`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
 refusal shown in the row) and **Details** (the board at that project) — and
 its text wraps instead of truncating, so the repository, number and title are
-readable before the click. Every other row's page button is **Details** too: a
-row without choices, or a `provide-secret` item, opens the Stewards page at
-that project, where the free-text answer and the secret form live. The block
-adds no write path the page does not already make.
+readable before the click. A `merge` row adds **Merge**
+(`stewardsNeedAction { action: "merge" }`, the lane gate re-checked
+server-side) beside **Open the pull request** and **Details**. Every other
+row's page button is **Details** too: a row without choices, or a
+`provide-secret` item, opens the Stewards page at that project, where the
+free-text answer and the secret form live. The block adds no write path the
+page does not already make.
 
 **One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
 })` builds the board's `questions`, `withUser` and `needs` lists in one place;
@@ -1492,7 +1495,8 @@ the board calls it unfiltered and the sidebar calls it with `actionableOnly`,
 so the two surfaces cannot drift and a non-actionable need is on the page but
 not in the sidebar's count or items. `stewardsSidebar` carries, per project,
 `needs: { count, items }` with the same row shapes, each tagged
-`question`/`withUser`/`need` so the app knows which RPC a choice calls.
+`question`/`withUser`/`need` so the app knows how to render the row and which
+one-click action it carries.
 
 **Realtime, not the poll.** The store takes an optional
 `onNeedsYouChange(projectId)` callback, wired in `server.ts` to
