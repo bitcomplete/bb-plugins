@@ -1315,9 +1315,10 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   (`clusterKey` normalises the wording; the playbook keeps kinds apart). It
   never asks on a `bigDecisions` kind the project could never decide, on a
   credential or a plain step, or on a gate item (`approve-pr`, `merge`,
-  `approve-spec`); and one cluster is never asked twice (`rationale_asked`).
-  An empty box is always accepted, and the answer rides with the lesson
-  candidate the project steward is woken for. When the user's answer
+  `approve-spec`); and one cluster is never asked twice — a supplied rationale
+  (`rationale_given`) settles it for good, while an empty box leaves it open
+  for a later repeat. An empty box is always accepted, and the answer rides
+  with the lesson candidate the project steward is woken for. When the user's answer
   contradicts the recommendation, the plugin sets the after-the-fact ask and
   the project steward is woken once, in its thread, to ask why — one follow-up,
   never repeated. Only the owner's words (the page answer or an unsigned

@@ -5384,7 +5384,7 @@ describe("the rationale box (BB-35 step 4)", () => {
     expect(t.hooks.store.escalation(esc)).toMatchObject({ rationaleWanted: expect.stringMatching(/went against/u), rationaleAsked: true });
   });
 
-  it("asks why on a nightly-clustered repeat, and never twice for one cluster", async () => {
+  it("asks why on a nightly-clustered repeat, and one cluster is asked once", async () => {
     const t = await adopted();
     await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
     await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
@@ -5404,6 +5404,48 @@ describe("the rationale box (BB-35 step 4)", () => {
     expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: qs[1]!.id, answer: "Yes.", rationale: "Auth is the plugin's." }, client)).toMatchObject({ ok: true });
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.project).at(-1)!.text).toMatch(/Auth is the plugin's\./u);
+  });
+
+  it("puts at most one box on a cluster, however many open questions it holds", async () => {
+    const t = await adopted();
+    for (let i = 0; i < 3; i += 1) await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const qs = (await t.board()).questions;
+    expect(qs.map((q) => q.rationaleWanted)).toEqual([null, expect.stringMatching(/reached you before/u), null]);
+  });
+
+  it("never asks a cluster again once a rationale was supplied, even after the boxed question closed", async () => {
+    const t = await adopted();
+    const first = await escalateAndForward(t);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qid(first.out.text), answer: "Keep SSO.", rationale: "The plugin owns auth." }, client)).toMatchObject({ ok: true });
+    expect(t.hooks.store.escalation(first.esc)).toMatchObject({ rationaleGiven: true });
+    // A later forward of the same wording under the same playbook does not ask again.
+    const second = await escalateAndForward(t);
+    expect((await t.board()).questions.find((q) => q.id === t.qid(second.out.text))!.rationaleWanted).toBeNull();
+  });
+
+  it("does not also ask the after-the-fact follow-up when the box already collected the reasoning", async () => {
+    const t = await adopted();
+    const { esc, out } = await escalateAndForward(t);
+    expect(await t.harness.callRpc("stewardsAnswerQuestion", { questionId: t.qid(out.text), answer: "Actually, include SSO.", rationale: "The plugin owns auth." }, client)).toMatchObject({ ok: true });
+    await t.flush();
+    const wake = t.sends.filter((s) => s.threadId === t.project).at(-1)!.text;
+    expect(wake).toMatch(/The plugin owns auth\./u);
+    expect(wake).not.toMatch(/one follow-up/u);
+    expect(t.hooks.store.escalation(esc)).toMatchObject({ rationaleGiven: true, rationaleWanted: null });
+  });
+
+  it("marks a boxed question asked when it is closed from a thread", async () => {
+    const t = await adopted();
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.tool("steward_update", { ask: { question: "Include SSO?" } }, t.project);
+    await t.hooks.nightlyPass("p1", "2026-10-18");
+    await t.flush();
+    const boxed = (await t.board()).questions[1]!;
+    expect(boxed.rationaleWanted).not.toBeNull();
+    await t.harness.behavior.runCli(["done", boxed.id, "--project", "p1"]);
+    expect(t.hooks.store.question(boxed.id)).toMatchObject({ status: "answered", rationaleAsked: true, rationaleGiven: false });
   });
 
   it("sets the after-the-fact ask from the owner's own unsigned comment, never from someone else's", async () => {

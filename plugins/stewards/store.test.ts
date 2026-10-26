@@ -326,27 +326,31 @@ describe("the rationale migration (BB-35 step 4)", () => {
 
   it("is additive and lossless: an existing escalation keeps its values and reads as not asked", () => {
     const s = createStore(legacy(), () => 2000);
-    expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", route: "me", status: "open", rationaleWanted: null, rationaleAsked: false, clusterKey: null });
+    expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", route: "me", status: "open", rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null });
   });
 
   it("keeps every escalation column, dropping nothing", () => {
     const db = legacy();
     const columns = (db.prepare("PRAGMA table_info(escalations)").all() as Array<{ name: string }>).map((c) => c.name);
-    expect(columns).toEqual(expect.arrayContaining(["id", "binding_id", "kind", "question", "meanwhile", "route", "recommendation", "choices", "status", "resolution", "created_at", "resolved_at", "cited_lessons", "corrections_counted", "rationale_wanted", "rationale_asked", "cluster_key"]));
+    expect(columns).toEqual(expect.arrayContaining(["id", "binding_id", "kind", "question", "meanwhile", "route", "recommendation", "choices", "status", "resolution", "created_at", "resolved_at", "cited_lessons", "corrections_counted", "rationale_wanted", "rationale_asked", "rationale_given", "cluster_key"]));
   });
 
-  it("sets, clears and records the ask without disturbing the other columns", () => {
+  it("sets, clears and records the ask and the supplied rationale without disturbing the other columns", () => {
     const s = createStore(legacy(), () => 2000);
     s.setEscalationRationale("esc_1", "why");
     s.setEscalationCluster("esc_1", "cluster");
-    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: "why", rationaleAsked: false, clusterKey: "cluster", question: "Include SSO?" });
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: "why", rationaleAsked: false, rationaleGiven: false, clusterKey: "cluster", question: "Include SSO?" });
     s.markEscalationRationaleAsked("esc_1");
-    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true });
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: false });
+    // Supplying reasoning also marks it asked, so the two can never disagree.
+    s.markEscalationRationaleGiven("esc_1");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: true });
     s.setEscalationRationale("esc_1", null);
-    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: null, rationaleAsked: true, clusterKey: "cluster" });
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleWanted: null, rationaleAsked: true, rationaleGiven: true, clusterKey: "cluster" });
     // A second set is stable, so the migration's values never drift on a re-run.
     s.markEscalationRationaleAsked("esc_1");
-    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true });
+    s.markEscalationRationaleGiven("esc_1");
+    expect(s.escalation("esc_1")).toMatchObject({ rationaleAsked: true, rationaleGiven: true });
   });
 });
 

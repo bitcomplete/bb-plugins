@@ -386,13 +386,16 @@ export const FINISHED_AND_DIGEST_MIGRATIONS = [
 
 // BB-35 step 4: the rationale box. `rationale_wanted` is the one-line why the
 // page shows above the box, or null when it must not ask; `rationale_asked`
-// records that the box (or the after-the-fact follow-up) was shown once, so one
-// cluster is never asked twice; `cluster_key` groups a repeat escalation with
-// the earlier one the nightly pass clustered it against. Additive and
-// defaulted: an escalation from before this step behaves as before.
+// records that the box (or the after-the-fact follow-up) was shown once;
+// `rationale_given` records that the user actually supplied reasoning, which
+// settles the cluster for good (an empty box leaves it open for a later
+// repeat); `cluster_key` groups a repeat escalation with the earlier one the
+// nightly pass clustered it against. Additive and defaulted: an escalation
+// from before this step behaves as before.
 export const RATIONALE_MIGRATIONS = [
   `ALTER TABLE escalations ADD COLUMN rationale_wanted TEXT`,
   `ALTER TABLE escalations ADD COLUMN rationale_asked INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE escalations ADD COLUMN rationale_given INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE escalations ADD COLUMN cluster_key TEXT`,
 ];
 
@@ -720,6 +723,8 @@ export type Escalation = {
   rationaleWanted: string | null;
   /** True once the rationale box or the after-the-fact follow-up has been shown, so a cluster is asked once. */
   rationaleAsked: boolean;
+  /** True once the user supplied reasoning, which settles the cluster for good (an empty box does not). */
+  rationaleGiven: boolean;
   /** The cluster a repeat escalation belongs to, or null (BB-35 step 4). */
   clusterKey: string | null;
 };
@@ -757,6 +762,10 @@ export type Question = {
   resolvedAt: number | null;
   /** Why the page shows a rationale box, or null when it must not (BB-35 step 4). */
   rationaleWanted: string | null;
+  /** True once the box (or a thread close) has shown the ask for this question. */
+  rationaleAsked: boolean;
+  /** True once the user supplied reasoning for this question (BB-35 step 4). */
+  rationaleGiven: boolean;
 };
 
 /** The kinds of thing that can wait on the user, from the ticket's table. */
@@ -1016,6 +1025,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     correctionsCounted: Number(r.corrections_counted ?? 0) === 1,
     rationaleWanted: r.rationale_wanted === null || r.rationale_wanted === undefined ? null : String(r.rationale_wanted),
     rationaleAsked: Number(r.rationale_asked ?? 0) === 1,
+    rationaleGiven: Number(r.rationale_given ?? 0) === 1,
     clusterKey: r.cluster_key === null || r.cluster_key === undefined ? null : String(r.cluster_key),
   });
   const toQuestion = (r: Record<string, unknown>): Question => {
@@ -1034,6 +1044,8 @@ export function createStore(db: Database.Database, now: () => number, options: S
       createdAt: e.createdAt,
       resolvedAt: e.resolvedAt,
       rationaleWanted: e.rationaleWanted,
+      rationaleAsked: e.rationaleAsked,
+      rationaleGiven: e.rationaleGiven,
     };
   };
   const insertNeed = db.prepare(
@@ -1071,6 +1083,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   // the cluster a repeat belongs to.
   const setEscalationRationaleStmt = db.prepare("UPDATE escalations SET rationale_wanted = ? WHERE id = ?");
   const markEscalationRationaleAskedStmt = db.prepare("UPDATE escalations SET rationale_asked = 1 WHERE id = ?");
+  const markEscalationRationaleGivenStmt = db.prepare("UPDATE escalations SET rationale_given = 1, rationale_asked = 1 WHERE id = ?");
   const setEscalationClusterStmt = db.prepare("UPDATE escalations SET cluster_key = ? WHERE id = ?");
   const openUserEscalationsStmt = db.prepare<[string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND route = 'me' AND status = 'open' ORDER BY created_at");
   const escalationsByClusterStmt = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM escalations WHERE project_id = ? AND cluster_key = ? ORDER BY created_at");
@@ -1886,6 +1899,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Record that the box (or the after-the-fact follow-up) has been shown, so one cluster is asked once. */
     markEscalationRationaleAsked(id: string): void {
       markEscalationRationaleAskedStmt.run(id);
+    },
+    /** Record that the user supplied reasoning, which settles the cluster for good. */
+    markEscalationRationaleGiven(id: string): void {
+      markEscalationRationaleGivenStmt.run(id);
     },
     /** Record the cluster a repeat escalation belongs to (BB-35 step 4). */
     setEscalationCluster(id: string, clusterKey: string | null): void {
