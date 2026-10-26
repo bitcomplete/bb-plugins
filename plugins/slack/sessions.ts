@@ -17,11 +17,6 @@ export const sessionRecordSchema = z.object({
   threadId: z.string().nullable(),
   /** The bb project the thread was placed in, for its link. */
   projectId: z.string().nullable(),
-  /**
-   * The channel the assistant pane last said the user was viewing, for a DM's
-   * map lookup. Null until an `assistant_thread_context_changed` names one.
-   */
-  contextChannel: z.string().nullable().default(null),
   /** When the latest wake arrived, for expiry. */
   eventAt: z.number(),
   /** How many wakes this conversation has had; each needs its own reply. */
@@ -88,14 +83,11 @@ export function clipSessionText(text: string): string {
   return text.length > SESSION_TEXT_CHARS ? `${text.slice(0, SESSION_TEXT_CHARS - 40)}\n… (cut; the rest is in Slack)` : text;
 }
 
-// ---- the channel → project map --------------------------------------------
-
-/** The reserved channel-map key for a direct message with the app. */
-export const DM_CHANNEL = "dm";
+// ---- the routing map -------------------------------------------------------
 
 /**
- * One entry of the channel map: a Slack channel id (`C…`/`G…`), never a name,
- * and a bb project name. The reserved key `dm` is the direct message.
+ * One entry of the routing map: a Slack channel id (`C…`/`G…`), never a name,
+ * and a bb project name.
  */
 export const channelEntrySchema = z.object({
   channel: z.string().trim().min(1).max(200),
@@ -104,11 +96,39 @@ export const channelEntrySchema = z.object({
 export type ChannelEntry = z.infer<typeof channelEntrySchema>;
 
 /**
- * Parse the channel map setting: a JSON array of `{channel, project}`. Junk is
- * dropped rather than failing a wake, so a hand-edited value can never stop a
- * message. Later entries win over earlier ones for the same key.
+ * The routing map: a mention in a mapped channel starts its thread in that
+ * channel's project; everything else, DMs included, starts in `fallback`. The
+ * fallback may name no project (or one this server does not have), in which
+ * case `chooseProject`'s personal-or-first rule applies; the editor asks for a
+ * fallback when it is empty.
  */
-export function parseChannelMap(raw: string | null | undefined): ChannelEntry[] {
+export const channelMapSchema = z.object({
+  fallback: z.string().trim().max(200).default(""),
+  channels: z.array(channelEntrySchema).default([]),
+});
+export type ChannelMap = z.infer<typeof channelMapSchema>;
+
+/** Parse a stored map; junk becomes the empty map rather than failing a wake. */
+export function parseChannelMap(raw: unknown): ChannelMap {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return { fallback: "", channels: [] };
+  const record = raw as Record<string, unknown>;
+  const fallback = typeof record.fallback === "string" ? record.fallback.trim().slice(0, 200) : "";
+  const channels: ChannelEntry[] = [];
+  if (Array.isArray(record.channels)) {
+    for (const item of record.channels) {
+      const entry = channelEntrySchema.safeParse(item);
+      if (entry.success) channels.push(entry.data);
+    }
+  }
+  return { fallback, channels };
+}
+
+/**
+ * Parse the old `channels` setting: a JSON array of `{channel, project}`. Junk
+ * is dropped rather than failing the one-time migration, so a hand-edited value
+ * can never stop a start.
+ */
+export function parseLegacyChannelEntries(raw: string | null | undefined): ChannelEntry[] {
   if (raw === null || raw === undefined || raw.trim() === "") return [];
   let parsed: unknown;
   try {
@@ -125,19 +145,31 @@ export function parseChannelMap(raw: string | null | undefined): ChannelEntry[] 
   return out;
 }
 
-/** Whether a map key is the reserved direct-message key (case-insensitive). */
-function isDmKey(value: string): boolean {
-  return value.toLowerCase() === DM_CHANNEL;
+/** The old reserved direct-message key, dropped by the migration. */
+function isLegacyDmKey(value: string): boolean {
+  return value.trim().toLowerCase() === "dm";
+}
+
+/**
+ * The routing map the old settings become. The old `dm` entry is the fallback,
+ * because DMs are the main traffic and it wins over the old `project` setting
+ * when both name one; without it the old project setting is the fallback. The
+ * `dm` entry is dropped from the channels, since the fallback is its own field
+ * now.
+ */
+export function channelMapFromLegacy(entries: ChannelEntry[], project: string | null | undefined): ChannelMap {
+  return {
+    fallback: entries.find((entry) => isLegacyDmKey(entry.channel))?.project ?? (project ?? "").trim(),
+    channels: entries.filter((entry) => !isLegacyDmKey(entry.channel)),
+  };
 }
 
 /**
  * The project name the map gives a channel, or null when it has no entry. A
- * channel id is matched exactly (it is an id, so a rename does not move it);
- * the reserved `dm` key ignores case.
+ * channel id is matched exactly (it is an id, so a rename does not move it).
  */
 export function channelProject(entries: ChannelEntry[], channel: string): string | null {
-  const wanted = isDmKey(channel);
-  return entries.find((entry) => (wanted ? isDmKey(entry.channel) : entry.channel === channel))?.project ?? null;
+  return entries.find((entry) => entry.channel === channel)?.project ?? null;
 }
 
 /** A bb project, as the map names it. */
@@ -164,30 +196,26 @@ export function chooseProject(projects: Project[], chosen: string): Project | nu
 }
 
 /**
- * The project a Slack conversation starts its thread in. A channel uses the
- * map by its own channel id, then the default; the reserved `dm` entry is for
- * a direct message with the app, so it is never consulted for a channel. A DM
- * uses the map by its channel id, then the channel the assistant pane was
- * showing (its remembered context), then the `dm` entry, then the default. An
- * entry naming a project this server does not have is skipped, so the same map
- * works on every server. With an empty map this is exactly `chooseProject`.
+ * The project a Slack conversation starts its thread in. A mention in a mapped
+ * channel uses that channel's project; everything else, DMs included, uses the
+ * fallback. An entry or fallback naming a project this server does not have is
+ * skipped, so the same map works on every server; with no fallback this is
+ * exactly `chooseProject`'s personal-or-first rule.
  */
 export function chooseConversationProject(
   projects: Project[],
-  entries: ChannelEntry[],
-  defaultProject: string,
+  map: ChannelMap,
   channel: string,
-  contextChannel: string | null,
-  directMessage: boolean,
+  mention: boolean,
 ): Project | null {
-  for (const key of directMessage ? [channel, contextChannel, DM_CHANNEL] : [channel]) {
-    if (key === null || key === "") continue;
-    const name = channelProject(entries, key);
-    if (name === null) continue;
-    const found = findProject(projects, name);
-    if (found !== null) return found;
+  if (mention) {
+    const name = channelProject(map.channels, channel);
+    if (name !== null) {
+      const found = findProject(projects, name);
+      if (found !== null) return found;
+    }
   }
-  return chooseProject(projects, defaultProject);
+  return chooseProject(projects, map.fallback);
 }
 
 // ---- held requests ---------------------------------------------------------
