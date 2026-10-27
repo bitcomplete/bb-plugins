@@ -409,8 +409,9 @@ empty red ring when blocked, a blue ring that pulses slowly while a worker or
 reviewer runs (CSS only, off under `prefers-reduced-motion`), and an empty grey
 ring when quiet. One-off threads use the same four glyphs — yellow when unread,
 blue animated while their agent runs, grey otherwise — except a draft, which
-keeps bb's own glyph. An `ops` binding that needs you or is blocked moves from
-Monitors into Blocked.
+keeps bb's own glyph. A worker or reviewer child row under an effort, and a
+one-off thread's children, share those glyphs and carry no role tag. An `ops`
+binding that needs you or is blocked moves from Monitors into Blocked.
 
 **The needs-you items and the picker count (BB-46).** The project dropdown
 shows each project's count in its option label, counting the yellow effort

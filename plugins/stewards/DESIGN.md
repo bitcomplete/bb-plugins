@@ -1501,8 +1501,10 @@ blocked (`blockedOn`, a hold or `stuck`), a blue ring that pulses slowly while
 a worker or reviewer runs, and an empty grey ring when quiet. The pulse is CSS
 only and stops under `prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
 when unread, blue animated while their agent runs, grey otherwise — except a
-draft, which keeps bb's own `ThreadStatusGlyph`. The project steward footer
-row is the grey ring.
+draft, which keeps bb's own `ThreadStatusGlyph`. A worker or reviewer child row
+under an effort, and a one-off thread's own children, use those same one-off
+glyphs and carry no role tag; the indent is the only sign of the role. The
+project steward footer row is the grey ring.
 
 **The status phrase (BB-76).** First match wins: `needs you`; `blocked on
 <blockedOn>`; `held behind <holdBehind keys>` when `holdBehind` is non-empty,

@@ -1118,7 +1118,6 @@ function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
 /** One thread row: a glyph, title and context menu, expanding into its children. */
 function SidebarThreadRow({
   thread,
-  role,
   children,
   depth,
   byId,
@@ -1136,7 +1135,9 @@ function SidebarThreadRow({
   meta?: ReactNode;
   /** The full binding key, kept on the row's `title` attribute when the row is an effort. */
   titleAttr?: string;
-  /** The four-glyph component for a one-off thread or the project steward row; drafts keep bb's glyph. */
+  /** The four-glyph component every thread row gets: a one-off thread or its
+   * child, an effort's worker/reviewer child, or the project steward row;
+   * drafts keep bb's glyph. */
   glyph?: SidebarEffortState;
 }) {
   const navigate = useBbNavigate();
@@ -1182,11 +1183,6 @@ function SidebarThreadRow({
           >
             <ThreadTitle threadId={thread.id} />
           </a>
-          {role === "worker" || role === "reviewer" ? (
-            <span className="shrink-0 rounded bg-state-hover px-1 text-[9px] font-semibold uppercase leading-4 text-muted-foreground" title={role}>
-              {role === "worker" ? "W" : "R"}
-            </span>
-          ) : null}
           {meta}
         </div>
       </ThreadActionsContextMenu>
@@ -1195,7 +1191,7 @@ function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} />
             );
           })}
         </ul>
@@ -1354,7 +1350,7 @@ function SidebarEffortRow({
           {effort.children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} />
             );
           })}
         </ul>

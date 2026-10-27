@@ -218,11 +218,11 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows workers and reviewers only when the effort is expanded, as muted W/R tags", async () => {
+  it("shows workers and reviewers only when the effort is expanded, with no role tag and the one-off glyphs", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
-        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" }), thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" })],
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry", status: "active" }), thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" })],
       },
       rpc: {
         stewardsSidebar: () =>
@@ -235,10 +235,57 @@ describe("the stewards sidebar list (BB-44)", () => {
     expect(slot.queryByText("Implement retry")).toBeNull();
     fireEvent.click(slot.getByRole("button", { name: /Expand ENG-1: Fix login/u }));
     await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
-    expect(slot.getByTitle("worker").textContent).toBe("W");
+    // No W/R badge: nothing in the row names the role.
+    expect(slot.queryByTitle("worker")).toBeNull();
+    expect(slot.queryByTitle("reviewer")).toBeNull();
+    // The busy worker pulses blue; the quiet reviewer is a grey ring.
+    expect(glyphOf(slot, "Implement retry")).toBe("running");
     fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
     await waitFor(() => expect(slot.getByText("Review the PR")).toBeTruthy());
-    expect(slot.getByTitle("reviewer").textContent).toBe("R");
+    expect(glyphOf(slot, "Review the PR")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  it("gives worker, reviewer and one-off child rows the same one-off glyphs", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_unread_worker", displayTitle: "Unread worker", isUnread: true }),
+          thread({ id: "thr_busy_reviewer", displayTitle: "Busy reviewer", parentThreadId: "thr_unread_worker", status: "active" }),
+          thread({ id: "thr_parent", displayTitle: "One-off parent" }),
+          thread({ id: "thr_idle_child", displayTitle: "Idle child", parentThreadId: "thr_parent" }),
+          thread({ id: "thr_draft_child", displayTitle: "Draft child", parentThreadId: "thr_parent", indicator: "draft" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({
+                workers: [{ threadId: "thr_unread_worker", title: "Unread worker", status: "finished" }],
+                reviewers: [{ threadId: "thr_busy_reviewer", workerThreadId: "thr_unread_worker" }],
+              }),
+            ],
+          }),
+      } as never,
+    });
+    // An unread worker is the yellow dot even with no running worker; its busy
+    // reviewer is the pulsing blue ring.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Expand ENG-1: Fix login/u })));
+    await waitFor(() => expect(slot.getByText("Unread worker")).toBeTruthy());
+    expect(glyphOf(slot, "Unread worker")).toBe("you");
+    fireEvent.click(slot.getByRole("button", { name: /Expand Unread worker/u }));
+    await waitFor(() => expect(slot.getByText("Busy reviewer")).toBeTruthy());
+    expect(glyphOf(slot, "Busy reviewer")).toBe("running");
+    // A one-off thread's children share the glyphs: idle grey, draft bb's own.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Expand One-off parent/u })));
+    await waitFor(() => expect(slot.getByText("Idle child")).toBeTruthy());
+    expect(glyphOf(slot, "Idle child")).toBe("quiet");
+    expect(glyphOf(slot, "Draft child")).toBeNull();
+    expect(slot.container.querySelector('[data-thread-status-glyph="draft"]')).not.toBeNull();
     slot.lifecycle.unmount();
   });
 
