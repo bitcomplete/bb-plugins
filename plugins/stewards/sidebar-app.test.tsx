@@ -443,14 +443,16 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     // Monitors holds the ops wait, grey, once opened.
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
+    // Threads holds the one-off thread.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    await waitFor(() => expect(slot.getByText("One-off")).toBeTruthy());
+    // Both collapsibles now show their rows in their own sections.
     const monitors = slot.getByRole("button", { name: /Monitors/u }).closest("section")!;
     expect(monitors.textContent).toContain("Ops watch: acme/web");
     expect(glyphOf(slot, "Ops watch: acme/web")).toBe("quiet");
     expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · waiting on Next scheduled look");
-    // Threads holds the one-off thread.
-    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
-    await waitFor(() => expect(slot.getByText("One-off")).toBeTruthy());
-    expect(slot.getByRole("button", { name: /Threads/u }).closest("section")!.textContent).toContain("One-off");
+    const threads = slot.getByRole("button", { name: /Threads/u }).closest("section")!;
+    expect(threads.textContent).toContain("One-off");
     slot.lifecycle.unmount();
   });
 
