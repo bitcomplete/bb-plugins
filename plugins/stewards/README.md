@@ -370,9 +370,42 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 ## The sidebar thread list and its toggle
 
 BB-44 registers a replacement for bb's own sidebar thread list through the
-exclusive `experimental_threadList` slot: one project dropdown,
-in-flight efforts grouped by the steward relationship, and collapsed Watches
-and Recently ended rows. BB-45 makes it switchable from where you are.
+exclusive `experimental_threadList` slot: one project dropdown, two-line
+effort rows with the four glyphs, and the **Blocked**, **In flight**,
+**Threads**, **Monitors** and **Recently ended** sections. BB-45 makes it
+switchable from where you are.
+
+**The row and the glyphs (BB-76).** An effort row is two lines: the glyph, the
+entity key in bold and the title on line one; the kind (`ticket`, `pull
+request`, `review`, `ops`), the entity's phase when it has one, and the status
+phrase on line two. A row that needs you adds its prompt and one-click actions
+under line two, in the same row. The glyph is one of four, in precedence order
+`you › blocked › running › quiet`: a solid yellow dot when it waits on you, an
+empty red ring when blocked, a blue ring that pulses slowly while a worker or
+reviewer runs (CSS only, off under `prefers-reduced-motion`), and an empty grey
+ring when quiet. One-off threads use the same four glyphs — yellow when unread,
+blue animated while their agent runs, grey otherwise — except a draft, which
+keeps bb's own glyph. An `ops` binding that needs you or is blocked moves from
+Monitors into Blocked.
+
+**The needs-you items and the picker count (BB-46).** The project dropdown
+shows each project's count in its option label, counting the yellow effort
+rows. A needs-you effort shows the question or need's text and its one-click
+actions inline under line two: a fixed-choice question answers through
+`stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
+{ action: "choose" }`, an `approve-pr` row carries **Open PR** / **Approve** /
+**Details**, a `merge` row **Open PR** / **Merge** / **Details**, and every
+other row opens the Stewards page with **Details**. The actions make the same
+RPC calls the board does, the server's refusal is shown in the row, and the
+row refetches on success. The items come from `stewardsSidebar` and each
+carries the binding's entity key as `bindingKey`, so a row owns its item; a
+project-level question with no binding has no row and stays on the Stewards
+page. The plugin publishes `needs-you-changed { projectId }` on its realtime
+channel whenever a question is opened or answered, an escalation is filed with
+or forwarded to the user or resolved, a need is filed, updated or closed, or a
+binding ends or reopens — including from a steward's own tools — so every open
+sidebar and the board page refresh within seconds. The half-minute poll stays
+as the fallback.
 
 **The footer toggle.** A `ShieldCheck` icon in the sidebar footer (next to
 Settings) opens a small panel above the footer row with a **Stewards
@@ -397,32 +430,6 @@ reads the preference and, when it is unset or `__automatic__`, sets it to
 is left alone. The write is best-effort: a failure is logged and the sidebar
 keeps working. (`bb.onInstall` is not usable here; it does not run for
 plugins baked into the `bb-server` image.)
-
-**The Needs you block and the picker badge (BB-46).** The project dropdown
-shows each project's count in its option label and the summed count in a small
-pill beside it. Above **In flight**, a **Needs you** block lists one row per
-item: the entity key opens the entity, one line of what, and **Details**, which
-opens the Stewards page at that project. A question's or `decide` item's fixed
-`choices` are not rendered here: the page shows the full question, its context
-and the choices, so a one-line row never asks the user to pick blind. An
-`approve-pr` row carries the page's three actions: **Open the pull request**
-opens the item's `url`, **Approve** makes the page's one-click approval
-(`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
-refusal shown in the row), and **Details** opens the Stewards page at that
-project; its text wraps so the repository, number and title are readable. A
-`merge` row adds **Merge** (`stewardsNeedAction { action: "merge" }`, the gate
-re-checked server-side) beside **Open the pull request** and **Details**. Every
-other row's page button is **Details** too: a row without choices, or a
-`provide-secret` item, opens the Stewards page at that project. The block and
-the board page read one server function
-(`needsYou`), so the sidebar and the page can never disagree; a
-non-actionable need is on the page but not in the sidebar. The count and the
-items come from `stewardsSidebar`; the plugin publishes
-`needs-you-changed { projectId }` on its realtime channel whenever a question
-is opened or answered, an escalation is filed with or forwarded to the user
-or resolved, a need is filed, updated or closed, or a binding ends or reopens
-— including from a steward's own tools — so every open sidebar and the board
-page refresh within seconds. The half-minute poll stays as the fallback.
 
 **Per client or per server?** Checked on a dev server: the preference is
 **server-synced**, so a flip is per server, not per browser. Every open

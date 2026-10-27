@@ -3193,14 +3193,20 @@ describe("the stewards sidebar call", () => {
         key: string;
         kind: string;
         stage: string | null;
+        phase: string | null;
         threadId: string | null;
         hold: string | null;
+        holdBehind: string[];
         blockedOn: string | null;
         needsUser: boolean;
+        stuck: boolean;
+        status: { actor: string; nextAction: string; at: number } | null;
+        deployment: string | null;
         advancedAt: number | null;
-        workers: Array<{ threadId: string; title: string }>;
+        workers: Array<{ threadId: string; title: string; status: string }>;
         reviewers: Array<{ threadId: string; workerThreadId: string }>;
       }>;
+      needs: { count: number; items: Array<{ type: string; id: string; bindingKey: string | null }> };
       ended: Array<{ key: string; kind: string; threadId: string | null; title: string | null; endedAt: number }>;
     }>;
   };
@@ -3226,6 +3232,42 @@ describe("the stewards sidebar call", () => {
       },
     ]);
     expect(result.projects[0]!.ended).toEqual([]);
+  });
+
+  it("carries phase, status, holdBehind, stuck, deployment, worker status and a needs item's bindingKey (BB-76)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "Implement retry");
+    t.hooks.store.setWorker("thr_w1", "running", null);
+    const at = t.now();
+    t.hooks.store.patch(b.id, {
+      phase: "In Review",
+      hold: "a freeze",
+      holdBehind: ["ENG-9"],
+      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
+      deployments: {
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+      },
+    });
+    // An open `stuck` escalation is a block (BB-76).
+    t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
+    const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
+
+    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
+    const binding = result.projects[0]!.bindings.find((x) => x.key === "ENG-12")!;
+    expect(binding).toMatchObject({
+      phase: "In Review",
+      hold: "a freeze",
+      holdBehind: ["ENG-9"],
+      stuck: true,
+      status: { actor: "other", nextAction: "the vendor", at },
+      deployment: "deployed",
+      workers: [{ threadId: "thr_w1", title: "Implement retry", status: "running" }],
+    });
+    expect(result.projects[0]!.needs.items).toContainEqual(expect.objectContaining({ type: "question", id: q.id, bindingKey: "ENG-12" }));
   });
 
   it("lists an ended binding in `ended` and drops it from the bindings", async () => {

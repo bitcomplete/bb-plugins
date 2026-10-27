@@ -73,7 +73,7 @@ import {
   type Source,
   type WorkflowRun,
 } from "./source-contract.js";
-import { allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
+import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
@@ -271,9 +271,9 @@ const needViewSchema = z.object({
 });
 /** One "needs you" item in the sidebar, tagged so the app knows which write it makes. */
 const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
-  questionViewSchema.extend({ type: z.literal("question") }),
-  withUserViewSchema.extend({ type: z.literal("withUser") }),
-  needViewSchema.extend({ type: z.literal("need") }),
+  questionViewSchema.extend({ type: z.literal("question"), /** The binding's entity key, so a row owns its item (BB-76); null for a project-level question. */ bindingKey: z.string().nullable() }),
+  withUserViewSchema.extend({ type: z.literal("withUser"), bindingKey: z.string() }),
+  needViewSchema.extend({ type: z.literal("need"), bindingKey: z.string() }),
 ]);
 
 /** The steward's own surface for the app and the CLI. Cross-plugin methods are in source-contract.ts. */
@@ -447,12 +447,23 @@ export const rpcContract = defineRpcContract({
               key: z.string(),
               kind: z.string(),
               stage: z.string().nullable(),
+              /** The entity's own phase, for line two; null when the binding has none (ops). */
+              phase: z.string().nullable(),
               threadId: z.string().nullable(),
               hold: z.string().nullable(),
+              /** Entity keys this hold waits behind, for `held behind <keys>`. */
+              holdBehind: z.array(z.string()),
               blockedOn: z.string().nullable(),
               needsUser: z.boolean(),
+              /** An open `stuck` escalation: the row is blocked (BB-76). */
+              stuck: z.boolean(),
+              /** The status report's actor, next action and timestamp; null with no report. */
+              status: z.object({ actor: z.string(), nextAction: z.string(), at: z.number() }).nullable(),
+              /** The newest deployment watch's state, or null with none (BB-76). */
+              deployment: z.enum(DEPLOY_STATES).nullable(),
               advancedAt: z.number().nullable(),
-              workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
+              /** Every worker, running or not, with the plugin's own status so the row counts running ones. */
+              workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string() })),
               /** Reviewer threads, each under the worker it reviews. */
               reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })),
             }),
@@ -4552,23 +4563,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               needs: {
                 count: questions.length + withUser.length + needs.length,
                 items: [
-                  ...questions.map((q) => ({ type: "question" as const, ...q })),
-                  ...withUser.map((w) => ({ type: "withUser" as const, ...w })),
-                  ...needs.map((n) => ({ type: "need" as const, ...n })),
+                  ...questions.map((q) => ({ type: "question" as const, ...q, bindingKey: q.key })),
+                  ...withUser.map((w) => ({ type: "withUser" as const, ...w, bindingKey: w.key })),
+                  ...needs.map((n) => ({ type: "need" as const, ...n, bindingKey: n.key })),
                 ],
               },
               bindings: all
                 .filter((b) => b.endedAt === null)
                 .map((b) => {
-                  const workers = store.workers(b.id).map((w) => ({ threadId: w.threadId, title: w.title }));
+                  const workers = store.workers(b.id).map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
+                  // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
+                  const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
                   return {
                     key: b.entityKey,
                     kind: b.kind,
                     stage: b.stage,
+                    phase: b.phase,
                     threadId: b.threadId,
                     hold: b.hold,
+                    holdBehind: b.holdBehind,
                     blockedOn: b.status?.blockedOn ?? null,
                     needsUser: needsUser(b),
+                    stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+                    status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
+                    deployment: newestDeployment === null ? null : newestDeployment.state,
                     advancedAt: b.advancedAt,
                     workers,
                     reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),

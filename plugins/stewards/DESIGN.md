@@ -1438,25 +1438,51 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 
 An opt-in replacement for bb's own sidebar list, registered through the
 exclusive `experimental_threadList` slot (`plugins/stewards/app.tsx`). One
-project dropdown in the live view; in-flight efforts grouped by the steward
-relationship; a collapsed Watches row for `ops`, Dependabot and Sentry
-bindings; a collapsed Recently ended row; and the project steward demoted to
-one small row at the bottom. Every row carries bb's own thread actions
-context menu, so archive, pin, rename, split and delete still work.
+project dropdown in the live view; the sections top to bottom are **Blocked**
+(needs-you rows first, then blocked), **In flight** (running before quiet),
+**Threads** (one-off threads, collapsed), **Monitors** (the `ops`, Dependabot
+and Sentry bindings, collapsed), **Recently ended** (collapsed), and the
+project steward demoted to one small row at the bottom. Every row carries bb's
+own thread actions context menu, so archive, pin, rename, split and delete
+still work.
 
-**Title-first rows (BB-48).** A row is the status glyph, the title, and — for
-a stewarded effort — the binding key only when the title does not already name
-it, plus the held and blocked badges. The title wins: it takes the available
-width and truncates last, while the meta shrinks and truncates first. A key
-shown is shortened (a pull request `acme/web#612` as `#612`, a ticket as its
-own key) and the full key stays on the row's `title` attribute. The stage
-leaves the row — the board still groups by stage, but a row no longer repeats
-it — and the chevron no longer carries a child count, so only the chevron
-signals children. A child row's worker/reviewer label is a small muted `W`/`R`
-tag. One-off threads no longer share In flight: they sit in a collapsed
-**Threads** row below it, so In flight counts stewarded efforts only.
-`buildSidebar` returns `efforts`, `threads` and `watches` separately, and the
-split is unit tested in `sidebar.test.ts`.
+**Two-line effort rows and the four glyphs (BB-76).** An effort row is two
+lines. Line one is the glyph, the entity key in bold, and the title, which
+takes the available width and truncates last; the key prefix is stripped from
+the steward thread's title (titled `<key>: <title>`, or `<Review key>:
+<title>`), so the key and title are not repeated. Line two is the kind
+(`ticket`, `pull request`, `review`, `ops`), the entity's own phase when it has
+one (omitted for ops), and the status phrase. A row that needs you adds its
+prompt and one-click actions under line two, in the same row, with no tinted
+callout box.
+
+The glyph is one of four shapes, in precedence order `you › blocked › running ›
+quiet`: a solid yellow dot when it waits on you, an empty red ring when
+blocked, a blue ring that pulses slowly while a worker or reviewer runs, and
+an empty grey ring when quiet. The pulse is CSS only and stops under
+`prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
+when unread, blue animated while their agent runs, grey otherwise — except a
+draft, which keeps bb's own `ThreadStatusGlyph`. The project steward footer
+row is the grey ring.
+
+**The status phrase (BB-76).** First match wins: `needs you`; `blocked on
+<blockedOn>`; `held behind <holdBehind keys>` when `holdBehind` is non-empty,
+else `on hold`; `stuck` for an open stuck escalation; `waiting on
+<nextAction>` when the status actor is `other` (an external wait is a block);
+`N worker(s) running` counting only workers whose worker-table status is
+`running` (a busy steward or reviewer with no running worker falls through,
+rather than reading `0 workers running`); the newest deployment watch's state (`deploying`, `deployed`,
+`deploy failed`); the status `nextAction`; otherwise `no report yet`. The
+phrase's colour follows the glyph's. `sidebar.ts` derives `state`, `section`
+and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
+covers every rule and the precedence.
+
+**Sections.** Blocked holds the needs-you (yellow) and blocked (red) efforts,
+whether stewarded or `ops`; a blocked `ops` binding leaves Monitors for
+Blocked. In flight holds the rest of the stewarded, non-ops efforts, running
+before quiet, then by recency. Pinned rows stay first within their section.
+`buildSidebar` returns `blocked`, `efforts`, `threads` and `monitors`
+separately, and the split is unit tested in `sidebar.test.ts`.
 
 **Grouping is the steward relationship, not the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
@@ -1467,37 +1493,35 @@ The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
 component joins them to `experimental_useSidebarThreads` and polls
 `stewardsSidebar` on the board's half-minute visibility-aware cadence.
 
-**The Needs you block and the count badge (BB-46).** The sidebar is where the
-user already looks, so what waits on them is shown there, not only on the
-Stewards page. The project dropdown carries each project's count in its option
-label and the summed count in a pill beside it. Above In flight, a **Needs you**
-block lists one row per item
-with the entity key (opening the entity), one line of text, and **Details**,
-which opens the board at that project. A question's or `decide` item's fixed
-`choices` are not rendered here: the board carries the full question, its
-context and the choices, so a truncated one-line row never asks the user to
-pick blind. An `approve-pr` row carries the page's actions — **Open the pull
-request** (`navigate.openUrl` on the item's `url`), **Approve**
+**The inline needs-you actions and the picker count (BB-46, BB-76).** The
+sidebar is where the user already looks, so what waits on them is shown there,
+not only on the Stewards page. An effort that needs you appears once, at the
+top of **Blocked**, with a yellow dot; under its line two it shows the
+question or need's text and its one-click actions, the same RPC calls the old
+block made. A fixed-choice question answers through
+`stewardsAnswerQuestion { choice }`, a `decide` need through
+`stewardsNeedAction { action: "choose", choice }`; an `approve-pr` row carries
+**Open PR** (`navigate.openUrl` on the item's `url`), **Approve**
 (`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
-refusal shown in the row) and **Details** (the board at that project) — and
-its text wraps instead of truncating, so the repository, number and title are
-readable before the click. A `merge` row adds **Merge**
-(`stewardsNeedAction { action: "merge" }`, the lane gate re-checked
-server-side) beside **Open the pull request** and **Details**. Every other
-row's page button is **Details** too: a row without choices, or a
-`provide-secret` item, opens the Stewards page at that project, where the
-free-text answer and the secret form live. The block adds no write path the
-page does not already make.
+refusal shown in the row) and **Details** (the board at that project); a
+`merge` row swaps **Merge** for **Approve** (the lane gate re-checked
+server-side). Every other row's page button is **Details**, opening the
+Stewards page at that project, where the free-text answer and the secret form
+live. The inline block adds no write path the page does not already make. The
+project dropdown carries each project's count in its option label, and that
+count is the number of yellow effort rows, so the picker and the sections
+cannot disagree. `stewardsSidebar` carries, per project,
+`needs: { count, items }` with the board's row shapes, each tagged
+`question`/`withUser`/`need` and carrying the binding's entity key as
+`bindingKey` so a row owns its item; the effort row filters the items by that
+key. A project-level question with no binding has no effort row and stays on
+the Stewards page.
 
 **One source of truth.** `server.ts`'s `needsYou(projectId, { actionableOnly
 })` builds the board's `questions`, `withUser` and `needs` lists in one place;
 the board calls it unfiltered, the sidebar calls it with `actionableOnly`, and
 `bb stewards needs` prints it, so the surfaces cannot drift and a non-actionable
-need is on the page but not in the sidebar's count or items. `stewardsSidebar`
-carries, per project,
-`needs: { count, items }` with the same row shapes, each tagged
-`question`/`withUser`/`need` so the app knows how to render the row and which
-one-click action it carries.
+need is on the page but not in the sidebar's items.
 
 **Realtime, not the poll.** The store takes an optional
 `onNeedsYouChange(projectId)` callback, wired in `server.ts` to
