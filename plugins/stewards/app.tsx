@@ -1305,9 +1305,12 @@ function SidebarThreadRow({
   const selected = activeThreadId !== null && thread.id === activeThreadId;
   // Navigation to a row inside this one expands it, so the highlighted row is revealed.
   const revealed = openThreads.has(thread.id);
+  useEffect(() => {
+    if (revealed) setUserOpen(true);
+  }, [revealed]);
   // An untouched row follows the unread state of its descendants (BB-80); a
   // manual toggle always wins.
-  const open = userOpen ?? (revealed || hasUnread(children, byId));
+  const open = userOpen ?? hasUnread(children, byId);
   // The array-wide indicator never reports a draft; the row folds in the
   // client-local one, as bb's own row does.
   const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
@@ -1491,9 +1494,12 @@ function SidebarEffortRow({
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
   const selected = activeKey !== null && activeKey === key;
   const revealed = openThreads.has(effort.rootThreadId);
+  useEffect(() => {
+    if (revealed) setUserOpen(true);
+  }, [revealed]);
   // An untouched effort follows the unread state of its workers and reviewers
   // (BB-80); a manual toggle always wins.
-  const open = userOpen ?? (revealed || hasUnread(effort.children, byId));
+  const open = userOpen ?? hasUnread(effort.children, byId);
   const href = boardHref(pluginId, projectId, key);
   const body = (
     <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
@@ -1579,7 +1585,11 @@ function SidebarCollapsible({ title, count, revealed = false, unread = false, ch
   // An untouched section follows the unread state of the threads in it
   // (BB-80); a manual toggle always wins.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = userOpen ?? (revealed || unread);
+  // Navigation to a row inside this section expands it, so the row is revealed.
+  useEffect(() => {
+    if (revealed) setUserOpen(true);
+  }, [revealed]);
+  const open = userOpen ?? unread;
   return (
     <section className="flex flex-col">
       {/* `<details>` only for its `open` attribute, which drives the chevron's

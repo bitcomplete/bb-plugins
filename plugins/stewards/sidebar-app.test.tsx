@@ -1309,4 +1309,25 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
     await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
+
+  // BB-85 kept: navigation to a thread inside a group re-expands it even after
+  // a manual collapse, so the highlighted row is revealed.
+  it("re-expands a manually collapsed effort when navigation later targets a worker inside it", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Worker" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+    });
+    // All read: collapsed, expanded and collapsed by hand.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Expand ENG-1: Fix login" })));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" }));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    // Navigation now targets the worker inside, so the effort re-expands.
+    slot.lifecycle.rerender(<list.component {...props} activeThreadId="thr_worker" />);
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
 });
