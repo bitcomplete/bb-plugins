@@ -1285,10 +1285,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return "gone";
       if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
-      // A worker the waiting cascade hid comes back with the message, so a
-      // resumed worker shows under its effort again (BB-47). A steward's own
-      // thread keeps its hidden state: a wake that needs nobody stays hidden.
-      if (info.visibility === "hidden" && store.worker(threadId) !== null) await quietly(`show ${threadId}`, () => bb.sdk.threads.update({ threadId, visibility: "visible" }));
       return send(threadId, typeof text === "string" ? text : text());
     }
 
@@ -1586,37 +1582,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** Set a thread's sidebar visibility, unless it is archived, gone, or already there. */
-    async function setVisibility(threadId: string, visibility: "hidden" | "visible"): Promise<void> {
-      const info = await threadInfo(threadId).catch(() => null);
-      if (info === null || info.deletedAt !== null || info.archivedAt !== null || info.visibility === visibility) return;
-      await quietly(`${visibility === "hidden" ? "hide" : "show"} ${threadId}`, () => bb.sdk.threads.update({ threadId, visibility }));
-    }
-
     /**
-     * A waiting steward's finished workers and their reviewers share its
-     * visibility: hidden with it, and shown again when it comes back. Running
-     * workers are unaffected (BB-47).
+     * The one-time unhide (BB-93). Before this change a steward waiting on
+     * someone else had its thread hidden (`threads.update { visibility:
+     * "hidden" }`), and its finished workers and their reviewers with it.
+     * Nothing hides a thread any more, but a server upgrading still holds
+     * those rows, so the first start after the change shows every live,
+     * unarchived hidden thread of an open binding. The marker lives in the
+     * plugin's kv store, so a later start does nothing.
      */
-    async function cascadeVisibility(b: Binding, visibility: "hidden" | "visible"): Promise<void> {
-      for (const w of store.workers(b.id)) {
-        if (w.status !== "finished") continue;
-        await setVisibility(w.threadId, visibility);
-        for (const r of (await reviewersOf(w.threadId)) ?? []) await setVisibility(r.id, visibility);
+    const UNHIDE_ONCE_KEY = "migrations/unhide-hidden-threads";
+    async function unhideOnce(): Promise<void> {
+      if ((await bb.storage.kv.get<string>(UNHIDE_ONCE_KEY)) != null) return;
+      let failed = false;
+      for (const b of store.open()) {
+        if (b.threadId !== null && !(await showIfHidden(b.threadId))) failed = true;
+        for (const w of store.workers(b.id)) {
+          if (!(await showIfHidden(w.threadId))) failed = true;
+          for (const r of (await reviewersOf(w.threadId)) ?? []) if (!(await showIfHidden(r.id))) failed = true;
+        }
       }
+      // A transient show failure must not burn the one-time marker: leaving it
+      // unset makes the next start retry, as the old show-on-every-wake path
+      // did. Only a clean pass records it.
+      if (!failed) await bb.storage.kv.set(UNHIDE_ONCE_KEY, String(now()));
     }
 
-    /** Show a steward, and with it the finished workers and reviewers that were hidden with it. */
-    async function showSteward(b: Binding): Promise<void> {
-      if (b.threadId === null) return;
-      const info = await threadInfo(b.threadId).catch(() => null);
-      // Already visible: nothing to show and no write to spend. This runs on
-      // every worker registration and turn, so the common case is a no-op. A
-      // lookup that failed is unknown, so the write is still attempted.
-      if (info !== null && info.visibility === "visible") return;
-      const wasHidden = info !== null && info.visibility === "hidden";
-      await quietly(`show ${b.entityKey}'s steward`, () => bb.sdk.threads.update({ threadId: b.threadId!, visibility: "visible" }));
-      if (wasHidden) await cascadeVisibility(b, "visible");
+    /** Show a thread hidden in the sidebar; false when the update failed, so the caller can retry. */
+    async function showIfHidden(threadId: string): Promise<boolean> {
+      const info = await threadInfo(threadId).catch(() => null);
+      if (info === null || info.deletedAt !== null || info.archivedAt !== null || info.visibility !== "hidden") return true;
+      try {
+        await bb.sdk.threads.update({ threadId, visibility: "visible" });
+        return true;
+      } catch (error) {
+        bb.log.warn(`stewards: could not show ${threadId}: ${errorMessage(error)}`);
+        return false;
+      }
     }
 
     /**
@@ -1785,9 +1787,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       store.setSecretRequester(thread.id, need.id);
       store.addWorker(thread.id, b.id, title);
-      // A requester is a worker of the binding: a steward hidden by hideWaiting
-      // comes back so the effort roots at it (BB-64).
-      await showSteward(b);
       bb.log.info(`stewards: started a requester thread for ${b.entityKey}'s ${variable} (${thread.id})`);
       return thread.id;
     }
@@ -1846,10 +1845,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // compact first (criterion 4). If compaction makes the thread busy,
       // sendTo queues the wake for the next idle.
       await compactIfLarge(b.threadId, text.length);
-      // A wake that needs the user brings a hidden steward back into the
-      // sidebar, with the finished workers and reviewers that were hidden with
-      // it; a scheduled look that found nothing leaves it hidden.
-      if (needsUser(b)) await showSteward(b);
       const sent = await sendTo(b.threadId, text);
       if (sent === "gone") {
         // The user deleted the thread: that is a detach they meant.
@@ -4216,10 +4211,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const runaway = store.spawnsSince(owner.id, now() - 3_600_000) >= limit;
       store.addWorker(thread.id, owner.id, thread.title ?? thread.titleFallback ?? thread.id);
       if (!runaway) {
-        // A hidden steward (hideWaiting, "waits on others") comes back when a
-        // worker of its binding starts, so the sidebar roots the effort at it
-        // and the worker is not a bare row under Threads (BB-64).
-        await showSteward(owner);
         await validateWorkerSpawn(thread, owner);
         return;
       }
@@ -4318,38 +4309,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       }
       // Compaction makes the thread busy; a wake that finds it so waits as notes for the next idle.
-      const compacting = await compactIfLarge(thread.id);
+      await compactIfLarge(thread.id);
       const after = store.binding(b.id)!;
       if (after.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
-      // Compaction ends in another idle, which hides.
-      else if (after.archiveWhenIdle && !compacting) await hideWaiting(after);
     });
-
-    /**
-     * Hide a steward whose wake turn ended waiting on someone else, so the
-     * sidebar holds only stewards with something to do. Hidden threads stay
-     * out of the sidebar's organisation and unread attention while remaining
-     * addressable; the binding stays, and the next wake brings it back
-     * (deliverWake). Not while anything needs the user — an open escalation, a
-     * question, or a needs item — which they should still see. Not while a
-     * worker of the binding is in flight either (running or finished): the
-     * sidebar's buildTab roots the effort at the steward thread, so hiding the
-     * steward while its worker runs drops the effort out of In flight and
-     * leaves a bare worker row under Threads. Once no worker is in flight,
-     * hiding cascades to any worker that finished in the meantime, so it is
-     * not left as a bare row without its steward (BB-47, BB-56).
-     */
-    async function hideWaiting(b: Binding): Promise<void> {
-      store.patch(b.id, { archiveWhenIdle: false });
-      if (anyWorkerInFlight(store.workers(b.id))) return;
-      if (b.threadId === null || b.endedAt !== null || b.ending !== null) return;
-      if (needsUser(b)) return;
-      const info = await threadInfo(b.threadId).catch(() => null);
-      if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) return;
-      await quietly(`hide ${b.entityKey}'s waiting steward`, () => bb.sdk.threads.update({ threadId: info.id, visibility: "hidden" }));
-      await cascadeVisibility(b, "hidden");
-      bb.log.info(`stewards: ${b.entityKey} waits on others; hid its steward until the next wake`);
-    }
 
     /**
      * The questions the binding's workers ended their last turn with. A
@@ -4438,13 +4401,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     bb.events.on("thread.active", async ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker === null) return;
-      // A worker the waiting cascade hid is shown again once it runs (BB-47).
-      if (thread.visibility === "hidden") await quietly(`show running worker ${thread.id}`, () => bb.sdk.threads.update({ threadId: thread.id, visibility: "visible" }));
       if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
       const owner = store.binding(worker.bindingId);
-      // A hidden steward comes back when a worker of its binding runs again,
-      // so the effort stays rooted at it (BB-64).
-      if (owner !== null && owner.endedAt === null) await showSteward(owner);
       // The first turn is dispatched now, so the spawn's model can be read.
       if (worker.modelCheckPending && worker.status !== "stopped") {
         store.setWorkerModelCheckPending(thread.id, false);
@@ -5670,11 +5628,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             at: now(),
           };
           const moved = advanced(b.status, status);
-          // A wake turn that ends waiting on someone else is hidden when it
-          // goes idle; a turn the user started is left where they can see it.
-          const archiveWhenIdle = input.actor === "other" && (b.awaitingReport || b.archiveWhenIdle);
           b = store.patch(b.id, {
-            archiveWhenIdle,
             status,
             statusAt: now(),
             ...(moved ? { advancedAt: now() } : {}),
@@ -5746,14 +5700,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (raised !== null && !(raised.route === "project" && requests.length > 0)) await deliver(b, raised);
           if (requests.length > 0) await wakeProject(b.projectId, raised !== null && raised.route === "project" ? `escalation and ${requests.join(" and ")} request from ${b.entityKey}` : `${requests.join(" and ")} requested for ${b.entityKey}`, { digestDue: false });
           // The unread dot means "needs you": a turn that ends with nothing for
-          // the user is marked read and hidden when it goes idle, so a "nothing
-          // to do yet" look does not flag the sidebar like a question does. A
-          // turn that does need the user is made visible and left unread. A
-          // terminal ending archives the thread, so there is no read state to
-          // set.
-          if (b.ending !== "terminal") {
-            if (needsUser(b)) await showSteward(b);
-            else await quietly(`mark ${b.entityKey}'s steward read`, () => bb.sdk.threads.markRead({ threadId }));
+          // the user is marked read, so a "nothing to do yet" look does not
+          // flag the sidebar like a question does. A turn that does need the
+          // user is left unread. A terminal ending archives the thread, so
+          // there is no read state to set.
+          if (b.ending !== "terminal" && !needsUser(b)) {
+            await quietly(`mark ${b.entityKey}'s steward read`, () => bb.sdk.threads.markRead({ threadId }));
           }
           if (moved && b.parentBindingId !== null) {
             const parent = store.binding(b.parentBindingId);
@@ -5808,12 +5760,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (b.followThrough === null) return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding ends when this turn does: running workers are stopped and the thread is archived. End the turn now.`;
             return `Reported.${replacedNote}${refusalNote}${escalated}${deploymentNote} The binding stays open to follow through until ${iso(followThroughUntil!)}; running workers keep going. You will be woken when a worker finishes or something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
           }
-          const hidden = archiveWhenIdle && !needsUser(b) ? " Your thread is hidden when the turn ends, and comes back on that wake." : "";
           const recorded = opsTickets.length === 0 ? "" : ` Recorded ${opsTickets.map((t) => `${t.ticket} (${t.did})`).join(", ")} against ${opsTickets.length === 1 ? "its fingerprint" : "their fingerprints"}.`;
           if (gateJustPassed && nothingPending) {
             return `Reported.${replacedNote}${recorded}${refusalNote}${escalated} Ready gate: passed and nothing schedules you. Move the ticket to In Progress and start the worker now, in this turn, with the task in the In Progress instructions; do not end the turn first.`;
           }
-          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}.${hidden} End the turn now.`;
+          return `Reported.${replacedNote}${recorded}${refusalNote}${gateNote}${escalated} You will be woken when something actionable changes, or in ${formatDuration(requeueMs)}. End the turn now.`;
         } catch (error) {
           return toolError(error);
         }
@@ -6627,6 +6578,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
     bb.background.service("loop", {
       async start(signal) {
+        // BB-93: nothing hides threads any more; the first start after the
+        // upgrade shows the ones the old hide path left hidden.
+        await unhideOnce().catch((e: unknown) => bb.log.warn(`stewards: one-time unhide: ${errorMessage(e)}`));
         const requeue = setInterval(() => void requeueTick().catch((e: unknown) => bb.log.warn(`stewards: requeue: ${errorMessage(e)}`)), timing.requeueTickMs);
         const sweeper = setInterval(() => void sweep().catch((e: unknown) => bb.log.warn(`stewards: sweep: ${errorMessage(e)}`)), timing.sweepMs);
         // The first sweep tells linear and github what to watch after a restart.
@@ -7304,12 +7258,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
