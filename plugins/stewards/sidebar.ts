@@ -26,7 +26,7 @@ export interface SidebarBinding {
   holdBehind: string[];
   blockedOn: string | null;
   needsUser: boolean;
-  /** An open `stuck` escalation (BB-76): an external wait is a block. */
+  /** An open `stuck` escalation (BB-76). */
   stuck: boolean;
   /** The status report's actor, next action and timestamp, or null with no report. */
   status: { actor: string; nextAction: string; at: number } | null;
@@ -183,12 +183,14 @@ export const isRunning = (e: Pick<EffortStatus, "busy" | "runningWorkers">): boo
 
 /**
  * The effort's glyph, first match wins (BB-76):
- * needs you › blocked › running › quiet. An external wait (`actor = other`)
- * is a block, and a running effort that also needs you is yellow.
+ * needs you › blocked › running › quiet. Blocked is `blockedOn`, a hold or
+ * `stuck` only; an external wait (`actor = other`) is not a block, so it is
+ * running when a worker or reviewer runs and quiet otherwise. A running
+ * effort that also needs you is yellow.
  */
 export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
-  if (e.blockedOn !== null || e.hold !== null || e.stuck || e.statusActor === "other") return "blocked";
+  if (e.blockedOn !== null || e.hold !== null || e.stuck) return "blocked";
   if (isRunning(e)) return "running";
   return "quiet";
 }
@@ -208,21 +210,22 @@ export function deploymentPhrase(state: DeployState): string {
 
 /**
  * Line two's status phrase, first match wins (BB-76):
- * needs you › blockedOn › hold › stuck › actor=other › running › deployment › nextAction › no report.
+ * needs you › blockedOn › hold › stuck › running › actor=other › deployment › nextAction › no report.
  */
 export function effortPhrase(e: EffortStatus): string {
   if (e.needsUser) return "needs you";
   if (e.blockedOn !== null) return `blocked on ${e.blockedOn}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
   if (e.stuck) return "stuck";
-  if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
   // A running worker or reviewer paints the blue ring, but the count is of
   // running workers: a busy steward or reviewer with no running worker falls
-  // through rather than reading "0 workers running".
+  // through rather than reading "0 workers running". A wait on someone else
+  // is not a block, so a waiting effort with a running worker reads the count.
   if (e.runningWorkers > 0) {
     const n = e.runningWorkers;
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }
+  if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
   return "no report yet";

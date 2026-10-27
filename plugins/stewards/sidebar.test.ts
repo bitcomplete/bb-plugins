@@ -218,6 +218,43 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[0]!.blocked.map((e) => e.key)).toEqual(["ENG-1"]);
     expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-2"]);
   });
+
+  // BB-81: an external wait is not a block, so it files by kind and the wait
+  // phrase comes after the running-worker count.
+  it("files an external wait by kind: ops in monitors grey, ticket and review in flight, only blockedOn and needsUser blocked", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_ops_wait" }), thread({ id: "thr_ops_blocked" }), thread({ id: "thr_ops_you" }), thread({ id: "thr_ticket_wait" }), thread({ id: "thr_review_wait" }), thread({ id: "thr_worker" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [
+            binding({ key: "acme/deps", threadId: "thr_ops_wait", kind: "ops", stage: null, status: { actor: "other", nextAction: "Next scheduled look", at: 1 } }),
+            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, blockedOn: "a rotation" }),
+            binding({ key: "acme/ns", threadId: "thr_ops_you", kind: "ops", stage: null, needsUser: true }),
+            binding({ key: "ENG-1", threadId: "thr_ticket_wait", status: { actor: "other", nextAction: "an author push", at: 1 } }),
+            binding({ key: "acme/web#728", threadId: "thr_review_wait", kind: "review", status: { actor: "other", nextAction: "an author push", at: 1 }, workers: [{ threadId: "thr_worker", title: "Review", status: "running" }] }),
+          ],
+        }),
+      ],
+    });
+    const tab = tabs[0]!;
+    // ops + other is a monitor, grey, with the wait phrase.
+    expect(tab.monitors.map((e) => e.key)).toEqual(["acme/deps"]);
+    expect(tab.monitors[0]!.state).toBe("quiet");
+    expect(tab.monitors[0]!.phrase).toBe("waiting on Next scheduled look");
+    // ops with blockedOn or needsUser is still blocked, out of monitors.
+    expect(tab.blocked.map((e) => e.key).sort()).toEqual(["acme/ns", "acme/sentry"]);
+    // ticket + other is in flight, grey, with the wait phrase; review + other
+    // with a running worker is blue and reads the count.
+    expect(tab.efforts.map((e) => e.key).sort()).toEqual(["ENG-1", "acme/web#728"]);
+    const ticketWait = tab.efforts.find((e) => e.key === "ENG-1")!;
+    expect(ticketWait.state).toBe("quiet");
+    expect(ticketWait.phrase).toBe("waiting on an author push");
+    const reviewWait = tab.efforts.find((e) => e.key === "acme/web#728")!;
+    expect(reviewWait.state).toBe("running");
+    expect(reviewWait.phrase).toBe("1 worker running");
+  });
 });
 
 describe("stewards sidebar ordering", () => {
@@ -272,11 +309,15 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortState(effort({ key: "d" }))).toBe("quiet");
   });
 
-  it("treats each block signal as blocked: blockedOn, hold, stuck, and actor = other", () => {
+  it("treats each block signal as blocked: blockedOn, hold and stuck", () => {
     expect(effortState(effort({ key: "a", blockedOn: "a review" }))).toBe("blocked");
     expect(effortState(effort({ key: "b", hold: "a freeze" }))).toBe("blocked");
     expect(effortState(effort({ key: "c", stuck: true }))).toBe("blocked");
-    expect(effortState(effort({ key: "d", statusActor: "other", statusNextAction: "the vendor" }))).toBe("blocked");
+  });
+
+  it("does not treat an external wait as a block: quiet, or running with a running worker", () => {
+    expect(effortState(effort({ key: "a", statusActor: "other", statusNextAction: "the vendor" }))).toBe("quiet");
+    expect(effortState(effort({ key: "b", statusActor: "other", statusNextAction: "the vendor", runningWorkers: 1 }))).toBe("running");
   });
 
   it("counts a busy thread or a running worker as running", () => {
@@ -301,14 +342,16 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");
     // 4. stuck
     expect(effortPhrase(effort({ key: "e", stuck: true }))).toBe("stuck");
-    // 5. actor = other
-    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM" }))).toBe("waiting on an owner LGTM");
-    // 6. running workers
+    // 5. running workers, before the external wait so a waiting effort with a
+    // running worker reads the count (BB-81).
     expect(effortPhrase(effort({ key: "g", runningWorkers: 2 }))).toBe("2 workers running");
     expect(effortPhrase(effort({ key: "h", runningWorkers: 1 }))).toBe("1 worker running");
     // A busy steward or reviewer with no running worker falls through, not "0 workers running".
     expect(effortPhrase(effort({ key: "g2", busy: true, statusNextAction: "a reviewer is checking" }))).toBe("a reviewer is checking");
     expect(effortPhrase(effort({ key: "g3", busy: true }))).toBe("no report yet");
+    // 6. actor = other, after the count
+    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM" }))).toBe("waiting on an owner LGTM");
+    expect(effortPhrase(effort({ key: "f2", statusActor: "other", statusNextAction: "the vendor", runningWorkers: 1 }))).toBe("1 worker running");
     // 7. deployment
     expect(effortPhrase(effort({ key: "i", deployment: "merged" }))).toBe("deploying");
     expect(effortPhrase(effort({ key: "j", deployment: "deployed" }))).toBe("deployed");
