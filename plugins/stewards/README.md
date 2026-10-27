@@ -351,9 +351,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   and the meta line with the stage and deployment); **Threads** (the steward,
   the workers and the pull request); and the lessons the effort wrote. An ended
   effort shows the key, title, how it ended and the archived thread; an unknown
-  key says so. The page registers its own sidebar (`experimental_sidebar`), the
-  same list told the project and effort the path names, so it is there whichever
-  thread list the user pinned.
+  key says so. The page has no sidebar of its own (BB-94): it publishes the
+  project and effort its path names through [board-route.ts](board-route.ts),
+  and the sidebar thread list follows it, so the list is not remounted when the
+  page opens.
 - **Questions and asks to you** are escalations with `route: me`, kept in
   the store from the moment the project steward asks
   (`steward_update { ask }`, or forwarding an escalation) until it records

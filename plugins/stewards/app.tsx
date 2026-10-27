@@ -4,8 +4,9 @@
 // and the lessons block) and `board/<project>/<key>` is one effort's detail
 // (its two-line row one size up, its needs-you items with the page's full
 // controls, its status, threads and lessons). The sidebar (the opt-in
-// `experimental_threadList`, or the panel's own `experimental_sidebar`) is the
-// list; the one write is closing a question put to you or pressing a needs
+// `experimental_threadList`) is the list; the page publishes the project and
+// effort its path names through `board-route.ts`, so the list follows it. The
+// one write is closing a question put to you or pressing a needs
 // item's button. Settings → Plugins → Stewards: which projects are stewarded
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
@@ -26,13 +27,13 @@ import {
   useSdk,
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
-  type PluginNavPanelProps,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
+import { setBoardRoute, useBoardRoute } from "./board-route.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
@@ -478,6 +479,14 @@ function BoardPage({ subPath }: { subPath: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const { projectId: wanted, key } = parseBoardPath(subPath);
+  // Publish the project and effort the path names for the sidebar thread list
+  // (BB-94), which the host mounts outside this panel. The effect keyed on the
+  // path republishes as it changes; the empty-deps effect clears the store when
+  // the panel unmounts, so a thread route falls back to its own props.
+  useEffect(() => {
+    setBoardRoute({ projectId: wanted, key });
+  }, [wanted, key]);
+  useEffect(() => () => setBoardRoute({ projectId: null, key: null }), []);
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
   const boardProjectId = data?.board?.projectId ?? null;
   // A path with no project takes the server's choice, replacing rather than
@@ -1179,13 +1188,13 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
 // ---- The sidebar thread list -------------------------------------------------------------------
 //
 // The opt-in replacement for bb's sidebar list, registered through the
-// exclusive `experimental_threadList` slot, and the same list as the board
-// panel's own sidebar (`experimental_sidebar`, BB-85). One project dropdown,
+// exclusive `experimental_threadList` slot. One project dropdown,
 // two-line effort rows with the four glyphs in the Blocked / In flight /
 // Threads / Monitors / Recently ended sections, and a demoted project-steward
 // row. An effort row and a Recently ended row open the detail view; worker,
-// reviewer, one-off and project-steward rows open their thread; the row the
-// board shows is highlighted and navigation expands a collapsed parent. Every
+// reviewer, one-off and project-steward rows open their thread; the effort the
+// Stewards page shows is highlighted and navigation expands a collapsed parent
+// (the page publishes it through `board-route.ts`, BB-94). Every
 // effort and thread row carries bb's own thread actions context menu, so
 // nothing bb's rows can do is lost.
 
@@ -1229,17 +1238,14 @@ function phraseClass(state: SidebarEffortState): string {
 }
 
 /**
- * A CSS-safe `view-transition-name` for one row, from the surface, row kind and
- * key (BB-91). The surface keeps the two sidebar instances (the pinned thread
- * list and the board panel's own sidebar) apart, since both can be mounted at
- * once and duplicate names skip the whole transition; the kind keeps an effort
- * row and an ended row with the same binding key apart; the hash keeps two keys
- * that sanitise alike apart.
+ * A CSS-safe `view-transition-name` for one row, from the row kind and key
+ * (BB-91): the kind keeps an effort row and an ended row with the same binding
+ * key apart, and the hash keeps two keys that sanitise alike apart.
  */
-function viewTransitionName(surface: string, kind: "effort" | "ended" | "thread", key: string): string {
+function viewTransitionName(kind: "effort" | "ended" | "thread", key: string): string {
   let hash = 0;
   for (let i = 0; i < key.length; i += 1) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
-  return `stewards-${kind}-${surface}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
+  return `stewards-${kind}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
 }
 
 /**
@@ -1274,7 +1280,6 @@ function SidebarThreadRow({
   glyph,
   activeThreadId,
   openThreads,
-  viewTransitionPrefix,
   entered = false,
 }: {
   thread: PluginSidebarThread;
@@ -1293,8 +1298,6 @@ function SidebarThreadRow({
   activeThreadId: string | null;
   /** The rows that must be open so the active thread is revealed (BB-85). */
   openThreads: ReadonlySet<string>;
-  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
-  viewTransitionPrefix: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 }) {
@@ -1317,7 +1320,7 @@ function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, "thread", thread.id) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName("thread", thread.id) }}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1360,7 +1363,7 @@ function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
             );
           })}
         </ul>
@@ -1453,7 +1456,6 @@ function SidebarEffortRow({
   trailing,
   rowKind = "effort",
   viewTransitionKey,
-  viewTransitionPrefix,
   entered = false,
 }: {
   effort: SidebarEffort;
@@ -1474,8 +1476,6 @@ function SidebarEffortRow({
   rowKind?: "effort" | "ended";
   /** The row's stable key for the view-transition name, when it differs from the effort key (an ended row's `endedAt`). */
   viewTransitionKey?: string;
-  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
-  viewTransitionPrefix: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 }) {
@@ -1545,7 +1545,7 @@ function SidebarEffortRow({
     </div>
   );
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, rowKind, viewTransitionKey ?? effort.key) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(rowKind, viewTransitionKey ?? effort.key) }}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
@@ -1560,7 +1560,7 @@ function SidebarEffortRow({
             {effort.children.map((c) => {
               const child = byId.get(c.threadId);
               return child === undefined ? null : (
-                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
+                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
               );
             })}
           </ul>
@@ -1717,26 +1717,21 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
 }
 
 /**
- * The list itself, shared by the sidebar's thread list and the board panel's
- * own sidebar (BB-85). The panel passes the project and effort the path names
- * and navigates on a project pick; the thread list passes the route's thread.
+ * The sidebar thread list (BB-44), mounted by the host in the
+ * `experimental_threadList` slot. It follows the thread route through its
+ * `activeThreadId` and `activeProjectId` props, and the Stewards page through
+ * the board-route store (BB-94): while that panel is mounted the store names
+ * the project and effort its path shows, and a project pick moves the page.
  */
 function StewardsSidebarCore({
-  surface,
   activeProjectId,
-  activeKey,
   activeThreadId,
   onNavigate,
-  onPickProject,
   onNewThread,
 }: {
-  /** Which mounted sidebar this is; folded into each row's view-transition name (BB-91). */
-  surface: "sidebar" | "panel";
   activeProjectId: string | null;
-  activeKey: string | null;
   activeThreadId: string | null;
   onNavigate: () => void;
-  onPickProject?: (projectId: string) => void;
   onNewThread: (projectId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -1760,19 +1755,26 @@ function StewardsSidebarCore({
     ),
   );
   const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
+  // The Stewards page's route, when that panel is mounted (BB-94). It is null
+  // on a thread route, where the props above are the source.
+  const boardRoute = useBoardRoute();
+  const navigate = useBbNavigate();
   const [picked, setPicked] = useState<string | null>(null);
-  // The active tab follows the route; a pick only lasts until the route moves.
-  useEffect(() => setPicked(null), [activeProjectId]);
-  const wanted = picked ?? activeProjectId;
+  // The active tab follows the panel route, then the thread route; a pick only
+  // lasts until one of them moves.
+  useEffect(() => setPicked(null), [activeProjectId, boardRoute.projectId]);
+  const wanted = picked ?? boardRoute.projectId ?? activeProjectId;
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
   const activeNeeds = active === null ? undefined : needsByProject.get(active.projectId);
   const now = Date.now();
+  const activeKey = boardRoute.key;
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
-  // The picker changes local state and, in the board panel, moves the page.
+  // The picker changes local state and, while the Stewards panel is mounted,
+  // moves the page so the two cannot disagree.
   const pick = (projectId: string) => {
     setPicked(projectId);
-    onPickProject?.(projectId);
+    if (boardRoute.projectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
   };
   const needItems = activeNeeds?.items ?? [];
   const rows = (list: readonly SidebarEffort[]) =>
@@ -1788,7 +1790,6 @@ function StewardsSidebarCore({
         openThreads={openThreads}
         onNavigate={onNavigate}
         onChanged={refetch}
-        viewTransitionPrefix={surface}
         entered={loaded}
       />
     ));
@@ -1827,7 +1828,7 @@ function StewardsSidebarCore({
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
                   return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={surface} entered={loaded} />
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} entered={loaded} />
                   );
                 })}
               </ul>
@@ -1856,7 +1857,6 @@ function StewardsSidebarCore({
                     trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
                     rowKind="ended"
                     viewTransitionKey={`${e.key}-${e.endedAt}`}
-                    viewTransitionPrefix={surface}
                     entered={loaded}
                   />
                 ))}
@@ -1875,7 +1875,6 @@ function StewardsSidebarCore({
                 glyph="quiet"
                 activeThreadId={activeThreadId}
                 openThreads={openThreads}
-                viewTransitionPrefix={surface}
                 entered={loaded}
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />
@@ -1893,32 +1892,13 @@ function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: Plugin
   const navigate = useBbNavigate();
   return (
     <StewardsSidebarCore
-      surface="sidebar"
       activeProjectId={activeProjectId}
-      activeKey={null}
       activeThreadId={activeThreadId}
       onNavigate={onNavigate}
       onNewThread={(projectId) => {
         navigate.toCompose({ projectId });
         onNavigate();
       }}
-    />
-  );
-}
-
-/** The board panel's own sidebar (BB-85): the same list, told the path's project and effort. */
-function StewardsPanelSidebar({ subPath }: PluginNavPanelProps) {
-  const navigate = useBbNavigate();
-  const { projectId, key } = parseBoardPath(subPath);
-  return (
-    <StewardsSidebarCore
-      surface="panel"
-      activeProjectId={projectId}
-      activeKey={key}
-      activeThreadId={null}
-      onNavigate={() => {}}
-      onPickProject={(id) => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(id) })}
-      onNewThread={(id) => navigate.toCompose({ projectId: id })}
     />
   );
 }
@@ -2031,9 +2011,6 @@ export default definePluginApp((app) => {
     icon: "ShieldCheck",
     path: BOARD_PATH,
     component: BoardPage,
-    // The panel's own sidebar (BB-85), so the list is there whichever thread
-    // list the user pinned.
-    experimental_sidebar: StewardsPanelSidebar,
   });
   // The exclusive sidebar slot: while this plugin is enabled and no provider is
   // pinned, this list replaces bb's own (see DESIGN.md, "The sidebar thread list").

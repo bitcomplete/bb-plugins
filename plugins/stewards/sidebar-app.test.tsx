@@ -7,6 +7,7 @@ import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
+import { setBoardRoute } from "./board-route.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
   projectId: "p1",
@@ -154,6 +155,7 @@ const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, pro
 
 afterEach(() => {
   app = null;
+  setBoardRoute({ projectId: null, key: null });
   delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
 });
 
@@ -973,60 +975,122 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
     expect(old.closest("a")!.getAttribute("href")).toContain("/board/p1/ENG-0");
     ended.lifecycle.unmount();
   });
-
-  it("highlights a Recently ended row while its detail page is showing", async () => {
-    const captured = await loadApp();
-    const panel = captured.navPanels[0]!;
-    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-0" }, {
-      sidebarThreads: { projects, threads: [] },
-      rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }] }) } as never,
-    });
-    const old = await waitFor(() => slot.getByText("Old work"));
-    expect(old.closest("a")!.getAttribute("aria-current")).toBe("page");
-    slot.lifecycle.unmount();
-  });
 });
 
-// BB-85: the board panel's own sidebar, so the list is there whichever thread
-// list the user pinned.
-describe("the board panel's own sidebar (BB-85)", () => {
-  it("registers the panel sidebar and renders the same list told the path's project and effort", async () => {
-    const captured = await loadApp();
-    const panel = captured.navPanels[0]!;
-    expect(panel.experimental_sidebar).toBeTruthy();
-    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-1" }, {
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
-    });
-    const row = await waitFor(() => slot.getByText("Fix login"));
-    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
-    expect(row.closest("a")!.getAttribute("href")).toBe("/plugins/test-plugin/board/p1/ENG-1");
-    slot.lifecycle.unmount();
+// BB-94: the board panel publishes its route to the sidebar thread list, which
+// the host mounts outside the panel, so the list highlights and reveals the
+// effort the Stewards page shows even with no active thread.
+describe("the board route store (BB-94)", () => {
+  const boardData = () => ({
+    projects: [{ projectId: "p1", name: "Acme" }],
+    board: {
+      projectId: "p1",
+      name: "Acme",
+      paused: false,
+      projectStewardThreadId: null,
+      stages: [],
+      digest: null,
+      questions: [],
+      withUser: [],
+      needs: [],
+      lessons: [],
+      lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+      stewards: [],
+      stuck: [],
+      ended: [],
+    },
   });
 
-  it("moves the page on a project pick", async () => {
+  it("highlights and reveals the effort the panel's path names, and clears when the panel unmounts", async () => {
     const captured = await loadApp();
+    const list = captured.threadLists[0]!;
     const panel = captured.navPanels[0]!;
-    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1" }, {
-      sidebarThreads: { projects, threads: [] },
-      rpc: { stewardsSidebar: () => sidebarData() } as never,
-    });
-    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
-    fireEvent.change(select, { target: { value: "personal" } });
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
-    slot.lifecycle.unmount();
-  });
-
-  it("expands Monitors when the path's effort is a monitor", async () => {
-    const captured = await loadApp();
-    const panel = captured.navPanels[0]!;
-    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/acme/web" }, {
+    const options = {
       sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops" })] }) } as never,
-    });
-    const row = await waitFor(() => slot.getByText("acme/web"));
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops" })] }),
+        stewardsBoard: () => boardData(),
+      } as never,
+    };
+    // The list is mounted with no active thread, so only the store can name
+    // the page's project and effort.
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const monitors = (await waitFor(() => listSlot.getByRole("button", { name: /Monitors/u }))).closest("section")!;
+    expect(monitors.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
+    // Mounting the page publishes its route.
+    const panelSlot = renderSlot(panel, { subPath: "p1/acme/web" }, options);
+    const row = await waitFor(() => listSlot.getByText("acme/web"));
     expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
-    slot.lifecycle.unmount();
+    // Monitors is revealed for the row inside it.
+    await waitFor(() => expect(monitors.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
+    // Unmounting the page clears the store: the highlight goes.
+    panelSlot.lifecycle.unmount();
+    await waitFor(() => expect(row.closest("a")!.getAttribute("aria-current")).toBeNull());
+    listSlot.lifecycle.unmount();
+  });
+
+  it("follows the panel's project in the picker and returns to the thread route's on unmount", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const options = {
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsBoard: () => boardData(),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "personal", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const select = await waitFor(() => listSlot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.value).toBe("personal");
+    const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
+    await waitFor(() => expect(select.value).toBe("p1"));
+    panelSlot.lifecycle.unmount();
+    await waitFor(() => expect(select.value).toBe("personal"));
+    listSlot.lifecycle.unmount();
+  });
+
+  it("reveals a Recently ended row the panel's path names, with no active thread", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const options = {
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }] }),
+        stewardsBoard: () => boardData(),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const ended = await waitFor(() => listSlot.getByRole("button", { name: /Recently ended/u }).closest("section")!);
+    expect(ended.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
+    const panelSlot = renderSlot(panel, { subPath: "p1/ENG-0" }, options);
+    const row = await waitFor(() => listSlot.getByText("Old work"));
+    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
+    await waitFor(() => expect(ended.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
+    panelSlot.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
+  });
+
+  it("moves the page when a project is picked while the panel is mounted", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const options = {
+      sidebarThreads: { projects, threads: [] },
+      rpc: {
+        stewardsSidebar: () => sidebarData(),
+        stewardsBoard: () => boardData(),
+      } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const panelSlot = renderSlot(panel, { subPath: "p1" }, options);
+    const select = await waitFor(() => listSlot.getByLabelText("Project") as HTMLSelectElement);
+    await waitFor(() => expect(select.value).toBe("p1"));
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(listSlot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    panelSlot.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
   });
 });
 
@@ -1056,28 +1120,6 @@ describe("the sidebar's row transitions (BB-91)", () => {
     expect(names.some((name) => name.startsWith("stewards-ended-"))).toBe(true);
     expect(names.some((name) => name.startsWith("stewards-thread-"))).toBe(true);
     slot.lifecycle.unmount();
-  });
-
-  it("keeps view-transition-names unique when the thread list and the board panel sidebar are both mounted", async () => {
-    const captured = await loadApp();
-    const list = captured.threadLists[0]!;
-    const panel = captured.navPanels[0]!;
-    const options = {
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
-    };
-    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
-    const panelSlot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-1" }, options);
-    // Both slots render into the same document, so wait on each container.
-    await waitFor(() => expect(listSlot.container.querySelector("[style*='view-transition-name']")).not.toBeNull());
-    await waitFor(() => expect(panelSlot.container.querySelector("[style*='view-transition-name']")).not.toBeNull());
-    const names = Array.from(document.querySelectorAll<HTMLElement>("[style]"))
-      .map((el) => el.style.viewTransitionName)
-      .filter((name) => name !== "");
-    expect(names.length).toBeGreaterThan(0);
-    expect(new Set(names).size).toBe(names.length);
-    listSlot.lifecycle.unmount();
-    panelSlot.lifecycle.unmount();
   });
 
   it("eases glyph and phrase colours and rotates both chevrons", async () => {
