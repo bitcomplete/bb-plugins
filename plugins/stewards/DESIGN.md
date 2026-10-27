@@ -901,8 +901,10 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   blocked / on hold / stuck lines and the meta line), **Threads** (the steward,
   the workers and the pull request) and the lessons the effort wrote. An ended
   effort shows the key, title, how it ended and the archived thread; an unknown
-  key says so. The page's own sidebar is the same list
-  (`experimental_sidebar`), told the project and effort the path names.
+  key says so. The page has no sidebar of its own: it publishes the project and
+  effort its path names through the module-level store in
+  [board-route.ts](board-route.ts) (BB-94), and the sidebar thread list follows
+  it, so the list is not remounted when the page opens.
   Settings → Plugins → Stewards keeps each project's configuration and health.
 
 ### Changes to linear and github
@@ -1596,10 +1598,15 @@ thread row is highlighted while its thread page is the route (`bg-state-active`,
 with `aria-current="page"` on the anchor). When navigation lands on a row
 inside a collapsed parent, the parent expands so the row is revealed: the
 effort's row for a worker or reviewer, the **Threads** section for a one-off
-thread, and **Monitors** or **Recently ended** for their rows. The board panel
-registers the same list as its own `experimental_sidebar`, told the project and
-effort the path names, so the list is there whichever thread list the user
-pinned; a project pick in it moves the page.
+thread, and **Monitors** or **Recently ended** for their rows. The Stewards
+page has no sidebar of its own (BB-94): the host mounts one list, in the
+`experimental_threadList` slot, and it stays mounted across the page the way it
+does across thread pages. `BoardPage` publishes the project and effort its path
+names through a module-level store ([board-route.ts](board-route.ts)),
+subscribed with `useSyncExternalStore`; the list highlights and reveals that
+effort and follows that project, and clears both when the page unmounts. A
+project pick while the page is mounted moves it. A user who pinned bb's own
+list sees bb's list on the Stewards page rather than the stewards one.
 
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
