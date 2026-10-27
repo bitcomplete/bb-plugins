@@ -239,6 +239,8 @@ const withUserViewSchema = z.object({
   id: z.string(),
   kind: z.string(),
   question: z.string(),
+  /** The evidence and reasoning the escalation carries; the page shows it under the question. */
+  context: z.string().nullable(),
   recommendation: z.string().nullable(),
   key: z.string(),
   url: z.string().nullable(),
@@ -5326,7 +5328,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalate: z
           .object({
             kind: z.enum(ESCALATION_KINDS).describe("blocked, decision, scope (the scope must change), conflict (the entity's state contradicts the playbook), or stuck."),
-            question: z.string().trim().min(1).max(1500).describe("One answerable question."),
+            question: z
+              .string()
+              .trim()
+              .min(1)
+              .max(240, "The question is the one line the sidebar row shows; keep it to 240 characters and put the evidence and reasoning in `context`.")
+              .describe("The one-line ask, as the sidebar row shows it. Put the why in context."),
+            context: z.string().trim().max(3000).optional().describe("What the reader needs to decide: the evidence and the reasoning. Not shown in the sidebar row."),
             meanwhile: z.string().trim().min(1).max(600).describe("What you do meanwhile: wait, continue the unblocked part, or proceed with a stated default."),
             choices: choicesSchema.optional().describe("decision only: 2-6 short labels the user picks between, so the page (or the question forwarding it) shows one button each instead of asking in prose."),
           })
@@ -5470,7 +5478,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Delivered after the status is written, together with any approval
           // request this report makes due, so the project steward reads the
           // new status and is woken once.
-          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
+          const raised = input.escalate === undefined ? null : store.escalate({ bindingId: b.id, kind: input.escalate.kind, question: input.escalate.question, context: input.escalate.context ?? null, meanwhile: input.escalate.meanwhile, route: nextRoute(b, null), recommendation: null, projectId: b.projectId, origin: { threadId, bindingId: b.id, chain: [] }, ...(input.escalate.choices === undefined ? {} : { choices: input.escalate.choices }) });
           const open = store.openEscalations(b.id);
           const status = {
             phase: input.phase,
@@ -6032,7 +6040,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     bindingId: target.id,
                     escalationId: forwarding.id,
                     question: forwarding.question,
-                    context: [`A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
+                    context: [forwarding.context, `A ${forwarding.kind} escalation from ${target.entityKey}${target.title === null ? "" : ` (${target.title})`}.`, `Meanwhile: ${forwarding.meanwhile}`, recommendation === null ? null : `Recommendation: ${recommendation}`].filter((c) => c !== null).join(" "),
                     ...(forwarding.choices.length === 0 ? {} : { choices: forwarding.choices }),
                     resolutionKind,
                     ...(input.url === undefined ? {} : { url: input.url }),
@@ -6219,7 +6227,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
-      return { id: x.id, kind: x.kind, question: x.question, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted };
+      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted };
     }
 
     function formatBindings(rows: Binding[]): string {
@@ -6786,9 +6794,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           escalate: cliCommand({
             summary: "Raise an escalation from a worker thread to its steward",
-            description: "Files one escalation on the worker's binding with the plugin's next hop and schedules the steward's reconcile. The payload is free text; the wake's guidance says what a good escalation contains. The steward's wake lists it ahead of other changes.",
-            positionals: [{ name: "text", description: "The payload: the question, the options you see, your recommendation, where to look", required: true }],
-            options: { project: PROJECT_OPTION, meanwhile: { type: "string", description: "wait (the default) or continue" } },
+            description: "Files one escalation on the worker's binding with the plugin's next hop and schedules the steward's reconcile. The question is the one line the sidebar row shows; the evidence and reasoning go in --context. The steward's wake lists it ahead of other changes.",
+            positionals: [{ name: "text", description: "The one-line question, as the sidebar row shows it (at most 240 characters)", required: true }],
+            options: { project: PROJECT_OPTION, context: { type: "string", description: "The evidence and reasoning behind the question (at most 3000 characters)" }, meanwhile: { type: "string", description: "wait (the default) or continue" } },
             async run(input, ctx) {
               const threadId = ctx.threadId;
               if (threadId === undefined) throw new PluginCliError("No thread: run this from a worker thread.", { code: "no_thread" });
@@ -6796,11 +6804,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (worker === null) throw new PluginCliError("This thread is not a worker of a binding; a steward escalates with steward_report { escalate }.", { code: "not_a_worker" });
               const b = store.binding(worker.bindingId);
               if (b === null) throw new PluginCliError("The worker's binding is gone.", { code: "binding_missing" });
+              const question = input.positionals.text.trim();
+              if (question.length > 240) throw new PluginCliError("The question is the one line the sidebar row shows; keep it to 240 characters and put the evidence and reasoning in --context.", { code: "question_too_long" });
+              const context = input.options.context === undefined || input.options.context.trim() === "" ? null : input.options.context.trim();
+              if (context !== null && context.length > 3000) throw new PluginCliError("context is at most 3000 characters.", { code: "context_too_long" });
               const meanwhile = input.options.meanwhile === "continue" ? "continue" : "wait";
               const x = store.escalate({
                 bindingId: b.id,
                 kind: "decision",
-                question: input.positionals.text,
+                question,
+                context,
                 meanwhile,
                 route: "steward",
                 recommendation: null,

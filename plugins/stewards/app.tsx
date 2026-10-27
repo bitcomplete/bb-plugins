@@ -812,6 +812,7 @@ function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
           <span className="text-xs text-muted-foreground">asked {ago(x.createdAt, now)}</span>
         </p>
         <p>{x.question}</p>
+        {x.context !== null ? <p className="text-muted-foreground">{x.context}</p> : null}
         {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
       </>
     );
@@ -1219,6 +1220,11 @@ function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeed
   const isApprovePr = item.type === "need" && item.kind === "approve-pr";
   const isMerge = item.type === "need" && item.kind === "merge";
   const choices = item.type === "question" ? item.choices : item.type === "need" && item.kind === "decide" ? item.choices : [];
+  // A free-text prompt (no choices, not an approve-pr or merge need) cannot be
+  // answered from the sidebar, so it gets one line; the rest get three. The
+  // full text stays on the element's title and on the page; context is never
+  // shown here (BB-79).
+  const clamped = choices.length === 0 && !isApprovePr && !isMerge;
   const run = (call: Promise<{ ok: boolean; message: string }>) => {
     setState("running");
     call.then(
@@ -1236,7 +1242,7 @@ function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeed
   const button = "rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50";
   return (
     <div className="flex flex-col gap-1">
-      <p className="min-w-0 break-words text-[11px] text-muted-foreground">{text}</p>
+      <p className={`min-w-0 break-words text-[11px] text-muted-foreground ${clamped ? "line-clamp-1" : "line-clamp-3"}`} title={text}>{text}</p>
       <div className="flex flex-wrap items-center gap-1">
         {choices.length > 0 ? (
           choices.map((choice) => (

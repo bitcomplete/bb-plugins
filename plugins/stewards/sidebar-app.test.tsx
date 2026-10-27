@@ -122,6 +122,7 @@ const withUserItem = (over: Record<string, unknown> = {}) => ({
   id: "esc_1",
   kind: "blocked",
   question: "Need cluster access",
+  context: null,
   recommendation: null,
   key: "ENG-1",
   bindingKey: "ENG-1",
@@ -563,8 +564,55 @@ describe("the inline needs-you actions (BB-76)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
+    // A with-user escalation has no choices and is not an approve-pr or merge,
+    // so its prompt is one line (BB-79).
+    expect(slot.getByText("Need cluster access").className).toContain("line-clamp-1");
     expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
     expect(slot.queryByRole("button", { name: "Approve" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("clamps a choice question's prompt to three lines with the full text on title", async () => {
+    const long = "A long forwarded prompt that would otherwise fill the sidebar. ".repeat(6).trim();
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [questionItem({ choices: ["Stack", "Hold"], question: long })] } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText(long)).toBeTruthy());
+    const prompt = slot.getByText(long);
+    expect(prompt.className).toContain("line-clamp-3");
+    expect(prompt.getAttribute("title")).toBe(long);
+    slot.lifecycle.unmount();
+  });
+
+  it("clamps a free-text question's prompt to one line and never shows its context", async () => {
+    const long = "A free-text question the sidebar cannot answer, so one line only. ".repeat(6).trim();
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [questionItem({ question: long, context: "The evidence and reasoning the sidebar must never show." })] } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText(long)).toBeTruthy());
+    const prompt = slot.getByText(long);
+    expect(prompt.className).toContain("line-clamp-1");
+    expect(prompt.getAttribute("title")).toBe(long);
+    expect(slot.queryByText(/The evidence and reasoning the sidebar must never show/u)).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps an approve-pr need's prompt at three lines", async () => {
+    const long = "Approve the pull request, which needs the full three lines. ".repeat(4).trim();
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ what: long })] } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText(long)).toBeTruthy());
+    expect(slot.getByText(long).className).toContain("line-clamp-3");
     slot.lifecycle.unmount();
   });
 
