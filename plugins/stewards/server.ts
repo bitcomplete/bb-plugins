@@ -3752,6 +3752,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function postApprovalMarker(entity: EntitySnapshot, byThread: string, fields: { headSha: string; entry: string | null; verdict: "approved" | "declined"; reasoning: string }): Promise<string> {
       const ref = parsePullRef(entity.url ?? entity.key);
       if (ref === null) throw new Error(`I cannot tell which pull request ${entity.key} is.`);
+      if (fields.headSha.trim() === "") throw new Error("The pull request's head sha is not known yet, so the marker cannot name it. Retry once the pull request has been observed.");
       const body = [approvalMarkerLine({ sha: fields.headSha, entry: fields.entry, verdict: fields.verdict }), "", fields.reasoning.trim(), "", signatureLine(byThread)].join("\n");
       return github.comment(ref.repo, ref.number, body);
     }

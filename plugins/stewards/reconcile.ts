@@ -561,15 +561,19 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // Only an explicit `no-review` marker skips the owner; a marker the plugin
   // cannot read, or an unknown lane, is the user's (fail closed).
   const ownerLane = lane !== "no-review";
-  // The project steward's approval is the plugin's own record AND the marker
+  // The project steward's decision is the plugin's own record AND the marker
   // it posted: only a `bb-approval` comment whose id the plugin recorded
   // counts, so a hand-typed lookalike (a different comment id) never does.
-  // The record's head sha is not compared with the current head: an approval
-  // is of the pull request, and a later head is covered unless the worker
-  // added scope (AGENTS.md, "What counts as an approval").
-  const recorded = new Set((opts.projectApprovals ?? []).filter((r) => r.verdict === "approved" && r.commentId !== null).map((r) => r.commentId!));
-  const approval = latestProjectApprovalMarker(entity.comments, recorded);
-  const projectApprovedRaw = approval !== null && (approval.marker.verdict ?? "approved") !== "declined";
+  // Every record is kept, declines included: the newest matching marker's
+  // verdict decides, so a decline at a later sha revokes an earlier approval
+  // rather than leaving its marker as the latest word. The record's head sha
+  // is not compared with the current head: a decision is of the pull request,
+  // and a later head is covered unless the worker added scope (AGENTS.md,
+  // "What counts as an approval").
+  const recorded = new Map((opts.projectApprovals ?? []).filter((r) => r.commentId !== null).map((r) => [r.commentId!, r.verdict] as const));
+  const approval = latestProjectApprovalMarker(entity.comments, new Set(recorded.keys()));
+  const approvalVerdict = approval === null ? null : (approval.marker.verdict ?? recorded.get(approval.comment.id) ?? "approved");
+  const projectApprovedRaw = approvalVerdict !== null && approvalVerdict !== "declined";
   // The gate belongs to whoever the decide list names. An explicit decision
   // wins; without one, a project approval means the project steward (a
   // project approval is only ever recorded for a `project` entry), and

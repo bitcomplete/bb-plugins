@@ -408,8 +408,8 @@ describe("the pull request gate (build-tickets)", () => {
   const marker = (sha: string, verdict: string, lane: string) =>
     comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
   const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
-  const approval = (sha: string, entry: string | null, verdict: "approved" | "declined" = "approved", id = `ap-${sha}-${verdict}`) =>
-    comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha, entry, verdict }), signedBy: "thr_project", createdAt: "2026-10-14T16:10:00Z" });
+  const approval = (sha: string, entry: string | null, verdict: "approved" | "declined" = "approved", id = `ap-${sha}-${verdict}`, createdAt = "2026-10-14T16:10:00Z") =>
+    comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha, entry, verdict }), signedBy: "thr_project", createdAt });
   const record = (commentId: string, verdict: "approved" | "declined" = "approved"): ProjectApprovalRecord => ({ commentId, verdict });
   const green = { checks: { state: "success", failing: [] } };
 
@@ -501,6 +501,20 @@ describe("the pull request gate (build-tickets)", () => {
     // A declined marker is not an approval even when its record matches.
     const declined = approval(head, "A cross-repo contract", "declined", "IC_declined");
     expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), declined] }, green), { decision: "project", projectApprovals: [record(declined.id, "declined")] })).toMatchObject({ projectApproved: false, gateMet: false, missing: "project steward approval needed" });
+  });
+
+  it("lets a decline at a later sha revoke an earlier approval, and a later approval revoke the decline (BB-77)", () => {
+    const sha1 = "aaaaaaa1";
+    const sha2 = "bbbbbbb2";
+    const sha3 = "ccccccc3";
+    const approved = approval(sha1, "A cross-repo contract", "approved", "IC_approved", "2026-10-14T16:10:00Z");
+    const declined = approval(sha2, "A cross-repo contract", "declined", "IC_declined", "2026-10-14T16:20:00Z");
+    const records: ProjectApprovalRecord[] = [record(approved.id), record(declined.id, "declined")];
+    const declinedPull = pull({ comments: [marker(sha1, "approved", "owner-reviewed"), approved, declined] }, { ...green, headSha: sha3 });
+    expect(prGate(declinedPull, { decision: "project", projectApprovals: records })).toMatchObject({ projectApproved: false, gateMet: false, missing: "project steward approval needed" });
+    const approvedAgain = approval(sha3, "A cross-repo contract", "approved", "IC_approved_again", "2026-10-14T16:30:00Z");
+    const reapproved = pull({ comments: [marker(sha1, "approved", "owner-reviewed"), approved, declined, approvedAgain] }, { ...green, headSha: sha3 });
+    expect(prGate(reapproved, { decision: "project", projectApprovals: [...records, record(approvedAgain.id)] })).toMatchObject({ projectApproved: true, gateMet: true });
   });
 
   it("covers a later head with an approval recorded on an earlier one (BB-77)", () => {
