@@ -175,6 +175,36 @@ export const isBusy = (status: string): boolean => BUSY.has(status);
 
 const parentOf = (t: Pick<SidebarLiveThread, "parentThreadId" | "lifecycleOwnerThreadId">): string | null => t.parentThreadId ?? t.lifecycleOwnerThreadId;
 
+/** Count every thread in a child tree, at any depth. */
+export function countThreads(children: readonly SidebarChild[]): number {
+  return children.reduce((n, c) => n + 1 + countThreads(c.children), 0);
+}
+
+/** The fields the unread test reads (BB-80): the same pair the sidebar's glyph reads. */
+export interface UnreadFlags {
+  isUnread: boolean;
+  indicator: string;
+}
+
+/**
+ * Whether a thread is unread (BB-80): `isUnread`, or an `unread-success` /
+ * `unread-error` indicator. The one predicate the glyph and the group defaults
+ * share.
+ */
+export const isUnread = (t: UnreadFlags): boolean => t.isUnread || t.indicator === "unread-success" || t.indicator === "unread-error";
+
+/**
+ * Whether any thread in `children` is unread, at any depth (BB-80). A thread
+ * missing from `byId` counts as read, so an ended or archived row never opens
+ * a group by itself.
+ */
+export function hasUnread(children: readonly SidebarChild[], byId: ReadonlyMap<string, UnreadFlags>): boolean {
+  return children.some((c) => {
+    const t = byId.get(c.threadId);
+    return (t !== undefined && isUnread(t)) || hasUnread(c.children, byId);
+  });
+}
+
 /**
  * The fields the glyph, section and phrase rules read. A `SidebarEffort` has
  * all of them; the Stewards page builds one from its board RPC's steward shape,
