@@ -1511,10 +1511,11 @@ project steward footer row is the grey ring.
 else `on hold`; `stuck` for an open stuck escalation; `N worker(s) running`
 counting only workers whose worker-table status is `running` (a busy steward or
 reviewer with no running worker falls through, rather than reading `0 workers
-running`); `waiting on <nextAction>` when the status actor is `other` (an
-external wait is not a block, so its colour follows the glyph); the newest
-deployment watch's state (`deploying`, `deployed`, `deploy failed`); the status
-`nextAction`; otherwise `no report yet`. The phrase's colour follows the
+running`); the newest deployment watch's state (`deploying`, `deployed`,
+`deploy failed`), ahead of the free-text `nextAction` whatever the actor (BB-86);
+the status `nextAction` verbatim, with `the other party` standing in for an
+`other` actor that has no report (an external wait is not a block, so its colour
+follows the glyph); otherwise `no report yet`. The phrase's colour follows the
 glyph's. `sidebar.ts` derives `state`, `section`
 and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
 covers every rule and the precedence.

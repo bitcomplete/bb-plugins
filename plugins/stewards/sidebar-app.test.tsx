@@ -507,7 +507,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(inflight.textContent).toContain("Waiting ticket");
     expect(inflight.textContent).not.toContain("Needs you");
     expect(glyphOf(slot, "Waiting ticket")).toBe("quiet");
-    expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · waiting on an author push");
+    expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · an author push");
     // Monitors holds the ops wait, grey, once opened.
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
@@ -518,7 +518,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     const monitors = slot.getByRole("button", { name: /Monitors/u }).closest("section")!;
     expect(monitors.textContent).toContain("Ops watch: acme/web");
     expect(glyphOf(slot, "Ops watch: acme/web")).toBe("quiet");
-    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · waiting on Next scheduled look");
+    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · Next scheduled look");
     const threads = slot.getByRole("button", { name: /Threads/u }).closest("section")!;
     expect(threads.textContent).toContain("One-off");
     slot.lifecycle.unmount();
