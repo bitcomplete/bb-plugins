@@ -157,14 +157,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   Reopening, or re-adding the label, wakes the same thread, bringing it back
   from the archive; an entity that leaves its terminal state before the
   binding has ended takes the ending back. A steward whose wake turn reports
-  `actor: other` (waiting on a reviewer or the author) is hidden rather than
-  archived: it leaves the sidebar's organisation and unread attention but
-  stays addressable, so a later wake can reach it. It is made visible again
-  when it needs you (the report puts you next, an escalation is open, or a
-  question is unanswered) and stays hidden across "nothing changed" wakes.
-  Hiding cascades to its finished workers and their reviewers, so no row is
-  left behind without its steward; a running worker is unaffected, and
-  showing the steward again shows them. Binding end still archives.
+  `actor: other` (waiting on a reviewer or the author) stays in the sidebar
+  rather than being hidden or archived: it stays addressable, so a later wake
+  reaches it, and its finished workers and their reviewers stay visible with
+  it. Binding end still archives.
 - **Finished workers and reviewers.** A worker whose turn ends is marked
   `finished`; once the reconcile that consumed its report has woken the
   steward, its thread is archived, so the sidebar keeps only work in flight.
@@ -196,8 +192,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   section when it is spawned, and a worker or reviewer the plugin did not
   place is filed there by the `thread.created` handler. A finished worker
   leaves the sidebar once its report is consumed, and a consumed reviewer
-  once its round is; a waiting steward's finished workers and their reviewers
-  hide with it and come back when it does. The unread dot
+  once its round is. The unread dot
   means "needs you": a report that waits on someone else, with no
   escalation, question or needs item, is marked read. A report that needs
   you is left unread.
