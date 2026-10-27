@@ -697,24 +697,7 @@ function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; cou
       {lessons.length === 0 ? (
         <p className="border-t border-border p-3 text-muted-foreground">No lessons yet.</p>
       ) : (
-        <ul className="flex flex-col divide-y divide-border border-t border-border">
-          {lessons.map((l) => (
-            <li key={l.id} className="flex flex-col gap-1 p-3">
-              <p className="flex flex-wrap items-center gap-2">
-                <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
-                <Badge>{l.tier}</Badge>
-                <span className="font-medium">{l.file}</span>
-                {l.key !== null ? <span className="text-muted-foreground">{l.key}</span> : null}
-                <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
-              </p>
-              <p>{l.text}</p>
-              <p className="text-xs text-muted-foreground">
-                {l.hits} citation{l.hits === 1 ? "" : "s"} · {l.corrections} correction{l.corrections === 1 ? "" : "s"} · last cited {ago(l.lastCitedAt, now)}
-                {l.note !== null ? ` · ${l.note}` : ""}
-              </p>
-            </li>
-          ))}
-        </ul>
+        <LessonsList lessons={lessons} now={now} className="border-t border-border" />
       )}
     </details>
   );
@@ -869,9 +852,9 @@ function UnknownEffort({ board: b, effortKey }: { board: Board; effortKey: strin
 }
 
 /** The lesson rows, shared by the project view's collapsed block and one effort's detail. */
-function LessonsList({ lessons, now }: { lessons: Board["lessons"]; now: number }) {
+function LessonsList({ lessons, now, className = "rounded-lg border border-border" }: { lessons: Board["lessons"]; now: number; className?: string }) {
   return (
-    <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
+    <ul className={`flex flex-col divide-y divide-border ${className}`}>
       {lessons.map((l) => (
         <li key={l.id} className="flex flex-col gap-1 p-3">
           <p className="flex flex-wrap items-center gap-2">
