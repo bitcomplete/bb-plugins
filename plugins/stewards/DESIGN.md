@@ -875,14 +875,19 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 - **Agent tools:** `steward_report` and `steward_update` (which also
   records and completes lessons, §20).
 - **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.
-- **UI:** the Stewards page, a nav panel with one tab per stewarded project and
-  the expanded view of the sidebar (BB-78): **Blocked** (needs-you cards first,
-  then blocked, held, stuck and waiting-on-others), **In flight** (the rest of
-  the non-`ops` bindings, running before quiet), **Monitors** (the `ops`
-  bindings with their last wake) and **Recently ended**, then the latest digest
-  with its date and the lessons block. Each card is headed by the same two-line
-  effort row the sidebar shows (§21), with the status report underneath; a
-  needs-you card carries its prompt and the page's full one-click controls.
+- **UI:** the Stewards page, a nav panel (BB-85): `board/<project>` is the
+  project view — the project name and project-steward link, **Waiting on you**
+  (the needs-you items with no open binding: project-level questions and items
+  whose binding ended), one line counting what the sidebar holds, the latest
+  digest with its date and the collapsed lessons block. `board/<project>/<key>`
+  is one effort's detail view, opened from its sidebar row: the sidebar's
+  two-line effort row (§21) one size up with a crumb back, **Needs you** with
+  the page's full controls, **Status** (summary, `Next: … (actor)`, the
+  blocked / on hold / stuck lines and the meta line), **Threads** (the steward,
+  the workers and the pull request) and the lessons the effort wrote. An ended
+  effort shows the key, title, how it ended and the archived thread; an unknown
+  key says so. The page's own sidebar is the same list
+  (`experimental_sidebar`), told the project and effort the path names.
   Settings → Plugins → Stewards keeps each project's configuration and health.
 
 ### Changes to linear and github
@@ -962,7 +967,7 @@ goes wrong there into Linear tickets for the project steward to adopt.
   its thread is archived; put back, the same binding and thread resume.
   `bb stewards detach` ends it until the target is taken out and put back,
   as a ticket stays detached until its label is. It reports to the project
-  steward and has no workers. On the Stewards page it sits under **Monitors**,
+  steward and has no workers. In the sidebar it sits under **Monitors**,
   a quiet row with its last wake; a `watch` stage only survives in the board
   RPC for the CLI. In `bb stewards list` it shows when it last looked and how
   many problems are failing.
@@ -1135,13 +1140,13 @@ must do, with a link, one line of what, steps, and a close rule. Under
 BB-30 the steward-filed asks (`decide`, `configure`, `provide-secret`) are
 the one `escalations` record with `route: me` and a `resolution`; the
 plugin-filed gate items (`approve-spec`, `approve-pr`, `merge`) stay as
-needs. Both appear on the Stewards page under **Blocked**, attached to the
-binding's card by its entity key (or, with no open binding, as a card of their
-own at the top), in the digest, and by `bb stewards needs` and
-`bb stewards show`. The page's needs-you card keeps its full controls — the
-free-text answer box, the rationale box, the fixed-choice buttons and **Other…**,
-the secret form and the `approve-spec` note — where the sidebar's inline block
-carries only the one-click actions. A `route: me`
+needs. Both appear on the effort's detail view under **Needs you**, attached
+to its binding by its entity key (or, with no open binding, in the project
+view's **Waiting on you**), in the digest, and by `bb stewards needs` and
+`bb stewards show`. The detail's needs-you item keeps the page's full controls
+— the free-text answer box, the rationale box, the fixed-choice buttons and
+**Other…**, the secret form and the `approve-spec` note — where the sidebar's
+inline block carries only the one-click actions. A `route: me`
 escalation is rendered from its `resolution` alone: `choice` (one button
 per label), `text` (the answer box), `approve-decline`, `secret` (the
 requester thread and bb's secure form) or `done`.
@@ -1475,9 +1480,9 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   section is gone, and `bb stewards lessons --all` is where their state is
   read.
 - **Surfaces.** Every lesson is in one collapsed details block at the bottom
-  of the Stewards page's project tab, with counts by tier and the rows behind
+  of the Stewards page's project view, with counts by tier and the rows behind
   the disclosure (no buttons of its own; the boundary Merge / Drop stays the
-  need under **Blocked**); `bb stewards list` names the pending ones,
+  need on the effort's detail); `bb stewards list` names the pending ones,
   `bb stewards lessons [--all]` lists them all with their counts, and
   `bb stewards lessons --efficacy` prints the escalation-to-user trend and the
   uncited guidance units; `bb stewards drop-lesson <id>` drops one.
@@ -1501,9 +1506,9 @@ project dropdown in the live view; the sections top to bottom are **Blocked**
 (needs-you rows first, then blocked), **In flight** (running before quiet),
 **Threads** (one-off threads, collapsed), **Monitors** (the `ops`, Dependabot
 and Sentry bindings, collapsed), **Recently ended** (collapsed), and the
-project steward demoted to one small row at the bottom. Every row carries bb's
-own thread actions context menu, so archive, pin, rename, split and delete
-still work.
+project steward demoted to one small row at the bottom. Every effort and thread
+row carries bb's own thread actions context menu, so archive, pin, rename,
+split and delete still work.
 
 **Two-line effort rows and the four glyphs (BB-76).** An effort row is two
 lines. Line one is the glyph, the entity key in bold, and the title, which
@@ -1551,6 +1556,20 @@ non-ops efforts, running before quiet, then by recency. Pinned rows stay first w
 `buildSidebar` returns `blocked`, `efforts`, `threads` and `monitors`
 separately, and the split is unit tested in `sidebar.test.ts`.
 
+**Rows, highlighting and auto-expand (BB-85).** A stewarded effort row in
+Blocked, In flight or Monitors and a Recently ended row are real links to the
+effort's detail view (`board/<project>/<key>`, §16); a worker or reviewer child
+row, a one-off thread and the project steward row still open their thread. An
+effort row is highlighted while the board shows that effort's detail, and a
+thread row is highlighted while its thread page is the route (`bg-state-active`,
+with `aria-current="page"` on the anchor). When navigation lands on a row
+inside a collapsed parent, the parent expands so the row is revealed: the
+effort's row for a worker or reviewer, the **Threads** section for a one-off
+thread, and **Monitors** or **Recently ended** for their rows. The board panel
+registers the same list as its own `experimental_sidebar`, told the project and
+effort the path names, so the list is there whichever thread list the user
+pinned; a project pick in it moves the page.
+
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
 through the worker the RPC names, so the grouping survives a worker spawned
@@ -1571,13 +1590,13 @@ question or need's text and its one-click actions, the same RPC calls the old
 block made. A fixed-choice question answers through
 `stewardsAnswerQuestion { choice }`, a `decide` need through
 `stewardsNeedAction { action: "choose", choice }`; an `approve-pr` row carries
-**Open PR** (`navigate.openUrl` on the item's `url`), **Approve**
+**Open PR** (`navigate.openUrl` on the item's `url`) and **Approve**
 (`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
-refusal shown in the row) and **Details** (the board at that project); a
-`merge` row swaps **Merge** for **Approve** (the lane gate re-checked
-server-side). Every other row's page button is **Details**, opening the
-Stewards page at that project, where the free-text answer and the secret form
-live. The inline block adds no write path the page does not already make. The
+refusal shown in the row); a `merge` row swaps **Merge** for **Approve** (the
+lane gate re-checked server-side). There is no **Details** button: the row
+itself opens the effort's detail view (BB-85), where the free-text answer and
+the secret form live. The inline block adds no write path the page does not
+already make. The
 project dropdown carries each project's count in its option label, and that
 count is the number of yellow effort rows, so the picker and the sections
 cannot disagree. `stewardsSidebar` carries, per project,

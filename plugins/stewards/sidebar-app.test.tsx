@@ -422,7 +422,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("navigates to the row's thread and calls onNavigate", async () => {
+  it("opens a stewarded effort's detail view as a real link and calls onNavigate", async () => {
     const onNavigate = vi.fn();
     const slot = await renderSidebar(
       {
@@ -431,10 +431,44 @@ describe("the stewards sidebar list (BB-44)", () => {
       },
       { onNavigate },
     );
-    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    fireEvent.click(slot.getByText("Fix login"));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_steward" }));
+    const row = await waitFor(() => slot.getByText("Fix login"));
+    expect(row.closest("a")!.getAttribute("href")).toBe("/plugins/test-plugin/board/p1/ENG-1");
+    fireEvent.click(row);
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
     expect(onNavigate).toHaveBeenCalled();
+    slot.lifecycle.unmount();
+  });
+
+  it("still opens a worker, a one-off thread and the project steward row's thread", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_worker", displayTitle: "Implement retry", status: "active" }),
+          thread({ id: "thr_oneoff", displayTitle: "A one-off thread" }),
+          thread({ id: "thr_p", displayTitle: "Acme project steward" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            projectStewardThreadId: "thr_p",
+            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })],
+          }),
+      } as never,
+    });
+    // The worker under the effort.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Expand ENG-1: Fix login/u })));
+    fireEvent.click(await waitFor(() => slot.getByText("Implement retry")));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_worker" }));
+    // A one-off thread in the Threads section.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    fireEvent.click(await waitFor(() => slot.getByText("A one-off thread")));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_oneoff" }));
+    // The project steward footer row.
+    fireEvent.click(await waitFor(() => slot.getByText("Acme project steward")));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_p" }));
     slot.lifecycle.unmount();
   });
 });
@@ -677,7 +711,6 @@ describe("the inline needs-you actions (BB-76)", () => {
     await waitFor(() => expect(slot.getByText("Stacked on BB-57. Merge order?")).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: "Stack" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Stack" } }));
-    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -715,7 +748,7 @@ describe("the inline needs-you actions (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("renders a with-user escalation with Details only", async () => {
+  it("renders a with-user escalation's prompt with no one-click buttons", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
       rpc: {
@@ -724,9 +757,9 @@ describe("the inline needs-you actions (BB-76)", () => {
     });
     await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
     // A with-user escalation has no choices and is not an approve-pr or merge,
-    // so its prompt is one line (BB-79).
+    // so its prompt is one line (BB-79) and the row itself is the detail (BB-85).
     expect(slot.getByText("Need cluster access").className).toContain("line-clamp-1");
-    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
+    expect(slot.queryByRole("button", { name: "Details" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Approve" })).toBeNull();
     slot.lifecycle.unmount();
   });
@@ -808,6 +841,154 @@ describe("the inline needs-you actions (BB-76)", () => {
     fireEvent.click(slot.getByRole("button", { name: "Stack" }));
     await waitFor(() => expect(slot.queryByRole("button", { name: "Stack" })).toBeNull());
     expect(calls).toBeGreaterThan(1);
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-85: navigation highlighting and auto-expand.
+describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
+  it("expands a collapsed effort and highlights the worker whose thread page is showing", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry", status: "active" })],
+        },
+        rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })] }) } as never,
+      },
+      { activeThreadId: "thr_worker" },
+    );
+    const worker = await waitFor(() => slot.getByText("Implement retry"));
+    expect(worker.closest("a")!.getAttribute("aria-current")).toBe("page");
+    expect(worker.closest("a")!.parentElement!.className).toContain("bg-state-active");
+    slot.lifecycle.unmount();
+  });
+
+  it("expands a collapsed effort and highlights a reviewer nested under its worker", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [
+            thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+            thread({ id: "thr_worker", displayTitle: "Implement retry", status: "active" }),
+            thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" }),
+          ],
+        },
+        rpc: {
+          stewardsSidebar: () =>
+            sidebarData({
+              bindings: [
+                binding({
+                  workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }],
+                  reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }],
+                }),
+              ],
+            }),
+        } as never,
+      },
+      { activeThreadId: "thr_reviewer" },
+    );
+    const reviewer = await waitFor(() => slot.getByText("Review the PR"));
+    expect(reviewer.closest("a")!.getAttribute("aria-current")).toBe("page");
+    slot.lifecycle.unmount();
+  });
+
+  it("expands the Threads section for a one-off thread, and highlights it", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeThreadId: "thr_oneoff" },
+    );
+    const row = await waitFor(() => slot.getByText("A one-off thread"));
+    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
+    slot.lifecycle.unmount();
+  });
+
+  it("expands Monitors for a worker under a monitor, and Recently ended for an archived thread", async () => {
+    const monitors = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" }), thread({ id: "thr_ops_worker", displayTitle: "Check Sentry" })],
+        },
+        rpc: {
+          stewardsSidebar: () =>
+            sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", workers: [{ threadId: "thr_ops_worker", title: "Check Sentry", status: "running" }] })] }),
+        } as never,
+      },
+      { activeThreadId: "thr_ops_worker" },
+    );
+    const worker = await waitFor(() => monitors.getByText("Check Sentry"));
+    expect(worker.closest("a")!.getAttribute("aria-current")).toBe("page");
+    monitors.lifecycle.unmount();
+
+    const ended = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", endedAt: 1_000 }] }) } as never,
+      },
+      { activeThreadId: "thr_old" },
+    );
+    const old = await waitFor(() => ended.getByText("Old work"));
+    expect(old.closest("a")!.getAttribute("href")).toContain("/board/p1/ENG-0");
+    ended.lifecycle.unmount();
+  });
+
+  it("highlights a Recently ended row while its detail page is showing", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-0" }, {
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", endedAt: 1_000 }] }) } as never,
+    });
+    const old = await waitFor(() => slot.getByText("Old work"));
+    expect(old.closest("a")!.getAttribute("aria-current")).toBe("page");
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-85: the board panel's own sidebar, so the list is there whichever thread
+// list the user pinned.
+describe("the board panel's own sidebar (BB-85)", () => {
+  it("registers the panel sidebar and renders the same list told the path's project and effort", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    expect(panel.experimental_sidebar).toBeTruthy();
+    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-1" }, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    });
+    const row = await waitFor(() => slot.getByText("Fix login"));
+    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
+    expect(row.closest("a")!.getAttribute("href")).toBe("/plugins/test-plugin/board/p1/ENG-1");
+    slot.lifecycle.unmount();
+  });
+
+  it("moves the page on a project pick", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1" }, {
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("expands Monitors when the path's effort is a monitor", async () => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/acme/web" }, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops" })] }) } as never,
+    });
+    const row = await waitFor(() => slot.getByText("acme/web"));
+    expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
     slot.lifecycle.unmount();
   });
 });

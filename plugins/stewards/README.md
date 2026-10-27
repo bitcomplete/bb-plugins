@@ -340,22 +340,25 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
-- **The Stewards page** (a nav panel, [app.tsx](app.tsx)) is the expanded
-  view of the sidebar list, with the same sections in the same order: a tab per
-  stewarded project showing **Blocked** (needs-you cards first, then blocked,
-  held, stuck and waiting-on-others), **In flight** (the other open non-`ops`
-  bindings, running before quiet), **Monitors** (the `ops` bindings with their
-  last wake) and **Recently ended**, then the latest digest with its date and
-  one collapsed lessons details block at the bottom (counts by tier, rows
-  behind the disclosure, no buttons of its own). Every card is headed by the
-  same two-line effort row the sidebar shows — glyph, key, title / kind, phase,
-  phrase — derived by the same `sidebar.ts` rules. A needs-you card adds the
-  prompt, the summary and the page's full controls (the free-text answer, the
-  fixed choices, the secret form and the `approve-spec` note, which the sidebar
-  does not have); every other card adds the summary, `Next: <nextAction>
-  (<actor>)` and the meta line. A needs-you item attaches to its binding's
-  card; a project-level question with no binding keeps a card of its own at the
-  top of Blocked.
+- **The Stewards page** (a nav panel, [app.tsx](app.tsx)) is no longer the
+  list (BB-85). `board/<project>` is the project view: project name and
+  project-steward link, **Waiting on you** (the needs-you items with no open
+  binding — project-level questions and items whose binding ended), one line
+  counting what the sidebar holds, the latest digest with its date and one
+  collapsed lessons details block at the bottom (counts by tier, rows behind
+  the disclosure, no buttons of its own). `board/<project>/<key>` is one
+  effort's detail view, opened from its sidebar row: the same two-line effort
+  row the sidebar shows — glyph, key, title / kind, phase, phrase — one size up
+  with a crumb back to the project view; **Needs you** with the page's full
+  controls (the free-text answer, the fixed choices, the secret form and the
+  `approve-spec` note, which the sidebar does not have); **Status** (the
+  summary, `Next: <nextAction> (<actor>)`, the blocked / on hold / stuck lines
+  and the meta line with the stage and deployment); **Threads** (the steward,
+  the workers and the pull request); and the lessons the effort wrote. An ended
+  effort shows the key, title, how it ended and the archived thread; an unknown
+  key says so. The page registers its own sidebar (`experimental_sidebar`), the
+  same list told the project and effort the path names, so it is there whichever
+  thread list the user pinned.
 - **Questions and asks to you** are escalations with `route: me`, kept in
   the store from the moment the project steward asks
   (`steward_update { ask }`, or forwarding an escalation) until it records
@@ -415,16 +418,26 @@ keeps bb's own glyph. A worker or reviewer child row under an effort, and a
 one-off thread's children, share those glyphs and carry no role tag. An `ops`
 binding that needs you or is blocked moves from Monitors into Blocked.
 
-**The needs-you items and the picker count (BB-46).** The project dropdown
-shows each project's count in its option label, counting the yellow effort
-rows. A needs-you effort shows the question or need's text and its one-click
-actions inline under line two: a fixed-choice question answers through
+**Rows, highlighting and auto-expand (BB-85).** An effort row in Blocked, In
+flight or Monitors and a Recently ended row are real links to the effort's
+detail view; a worker or reviewer child row, a one-off thread and the project
+steward row still open their thread. The row the board is showing is
+highlighted, and a thread row is highlighted while its thread page is the
+route. When navigation lands on a row inside a collapsed parent, the parent
+expands so the row is revealed: the effort's row for a worker or reviewer, the
+**Threads** section for a one-off thread, and **Monitors** or **Recently
+ended** for their rows.
+
+**The needs-you items and the picker count (BB-46, BB-85).** The project
+dropdown shows each project's count in its option label, counting the yellow
+effort rows. A needs-you effort shows the question or need's text and its
+one-click actions inline under line two: a fixed-choice question answers through
 `stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
-{ action: "choose" }`, an `approve-pr` row carries **Open PR** / **Approve** /
-**Details**, a `merge` row **Open PR** / **Merge** / **Details**, and every
-other row opens the Stewards page with **Details**. The actions make the same
-RPC calls the board does, the server's refusal is shown in the row, and the
-row refetches on success. The items come from `stewardsSidebar` and each
+{ action: "choose" }`, an `approve-pr` row carries **Open PR** / **Approve**,
+and a `merge` row **Open PR** / **Merge**. There is no **Details** button: the
+row itself opens the effort's detail view, where the free-text answer and the
+secret form live. The actions make the same RPC calls the board does, the
+server's refusal is shown in the row, and the row refetches on success. The items come from `stewardsSidebar` and each
 carries the binding's entity key as `bindingKey`, so a row owns its item; a
 project-level question with no binding has no row and stays on the Stewards
 page. The plugin publishes `needs-you-changed { projectId }` on its realtime

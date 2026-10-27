@@ -1,11 +1,14 @@
-// Two surfaces. The Stewards page (a nav panel, one tab per stewarded
-// project) is the expanded view of the sidebar (BB-78): the Blocked, In flight,
-// Monitors and Recently ended sections, every card headed by the shared BB-76
-// effort row, and the latest digest and lessons block; the one write is closing
-// a question put to you or pressing a needs item's button. Settings → Plugins →
-// Stewards: which projects are stewarded and whether their configuration is
-// healthy, then every open steward and where it stands. Steering stays with the
-// project steward and the CLI.
+// Two surfaces. The Stewards page (a nav panel, BB-85) is no longer the list:
+// `board/<project>` is the project view (project name and steward link, the
+// items waiting on you with no open binding, one count line, the latest digest
+// and the lessons block) and `board/<project>/<key>` is one effort's detail
+// (its two-line row one size up, its needs-you items with the page's full
+// controls, its status, threads and lessons). The sidebar (the opt-in
+// `experimental_threadList`, or the panel's own `experimental_sidebar`) is the
+// list; the one write is closing a question put to you or pressing a needs
+// item's button. Settings → Plugins → Stewards: which projects are stewarded
+// and whether their configuration is healthy, then every open steward and
+// where it stands. Steering stays with the project steward and the CLI.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Markdown,
@@ -22,13 +25,14 @@ import {
   useSdk,
   useSidebarThreadDraft,
   useSidebarThreadRowStatus,
+  type PluginNavPanelProps,
   type PluginSidebarThread,
   type PluginThreadActionTarget,
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarEnded, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -406,8 +410,36 @@ function Section({ title, count, children }: { title: string; count?: number; ch
   );
 }
 
-function List({ children }: { children: ReactNode }) {
-  return <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">{children}</ul>;
+/** `decodeURIComponent` without throwing on a malformed path segment. */
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * The panel's `subPath` names the project in its first segment and, in a detail
+ * view, the effort key in everything after it. A pull-request key like
+ * `acme/web#612` keeps its own `/`, so the key is the whole remainder, not one
+ * more segment.
+ */
+function parseBoardPath(subPath: string): { projectId: string | null; key: string | null } {
+  const slash = subPath.indexOf("/");
+  const first = slash === -1 ? subPath : subPath.slice(0, slash);
+  const rest = slash === -1 ? "" : subPath.slice(slash + 1);
+  return { projectId: first === "" ? null : safeDecode(first), key: rest === "" ? null : safeDecode(rest) };
+}
+
+/** The subPath for a project view, or with a key one effort's detail view. */
+function boardSubPath(projectId: string, key?: string): string {
+  return key === undefined ? projectId : `${projectId}/${key}`;
+}
+
+/** A real link to one effort's detail view, keeping a pull-request key's own `/` as path. */
+function boardHref(pluginId: string, projectId: string, key: string): string {
+  return `/plugins/${encodeURIComponent(pluginId)}/${BOARD_PATH}/${encodeURIComponent(projectId)}/${key.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function None({ children }: { children: ReactNode }) {
@@ -417,10 +449,14 @@ function None({ children }: { children: ReactNode }) {
 function BoardPage({ subPath }: { subPath: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const first = subPath.split("/")[0] ?? "";
-  const wanted = first === "" ? null : decodeURIComponent(first);
+  const { projectId: wanted, key } = parseBoardPath(subPath);
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsBoard", { projectId: wanted }), [rpc, wanted]));
   const boardProjectId = data?.board?.projectId ?? null;
+  // A path with no project takes the server's choice, replacing rather than
+  // pushing so the sidebar follows without a back-button trap.
+  useEffect(() => {
+    if (wanted === null && boardProjectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(boardProjectId), replace: true });
+  }, [wanted, boardProjectId, navigate]);
   // A steward's question or item shows up here without the half-minute poll.
   useRealtime(
     NEEDS_YOU_CHANGED,
@@ -453,7 +489,7 @@ function BoardPage({ subPath }: { subPath: string }) {
                       type="button"
                       aria-current={active ? "page" : undefined}
                       className={`-mb-px border-b-2 px-3 py-1.5 ${active ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}
-                      onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(p.projectId) })}
+                      onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(p.projectId) })}
                     >
                       {p.name}
                     </button>
@@ -461,7 +497,13 @@ function BoardPage({ subPath }: { subPath: string }) {
                 })}
               </nav>
             ) : null}
-            {data.board === null ? <None>That project is not stewarded.</None> : <ProjectBoard board={data.board} refetch={refetch} />}
+            {data.board === null ? (
+              <None>That project is not stewarded.</None>
+            ) : key === null ? (
+              <ProjectView board={data.board} refetch={refetch} />
+            ) : (
+              <EffortDetail board={data.board} effortKey={key} refetch={refetch} />
+            )}
             {error !== null ? <p className="text-xs text-destructive">Refresh failed: {error}</p> : null}
           </>
         )}
@@ -540,17 +582,17 @@ function boardOrder(e: BoardEffort) {
   };
 }
 
-function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
+/** The open efforts with their derived state, section, phrase and needs-you items. */
+function boardEfforts(b: Board): { efforts: BoardEffort[]; orphans: NeedsYouItem[] } {
   const now = Date.now();
   // An escalation a need answers is shown as that need's row, not as the raw
   // escalation: a forwarded approval is answered with Approve/Decline, not by
   // "approve or decline in its steward's thread".
   const covered = new Set(b.needs.map((n) => n.escalationId).filter((id): id is string => id !== null));
   const withUser = b.withUser.filter((x) => !covered.has(x.id));
-
-  // Needs-you items attach to their binding's card; an item with no open binding
-  // (a project-level question, or one whose binding has ended) keeps a card of
-  // its own at the top of Blocked (BB-78).
+  // A needs-you item attaches to its binding's detail view; an item with no
+  // open binding (a project-level question, or one whose binding has ended)
+  // waits in the project view.
   const openKeys = new Set(b.stewards.map((s) => s.key));
   const itemsByKey = new Map<string, NeedsYouItem[]>();
   const orphans: NeedsYouItem[] = [];
@@ -564,16 +606,28 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
     if (key === null || !openKeys.has(key)) orphans.push(item);
     else itemsByKey.set(key, [...(itemsByKey.get(key) ?? []), item]);
   }
-
   const efforts: BoardEffort[] = b.stewards.map((s) => {
     const status = boardEffortStatus(s);
     const state = effortState(status);
     return { steward: s, state, section: effortSection({ state, kind: s.kind }), phrase: effortPhrase(status, now), items: itemsByKey.get(s.key) ?? [] };
   });
-  const blocked = efforts.filter((e) => e.section === "blocked").sort((a, b) => compareBlocked(boardOrder(a), boardOrder(b)));
-  const inflight = efforts.filter((e) => e.section === "inflight").sort((a, b) => compareInflight(boardOrder(a), boardOrder(b)));
-  const monitors = efforts.filter((e) => e.section === "monitors").sort((a, b) => compareEfforts(boardOrder(a), boardOrder(b)));
+  return { efforts, orphans };
+}
 
+/** One line counting the efforts the sidebar holds for this project. */
+function boardCountLine(efforts: readonly BoardEffort[], ended: number): string {
+  const count = (section: SidebarSection) => efforts.filter((e) => e.section === section).length;
+  return `${efforts.length} open: ${count("blocked")} blocked · ${count("inflight")} in flight · ${count("monitors")} monitors · ${ended} recently ended`;
+}
+
+/**
+ * The project view at `board/<project>` (BB-85): no list of efforts — the
+ * sidebar is the list — just the name, the project steward, what waits on you
+ * with no open binding, one count line, the digest and the collapsed lessons.
+ */
+function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void }) {
+  const now = Date.now();
+  const { efforts, orphans } = boardEfforts(b);
   return (
     <>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -591,62 +645,21 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         </p>
       ) : null}
 
-      <Section title="Blocked" count={orphans.length + blocked.length}>
-        {orphans.length === 0 && blocked.length === 0 ? (
-          <None>Nothing is blocked or waiting on you.</None>
+      <Section title="Waiting on you" count={orphans.length}>
+        {orphans.length === 0 ? (
+          <None>Nothing is waiting on you.</None>
         ) : (
-          <List>
+          <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
             {orphans.map((item) => (
               <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
             ))}
-            {blocked.map((e) => (
-              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
-            ))}
-          </List>
+          </ul>
         )}
       </Section>
 
-      <Section title="In flight" count={inflight.length}>
-        {inflight.length === 0 ? (
-          <None>Nothing in flight.</None>
-        ) : (
-          <List>
-            {inflight.map((e) => (
-              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
-            ))}
-          </List>
-        )}
-      </Section>
-
-      <Section title="Monitors" count={monitors.length}>
-        {monitors.length === 0 ? (
-          <None>No ops bindings.</None>
-        ) : (
-          <List>
-            {monitors.map((e) => (
-              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
-            ))}
-          </List>
-        )}
-      </Section>
-
-      <Section title="Recently ended" count={b.ended.length}>
-        {b.ended.length === 0 ? (
-          <None>Nothing ended in the last two weeks.</None>
-        ) : (
-          <List>
-            {b.ended.map((x) => (
-              <li key={`${x.key}-${x.endedAt}`} className="flex flex-wrap items-center gap-2 p-3">
-                <EntityLink entityKey={x.key} url={x.url} />
-                <span className="min-w-0 flex-1 truncate text-muted-foreground">{x.title}</span>
-                <Badge>{x.kind}</Badge>
-                {x.endReason !== null ? <Badge>{x.endReason}</Badge> : null}
-                <span className="text-xs text-muted-foreground">{ago(x.endedAt, now)}</span>
-              </li>
-            ))}
-          </List>
-        )}
-      </Section>
+      <p data-board-count-line="" className="text-muted-foreground">
+        {boardCountLine(efforts, b.ended.length)}
+      </p>
 
       <Section title="Latest digest">
         {b.digest === null ? (
@@ -708,71 +721,174 @@ function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; cou
 }
 
 /**
- * One Stewards page card (BB-78): the BB-76 effort row as its header, then its
- * needs-you items (prompt, muted summary, the page's full controls) or its
- * status report (summary, next action, meta line). The glyph and phrase come
- * from the same `sidebar.ts` rules the sidebar uses.
+ * The detail view at `board/<project>/<key>` (BB-85): the effort's own page.
+ * Its heading is the sidebar's two-line row one size up, with a crumb back to
+ * the project view; below it the needs-you items with the page's full controls,
+ * the status report, the threads and the lessons the effort wrote.
  */
-function StewardCard({ effort, now, onChanged, projectStewardThreadId }: { effort: BoardEffort; now: number; onChanged: () => void; projectStewardThreadId: string | null }) {
+function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKey: string; refetch: () => void }) {
+  const now = Date.now();
+  const navigate = useBbNavigate();
+  const { efforts } = boardEfforts(b);
+  const effort = efforts.find((e) => e.steward.key === effortKey);
+  if (effort === undefined) {
+    const ended = b.ended.find((x) => x.key === effortKey);
+    if (ended !== undefined) return <EndedDetail board={b} ended={ended} now={now} />;
+    return <UnknownEffort board={b} effortKey={effortKey} />;
+  }
   const s = effort.steward;
+  const lessons = b.lessons.filter((l) => l.key === effortKey);
+  const stuck = b.stuck.find((x) => x.key === effortKey) ?? null;
   return (
-    <li className="flex flex-col gap-2 p-3">
-      <StewardHeader
-        state={effort.state}
-        phrase={effort.phrase}
-        kind={s.kind}
-        phase={s.phase}
-        entityKey={s.key}
-        url={s.url}
-        title={s.title}
-        extra={
-          <>
-            {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
-            {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
-          </>
-        }
-      />
-      {effort.items.length > 0 ? (
-        effort.items.map((item, i) => (
-          <div key={needsYouItemKey(item)} className="flex flex-col gap-2">
-            <NeedsYouPrompt entry={item} now={now} />
-            {i === 0 ? <p className="text-muted-foreground">{s.summary ?? "No status report yet."}</p> : null}
-            <NeedsYouControls entry={item} onChanged={onChanged} projectStewardThreadId={projectStewardThreadId} />
-          </div>
-        ))
-      ) : (
-        <>
-          {s.summary === null ? (
-            <p className="text-muted-foreground">No status report yet.</p>
-          ) : (
-            <p>
-              {s.summary}{" "}
-              <span className="text-muted-foreground">
-                Next: {s.nextAction ?? "—"}
-                {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
-              </span>
-            </p>
-          )}
-          {s.hold !== null ? <p className="text-amber-600 dark:text-amber-500">On hold: {s.hold}</p> : null}
+    <>
+      <EffortHeading board={b} effort={effort} />
+      <Section title="Needs you" count={effort.items.length}>
+        {effort.items.length === 0 ? (
+          <None>Nothing is waiting on you for this effort.</None>
+        ) : (
+          <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
+            {effort.items.map((item) => (
+              <li key={needsYouItemKey(item)} className="flex flex-col gap-2 p-3">
+                <NeedsYouPrompt entry={item} now={now} />
+                <NeedsYouControls entry={item} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+      <Section title="Status">
+        <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+          {s.summary === null ? <p className="text-muted-foreground">No status report yet.</p> : <p>{s.summary}</p>}
+          <p className="text-muted-foreground">
+            Next: {s.nextAction ?? "—"}
+            {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
+          </p>
+          {s.blockedOn !== null ? <p className="text-destructive">Blocked on {s.blockedOn}</p> : null}
+          {s.hold !== null ? <p className="text-amber-600 dark:text-amber-500">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
           <p className="text-xs text-muted-foreground">
             {s.kind === "ops" ? `Last wake ${ago(s.wokeAt, now)}` : `Reported ${ago(s.statusAt, now)} · adopted ${ago(s.createdAt, now)}`}
+            {s.stage !== null ? ` · stage ${s.stage}` : ""}
             {s.deployment !== null ? ` · ${deploymentPhrase(s.deployment)}` : ""}
-            {s.threadId !== null ? (
-              <>
-                {" · "}
-                <ThreadLink threadId={s.threadId}>Open steward</ThreadLink>
-              </>
-            ) : null}
-            {s.workers.map((w) => (
-              <span key={w.threadId}>
-                {" · worker "}
-                <ThreadLink threadId={w.threadId}>{w.title}</ThreadLink>
-              </span>
-            ))}
           </p>
-        </>
-      )}
-    </li>
+        </div>
+      </Section>
+      <Section title="Threads">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border p-3">
+          {s.threadId === null ? null : <ThreadLink threadId={s.threadId}>Open the steward</ThreadLink>}
+          {s.workers.map((w) => (
+            <ThreadLink key={w.threadId} threadId={w.threadId}>{w.title}</ThreadLink>
+          ))}
+          {s.url === null ? null : (
+            <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.openUrl(s.url!)}>
+              {s.kind === "pr" ? "Open the pull request" : "Open the entity"}
+            </button>
+          )}
+        </div>
+      </Section>
+      <Section title="Lessons" count={lessons.length}>
+        {lessons.length === 0 ? <None>This effort wrote no lessons.</None> : <LessonsList lessons={lessons} now={now} />}
+      </Section>
+    </>
+  );
+}
+
+/** The detail heading: the sidebar's two-line effort row one size up, with a crumb back. */
+function EffortHeading({ board: b, effort }: { board: Board; effort: BoardEffort }) {
+  const navigate = useBbNavigate();
+  const s = effort.steward;
+  return (
+    <div className="flex flex-col gap-2">
+      <button
+        type="button"
+        className="self-start text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(b.projectId) })}
+      >
+        ← {b.name}
+      </button>
+      <div className="flex flex-col gap-1 rounded-lg border border-border p-3">
+        <div className="flex flex-wrap items-center gap-2 text-base" title={s.key}>
+          <StewardGlyph kind={effort.state} />
+          <EntityLink entityKey={shortBindingKey(s.key)} url={s.url} />
+          {s.title === null ? null : <span className="min-w-0 flex-1 truncate text-lg font-medium">{s.title}</span>}
+          {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+          {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
+        </div>
+        <p data-steward-line-two="" className="text-xs text-muted-foreground">
+          {kindLabel(s.kind)}
+          {s.phase !== null ? ` · ${s.phase}` : ""}
+          {" · "}
+          <span className={phraseClass(effort.state)}>{effort.phrase}</span>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/** An ended effort's detail: what the board still knows about it. */
+function EndedDetail({ board: b, ended, now }: { board: Board; ended: Board["ended"][number]; now: number }) {
+  const navigate = useBbNavigate();
+  return (
+    <div className="flex flex-col gap-2">
+      <button
+        type="button"
+        className="self-start text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(b.projectId) })}
+      >
+        ← {b.name}
+      </button>
+      <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+        <div className="flex flex-wrap items-center gap-2 text-base" title={ended.key}>
+          <EntityLink entityKey={shortBindingKey(ended.key)} url={ended.url} />
+          {ended.title === null ? null : <span className="min-w-0 flex-1 truncate text-lg font-medium">{ended.title}</span>}
+          <Badge>{kindLabel(ended.kind)}</Badge>
+          {ended.endReason === null ? null : <Badge>{ended.endReason}</Badge>}
+        </div>
+        <p className="text-xs text-muted-foreground">Ended {ago(ended.endedAt, now)}</p>
+        {ended.threadId === null ? <p className="text-muted-foreground">Its thread is no longer available.</p> : <p><ThreadLink threadId={ended.threadId}>Open the archived thread</ThreadLink></p>}
+      </div>
+    </div>
+  );
+}
+
+/** A key the board does not know. */
+function UnknownEffort({ board: b, effortKey }: { board: Board; effortKey: string }) {
+  const navigate = useBbNavigate();
+  return (
+    <div className="flex flex-col gap-2">
+      <button
+        type="button"
+        className="self-start text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(b.projectId) })}
+      >
+        ← {b.name}
+      </button>
+      <None>No effort <code>{effortKey}</code> on this board. It may have ended more than two weeks ago.</None>
+    </div>
+  );
+}
+
+/** The lesson rows, shared by the project view's collapsed block and one effort's detail. */
+function LessonsList({ lessons, now }: { lessons: Board["lessons"]; now: number }) {
+  return (
+    <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
+      {lessons.map((l) => (
+        <li key={l.id} className="flex flex-col gap-1 p-3">
+          <p className="flex flex-wrap items-center gap-2">
+            <Badge tone={l.scope === "boundary" ? "bad" : "muted"}>{l.scope}</Badge>
+            <Badge>{l.tier}</Badge>
+            <span className="font-medium">{l.file}</span>
+            {l.key !== null ? <span className="text-muted-foreground">{l.key}</span> : null}
+            <span className="text-xs text-muted-foreground">{ago(l.createdAt, now)}</span>
+          </p>
+          <p>{l.text}</p>
+          <p className="text-xs text-muted-foreground">
+            {l.hits} citation{l.hits === 1 ? "" : "s"} · {l.corrections} correction{l.corrections === 1 ? "" : "s"} · last cited {ago(l.lastCitedAt, now)}
+            {l.note !== null ? ` · ${l.note}` : ""}
+          </p>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -1052,11 +1168,15 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
 // ---- The sidebar thread list -------------------------------------------------------------------
 //
 // The opt-in replacement for bb's sidebar list, registered through the
-// exclusive `experimental_threadList` slot. One project dropdown, two-line
-// effort rows with the four glyphs in the Blocked / In flight / Threads /
-// Monitors / Recently ended sections, and a demoted project-steward row. Every
-// row carries bb's own thread actions context menu, so nothing bb's rows can
-// do is lost.
+// exclusive `experimental_threadList` slot, and the same list as the board
+// panel's own sidebar (`experimental_sidebar`, BB-85). One project dropdown,
+// two-line effort rows with the four glyphs in the Blocked / In flight /
+// Threads / Monitors / Recently ended sections, and a demoted project-steward
+// row. An effort row and a Recently ended row open the detail view; worker,
+// reviewer, one-off and project-steward rows open their thread; the row the
+// board shows is highlighted and navigation expands a collapsed parent. Every
+// effort and thread row carries bb's own thread actions context menu, so
+// nothing bb's rows can do is lost.
 
 /** The live fields bb's thread actions read, from a sidebar row. */
 function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
@@ -1129,6 +1249,8 @@ function SidebarThreadRow({
   meta,
   titleAttr,
   glyph,
+  activeThreadId,
+  openThreads,
 }: {
   thread: PluginSidebarThread;
   role: SidebarChildRole;
@@ -1142,11 +1264,21 @@ function SidebarThreadRow({
   /** The four-glyph component for a one-off thread or its child, an effort's
    * worker/reviewer child, or the project steward row; drafts keep bb's glyph. */
   glyph?: SidebarEffortState;
+  /** The route's thread, so the row is highlighted while its page is showing (BB-85). */
+  activeThreadId: string | null;
+  /** The rows that must be open so the active thread is revealed (BB-85). */
+  openThreads: ReadonlySet<string>;
 }) {
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
   const draft = useSidebarThreadDraft(thread.id);
   const [open, setOpen] = useState(false);
+  const selected = activeThreadId !== null && thread.id === activeThreadId;
+  // Navigation to a row inside this one expands it, so the highlighted row is revealed.
+  const revealed = openThreads.has(thread.id);
+  useEffect(() => {
+    if (revealed) setOpen(true);
+  }, [revealed]);
   // The array-wide indicator never reports a draft; the row folds in the
   // client-local one, as bb's own row does.
   const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
@@ -1155,7 +1287,7 @@ function SidebarThreadRow({
   return (
     <li className="flex flex-col">
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
-        <div className="flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
+        <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
             <button
               type="button"
@@ -1177,6 +1309,7 @@ function SidebarThreadRow({
           </span>
           <a
             href={thread.href}
+            aria-current={selected ? "page" : undefined}
             className="min-w-0 flex-1 truncate text-sm"
             title={thread.displayTitle}
             onClick={(e) => {
@@ -1195,7 +1328,7 @@ function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} />
             );
           })}
         </ul>
@@ -1209,10 +1342,10 @@ function SidebarThreadRow({
  * question or need's text, then its one-click actions, exactly the RPC calls
  * the old Needs you block made. A fixed-choice question answers through
  * `stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
- * choose`; an approve-pr or merge keeps its Open PR / Approve|Merge buttons;
- * everything else opens the board.
+ * choose`; an approve-pr or merge keeps its Open PR / Approve|Merge buttons.
+ * The row itself opens the detail view (BB-85), so there is no Details button.
  */
-function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeedItem; onChanged: () => void; onOpenBoard: () => void }) {
+function SidebarInlineNeed({ item, onChanged }: { item: SidebarNeedItem; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
@@ -1262,9 +1395,6 @@ function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeed
             </button>
           </>
         ) : null}
-        <button type="button" className={button} onClick={onOpenBoard}>
-          Details
-        </button>
         {typeof state === "object" ? <span className="text-[11px] text-destructive">{state.error}</span> : null}
       </div>
     </div>
@@ -1274,36 +1404,54 @@ function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeed
 /**
  * One effort's root row, two lines (BB-76): glyph, entity key and title on
  * line one; kind, phase and status phrase on line two; a needs-you row adds
- * its prompt and actions under that, in the same row.
+ * its prompt and actions under that, in the same row. A stewarded effort row is
+ * a real link to its detail view (BB-85) and is highlighted while the board
+ * shows that effort.
  */
 function SidebarEffortRow({
   effort,
   needs,
   byId,
+  projectId,
+  activeKey,
+  activeThreadId,
+  openThreads,
   onNavigate,
   onChanged,
-  onOpenBoard,
 }: {
   effort: SidebarEffort;
   needs: readonly SidebarNeedItem[];
   byId: ReadonlyMap<string, PluginSidebarThread>;
+  projectId: string;
+  /** The effort key the board is showing, so its row is highlighted (BB-85). */
+  activeKey: string | null;
+  /** The route's thread, passed to the effort's worker and reviewer rows (BB-85). */
+  activeThreadId: string | null;
+  /** The rows that must be open so the active thread is revealed (BB-85). */
+  openThreads: ReadonlySet<string>;
   onNavigate: () => void;
   onChanged: () => void;
-  onOpenBoard: () => void;
 }) {
   const root = byId.get(effort.rootThreadId);
   const navigate = useBbNavigate();
+  const pluginId = experimental_usePluginId();
   const [open, setOpen] = useState(false);
-  if (root === undefined) return null;
   const key = effort.bindingKey;
-  const displayKey = key === null ? null : shortBindingKey(key);
+  if (root === undefined || key === null) return null;
+  const displayKey = shortBindingKey(key);
   const title = effortTitle(root.displayTitle, key);
   const count = countThreads(effort.children);
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
+  const selected = activeKey !== null && activeKey === key;
+  const revealed = openThreads.has(effort.rootThreadId);
+  useEffect(() => {
+    if (revealed) setOpen(true);
+  }, [revealed]);
+  const href = boardHref(pluginId, projectId, key);
   return (
     <li className="flex flex-col">
       <ThreadActionsContextMenu thread={actionTarget(root)}>
-        <div className="flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: "4px" }} title={key ?? undefined}>
+        <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
           <div className="flex items-center gap-1">
             {count > 0 ? (
               <button
@@ -1322,16 +1470,17 @@ function SidebarEffortRow({
               <StewardGlyph kind={effort.state} />
             </span>
             <a
-              href={root.href}
+              href={href}
+              aria-current={selected ? "page" : undefined}
               className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
               title={root.displayTitle}
               onClick={(e) => {
                 e.preventDefault();
-                navigate.toThread(root.id);
+                navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, key) });
                 onNavigate();
               }}
             >
-              {displayKey !== null ? <span className="shrink-0 font-semibold">{displayKey}</span> : null}
+              <span className="shrink-0 font-semibold">{displayKey}</span>
               <span className="min-w-0 truncate">{title}</span>
             </a>
           </div>
@@ -1346,7 +1495,7 @@ function SidebarEffortRow({
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
           {mine.map((item) => (
-            <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} onOpenBoard={onOpenBoard} />
+            <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} />
           ))}
         </div>
       ) : null}
@@ -1355,7 +1504,7 @@ function SidebarEffortRow({
           {effort.children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} />
             );
           })}
         </ul>
@@ -1375,8 +1524,12 @@ function SidebarSection({ title, count, children }: { title: string; count: numb
   );
 }
 
-function SidebarCollapsible({ title, count, children }: { title: string; count: number; children: ReactNode }) {
+function SidebarCollapsible({ title, count, revealed = false, children }: { title: string; count: number; revealed?: boolean; children: ReactNode }) {
   const [open, setOpen] = useState(false);
+  // Navigation to a row inside this section expands it, so the row is revealed.
+  useEffect(() => {
+    if (revealed) setOpen(true);
+  }, [revealed]);
   return (
     <section className="flex flex-col">
       <button
@@ -1439,9 +1592,73 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
   );
 }
 
-function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps) {
+/** Whether `id` is anywhere in a child tree. */
+function subtreeHas(children: readonly SidebarChild[], id: string): boolean {
+  return children.some((c) => c.threadId === id || subtreeHas(c.children, id));
+}
+
+/** The ancestor thread ids from the direct parent up, or null when `id` is not in the tree. */
+function ancestorThreads(children: readonly SidebarChild[], id: string): string[] | null {
+  for (const c of children) {
+    if (c.threadId === id) return [];
+    const sub = ancestorThreads(c.children, id);
+    if (sub !== null) return [c.threadId, ...sub];
+  }
+  return null;
+}
+
+/** Every effort row a tab renders, whatever its section. */
+function tabEfforts(tab: SidebarTab): SidebarEffort[] {
+  return [...tab.blocked, ...tab.efforts, ...tab.monitors, ...tab.threads];
+}
+
+/** The effort and thread rows that must be open so the active thread is revealed (BB-85). */
+function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | null): ReadonlySet<string> {
+  const open = new Set<string>();
+  if (activeThreadId === null) return open;
+  for (const tab of tabs) {
+    for (const effort of tabEfforts(tab)) {
+      const chain = ancestorThreads(effort.children, activeThreadId);
+      if (chain === null) continue;
+      open.add(effort.rootThreadId);
+      for (const id of chain) open.add(id);
+    }
+  }
+  return open;
+}
+
+/** The collapsed sections that must be open so the active thread or effort is revealed (BB-85). */
+function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | null, activeKey: string | null): ReadonlySet<string> {
+  const open = new Set<string>();
+  for (const tab of tabs) {
+    if ((activeThreadId !== null && tab.ended.some((e) => e.threadId === activeThreadId)) || (activeKey !== null && tab.ended.some((e) => e.key === activeKey))) open.add("Recently ended");
+    if (activeThreadId !== null && tab.threads.some((e) => e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))) open.add("Threads");
+    if (tab.monitors.some((e) => (activeKey !== null && e.bindingKey === activeKey) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))))) open.add("Monitors");
+  }
+  return open;
+}
+
+/**
+ * The list itself, shared by the sidebar's thread list and the board panel's
+ * own sidebar (BB-85). The panel passes the project and effort the path names
+ * and navigates on a project pick; the thread list passes the route's thread.
+ */
+function StewardsSidebarCore({
+  activeProjectId,
+  activeKey,
+  activeThreadId,
+  onNavigate,
+  onPickProject,
+  onNewThread,
+}: {
+  activeProjectId: string | null;
+  activeKey: string | null;
+  activeThreadId: string | null;
+  onNavigate: () => void;
+  onPickProject?: (projectId: string) => void;
+  onNewThread: (projectId: string) => void;
+}) {
   const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
   const { status, threads, projects } = experimental_useSidebarThreads();
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }), [projects, threads, data]);
@@ -1469,19 +1686,40 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
   const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
   const activeNeeds = active === null ? undefined : needsByProject.get(active.projectId);
   const now = Date.now();
-  // The picker only changes local state; the plus button is what retargets the
-  // composer to it, then closes the drawer.
-  const openNewThread = () => {
-    if (active !== null) navigate.toCompose({ projectId: active.projectId });
-    onNavigate();
-  };
-  const openBoard = () => {
-    if (active !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(active.projectId) });
+  const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
+  const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
+  // The picker changes local state and, in the board panel, moves the page.
+  const pick = (projectId: string) => {
+    setPicked(projectId);
+    onPickProject?.(projectId);
   };
   const needItems = activeNeeds?.items ?? [];
+  const rows = (list: readonly SidebarEffort[]) =>
+    list.map((e) => (
+      <SidebarEffortRow
+        key={e.key}
+        effort={e}
+        needs={needItems}
+        byId={byId}
+        projectId={active!.projectId}
+        activeKey={activeKey}
+        activeThreadId={activeThreadId}
+        openThreads={openThreads}
+        onNavigate={onNavigate}
+        onChanged={refetch}
+      />
+    ));
   return (
     <div className="flex h-full flex-col text-sm">
-      <ProjectTabs tabs={tabs} counts={counts} activeId={active?.projectId ?? null} onPick={setPicked} onNewThread={openNewThread} />
+      <ProjectTabs
+        tabs={tabs}
+        counts={counts}
+        activeId={active?.projectId ?? null}
+        onPick={pick}
+        onNewThread={() => {
+          if (active !== null) onNewThread(active.projectId);
+        }}
+      />
       {status === "loading" && data === null ? (
         <p className="p-3 text-muted-foreground">Loading…</p>
       ) : active === null ? (
@@ -1490,69 +1728,39 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
           {active.blocked.length > 0 ? (
             <SidebarSection title="Blocked" count={active.blocked.length}>
-              <ul className="flex flex-col">
-                {active.blocked.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
-                ))}
-              </ul>
+              <ul className="flex flex-col">{rows(active.blocked)}</ul>
             </SidebarSection>
           ) : null}
           <SidebarSection title="In flight" count={active.efforts.length}>
             {active.efforts.length === 0 ? (
               <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>
             ) : (
-              <ul className="flex flex-col">
-                {active.efforts.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
-                ))}
-              </ul>
+              <ul className="flex flex-col">{rows(active.efforts)}</ul>
             )}
           </SidebarSection>
           {active.threads.length > 0 ? (
-            <SidebarCollapsible title="Threads" count={active.threads.length}>
+            <SidebarCollapsible title="Threads" count={active.threads.length} revealed={openSections.has("Threads")}>
               <ul className="flex flex-col">
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
                   return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} />
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} />
                   );
                 })}
               </ul>
             </SidebarCollapsible>
           ) : null}
           {active.monitors.length > 0 ? (
-            <SidebarCollapsible title="Monitors" count={active.monitors.length}>
-              <ul className="flex flex-col">
-                {active.monitors.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
-                ))}
-              </ul>
+            <SidebarCollapsible title="Monitors" count={active.monitors.length} revealed={openSections.has("Monitors")}>
+              <ul className="flex flex-col">{rows(active.monitors)}</ul>
             </SidebarCollapsible>
           ) : null}
           {active.ended.length > 0 ? (
-            <SidebarCollapsible title="Recently ended" count={active.ended.length}>
+            <SidebarCollapsible title="Recently ended" count={active.ended.length} revealed={openSections.has("Recently ended")}>
               <ul className="flex flex-col">
-                {active.ended.map((e) => {
-                  const t = e.threadId === null ? undefined : byId.get(e.threadId);
-                  return t === undefined ? (
-                    <li key={`${e.key}-${e.endedAt}`} className="flex items-center gap-2 px-2 py-0.5 text-muted-foreground">
-                      <span className="font-medium">{e.key}</span>
-                      <span className="min-w-0 flex-1 truncate">{e.title ?? ""}</span>
-                      <span className="shrink-0 text-[11px]">{ago(e.endedAt, now)}</span>
-                    </li>
-                  ) : (
-                    <SidebarThreadRow
-                      key={`${e.key}-${e.endedAt}`}
-                      thread={t}
-                      role="thread"
-                      children={[]}
-                      depth={0}
-                      byId={byId}
-                      onNavigate={onNavigate}
-                      meta={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
-                    />
-                  );
-                })}
+                {active.ended.map((e) => (
+                  <SidebarEndedRow key={`${e.key}-${e.endedAt}`} ended={e} projectId={active.projectId} activeKey={activeKey} now={now} onNavigate={onNavigate} />
+                ))}
               </ul>
             </SidebarCollapsible>
           ) : null}
@@ -1566,6 +1774,8 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
                 byId={byId}
                 onNavigate={onNavigate}
                 glyph="quiet"
+                activeThreadId={activeThreadId}
+                openThreads={openThreads}
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />
             </div>
@@ -1574,6 +1784,70 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
       )}
       {error !== null ? <p className="px-2 py-1 text-xs text-destructive">Refresh failed: {error}</p> : null}
     </div>
+  );
+}
+
+/** A Recently ended row: a real link to the effort's detail view (BB-85). */
+function SidebarEndedRow({ ended, projectId, activeKey, now, onNavigate }: { ended: SidebarEnded; projectId: string; activeKey: string | null; now: number; onNavigate: () => void }) {
+  const navigate = useBbNavigate();
+  const pluginId = experimental_usePluginId();
+  const selected = activeKey !== null && activeKey === ended.key;
+  return (
+    <li className="flex flex-col">
+      <a
+        href={boardHref(pluginId, projectId, ended.key)}
+        aria-current={selected ? "page" : undefined}
+        className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`}
+        style={{ paddingLeft: "4px" }}
+        title={ended.key}
+        onClick={(e) => {
+          e.preventDefault();
+          navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, ended.key) });
+          onNavigate();
+        }}
+      >
+        <span className="flex size-4 shrink-0 items-center justify-center" />
+        <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
+          <StewardGlyph kind="quiet" />
+        </span>
+        <span className="shrink-0 font-semibold">{shortBindingKey(ended.key)}</span>
+        <span className="min-w-0 flex-1 truncate text-muted-foreground">{ended.title ?? ""}</span>
+        <span className="shrink-0 text-[11px] text-muted-foreground">{ago(ended.endedAt, now)}</span>
+      </a>
+    </li>
+  );
+}
+
+/** The opt-in sidebar thread list (BB-44): the shared list with the route's active thread. */
+function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: PluginThreadListProps) {
+  const navigate = useBbNavigate();
+  return (
+    <StewardsSidebarCore
+      activeProjectId={activeProjectId}
+      activeKey={null}
+      activeThreadId={activeThreadId}
+      onNavigate={onNavigate}
+      onNewThread={(projectId) => {
+        navigate.toCompose({ projectId });
+        onNavigate();
+      }}
+    />
+  );
+}
+
+/** The board panel's own sidebar (BB-85): the same list, told the path's project and effort. */
+function StewardsPanelSidebar({ subPath }: PluginNavPanelProps) {
+  const navigate = useBbNavigate();
+  const { projectId, key } = parseBoardPath(subPath);
+  return (
+    <StewardsSidebarCore
+      activeProjectId={projectId}
+      activeKey={key}
+      activeThreadId={null}
+      onNavigate={() => {}}
+      onPickProject={(id) => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(id) })}
+      onNewThread={(id) => navigate.toCompose({ projectId: id })}
+    />
   );
 }
 
@@ -1685,6 +1959,9 @@ export default definePluginApp((app) => {
     icon: "ShieldCheck",
     path: BOARD_PATH,
     component: BoardPage,
+    // The panel's own sidebar (BB-85), so the list is there whichever thread
+    // list the user pinned.
+    experimental_sidebar: StewardsPanelSidebar,
   });
   // The exclusive sidebar slot: while this plugin is enabled and no provider is
   // pinned, this list replaces bb's own (see DESIGN.md, "The sidebar thread list").
