@@ -195,7 +195,10 @@ export function effortPhrase(e: SidebarEffort): string {
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
   if (e.stuck) return "stuck";
   if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
-  if (isRunning(e)) {
+  // A running worker or reviewer paints the blue ring, but the count is of
+  // running workers: a busy steward or reviewer with no running worker falls
+  // through rather than reading "0 workers running".
+  if (e.runningWorkers > 0) {
     const n = e.runningWorkers;
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }

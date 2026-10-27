@@ -1470,7 +1470,8 @@ row is the grey ring.
 else `on hold`; `stuck` for an open stuck escalation; `waiting on
 <nextAction>` when the status actor is `other` (an external wait is a block);
 `N worker(s) running` counting only workers whose worker-table status is
-`running`; the newest deployment watch's state (`deploying`, `deployed`,
+`running` (a busy steward or reviewer with no running worker falls through,
+rather than reading `0 workers running`); the newest deployment watch's state (`deploying`, `deployed`,
 `deploy failed`); the status `nextAction`; otherwise `no report yet`. The
 phrase's colour follows the glyph's. `sidebar.ts` derives `state`, `section`
 and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`

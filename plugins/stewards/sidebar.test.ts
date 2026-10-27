@@ -286,6 +286,9 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     // 6. running workers
     expect(effortPhrase(effort({ key: "g", runningWorkers: 2 }))).toBe("2 workers running");
     expect(effortPhrase(effort({ key: "h", runningWorkers: 1 }))).toBe("1 worker running");
+    // A busy steward or reviewer with no running worker falls through, not "0 workers running".
+    expect(effortPhrase(effort({ key: "g2", busy: true, statusNextAction: "a reviewer is checking" }))).toBe("a reviewer is checking");
+    expect(effortPhrase(effort({ key: "g3", busy: true }))).toBe("no report yet");
     // 7. deployment
     expect(effortPhrase(effort({ key: "i", deployment: "merged" }))).toBe("deploying");
     expect(effortPhrase(effort({ key: "j", deployment: "deployed" }))).toBe("deployed");

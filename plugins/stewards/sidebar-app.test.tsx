@@ -568,6 +568,20 @@ describe("the inline needs-you actions (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("shows the server's refusal in the row and re-enables the buttons", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem()] } }),
+        stewardsNeedAction: () => ({ ok: false, message: "the owner must approve first" }),
+      } as never,
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Approve" })));
+    await waitFor(() => expect(slot.getByText("the owner must approve first")).toBeTruthy());
+    expect((slot.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
   it("refetches after an action so the row updates without a reload", async () => {
     let calls = 0;
     const slot = await renderSidebar({
