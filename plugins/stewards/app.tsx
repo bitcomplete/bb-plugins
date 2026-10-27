@@ -32,7 +32,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarEnded, type SidebarSection, type SidebarTab } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -1401,6 +1401,7 @@ function SidebarEffortRow({
   openThreads,
   onNavigate,
   onChanged,
+  trailing,
 }: {
   effort: SidebarEffort;
   needs: readonly SidebarNeedItem[];
@@ -1414,15 +1415,20 @@ function SidebarEffortRow({
   openThreads: ReadonlySet<string>;
   onNavigate: () => void;
   onChanged: () => void;
+  /** A right-aligned stamp after the title, for a Recently ended row's `ended N ago` (BB-88). */
+  trailing?: ReactNode;
 }) {
   const root = byId.get(effort.rootThreadId);
   const navigate = useBbNavigate();
   const pluginId = experimental_usePluginId();
   const [open, setOpen] = useState(false);
   const key = effort.bindingKey;
-  if (root === undefined || key === null) return null;
+  if (key === null) return null;
   const displayKey = shortBindingKey(key);
-  const title = effortTitle(root.displayTitle, key);
+  // A Recently ended binding's steward thread is usually archived and so absent
+  // from the live view; its title comes from the RPC and the row renders without
+  // the thread actions context menu (BB-88).
+  const title = effortTitle(root?.displayTitle ?? effort.title, key);
   const count = countThreads(effort.children);
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
   const selected = activeKey !== null && activeKey === key;
@@ -1431,50 +1437,52 @@ function SidebarEffortRow({
     if (revealed) setOpen(true);
   }, [revealed]);
   const href = boardHref(pluginId, projectId, key);
+  const body = (
+    <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
+      <div className="flex items-center gap-1">
+        {count > 0 ? (
+          <button
+            type="button"
+            aria-label={`${open ? "Collapse" : "Expand"} ${root?.displayTitle ?? effort.title}`}
+            aria-expanded={open}
+            className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
+            onClick={() => setOpen((v) => !v)}
+          >
+            <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+          </button>
+        ) : (
+          <span className="flex size-4 shrink-0 items-center justify-center" />
+        )}
+        <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
+          <StewardGlyph kind={effort.state} />
+        </span>
+        <a
+          href={href}
+          aria-current={selected ? "page" : undefined}
+          className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+          title={root?.displayTitle ?? effort.title}
+          onClick={(e) => {
+            e.preventDefault();
+            navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, key) });
+            onNavigate();
+          }}
+        >
+          <span className="shrink-0 font-semibold">{displayKey}</span>
+          <span className="min-w-0 truncate">{title}</span>
+        </a>
+        {trailing}
+      </div>
+      <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: "36px" }} data-sidebar-line-two="">
+        {kindLabel(effort.kind)}
+        {effort.phase !== null ? ` · ${effort.phase}` : ""}
+        {" · "}
+        <span className={phraseClass(effort.state)}>{effort.phrase}</span>
+      </p>
+    </div>
+  );
   return (
     <li className="flex flex-col">
-      <ThreadActionsContextMenu thread={actionTarget(root)}>
-        <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
-          <div className="flex items-center gap-1">
-            {count > 0 ? (
-              <button
-                type="button"
-                aria-label={`${open ? "Collapse" : "Expand"} ${root.displayTitle}`}
-                aria-expanded={open}
-                className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-                onClick={() => setOpen((v) => !v)}
-              >
-                <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
-              </button>
-            ) : (
-              <span className="flex size-4 shrink-0 items-center justify-center" />
-            )}
-            <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
-              <StewardGlyph kind={effort.state} />
-            </span>
-            <a
-              href={href}
-              aria-current={selected ? "page" : undefined}
-              className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
-              title={root.displayTitle}
-              onClick={(e) => {
-                e.preventDefault();
-                navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, key) });
-                onNavigate();
-              }}
-            >
-              <span className="shrink-0 font-semibold">{displayKey}</span>
-              <span className="min-w-0 truncate">{title}</span>
-            </a>
-          </div>
-          <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: "36px" }} data-sidebar-line-two="">
-            {kindLabel(effort.kind)}
-            {effort.phase !== null ? ` · ${effort.phase}` : ""}
-            {" · "}
-            <span className={phraseClass(effort.state)}>{effort.phrase}</span>
-          </p>
-        </div>
-      </ThreadActionsContextMenu>
+      {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
           {mine.map((item) => (
@@ -1614,7 +1622,7 @@ function revealThreads(tabs: readonly SidebarTab[], activeThreadId: string | nul
 function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | null, activeKey: string | null): ReadonlySet<string> {
   const open = new Set<string>();
   for (const tab of tabs) {
-    if ((activeThreadId !== null && tab.ended.some((e) => e.threadId === activeThreadId)) || (activeKey !== null && tab.ended.some((e) => e.key === activeKey))) open.add("Recently ended");
+    if ((activeThreadId !== null && tab.ended.some((e) => e.rootThreadId === activeThreadId)) || (activeKey !== null && tab.ended.some((e) => e.key === activeKey))) open.add("Recently ended");
     if (activeThreadId !== null && tab.threads.some((e) => e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))) open.add("Threads");
     if (tab.monitors.some((e) => (activeKey !== null && e.bindingKey === activeKey) || (activeThreadId !== null && (e.rootThreadId === activeThreadId || subtreeHas(e.children, activeThreadId))))) open.add("Monitors");
   }
@@ -1742,7 +1750,19 @@ function StewardsSidebarCore({
             <SidebarCollapsible title="Recently ended" count={active.ended.length} revealed={openSections.has("Recently ended")}>
               <ul className="flex flex-col">
                 {active.ended.map((e) => (
-                  <SidebarEndedRow key={`${e.key}-${e.endedAt}`} ended={e} projectId={active.projectId} activeKey={activeKey} now={now} onNavigate={onNavigate} />
+                  <SidebarEffortRow
+                    key={`${e.key}-${e.endedAt}`}
+                    effort={e}
+                    needs={needItems}
+                    byId={byId}
+                    projectId={active.projectId}
+                    activeKey={activeKey}
+                    activeThreadId={activeThreadId}
+                    openThreads={openThreads}
+                    onNavigate={onNavigate}
+                    onChanged={refetch}
+                    trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
+                  />
                 ))}
               </ul>
             </SidebarCollapsible>
@@ -1767,37 +1787,6 @@ function StewardsSidebarCore({
       )}
       {error !== null ? <p className="px-2 py-1 text-xs text-destructive">Refresh failed: {error}</p> : null}
     </div>
-  );
-}
-
-/** A Recently ended row: a real link to the effort's detail view (BB-85). */
-function SidebarEndedRow({ ended, projectId, activeKey, now, onNavigate }: { ended: SidebarEnded; projectId: string; activeKey: string | null; now: number; onNavigate: () => void }) {
-  const navigate = useBbNavigate();
-  const pluginId = experimental_usePluginId();
-  const selected = activeKey !== null && activeKey === ended.key;
-  return (
-    <li className="flex flex-col">
-      <a
-        href={boardHref(pluginId, projectId, ended.key)}
-        aria-current={selected ? "page" : undefined}
-        className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`}
-        style={{ paddingLeft: "4px" }}
-        title={ended.key}
-        onClick={(e) => {
-          e.preventDefault();
-          navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, ended.key) });
-          onNavigate();
-        }}
-      >
-        <span className="flex size-4 shrink-0 items-center justify-center" />
-        <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
-          <StewardGlyph kind="quiet" />
-        </span>
-        <span className="shrink-0 font-semibold">{shortBindingKey(ended.key)}</span>
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">{ended.title ?? ""}</span>
-        <span className="shrink-0 text-[11px] text-muted-foreground">{ago(ended.endedAt, now)}</span>
-      </a>
-    </li>
   );
 }
 

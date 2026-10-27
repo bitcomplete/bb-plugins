@@ -58,6 +58,10 @@ export interface SidebarEnded {
   kind: string;
   threadId: string | null;
   title: string | null;
+  /** The entity's final phase, shown on line two; null when the binding has none (BB-88). */
+  phase: string | null;
+  /** Why the binding ended (`terminal`, `detach`, `deleted`, ...), line two's status phrase (BB-88). */
+  endReason: string | null;
   endedAt: number;
 }
 
@@ -156,7 +160,12 @@ export interface SidebarTab {
   /** `ops`, Dependabot and Sentry bindings that are neither waiting on you nor blocked. */
   monitors: SidebarEffort[];
   projectStewardThreadId: string | null;
-  ended: SidebarEnded[];
+  ended: SidebarEndedEffort[];
+}
+
+/** A Recently ended binding as a row: the same effort shape a live one uses, plus the stamp (BB-88). */
+export interface SidebarEndedEffort extends SidebarEffort {
+  endedAt: number;
 }
 
 const BUSY = new Set(["starting", "active", "stopping"]);
@@ -221,6 +230,16 @@ export function deploymentPhrase(state: DeployState): string {
 }
 
 /**
+ * Line two's status phrase for an ended binding (BB-88): the end reason, with
+ * the terse internal reasons spelled out. A missing reason reads `ended`.
+ */
+export function endReasonPhrase(reason: string | null): string {
+  if (reason === null || reason === "") return "ended";
+  const spelled: Record<string, string> = { detach: "label removed", gone: "no longer listed", unconfigured: "no longer configured" };
+  return spelled[reason] ?? reason;
+}
+
+/**
  * A pending note that a worker finished its turn quietly (BB-52 rule 3): the
  * one whose place a stale status summary must not keep (BB-83).
  */
@@ -274,6 +293,45 @@ function derive(e: SidebarEffort, now: number): SidebarEffort {
   e.section = effortSection(e);
   e.phrase = effortPhrase(e, now);
   return e;
+}
+
+/**
+ * A Recently ended binding as the same `SidebarEffort` shape a live one uses
+ * (BB-88), so the row renders through `SidebarEffortRow`. There is no live
+ * thread to join: the title, kind and final phase come from the RPC, the glyph
+ * is always the grey quiet ring, there are no children, and line two's phrase
+ * is the end reason. The section shows `ended N ago` separately.
+ */
+export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
+  return {
+    key: e.key,
+    bindingKey: e.key,
+    rootThreadId: e.threadId ?? "",
+    title: e.title ?? e.key,
+    kind: e.kind,
+    stage: null,
+    phase: e.phase ?? null,
+    hold: null,
+    holdBehind: [],
+    blockedOn: null,
+    needsUser: false,
+    stuck: false,
+    statusActor: null,
+    statusNextAction: null,
+    statusAt: null,
+    deployment: null,
+    pending: [],
+    requeueAt: null,
+    runningWorkers: 0,
+    pinned: false,
+    busy: false,
+    recency: e.endedAt,
+    state: "quiet",
+    section: "inflight",
+    phrase: endReasonPhrase(e.endReason ?? null),
+    children: [],
+    endedAt: e.endedAt,
+  };
 }
 
 /**
@@ -527,6 +585,6 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
     monitors: ops.filter((e) => e.section === "monitors").sort(compareEfforts),
     projectStewardThreadId: stewardThreadId,
-    ended: data?.ended ?? [],
+    ended: (data?.ended ?? []).map(endedEffort),
   };
 }

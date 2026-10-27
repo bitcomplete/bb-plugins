@@ -1520,6 +1520,16 @@ one (omitted for ops), and the status phrase. A row that needs you adds its
 prompt and one-click actions under line two, in the same row, with no tinted
 callout box.
 
+A **Recently ended** row is that same row (BB-88): `sidebar.ts`'s
+`endedEffort` builds the ended binding as a quiet effort with no children, the
+entity's final phase, and the end reason in the status-phrase slot (`terminal`,
+`deleted`, `label removed` for a removed label, `no longer listed` when the
+entity is gone, `no longer configured` when the project stopped stewarding
+it), and the row keeps the `ended N ago` stamp
+at the right, which is what distinguishes the section. The steward thread is
+usually archived by then, so the title comes from the RPC and the row renders
+without the thread actions menu when the thread is no longer in the live view.
+
 The glyph is one of four shapes, in precedence order `you › blocked › running ›
 quiet`: a solid yellow dot when it waits on you, an empty red ring when
 blocked (`blockedOn`, a hold or `stuck`), a blue ring that pulses slowly while
@@ -1553,7 +1563,9 @@ covers every rule and the precedence.
 whether stewarded or `ops`; a needs-you, blockedOn, held or stuck `ops`
 binding leaves Monitors for Blocked. In flight holds the rest of the stewarded,
 non-ops efforts, running before quiet, then by recency. Pinned rows stay first within their section.
-`buildSidebar` returns `blocked`, `efforts`, `threads` and `monitors`
+Recently ended holds the ended bindings, newest first, each built by
+`endedEffort` as a quiet effort with no children (BB-88).
+`buildSidebar` returns `blocked`, `efforts`, `threads`, `monitors` and `ended`
 separately, and the split is unit tested in `sidebar.test.ts`.
 
 **Rows, highlighting and auto-expand (BB-85).** A stewarded effort row in
