@@ -723,6 +723,31 @@ const COLUMNS = {
 
 export type BindingPatch = Partial<Pick<Binding, keyof typeof COLUMNS>>;
 
+/**
+ * The binding columns the sidebar, the board and the overview show (BB-90).
+ * `patch` rings the realtime channel only when one of these actually changed
+ * before and after; a write to `lastJudgmentAt`, `lastSnapshot`, `wokeAt`,
+ * `awaitingReport`, `missedReports`, `archiveWhenIdle`, `manualDetach`, a
+ * model-check flag or the like changes nothing a page renders and stays
+ * silent, as does setting a field to the value it already had.
+ */
+const VISIBLE_COLUMNS = [
+  "stage",
+  "phase",
+  "hold",
+  "hold_behind",
+  "status",
+  "pending",
+  "requeue_at",
+  "advanced_at",
+  "deployments",
+  "title",
+  "url",
+  "ending",
+  "ended_at",
+  "thread_id",
+] as const satisfies ReadonlyArray<(typeof COLUMNS)[keyof typeof COLUMNS]>;
+
 function toColumn(value: unknown): unknown {
   if (value === undefined || value === null) return null;
   if (typeof value === "boolean") return value ? 1 : 0;
@@ -977,12 +1002,14 @@ export const GUIDANCE_DEDUPE_MS = 5 * 60_000;
 export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("base64url")}`;
 
 /**
- * What a store reports back to its owner when a project's "needs you" set
- * changes. The server wires it to the realtime channel; the store itself
- * knows nothing about bb.
+ * What a store reports back to its owner when a project's sidebar- or
+ * board-visible state changes: a binding's stage, phase, hold, status report,
+ * requeue time, deployment state, title, link or ending, a worker starting or
+ * finishing, or the "needs you" set. The server wires it to the realtime
+ * channel; the store itself knows nothing about bb.
  */
 export interface StoreOptions {
-  onNeedsYouChange?: (projectId: string) => void;
+  onProjectChange?: (projectId: string) => void;
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
@@ -1306,7 +1333,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     resolvedAt: r.resolved_at === null || r.resolved_at === undefined ? null : Number(r.resolved_at),
   });
 
-  const onNeedsYouChange = options.onNeedsYouChange;
+  const onProjectChange = options.onProjectChange;
 
   /** The project a binding belongs to, for a mutation that only has the binding. */
   function projectIdForBinding(bindingId: string): string | null {
@@ -1314,24 +1341,25 @@ export function createStore(db: Database.Database, now: () => number, options: S
     return b === undefined ? null : String(b.project_id);
   }
 
-  // A "needs you" change is coalesced within one synchronous store operation,
-  // so one question filed or answered publishes exactly one event even when
-  // the operation nests (answer -> resolve) or closes a migrated need through
-  // resolve. The flush runs when the outermost operation finishes.
+  // A project-visible change is coalesced within one synchronous store
+  // operation, so one question filed or answered publishes exactly one event
+  // even when the operation nests (answer -> resolve) or closes a migrated
+  // need through resolve, and a turn that writes several fields publishes one
+  // signal. The flush runs when the outermost operation finishes.
   let notifyDepth = 0;
   const dirtyProjects = new Set<string>();
 
-  function flushNeedsYou(): void {
+  function flushProjectChanged(): void {
     const projects = [...dirtyProjects];
     dirtyProjects.clear();
-    if (onNeedsYouChange !== undefined) for (const projectId of projects) onNeedsYouChange(projectId);
+    if (onProjectChange !== undefined) for (const projectId of projects) onProjectChange(projectId);
   }
 
-  /** Mark a project's "needs you" set changed; publishes now, or on the way out of a nested operation. */
-  function needsYouChanged(projectId: string | null | undefined): void {
-    if (onNeedsYouChange === undefined || projectId === null || projectId === undefined || projectId === "") return;
+  /** Mark a project's visible state changed; publishes now, or on the way out of a nested operation. */
+  function projectChanged(projectId: string | null | undefined): void {
+    if (onProjectChange === undefined || projectId === null || projectId === undefined || projectId === "") return;
     dirtyProjects.add(projectId);
-    if (notifyDepth === 0) flushNeedsYou();
+    if (notifyDepth === 0) flushProjectChanged();
   }
 
   /** Run `fn`, flushing at most one notification per project when it returns successfully. */
@@ -1340,7 +1368,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     try {
       const result = fn();
       notifyDepth -= 1;
-      if (notifyDepth === 0) flushNeedsYou();
+      if (notifyDepth === 0) flushProjectChanged();
       return result;
     } catch (error) {
       // A failed operation did not change anything: drop its pending marks.
@@ -1379,7 +1407,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       })();
       if (resolved) {
         const x = getEscalation.get(id);
-        needsYouChanged(x === undefined ? null : projectIdForBinding(String(x.binding_id)));
+        projectChanged(x === undefined ? null : projectIdForBinding(String(x.binding_id)));
       }
       return resolved;
     });
@@ -1417,17 +1445,26 @@ export function createStore(db: Database.Database, now: () => number, options: S
     if (deliver && x.origin.threadId !== null && x.origin.threadId !== "") insertDelivery.run(newId("dlv"), x.id, x.origin.threadId, originBindingId === "" ? null : originBindingId, resolution, by, now());
   }
 
-  function patch(id: string, fields: BindingPatch): Binding {
-    const wasOpen = getBinding.get(id)?.ended_at === null;
+  /** Write the given columns and return the raw row, with no realtime signal. */
+  function writeBinding(id: string, fields: BindingPatch): BindingRow {
     const entries = Object.entries(fields).filter(([, v]) => v !== undefined) as Array<[keyof typeof COLUMNS, unknown]>;
     if (entries.length > 0) {
       const sets = entries.map(([k]) => `${COLUMNS[k]} = ?`).join(", ");
       db.prepare(`UPDATE bindings SET ${sets} WHERE id = ?`).run(...entries.map(([, v]) => toColumn(v)), id);
     }
-    const b = rowToBinding(getBinding.get(id)!);
-    // Ending a binding takes its needs and with-user escalations off the board
-    // and the sidebar; reopening one puts them back.
-    if (fields.endedAt !== undefined && wasOpen !== (b.endedAt === null)) needsYouChanged(b.projectId);
+    return getBinding.get(id)!;
+  }
+
+  function patch(id: string, fields: BindingPatch): Binding {
+    const before = getBinding.get(id);
+    const after = writeBinding(id, fields);
+    const b = rowToBinding(after);
+    // A field the sidebar or board shows changing rings the refetch channel;
+    // per-turn bookkeeping (lastJudgmentAt, lastSnapshot, wokeAt, …) and a
+    // same-value write change nothing visible and stay silent. Ending or
+    // reopening a binding is covered here too: endedAt is one of these fields,
+    // so its needs and with-user escalations leave or return with the signal.
+    if (before !== undefined && VISIBLE_COLUMNS.some((c) => before[c] !== after[c])) projectChanged(b.projectId);
     return b;
   }
 
@@ -1495,7 +1532,13 @@ export function createStore(db: Database.Database, now: () => number, options: S
         const i = pending.findIndex((n) => n.quiet === true);
         pending.splice(i === -1 ? 0 : i, 1);
       }
-      return patch(id, { pending });
+      // A queued note is a reason for the next judgment turn, not a page
+      // change, so it writes without a signal (BB-90). Its one visible effect,
+      // the "worker finished" phrase, is published by `setWorker` when the
+      // worker's status changes; ringing here would add a second signal for
+      // that finish and a second event in the answer path, where the note is
+      // written after `answer`'s operation has already flushed.
+      return rowToBinding(writeBinding(id, { pending }));
     },
     /** Save guidance; false when it repeats the binding's last guidance by the same author within five minutes (a retry), which saves nothing. */
     addGuidance(id: string, text: string, by: string): boolean {
@@ -1517,7 +1560,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           patch(bindingId, { ready: { ...b.ready, approval, voidedAt: null, declinedSpecHash: null }, declinedSpecObjections: [] });
           closeNeedKindStmt.run("Approved.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
-          needsYouChanged(projectIdForBinding(bindingId));
+          projectChanged(projectIdForBinding(bindingId));
         })(),
       );
     },
@@ -1529,7 +1572,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           patch(bindingId, { ready: { ...b.ready, declinedSpecHash: specHash } });
           closeNeedKindStmt.run("Declined.", now(), bindingId, "approve-spec");
           for (const x of openEscalations.all(bindingId).map(toEscalation).filter((e) => e.kind === "approval" && e.resolutionKind !== "approve-decline")) resolve(x.id, resolution, by);
-          needsYouChanged(projectIdForBinding(bindingId));
+          projectChanged(projectIdForBinding(bindingId));
         })(),
       );
     },
@@ -1576,7 +1619,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         head_sha: fields.headSha ?? null,
       });
       // A route-`me` escalation is a "needs you" item the moment it is filed.
-      if (fields.route === "me") needsYouChanged(fields.projectId ?? projectIdForBinding(fields.bindingId));
+      if (fields.route === "me") projectChanged(fields.projectId ?? projectIdForBinding(fields.bindingId));
       return toEscalation(getEscalation.get(id)!);
     },
     escalation(id: string): Escalation | null {
@@ -1625,7 +1668,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       // A route-`me` escalation is a "needs you" item: forwarding one to the
       // user adds it, and moving one off the user removes it. A reroute to the
       // route it already had changes nothing on the board.
-      if (changed && before !== undefined && String(before.route) !== route && (String(before.route) === "me" || route === "me")) needsYouChanged(projectIdForBinding(String(before.binding_id)));
+      if (changed && before !== undefined && String(before.route) !== route && (String(before.route) === "me" || route === "me")) projectChanged(projectIdForBinding(String(before.binding_id)));
       return changed;
     },
     /** Re-point a pull-request approval escalation at a new head sha (a push voids the old approval). */
@@ -1705,7 +1748,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         data: JSON.stringify(fields.data ?? {}),
         origin: JSON.stringify({ threadId: null, bindingId: fields.bindingId, chain: [] }),
       });
-      needsYouChanged(fields.projectId);
+      projectChanged(fields.projectId);
       return toQuestion(getQuestion.get(id)!);
     },
     question(id: string): Question | null {
@@ -1735,7 +1778,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
           if (answerQuestion.run(answer, by, at, id).changes === 0) return false;
           const q = toQuestion(getQuestion.get(id)!);
           if (q.escalationId !== null) resolve(q.escalationId, resolution, by);
-          needsYouChanged(q.projectId);
+          projectChanged(q.projectId);
           return true;
         })(),
       );
@@ -1750,7 +1793,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         const changed = answerQuestion.run(answer, by, now(), id).changes > 0;
         if (changed) {
           const q = getQuestion.get(id);
-          needsYouChanged(q === undefined || q.project_id === null || q.project_id === undefined ? null : String(q.project_id));
+          projectChanged(q === undefined || q.project_id === null || q.project_id === undefined ? null : String(q.project_id));
         }
         return changed;
       });
@@ -1791,19 +1834,19 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const existing = openNeedByKey.get(fields.bindingId, fields.kind, fields.url);
       if (existing !== undefined) {
         updateNeed.run(fields.what, fields.how, JSON.stringify(fields.data ?? {}), existing.id);
-        needsYouChanged(projectId);
+        projectChanged(projectId);
         return toNeed(getNeed.get(String(existing.id))!);
       }
       const id = newId("need");
       insertNeed.run({ id, binding_id: fields.bindingId, kind: fields.kind, url: fields.url, what: fields.what, how: fields.how, data: JSON.stringify(fields.data ?? {}), filed_by: fields.filedBy ?? "steward", created_at: now() });
-      needsYouChanged(projectId);
+      projectChanged(projectId);
       return toNeed(getNeed.get(id)!);
     },
     closeNeed(id: string, resolution: string, by = "plugin"): boolean {
       return coalescing(() => {
         const row = getNeed.get(id);
         if (closeNeedStmt.run(resolution, now(), id).changes > 0) {
-          needsYouChanged(row === undefined ? null : projectIdForBinding(String(row.binding_id)));
+          projectChanged(row === undefined ? null : projectIdForBinding(String(row.binding_id)));
           return true;
         }
         // A migrated provide-secret need is an escalation now.
@@ -1812,18 +1855,20 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     closeNeeds(bindingId: string, kind: NeedKind, resolution: string): number {
       const changed = closeNeedKindStmt.run(resolution, now(), bindingId, kind).changes;
-      if (changed > 0) needsYouChanged(projectIdForBinding(bindingId));
+      if (changed > 0) projectChanged(projectIdForBinding(bindingId));
       return changed;
     },
     closeNeedByKey(bindingId: string, kind: NeedKind, url: string, resolution: string): number {
       const changed = closeNeedKeyStmt.run(resolution, now(), bindingId, kind, url).changes;
-      if (changed > 0) needsYouChanged(projectIdForBinding(bindingId));
+      if (changed > 0) projectChanged(projectIdForBinding(bindingId));
       return changed;
     },
 
     // workers
     addWorker(threadId: string, bindingId: string, title: string): void {
       insertWorker.run(threadId, bindingId, title, now());
+      // A worker starting moves its row at once, like any visible field.
+      projectChanged(projectIdForBinding(bindingId));
     },
     worker(threadId: string): Worker | null {
       const r = getWorker.get(threadId);
@@ -1836,7 +1881,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return spawnsSince.get(bindingId, since)!.n;
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
+      const before = getWorker.get(threadId);
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
+      const w = getWorker.get(threadId);
+      // A worker finishing or being stopped moves its row at once, but a repeat
+      // write of the same status changes nothing visible and stays silent.
+      if (w !== undefined && (before === undefined || before.status !== w.status)) projectChanged(projectIdForBinding(String(w.binding_id)));
     },
     /** Whether the worker's model is still to be checked when its first turn is dispatched. */
     setWorkerModelCheckPending(threadId: string, pending: boolean): void {

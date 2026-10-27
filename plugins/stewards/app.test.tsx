@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
-import { NEEDS_YOU_CHANGED } from "./channels.js";
+import { PROJECT_CHANGED } from "./channels.js";
 
 type Need = {
   id: string;
@@ -478,10 +478,10 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
       },
     });
     await waitFor(() => expect(calls).toBe(1));
-    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p9" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p9" });
     await new Promise((r) => setTimeout(r, 20));
     expect(calls).toBe(1);
-    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p1" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
     slot.lifecycle.unmount();
   });
@@ -504,11 +504,33 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     await waitFor(() => expect(calls).toBe(1));
     // The handler only refetches once the board (and its project id) has rendered.
     await waitFor(() => expect(slot.getByText("Acme")).toBeTruthy());
-    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p1" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
-    await slot.emitRealtime(NEEDS_YOU_CHANGED, { projectId: "p2" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p2" });
     await new Promise((r) => setTimeout(r, 20));
     expect(calls).toBe(2);
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-90: the overview (Settings → Plugins → Stewards → Status) polled only, so
+// it now subscribes to the widened channel too.
+describe("the stewards overview's refresh (BB-90)", () => {
+  it("refetches on a realtime event for any project", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[0]!;
+    let calls = 0;
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => {
+          calls += 1;
+          return { paused: false, projects: [], lastSweepAt: 0 };
+        },
+      },
+    } as never);
+    await waitFor(() => expect(calls).toBe(1));
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
     slot.lifecycle.unmount();
   });
 });

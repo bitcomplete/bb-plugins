@@ -81,7 +81,7 @@ import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuid
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
-import { NEEDS_YOU_CHANGED } from "./channels.js";
+import { PROJECT_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
@@ -735,10 +735,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
-    // The store reports a project whose "needs you" set changed; the sidebar
-    // and the board page refetch on the channel. Keeping it a callback keeps
-    // store.ts free of bb, so steward-side mutations publish too.
-    const store = createStore(db, now, { onNeedsYouChange: (projectId) => bb.realtime.publish(NEEDS_YOU_CHANGED, { projectId }) });
+    // The store reports a project whose sidebar- or board-visible state
+    // changed; the sidebar, the board page and the overview refetch on the
+    // channel. Keeping it a callback keeps store.ts free of bb, so
+    // steward-side mutations publish too.
+    const store = createStore(db, now, { onProjectChange: (projectId) => bb.realtime.publish(PROJECT_CHANGED, { projectId }) });
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
@@ -4236,19 +4237,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (worker.status === "stopped") return;
         const result = lastAssistantText === null ? null : clip(lastAssistantText, 4000);
         store.setWorker(thread.id, "finished", result);
+        // The quiet-finish note is what the visible "worker finished" phrase
+        // reads, so write it before the awaits below: `setWorker` has already
+        // published the signal, and the refetch it triggers would otherwise
+        // read the store before the note lands (BB-90).
+        const finished = store.binding(worker.bindingId);
+        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
+        // the owner or a build is a quiet note. Only a question, an error
+        // report or a gone thread makes the turn due; a failed turn comes
+        // through thread.failed and wakes on its own. A binding following
+        // through is waiting on this worker's result, so its finish is news.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || workerReportedError(result) || followingThrough(finished));
+        if (finished !== null && finished.endedAt === null) store.note(finished.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).
         await archiveConsumedReviewers(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
-        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
-        // the owner or a build is a quiet note. Only a question, an error
-        // report or a gone thread makes the turn due; a failed turn comes
-        // through thread.failed and wakes on its own. A binding following
-        // through is waiting on this worker's result, so its finish is news.
-        const needsSteward = workerQuestion(result) !== null || workerReportedError(result) || followingThrough(b);
-        store.note(b.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
         // A quiet finish is consumed here, not by a wake: archive the worker
         // now (BB-47), keeping one that still has a question, a reviewer, or is
         // parked waiting on something that will wake it (BB-52 rule 3).
