@@ -10,6 +10,7 @@
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { flushSync } from "react-dom";
 import {
   Markdown,
   ThreadTitle,
@@ -63,10 +64,16 @@ function ago(at: number | null, now: number): string {
   return `${Math.round(s / 86_400)}d ago`;
 }
 
+/** `document.startViewTransition`, where the browser supports it (Chromium). */
+type ViewTransitionDocument = Document & { startViewTransition?: (update: () => void) => unknown };
+
 /** What `load` returns, refetched every half minute while the page is visible, and on demand. */
-function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; refetch: () => void } {
+function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // True once a load has been on screen for a paint, so the first load's rows
+  // do not all animate in at once (BB-91).
+  const [loaded, setLoaded] = useState(false);
   const mounted = useRef(true);
   // Only the latest call lands, so a slow answer for the last project does not replace this one's.
   const latest = useRef(0);
@@ -75,14 +82,29 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
     load().then(
       (o) => {
         if (!mounted.current || call !== latest.current) return;
-        setData(o);
-        setError(null);
+        const commit = () => {
+          setData(o);
+          setError(null);
+        };
+        // A view transition around the commit lets the browser animate a row
+        // moving between sections; without the API the commit is plain (BB-91).
+        const start = (document as ViewTransitionDocument).startViewTransition;
+        if (typeof start !== "function") return commit();
+        try {
+          start.call(document, () => flushSync(commit));
+        } catch {
+          commit();
+        }
       },
       (e: unknown) => {
         if (mounted.current && call === latest.current) setError(message(e));
       },
     );
   }, [load]);
+  // A paint after the first successful load, so rows that mount later animate.
+  useEffect(() => {
+    if (data !== null) setLoaded(true);
+  }, [data]);
   useEffect(() => {
     mounted.current = true;
     refetch();
@@ -99,7 +121,7 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refetch]);
-  return { data, error, refetch };
+  return { data, error, loaded, refetch };
 }
 
 function useOverview(): { overview: Overview | null; error: string | null } {
@@ -1203,10 +1225,25 @@ function kindLabel(kind: string | null): string {
 
 /** The phrase's colour follows the glyph's (BB-76): yellow, red, blue, muted. */
 function phraseClass(state: SidebarEffortState): string {
-  if (state === "you") return "text-amber-600 dark:text-amber-500";
-  if (state === "blocked") return "text-destructive";
-  if (state === "running") return "text-blue-600 dark:text-blue-400";
-  return "text-muted-foreground";
+  const transition = " motion-safe:transition-colors duration-300";
+  if (state === "you") return `text-amber-600 dark:text-amber-500${transition}`;
+  if (state === "blocked") return `text-destructive${transition}`;
+  if (state === "running") return `text-blue-600 dark:text-blue-400${transition}`;
+  return `text-muted-foreground${transition}`;
+}
+
+/**
+ * A CSS-safe `view-transition-name` for one row, from the surface, row kind and
+ * key (BB-91). The surface keeps the two sidebar instances (the pinned thread
+ * list and the board panel's own sidebar) apart, since both can be mounted at
+ * once and duplicate names skip the whole transition; the kind keeps an effort
+ * row and an ended row with the same binding key apart; the hash keeps two keys
+ * that sanitise alike apart.
+ */
+function viewTransitionName(surface: string, kind: "effort" | "ended" | "thread", key: string): string {
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
+  return `stewards-${kind}-${surface}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
 }
 
 /**
@@ -1216,9 +1253,10 @@ function phraseClass(state: SidebarEffortState): string {
  * CSS only and stops under `prefers-reduced-motion`.
  */
 function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
-  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className="size-2.5 shrink-0 rounded-full bg-amber-400" />;
+  const transition = " motion-safe:transition-colors duration-300";
+  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className={`size-2.5 shrink-0 rounded-full bg-amber-400${transition}`} />;
   const border = kind === "blocked" ? "border-red-500" : kind === "running" ? "border-blue-500" : "border-muted-foreground/50";
-  return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
+  return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border}${transition}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
 }
 
 /** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
@@ -1240,6 +1278,8 @@ function SidebarThreadRow({
   glyph,
   activeThreadId,
   openThreads,
+  viewTransitionPrefix,
+  entered = false,
 }: {
   thread: PluginSidebarThread;
   role: SidebarChildRole;
@@ -1257,6 +1297,10 @@ function SidebarThreadRow({
   activeThreadId: string | null;
   /** The rows that must be open so the active thread is revealed (BB-85). */
   openThreads: ReadonlySet<string>;
+  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
+  viewTransitionPrefix: string;
+  /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
+  entered?: boolean;
 }) {
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
@@ -1274,7 +1318,7 @@ function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className="flex flex-col">
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, "thread", thread.id) }}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1317,7 +1361,7 @@ function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
             );
           })}
         </ul>
@@ -1408,6 +1452,10 @@ function SidebarEffortRow({
   onNavigate,
   onChanged,
   trailing,
+  rowKind = "effort",
+  viewTransitionKey,
+  viewTransitionPrefix,
+  entered = false,
 }: {
   effort: SidebarEffort;
   needs: readonly SidebarNeedItem[];
@@ -1423,6 +1471,14 @@ function SidebarEffortRow({
   onChanged: () => void;
   /** A right-aligned stamp after the title, for a Recently ended row's `ended N ago` (BB-88). */
   trailing?: ReactNode;
+  /** Which row this is for the view-transition name: a live effort or a Recently ended one (BB-91). */
+  rowKind?: "effort" | "ended";
+  /** The row's stable key for the view-transition name, when it differs from the effort key (an ended row's `endedAt`). */
+  viewTransitionKey?: string;
+  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
+  viewTransitionPrefix: string;
+  /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
+  entered?: boolean;
 }) {
   const root = byId.get(effort.rootThreadId);
   const navigate = useBbNavigate();
@@ -1454,7 +1510,7 @@ function SidebarEffortRow({
             className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
             onClick={() => setOpen((v) => !v)}
           >
-            <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200${open ? " rotate-90" : ""}`} />
           </button>
         ) : (
           <span className="flex size-4 shrink-0 items-center justify-center" />
@@ -1487,7 +1543,7 @@ function SidebarEffortRow({
     </div>
   );
   return (
-    <li className="flex flex-col">
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, rowKind, viewTransitionKey ?? effort.key) }}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
@@ -1496,15 +1552,17 @@ function SidebarEffortRow({
           ))}
         </div>
       ) : null}
-      {open && effort.children.length > 0 ? (
-        <ul className="flex flex-col">
-          {effort.children.map((c) => {
-            const child = byId.get(c.threadId);
-            return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} />
-            );
-          })}
-        </ul>
+      {effort.children.length > 0 ? (
+        <div data-sidebar-workers="" className={`grid motion-safe:transition-[grid-template-rows,visibility] motion-safe:duration-200 ${open ? "visible grid-rows-[1fr]" : "invisible grid-rows-[0fr]"}`}>
+          <ul className="flex min-h-0 flex-col overflow-hidden">
+            {effort.children.map((c) => {
+              const child = byId.get(c.threadId);
+              return child === undefined ? null : (
+                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
+              );
+            })}
+          </ul>
+        </div>
       ) : null}
     </li>
   );
@@ -1529,16 +1587,26 @@ function SidebarCollapsible({ title, count, revealed = false, children }: { titl
   }, [revealed]);
   return (
     <section className="flex flex-col">
-      <button
-        type="button"
-        aria-expanded={open}
-        className="flex items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
-        {title} <span className="font-normal">{count}</span>
-      </button>
-      {open ? children : null}
+      {/* `<details>` only for its `open` attribute, which drives the chevron's
+          `group-open:` rotation; the body is a sibling so it stays mounted and
+          eases between `0fr` and `1fr` (BB-91). */}
+      <details className="group" open={open}>
+        <summary
+          role="button"
+          aria-expanded={open}
+          className="flex cursor-pointer list-none items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+          onClick={(e) => {
+            e.preventDefault();
+            setOpen((v) => !v);
+          }}
+        >
+          <Icon name="ChevronRight" className="size-3.5 motion-safe:transition-transform group-open:rotate-90" />
+          {title} <span className="font-normal">{count}</span>
+        </summary>
+      </details>
+      <div data-sidebar-collapsible="" className={`grid motion-safe:transition-[grid-template-rows,visibility] motion-safe:duration-200 ${open ? "visible grid-rows-[1fr]" : "invisible grid-rows-[0fr]"}`}>
+        <div className="min-h-0 overflow-hidden">{children}</div>
+      </div>
     </section>
   );
 }
@@ -1641,6 +1709,7 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
  * and navigates on a project pick; the thread list passes the route's thread.
  */
 function StewardsSidebarCore({
+  surface,
   activeProjectId,
   activeKey,
   activeThreadId,
@@ -1648,6 +1717,8 @@ function StewardsSidebarCore({
   onPickProject,
   onNewThread,
 }: {
+  /** Which mounted sidebar this is; folded into each row's view-transition name (BB-91). */
+  surface: "sidebar" | "panel";
   activeProjectId: string | null;
   activeKey: string | null;
   activeThreadId: string | null;
@@ -1657,7 +1728,7 @@ function StewardsSidebarCore({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const { status, threads, projects } = experimental_useSidebarThreads();
-  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
+  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }), [projects, threads, data]);
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
   // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
@@ -1704,6 +1775,8 @@ function StewardsSidebarCore({
         openThreads={openThreads}
         onNavigate={onNavigate}
         onChanged={refetch}
+        viewTransitionPrefix={surface}
+        entered={loaded}
       />
     ));
   return (
@@ -1741,7 +1814,7 @@ function StewardsSidebarCore({
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
                   return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} />
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={surface} entered={loaded} />
                   );
                 })}
               </ul>
@@ -1768,6 +1841,10 @@ function StewardsSidebarCore({
                     onNavigate={onNavigate}
                     onChanged={refetch}
                     trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
+                    rowKind="ended"
+                    viewTransitionKey={`${e.key}-${e.endedAt}`}
+                    viewTransitionPrefix={surface}
+                    entered={loaded}
                   />
                 ))}
               </ul>
@@ -1785,6 +1862,8 @@ function StewardsSidebarCore({
                 glyph="quiet"
                 activeThreadId={activeThreadId}
                 openThreads={openThreads}
+                viewTransitionPrefix={surface}
+                entered={loaded}
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />
             </div>
@@ -1801,6 +1880,7 @@ function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: Plugin
   const navigate = useBbNavigate();
   return (
     <StewardsSidebarCore
+      surface="sidebar"
       activeProjectId={activeProjectId}
       activeKey={null}
       activeThreadId={activeThreadId}
@@ -1819,6 +1899,7 @@ function StewardsPanelSidebar({ subPath }: PluginNavPanelProps) {
   const { projectId, key } = parseBoardPath(subPath);
   return (
     <StewardsSidebarCore
+      surface="panel"
       activeProjectId={projectId}
       activeKey={key}
       activeThreadId={null}
