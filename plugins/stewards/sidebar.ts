@@ -236,9 +236,11 @@ export function untilPhrase(at: number, now: number): string {
 }
 
 /**
- * Line two's status phrase, first match wins (BB-76):
+ * Line two's status phrase, first match wins (BB-76, BB-86, BB-83):
  * needs you › blockedOn › hold › stuck › running › quiet worker finish ›
- * actor=other › deployment › nextAction › no report.
+ * deployment › nextAction › no report. An external wait is not a prefix: an
+ * `other` actor reads its `nextAction` verbatim like any other actor, and
+ * `the other party` only stands in when there is no report at all.
  *
  * The quiet worker finish (BB-83) sits after the running count and before the
  * external wait: a binding whose worker finished and has nothing to wait on
@@ -260,9 +262,9 @@ export function effortPhrase(e: EffortStatus, now: number = Date.now()): string 
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }
   if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
-  if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
+  if (e.statusActor === "other") return "the other party";
   return "no report yet";
 }
 

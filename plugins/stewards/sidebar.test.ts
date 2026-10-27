@@ -246,7 +246,7 @@ describe("stewards sidebar grouping", () => {
     // ops + other is a monitor, grey, with the wait phrase.
     expect(tab.monitors.map((e) => e.key)).toEqual(["acme/deps"]);
     expect(tab.monitors[0]!.state).toBe("quiet");
-    expect(tab.monitors[0]!.phrase).toBe("waiting on Next scheduled look");
+    expect(tab.monitors[0]!.phrase).toBe("Next scheduled look");
     // ops with blockedOn or needsUser is still blocked, out of monitors.
     expect(tab.blocked.map((e) => e.key).sort()).toEqual(["acme/ns", "acme/sentry"]);
     // ticket + other is in flight, grey, with the wait phrase; review + other
@@ -254,7 +254,7 @@ describe("stewards sidebar grouping", () => {
     expect(tab.efforts.map((e) => e.key).sort()).toEqual(["ENG-1", "acme/web#728"]);
     const ticketWait = tab.efforts.find((e) => e.key === "ENG-1")!;
     expect(ticketWait.state).toBe("quiet");
-    expect(ticketWait.phrase).toBe("waiting on an author push");
+    expect(ticketWait.phrase).toBe("an author push");
     const reviewWait = tab.efforts.find((e) => e.key === "acme/web#728")!;
     expect(reviewWait.state).toBe("running");
     expect(reviewWait.phrase).toBe("1 worker running");
@@ -346,23 +346,26 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");
     // 4. stuck
     expect(effortPhrase(effort({ key: "e", stuck: true }))).toBe("stuck");
-    // 5. running workers, before the external wait so a waiting effort with a
-    // running worker reads the count (BB-81).
+    // 5. running workers, before the deployment watch and the free-text
+    // nextAction, so a waiting effort with a running worker reads the count (BB-81).
     expect(effortPhrase(effort({ key: "g", runningWorkers: 2 }))).toBe("2 workers running");
     expect(effortPhrase(effort({ key: "h", runningWorkers: 1 }))).toBe("1 worker running");
     // A busy steward or reviewer with no running worker falls through, not "0 workers running".
     expect(effortPhrase(effort({ key: "g2", busy: true, statusNextAction: "a reviewer is checking" }))).toBe("a reviewer is checking");
     expect(effortPhrase(effort({ key: "g3", busy: true }))).toBe("no report yet");
-    // 6. actor = other, after the count
-    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM" }))).toBe("waiting on an owner LGTM");
-    expect(effortPhrase(effort({ key: "f2", statusActor: "other", statusNextAction: "the vendor", runningWorkers: 1 }))).toBe("1 worker running");
-    // 7. deployment
+    // 6. deployment, ahead of the free-text nextAction whatever the actor (BB-86).
     expect(effortPhrase(effort({ key: "i", deployment: "merged" }))).toBe("deploying");
     expect(effortPhrase(effort({ key: "j", deployment: "deployed" }))).toBe("deployed");
     expect(effortPhrase(effort({ key: "k", deployment: "failed" }))).toBe("deploy failed");
-    // 8. nextAction
+    expect(effortPhrase(effort({ key: "i2", statusActor: "other", deployment: "merged", statusNextAction: "Wait for a bb-server build" }))).toBe("deploying");
+    expect(effortPhrase(effort({ key: "i3", statusActor: "other", runningWorkers: 1, deployment: "merged" }))).toBe("1 worker running");
+    // 7. nextAction, verbatim for every actor (BB-86): the external wait is not a prefix.
     expect(effortPhrase(effort({ key: "l", statusNextAction: "wait for the review" }))).toBe("wait for the review");
-    // 9. no report
+    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM" }))).toBe("an owner LGTM");
+    expect(effortPhrase(effort({ key: "f2", statusActor: "other", statusNextAction: "Wait for the hold to lift." }))).toBe("Wait for the hold to lift.");
+    expect(effortPhrase(effort({ key: "f3", statusActor: "other", statusNextAction: "the vendor", runningWorkers: 1 }))).toBe("1 worker running");
+    // 8. no report: `the other party` stands in for an external wait with no nextAction.
+    expect(effortPhrase(effort({ key: "n", statusActor: "other" }))).toBe("the other party");
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
   });
 

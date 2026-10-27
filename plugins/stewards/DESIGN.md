@@ -1534,10 +1534,12 @@ reviewer with no running worker falls through, rather than reading `0 workers
 running`); `worker finished, next look <time>` when the binding has a pending
 quiet worker-finish note and no running worker (BB-83 — the status summary a
 finished worker left behind must not keep the row, and the time is the
-binding's `requeueAt`); `waiting on <nextAction>` when the status actor is
-`other` (an external wait is not a block, so its colour follows the glyph); the newest
-deployment watch's state (`deploying`, `deployed`, `deploy failed`); the status
-`nextAction`; otherwise `no report yet`. The phrase's colour follows the
+binding's `requeueAt`); the newest deployment watch's state (`deploying`,
+`deployed`, `deploy failed`), ahead of the free-text `nextAction` whatever the
+actor (BB-86); the status `nextAction` verbatim, with `the other party`
+standing in for an `other` actor that has no report (an external wait is not a
+block, so its colour follows the glyph); otherwise `no report yet`. The
+phrase's colour follows the
 glyph's. `sidebar.ts` derives `state`, `section`
 and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
 covers every rule and the precedence.

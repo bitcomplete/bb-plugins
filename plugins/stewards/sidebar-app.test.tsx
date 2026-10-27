@@ -181,6 +181,27 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-84: a truncated title is still readable on hover, through the native
+  // `title` tooltip on the row's title anchor.
+  it("puts the thread's full display title on the row's title anchor as a tooltip", async () => {
+    const plainTitle = "A one-off thread whose long title the sidebar truncates";
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: plainTitle })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    });
+    // The effort row's own title anchor carries the full title.
+    const effortAnchor = (await waitFor(() => slot.getByText("Fix login"))).closest("a")!;
+    expect(effortAnchor.getAttribute("title")).toBe("ENG-1: Fix login");
+    // So does a plain thread row's title anchor.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    const plainAnchor = (await waitFor(() => slot.getByText(plainTitle))).closest("a")!;
+    expect(plainAnchor.getAttribute("title")).toBe(plainTitle);
+    slot.lifecycle.unmount();
+  });
+
   it("shortens a pull-request key to #N and spells out the kind", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "acme/web#612: Read dashboard metrics" })] },
@@ -343,6 +364,23 @@ describe("the stewards sidebar list (BB-44)", () => {
     }
   });
 
+  it("draws a custom chevron on the project picker instead of the native arrow", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.className).toContain("appearance-none");
+    expect(select.className).toContain("pr-7");
+    expect(select.closest(".relative")).not.toBeNull();
+    const chevron = slot.container.querySelector('[data-icon="ChevronDown"]');
+    expect(chevron).not.toBeNull();
+    expect(chevron!.className).toContain("pointer-events-none");
+    expect(chevron!.className).toContain("text-muted-foreground");
+    expect(chevron!.getAttribute("aria-hidden")).toBe("true");
+    slot.lifecycle.unmount();
+  });
+
   it("follows activeProjectId in the picker and switches on pick without navigating", async () => {
     const slot = await renderSidebar(
       {
@@ -488,7 +526,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     expect(inflight.textContent).toContain("Waiting ticket");
     expect(inflight.textContent).not.toContain("Needs you");
     expect(glyphOf(slot, "Waiting ticket")).toBe("quiet");
-    expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · waiting on an author push");
+    expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · an author push");
     // Monitors holds the ops wait, grey, once opened.
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
@@ -499,7 +537,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     const monitors = slot.getByRole("button", { name: /Monitors/u }).closest("section")!;
     expect(monitors.textContent).toContain("Ops watch: acme/web");
     expect(glyphOf(slot, "Ops watch: acme/web")).toBe("quiet");
-    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · waiting on Next scheduled look");
+    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · Next scheduled look");
     const threads = slot.getByRole("button", { name: /Threads/u }).closest("section")!;
     expect(threads.textContent).toContain("One-off");
     slot.lifecycle.unmount();

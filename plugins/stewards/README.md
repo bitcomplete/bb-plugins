@@ -402,7 +402,9 @@ switchable from where you are.
 **The row and the glyphs (BB-76).** An effort row is two lines: the glyph, the
 entity key in bold and the title on line one; the kind (`ticket`, `pull
 request`, `review`, `ops`), the entity's phase when it has one, and the status
-phrase on line two. A row that needs you adds its prompt and one-click actions
+phrase on line two (first match wins: `needs you`, `blocked on …`, a hold,
+`stuck`, `N worker(s) running`, the deployment state, then the report's
+`nextAction` verbatim). A row that needs you adds its prompt and one-click actions
 under line two, in the same row. The glyph is one of four, in precedence order
 `you › blocked › running › quiet`: a solid yellow dot when it waits on you, an
 empty red ring when blocked, a blue ring that pulses slowly while a worker or
