@@ -493,6 +493,12 @@ export const frontMatterSchema = z
     may: z.array(z.string().trim().min(1).max(60)).default([]),
     models: z.object({ steward: modelSpecSchema.optional(), worker: modelSpecSchema.optional() }).strict().default({}),
     "requeue-default": durationSchema.default(2 * 86_400_000),
+    /**
+     * How long a binding in a build or review stage may sit with nothing to
+     * wait on before the plugin wakes its steward (BB-83). The idle wake fires
+     * once per idle period, so this is a grace, not a poll interval.
+     */
+    "idle-grace": durationSchema.default(15 * 60_000),
     /** How long a steward may keep a binding open past a terminal state to finish its work. */
     "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /** Reviews: pull request authors no review steward is made for (bots). */
@@ -513,6 +519,8 @@ export type Playbook = {
   may: string[];
   models: { steward: ModelSpec | null; worker: ModelSpec | null };
   requeueDefaultMs: number;
+  /** How long a binding may sit idle in an active stage before its steward is woken (BB-83). */
+  idleGraceMs: number;
   followThroughMs: number;
   skipAuthors: string[];
   /** Where a merge is confirmed live, or null when the playbook names no deployment target. */
@@ -583,6 +591,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       may: fm.may,
       models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null },
       requeueDefaultMs: fm["requeue-default"],
+      idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
       skipAuthors: fm["skip-authors"],
       deployment: fm.deployment ?? null,

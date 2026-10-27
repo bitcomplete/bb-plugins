@@ -32,6 +32,10 @@ export interface SidebarBinding {
   status: { actor: string; nextAction: string; at: number } | null;
   /** The state of the newest deployment watch, or null with none (BB-76). */
   deployment: DeployState | null;
+  /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+  pending: { text: string; quiet?: boolean }[];
+  /** When the binding is next due a look, for `next look <time>` (BB-83). */
+  requeueAt: number | null;
   advancedAt: number | null;
   workers: SidebarWorker[];
   reviewers: SidebarReviewer[];
@@ -120,6 +124,10 @@ export interface SidebarEffort {
   statusNextAction: string | null;
   statusAt: number | null;
   deployment: DeployState | null;
+  /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+  pending: { text: string; quiet?: boolean }[];
+  /** When the binding is next due a look, for `next look <time>` (BB-83). */
+  requeueAt: number | null;
   /** How many of the binding's workers are running (worker-table status). */
   runningWorkers: number;
   pinned: boolean;
@@ -176,6 +184,10 @@ export interface EffortStatus {
   statusActor: string | null;
   statusNextAction: string | null;
   deployment: DeployState | null;
+  /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+  pending: readonly { text: string; quiet?: boolean }[];
+  /** When the binding is next due a look, for `next look <time>` (BB-83). */
+  requeueAt: number | null;
 }
 
 /** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
@@ -209,13 +221,34 @@ export function deploymentPhrase(state: DeployState): string {
 }
 
 /**
- * Line two's status phrase, first match wins (BB-76, BB-86):
- * needs you › blockedOn › hold › stuck › running › deployment › nextAction › no report.
- * An external wait is not a prefix: an `other` actor reads its `nextAction`
- * verbatim like any other actor, and `the other party` only stands in when
- * there is no report at all.
+ * A pending note that a worker finished its turn quietly (BB-52 rule 3): the
+ * one whose place a stale status summary must not keep (BB-83).
  */
-export function effortPhrase(e: EffortStatus): string {
+export const isQuietWorkerFinish = (n: { text: string; quiet?: boolean }): boolean => n.quiet === true && /^Worker ".+" finished its turn\.$/u.test(n.text);
+
+/** A short relative time to a future moment, for `next look <time>` (BB-83). */
+export function untilPhrase(at: number, now: number): string {
+  const ms = at - now;
+  if (ms <= 0) return "now";
+  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+}
+
+/**
+ * Line two's status phrase, first match wins (BB-76, BB-86, BB-83):
+ * needs you › blockedOn › hold › stuck › running › quiet worker finish ›
+ * deployment › nextAction › no report. An external wait is not a prefix: an
+ * `other` actor reads its `nextAction` verbatim like any other actor, and
+ * `the other party` only stands in when there is no report at all.
+ *
+ * The quiet worker finish (BB-83) sits after the running count and before the
+ * external wait: a binding whose worker finished and has nothing to wait on
+ * says so instead of repeating the status summary the worker's finish made
+ * stale. `now` is the clock for the relative `next look` time; it defaults to
+ * the wall clock so a caller with no clock still gets a phrase.
+ */
+export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
   if (e.needsUser) return "needs you";
   if (e.blockedOn !== null) return `blocked on ${e.blockedOn}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
@@ -228,6 +261,7 @@ export function effortPhrase(e: EffortStatus): string {
     const n = e.runningWorkers;
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }
+  if (e.pending.some(isQuietWorkerFinish)) return e.requeueAt === null ? "worker finished" : `worker finished, next look ${untilPhrase(e.requeueAt, now)}`;
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
   if (e.statusActor === "other") return "the other party";
@@ -235,10 +269,10 @@ export function effortPhrase(e: EffortStatus): string {
 }
 
 /** Fill in the derived fields. Grouping calls this once the effort's children are attached. */
-function derive(e: SidebarEffort): SidebarEffort {
+function derive(e: SidebarEffort, now: number): SidebarEffort {
   e.state = effortState(e);
   e.section = effortSection(e);
-  e.phrase = effortPhrase(e);
+  e.phrase = effortPhrase(e, now);
   return e;
 }
 
@@ -311,7 +345,10 @@ export function buildSidebar(input: {
   projects: readonly SidebarLiveProject[];
   threads: readonly SidebarLiveThread[];
   data: readonly SidebarProjectData[];
+  /** The clock for relative phrases (BB-83); the wall clock when left out. */
+  now?: number;
 }): SidebarTab[] {
+  const now = input.now ?? Date.now();
   const dataByProject = new Map(input.data.map((d) => [d.projectId, d] as const));
   const threadsByProject = new Map<string, SidebarLiveThread[]>();
   for (const t of input.threads) {
@@ -319,10 +356,10 @@ export function buildSidebar(input: {
     list.push(t);
     threadsByProject.set(t.projectId, list);
   }
-  return input.projects.map((project) => buildTab(project, dataByProject.get(project.id), threadsByProject.get(project.id) ?? []));
+  return input.projects.map((project) => buildTab(project, dataByProject.get(project.id), threadsByProject.get(project.id) ?? [], now));
 }
 
-function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefined, threads: readonly SidebarLiveThread[]): SidebarTab {
+function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefined, threads: readonly SidebarLiveThread[], now: number): SidebarTab {
   const byId = new Map(threads.map((t) => [t.id, t] as const));
   const bindings = data?.bindings ?? [];
   const stewardThreadId = data?.projectStewardThreadId ?? null;
@@ -361,6 +398,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       statusNextAction: b.status?.nextAction ?? null,
       statusAt: b.status?.at ?? null,
       deployment: b.deployment,
+      pending: b.pending,
+      requeueAt: b.requeueAt,
       runningWorkers: b.workers.filter((w) => w.status === "running").length,
       pinned: root.isPinned,
       busy: isBusy(root.status),
@@ -397,7 +436,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       byThread.set(thread.id, child);
       touch(effort, thread);
     }
-    derive(effort);
+    derive(effort, now);
   }
 
   // The fallback the RPC records do not cover: a worker whose parent is its
@@ -423,7 +462,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     }
   }
   // A fallback child can flip busy after the effort was derived.
-  for (const effort of efforts) derive(effort);
+  for (const effort of efforts) derive(effort, now);
 
   // One-off efforts: everything left, treed by parent / lifecycle owner.
   const remaining = threads.filter((t) => !claimed.has(t.id) && t.id !== stewardThreadId);
@@ -458,6 +497,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       statusNextAction: null,
       statusAt: null,
       deployment: null,
+      pending: [],
+      requeueAt: null,
       runningWorkers: 0,
       pinned: root.isPinned,
       busy: isBusy(root.status),
@@ -472,7 +513,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       return { threadId: t.id, title: t.displayTitle, role: "thread", children: (childrenByParent.get(t.id) ?? []).map(visit) };
     };
     effort.children = (childrenByParent.get(root.id) ?? []).map(visit);
-    efforts.push(derive(effort));
+    efforts.push(derive(effort, now));
   }
 
   const nonOps = efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops");

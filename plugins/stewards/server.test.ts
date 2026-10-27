@@ -7048,3 +7048,184 @@ describe("deployment watching (BB-53)", () => {
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
   });
 });
+
+// BB-83: a binding in a build or review stage with nothing left to wait on is
+// woken after a short grace, once per idle period. A worker finish that leaves
+// nothing to wait on is loud at once; a finish that leaves an open own pull
+// request stays quiet, as does a finish whose message says it is waiting.
+describe("a steward idle in an active stage (BB-83)", () => {
+  const idleLine = /Nothing is running and nothing is being waited on/u;
+
+  it("wakes at a worker finish that leaves nothing to wait on", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const before = t.sends.length;
+    await t.idle("thr_w1", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+    expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+  });
+
+  it("stays quiet at a worker finish that leaves its own pull request open", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const before = t.sends.length;
+    // The message says merged, but the snapshot still shows the pull request
+    // open: there is something to wait on, so the finish is quiet.
+    await t.idle("thr_w1", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before);
+    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true }]);
+  });
+
+  it("wakes once after the grace, and not again after the steward reports", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    // A waiting finish is quiet now; the idle rule catches it after the grace.
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+
+    // Inside the grace: nobody is woken.
+    t.advance(10 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before);
+
+    // Past the grace: one idle wake.
+    t.advance(6 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+
+    // The steward reports and asks for a long requeue; two later ticks past
+    // the grace do not wake it again in the same idle period.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting on the reviewer.", nextAction: "Wait", actor: "other", requeueAfter: "2d" }, steward);
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+  });
+
+  it("wakes from the requeue tick for a binding idle past the grace", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+    t.advance(16 * 60_000);
+    // The requeue tick only looks at bindings whose requeue has come, so make
+    // it due: the same predicate is evaluated on that path too.
+    t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { requeueAt: t.now() });
+    await t.hooks.requeueTick();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+  });
+
+  it("starts a new idle period when the steward starts a worker that finishes", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+
+    // A new worker runs and finishes leaving nothing to wait on: a new period.
+    await t.created("thr_w2", steward, "ENG-12: Implement");
+    await t.idle("thr_w2", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before + 2);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+  });
+
+  it("starts a new idle period when an own pull request closes", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    // The worker finishes waiting, leaving its pull request open: not idle, and
+    // a worker end happened long before the close.
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    t.advance(30 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.idleWokenAt).toBeNull();
+
+    // The pull request closes. The idle period starts at the close, so the
+    // close's own wake does not carry the idle line even though the worker
+    // ended long ago.
+    t.entities.set("acme/web#7", pull({ author: "jane", state: "merged" }, { headAuthor: "jane", merged: true }));
+    await t.ring("github", "acme/web#7");
+    expect(t.sends.at(-1)!.text).not.toMatch(idleLine);
+    // Past the grace from the close, the second idle wake fires.
+    const afterClose = t.sends.length;
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(afterClose + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+  });
+
+  it("starts a new idle period when a deployment watch changes", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries: "The pin contains the merge."\n  timeout: 1h',
+    );
+    t.entities.set("uuid-12", issue({ state: "In Progress", linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const toSteward = () => t.sends.filter((s) => s.threadId === steward);
+
+    // A merged pull request leaves a deployment to wait on: not idle.
+    t.advance(30 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    // The deployment is discovered on the sweep: the watch moves to deploying
+    // (still a wait) and the change wakes the steward.
+    t.sourceDeployments.set("acme/bb-gate production", [{ id: 7, environment: "production", ref: "main", sha: "bbbbbbb2", state: "success", url: "https://github.com/acme/bb-gate/actions/runs/9" }]);
+    await t.hooks.sweep();
+    await t.flush();
+    const afterDeploy = toSteward().length;
+    t.advance(30 * 60_000);
+
+    // The steward reports the deployment carried the merge: the watch is
+    // deployed, the binding is idle, and the period starts at the report, not
+    // at the older deployment change.
+    await t.tool("steward_report", { phase: "In Review", summary: "The deployment pins the merge.", nextAction: "Close the ticket", actor: "steward", deployment: { state: "deployed" } }, steward);
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed" });
+    expect(toSteward().at(-1)!.text).not.toMatch(idleLine);
+    // Past the grace from the report, the idle wake fires.
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(toSteward()).toHaveLength(afterDeploy + 2);
+    expect(toSteward().at(-1)!.text).toMatch(idleLine);
+  });
+});

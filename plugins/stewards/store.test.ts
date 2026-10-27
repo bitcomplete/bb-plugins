@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -309,10 +309,11 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     // `bb.storage.migrate` records each statement by index and refuses a changed
     // one; a group spliced in mid-array would fail every live database on load.
     // BB-35 step 4 appended the rationale group, step 5 the validation group,
-    // and step 6 the guidance group, after this one.
-    expect(MIGRATIONS.slice(-GUIDANCE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -GUIDANCE_MIGRATIONS.length)).toEqual([...VALIDATION_MIGRATIONS]);
-    const afterTier = GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length + RATIONALE_MIGRATIONS.length;
+    // step 6 the guidance group, and BB-83 the idle group, after this one.
+    expect(MIGRATIONS.slice(-IDLE_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -IDLE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
+    const afterTier = IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length + RATIONALE_MIGRATIONS.length;
     expect(MIGRATIONS.slice(-(afterTier + LESSON_TIER_MIGRATIONS.length), -afterTier)).toEqual([...LESSON_TIER_MIGRATIONS]);
   });
 });
@@ -493,8 +494,9 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    expect(MIGRATIONS.slice(-GUIDANCE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -GUIDANCE_MIGRATIONS.length)).toEqual([...VALIDATION_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-IDLE_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -IDLE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
   });
 });
 

@@ -430,7 +430,19 @@ export const GUIDANCE_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS guidance_citations_project ON guidance_citations (project_id)`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS];
+// BB-83: the idle clock. `idle_since` is when the binding became idle in a
+// build or review stage (nothing running and nothing waited on); `idle_woken_at`
+// is when the plugin last woke its steward for it, so the wake fires once per
+// idle period; `idle_wake_now` is set by a worker finish so the next reconcile
+// looks at once, without the grace. Additive and defaulted: an old row reads as
+// never idle, never woken and no immediate look.
+export const IDLE_MIGRATIONS = [
+  `ALTER TABLE bindings ADD COLUMN idle_since INTEGER`,
+  `ALTER TABLE bindings ADD COLUMN idle_woken_at INTEGER`,
+  `ALTER TABLE bindings ADD COLUMN idle_wake_now INTEGER NOT NULL DEFAULT 0`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -567,6 +579,12 @@ export type Binding = {
   sentryLook: SentryLook | null;
   /** Per-pull-request deployment state, keyed by the pull request's key (BB-53). Empty with no deployment target. */
   deployments: Deployments;
+  /** When the binding became idle in an active stage, or null (BB-83). */
+  idleSince: number | null;
+  /** When the plugin last woke the steward for being idle in an active stage (BB-83). */
+  idleWokenAt: number | null;
+  /** A worker finish asked for an idle look at once, without the grace (BB-83). */
+  idleWakeNow: boolean;
   createdAt: number;
   endedAt: number | null;
   endReason: string | null;
@@ -629,6 +647,9 @@ function rowToBinding(r: BindingRow): Binding {
     depsLook: json(depsLookSchema.nullable(), str("deps_look"), null),
     sentryLook: json(sentryLookSchema.nullable(), str("sentry_look"), null),
     deployments: json(deploymentsSchema, str("deployments"), {}),
+    idleSince: num("idle_since"),
+    idleWokenAt: num("idle_woken_at"),
+    idleWakeNow: Number(r.idle_wake_now ?? 0) === 1,
     createdAt: Number(r.created_at),
     endedAt: num("ended_at"),
     endReason: str("end_reason"),
@@ -682,6 +703,9 @@ const COLUMNS = {
   depsLook: "deps_look",
   sentryLook: "sentry_look",
   deployments: "deployments",
+  idleSince: "idle_since",
+  idleWokenAt: "idle_woken_at",
+  idleWakeNow: "idle_wake_now",
   endedAt: "ended_at",
   endReason: "end_reason",
 } as const satisfies Partial<Record<keyof Binding, string>>;
