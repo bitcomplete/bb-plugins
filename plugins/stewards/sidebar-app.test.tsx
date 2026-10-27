@@ -362,6 +362,23 @@ describe("the stewards sidebar list (BB-44)", () => {
     }
   });
 
+  it("draws a custom chevron on the project picker instead of the native arrow", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.className).toContain("appearance-none");
+    expect(select.className).toContain("pr-7");
+    expect(select.closest(".relative")).not.toBeNull();
+    const chevron = slot.container.querySelector('[data-icon="ChevronDown"]');
+    expect(chevron).not.toBeNull();
+    expect(chevron!.className).toContain("pointer-events-none");
+    expect(chevron!.className).toContain("text-muted-foreground");
+    expect(chevron!.getAttribute("aria-hidden")).toBe("true");
+    slot.lifecycle.unmount();
+  });
+
   it("follows activeProjectId in the picker and switches on pick without navigating", async () => {
     const slot = await renderSidebar(
       {

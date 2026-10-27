@@ -1398,21 +1398,28 @@ function SidebarCollapsible({ title, count, children }: { title: string; count: 
 function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
   return (
     <div className="flex items-center gap-1 px-2 py-1.5">
-      <select
-        aria-label="Project"
-        className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-3 text-sm"
-        value={activeId ?? ""}
-        onChange={(e) => onPick(e.target.value)}
-      >
-        {tabs.map((t) => {
-          const count = counts.get(t.projectId) ?? 0;
-          return (
-            <option key={t.projectId} value={t.projectId}>
-              {count > 0 ? `${t.name} (${count})` : t.name}
-            </option>
-          );
-        })}
-      </select>
+      <div className="relative min-w-0 flex-1">
+        <select
+          aria-label="Project"
+          className="h-8 w-full min-w-0 appearance-none rounded-md border border-input bg-transparent pl-3 pr-7 text-sm"
+          value={activeId ?? ""}
+          onChange={(e) => onPick(e.target.value)}
+        >
+          {tabs.map((t) => {
+            const count = counts.get(t.projectId) ?? 0;
+            return (
+              <option key={t.projectId} value={t.projectId}>
+                {count > 0 ? `${t.name} (${count})` : t.name}
+              </option>
+            );
+          })}
+        </select>
+        <Icon
+          name="ChevronDown"
+          className="pointer-events-none absolute right-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+          aria-hidden
+        />
+      </div>
       {tabs.length > 0 ? (
         <button
           type="button"
