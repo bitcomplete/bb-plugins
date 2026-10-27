@@ -1593,21 +1593,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const UNHIDE_ONCE_KEY = "migrations/unhide-hidden-threads";
     async function unhideOnce(): Promise<void> {
       if ((await bb.storage.kv.get<string>(UNHIDE_ONCE_KEY)) != null) return;
+      let failed = false;
       for (const b of store.open()) {
-        if (b.threadId !== null) await showIfHidden(b.threadId);
+        if (b.threadId !== null && !(await showIfHidden(b.threadId))) failed = true;
         for (const w of store.workers(b.id)) {
-          await showIfHidden(w.threadId);
-          for (const r of (await reviewersOf(w.threadId)) ?? []) await showIfHidden(r.id);
+          if (!(await showIfHidden(w.threadId))) failed = true;
+          for (const r of (await reviewersOf(w.threadId)) ?? []) if (!(await showIfHidden(r.id))) failed = true;
         }
       }
-      await bb.storage.kv.set(UNHIDE_ONCE_KEY, String(now()));
+      // A transient show failure must not burn the one-time marker: leaving it
+      // unset makes the next start retry, as the old show-on-every-wake path
+      // did. Only a clean pass records it.
+      if (!failed) await bb.storage.kv.set(UNHIDE_ONCE_KEY, String(now()));
     }
 
-    /** Show a thread hidden in the sidebar, unless it is archived, gone, or already visible. */
-    async function showIfHidden(threadId: string): Promise<void> {
+    /** Show a thread hidden in the sidebar; false when the update failed, so the caller can retry. */
+    async function showIfHidden(threadId: string): Promise<boolean> {
       const info = await threadInfo(threadId).catch(() => null);
-      if (info === null || info.deletedAt !== null || info.archivedAt !== null || info.visibility !== "hidden") return;
-      await quietly(`show ${threadId}`, () => bb.sdk.threads.update({ threadId, visibility: "visible" }));
+      if (info === null || info.deletedAt !== null || info.archivedAt !== null || info.visibility !== "hidden") return true;
+      try {
+        await bb.sdk.threads.update({ threadId, visibility: "visible" });
+        return true;
+      } catch (error) {
+        bb.log.warn(`stewards: could not show ${threadId}: ${errorMessage(error)}`);
+        return false;
+      }
     }
 
     /**

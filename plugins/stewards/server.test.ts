@@ -2616,6 +2616,26 @@ describe("the one-time unhide (BB-93)", () => {
       service.controller.abort();
     }
   });
+
+  it("retries on the next start when a show fails, rather than burning the marker", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    t.threads.get(steward)!.visibility = "hidden";
+
+    // The API is down for the first start: the marker is not written, so a
+    // later start tries again instead of leaving the thread hidden forever.
+    t.harness.sdk.stub("threads.update", async () => {
+      throw new Error("the API is down");
+    });
+    await t.hooks.unhideOnce();
+    expect(t.threads.get(steward)!.visibility).toBe("hidden");
+
+    t.harness.sdk.stub("threads.update", t.sdk.threads.update);
+    await t.hooks.unhideOnce();
+    expect(t.threads.get(steward)!.visibility).toBe("visible");
+  });
 });
 
 describe("archiving finished workers and reviewers (BB-47)", () => {

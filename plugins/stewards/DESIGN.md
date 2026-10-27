@@ -276,7 +276,10 @@ plugins.
   not hidden with it either: hiding made the stewards sidebar drop a waiting
   or held steward from the list entirely (BB-93). The report is marked read
   (`threads.markRead`) when nothing needs the user, so the unread dot means
-  "needs you"; a report that needs the user is left unread. The
+  "needs you"; a report that needs the user is left unread. The plugin never
+  sets a thread's visibility now, so a thread the user hides by hand stays
+  hidden even when it later asks a question; showing it again is the user's
+  to undo. The
   open-escalation rule stays.
   binding end still archives the thread. Workers stay lifecycle-owned: they
   are the steward's children in bb, and the plugin stops them explicitly only
