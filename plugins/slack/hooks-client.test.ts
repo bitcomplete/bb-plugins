@@ -42,6 +42,41 @@ describe("sessionEventSchema", () => {
   it("rejects a wake from another source", () => {
     expect(sessionEventSchema.safeParse({ source: "linear", session: "x", action: "created", channel: "c", thread: "t", asker: {}, owner: {}, fromOwner: true, comment: {} }).success).toBe(false);
   });
+
+  it("accepts the invited and block_action wakes, which carry no conversation", () => {
+    const invited = sessionEventSchema.parse({
+      source: "slack",
+      session: "",
+      action: "invited",
+      channel: "C0123",
+      thread: "",
+      asker: { id: "U1", name: "Alice" },
+      owner: { id: "U1", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "", untrusted: false },
+      at: "2026-10-26T12:00:00Z",
+    });
+    expect(invited).toMatchObject({ action: "invited", session: "", thread: "", actionId: "", value: "", responseUrl: "" });
+
+    const block = sessionEventSchema.parse({
+      source: "slack",
+      session: "",
+      action: "block_action",
+      channel: "C0123",
+      thread: "",
+      asker: { id: "U1", name: "Alice" },
+      owner: { id: "U1", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      actionId: "bb_set_project",
+      value: "prj-1",
+      responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
+      comment: { text: "", untrusted: false },
+      at: "2026-10-26T12:00:00Z",
+    });
+    expect(block).toMatchObject({ action: "block_action", actionId: "bb_set_project", value: "prj-1", responseUrl: "https://hooks.slack.com/actions/T1/B1/cap" });
+  });
 });
 
 describe("createHooksLoop", () => {
@@ -79,6 +114,42 @@ describe("createHooksLoop", () => {
     await vi.waitFor(() => expect(seen).toHaveLength(1));
     expect(identifies).toEqual([{ connection: "c_1", source: "slack", token: "tok", teams: [] }]);
     expect(loop.connectionId).toBe("c_1");
+    abort.abort();
+    await running;
+  });
+
+  it("posts an ephemeral prompt through the loop with the connection id", async () => {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let streamReady!: () => void;
+    const ready = new Promise<void>((resolve) => (streamReady = resolve));
+    const ephemerals: unknown[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      if (u === `${BASE}/v1/events`) {
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            controller = c;
+            streamReady();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (u === `${BASE}/v1/slack/ephemeral`) {
+        ephemerals.push(JSON.parse(String(init?.body)));
+        return Response.json({ ok: true });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const loop = createHooksLoop({ fetch: fetchImpl, baseUrl: BASE, now: () => 1, log: { info: () => undefined, warn: () => undefined }, identity: () => "tok", onSession: () => undefined });
+    const abort = new AbortController();
+    const running = loop.run(abort.signal);
+    await ready;
+    controller.enqueue(encoder.encode(`event: hello\ndata: ${JSON.stringify({ connection: "c_1", leaseSeconds: 3600 })}\n\n`));
+    await vi.waitFor(() => expect(loop.connectionId).toBe("c_1"));
+    await loop.ephemeral({ channel: "C1", user: "U1", text: "Which project?", blocks: [{ type: "section" }] }, abort.signal);
+    expect(ephemerals).toEqual([{ connection: "c_1", channel: "C1", user: "U1", text: "Which project?", blocks: [{ type: "section" }] }]);
     abort.abort();
     await running;
   });
