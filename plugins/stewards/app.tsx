@@ -1135,9 +1135,8 @@ function SidebarThreadRow({
   meta?: ReactNode;
   /** The full binding key, kept on the row's `title` attribute when the row is an effort. */
   titleAttr?: string;
-  /** The four-glyph component every thread row gets: a one-off thread or its
-   * child, an effort's worker/reviewer child, or the project steward row;
-   * drafts keep bb's glyph. */
+  /** The four-glyph component for a one-off thread or its child, an effort's
+   * worker/reviewer child, or the project steward row; drafts keep bb's glyph. */
   glyph?: SidebarEffortState;
 }) {
   const navigate = useBbNavigate();
