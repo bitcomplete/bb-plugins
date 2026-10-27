@@ -337,9 +337,18 @@ export const rpcContract = defineRpcContract({
               blockedOn: z.string().nullable(),
               priority: z.string().nullable(),
               hold: z.string().nullable(),
+              /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
+              holdBehind: z.array(z.string()),
+              /** Something waits on the user, so the shared BB-78 row is yellow. */
+              needsUser: z.boolean(),
+              /** An open `stuck` escalation: the row is blocked (BB-78). */
+              stuck: z.boolean(),
+              /** The newest deployment watch's state, or null with none (BB-78). */
+              deployment: z.enum(DEPLOY_STATES).nullable(),
               ending: z.string().nullable(),
               statusAt: z.number().nullable(),
               createdAt: z.number(),
+              /** The running-worker count; the query already filters to workers whose status is running. */
               workers: z.number(),
               escalations: z.array(z.object({ kind: z.string(), route: z.string(), question: z.string() })),
             }),
@@ -413,8 +422,25 @@ export const rpcContract = defineRpcContract({
               actor: z.string().nullable(),
               blockedOn: z.string().nullable(),
               priority: z.string().nullable(),
+              /** The hold reason, for the card's `On hold` line; null when not held. */
+              hold: z.string().nullable(),
+              /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
+              holdBehind: z.array(z.string()),
+              /** Something waits on the user: the row is yellow and the card shows its items (BB-78). */
+              needsUser: z.boolean(),
+              /** An open `stuck` escalation: the row is blocked (BB-78). */
+              stuck: z.boolean(),
+              /** The newest deployment watch's state, or null with none (BB-78). */
+              deployment: z.enum(DEPLOY_STATES).nullable(),
               ending: z.string().nullable(),
+              /** The last status report's timestamp, for the card's `Reported` line; null with no report. */
+              statusAt: z.number().nullable(),
+              /** When the binding was adopted, for the card's `adopted` line. */
+              createdAt: z.number(),
+              /** The last wake, shown on an ops monitor row. */
+              wokeAt: z.number().nullable(),
               advancedAt: z.number().nullable(),
+              /** The running workers, each a link; the count is their length. */
               workers: z.array(z.object({ threadId: z.string(), title: z.string() })),
             }),
           ),
@@ -4534,6 +4560,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               blockedOn: b.status?.blockedOn ?? null,
               priority: b.priority,
               hold: b.hold,
+              holdBehind: b.holdBehind,
+              needsUser: needsUser(b),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               ending: b.ending,
               statusAt: b.statusAt,
               createdAt: b.createdAt,
@@ -4600,7 +4630,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               actor: b.status?.actor ?? null,
               blockedOn: b.status?.blockedOn ?? null,
               priority: b.priority,
+              hold: b.hold,
+              holdBehind: b.holdBehind,
+              needsUser: needsUser(b),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              // The newest deployment watch, whatever its state; `merged` reads as deploying.
+              deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
               ending: b.ending,
+              statusAt: b.statusAt,
+              createdAt: b.createdAt,
+              wokeAt: b.wokeAt,
               advancedAt: b.advancedAt,
               workers: store.workers(b.id).filter((w) => w.status === "running").map((w) => ({ threadId: w.threadId, title: w.title })),
             })),

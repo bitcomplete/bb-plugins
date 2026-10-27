@@ -19,6 +19,7 @@ type Need = {
   lessonId: string | null;
   what: string;
   how: string | null;
+  destination: string | null;
   threadId: string | null;
   createdAt: number;
   actionable: boolean;
@@ -49,6 +50,7 @@ const need = (over: Partial<Need> = {}): Need => ({
   lessonId: null,
   what: "Merge or close?",
   how: null,
+  destination: null,
   threadId: null,
   createdAt: 1_000,
   actionable: true,
@@ -506,5 +508,211 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(calls).toBe(2);
     slot.lifecycle.unmount();
+  });
+});
+
+// BB-78: the Stewards page adopts the sidebar's two-line row, glyph and phrase,
+// with the Blocked / In flight / Monitors / Recently ended sections.
+const boardSteward = (over: Record<string, unknown> = {}) => ({
+  key: "ENG-1",
+  url: null,
+  title: "Fix login",
+  kind: "ticket",
+  phase: null,
+  stage: null,
+  threadId: "thr_steward",
+  summary: null,
+  nextAction: null,
+  actor: null,
+  blockedOn: null,
+  priority: null,
+  hold: null,
+  holdBehind: [],
+  needsUser: false,
+  stuck: false,
+  deployment: null,
+  ending: null,
+  statusAt: null,
+  createdAt: 1_000,
+  wokeAt: null,
+  advancedAt: null,
+  workers: [],
+  ...over,
+});
+
+const renderBoardWith = async (over: { stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[] } = {}): Promise<RenderedSlot> => {
+  const captured = await loadApp();
+  const panel = captured.navPanels[0]!;
+  return renderSlot(panel, { subPath: "" }, {
+    rpc: {
+      stewardsBoard: () => ({
+        projects: [{ projectId: "p1", name: "Acme" }],
+        board: {
+          projectId: "p1",
+          name: "Acme",
+          paused: false,
+          projectStewardThreadId: "thr_p",
+          stages: [],
+          digest: null,
+          questions: over.questions ?? [],
+          withUser: over.withUser ?? [],
+          needs: over.needs ?? [],
+          lessons: [],
+          lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+          stewards: over.stewards ?? [],
+          stuck: [],
+          ended: [],
+        },
+      }),
+      stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
+      stewardsNeedAction: () => ({ ok: true, message: "done" }),
+    } as never,
+  });
+};
+
+const glyphIn = (slot: RenderedSlot, title: string): string | null => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")?.getAttribute("data-steward-glyph") ?? null;
+const lineTwoIn = (slot: RenderedSlot, title: string): string => {
+  const li = slot.getByText(title).closest("li")!;
+  return (li.querySelector("[data-steward-line-two]") ?? li.querySelector("[data-sidebar-line-two]"))?.textContent ?? "";
+};
+
+describe("the Stewards page's sections and cards (BB-78)", () => {
+  it("places every open binding in the section the BB-76 rules put it in, with the shared glyph and phrase", async () => {
+    const slot = await renderBoardWith({
+      stewards: [
+        boardSteward({ key: "ENG-1", title: "Needs you", needsUser: true, phase: "In Review" }),
+        boardSteward({ key: "ENG-2", title: "Held up", blockedOn: "bb-gate#88" }),
+        boardSteward({ key: "ENG-3", title: "Working", workers: [{ threadId: "thr_w", title: "w" }] }),
+        boardSteward({ key: "ENG-4", title: "Waiting", summary: "All done", nextAction: "wait for CI", actor: "steward" }),
+        boardSteward({ key: "acme/web", title: "Ops watch", kind: "ops", wokeAt: Date.now() - 60_000 }),
+      ],
+    });
+    await waitFor(() => expect(slot.getByText("Needs you")).toBeTruthy());
+    // The sections are in order, and the old stage grouping is gone.
+    const headings = [...slot.container.querySelectorAll("h2")].map((h) => h.textContent ?? "");
+    expect(headings[0]).toContain("Blocked");
+    expect(headings[1]).toContain("In flight");
+    expect(headings[2]).toContain("Monitors");
+    expect(headings[3]).toContain("Recently ended");
+    expect(slot.queryByRole("heading", { name: /Waiting on you/u })).toBeNull();
+    expect(slot.queryByRole("heading", { name: /Stuck or held/u })).toBeNull();
+    // Blocked holds the yellow and the red; In flight the running and the quiet; Monitors the ops.
+    const blockedSection = slot.getByRole("heading", { name: /^Blocked/u }).closest("section")!;
+    expect(blockedSection.textContent).toContain("Needs you");
+    expect(blockedSection.textContent).toContain("Held up");
+    const inflightSection = slot.getByRole("heading", { name: /^In flight/u }).closest("section")!;
+    expect(inflightSection.textContent).toContain("Working");
+    expect(inflightSection.textContent).toContain("Waiting");
+    const monitorsSection = slot.getByRole("heading", { name: /^Monitors/u }).closest("section")!;
+    expect(monitorsSection.textContent).toContain("Ops watch");
+    expect(monitorsSection.textContent).toContain("Last wake");
+    // The shared row: the same glyph and phrase the sidebar derives.
+    expect(glyphIn(slot, "Needs you")).toBe("you");
+    expect(lineTwoIn(slot, "Needs you")).toBe("ticket · In Review · needs you");
+    expect(glyphIn(slot, "Held up")).toBe("blocked");
+    expect(lineTwoIn(slot, "Held up")).toBe("ticket · blocked on bb-gate#88");
+    expect(glyphIn(slot, "Working")).toBe("running");
+    expect(lineTwoIn(slot, "Working")).toBe("ticket · 1 worker running");
+    expect(glyphIn(slot, "Waiting")).toBe("quiet");
+    expect(lineTwoIn(slot, "Waiting")).toBe("ticket · wait for CI");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the summary, next action, actor and meta line under a non-needs-you card", async () => {
+    const slot = await renderBoardWith({
+      stewards: [boardSteward({ summary: "Everything is fine", nextAction: "wait for CI", actor: "steward", statusAt: 1_000, createdAt: 2_000, deployment: "deployed", hold: "a freeze" })],
+    });
+    await waitFor(() => expect(slot.getByText(/Everything is fine/u)).toBeTruthy());
+    const card = slot.getByText("Fix login").closest("li")!;
+    expect(card.textContent).toContain("Next: wait for CI (the steward)");
+    expect(card.textContent).toContain("Reported");
+    expect(card.textContent).toContain("adopted");
+    expect(card.textContent).toContain("deployed");
+    expect(card.textContent).toContain("On hold: a freeze");
+    expect(slot.getByRole("button", { name: "Open steward" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("attaches a needs-you item to its binding's card, and keeps a project-level question at the top of Blocked", async () => {
+    const slot = await renderBoardWith({
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, summary: "In review" })],
+      questions: [question({ id: "qst_project", key: null, question: "Which release?" }), question({ id: "qst_eng1", key: "ENG-1", question: "Stack or hold?", choices: ["Stack", "Hold"] })],
+    });
+    await waitFor(() => expect(slot.getByText("Stack or hold?")).toBeTruthy());
+    // The project-level question is its own card, before the binding's card.
+    const items = [...slot.container.querySelectorAll("li")];
+    expect(items[0]!.textContent).toContain("Which release?");
+    // The binding's question is inside the same card as its row header.
+    const card = slot.getByText("Fix login").closest("li")!;
+    expect(card.textContent).toContain("Stack or hold?");
+    expect(card.textContent).toContain("In review");
+    // Its controls are the page's, and they make the same RPC call.
+    fireEvent.click(slot.getByRole("button", { name: "Stack" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_eng1", answer: null, choice: "Stack" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps the page-only controls on a needs-you card: the secret form and the approve-spec note", async () => {
+    const slot = await renderBoardWith({
+      stewards: [boardSteward({ needsUser: true, summary: "Waiting on you" })],
+      needs: [
+        need({ id: "need_secret", kind: "provide-secret", what: "Add the token", destination: "the dotenv" }),
+        need({ id: "need_spec", kind: "approve-spec", what: "Approve the spec", how: "Read the spec first" }),
+      ],
+    });
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    expect(slot.getByText(/The form opens in a thread/u)).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Provide" })).toBeTruthy();
+    const note = slot.getByLabelText("Note for: Approve the spec") as HTMLTextAreaElement;
+    fireEvent.change(note, { target: { value: "LGTM" } });
+    fireEvent.click(slot.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_spec", action: "approve", note: "LGTM" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("derives the same state and phrase on the page and the sidebar for the same binding", async () => {
+    const bindings = [
+      sidebarBinding({ key: "ENG-1", threadId: "thr_1", needsUser: true, phase: "In Review" }),
+      sidebarBinding({ key: "ENG-2", threadId: "thr_2", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
+      sidebarBinding({ key: "ENG-3", threadId: "thr_3", blockedOn: "bb-gate#88" }),
+      sidebarBinding({ key: "ENG-4", threadId: "thr_4", deployment: "deployed" }),
+    ];
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const sidebar = renderSlot(
+      list,
+      { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" },
+      {
+        sidebarThreads: {
+          projects: sidebarProjects,
+          threads: [
+            { ...sidebarThread("thr_1"), displayTitle: "ENG-1: Needs you" },
+            { ...sidebarThread("thr_2"), displayTitle: "ENG-2: Working" },
+            { ...sidebarThread("thr_3"), displayTitle: "ENG-3: Held up" },
+            { ...sidebarThread("thr_4"), displayTitle: "ENG-4: Waiting" },
+          ],
+        },
+        rpc: { stewardsSidebar: () => sidebarData({ p1: { bindings } }) },
+      } as never,
+    );
+    await waitFor(() => expect(sidebar.getByText("Needs you")).toBeTruthy());
+    const fromSidebar = new Map(["Needs you", "Working", "Held up", "Waiting"].map((title) => [title, { glyph: glyphIn(sidebar, title), lineTwo: lineTwoIn(sidebar, title) }]));
+    sidebar.lifecycle.unmount();
+
+    const board = await renderBoardWith({
+      stewards: [
+        boardSteward({ key: "ENG-1", title: "Needs you", needsUser: true, phase: "In Review" }),
+        boardSteward({ key: "ENG-2", title: "Working", workers: [{ threadId: "thr_w", title: "w" }] }),
+        boardSteward({ key: "ENG-3", title: "Held up", blockedOn: "bb-gate#88" }),
+        boardSteward({ key: "ENG-4", title: "Waiting", deployment: "deployed" }),
+      ],
+    });
+    await waitFor(() => expect(board.getByText("Needs you")).toBeTruthy());
+
+    for (const title of ["Needs you", "Working", "Held up", "Waiting"]) {
+      expect(glyphIn(board, title)).toBe(fromSidebar.get(title)!.glyph);
+      expect(lineTwoIn(board, title)).toBe(fromSidebar.get(title)!.lineTwo);
+    }
+    board.lifecycle.unmount();
   });
 });

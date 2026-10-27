@@ -847,12 +847,15 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 - **Agent tools:** `steward_report` and `steward_update` (which also
   records and completes lessons, §20).
 - **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.
-- **UI:** the Stewards page, a nav panel with one tab per stewarded project:
-  waiting on you (needs items with links and buttons, open questions, which you
-  can close there, forwarded escalations and approval requests), in flight by
-  stage (summary, next action and actor, running workers), stuck or held, ended
-  in the last two weeks, and the latest digest with its date. Settings →
-  Plugins → Stewards keeps each project's configuration and health.
+- **UI:** the Stewards page, a nav panel with one tab per stewarded project and
+  the expanded view of the sidebar (BB-78): **Blocked** (needs-you cards first,
+  then blocked, held, stuck and waiting-on-others), **In flight** (the rest of
+  the non-`ops` bindings, running before quiet), **Monitors** (the `ops`
+  bindings with their last wake) and **Recently ended**, then the latest digest
+  with its date and the lessons block. Each card is headed by the same two-line
+  effort row the sidebar shows (§21), with the status report underneath; a
+  needs-you card carries its prompt and the page's full one-click controls.
+  Settings → Plugins → Stewards keeps each project's configuration and health.
 
 ### Changes to linear and github
 
@@ -931,9 +934,10 @@ goes wrong there into Linear tickets for the project steward to adopt.
   its thread is archived; put back, the same binding and thread resume.
   `bb stewards detach` ends it until the target is taken out and put back,
   as a ticket stays detached until its label is. It reports to the project
-  steward and has no workers. On the Stewards page it is grouped as
-  `watch`; in `bb stewards list` it shows when it last looked and how many
-  problems are failing.
+  steward and has no workers. On the Stewards page it sits under **Monitors**,
+  a quiet row with its last wake; a `watch` stage only survives in the board
+  RPC for the CLI. In `bb stewards list` it shows when it last looked and how
+  many problems are failing.
 - **The plugin looks with kubectl, as the developer; the steward judges.**
   There is no cluster identity of the plugin's own. The project's machine
   — the developer's, a tailnet node, where the steward's turns run too —
@@ -1103,8 +1107,13 @@ must do, with a link, one line of what, steps, and a close rule. Under
 BB-30 the steward-filed asks (`decide`, `configure`, `provide-secret`) are
 the one `escalations` record with `route: me` and a `resolution`; the
 plugin-filed gate items (`approve-spec`, `approve-pr`, `merge`) stay as
-needs. Both are listed under "Waiting on you" on the Stewards page, in the
-digest, and by `bb stewards needs` and `bb stewards show`. A `route: me`
+needs. Both appear on the Stewards page under **Blocked**, attached to the
+binding's card by its entity key (or, with no open binding, as a card of their
+own at the top), in the digest, and by `bb stewards needs` and
+`bb stewards show`. The page's needs-you card keeps its full controls — the
+free-text answer box, the rationale box, the fixed-choice buttons and **Other…**,
+the secret form and the `approve-spec` note — where the sidebar's inline block
+carries only the one-click actions. A `route: me`
 escalation is rendered from its `resolution` alone: `choice` (one button
 per label), `text` (the answer box), `approve-decline`, `secret` (the
 requester thread and bb's secure form) or `done`.
@@ -1440,7 +1449,7 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 - **Surfaces.** Every lesson is in one collapsed details block at the bottom
   of the Stewards page's project tab, with counts by tier and the rows behind
   the disclosure (no buttons of its own; the boundary Merge / Drop stays the
-  need in "Waiting on you"); `bb stewards list` names the pending ones,
+  need under **Blocked**); `bb stewards list` names the pending ones,
   `bb stewards lessons [--all]` lists them all with their counts, and
   `bb stewards lessons --efficacy` prints the escalation-to-user trend and the
   uncited guidance units; `bb stewards drop-lesson <id>` drops one.

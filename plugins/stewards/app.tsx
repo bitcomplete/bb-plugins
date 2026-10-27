@@ -1,10 +1,11 @@
 // Two surfaces. The Stewards page (a nav panel, one tab per stewarded
-// project): what waits on you, what is in flight by stage, what is stuck or
-// held, what ended lately, and the latest digest; the one write is closing a
-// question put to you. Settings → Plugins → Stewards: which projects are
-// stewarded and whether their configuration is healthy, then every open
-// steward and where it stands. Steering stays with the project steward and
-// the CLI.
+// project) is the expanded view of the sidebar (BB-78): the Blocked, In flight,
+// Monitors and Recently ended sections, every card headed by the shared BB-76
+// effort row, and the latest digest and lessons block; the one write is closing
+// a question put to you or pressing a needs item's button. Settings → Plugins →
+// Stewards: which projects are stewarded and whether their configuration is
+// healthy, then every open steward and where it stands. Steering stays with the
+// project steward and the CLI.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Markdown,
@@ -27,7 +28,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
-import { buildSidebar, effortTitle, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -260,6 +261,57 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
 
 const ACTOR_LABEL: Record<string, string> = { me: "you", steward: "the steward", other: "someone else" };
 
+/**
+ * The BB-76 effort row (BB-78): the glyph, the shortened key and the title on
+ * line one; the kind, the entity's phase and the status phrase on line two.
+ * Shared by the settings list and the Stewards page cards, so both show the row
+ * the sidebar shows. `extra` carries the badges a surface adds beside the
+ * title (priority, ending, escalations).
+ */
+function StewardHeader({ state, phrase, kind, phase, entityKey, url, title, extra }: {
+  state: SidebarEffortState;
+  phrase: string;
+  kind: string;
+  phase: string | null;
+  entityKey: string;
+  url: string | null;
+  title: string | null;
+  extra?: ReactNode;
+}) {
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2" title={entityKey}>
+        <StewardGlyph kind={state} />
+        <EntityLink entityKey={shortBindingKey(entityKey)} url={url} />
+        {title !== null ? <span className="min-w-0 flex-1 truncate text-muted-foreground">{title}</span> : null}
+        {extra}
+      </div>
+      <p data-steward-line-two="" className="text-[11px] text-muted-foreground">
+        {kindLabel(kind)}
+        {phase !== null ? ` · ${phase}` : ""}
+        {" · "}
+        <span className={phraseClass(state)}>{phrase}</span>
+      </p>
+    </>
+  );
+}
+
+/** The rules' inputs from a `stewardsOverview` steward, so its row derives the same state and phrase as the page and sidebar. */
+function overviewEffortStatus(s: Steward): EffortStatus {
+  return {
+    busy: false,
+    runningWorkers: s.workers,
+    needsUser: s.needsUser,
+    blockedOn: s.blockedOn,
+    hold: s.hold,
+    holdBehind: s.holdBehind,
+    stuck: s.stuck,
+    statusActor: s.actor,
+    statusNextAction: s.nextAction,
+    deployment: s.deployment,
+  };
+}
+
 function StewardsSection() {
   const { overview, error } = useOverview();
   if (overview === null) return <Loading error={error} />;
@@ -288,25 +340,28 @@ function StewardsSection() {
 }
 
 function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
-  const navigate = useBbNavigate();
   const mine = s.escalations.filter((x) => x.route === "me");
+  const status = overviewEffortStatus(s);
+  const state = effortState(status);
+  const phrase = effortPhrase(status);
   return (
     <li className="flex flex-col gap-1 p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        {s.url === null ? (
-          <span className="font-medium">{s.key}</span>
-        ) : (
-          <button type="button" className="font-medium underline-offset-2 hover:underline" onClick={() => navigate.openUrl(s.url!)}>
-            {s.key}
-          </button>
-        )}
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">{s.title}</span>
-        <Badge>{s.kind}</Badge>
-        {s.phase !== null ? <Badge>{s.phase}</Badge> : null}
-        {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
-        {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
-        {s.escalations.length > 0 ? <Badge tone={mine.length > 0 ? "bad" : "warn"}>{s.escalations.length === 1 ? "1 escalation" : `${s.escalations.length} escalations`}</Badge> : null}
-      </div>
+      <StewardHeader
+        state={state}
+        phrase={phrase}
+        kind={s.kind}
+        phase={s.phase}
+        entityKey={s.key}
+        url={s.url}
+        title={s.title}
+        extra={
+          <>
+            {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+            {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
+            {s.escalations.length > 0 ? <Badge tone={mine.length > 0 ? "bad" : "warn"}>{s.escalations.length === 1 ? "1 escalation" : `${s.escalations.length} escalations`}</Badge> : null}
+          </>
+        }
+      />
       {s.summary === null ? (
         <p className="text-muted-foreground">No status report yet.</p>
       ) : (
@@ -336,13 +391,6 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
 }
 
 // ---- The stewards page -------------------------------------------------------------------------
-
-/** The stage groups, in the playbook schema's order (from the server), then any other stage seen, then none. */
-function stageGroups(stages: string[], seen: Array<string | null>): Array<{ stage: string | null; title: string }> {
-  const order = [...stages, ...seen.filter((s): s is string => s !== null && !stages.includes(s))];
-  const groups: Array<{ stage: string | null; title: string }> = [...new Set(order)].map((stage) => ({ stage, title: stage.charAt(0).toUpperCase() + stage.slice(1) }));
-  return [...groups, { stage: null, title: "No stage" }];
-}
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
   return (
@@ -420,6 +468,74 @@ function BoardPage({ subPath }: { subPath: string }) {
   );
 }
 
+type BoardSteward = Board["stewards"][number];
+type BoardQuestion = Board["questions"][number];
+type BoardWithUser = Board["withUser"][number];
+type BoardNeed = Board["needs"][number];
+
+/** One needs-you item on the page, tagged so its card knows which write the controls make. */
+type NeedsYouItem =
+  | { type: "question"; question: BoardQuestion }
+  | { type: "withUser"; withUser: BoardWithUser }
+  | { type: "need"; need: BoardNeed };
+
+/** The binding key a needs-you item attaches to, or null for a project-level question. */
+function needsYouKey(item: NeedsYouItem): string | null {
+  if (item.type === "question") return item.question.key;
+  if (item.type === "withUser") return item.withUser.key;
+  return item.need.key;
+}
+
+/** A stable React key for a needs-you item. */
+function needsYouItemKey(item: NeedsYouItem): string {
+  if (item.type === "question") return `question:${item.question.id}`;
+  if (item.type === "withUser") return `withUser:${item.withUser.id}`;
+  return `need:${item.need.id}`;
+}
+
+/** The rules' inputs from a board steward, so the page and sidebar derive the same state and phrase (BB-78). */
+function boardEffortStatus(s: BoardSteward): EffortStatus {
+  return {
+    busy: false,
+    runningWorkers: s.workers.length,
+    needsUser: s.needsUser,
+    blockedOn: s.blockedOn,
+    hold: s.hold,
+    holdBehind: s.holdBehind,
+    stuck: s.stuck,
+    statusActor: s.actor,
+    statusNextAction: s.nextAction,
+    deployment: s.deployment,
+  };
+}
+
+/** A board steward with its derived row and the needs-you items that attach to it. */
+interface BoardEffort {
+  steward: BoardSteward;
+  state: SidebarEffortState;
+  section: SidebarSection;
+  phrase: string;
+  items: NeedsYouItem[];
+}
+
+/** The most recent thing the board knows about an effort, for the section ordering. */
+function boardRecency(e: BoardEffort): number {
+  return e.steward.advancedAt ?? e.steward.statusAt ?? e.steward.createdAt;
+}
+
+/** The ordering fields the shared comparators read; the page has no live thread, so `pinned` and `busy` are false. */
+function boardOrder(e: BoardEffort) {
+  return {
+    pinned: false,
+    state: e.state,
+    needsUser: e.steward.needsUser,
+    busy: false,
+    runningWorkers: e.steward.workers.length,
+    recency: boardRecency(e),
+    title: e.steward.title ?? e.steward.key,
+  };
+}
+
 function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void }) {
   const now = Date.now();
   // An escalation a need answers is shown as that need's row, not as the raw
@@ -427,7 +543,33 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
   // "approve or decline in its steward's thread".
   const covered = new Set(b.needs.map((n) => n.escalationId).filter((id): id is string => id !== null));
   const withUser = b.withUser.filter((x) => !covered.has(x.id));
-  const waiting = b.questions.length + withUser.length + b.needs.length;
+
+  // Needs-you items attach to their binding's card; an item with no open binding
+  // (a project-level question, or one whose binding has ended) keeps a card of
+  // its own at the top of Blocked (BB-78).
+  const openKeys = new Set(b.stewards.map((s) => s.key));
+  const itemsByKey = new Map<string, NeedsYouItem[]>();
+  const orphans: NeedsYouItem[] = [];
+  const allItems: NeedsYouItem[] = [
+    ...b.questions.map((q) => ({ type: "question" as const, question: q })),
+    ...withUser.map((x) => ({ type: "withUser" as const, withUser: x })),
+    ...b.needs.map((n) => ({ type: "need" as const, need: n })),
+  ];
+  for (const item of allItems) {
+    const key = needsYouKey(item);
+    if (key === null || !openKeys.has(key)) orphans.push(item);
+    else itemsByKey.set(key, [...(itemsByKey.get(key) ?? []), item]);
+  }
+
+  const efforts: BoardEffort[] = b.stewards.map((s) => {
+    const status = boardEffortStatus(s);
+    const state = effortState(status);
+    return { steward: s, state, section: effortSection({ state, kind: s.kind }), phrase: effortPhrase(status), items: itemsByKey.get(s.key) ?? [] };
+  });
+  const blocked = efforts.filter((e) => e.section === "blocked").sort((a, b) => compareBlocked(boardOrder(a), boardOrder(b)));
+  const inflight = efforts.filter((e) => e.section === "inflight").sort((a, b) => compareInflight(boardOrder(a), boardOrder(b)));
+  const monitors = efforts.filter((e) => e.section === "monitors").sort((a, b) => compareEfforts(boardOrder(a), boardOrder(b)));
+
   return (
     <>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -445,88 +587,40 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
         </p>
       ) : null}
 
-      <Section title="Waiting on you" count={waiting}>
-        {waiting === 0 ? (
-          <None>Nothing is waiting on you.</None>
+      <Section title="Blocked" count={orphans.length + blocked.length}>
+        {orphans.length === 0 && blocked.length === 0 ? (
+          <None>Nothing is blocked or waiting on you.</None>
         ) : (
           <List>
-            {b.questions.map((q) => (
-              <QuestionRow key={q.id} question={q} now={now} onClosed={refetch} />
+            {orphans.map((item) => (
+              <NeedsYouOrphanCard key={needsYouItemKey(item)} entry={item} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
             ))}
-            {withUser.map((x) => (
-              <li key={x.id} className="flex flex-col gap-1 p-3">
-                <p className="flex flex-wrap items-center gap-2">
-                  <EntityLink entityKey={x.key} url={x.url} />
-                  <Badge tone="bad">{x.kind === "approval" ? "approval request" : `${x.kind} escalation`}</Badge>
-                  <span className="text-xs text-muted-foreground">{ago(x.createdAt, now)}</span>
-                </p>
-                <p>{x.question}</p>
-                {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
-                <p className="text-xs text-muted-foreground">
-                  {x.kind === "approval" ? "Approve or decline in its steward's thread." : "The project steward has not said how to ask you this yet."}
-                  {x.kind === "approval" && x.threadId !== null ? (
-                    <>
-                      {" "}
-                      <ThreadLink threadId={x.threadId}>Open steward</ThreadLink>
-                    </>
-                  ) : null}
-                  {x.kind !== "approval" && b.projectStewardThreadId !== null ? (
-                    <>
-                      {" "}
-                      <ThreadLink threadId={b.projectStewardThreadId}>Open the project steward</ThreadLink>
-                    </>
-                  ) : null}
-                </p>
-              </li>
-            ))}
-            {b.needs.map((n) => (
-              <NeedRow key={n.id} need={n} now={now} onDone={refetch} />
+            {blocked.map((e) => (
+              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
             ))}
           </List>
         )}
       </Section>
 
-      <Section title="In flight" count={b.stewards.length}>
-        {b.stewards.length === 0 ? (
-          <None>No open stewards. Label a Linear ticket or pull request to adopt it.</None>
+      <Section title="In flight" count={inflight.length}>
+        {inflight.length === 0 ? (
+          <None>Nothing in flight.</None>
         ) : (
-          stageGroups(b.stages, b.stewards.map((s) => s.stage)).map(({ stage, title }) => {
-            const rows = b.stewards.filter((s) => (s.stage ?? null) === stage);
-            if (rows.length === 0) return null;
-            return (
-              <div key={title} className="flex flex-col gap-1">
-                <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  {title} · {rows.length}
-                </h3>
-                <List>
-                  {rows.map((s) => (
-                    <InFlightRow key={s.key} steward={s} now={now} />
-                  ))}
-                </List>
-              </div>
-            );
-          })
+          <List>
+            {inflight.map((e) => (
+              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
+            ))}
+          </List>
         )}
       </Section>
 
-      <Section title="Stuck or held" count={b.stuck.length}>
-        {b.stuck.length === 0 ? (
-          <None>Nothing is stuck or held.</None>
+      <Section title="Monitors" count={monitors.length}>
+        {monitors.length === 0 ? (
+          <None>No ops bindings.</None>
         ) : (
           <List>
-            {b.stuck.map((x, i) => (
-              <li key={`${x.key}-${i}`} className="flex flex-col gap-1 p-3">
-                <p className="flex flex-wrap items-center gap-2">
-                  <EntityLink entityKey={x.key} url={x.url} />
-                  {x.since !== null ? <span className="text-xs text-muted-foreground">{ago(x.since, now)}</span> : null}
-                </p>
-                <p className="text-amber-600 dark:text-amber-500">{x.why}</p>
-                {x.threadId !== null ? (
-                  <p className="text-xs text-muted-foreground">
-                    <ThreadLink threadId={x.threadId}>Open steward</ThreadLink>
-                  </p>
-                ) : null}
-              </li>
+            {monitors.map((e) => (
+              <StewardCard key={e.steward.key} effort={e} now={now} onChanged={refetch} projectStewardThreadId={b.projectStewardThreadId} />
             ))}
           </List>
         )}
@@ -610,11 +704,170 @@ function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; cou
 }
 
 /**
- * One "needs you" item with its buttons. A button is offered only when the
- * server can verify the item's preconditions now; otherwise the item says why
- * it is not actionable yet. Every action runs on the server, as the user.
+ * One Stewards page card (BB-78): the BB-76 effort row as its header, then its
+ * needs-you items (prompt, muted summary, the page's full controls) or its
+ * status report (summary, next action, meta line). The glyph and phrase come
+ * from the same `sidebar.ts` rules the sidebar uses.
  */
-function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: number; onDone: () => void }) {
+function StewardCard({ effort, now, onChanged, projectStewardThreadId }: { effort: BoardEffort; now: number; onChanged: () => void; projectStewardThreadId: string | null }) {
+  const s = effort.steward;
+  return (
+    <li className="flex flex-col gap-2 p-3">
+      <StewardHeader
+        state={effort.state}
+        phrase={effort.phrase}
+        kind={s.kind}
+        phase={s.phase}
+        entityKey={s.key}
+        url={s.url}
+        title={s.title}
+        extra={
+          <>
+            {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
+            {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
+          </>
+        }
+      />
+      {effort.items.length > 0 ? (
+        effort.items.map((item, i) => (
+          <div key={needsYouItemKey(item)} className="flex flex-col gap-2">
+            <NeedsYouPrompt entry={item} now={now} />
+            {i === 0 ? <p className="text-muted-foreground">{s.summary ?? "No status report yet."}</p> : null}
+            <NeedsYouControls entry={item} onChanged={onChanged} projectStewardThreadId={projectStewardThreadId} />
+          </div>
+        ))
+      ) : (
+        <>
+          {s.summary === null ? (
+            <p className="text-muted-foreground">No status report yet.</p>
+          ) : (
+            <p>
+              {s.summary}{" "}
+              <span className="text-muted-foreground">
+                Next: {s.nextAction ?? "—"}
+                {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
+              </span>
+            </p>
+          )}
+          {s.hold !== null ? <p className="text-amber-600 dark:text-amber-500">On hold: {s.hold}</p> : null}
+          <p className="text-xs text-muted-foreground">
+            {s.kind === "ops" ? `Last wake ${ago(s.wokeAt, now)}` : `Reported ${ago(s.statusAt, now)} · adopted ${ago(s.createdAt, now)}`}
+            {s.deployment !== null ? ` · ${deploymentPhrase(s.deployment)}` : ""}
+            {s.threadId !== null ? (
+              <>
+                {" · "}
+                <ThreadLink threadId={s.threadId}>Open steward</ThreadLink>
+              </>
+            ) : null}
+            {s.workers.map((w) => (
+              <span key={w.threadId}>
+                {" · worker "}
+                <ThreadLink threadId={w.threadId}>{w.title}</ThreadLink>
+              </span>
+            ))}
+          </p>
+        </>
+      )}
+    </li>
+  );
+}
+
+/**
+ * A needs-you item with no open binding (a project-level question, or one whose
+ * binding has ended): its own card at the top of Blocked (BB-78).
+ */
+function NeedsYouOrphanCard({ entry, now, onChanged, projectStewardThreadId }: { entry: NeedsYouItem; now: number; onChanged: () => void; projectStewardThreadId: string | null }) {
+  const key = needsYouKey(entry);
+  const url = entry.type === "question" ? entry.question.url : entry.type === "withUser" ? entry.withUser.url : (entry.need.entityUrl ?? entry.need.url);
+  return (
+    <li className="flex flex-col gap-2 p-3">
+      {key !== null ? <EntityLink entityKey={key} url={url} /> : null}
+      <NeedsYouPrompt entry={entry} now={now} />
+      <NeedsYouControls entry={entry} onChanged={onChanged} projectStewardThreadId={projectStewardThreadId} />
+    </li>
+  );
+}
+
+/** The prompt half of one needs-you item: what it asks, and why it is not actionable yet. */
+function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
+  if (entry.type === "question") {
+    const q = entry.question;
+    return (
+      <>
+        <p className="flex flex-wrap items-center gap-2">
+          <Badge tone="bad">{q.escalationId === null ? "question" : "forwarded escalation"}</Badge>
+          <span className="text-xs text-muted-foreground">asked {ago(q.createdAt, now)}</span>
+        </p>
+        <p>{q.question}</p>
+        {q.context !== null ? <p className="text-muted-foreground">{q.context}</p> : null}
+      </>
+    );
+  }
+  if (entry.type === "withUser") {
+    const x = entry.withUser;
+    return (
+      <>
+        <p className="flex flex-wrap items-center gap-2">
+          <Badge tone="bad">{x.kind === "approval" ? "approval request" : `${x.kind} escalation`}</Badge>
+          <span className="text-xs text-muted-foreground">asked {ago(x.createdAt, now)}</span>
+        </p>
+        <p>{x.question}</p>
+        {x.recommendation !== null ? <p className="text-muted-foreground">Recommendation: {x.recommendation}</p> : null}
+      </>
+    );
+  }
+  const n = entry.need;
+  return (
+    <>
+      <p className="flex flex-wrap items-center gap-2">
+        <Badge tone="bad">{n.kind}</Badge>
+        <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
+      </p>
+      <p>{n.what}</p>
+      {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
+      {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
+      {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+    </>
+  );
+}
+
+/** The controls half of one needs-you item, chosen by its type; each makes the same RPC call the page always did. */
+function NeedsYouControls({ entry, onChanged, projectStewardThreadId }: { entry: NeedsYouItem; onChanged: () => void; projectStewardThreadId: string | null }) {
+  if (entry.type === "question") return <QuestionControls question={entry.question} onClosed={onChanged} />;
+  if (entry.type === "withUser") return <WithUserControls withUser={entry.withUser} projectStewardThreadId={projectStewardThreadId} />;
+  return <NeedControls need={entry.need} onDone={onChanged} />;
+}
+
+/**
+ * A with-user escalation's controls: a forwarded approval is answered in its
+ * steward's thread, anything else waits on the project steward.
+ */
+function WithUserControls({ withUser: x, projectStewardThreadId }: { withUser: BoardWithUser; projectStewardThreadId: string | null }) {
+  return (
+    <p className="text-xs text-muted-foreground">
+      {x.kind === "approval" ? "Approve or decline in its steward's thread." : "The project steward has not said how to ask you this yet."}
+      {x.kind === "approval" && x.threadId !== null ? (
+        <>
+          {" "}
+          <ThreadLink threadId={x.threadId}>Open steward</ThreadLink>
+        </>
+      ) : null}
+      {x.kind !== "approval" && projectStewardThreadId !== null ? (
+        <>
+          {" "}
+          <ThreadLink threadId={projectStewardThreadId}>Open the project steward</ThreadLink>
+        </>
+      ) : null}
+    </p>
+  );
+}
+
+/**
+ * A need's buttons. A button is offered only when the server can verify the
+ * item's preconditions now; otherwise the item says why it is not actionable
+ * yet. Every action runs on the server, as the user.
+ */
+function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [note, setNote] = useState("");
@@ -646,16 +899,7 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
   // item's `url` is the pull request, so it gets its own link.
   const prUrl = n.kind === "approve-pr" || n.kind === "merge" ? n.url : null;
   return (
-    <li className="flex flex-col gap-2 p-3">
-      <p className="flex flex-wrap items-center gap-2">
-        <EntityLink entityKey={n.key} url={n.entityUrl ?? n.url} />
-        <Badge tone="bad">{n.kind}</Badge>
-        <span className="text-xs text-muted-foreground">asked {ago(n.createdAt, now)}</span>
-      </p>
-      <p>{n.what}</p>
-      {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
-      {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
-      {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+    <>
       {takesNote && !lesson ? (
         <textarea
           value={note}
@@ -723,11 +967,12 @@ function NeedRow({ need: n, now, onDone }: { need: Board["needs"][number]; now: 
         ) : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
       </div>
-    </li>
+    </>
   );
 }
 
-function QuestionRow({ question: q, now, onClosed }: { question: Board["questions"][number]; now: number; onClosed: () => void }) {
+/** A question's page controls (BB-78): the optional rationale box, the free-text answer, fixed choices and Other…. */
+function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; onClosed: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [answer, setAnswer] = useState("");
   // BB-35 step 4: the rationale box appears only when the plugin set
@@ -757,14 +1002,7 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
   };
   const button = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   return (
-    <li className="flex flex-col gap-2 p-3">
-      <p className="flex flex-wrap items-center gap-2">
-        {q.key !== null ? <EntityLink entityKey={q.key} url={q.url} /> : null}
-        <Badge tone="bad">{q.escalationId === null ? "question" : "forwarded escalation"}</Badge>
-        <span className="text-xs text-muted-foreground">asked {ago(q.createdAt, now)}</span>
-      </p>
-      <p>{q.question}</p>
-      {q.context !== null ? <p className="text-muted-foreground">{q.context}</p> : null}
+    <>
       {q.rationaleWanted !== null ? (
         <textarea
           value={rationale}
@@ -802,49 +1040,7 @@ function QuestionRow({ question: q, now, onClosed }: { question: Board["question
         )}
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
-    </li>
-  );
-}
-
-function InFlightRow({ steward: s, now }: { steward: Board["stewards"][number]; now: number }) {
-  return (
-    <li className="flex flex-col gap-1 p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <EntityLink entityKey={s.key} url={s.url} />
-        <span className="min-w-0 flex-1 truncate text-muted-foreground">{s.title}</span>
-        <Badge>{s.kind}</Badge>
-        {s.phase !== null ? <Badge>{s.phase}</Badge> : null}
-        {s.priority !== null && s.priority !== "normal" ? <Badge tone={s.priority === "urgent" ? "bad" : "muted"}>{s.priority}</Badge> : null}
-        {s.ending !== null ? <Badge tone="warn">{s.ending === "detach" ? "detaching" : "wrapping up"}</Badge> : null}
-      </div>
-      {s.summary === null ? (
-        <p className="text-muted-foreground">No status report yet.</p>
-      ) : (
-        <p>
-          {s.summary}{" "}
-          <span className="text-muted-foreground">
-            Next: {s.nextAction}
-            {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
-          </span>
-        </p>
-      )}
-      {s.blockedOn !== null ? <p className="text-muted-foreground">Blocked on {s.blockedOn}</p> : null}
-      <p className="text-xs text-muted-foreground">
-        Moved {ago(s.advancedAt, now)}
-        {s.threadId !== null ? (
-          <>
-            {" · "}
-            <ThreadLink threadId={s.threadId}>Open steward</ThreadLink>
-          </>
-        ) : null}
-        {s.workers.map((w) => (
-          <span key={w.threadId}>
-            {" · worker "}
-            <ThreadLink threadId={w.threadId}>{w.title}</ThreadLink>
-          </span>
-        ))}
-      </p>
-    </li>
+    </>
   );
 }
 

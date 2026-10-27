@@ -2653,7 +2653,23 @@ describe("questions to the user", () => {
       questions: Array<{ id: string; question: string; key: string | null; escalationId: string | null }>;
       withUser: Array<{ id: string; kind: string }>;
       needs: Array<{ id: string; kind: string; escalationId: string | null }>;
-      stewards: Array<{ key: string; stage: string | null; summary: string | null; nextAction: string | null; actor: string | null; workers: Array<{ threadId: string; title: string }> }>;
+      stewards: Array<{
+        key: string;
+        stage: string | null;
+        phase: string | null;
+        summary: string | null;
+        nextAction: string | null;
+        actor: string | null;
+        hold: string | null;
+        holdBehind: string[];
+        needsUser: boolean;
+        stuck: boolean;
+        deployment: string | null;
+        statusAt: number | null;
+        createdAt: number;
+        wokeAt: number | null;
+        workers: Array<{ threadId: string; title: string }>;
+      }>;
       stuck: Array<{ key: string; why: string }>;
       ended: Array<{ key: string; endReason: string | null }>;
     } | null;
@@ -3164,6 +3180,37 @@ describe("questions to the user", () => {
     expect(b.stuck).toEqual([expect.objectContaining({ key: "ENG-12", why: "On hold: billing freeze" })]);
     expect(b.digest).toMatchObject({ text: "Morning: ENG-12 is held." });
     expect(((await t.harness.callRpc("stewardsBoard", { projectId: "nope" })) as Board).board).toBeNull();
+  });
+
+  it("carries needsUser, holdBehind, stuck, deployment, statusAt and wokeAt for the page's cards (BB-78)", async () => {
+    const t = await adopted();
+    const b = t.hooks.store.find("ENG-12")!;
+    const at = t.now();
+    t.hooks.store.patch(b.id, {
+      phase: "In Review",
+      hold: "a freeze",
+      holdBehind: ["ENG-9"],
+      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
+      deployments: {
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+      },
+      wokeAt: at,
+    });
+    // An open `stuck` escalation is a block, and needs the user to clear it.
+    t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
+
+    const board = await t.board();
+    expect(board.stewards.find((s) => s.key === "ENG-12")).toMatchObject({
+      phase: "In Review",
+      hold: "a freeze",
+      holdBehind: ["ENG-9"],
+      needsUser: true,
+      stuck: true,
+      actor: "other",
+      nextAction: "the vendor",
+      deployment: "deployed",
+      wokeAt: at,
+    });
   });
 
   it("the nightly wake carries the previous digest and the record since it", async () => {
@@ -4471,7 +4518,7 @@ describe("forwarded spec approvals", () => {
 });
 
 describe("the settings page", () => {
-  type Overview = { paused: boolean; projects: Array<{ name: string; configured: boolean; repos: string[]; playbooks: Array<{ kind: string; version: string | null }>; problems: string[]; projectStewardThreadId: string | null; stewards: Array<{ key: string; summary: string | null; actor: string | null; escalations: Array<{ route: string; question: string }> }> }> };
+  type Overview = { paused: boolean; projects: Array<{ name: string; configured: boolean; repos: string[]; playbooks: Array<{ kind: string; version: string | null }>; problems: string[]; projectStewardThreadId: string | null; stewards: Array<{ key: string; summary: string | null; actor: string | null; hold: string | null; holdBehind: string[]; needsUser: boolean; stuck: boolean; deployment: string | null; workers: number; escalations: Array<{ route: string; question: string }> }> }> };
 
   it("shows each stewarded project's configuration and its open stewards with their status", async () => {
     const t = await setup();
@@ -4487,6 +4534,25 @@ describe("the settings page", () => {
     const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
     expect(overview.paused).toBe(false);
     expect(overview.projects[0]).toMatchObject({ projectStewardThreadId: project, stewards: [{ key: "ENG-12", summary: "Spec drafted.", actor: "other", escalations: [{ route: "project", question: "Include SSO?" }] }] });
+  });
+
+  it("carries stuck, holdBehind, deployment and needsUser per steward for the shared row (BB-78)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12")!;
+    const at = t.now();
+    t.hooks.store.patch(b.id, {
+      hold: "a freeze",
+      holdBehind: ["ENG-9"],
+      deployments: {
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+      },
+    });
+    t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
+    expect(overview.projects[0]!.stewards[0]).toMatchObject({ key: "ENG-12", hold: "a freeze", holdBehind: ["ENG-9"], needsUser: true, stuck: true, deployment: "deployed" });
   });
 
   it("reports a broken playbook as a problem and the check runs from the page", async () => {
