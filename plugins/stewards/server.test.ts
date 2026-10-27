@@ -7048,3 +7048,114 @@ describe("deployment watching (BB-53)", () => {
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
   });
 });
+
+// BB-83: a binding in a build or review stage with nothing left to wait on is
+// woken after a short grace, once per idle period. A worker finish that leaves
+// nothing to wait on is loud at once; a finish that leaves an open own pull
+// request stays quiet, as does a finish whose message says it is waiting.
+describe("a steward idle in an active stage (BB-83)", () => {
+  const idleLine = /Nothing is running and nothing is being waited on/u;
+
+  it("wakes at a worker finish that leaves nothing to wait on", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const before = t.sends.length;
+    await t.idle("thr_w1", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+    expect(t.sends.at(-1)!.text).toMatch(/Worker "ENG-12: Implement" finished its turn/u);
+  });
+
+  it("stays quiet at a worker finish that leaves its own pull request open", async () => {
+    const t = await setup();
+    const linked = { linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] };
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started", ...linked }));
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const before = t.sends.length;
+    // The message says merged, but the snapshot still shows the pull request
+    // open: there is something to wait on, so the finish is quiet.
+    await t.idle("thr_w1", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before);
+    expect(t.hooks.store.open("p1")[0]!.pending).toMatchObject([{ text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true }]);
+  });
+
+  it("wakes once after the grace, and not again after the steward reports", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    // A waiting finish is quiet now; the idle rule catches it after the grace.
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+
+    // Inside the grace: nobody is woken.
+    t.advance(10 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before);
+
+    // Past the grace: one idle wake.
+    t.advance(6 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+
+    // The steward reports and asks for a long requeue; two later ticks past
+    // the grace do not wake it again in the same idle period.
+    await t.tool("steward_report", { phase: "In Progress", summary: "Waiting on the reviewer.", nextAction: "Wait", actor: "other", requeueAfter: "2d" }, steward);
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+  });
+
+  it("wakes from the requeue tick for a binding idle past the grace", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+    t.advance(16 * 60_000);
+    // The requeue tick only looks at bindings whose requeue has come, so make
+    // it due: the same predicate is evaluated on that path too.
+    t.hooks.store.patch(t.hooks.store.find("ENG-12")!.id, { requeueAt: t.now() });
+    await t.hooks.requeueTick();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+  });
+
+  it("starts a new idle period when the steward starts a worker that finishes", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the reviewer.");
+    const before = t.sends.length;
+    t.advance(16 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.sends).toHaveLength(before + 1);
+
+    // A new worker runs and finishes leaving nothing to wait on: a new period.
+    await t.created("thr_w2", steward, "ENG-12: Implement");
+    await t.idle("thr_w2", "Merged acme/web#7.");
+    expect(t.sends).toHaveLength(before + 2);
+    expect(t.sends.at(-1)!.text).toMatch(idleLine);
+  });
+});

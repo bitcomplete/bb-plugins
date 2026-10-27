@@ -665,6 +665,68 @@ export function unheardWait(status: Binding["status"], open: readonly Escalation
   return null;
 }
 
+// ---- idle in an active stage (BB-83) --------------------------------------------
+
+/**
+ * The binding facts the idle rule reads beyond the snapshot: its workers, the
+ * pull requests its own workers opened (BB-52 rule 0), and what waits on the
+ * user. `server.ts` assembles these from the store; nothing here reads one.
+ */
+export type IdleBinding = Pick<Binding, "stage" | "ending" | "hold" | "deployments"> & {
+  workers: readonly Pick<Worker, "status">[];
+  ownPulls: ReadonlySet<string>;
+  escalations: readonly Pick<Escalation, "status" | "route">[];
+  needs: readonly unknown[];
+};
+
+/** The wake text for a binding idle in an active stage (BB-83). */
+export const IDLE_WAKE_TEXT =
+  "Nothing is running and nothing is being waited on: no worker, no open pull request, no pending deployment. Close the ticket, start the next slice, or report what remains and who does it.";
+
+/** A pull request the plugin can see is not yet merged or closed. */
+const pullOpen = (e: EntitySnapshot): boolean => e.pull !== null && e.state !== "merged" && e.state !== "closed";
+
+/**
+ * Whether a binding in an active stage has nothing left to wait on (BB-83):
+ * its playbook stage is `build` or `review`, it is not ending or held, no
+ * worker is running, no own pull request (BB-52 rule 0) is open, no deployment
+ * watch is merged or deploying, and no escalation or need waits on the user.
+ * It says nothing about the grace or the once-per-idle-period guard; the
+ * server measures those.
+ */
+export function idleInActiveStage(b: IdleBinding, observed: Observed): boolean {
+  if (b.stage !== "build" && b.stage !== "review") return false;
+  if (b.ending !== null || b.hold !== null) return false;
+  if (b.workers.some((w) => w.status === "running")) return false;
+  if ([observed.entity, ...observed.pulls].some((e) => pullOpen(e) && ownPull(e.key, e.url, b.ownPulls))) return false;
+  if (Object.values(b.deployments).some((w) => w.state === "merged" || w.state === "deploying")) return false;
+  if (b.escalations.some((x) => x.status === "open" && x.route === "me")) return false;
+  if (b.needs.length > 0) return false;
+  return true;
+}
+
+/**
+ * Whether an own pull request closed between two observations. A close starts
+ * a new idle period, so a steward woken for the previous one is looked at
+ * again rather than the close reading as the same period's news.
+ */
+export function ownPullClosed(before: Observed, after: Observed, ownPulls: ReadonlySet<string>): boolean {
+  const wasOpen = new Map<string, boolean>();
+  for (const e of [before.entity, ...before.pulls]) {
+    if (e.pull === null) continue;
+    if (e.key !== "") wasOpen.set(e.key.toLowerCase(), pullOpen(e));
+    if (e.url !== null && e.url !== "") wasOpen.set(e.url.toLowerCase(), pullOpen(e));
+  }
+  for (const e of [after.entity, ...after.pulls]) {
+    if (e.pull === null || pullOpen(e)) continue;
+    const own = (e.key !== "" && ownPulls.has(e.key.toLowerCase())) || (e.url !== null && e.url !== "" && ownPulls.has(e.url.toLowerCase()));
+    if (!own) continue;
+    const was = (e.key !== "" ? wasOpen.get(e.key.toLowerCase()) : undefined) ?? (e.url !== null && e.url !== "" ? wasOpen.get(e.url.toLowerCase()) : undefined);
+    if (was === true) return true;
+  }
+  return false;
+}
+
 // ---- lifecycle -----------------------------------------------------------------------
 
 export type Lifecycle =

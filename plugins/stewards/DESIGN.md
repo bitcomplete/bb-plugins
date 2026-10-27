@@ -362,6 +362,25 @@ Plugin code. No model turn.
    terminal state the steward's own last report already named ends the
    binding from the mechanical tier, with the wrap-up written from that
    report and no wrap-up wake; a terminal state someone else set still wakes.
+   Rule 3 has a missing premise, and BB-83 adds it: a quiet finish assumes a
+   louder event follows — a merge doorbell, a deployment, a terminal state.
+   When none exists the binding sits with nothing able to wake it, so the
+   plugin supplies the clock. A binding whose playbook stage is `build` or
+   `review`, which is not ending or held, with no worker running, no own pull
+   request open, no deployment watch `merged` or `deploying`, and no
+   escalation or need waiting on the user, is idle in an active stage. The
+   reconcile, the requeue tick and the sweep all evaluate that predicate; once
+   it has held for the playbook's `idle-grace` (15m by default), the steward is
+   woken with "Nothing is running and nothing is being waited on…" and the
+   idle clock restarts from that wake. A worker finish that leaves such a
+   binding is loud at once, without the grace, because the worker's final
+   message is what the steward must read; a finish that leaves an open pull
+   request, a pending deployment or a message that says it is waiting stays
+   quiet as before. The wake fires once per idle period, not once per grace: a
+   worker ending, an own pull request closing or a deployment watch changing
+   starts a new period, and a steward that waits on something the plugin
+   cannot observe is not woken every fifteen minutes. `idleInActiveStage` in
+   `reconcile.ts` is the whole rule.
 4. Otherwise the snapshot is recorded and the ring ends. Most rings end here:
    the steward's own comments, label churn, its workers at work. What
    changed is kept as a quiet note and shown with the next turn something
@@ -1511,8 +1530,11 @@ project steward footer row is the grey ring.
 else `on hold`; `stuck` for an open stuck escalation; `N worker(s) running`
 counting only workers whose worker-table status is `running` (a busy steward or
 reviewer with no running worker falls through, rather than reading `0 workers
-running`); `waiting on <nextAction>` when the status actor is `other` (an
-external wait is not a block, so its colour follows the glyph); the newest
+running`); `worker finished, next look <time>` when the binding has a pending
+quiet worker-finish note and no running worker (BB-83 — the status summary a
+finished worker left behind must not keep the row, and the time is the
+binding's `requeueAt`); `waiting on <nextAction>` when the status actor is
+`other` (an external wait is not a block, so its colour follows the glyph); the newest
 deployment watch's state (`deploying`, `deployed`, `deploy failed`); the status
 `nextAction`; otherwise `no report yet`. The phrase's colour follows the
 glyph's. `sidebar.ts` derives `state`, `section`

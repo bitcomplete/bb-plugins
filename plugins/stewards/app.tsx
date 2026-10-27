@@ -309,6 +309,8 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     deployment: s.deployment,
+    pending: s.pending,
+    requeueAt: s.requeueAt,
   };
 }
 
@@ -343,7 +345,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
   const mine = s.escalations.filter((x) => x.route === "me");
   const status = overviewEffortStatus(s);
   const state = effortState(status);
-  const phrase = effortPhrase(status);
+  const phrase = effortPhrase(status, now);
   return (
     <li className="flex flex-col gap-1 p-3">
       <StewardHeader
@@ -506,6 +508,8 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     statusActor: s.actor,
     statusNextAction: s.nextAction,
     deployment: s.deployment,
+    pending: s.pending,
+    requeueAt: s.requeueAt,
   };
 }
 
@@ -564,7 +568,7 @@ function ProjectBoard({ board: b, refetch }: { board: Board; refetch: () => void
   const efforts: BoardEffort[] = b.stewards.map((s) => {
     const status = boardEffortStatus(s);
     const state = effortState(status);
-    return { steward: s, state, section: effortSection({ state, kind: s.kind }), phrase: effortPhrase(status), items: itemsByKey.get(s.key) ?? [] };
+    return { steward: s, state, section: effortSection({ state, kind: s.kind }), phrase: effortPhrase(status, now), items: itemsByKey.get(s.key) ?? [] };
   });
   const blocked = efforts.filter((e) => e.section === "blocked").sort((a, b) => compareBlocked(boardOrder(a), boardOrder(b)));
   const inflight = efforts.filter((e) => e.section === "inflight").sort((a, b) => compareInflight(boardOrder(a), boardOrder(b)));
@@ -1431,7 +1435,7 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
   const navigate = useBbNavigate();
   const { status, threads, projects } = experimental_useSidebarThreads();
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
-  const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [] }), [projects, threads, data]);
+  const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }), [projects, threads, data]);
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
   // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
   const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, t.blocked.filter((e) => e.state === "you").length] as const)), [tabs]);

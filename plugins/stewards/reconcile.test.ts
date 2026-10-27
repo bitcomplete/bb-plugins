@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal } from "./reconcile.js";
+import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownPullClosed, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -543,5 +543,57 @@ describe("a correction from a comment", () => {
     expect(answerDiffers("Do it.", "")).toBe(false);
     expect(answerDiffers("  do   it. ", "Do it.")).toBe(false);
     expect(answerDiffers("Don't do it.", "Do it.")).toBe(true);
+  });
+});
+
+// BB-83: a binding in a build or review stage with nothing left to wait on is
+// idle. The predicate is the whole mechanical rule; the server measures the
+// grace and keeps it to one wake per idle period.
+describe("idle in an active stage (BB-83)", () => {
+  const own = new Set(["acme/web#7", "https://github.com/acme/web/pull/7"]);
+  const binding = (over: Partial<IdleBinding> = {}): IdleBinding => ({
+    stage: "review",
+    ending: null,
+    hold: null,
+    deployments: {},
+    workers: [{ status: "finished" }],
+    ownPulls: own,
+    escalations: [],
+    needs: [],
+    ...over,
+  });
+  const merged = { entity: issue({ state: "In Review" }), pulls: [pull({ state: "merged" })] };
+
+  it("is true with nothing left to wait on", () => {
+    expect(idleInActiveStage(binding(), merged)).toBe(true);
+    // No worker at all, a build stage, and an open pull request that is not
+    // the worker's own are each still idle.
+    expect(idleInActiveStage(binding({ workers: [], stage: "build" }), merged)).toBe(true);
+    expect(idleInActiveStage(binding(), { entity: issue({ state: "In Review" }), pulls: [pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "open" })] })).toBe(true);
+    // A wait on the project steward is not a wait on the user.
+    expect(idleInActiveStage(binding({ escalations: [{ status: "open", route: "project" }] }), merged)).toBe(true);
+  });
+
+  it("is false when any of the waits is present", () => {
+    expect(idleInActiveStage(binding({ workers: [{ status: "running" }] }), merged)).toBe(false);
+    expect(idleInActiveStage(binding(), { entity: issue({ state: "In Review" }), pulls: [pull({ state: "open" })] })).toBe(false);
+    expect(idleInActiveStage(binding({ deployments: { "acme/web#7": { state: "merged" } as never } }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ deployments: { "acme/web#7": { state: "deploying" } as never } }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ hold: "a freeze" }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ ending: "terminal" }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ escalations: [{ status: "open", route: "me" }] }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ needs: [{ kind: "approve-pr" }] }), merged)).toBe(false);
+    // The spec stage is not active, and a deployment that is already deployed
+    // is nothing to wait on.
+    expect(idleInActiveStage(binding({ stage: "spec" }), merged)).toBe(false);
+    expect(idleInActiveStage(binding({ deployments: { "acme/web#7": { state: "deployed" } as never } }), merged)).toBe(true);
+  });
+
+  it("starts a new idle period when an own pull request closes", () => {
+    const before = { entity: issue({ state: "In Review" }), pulls: [pull({ state: "open" })] };
+    expect(ownPullClosed(before, merged, own)).toBe(true);
+    expect(ownPullClosed(merged, merged, own)).toBe(false);
+    // A foreign pull request closing is not the binding's own event.
+    expect(ownPullClosed(before, { entity: issue({ state: "In Review" }), pulls: [pull({ key: "acme/web#9", url: "https://github.com/acme/web/pull/9", state: "merged" })] }, own)).toBe(false);
   });
 });

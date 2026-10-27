@@ -74,6 +74,8 @@ const binding = (over: Record<string, unknown> = {}) => ({
   stuck: false,
   status: null,
   deployment: null,
+  pending: [],
+  requeueAt: null,
   advancedAt: null,
   workers: [],
   reviewers: [],
@@ -537,6 +539,28 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(lineTwo(slot, "Fix login")).toBe("ticket · wait for CI");
+    expect(glyphOf(slot, "Fix login")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a quiet worker finish and the next look over a stale summary (BB-83)", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({
+                status: { actor: "steward", nextAction: "the worker has started", at: 1 },
+                pending: [{ text: 'Worker "ENG-1: Implement" finished its turn.', quiet: true }],
+                requeueAt: Date.now() + 12 * 60_000,
+              }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · worker finished, next look 12m");
     expect(glyphOf(slot, "Fix login")).toBe("quiet");
     slot.lifecycle.unmount();
   });

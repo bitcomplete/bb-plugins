@@ -25,6 +25,8 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   stuck: false,
   status: null,
   deployment: null,
+  pending: [],
+  requeueAt: null,
   advancedAt: null,
   workers: [],
   reviewers: [],
@@ -55,6 +57,8 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   statusNextAction: null,
   statusAt: null,
   deployment: null,
+  pending: [],
+  requeueAt: null,
   runningWorkers: 0,
   pinned: false,
   busy: false,
@@ -360,6 +364,23 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(effortPhrase(effort({ key: "l", statusNextAction: "wait for the review" }))).toBe("wait for the review");
     // 9. no report
     expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
+  });
+
+  it("shows a quiet worker finish over a stale summary, before the external wait (BB-83)", () => {
+    const now = Date.parse("2026-10-14T15:00:00Z");
+    const finish = { text: 'Worker "ENG-12: Implement" finished its turn.', quiet: true };
+    // A quiet worker-finish note wins over the status summary the finish made
+    // stale, and carries the next look.
+    expect(effortPhrase(effort({ key: "a", statusNextAction: "the worker has started", pending: [finish], requeueAt: now + 12 * 60_000 }), now)).toBe("worker finished, next look 12m");
+    // A running worker still reads the count.
+    expect(effortPhrase(effort({ key: "b", runningWorkers: 1, pending: [finish], requeueAt: now + 12 * 60_000 }), now)).toBe("1 worker running");
+    // With no requeue time there is no next look to name.
+    expect(effortPhrase(effort({ key: "c", pending: [finish] }), now)).toBe("worker finished");
+    // A loud note, or a quiet note that is not a worker finish, is not it.
+    expect(effortPhrase(effort({ key: "d", statusNextAction: "wait for CI", pending: [{ ...finish, quiet: false }], requeueAt: now + 12 * 60_000 }), now)).toBe("wait for CI");
+    expect(effortPhrase(effort({ key: "e", statusNextAction: "wait for CI", pending: [{ text: "Deploy failed.", quiet: true }], requeueAt: now + 12 * 60_000 }), now)).toBe("wait for CI");
+    // It sits before the external wait, so a finished worker wins over it too.
+    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM", pending: [finish], requeueAt: now + 12 * 60_000 }), now)).toBe("worker finished, next look 12m");
   });
 
   it("phrases a deployment watch's state", () => {

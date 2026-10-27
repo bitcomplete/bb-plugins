@@ -56,7 +56,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -347,6 +347,10 @@ export const rpcContract = defineRpcContract({
               stuck: z.boolean(),
               /** The newest deployment watch's state, or null with none (BB-78). */
               deployment: z.enum(DEPLOY_STATES).nullable(),
+              /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+              pending: z.array(z.object({ text: z.string(), quiet: z.boolean().optional() })),
+              /** When the binding is next due a look, for `next look <time>` (BB-83). */
+              requeueAt: z.number().nullable(),
               ending: z.string().nullable(),
               statusAt: z.number().nullable(),
               createdAt: z.number(),
@@ -434,6 +438,10 @@ export const rpcContract = defineRpcContract({
               stuck: z.boolean(),
               /** The newest deployment watch's state, or null with none (BB-78). */
               deployment: z.enum(DEPLOY_STATES).nullable(),
+              /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+              pending: z.array(z.object({ text: z.string(), quiet: z.boolean().optional() })),
+              /** When the binding is next due a look, for `next look <time>` (BB-83). */
+              requeueAt: z.number().nullable(),
               ending: z.string().nullable(),
               /** The last status report's timestamp, for the card's `Reported` line; null with no report. */
               statusAt: z.number().nullable(),
@@ -490,6 +498,10 @@ export const rpcContract = defineRpcContract({
               status: z.object({ actor: z.string(), nextAction: z.string(), at: z.number() }).nullable(),
               /** The newest deployment watch's state, or null with none (BB-76). */
               deployment: z.enum(DEPLOY_STATES).nullable(),
+              /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+              pending: z.array(z.object({ text: z.string(), quiet: z.boolean().optional() })),
+              /** When the binding is next due a look, for `next look <time>` (BB-83). */
+              requeueAt: z.number().nullable(),
               advancedAt: z.number().nullable(),
               /** Every worker, running or not, with the plugin's own status so the row counts running ones. */
               workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string() })),
@@ -1130,7 +1142,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * URLs (BB-52 rule 0): its head branch is one of the binding's worker
      * threads' branches, or a worker named the URL in its final message. A
      * pull request the plugin cannot tie to the worker is left out, so it is
-     * treated as foreign and keeps its activity actionable.
+     * treated as foreign and keeps its activity actionable. Every worker of
+     * the binding counts, archived ones included: the branch is cached from
+     * when it was read, and a binding whose worker finished but whose pull
+     * request is still open must not read as idle (BB-83).
      */
     async function ownPullKeys(b: Binding, workers: readonly Worker[], observed: Observed): Promise<Set<string>> {
       /** Whether a worker's message names a key or URL, without matching a longer number's prefix. */
@@ -1140,7 +1155,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       const branches = new Set<string>();
       for (const w of workers) {
-        if (!workerInFlight(w)) continue;
         const branch = await threadBranch(w.threadId);
         if (branch !== null) branches.add(branch);
       }
@@ -1941,6 +1955,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // steward with the playbook's rule.
       const deployTarget = playbook.deployment;
       const deploymentChanges: Change[] = [];
+      const deploymentsBefore = b.deployments;
       let deployments = b.deployments;
       if (deployTarget !== null) {
         const beforeDeploy = deployments;
@@ -2024,13 +2039,52 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const workers = store.workers(b.id);
       const workerInFlight = anyWorkerInFlight(workers);
-      // Rule 0: which linked pull requests are the worker's own. Only read the
-      // branches and reported URLs when a worker is in flight; otherwise the
-      // set is empty and every pull request is foreign.
-      const ownPulls = workerInFlight ? await ownPullKeys(b, workers, observed) : new Set<string>();
+      // Rule 0: which linked pull requests are the worker's own. Read the
+      // branches and reported URLs whether or not a worker is in flight: the
+      // diff only quiets them while one is, and the idle rule (BB-83) needs the
+      // set for a binding whose worker has finished its turn.
+      const ownPulls = await ownPullKeys(b, workers, observed);
       const fresh = prev === null ? [] : diffObserved(prev, observed, { own: ownThreads(b), stewardThreadId: b.threadId, approved: ready.approval !== null, cursor: b.commentCursor, workerInFlight, ownPulls, stageOf: (state) => phaseOf(playbook, state)?.stage ?? null, userThread: isUserThread });
       changes.push(...fresh);
       changes.push(...deploymentChanges);
+      // BB-83: a binding in a build or review stage with nothing to wait on is
+      // woken once per idle period, after the grace. The period starts at the
+      // later of the last worker's end, the last own pull request's close and
+      // the last wake; a worker finish asks for the look at once, without the
+      // grace. An idle wake ends the period until one of those happens again.
+      const idle = idleInActiveStage(
+        { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id) },
+        observed,
+      );
+      let idleSince = b.idleSince;
+      let idleWokenAt = b.idleWokenAt;
+      let idleWakeNow = b.idleWakeNow;
+      if (!idle) {
+        idleSince = null;
+        idleWokenAt = null;
+        idleWakeNow = false;
+      } else {
+        const lastWorkerEnd = workers.reduce((at, w) => (w.endedAt !== null && w.endedAt > at ? w.endedAt : at), 0);
+        if (idleSince === null || lastWorkerEnd > idleSince) {
+          idleSince = lastWorkerEnd > 0 ? lastWorkerEnd : (b.wokeAt ?? now());
+          idleWokenAt = null;
+        }
+        if (prev !== null && ownPullClosed(prev, observed, ownPulls)) {
+          idleSince = now();
+          idleWokenAt = null;
+        }
+        if (deployments !== deploymentsBefore) {
+          idleSince = now();
+          idleWokenAt = null;
+        }
+        if (idleWokenAt === null && b.wokeAt !== null && b.wokeAt > idleSince) idleSince = b.wokeAt;
+      }
+      if (idle && idleWokenAt === null && (idleWakeNow || (idleSince !== null && now() - idleSince >= playbook.idleGraceMs))) {
+        changes.push({ text: IDLE_WAKE_TEXT, actionable: true });
+        idleWokenAt = now();
+      }
+      idleWakeNow = false;
+      if (idleSince !== b.idleSince || idleWokenAt !== b.idleWokenAt || idleWakeNow !== b.idleWakeNow) b = store.patch(b.id, { idleSince, idleWokenAt, idleWakeNow });
       // BB-35 step 2: a fresh unsigned comment by the owner that differs from
       // the recommendation on a decision that cited lessons is a correction,
       // counted once. Anyone else's words never count. Only from the second
@@ -2145,7 +2199,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The steward now has the workers' reports: archive the finished ones
       // that do not need it to stay visible (BB-47). Only once the wake was
       // delivered, so a failed send keeps the worker for the retry.
-      if (await wake(b, config, playbook, observed, lines, reason ?? (followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"))) await archiveFinishedWorkers(store.binding(b.id) ?? b);
+      // An idle wake is a `changed` turn: there is no lifecycle instruction
+      // for it, and the line under What changed is the whole wake (BB-83).
+      const idleDue = lines.includes(IDLE_WAKE_TEXT);
+      if (await wake(b, config, playbook, observed, lines, reason ?? (idleDue ? "changed" : followingThrough(b) ? "follow-through" : b.requeueAt !== null && b.requeueAt <= now() && loudQueued === 0 ? "requeue" : "changed"))) await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
 
     // ---- ops bindings ----------------------------------------------------------------------------
@@ -4098,6 +4155,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // now (BB-47), keeping one that still has a question, a reviewer, or is
         // parked waiting on something that will wake it (BB-52 rule 3).
         if (!needsSteward && !workerWaiting(result)) await archiveFinishedWorkers(b);
+        // BB-83: a worker finish asks the idle rule to look at once, without
+        // the grace, since its final message is what the steward needs to read.
+        // A message that says it is waiting stays quiet as before; the idle
+        // rule still catches it after the grace if nothing else does. The
+        // reconcile evaluates the predicate on the fresh snapshot and clears
+        // this again when the binding is not idle in an active stage.
+        if (!workerWaiting(result)) store.patch(b.id, { idleWakeNow: true });
         scheduleReconcile(b.id);
         return;
       }
@@ -4575,6 +4639,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
+              pending: b.pending,
+              requeueAt: b.requeueAt,
               ending: b.ending,
               statusAt: b.statusAt,
               createdAt: b.createdAt,
@@ -4647,6 +4713,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               // The newest deployment watch, whatever its state; `merged` reads as deploying.
               deployment: (Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null)?.state ?? null,
+              pending: b.pending,
+              requeueAt: b.requeueAt,
               ending: b.ending,
               statusAt: b.statusAt,
               createdAt: b.createdAt,
@@ -4716,6 +4784,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
                     status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
                     deployment: newestDeployment === null ? null : newestDeployment.state,
+                    pending: b.pending,
+                    requeueAt: b.requeueAt,
                     advancedAt: b.advancedAt,
                     workers,
                     reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),
@@ -5513,6 +5583,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             missedReports: 0,
             ready,
             deployments,
+            // A deployment verdict changes a watch: the idle clock starts a new
+            // period, so a binding that goes idle again is looked at (BB-83).
+            ...(input.deployment === undefined ? {} : { idleSince: now(), idleWokenAt: null }),
             ...(input.touches === undefined ? {} : { touches: normalizeTouches(input.touches) }),
             ...(input.noMorePulls === undefined ? {} : { noMorePulls: input.noMorePulls ? true : null }),
             ...(input.noMorePulls === false && b.noMorePulls === true && b.scheduleAsked.length > 0 ? { scheduleAsked: [] } : {}),
@@ -7103,12 +7176,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
