@@ -2056,9 +2056,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         { stage, ending: b.ending, hold: b.hold, deployments, workers, ownPulls, escalations: store.openEscalations(b.id), needs: store.openNeeds(b.id) },
         observed,
       );
-      let idleSince = b.idleSince;
-      let idleWokenAt = b.idleWokenAt;
-      let idleWakeNow = b.idleWakeNow;
+      // Re-read the idle fields from the store: a worker finish may have set
+      // `idleWakeNow` (or a deployment verdict reset the period) after this
+      // reconcile captured `b`, and writing the stale locals back would lose
+      // the loud-at-once look.
+      const current = store.binding(b.id);
+      let idleSince = current?.idleSince ?? b.idleSince;
+      let idleWokenAt = current?.idleWokenAt ?? b.idleWokenAt;
+      let idleWakeNow = current?.idleWakeNow ?? b.idleWakeNow;
       if (!idle) {
         idleSince = null;
         idleWokenAt = null;

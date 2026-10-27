@@ -371,8 +371,9 @@ Plugin code. No model turn.
    escalation or need waiting on the user, is idle in an active stage. The
    reconcile, the requeue tick and the sweep all evaluate that predicate; once
    it has held for the playbook's `idle-grace` (15m by default), the steward is
-   woken with "Nothing is running and nothing is being waited on…" and the
-   idle clock restarts from that wake. A worker finish that leaves such a
+   woken with "Nothing is running and nothing is being waited on…" and that
+   idle period is spent: the wake fires once per idle period, not once per
+   grace. A worker finish that leaves such a
    binding is loud at once, without the grace, because the worker's final
    message is what the steward must read; a finish that leaves an open pull
    request, a pending deployment or a message that says it is waiting stays
