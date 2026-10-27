@@ -1077,24 +1077,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return { observed: { entity, pulls }, complete: pulls.length >= keys.length };
     }
 
-    /** Whether `b` is at work, judged from a fresh GitHub read and its running workers (BB-54). */
-    async function atWorkFresh(b: Binding): Promise<boolean> {
+    /**
+     * `b`'s at-work judgement from a fresh GitHub read, with the read itself
+     * (BB-54, BB-89): the schedule wake names the pull request facts from the
+     * same read the judgement used.
+     */
+    async function atWorkWithRead(b: Binding): Promise<{ atWork: boolean; observed: Observed } | null> {
       const running = store.workers(b.id).some((w) => w.status === "running");
       const fresh = await freshObserved(b);
-      if (fresh === null) return atWork(b, { runningWorker: running });
+      if (fresh === null) return null;
       // An incomplete read cannot prove the work is finished (a linked pull
       // request may be open and unread), so drop a "no more coming" report for
       // this judgement: the project steward is woken rather than a request
       // skipped.
       const base = { ...b, lastSnapshot: fresh.observed, ...(fresh.complete ? {} : { noMorePulls: null }) };
-      return atWork(base, { runningWorker: running });
+      return { atWork: atWork(base, { runningWorker: running }), observed: fresh.observed };
     }
 
-    /** The overlapping open bindings at work on `b`'s paths, from a fresh GitHub read (BB-54). */
-    async function conflictsFresh(b: Binding): Promise<Conflict[]> {
-      const conflicts: Conflict[] = [];
+    /** Whether `b` is at work, judged from a fresh GitHub read and its running workers (BB-54). */
+    async function atWorkFresh(b: Binding): Promise<boolean> {
+      const read = await atWorkWithRead(b);
+      return read === null ? atWork(b, { runningWorker: store.workers(b.id).some((w) => w.status === "running") }) : read.atWork;
+    }
+
+    /**
+     * The overlapping open bindings at work on `b`'s paths, from a fresh
+     * GitHub read (BB-54), each with the read the schedule wake reports from
+     * (BB-89).
+     */
+    async function conflictsFresh(b: Binding): Promise<Array<Conflict & { observed: Observed | null }>> {
+      const conflicts: Array<Conflict & { observed: Observed | null }> = [];
       for (const c of overlapping(b, store.open(b.projectId))) {
-        if (await atWorkFresh(c.with)) conflicts.push(c);
+        const read = await atWorkWithRead(c.with);
+        if (read === null ? atWork(c.with, { runningWorker: store.workers(c.with.id).some((w) => w.status === "running") }) : read.atWork) {
+          conflicts.push({ ...c, observed: read?.observed ?? null });
+        }
       }
       return conflicts;
     }
@@ -2144,6 +2161,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await syncNeeds(b, observed, playbook, workerInFlight);
       // The work this binding was holding others behind has landed: lift them.
       if (allPullsMerged(b, observed) && (prev === null || !allPullsMerged(b, prev))) await releaseBehind(b, "merged its pull requests");
+      // BB-89: level-triggered, so a hold placed after its targets finished, or
+      // a noMorePulls report that arrived after the merge, lifts on this
+      // reconcile rather than waiting for an edge that has already passed.
+      // Every target must satisfy `finished`; the release goes through
+      // releaseBehind, so the wake, the notes and the re-hold of overlapping
+      // waiters are the same as any other lift.
+      if (b.holdBehind.length > 0) {
+        const projectId = b.projectId;
+        const targets = b.holdBehind.map((k) => store.find(k, projectId)).filter((t): t is Binding => t !== null);
+        if (targets.length === b.holdBehind.length && targets.every((t) => t.lastSnapshot !== null && finished(t, t.lastSnapshot))) {
+          for (const t of targets) await releaseBehind(t, howFinished(t));
+          b = store.binding(b.id) ?? b;
+        }
+      }
       const scheduling = await syncScheduleRequest(b, playbook);
       // BB-55: the start-now backstop is queued by the report that passed the
       // gate, but by the time the turn ends the steward may have obeyed: the
@@ -3676,7 +3707,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       cleared(false);
       store.patch(b.id, { scheduleAsked: keys });
-      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}) on ${c.on.join(", ")}`).join("; ");
+      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}; ${pullFacts(c.with, c.observed)}) on ${c.on.join(", ")}`).join("; ");
       const x = store.escalate({
         bindingId: b.id,
         kind: "schedule",
@@ -3689,6 +3720,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
       bb.log.info(`stewards: ${b.entityKey} overlaps ${keys.join(", ")}; asked the project steward to schedule it (${x.id})`);
       return x;
+    }
+
+    /**
+     * How a finished target's hold release reads (BB-89): the ending it
+     * reached, or the merge that finished it.
+     */
+    function howFinished(b: Binding): string {
+      if (b.endedAt !== null) return `ended (${b.endReason ?? "ended"})`;
+      if (b.ending === "terminal") return `reached ${b.lastSnapshot?.entity.state ?? "a terminal state"}`;
+      return "merged its pull requests";
     }
 
     /**
@@ -3754,6 +3795,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function observedPulls(b: Binding, observed: Observed): EntitySnapshot[] {
       const own = observed.entity.pull === null ? [] : [observed.entity];
       return b.kind === "ticket" ? [...own, ...observed.pulls] : own;
+    }
+
+    /**
+     * The schedule wake's pull request facts (BB-89): how many of a binding's
+     * linked pull requests are open and how many merged, and whether its
+     * steward has reported that no more are coming. Facts only; the wake draws
+     * no conclusion from them.
+     */
+    function pullFacts(b: Binding, observed: Observed | null): string {
+      if (observed === null) return "pull requests not read, no more pull requests: not reported";
+      const pulls = observedPulls(b, observed);
+      const merged = pulls.filter((p) => p.pull?.merged === true).length;
+      const open = pulls.filter((p) => p.pull?.merged !== true && lc(p.state) !== "closed").length;
+      return `${open} open, ${merged} merged, no more pull requests: ${b.noMorePulls === true ? "reported" : "not reported"}`;
     }
 
     /**
