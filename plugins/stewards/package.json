@@ -29,7 +29,7 @@
     "build": "bb plugin build"
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.6.37",
+    "@get-bb/plugin-sdk": "0.6.80",
     "yaml": "^2.8.1",
     "zod": "^4.6.7"
   },

@@ -13,9 +13,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   in one of the project's repos gets a `pr` steward. Every non-draft pull
   request a teammate opens in those repos gets a `review` steward. Each
   steward reports to its nearest managed ancestor's steward, or to the
-  project's **project steward**, through its binding — not as a child
-  thread: bb wakes a parent thread every time a child finishes a turn, and
-  on bithub that was 88 of the project steward's 96 turns. A project's
+  project's **project steward**, through its binding, and is spawned as a
+  child of the project steward with parent notifications off: the sidebar
+  nests it under the project steward, and bb does not wake the parent on every
+  child turn. (Before bb 0.47.0 parenting meant the project steward woke on 88
+  of its first 96 turns on bithub, so stewards were top-level.) A project's
   stewards share one sidebar section, named after the project; see
   DESIGN.md §15.
 - **Ops stewards.** Each target in the project file's `ops.targets` (a
@@ -186,9 +188,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   thread's. The project steward also gets `ring: false`: it has no stage of
   its own, so its row keeps bb's own indicators. The project steward
   is titled "<project name> project steward". The sweep tags threads
-  spawned before this, lets go of stewards an earlier version made children
-  of another steward, and renames an older project steward once. After
-  that, a project steward renamed by hand keeps its name.
+  spawned before this, sets parent notifications off on a steward an earlier
+  version parented to the project steward (keeping the parent), and renames an
+  older project steward once. After that, a project steward renamed by hand
+  keeps its name.
 - **The sidebar and the unread dot.** A steward is put in its project's
   section when it is spawned, and a worker or reviewer the plugin did not
   place is filed there by the `thread.created` handler. A finished worker
@@ -198,13 +201,17 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   means "needs you": a report that waits on someone else, with no
   escalation, question or needs item, is marked read. A report that needs
   you is left unread.
-- **Workers** are top-level threads with their own checkout, one per bounded
-  task, owned by their steward through `--lifecycle-owner-thread`. A reviewer
-  is a child of the worker that started it, one per review round. Workers do
-  not nest under their steward's sidebar row: bb's list trees by parent
-  thread, not by lifecycle owner, so they show loose; whether it should tree
-  by lifecycle owner too is a core question. A runaway guard stops a
-  steward's workers past a per-hour limit.
+- **Workers** are children of their steward with their own checkout, one per
+  bounded task, spawned with `--parent-self --parent-notifications off
+  --lifecycle-owner-thread`. A reviewer is a child of the worker that started
+  it, one per review round. A worker nests under its steward's row and a
+  reviewer under its worker's, because bb's list trees by parent thread; the
+  parent is not woken on a child's turn. The plugin only ever archives a
+  steward, worker or reviewer, never deletes one: deleting a parent thread
+  deletes every descendant, archived ones included (get-bb/bb#6129), so
+  deleting the project steward row by hand takes every steward, worker and
+  reviewer under it. A runaway guard stops a steward's workers past a per-hour
+  limit.
 - **Decisions stay with the agents.** Escalations are conditions on the
   status record, routed to the parent steward, then the project steward,
   which decides from the project's guidance (AGENTS.md, design docs). Only

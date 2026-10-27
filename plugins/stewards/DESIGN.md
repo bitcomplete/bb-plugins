@@ -203,10 +203,14 @@ HEAD; a checkout with local commits is left as it is and read as it is.
   which already exist. The nightly pass re-lists labelled tickets and open
   pull requests as the correctness backstop.
 - A new steward reports to its nearest managed ancestor's steward, or to the
-  project steward when it has none. That is the binding's parent, not the
-  thread's: bb wakes a parent thread every time a child finishes a turn,
-  which made the project steward a reader of every steward's every turn
-  (on bithub, 88 of its first 96 turns). Stewards are threads of their own.
+  project steward when it has none. That is the binding's parent; the thread is
+  spawned as a child of the project steward with `parentNotifications: off`, so
+  the sidebar nests it under the project steward without waking it on every
+  turn. `off` suppresses every automatic notification — turn outcomes, setup
+  failures and exhausted retries — while explicit `bb thread tell` messages
+  still arrive. Before bb 0.47.0 the thread was not parented at all: bb woke a
+  parent every time a child finished a turn, 88 of the project steward's first
+  96 turns on bithub.
 - `--lifecycle-owner-thread` is used only between a steward and its workers.
   Stewards end on their own entity's terms.
 - Your own pull requests get no review steward. They belong to the ticket
@@ -442,7 +446,8 @@ tuning it against the BB and bithub stewards is a follow-up, not this design.
 #### Post-spawn validation
 
 A worker is recognized by the `thread.created` handler by its lifecycle
-owner first, then by its parent (for stewards spawned before BB-23). Before
+owner or its parent — whichever the skill that spawned it set — and never as
+a reviewer, which is a child of a worker. Before
 the runaway guard, the handler compares the worker's provider, model,
 reasoning level and environment provider with the playbook's `models.worker`
 (or the binding's override) and the project's environment. On a mismatch it
@@ -781,8 +786,9 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 ## 15. Organization
 
-- Stewards are no thread's children (§4): who reports to whom is in the
-  bindings. They are grouped in the sidebar instead: each stewarded project
+- Stewards are children of the project steward with parent notifications off
+  (§4), so they nest under it in bb's thread tree. Who reports to whom is in
+  the bindings. They are grouped in the sidebar too: each stewarded project
   gets one sidebar section, named after the project, holding its project
   steward and every ticket and pull request steward. Sections are flat in bb,
   and only shown when the sidebar is organized chronologically; in the
@@ -808,22 +814,24 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   same way when the `thread.created` handler files them, so thread-briefs
   never moves one out of the section or auto-archives it. The project
   steward is titled "<project name> project steward".
-- Workers are top-level threads, owned by their steward through
+- Workers are children of their steward, owned by it through
   `--lifecycle-owner-thread` and started with `bb thread spawn --project …
-  --lifecycle-owner-thread "$BB_THREAD_ID" --section <section id> …`; the
-  plugin recognizes them by that owner, and still recognizes a worker an
-  older steward made a child by its parent. A worker is no thread's child,
-  so finishing a turn does not wake the steward: its final message arrives
-  in the next wake, which lists finished workers. The sidebar loss is
-  accepted: a worker no longer nests under its steward's row in the project
-  section, because bb's list trees by parent thread and not by lifecycle
-  owner. Whether it should tree by lifecycle owner too is a core question,
-  not worked around here. The `thread.created` handler files any unsectioned
-  worker or reviewer into the owner's project section, so a skill that
-  builds its own spawn command lands there too. A finished worker's thread is
-  archived once the reconcile that consumed its report has woken the steward,
-  and a reviewer once its round is consumed, so a long-running binding does
-  not leave its finished rows loose (§5).
+  --parent-self --parent-notifications off --lifecycle-owner-thread
+  "$BB_THREAD_ID" --section <section id> …`; the plugin recognizes them by
+  that owner or their parent, and a worker an older steward left with only the
+  owner is still recognized. `parentNotifications: off` keeps a worker's
+  finish from waking the steward: its final message arrives in the next wake,
+  which lists finished workers. The worker nests under its steward's row in
+  the project section, because bb's list trees by parent thread. The
+  `thread.created` handler files any unsectioned worker or reviewer into the
+  owner's project section, so a skill that builds its own spawn command lands
+  there too. A finished worker's thread is archived once the reconcile that
+  consumed its report has woken the steward, and a reviewer once its round is
+  consumed, so a long-running binding does not leave its finished rows loose
+  (§5). The plugin only ever archives a steward, worker or reviewer, never
+  deletes one: deleting a parent thread deletes every descendant, archived
+  ones included (get-bb/bb#6129), so deleting the project steward row by hand
+  would take every steward, worker and reviewer under it.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. A steward waiting on someone
   else is hidden (`threads.update { visibility: "hidden" }`), not archived,
@@ -1515,11 +1523,14 @@ before quiet, then by recency. Pinned rows stay first within their section.
 `buildSidebar` returns `blocked`, `efforts`, `threads` and `monitors`
 separately, and the split is unit tested in `sidebar.test.ts`.
 
-**Grouping is the steward relationship, not the thread tree.** A worker
+**Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
-through the worker the RPC names, so BB-23's removal of the parent link cannot
-break it. The thread tree is used only for one-off threads, which have nothing
-else, and as a fallback for a pre-BB-23 worker whose parent is its steward.
+through the worker the RPC names, so the grouping survives a worker spawned
+without a parent. The thread tree (`parentThreadId ?? lifecycleOwnerThreadId`)
+places what the records do not cover: a worker an older steward parented under
+it, and a one-off thread's children. BB-72 restored the parent link — stewards
+under the project steward, workers under their steward, reviewers under their
+worker — so the tree and the records agree.
 The pure grouping and ordering live in `sidebar.ts` and are unit tested; the
 component joins them to `experimental_useSidebarThreads` and polls
 `stewardsSidebar` on the board's half-minute visibility-aware cadence.

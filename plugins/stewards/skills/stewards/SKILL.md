@@ -372,9 +372,10 @@ The project must be a multi-repo project: configuration is read from its
 3. `bb stewards check` validates the project file and playbooks against
    Linear (teams, states, label) and GitHub (repos, label), and that this
    server can read every ops target (and holds no write there).
-4. Label a ticket `bb-managed`. Its steward thread appears beside the
-   project steward's, not under it: a parent thread is woken whenever a
-   child finishes a turn, and stewards report through their bindings.
+4. Label a ticket `bb-managed`. Its steward thread appears under the project
+   steward's: stewards are spawned as the project steward's children with
+   parent notifications off, so the sidebar nests them without waking the
+   parent on every turn. They report through their bindings.
 
 Every command takes `--project <id>`; left out, it is the invoking thread's
 project.
@@ -421,5 +422,8 @@ above which a steward is compacted after its turn.
   chronologically (`bb thread-list prefs get organizationMode`). A steward
   is placed there once and never moved back; one dragged out stays out. A
   section deleted by hand is not recreated: `bb thread section create
-  "<project name>"` brings it back for new stewards. Workers are top-level
-  threads owned by their steward, so they do not nest under its row.
+  "<project name>"` brings it back for new stewards. Workers are children of
+  their steward with parent notifications off, so they nest under its row
+  without waking it on every turn. The plugin only archives a steward, worker
+  or reviewer, never deletes one: deleting a parent thread deletes every
+  descendant, archived ones included (get-bb/bb#6129).

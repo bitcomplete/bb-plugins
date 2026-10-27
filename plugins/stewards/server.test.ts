@@ -34,7 +34,9 @@ function world() {
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
-  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null }>();
+  /** Every `threads.delete` the plugin asked for; the plugin must only ever archive. */
+  const deletes: string[] = [];
   const writes: Array<{ path: string; hostId?: string }> = [];
   /** Dotenv files by `${hostId}:${path}`, for `bb stewards secret import`. */
   const fileContents = new Map<string, string>();
@@ -159,6 +161,8 @@ function world() {
           visibility: "visible",
           title: (args.title as string | undefined) ?? null,
           sectionId: (args.sectionId as string | undefined) ?? null,
+          ...(args.parentThreadId === undefined ? {} : { parentThreadId: args.parentThreadId as string }),
+          ...(args.parentNotifications === undefined ? {} : { parentNotifications: args.parentNotifications as string }),
           ...(environment?.machine?.hostId === undefined ? {} : { hostId: environment.machine.hostId }),
           ...(args.providerId === undefined ? {} : { providerId: args.providerId as string }),
           ...(args.model === undefined ? {} : { model: args.model as string }),
@@ -177,7 +181,7 @@ function world() {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
         return {
-          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null }),
+          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, parentNotifications: (t.parentNotifications ?? "auto") as never, sectionId: t.sectionId ?? null }),
           ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null, branchName: t.branchName ?? null } }),
         };
       },
@@ -208,12 +212,17 @@ function world() {
         return {};
       },
       stop: async () => ({}),
-      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null; sectionId?: string | null; visibility?: string }) => {
+      update: async (args: { threadId: string; title?: string; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; visibility?: string }) => {
         const t = threads.get(args.threadId);
         if (t !== undefined && args.sectionId !== undefined) t.sectionId = args.sectionId;
         if (t !== undefined && args.title !== undefined) t.title = args.title;
         if (t !== undefined && args.parentThreadId !== undefined) t.parentThreadId = args.parentThreadId;
+        if (t !== undefined && args.parentNotifications !== undefined) t.parentNotifications = args.parentNotifications;
         if (t !== undefined && args.visibility !== undefined) t.visibility = args.visibility;
+        return {};
+      },
+      delete: async ({ threadId }: { threadId: string }) => {
+        deletes.push(threadId);
         return {};
       },
       markRead: async ({ threadId }: { threadId: string }) => ({ threadId, readAt: now, unreadCount: 0 }),
@@ -253,7 +262,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, sourceDeployments, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, sourceDeployments, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -391,7 +400,7 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
 }
 
 describe("a Linear ticket steward", () => {
-  it("is adopted from a ring, beside the project steward rather than under it, with a self-contained wake", async () => {
+  it("is adopted from a ring, nested under the project steward with notifications off, with a self-contained wake", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
@@ -407,9 +416,9 @@ describe("a Linear ticket steward", () => {
     expect(project).toMatchObject({ sectionId: "sec_1" });
     expect(steward).toMatchObject({ sectionId: "sec_1" });
     expect(project).not.toHaveProperty("pinned");
-    expect(steward).toMatchObject({ title: "ENG-12: Fix login", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false } } });
-    // No parent: bb would wake a parent every time a steward finishes a turn.
-    expect(steward).not.toHaveProperty("parentThreadId");
+    // A child of the project steward, so the sidebar trees it there, with
+    // notifications off so a finished steward turn does not wake the parent.
+    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false } } });
     const prompt = String(steward!.prompt);
     expect(prompt).toMatch(/# Steward wake: ENG-12 — Fix login/u);
     expect(prompt).toMatch(/You have just been bound/u);
@@ -418,8 +427,8 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/given by the project steward/u);
     // The first wake is the spawn prompt, before the thread has an id.
     expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
-    expect(prompt).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
-    expect(prompt).not.toContain("--parent-self");
+    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).toContain("--parent-self --parent-notifications off");
     expect(prompt).not.toContain("--parent-thread");
     expect(prompt).toContain("A worker finishing starts no turn of yours");
     expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward!.id, ended: false }]);
@@ -907,10 +916,11 @@ describe("a Linear ticket steward", () => {
     expect(t.sends).toHaveLength(afterError);
   });
 
-  // BB-23: a worker is a top-level thread owned only through its lifecycle
-  // owner. It must still be tracked, guarded and reported, and its finish must
-  // not start a turn of its own.
-  it("recognizes a top-level worker by its lifecycle owner, guards it, and reports its finish in the next wake", async () => {
+  // BB-72: a worker is normally a child of its steward, but a worker spawned
+  // with only `--lifecycle-owner-thread` (an older steward, or a skill that
+  // built its own command) must still be tracked, guarded and reported, and
+  // its finish must not start a turn of its own.
+  it("recognizes a worker by its lifecycle owner, guards it, and reports its finish in the next wake", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
@@ -934,11 +944,37 @@ describe("a Linear ticket steward", () => {
     for (let i = 2; i <= 7; i++) await t.createdOwned(`thr_w${i}`, steward);
     expect(t.harness.sdk.callsTo("threads.stop")).toEqual([[{ threadId: "thr_w7" }]]);
 
-    // The template the steward acts from names no parent flag.
-    expect(String(t.spawns[1]!.prompt)).not.toContain("--parent-self");
+    // The template the steward acts from parents the worker with notifications off.
+    expect(String(t.spawns[1]!.prompt)).toContain("--parent-self --parent-notifications off");
     expect(String(t.spawns[1]!.prompt)).not.toContain("--parent-thread");
-    expect(t.sends.at(-1)!.text).not.toContain("--parent-self");
+    expect(t.sends.at(-1)!.text).toContain("--parent-self --parent-notifications off");
     expect(t.sends.at(-1)!.text).not.toContain("--parent-thread");
+  });
+
+  // BB-72: a worker is a child of its steward again. It must still be
+  // recognized as a worker, and never mistaken for a reviewer; a reviewer
+  // under its worker still is one, and the sidebar nests the chain.
+  it("recognizes a nested worker as a worker, not a reviewer, and a reviewer under its worker", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const binding = t.hooks.store.open("p1")[0]!.id;
+
+    // The worker's parent is its steward (`--parent-self`), which is not a
+    // worker, so reviewerOwner must not claim it as a reviewer.
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    expect(t.hooks.store.worker("thr_w1")).toMatchObject({ bindingId: binding, status: "running" });
+    expect(t.harness.sdk.callsTo("threads.archive")).toEqual([]);
+
+    // The reviewer is a child of the worker, filed under it, not a worker.
+    await t.created("thr_r1", "thr_w1", "Review acme/web#7");
+    expect(t.hooks.store.worker("thr_r1")).toBeNull();
+    const result = (await t.harness.callRpc("stewardsSidebar", null)) as { projects: Array<{ bindings: Array<{ workers: Array<{ threadId: string }>; reviewers: Array<{ threadId: string; workerThreadId: string }> }> }> };
+    expect(result.projects[0]!.bindings[0]).toMatchObject({
+      workers: [{ threadId: "thr_w1" }],
+      reviewers: [{ threadId: "thr_r1", workerThreadId: "thr_w1" }],
+    });
   });
 
   it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {
@@ -1693,6 +1729,22 @@ describe("terminal states and follow-through", () => {
     expect(t.archives()).toEqual([t.steward]);
   });
 
+  // BB-72 / get-bb/bb#6129: deleting a parent thread deletes every descendant,
+  // archived ones included. The plugin must never delete a steward, worker or
+  // project steward: it archives, and these paths call no delete.
+  it("archives and ends without ever deleting a thread", async () => {
+    const t = await working();
+    // A quiet worker finish is archived by the plugin.
+    await t.idle("thr_w1", "Implemented the retry.");
+    // The binding reaches Done; the steward's wrap-up ends and it is archived.
+    await t.done();
+    await t.report();
+    await t.idle(t.steward);
+    expect(t.archives()).toEqual(expect.arrayContaining(["thr_w1", t.steward]));
+    expect(t.deletes).toEqual([]);
+    expect(t.harness.sdk.callsTo("threads.delete")).toEqual([]);
+  });
+
   it("archives a steward whose wrap-up turn is still running when the binding ends, once that turn ends", async () => {
     const t = await working();
     await t.done();
@@ -1994,22 +2046,42 @@ describe("the project steward", () => {
 });
 
 describe("stewards and the sidebar", () => {
-  it("lets go of stewards an earlier version spawned as the project steward's children", async () => {
+  it("keeps a steward an earlier version parented to the project steward, switching its notifications to off once", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
+    // As an earlier version left it: parented, notifications on the default.
     t.threads.get(steward!)!.parentThreadId = project!;
+    t.threads.get(steward!)!.parentNotifications = "auto";
     t.threads.set("thr_mine", { status: "idle", archivedAt: null, parentThreadId: steward! });
 
     t.hooks.forgetTags();
     await t.hooks.sweep();
-    expect(t.threads.get(steward!)!.parentThreadId).toBeNull();
-    expect(t.harness.sdk.callsTo("threads.update").map(([args]) => args)).toContainEqual({ threadId: steward, parentThreadId: null });
+    // The parent is kept; only the notifications change, in one update.
+    expect(t.threads.get(steward!)!.parentThreadId).toBe(project!);
+    expect(t.threads.get(steward!)!.parentNotifications).toBe("off");
+    expect(t.harness.sdk.callsTo("threads.update").map(([args]) => args)).toContainEqual({ threadId: steward, parentNotifications: "off" });
+    expect(t.harness.sdk.callsTo("threads.update").map(([args]) => args)).not.toContainEqual({ threadId: steward, parentThreadId: null });
     // Only once per run.
     const updates = t.harness.sdk.callsTo("threads.update").length;
     await t.hooks.sweep();
     expect(t.harness.sdk.callsTo("threads.update")).toHaveLength(updates);
+  });
+
+  it("does not re-parent a steward that is already no thread's child; it nests when next spawned", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // An un-parented steward from before BB-72: the sweep must leave it alone.
+    t.threads.get(steward!)!.parentThreadId = null;
+    t.threads.get(steward!)!.parentNotifications = "auto";
+    t.hooks.forgetTags();
+    await t.hooks.sweep();
+    expect(t.threads.get(steward!)!.parentThreadId).toBeNull();
+    const parentWrites = t.harness.sdk.callsTo("threads.update").map(([args]) => args as { threadId: string; parentThreadId?: unknown }).filter((a) => a.threadId === steward && a.parentThreadId !== undefined);
+    expect(parentWrites).toEqual([]);
   });
 
   it("puts stewards that predate it in their project's section once, and leaves them where you move them", async () => {
@@ -2094,7 +2166,7 @@ describe("pull requests", () => {
     t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9" }, { draft: true }));
     for (const id of ["acme/web#7", "acme/web#8", "acme/web#9"]) await t.ring("github", id);
     expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "review" }]);
-    expect(t.spawns[1]).toMatchObject({ title: "Review acme/web#7: Add login retry", model: "claude-haiku-5-5" });
+    expect(t.spawns[1]).toMatchObject({ title: "Review acme/web#7: Add login retry", model: "claude-haiku-5-5", parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
   });
 
   it("adopts a labelled pull request as a pr binding", async () => {
@@ -2102,6 +2174,8 @@ describe("pull requests", () => {
     t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "jane" }));
     await t.ring("github", "acme/web#7");
     expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "pr" }]);
+    // A PR steward is a child of the project steward with notifications off.
+    expect(t.spawns[1]).toMatchObject({ parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
   });
 
   it("leaves out repos the project file excludes, and says so in check", async () => {
@@ -4839,7 +4913,7 @@ describe("ops stewards", () => {
     const ops = steward()!;
     // A binding of its own, reporting to the project steward, in the list and on the page.
     expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: ops.id, ended: false }]);
-    expect(ops).toMatchObject({ title: "Ops watch: bb-gate-production", sectionId: "sec_1", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5" });
+    expect(ops).toMatchObject({ title: "Ops watch: bb-gate-production", sectionId: "sec_1", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5" });
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; kind: string; stage: string | null }> } };
     expect(board.board.stewards).toEqual([expect.objectContaining({ key: TARGET, kind: "ops", stage: "watch" })]);
 
@@ -6318,7 +6392,7 @@ describe("the dotenv a requester imports", () => {
 // context was compacted, and a worker spawned wrong must be caught here.
 describe("steward invariants on every turn (BB-24)", () => {
   const spawnLine = (over = "") =>
-    `bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
+    `bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
 
   it("prints the full runnable spawn command from the playbook's worker model and the project environment", async () => {
     const t = await setup();
@@ -6329,7 +6403,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     const out = await t.harness.behavior.runCli(["spawn-flags"], { threadId: steward, projectId: "p1" });
     expect(out.exitCode).toBe(0);
     expect(out.stdout).toBe(spawnLine());
-    expect(out.stdout).not.toContain("--parent-self");
+    expect(out.stdout).toContain("--parent-self --parent-notifications off");
     expect(out.stdout).not.toContain("--parent-thread");
 
     // By key, without the invoking thread, and the same command.
@@ -6386,7 +6460,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(before).toContain("bb stewards brief");
     // The SDK truncates a contribution at 4096 characters; the brief must fit.
     expect(before!.length).toBeLessThanOrEqual(4096);
-    expect(before).not.toContain("--parent-self");
+    expect(before).toContain("--parent-self --parent-notifications off");
 
     // Compaction replaces the transcript, not the injected context.
     t.usage.set(steward, 200_000);
@@ -6411,7 +6485,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
     const wake = t.sends.at(-1)!.text;
     expect(wake).toMatch(/Worker thr_bad was started with the wrong provider codex instead of claude-code/u);
-    expect(wake).toContain(`bb thread spawn --project p1 --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
+    expect(wake).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
   });
 
   it("stops a worker on the wrong model, reasoning level or environment provider, and leaves a matching one alone", async () => {
@@ -6502,7 +6576,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
     const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
-    expect(instructions()).toContain("bb thread spawn --project p1 --lifecycle-owner-thread");
+    expect(instructions()).toContain("bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread");
 
     // A machine read more than a sweep ago is not trusted for a synchronous brief.
     t.advance(31 * 60_000);
