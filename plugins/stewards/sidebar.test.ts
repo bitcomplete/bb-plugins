@@ -456,8 +456,10 @@ describe("stewards sidebar Recently ended efforts (BB-88)", () => {
     expect(e.phrase).toBe("ended");
   });
 
-  it("spells `detach` as the label being removed and passes other reasons through", () => {
+  it("spells the terse internal end reasons out and passes the rest through", () => {
     expect(endReasonPhrase("detach")).toBe("label removed");
+    expect(endReasonPhrase("gone")).toBe("no longer listed");
+    expect(endReasonPhrase("unconfigured")).toBe("no longer configured");
     expect(endReasonPhrase("deleted")).toBe("deleted");
     expect(endReasonPhrase(null)).toBe("ended");
   });

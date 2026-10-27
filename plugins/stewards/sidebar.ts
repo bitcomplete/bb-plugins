@@ -231,12 +231,12 @@ export function deploymentPhrase(state: DeployState): string {
 
 /**
  * Line two's status phrase for an ended binding (BB-88): the end reason, with
- * the terse `detach` spelled out as the label being removed. A missing reason
- * reads `ended`.
+ * the terse internal reasons spelled out. A missing reason reads `ended`.
  */
 export function endReasonPhrase(reason: string | null): string {
   if (reason === null || reason === "") return "ended";
-  return reason === "detach" ? "label removed" : reason;
+  const spelled: Record<string, string> = { detach: "label removed", gone: "no longer listed", unconfigured: "no longer configured" };
+  return spelled[reason] ?? reason;
 }
 
 /**
