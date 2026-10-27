@@ -19,10 +19,12 @@ import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./s
 import {
   channelEntrySchema,
   channelMapFromLegacy,
+  channelProject,
   chooseConversationProject,
   chooseProject,
   clipMention,
   clipSessionText,
+  findProject,
   isFromOwner,
   isUntrusted,
   parseChannelMap,
@@ -47,6 +49,51 @@ export const CALLBACK_PATH = "/signin/callback";
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** A sign-in state the plugin started is good for as long as the service's own. */
 export const PENDING_TTL_MS = 10 * 60 * 1000;
+
+/** The Block Kit action id the ephemeral "which project?" prompt uses. */
+export const SET_PROJECT_ACTION = "bb_set_project";
+/** Slack's response_url host; the plugin posts to no other host. */
+export const SLACK_RESPONSE_HOST = "hooks.slack.com";
+
+/**
+ * Whether a response_url may be posted to. It is a capability Slack hands the
+ * app; a URL that is not an https hooks.slack.com one is refused, so a
+ * misbehaving wake cannot make the pod POST elsewhere.
+ */
+export function isSlackResponseUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.protocol === "https:" && url.hostname === SLACK_RESPONSE_HOST;
+}
+
+/** The one-line confirmation the prompt is replaced with once the map is set. */
+export function confirmationText(channel: string, project: string): string {
+  return `#${channel} → ${project}. Change it under Settings → Plugins → Slack.`;
+}
+
+/**
+ * The Block Kit blocks of the ephemeral "which project?" prompt: the channel
+ * bb joined, a static select of this server's projects, a Set button, and the
+ * line saying a mention starts a thread in the chosen project.
+ */
+export function projectPromptBlocks(channel: string, all: Project[]): unknown[] {
+  const options = all.slice(0, 100).map((p) => ({ text: { type: "plain_text", text: clipMention(p.name, 74) }, value: p.id }));
+  return [
+    { type: "section", text: { type: "mrkdwn", text: `bb joined <#${channel}>. Which project should a mention in this channel start a thread in?` } },
+    {
+      type: "actions",
+      elements: [
+        { type: "static_select", action_id: SET_PROJECT_ACTION, placeholder: { type: "plain_text", text: "Choose a project" }, options },
+        { type: "button", action_id: SET_PROJECT_ACTION, text: { type: "plain_text", text: "Set" }, value: "set" },
+      ],
+    },
+    { type: "context", elements: [{ type: "mrkdwn", text: "A mention of bb in this channel will start a thread in the chosen project." }] },
+  ];
+}
 
 const SESSIONS_KEY = "sessions";
 const IDENTITY_KEY = "identity";
@@ -459,6 +506,126 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /** A response_url is a capability: it must not appear in a log line. */
+    function withoutUrl(text: string, url: string): string {
+      return url === "" ? text : text.split(url).join("[response_url]");
+    }
+
+    /**
+     * Replace the ephemeral prompt a `block_action` came from, through Slack's
+     * response_url (ephemeral messages cannot be updated with `chat.update`).
+     * The URL is posted to only when it is an https hooks.slack.com one, and it
+     * is never logged; a refused or failed replacement is not fatal, because the
+     * map write is the point.
+     */
+    async function replacePrompt(responseUrl: string, text: string): Promise<void> {
+      if (!isSlackResponseUrl(responseUrl)) {
+        bb.log.warn("refusing to replace a Slack prompt: the response_url is not an https hooks.slack.com URL");
+        return;
+      }
+      try {
+        const response = await deps.fetch(responseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ replace_original: true, text }),
+          signal: checkSignal(),
+        });
+        if (!response.ok) bb.log.warn(`could not replace the Slack prompt: Slack answered HTTP ${response.status}`);
+      } catch (error) {
+        bb.log.warn(`could not replace the Slack prompt: ${withoutUrl(errorMessage(error), responseUrl)}`);
+      }
+    }
+
+    /** Write the routing map the way the settings editor's `setMap` does. */
+    async function saveChannelMap(map: ChannelMap): Promise<void> {
+      await bb.storage.kv.set(CHANNEL_MAP_KEY, { fallback: map.fallback, channels: map.channels } satisfies ChannelMap);
+    }
+
+    /**
+     * Serialize routing-map read-modify-writes, so a `block_action` and the
+     * settings editor's `setMap` cannot lose one another's row.
+     */
+    let mapLock: Promise<unknown> = Promise.resolve();
+    function withMapLock<T>(fn: () => Promise<T>): Promise<T> {
+      const run = mapLock.then(fn, fn);
+      mapLock = run.catch(() => undefined);
+      return run;
+    }
+
+    /**
+     * The app joined a channel: if this server has no routing row for it, ask
+     * the owner which project a mention there should use, ephemerally in that
+     * channel. An already-mapped channel says nothing. This is inert until the
+     * owner does the two by-hand Slack app steps (bb-gate/README.md), because
+     * no `invited` wake arrives without them.
+     */
+    async function handleInvited(event: SessionEvent): Promise<void> {
+      const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
+      if (channelProject(map.channels, event.channel) !== null) {
+        bb.log.info(`Slack was invited to ${event.channel}, which already has a routing row; nothing to ask`);
+        return;
+      }
+      const all = await projects();
+      if (all.length === 0) {
+        bb.log.warn(`Slack was invited to ${event.channel}, but this server has no projects to offer`);
+        return;
+      }
+      try {
+        await hooks.ephemeral({ channel: event.channel, user: event.owner.id, text: `Which project should a mention in this channel start a thread in?`, blocks: projectPromptBlocks(event.channel, all) }, checkSignal());
+        bb.log.info(`Slack asked which project channel ${event.channel} uses`);
+      } catch (error) {
+        bb.log.warn(`could not post the Slack project prompt for channel ${event.channel}: ${errorMessage(error)}`);
+      }
+    }
+
+    /**
+     * The owner clicked the project prompt. Validate the choice against this
+     * server's projects, write the routing row, and replace the prompt with the
+     * confirmation. A non-owner click never writes; an unknown project or a
+     * stale click (the row was set since the prompt was posted) gets a one-line
+     * replacement instead.
+     */
+    async function handleBlockAction(event: SessionEvent): Promise<void> {
+      if (event.actionId !== SET_PROJECT_ACTION) {
+        bb.log.info(`Slack block action ${event.actionId} is not the project prompt; ignored`);
+        return;
+      }
+      if (!isFromOwner(event)) {
+        bb.log.warn("the Slack project prompt was clicked by someone other than the owner; not writing the map");
+        await replacePrompt(event.responseUrl, "Only the person who invited bb can set this channel's project.");
+        return;
+      }
+      // A click on the Set button (or a select change Slack did not carry a
+      // value for) names no project; ask for one instead of writing. Checked
+      // before findProject, so a project literally named "set" is not mapped
+      // by a bare button press.
+      const value = event.value.trim();
+      if (value === "" || value === "set") {
+        await replacePrompt(event.responseUrl, "Pick a project from the list, then press Set.");
+        return;
+      }
+      const outcome = await withMapLock(async () => {
+        const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
+        const existing = channelProject(map.channels, event.channel);
+        if (existing !== null) return { kind: "stale" as const, existing };
+        const chosen = findProject(await projects(), event.value);
+        if (chosen === null) return { kind: "unknown" as const };
+        const channels = [...map.channels.filter((entry) => entry.channel !== event.channel), { channel: event.channel, project: chosen.name }];
+        await saveChannelMap({ fallback: map.fallback, channels });
+        return { kind: "set" as const, chosen };
+      });
+      if (outcome.kind === "stale") {
+        await replacePrompt(event.responseUrl, `This channel is already set to ${outcome.existing}. Change it under Settings → Plugins → Slack.`);
+        return;
+      }
+      if (outcome.kind === "unknown") {
+        await replacePrompt(event.responseUrl, "That project is not on this server. Pick one from the list, then press Set.");
+        return;
+      }
+      await replacePrompt(event.responseUrl, confirmationText(event.channel, outcome.chosen.name));
+      bb.log.info(`Slack channel ${event.channel} is now mapped to ${outcome.chosen.name}`);
+    }
+
     /** Push the bb thread's title to Slack for every conversation it answers. */
     async function pushTitle(threadId: string): Promise<void> {
       const mine = [...sessions].filter(([, r]) => r.threadId === threadId);
@@ -667,14 +834,19 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     /** One wake at a time per conversation, so two quick messages cannot both spawn a thread. */
     const sessionChains = new Map<string, Promise<void>>();
-    function onSession(event: SessionEvent): void {
-      const run = (sessionChains.get(event.session) ?? Promise.resolve())
-        .then(() => handleSession(event))
-        .catch((error: unknown) => bb.log.warn(`Slack session ${event.session} failed: ${errorMessage(error)}`));
-      sessionChains.set(event.session, run);
-      void run.then(() => {
-        if (sessionChains.get(event.session) === run) sessionChains.delete(event.session);
+    function chain(key: string, run: () => Promise<void>): void {
+      const chained = (sessionChains.get(key) ?? Promise.resolve())
+        .then(run)
+        .catch((error: unknown) => bb.log.warn(`Slack ${key} failed: ${errorMessage(error)}`));
+      sessionChains.set(key, chained);
+      void chained.then(() => {
+        if (sessionChains.get(key) === chained) sessionChains.delete(key);
       });
+    }
+    function onSession(event: SessionEvent): void {
+      if (event.action === "invited") return chain(`invite ${event.channel}`, () => handleInvited(event));
+      if (event.action === "block_action") return chain(`block ${event.channel}`, () => handleBlockAction(event));
+      chain(`session ${event.session}`, () => handleSession(event));
     }
 
     /** A bb thread that went away stops answering its Slack conversation; the next message starts a new one. */
@@ -754,7 +926,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return { ok: true };
       },
       async setMap({ fallback, channels }) {
-        await bb.storage.kv.set(CHANNEL_MAP_KEY, { fallback, channels } satisfies ChannelMap);
+        await withMapLock(() => saveChannelMap({ fallback, channels }));
         return { ok: true };
       },
     });

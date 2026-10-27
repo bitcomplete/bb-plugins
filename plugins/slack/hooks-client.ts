@@ -121,8 +121,9 @@ const personWire = z.object({ id: z.string().max(200), name: z.string().max(200)
 export const sessionEventSchema = z
   .object({
     source: z.literal(SOURCE),
-    session: z.string().min(1).max(200),
-    action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed"]),
+    /** Empty on an `invited` or `block_action` wake: there is no conversation. */
+    session: z.string().max(200),
+    action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
     /** True for a channel app_mention, false for a DM or assistant-thread event. */
     mention: z.boolean().default(false),
     channel: z.string().min(1).max(200),
@@ -132,11 +133,22 @@ export const sessionEventSchema = z
      * thread lives in, so this is the only place the viewed channel appears.
      */
     contextChannel: z.string().max(200).default(""),
-    thread: z.string().min(1).max(200),
+    /** Empty on an `invited` or `block_action` wake: there is no thread. */
+    thread: z.string().max(200).default(""),
     asker: personWire,
     owner: personWire,
     fromOwner: z.boolean(),
     routedAs: z.string().max(100).default("owner"),
+    /** The clicked Block Kit action on a `block_action` wake; empty otherwise. */
+    actionId: z.string().max(200).default(""),
+    /** The clicked action's value on a `block_action` wake; empty otherwise. */
+    value: z.string().max(2000).default(""),
+    /**
+     * Slack's capability to replace the ephemeral prompt a `block_action` came
+     * from (ephemeral messages cannot be updated with `chat.update`). It is
+     * secret-like: it reaches this pod and is never logged.
+     */
+    responseUrl: z.string().max(2000).default(""),
     comment: z.object({ text: z.string(), untrusted: z.boolean() }).loose(),
     at: z.string().max(100).default(""),
   })
@@ -244,6 +256,27 @@ export function setTitle(fetchImpl: FetchLike, baseUrl: string, title: SessionTi
   return postJson(fetchImpl, baseUrl, `/v1/slack/sessions/${encodeURIComponent(title.session)}/title`, { connection: title.connection, title: title.title }, okSchema, "the Slack title", signal);
 }
 
+export type SessionEphemeral = {
+  connection: string;
+  /** The channel the wake delivered to this connection. */
+  channel: string;
+  /** The connection's own bound user; naming anyone else is refused. */
+  user: string;
+  text: string;
+  /** Optional Block Kit blocks; `text` is the fallback. */
+  blocks?: unknown[];
+};
+
+/**
+ * POST /v1/slack/ephemeral: post as the app an ephemeral message visible only
+ * to the connection's own bound user, in a channel a wake delivered here.
+ */
+export function postEphemeral(fetchImpl: FetchLike, baseUrl: string, ephemeral: SessionEphemeral, signal: AbortSignal): Promise<{ ok?: boolean }> {
+  const body: Record<string, unknown> = { connection: ephemeral.connection, channel: ephemeral.channel, user: ephemeral.user, text: ephemeral.text };
+  if (ephemeral.blocks !== undefined) body.blocks = ephemeral.blocks;
+  return postJson(fetchImpl, baseUrl, "/v1/slack/ephemeral", body, okSchema, "the Slack ephemeral message", signal);
+}
+
 // ---- the loop ----------------------------------------------------------------
 
 export interface HooksTiming {
@@ -307,6 +340,8 @@ export interface HooksLoop {
   status(session: string, status: string, signal: AbortSignal): Promise<void>;
   /** Set the assistant conversation title on a Slack session. */
   title(session: string, title: string, signal: AbortSignal): Promise<void>;
+  /** Post an ephemeral message, visible only to the connection's own bound user. */
+  ephemeral(ephemeral: Omit<SessionEphemeral, "connection">, signal: AbortSignal): Promise<void>;
   /** Mint a sign-in URL for this connection. Throws when there is no connection. */
   signinStart(signal: AbortSignal): Promise<SigninStartResponse>;
   /** Complete a sign-in flow on the connection that started it. */
@@ -464,6 +499,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async title(session, title, signal) {
       await setTitle(deps.fetch, deps.baseUrl, { session, connection: requireConnection(), title }, signal);
+    },
+
+    async ephemeral(ephemeral, signal) {
+      await postEphemeral(deps.fetch, deps.baseUrl, { connection: requireConnection(), ...ephemeral }, signal);
     },
 
     async signinStart(signal) {

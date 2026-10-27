@@ -25,6 +25,8 @@ function fakeHooks() {
   const messages: Array<{ session: string; body: Record<string, unknown> }> = [];
   const statuses: Array<{ session: string; body: Record<string, unknown> }> = [];
   const titles: Array<{ session: string; body: Record<string, unknown> }> = [];
+  const ephemerals: Array<Record<string, unknown>> = [];
+  const responses: Array<{ url: string; body: Record<string, unknown> }> = [];
   let botChannelRequests = 0;
   const state: {
     start: () => Response | Promise<Response>;
@@ -70,6 +72,16 @@ function fakeHooks() {
       botChannelRequests += 1;
       return state.botChannels();
     }
+    if (u === `${HOOKS_URL}/v1/slack/ephemeral`) {
+      ephemerals.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ ok: true });
+    }
+    // Slack's response_url: the plugin posts the replacement here, not through
+    // bb-gate-hooks, so it arrives as a plain Slack-host POST.
+    if (u.startsWith("https://hooks.slack.com/")) {
+      responses.push({ url: u, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+      return Response.json({ ok: true });
+    }
     const route = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/slack\/sessions\/([^/]+)\/(message|status|title)$/u.exec(u);
     if (route !== null) {
       const session = decodeURIComponent(route[1]!);
@@ -90,6 +102,8 @@ function fakeHooks() {
     messages,
     statuses,
     titles,
+    ephemerals,
+    responses,
     state,
     botChannelRequests: () => botChannelRequests,
     last: () => streams.at(-1)!,
@@ -204,7 +218,7 @@ async function setup(
   const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
-  return { bb, harness, hooks, slack, tool, text, advance: (ms: number) => (now += ms), now: () => now, factory };
+  return { bb, harness, hooks, slack, fetchImpl, tool, text, advance: (ms: number) => (now += ms), now: () => now, factory };
 }
 
 describe("Slack plugin", () => {
@@ -410,6 +424,176 @@ describe("Slack plugin", () => {
     const status = (await s.harness.callRpc("status")) as { fallback: string; channels: unknown };
     expect(status.fallback).toBe("Project One");
     expect(status.channels).toEqual([{ channel: "C0123", project: "Project Two" }]);
+    await s.stop();
+  });
+
+  it("asks the owner which project an unmapped channel uses when bb joins it", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "invited",
+        channel: "C0123",
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    // No bb thread runs for the prompt.
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    expect(s.hooks.ephemerals).toHaveLength(1);
+    const eph = s.hooks.ephemerals[0]!;
+    expect(eph).toMatchObject({ connection: "c_1", channel: "C0123", user: "U0123" });
+    const blocks = eph.blocks as Array<Record<string, unknown>>;
+    expect(JSON.stringify(blocks)).toContain("C0123");
+    const actions = blocks.find((b) => b.type === "actions") as { elements: Array<Record<string, unknown>> };
+    expect(actions.elements.map((e) => e.type)).toEqual(["static_select", "button"]);
+    const select = actions.elements[0] as { action_id: string; options: Array<{ value: string }> };
+    expect(select.action_id).toBe("bb_set_project");
+    expect(select.options.map((o) => o.value)).toEqual(["prj-1", "prj-2"]);
+    expect(JSON.stringify(blocks)).toContain("start a thread in the chosen project");
+    await s.stop();
+  });
+
+  it("does nothing when bb joins a channel that already has a routing row", async () => {
+    const s = await live({ map: { fallback: "Personal", channels: [{ channel: "C0123", project: "Project One" }] } });
+    s.hooks.last().send(s.hooks.session({ session: "", thread: "", action: "invited", channel: "C0123", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.hooks.ephemerals).toEqual([]);
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    await s.stop();
+  });
+
+  it("writes the routing row on a block_action and confirms through the response_url", async () => {
+    const s = await live();
+    const responseUrl = "https://hooks.slack.com/actions/T1/B1/secret-capability";
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: "bb_set_project",
+        value: "prj-1",
+        responseUrl,
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    expect((await s.harness.callRpc("status")) as { channels: unknown }).toMatchObject({ channels: [{ channel: "C0123", project: "Project One" }] });
+    expect(s.hooks.responses).toHaveLength(1);
+    expect(s.hooks.responses[0]!.url).toBe(responseUrl);
+    expect(s.hooks.responses[0]!.body).toMatchObject({ replace_original: true });
+    expect(String(s.hooks.responses[0]!.body.text)).toContain("Project One");
+    await s.stop();
+  });
+
+  it("refuses a block_action whose response_url is not a Slack hooks host", async () => {
+    const s = await live();
+    const evil = "https://evil.example/actions/T1/B1/steal";
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: "bb_set_project",
+        value: "prj-1",
+        responseUrl: evil,
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    // The row is still written; the prompt is simply not replaced.
+    expect((await s.harness.callRpc("status")) as { channels: unknown }).toMatchObject({ channels: [{ channel: "C0123", project: "Project One" }] });
+    expect(s.hooks.responses).toEqual([]);
+    expect((s.fetchImpl as unknown as { mock: { calls: Array<[string]> } }).mock.calls.some(([u]) => String(u) === evil)).toBe(false);
+    // The capability never reaches a log line.
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("steal");
+    await s.stop();
+  });
+
+  it("replies with one line for an unknown project or a stale click", async () => {
+    const responseUrl = "https://hooks.slack.com/actions/T1/B1/cap";
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ session: "", thread: "", action: "block_action", channel: "C0123", actionId: "bb_set_project", value: "nope", responseUrl, comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(String(s.hooks.responses.at(-1)?.body.text)).toContain("not on this server");
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([]);
+    await s.stop();
+
+    const mapped = await live({ map: { fallback: "Personal", channels: [{ channel: "C0123", project: "Project One" }] } });
+    mapped.hooks.last().send(mapped.hooks.session({ session: "", thread: "", action: "block_action", channel: "C0123", actionId: "bb_set_project", value: "prj-2", responseUrl, comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(String(mapped.hooks.responses.at(-1)?.body.text)).toContain("already set to Project One");
+    // The existing row is not overwritten.
+    expect(((await mapped.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([{ channel: "C0123", project: "Project One" }]);
+    await mapped.stop();
+  });
+
+  it("never writes the map on a block_action from someone other than the owner", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: "bb_set_project",
+        value: "prj-1",
+        responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "", untrusted: true },
+      }),
+    );
+    await tick();
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([]);
+    expect(String(s.hooks.responses.at(-1)?.body.text)).toContain("Only the person who invited bb");
+    await s.stop();
+  });
+
+  it("stays inert when an invited wake has no project to offer", async () => {
+    const s = await live({ projects: [] });
+    s.hooks.last().send(s.hooks.session({ session: "", thread: "", action: "invited", channel: "C0123", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.hooks.ephemerals).toEqual([]);
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    await s.stop();
+  });
+
+  it("clips a long project name to Slack's plain_text limit in the prompt", async () => {
+    const s = await live({ projects: [{ id: "prj-1", name: "p".repeat(120), kind: "standard" }] });
+    s.hooks.last().send(s.hooks.session({ session: "", thread: "", action: "invited", channel: "C0123", comment: { text: "", untrusted: false } }));
+    await tick();
+    const blocks = s.hooks.ephemerals[0]!.blocks as Array<Record<string, unknown>>;
+    const actions = blocks.find((b) => b.type === "actions") as { elements: Array<{ options: Array<{ text: { text: string } }> }> };
+    expect(actions.elements[0]!.options[0]!.text.text.length).toBeLessThanOrEqual(75);
+    await s.stop();
+  });
+
+  it("treats the Set button's own value as no choice, even for a project named 'set'", async () => {
+    const s = await live({
+      projects: [
+        { id: "prj-1", name: "set", kind: "standard" },
+        { id: "prj-2", name: "Personal", kind: "personal" },
+      ],
+    });
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: "bb_set_project",
+        value: "set",
+        responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([]);
+    expect(String(s.hooks.responses.at(-1)?.body.text)).toContain("Pick a project");
     await s.stop();
   });
 
