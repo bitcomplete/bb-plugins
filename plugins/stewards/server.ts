@@ -1209,7 +1209,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; visibility: string | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; sectionId: string | null };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; visibility: string | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; parentNotifications: string; sectionId: string | null };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
@@ -1226,6 +1226,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           environmentHostId: t.environment?.hostId ?? t.environmentHostId ?? null,
           providerId: String(t.providerId ?? ""),
           parentThreadId: t.parentThreadId ?? null,
+          parentNotifications: String(t.parentNotifications ?? "auto"),
           sectionId: t.sectionId ?? null,
         };
       } catch (error) {
@@ -1644,12 +1645,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * A steward is no thread's child. bb tells a parent every time a child
-     * finishes a turn, and a steward's parent — the project steward, or the
-     * parent ticket's steward — hears what it needs from the plugin instead:
-     * escalations, and a child's status when it moves. The hierarchy lives in
-     * the bindings. Stewards spawned before this were children; they are let
-     * go here, once per run.
+     * A steward is a child of the project steward, with parent notifications
+     * off: the sidebar trees it under the project steward, and bb does not wake
+     * the parent every time the steward finishes a turn. A steward spawned by
+     * an earlier version is parented with `auto`; that is set to `off` here,
+     * once per run, keeping the parent. A steward that is no thread's child is
+     * left alone: it nests only when it is next spawned (no migration).
      */
     const kept = new Set<string>();
     async function keepSteward(projectId: string, threadId: string): Promise<void> {
@@ -1658,11 +1659,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return;
       const parent = info.parentThreadId;
-      if (parent !== null && (store.byThread(parent) !== null || store.projectByThread(parent) !== null)) {
+      if (parent !== null && info.parentNotifications !== "off" && (store.byThread(parent) !== null || store.projectByThread(parent) !== null)) {
         try {
-          await bb.sdk.threads.update({ threadId, parentThreadId: null });
+          // The parent stays; only the notifications change, in this one call.
+          await bb.sdk.threads.update({ threadId, parentNotifications: "off" });
         } catch (error) {
-          bb.log.warn(`stewards: could not un-parent steward ${threadId}: ${errorMessage(error)}`);
+          bb.log.warn(`stewards: could not set parent notifications off for steward ${threadId}: ${errorMessage(error)}`);
           return;
         }
       }
@@ -1678,6 +1680,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const sectionId = await projectSection(b.projectId);
       const base = {
         projectId: b.projectId,
+        // A steward is the project steward's child, with parent notifications
+        // off: it trees under the project steward in the sidebar without waking
+        // it on every turn. The parent and the notification mode are set in the
+        // same spawn call, so a parented steward is never left on `auto`.
+        ...(projectThread === null ? {} : { parentThreadId: projectThread, parentNotifications: "off" as const }),
         ...(sectionId === null ? {} : { sectionId }),
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : b.kind === "ops" ? (b.title ?? `Ops watch: ${b.entityKey}`) : `${b.entityKey}: ${b.title ?? ""}`.trim(),
@@ -3944,10 +3951,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- thread events ---------------------------------------------------------------------------
     //
-    // Workers are started by stewards as top-level threads with
-    // `--lifecycle-owner-thread`, so they are recognized here through their
-    // lifecycle owner rather than a tool of their own. A thread an older
-    // steward made a child is still recognized by its parent.
+    // Workers are started by stewards with `--parent-self
+    // --parent-notifications off --lifecycle-owner-thread`, so they are
+    // recognized here through their lifecycle owner or their parent (the
+    // steward) rather than a tool of their own. A worker an older steward left
+    // with only the lifecycle owner is still recognized, and a nested worker
+    // is never taken for a reviewer: a reviewer's parent is a worker.
 
     /**
      * The post-spawn safety net: a worker whose provider, model, reasoning
@@ -3955,8 +3964,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * and the project's environment was started wrong — by a compacted
      * steward, a hand-run command or an old wake. Stop it, note why on the
      * binding with the command that would have been right, and wake the
-     * steward. A worker recognized by lifecycle owner or, for older stewards,
-     * by parent both come through here.
+     * steward. A worker recognized by lifecycle owner or by parent (the
+     * steward) both come through here.
      *
      * The model and reasoning level are read from the worker's own first
      * `client/turn/requested` event, the spawn's request as the server

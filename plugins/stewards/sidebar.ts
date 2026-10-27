@@ -3,12 +3,13 @@
 // effort's state / section / phrase, and ordering them. No React and no SDK, so
 // the component and its tests share exactly this code.
 //
-// Grouping comes from the steward relationship, not the thread tree. A worker
+// Grouping comes from the steward relationship, then the thread tree. A worker
 // belongs to its binding through the plugin's `workers` table, which the RPC
 // carries; a reviewer through its worker, which the RPC names. The thread tree
-// is used only for one-off threads, which have nothing else, and as a fallback
-// for a pre-BB-23 worker whose parent is its steward (BB-23 removed that link,
-// so it is a fallback, never the rule).
+// covers what the records do not: a one-off thread's children, and a worker an
+// older steward left with only its lifecycle owner. Since BB-72 a worker's
+// parent is its steward and a reviewer's is its worker, so the fallback and
+// the records agree.
 
 import type { DeployState } from "./deploy.js";
 
@@ -393,9 +394,9 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     derive(effort);
   }
 
-  // The fallback the RPC records do not cover: a pre-BB-23 worker whose parent
-  // is its steward, and anything else a claimed thread owns. Run to a fixed
-  // point so a child of a fallback-attached thread lands too.
+  // The fallback the RPC records do not cover: a worker whose parent is its
+  // steward, and anything else a claimed thread owns. Run to a fixed point so
+  // a child of a fallback-attached thread lands too.
   for (let changed = true; changed; ) {
     changed = false;
     for (const t of threads) {

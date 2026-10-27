@@ -93,6 +93,26 @@ describe("stewards sidebar grouping", () => {
     expect(workers[0]!.children).toMatchObject([{ threadId: "thr_reviewer", role: "reviewer" }]);
   });
 
+  // BB-72: stewards nest under the project steward, workers under their
+  // steward, reviewers under their worker. The thread tree alone (parentOf)
+  // must produce that chain when the worker/reviewer records are absent.
+  it("nests steward, worker and reviewer from the thread tree, with the project steward at the tab root", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [
+        thread({ id: "thr_project" }),
+        thread({ id: "thr_steward", parentThreadId: "thr_project" }),
+        thread({ id: "thr_worker", parentThreadId: "thr_steward" }),
+        thread({ id: "thr_reviewer", parentThreadId: "thr_worker" }),
+      ],
+      data: [data({ projectId: "p1", projectStewardThreadId: "thr_project", bindings: [binding({ key: "ENG-1", threadId: "thr_steward" })] })],
+    });
+    expect(tabs[0]!.projectStewardThreadId).toBe("thr_project");
+    expect(tabs[0]!.efforts[0]!.children).toMatchObject([
+      { threadId: "thr_worker", role: "worker", children: [{ threadId: "thr_reviewer", role: "reviewer" }] },
+    ]);
+  });
+
   it("lands a pre-BB-23 worker whose parent is the steward with the steward, even with no workers record", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],

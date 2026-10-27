@@ -54,7 +54,7 @@ export const BRIEF_PREFIX =
 export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string; sectionId?: string | null }): string {
   const section = input.sectionId === null || input.sectionId === undefined ? "" : ` --section ${input.sectionId}`;
   return [
-    `bb thread spawn --project ${input.projectId} --lifecycle-owner-thread "$BB_THREAD_ID"${section}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
+    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${section}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
     "<the whole task>",
     "EOF",
   ].join("\n");
