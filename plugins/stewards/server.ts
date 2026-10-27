@@ -77,6 +77,7 @@ import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, apply
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
+import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
@@ -880,6 +881,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         problems.push(`could not read the repo set: ${errorMessage(error)}`);
       }
       return { projectId, file, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
+    }
+
+    // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
+
+    const guidanceIndexes = new Map<string, { at: number; value: GuidanceUnit[] }>();
+
+    /**
+     * Every paragraph of the project's `.bb` AGENTS.md and playbooks, read from
+     * committed HEAD and keyed by content hash. The index is derived, never
+     * stored: a hand-written unit is never written or retired by this plugin.
+     * A read failure leaves the last good index (or none) rather than stopping
+     * a citation; a citation that names no unit is reported unknown.
+     */
+    async function guidanceUnits(projectId: string, force = false): Promise<GuidanceUnit[]> {
+      const cached = guidanceIndexes.get(projectId);
+      if (!force && cached !== undefined && now() - cached.at < timing.configTtlMs) return cached.value;
+      let value: GuidanceUnit[] = [];
+      try {
+        const config = await loadConfig(projectId);
+        if (config !== null) {
+          const names = new Set<string>();
+          for (const playbook of Object.values(config.playbooks)) if (playbook !== null && playbook !== undefined) names.add(playbook.name);
+          if (config.depsAlerts !== null) names.add(config.depsAlerts.name);
+          if (config.depsPrs !== null) names.add(config.depsPrs.name);
+          const paths = ["AGENTS.md", ...[...names].map(playbookPath)];
+          const files = await readFiles(projectId, paths);
+          for (const path of paths) {
+            const content = files.get(path) ?? null;
+            if (content !== null) value.push(...parseGuidanceUnits(path, content));
+          }
+        }
+      } catch (error) {
+        bb.log.warn(`stewards: could not index the guidance of project ${projectId}: ${errorMessage(error)}`);
+        return cached?.value ?? [];
+      }
+      guidanceIndexes.set(projectId, { at: now(), value });
+      return value;
     }
 
     /** Every project with a stewards configuration. */
@@ -3309,11 +3347,41 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * The escalation's cluster key, computed from its playbook and question and
+     * written the first time (BB-35 steps 4/6). The after-the-fact ask needs it
+     * so the lesson recorded from the thread follow-up can settle the cluster.
+     */
+    function ensureEscalationCluster(x: Escalation): string {
+      if (x.clusterKey !== null) return x.clusterKey;
+      const b = x.bindingId === "" ? null : store.binding(x.bindingId);
+      const key = clusterKey(b?.playbook ?? null, x.question);
+      store.setEscalationCluster(x.id, key);
+      return key;
+    }
+
+    /**
+     * The cluster a lesson recorded for a binding settles (BB-35 step 6): the
+     * escalation it names, or the binding's outstanding after-the-fact ask
+     * (the one the project steward collected a why for in its thread). Null
+     * when neither exists, so an ordinary lesson is not linked to a cluster it
+     * did not answer. `settleClusterRationale` is the caller's next step.
+     */
+    function lessonClusterFor(bindingId: string | null, escalationId: string | null): string | null {
+      let x = escalationId === null ? null : store.escalation(escalationId);
+      // Only the after-the-fact follow-up's ask links a lesson to a cluster; an
+      // unanswered page box is not what the project steward is recording a why
+      // for.
+      if (x === null && bindingId !== null) x = store.escalationsAskedNotGiven(bindingId).find((e) => e.rationaleWanted === AFTER_THE_FACT_RATIONALE_WHY) ?? null;
+      return x === null ? null : ensureEscalationCluster(x);
+    }
+
+    /**
      * BB-35 step 4: cluster the escalations routed to the user under their
      * playbook. A question that repeats an earlier one is a repeat: the page
      * asks why, once per cluster, so the answer becomes a lesson. A cluster
-     * that already shows a box, or has been asked, is left alone — never twice
-     * for one cluster.
+     * that already shows a box, has been asked, or has a lesson from an
+     * after-the-fact thread follow-up is left alone — never twice for one
+     * cluster, across mechanisms (BB-35 step 6).
      */
     function applyRationaleClustering(config: ProjectConfig): void {
       const rows = store.openUserEscalations(config.projectId);
@@ -3332,8 +3400,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const [key, members] of byKey) {
         if (members.length < 2) continue;
         // A rationale supplied anywhere in the cluster settles it for good, so
-        // a repeat after the box was answered is not asked again.
-        if (store.escalationsByCluster(config.projectId, key).some((x) => x.rationaleGiven)) continue;
+        // a repeat after the box was answered is not asked again. A lesson the
+        // project steward recorded from the cluster's after-the-fact follow-up
+        // settles it too, across mechanisms (BB-35 step 6).
+        if (store.escalationsByCluster(config.projectId, key).some((x) => x.rationaleGiven) || store.lessonsByCluster(config.projectId, key).length > 0) continue;
         // One box at a time: if any open member already shows the box or has
         // been asked, the repeats are left alone.
         if (members.some((x) => x.rationaleWanted !== null || x.rationaleAsked)) continue;
@@ -3354,7 +3424,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // project steward asks why once after the fact, cited or not — unless
       // the page box already collected their reasoning.
       const fresh = store.escalation(x.id) ?? x;
-      if (!fresh.rationaleAsked && !fresh.rationaleGiven) store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+      if (!fresh.rationaleAsked && !fresh.rationaleGiven) {
+        // Give it a cluster key so the lesson the project steward records from
+        // the thread follow-up can settle it (BB-35 step 6).
+        ensureEscalationCluster(fresh);
+        store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+      }
       if (x.correctionsCounted || x.citedLessons.length === 0) return;
       store.recordCorrections(x.citedLessons);
       store.markEscalationCorrected(x.id);
@@ -3376,8 +3451,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (!comments.some((c) => commentDiffersFromRecommendation(c, viewer, x.recommendation))) continue;
         // BB-35 step 4: the owner's own unsigned comment that goes against the
         // recommendation is the after-the-fact case too. Only the owner's words
-        // reach here; anyone else's comment never sets an ask.
-        if (!x.rationaleAsked) store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+        // reach here; anyone else's comment never sets an ask. A cluster key is
+        // written so the follow-up's lesson settles the cluster (BB-35 step 6).
+        if (!x.rationaleAsked) {
+          ensureEscalationCluster(x);
+          store.setEscalationRationale(x.id, AFTER_THE_FACT_RATIONALE_WHY);
+        }
         if (x.correctionsCounted || x.citedLessons.length === 0) continue;
         store.recordCorrections(x.citedLessons);
         store.markEscalationCorrected(x.id);
@@ -5522,7 +5601,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .array(z.string().trim().min(1).max(100))
           .max(20)
           .optional()
-          .describe("With resolve (or forward): the lesson ids (lsn_…) this decision rested on. A lesson's hits count once per distinct binding, and a later reversal of the decision counts a correction. Counts only — nothing is promoted or retired here."),
+          .describe("With resolve (or forward): the lesson ids (lsn_…) and hand-written guidance unit ids (gu_…, from AGENTS.md or a playbook at .bb HEAD) this decision rested on. A lesson's hits count once per distinct binding, and a later reversal of the decision counts a correction. A guidance unit's citations are counted the same way for the efficacy view. Counts only — nothing is promoted, retired or written here."),
         answer: z.string().trim().min(1).max(4000).optional().describe("With resolve and a question id: the user's answer, kept on the question."),
         ask: z
           .object({
@@ -5671,7 +5750,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const recordLesson = (bindingId: string | null, escalationId: string | null): string => {
             const projectThread = store.project(projectOf!).threadId;
             const branch = projectThread === null ? null : lessonBranchFor(projectThread);
-            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch, ...(input.lesson!.supersedes === undefined ? {} : { supersedes: input.lesson!.supersedes }) });
+            // BB-35 step 6: link the lesson to the cluster it answers and settle
+            // it, so the after-the-fact thread follow-up counts as the cluster's
+            // why even for a much-later page box.
+            const cluster = lessonClusterFor(bindingId, escalationId);
+            const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch, ...(cluster === null ? {} : { clusterKey: cluster }), ...(input.lesson!.supersedes === undefined ? {} : { supersedes: input.lesson!.supersedes }) });
+            if (cluster !== null) store.settleClusterRationale(projectOf!, cluster);
             return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. To land it now, add \`${withLessonAnchor(lesson.text, lesson.id)}\` to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
           };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
@@ -5840,15 +5924,31 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           done.push(...questionWrites(closing, target));
           if (input.lesson !== undefined) done.push(recordLesson(target.id, resolving?.id ?? closing?.question.escalationId ?? null));
           if (input.cites !== undefined) {
-            // BB-35 step 2: count the citation, and keep the lessons on the
-            // escalation so a later reversal can be attributed. Counts only:
-            // nothing is promoted, retired or written to `.bb` here.
-            const { cited, unknown } = store.recordCitations(target.projectId, input.cites, target.id);
+            // BB-35 steps 2 and 6: count the citation, and keep the lessons on
+            // the escalation so a later reversal can be attributed. A cite may
+            // name a lesson (`lsn_…`) or a hand-written guidance unit (`gu_…`),
+            // resolved against `.bb` HEAD. Counts only: nothing is promoted,
+            // retired or written to `.bb` here.
+            const unique = [...new Set(input.cites)];
+            const lessonIds = unique.filter((id) => !id.startsWith(GUIDANCE_UNIT_PREFIX));
+            const guidanceIds = unique.filter((id) => id.startsWith(GUIDANCE_UNIT_PREFIX));
+            const { cited, unknown } = store.recordCitations(target.projectId, lessonIds, target.id);
             const citeTarget = resolving ?? forwarding;
             if (citeTarget !== null) store.setEscalationCitations(citeTarget.id, cited.map((l) => l.id));
-            if (cited.length === 0) done.push("no lesson cited");
-            else done.push(`cited ${cited.length} lesson${cited.length === 1 ? "" : "s"}: ${cited.map((l) => `${l.id} (${l.hits} binding${l.hits === 1 ? "" : "s"})`).join(", ")}`);
+            const index = guidanceIds.length === 0 ? [] : await guidanceUnits(target.projectId);
+            const handWritten = new Map(index.filter((u) => u.lessonId === null).map((u) => [u.id, u]));
+            const citedUnits = guidanceIds.map((id) => handWritten.get(id)).filter((u): u is GuidanceUnit => u !== undefined);
+            const unknownUnits = guidanceIds.filter((id) => !handWritten.has(id));
+            if (citedUnits.length > 0) store.recordGuidanceCitations(target.projectId, citedUnits, target.id);
+            if (cited.length === 0 && citedUnits.length === 0) done.push("no lesson or guidance unit cited");
+            else {
+              const parts: string[] = [];
+              if (cited.length > 0) parts.push(`${cited.length} lesson${cited.length === 1 ? "" : "s"}: ${cited.map((l) => `${l.id} (${l.hits} binding${l.hits === 1 ? "" : "s"})`).join(", ")}`);
+              if (citedUnits.length > 0) parts.push(`${citedUnits.length} guidance unit${citedUnits.length === 1 ? "" : "s"}: ${citedUnits.map((u) => `${u.id} (${u.file})`).join(", ")}`);
+              done.push(`cited ${parts.join("; ")}`);
+            }
             if (unknown.length > 0) done.push(`not counted (no such lesson in this project): ${unknown.join(", ")}`);
+            if (unknownUnits.length > 0) done.push(`not counted (no such guidance unit at .bb HEAD): ${unknownUnits.join(", ")}`);
           }
           if (forwarding !== null) {
             const route = nextRoute(target, forwarding.route);
@@ -5905,8 +6005,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               store.setEscalationCluster(q.id, key);
               const cluster = store.escalationsByCluster(target.projectId, key);
               // A rationale supplied anywhere in the cluster settles it for good;
-              // an open box (or a shown one) means one is already being asked.
-              const settled = cluster.some((x) => x.rationaleGiven);
+              // an open box (or a shown one) means one is already being asked. A
+              // lesson recorded from the after-the-fact follow-up settles it too,
+              // so a much-later page box is not asked for a why already given.
+              const settled = cluster.some((x) => x.rationaleGiven) || store.lessonsByCluster(target.projectId, key).length > 0;
               const pending = cluster.some((x) => x.status === "open" && (x.rationaleWanted !== null || x.rationaleAsked));
               if (routineRationaleWanted({ kind: forwarding.kind, resolutionKind, entry: input.entry ?? null }) && !settled && !pending) {
                 store.setEscalationRationale(q.id, ROUTINE_RATIONALE_WHY);
@@ -6500,10 +6602,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           lessons: cliCommand({
-            summary: "Lessons the project steward recorded, and their state",
-            options: { all: { type: "boolean", description: "Include merged and dropped lessons" }, project: PROJECT_OPTION, json: JSON_OPTION },
+            summary: "Lessons the project steward recorded, their state, and the efficacy view",
+            options: {
+              all: { type: "boolean", description: "Include promoted and retired lessons" },
+              efficacy: { type: "boolean", description: "The project line: escalations reaching the user per week, and hand-written guidance units uncited for 90 days" },
+              project: PROJECT_OPTION,
+              json: JSON_OPTION,
+            },
             async run(input, ctx) {
               const projectId = projectOf(input.options.project, ctx);
+              if (input.options.efficacy) {
+                // BB-35 step 6: the project line that matters. Escalations that
+                // reached the user, bucketed by week, and the hand-written
+                // guidance nothing has cited in 90 days. Read-only: it names a
+                // suggestion, it never removes a unit.
+                const units = await guidanceUnits(projectId);
+                const uncited = uncitedGuidanceUnits(units, store.guidanceCitations(projectId), now());
+                // One count per user-facing item: a forwarded escalation is
+                // represented by the question the user saw, not both. The
+                // question's creation is when it reached them.
+                const all = store.escalationsForProject(projectId);
+                const covered = new Set(all.map((x) => x.forwardedFrom).filter((id): id is string => id !== null));
+                const reaching = all.filter((x) => x.route === "me" && (x.isQuestion || !covered.has(x.id)));
+                const weeks = escalationWeeks(reaching.map((x) => x.createdAt), now());
+                if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ weeks, uncited: uncited.map((u) => ({ id: u.unit.id, file: u.unit.file, heading: u.unit.heading, text: u.unit.text, lastCitedAt: u.lastCitedAt })) }) };
+                const lines = ["Escalations reaching the user, per week (oldest first):", ...weeks.map((w) => `  ${iso(w.start).slice(0, 10)}  ${w.count}`)];
+                lines.push("", `Hand-written guidance units uncited for ${GUIDANCE_UNCITED_DAYS} days (consider removing):`);
+                if (uncited.length === 0) lines.push("  none");
+                for (const u of uncited) {
+                  const snippet = u.unit.text.replace(/\s+/gu, " ").slice(0, 120);
+                  lines.push(`  ${u.unit.id}  ${u.unit.file}${u.unit.heading === null ? "" : ` §${u.unit.heading}`}  ${u.lastCitedAt === null ? "(never cited)" : `(last cited ${iso(u.lastCitedAt).slice(0, 10)})`}\n    ${snippet}`);
+                }
+                return { exitCode: 0, stdout: lines.join("\n") };
+              }
               const rows = store.lessons(projectId, input.options.all ?? false);
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows) };
               if (rows.length === 0) return { exitCode: 0, stdout: "No pending lessons." };
@@ -6514,7 +6645,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     const b = l.bindingId === null ? null : store.binding(l.bindingId);
                     const source = [b === null ? null : `from ${b.entityKey}`, l.escalationId].filter((x) => x !== null).join(", ");
                     const landed = l.status === "merged" ? `${l.mergeSha === null ? "merged" : `merged at ${l.mergeSha.slice(0, 8)}`}${l.branch === null ? "" : ` on ${l.branch}`}` : l.status;
-                    return `${l.id} — ${l.tier} (${landed}), ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
+                    // The counters the lifecycle runs on (BB-35 step 6): hits
+                    // (distinct bindings), corrections, when it was last cited,
+                    // and when it entered its current tier.
+                    const counts = `${l.hits} binding${l.hits === 1 ? "" : "s"}, ${l.corrections} correction${l.corrections === 1 ? "" : "s"}, last cited ${l.lastCitedAt === null ? "never" : iso(l.lastCitedAt).slice(0, 10)}${l.tierAt === null ? "" : `, ${l.tier} since ${iso(l.tierAt).slice(0, 10)}`}`;
+                    return `${l.id} — ${l.tier} (${landed}), ${l.scope}, ${l.file}${source === "" ? "" : ` (${source})`}\n  ${counts}${l.note === null ? "" : ` — ${l.note}`}\n  ${l.text}`;
                   })
                   .join("\n"),
               };

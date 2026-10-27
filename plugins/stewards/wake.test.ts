@@ -93,8 +93,8 @@ describe("a steward's wake", () => {
     const binding = bind("ENG-12");
     const x = s.escalate({ bindingId: binding.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "steward", recommendation: null });
     const wake = formatWake(wakeInput({ binding, routedToMe: [{ escalation: x, from: binding }] }));
-    expect(wake).toMatch(/resolve, cites: \[lesson ids\]/u);
-    expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/resolve, cites: \[lesson ids or guidance unit ids\]/u);
+    expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids or guidance unit ids\]/u);
   });
 
   it("names the reviewer's sha and the head when the approval is on an earlier commit", () => {
@@ -181,10 +181,10 @@ describe("the nightly prompt", () => {
     const b = bind("ENG-12");
     const x = s.escalate({ bindingId: b.id, kind: "decision", question: "Include SSO?", meanwhile: "Wait.", route: "project", recommendation: null });
     const wake = formatProjectWake({ reason: "escalation", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
-    expect(wake).toMatch(/cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/cites: \[ids\]/u);
     expect(wake).toMatch(/a decision must cite what it was decided from/u);
     // A forward can cite too: the recommendation a correction is measured against lives there.
-    expect(wake).toMatch(/forward, recommendation, cites: \[lesson ids\]/u);
+    expect(wake).toMatch(/forward, recommendation, cites: \[ids\]/u);
   });
 
   it("injects trial lessons under their own heading and never a candidate (BB-35 step 3)", () => {

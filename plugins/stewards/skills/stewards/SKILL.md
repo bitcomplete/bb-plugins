@@ -311,9 +311,16 @@ arrives with the answer. When you forward one of the project's big
 decisions, name it with `entry: "<the entry>"` so the page does not ask. When
 their answer goes against your recommendation you are woken once, in your
 thread, to ask why — one follow-up, then record the reasoning as a lesson
-candidate. A resolve carries `cites: [lesson ids]`, the lessons the
-decision rested on; the plugin counts hits (once per distinct binding),
-corrections and last citation from them. A recorded lesson starts as a
+candidate. That lesson carries the escalation's cluster key and settles the
+cluster for good, so the same why is never asked on the page again even after
+a much later repeat. A resolve carries `cites: [ids]`: the lessons (`lsn_…`)
+and the hand-written guidance units (`gu_…`, a paragraph of `AGENTS.md` or a
+playbook keyed by a hash of its own text) the decision rested on. The plugin
+counts hits (once per distinct binding), corrections and last citation from
+them. Only an anchored `<!-- lesson:<id> -->` block is ever written or
+removed; a hand-written unit is never retired. `bb stewards lessons [--all]`
+shows each lesson's counts and `bb stewards lessons --efficacy` prints the
+escalation-to-user trend and the hand-written units uncited for 90 days. A recorded lesson starts as a
 `trial`: it is injected into wakes under `## Lessons (trial)` and stays in
 the store until the nightly pass promotes it (3 distinct-binding hits, no
 corrections, 14 days) or retires it (30 days uncited, or a correction); a
