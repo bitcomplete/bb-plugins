@@ -60,6 +60,7 @@ function world() {
   const github = {
     comment: async (repo: string, number: number, body: string) => {
       githubComments.push({ repo, number, body });
+      return `IC_${githubComments.length}`;
     },
     squashMerge: async (repo: string, number: number, title: string, body: string) => {
       githubMerges.push({ repo, number, title, body });
@@ -3757,14 +3758,78 @@ describe("needs you items", () => {
     const userEntry = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "Granting a new credential, token or cluster access, or widening what an existing one can reach" }, t.project);
     expect(userEntry.error).toBe(true);
     expect(userEntry.text).toMatch(/forward/u);
-    // A `project` entry is recorded, bound to the head sha, only in the store.
+    // A `project` entry is recorded, bound to the head sha, and the plugin
+    // posts the signed marker on the pull request (BB-77).
     const approved = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
     expect(approved.error).toBe(false);
-    expect(t.hooks.store.projectApproval(b.id, "aaaaaaa1")).toMatchObject({ entry: "A cross-repo contract other repos implement", byThread: t.project });
-    expect(t.githubComments).toEqual([]);
-    // A new push is a new sha: there is no approval for it.
+    expect(t.hooks.store.projectApproval(b.id, "aaaaaaa1")).toMatchObject({ entry: "A cross-repo contract other repos implement", byThread: t.project, verdict: "approved" });
+    expect(t.githubComments).toHaveLength(1);
+    expect(t.githubComments[0]!.body).toMatch(/^<!-- bb-approval by=project-steward sha=aaaaaaa1 entry="A cross-repo contract other repos implement" -->/u);
+    expect(t.githubComments[0]!.body).toMatch(/_— from bb thread .+_/u);
+    // The record is tied to the marker's comment id, so a hand-typed lookalike never counts.
+    expect(t.hooks.store.projectApproval(b.id, "aaaaaaa1")).toMatchObject({ commentId: "IC_1" });
+    // A new push is a new sha: the store's exact-sha lookup is null again (the
+    // marker survives, so the lane gate still reads it as approved).
     t.entities.set("acme/web#7", pull({ comments: [marker] }, { checks: { state: "success", failing: [] }, headSha: "bbbbbbb2" }));
     expect(t.hooks.store.projectApproval(b.id, "bbbbbbb2")).toBeNull();
+  });
+
+  it("wakes the pull request's worker when the project steward approves, so it merges without the owner (BB-77)", async () => {
+    const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
+    const t = await withPull([marker, workerComment]);
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the owner's approval.");
+    const before = t.sends.filter((s) => s.threadId === "thr_w1").length;
+    const b = t.binding();
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval")!;
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(res.error).toBe(false);
+    const sent = t.sends.filter((s) => s.threadId === "thr_w1");
+    expect(sent).toHaveLength(before + 1);
+    expect(sent.at(-1)!.text).toMatch(/The project steward approved acme\/web#7/u);
+    expect(sent.at(-1)!.text).toMatch(/merge it now/u);
+    expect(t.hooks.store.escalation(esc.id)!.status).toBe("resolved");
+  });
+
+  it("wakes the ticket steward when the worker has ended before the approval lands (BB-77)", async () => {
+    const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
+    const t = await withPull([marker, workerComment]);
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Done for now.");
+    t.threads.get("thr_w1")!.archivedAt = 1;
+    const before = t.sends.filter((s) => s.threadId === t.steward).length;
+    const res = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(res.error).toBe(false);
+    expect(t.sends.filter((s) => s.threadId === "thr_w1")).toHaveLength(0);
+    await t.flush();
+    const wakes = t.sends.filter((s) => s.threadId === t.steward);
+    expect(wakes.length).toBeGreaterThan(before);
+    expect(wakes.at(-1)!.text).toMatch(/The project steward approved acme\/web#7/u);
+    expect(wakes.at(-1)!.text).toMatch(/section 4c/u);
+  });
+
+  it("posts a declined marker and tells the worker to treat it as a change request (BB-77)", async () => {
+    const workerComment = comment({ id: "w1", author: "trotterdylan", body: "Independent review running in bb thread @thread:thr_w1.", signedBy: "thr_w1", createdAt: "2026-10-14T16:05:00Z" });
+    const t = await withPull([marker, workerComment]);
+    t.githubFiles.set("acme/web#7", ["bb-gate/docs/hooks.md"]);
+    await t.ring("linear", "uuid-12");
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    await t.idle("thr_w1", "Waiting on the project steward.");
+    const b = t.binding();
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    const res = await t.tool("steward_update", { binding: "ENG-12", guidance: "Needs a test for the contract first.", resolve: esc.id }, t.project);
+    expect(res.error).toBe(false);
+    const posted = t.githubComments.at(-1)!;
+    expect(posted.body).toMatch(/^<!-- bb-approval by=project-steward sha=aaaaaaa1 verdict=declined -->/u);
+    expect(posted.body).toMatch(/Needs a test for the contract first\./u);
+    expect(t.hooks.store.projectApprovals(b.id).at(-1)).toMatchObject({ verdict: "declined", commentId: "IC_1" });
+    const sent = t.sends.filter((s) => s.threadId === "thr_w1");
+    expect(sent.at(-1)!.text).toMatch(/The project steward declined acme\/web#7/u);
+    expect(sent.at(-1)!.text).toMatch(/change request/u);
   });
 
   it("bb stewards escalate from a worker files an escalation on its binding and wakes the steward (BB-30)", async () => {

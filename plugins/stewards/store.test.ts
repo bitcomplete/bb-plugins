@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
 
 function store() {
   const db = new Database(":memory:");
@@ -242,6 +242,7 @@ describe("lesson citation counts (BB-35 step 2)", () => {
     for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     for (const sql of VALIDATION_MIGRATIONS) db.exec(sql);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.lesson("lsn_old")).toMatchObject({
       id: "lsn_old",
@@ -283,6 +284,7 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     for (const sql of VALIDATION_MIGRATIONS) db.exec(sql);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -309,11 +311,13 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     // `bb.storage.migrate` records each statement by index and refuses a changed
     // one; a group spliced in mid-array would fail every live database on load.
     // BB-35 step 4 appended the rationale group, step 5 the validation group,
-    // step 6 the guidance group, and BB-83 the idle group, after this one.
-    expect(MIGRATIONS.slice(-IDLE_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -IDLE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
-    const afterTier = IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length + RATIONALE_MIGRATIONS.length;
+    // step 6 the guidance group, BB-83 the idle group, and BB-77 the approval
+    // marker group, after this one.
+    expect(MIGRATIONS.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
+    const afterTier = APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length + RATIONALE_MIGRATIONS.length;
     expect(MIGRATIONS.slice(-(afterTier + LESSON_TIER_MIGRATIONS.length), -afterTier)).toEqual([...LESSON_TIER_MIGRATIONS]);
   });
 });
@@ -331,6 +335,7 @@ describe("the rationale migration (BB-35 step 4)", () => {
     for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     for (const sql of VALIDATION_MIGRATIONS) db.exec(sql);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -376,6 +381,7 @@ describe("the validation migration (BB-35 step 5)", () => {
              VALUES ('lsn_1', 'p1', 'bnd_1', NULL, 'AGENTS.md', 'A rule.', 'procedure', 'pending', 'trial', 1000, 2, 1, 1000, 1000)`);
     for (const sql of VALIDATION_MIGRATIONS) db.exec(sql);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     return db;
   };
 
@@ -437,6 +443,7 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
     db.exec(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at, project_id)
              VALUES ('esc_1', 'bnd_1', 'decision', 'Include SSO?', 'Wait.', 'me', 'open', 1000, 'p1')`);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     expect(s.escalation("esc_1")).toMatchObject({ id: "esc_1", question: "Include SSO?", projectId: "p1" });
     expect(s.guidanceCitations("p1")).toEqual([]);
@@ -448,6 +455,7 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   it("counts a guidance unit once per distinct binding, refreshing last cited on a repeat", () => {
     const db = legacy();
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     let now = 2000;
     const s = createStore(db, () => now);
     const unit = { id: "gu_aaaaaaaaaaaaaaaa", file: "AGENTS.md", text: "A rule." };
@@ -468,6 +476,7 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   it("settles a cluster for good and links the lesson that answers it", () => {
     const db = legacy();
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     db.exec(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at, project_id, cluster_key)
              VALUES ('esc_1', 'bnd_1', 'decision', 'Include SSO?', 'Wait.', 'me', 'open', 1000, 'p1', 'k1'),
@@ -483,6 +492,7 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   it("reads a binding's unanswered after-the-fact asks, newest first", () => {
     const db = legacy();
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2000);
     db.exec(`INSERT INTO escalations (id, binding_id, kind, question, meanwhile, route, status, created_at, project_id, rationale_asked, rationale_given)
              VALUES ('esc_old', 'bnd_1', 'decision', 'Old?', 'Wait.', 'me', 'open', 1000, 'p1', 1, 0),
@@ -494,9 +504,10 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    expect(MIGRATIONS.slice(-IDLE_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -IDLE_MIGRATIONS.length)).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
   });
 });
 
@@ -518,7 +529,7 @@ describe("a worker's pending model check", () => {
 
   it("reads workers from before the column existed as not pending", () => {
     const db = new Database(":memory:");
-    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS]) db.exec(sql);
+    for (const sql of [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS]) db.exec(sql);
     db.exec(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, created_at)
              VALUES ('bnd_1', 'p1', 'linear', 'uuid-12', 'ENG-12', 'ticket', 'linear-tickets', 'v1', 1000)`);
     db.exec(`INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES ('thr_old', 'bnd_1', 'ENG-12: Implement', 'running', 1000)`);
@@ -560,6 +571,7 @@ describe("the escalation-chain migration (BB-30)", () => {
     for (const sql of RATIONALE_MIGRATIONS) db.exec(sql);
     for (const sql of VALIDATION_MIGRATIONS) db.exec(sql);
     for (const sql of GUIDANCE_MIGRATIONS) db.exec(sql);
+    for (const sql of APPROVAL_MARKER_MIGRATIONS) db.exec(sql);
     let now = 2000;
     return { db, s: createStore(db, () => now) };
   }

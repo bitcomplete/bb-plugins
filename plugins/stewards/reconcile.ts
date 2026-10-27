@@ -421,6 +421,94 @@ export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: 
   return { approved: at !== null, at };
 }
 
+// ---- the project steward's approval marker --------------------------------------------
+
+/**
+ * A project steward's `bb-approval` marker, as the plugin posts it on a pull
+ * request: `<!-- bb-approval by=project-steward sha=<sha> entry=<text> [verdict=declined] -->`.
+ * `entry` is quoted when it contains whitespace. `verdict` is null on an
+ * approval and `declined` on a decline.
+ */
+export type ProjectApprovalMarker = { by: string; sha: string; entry: string | null; verdict: string | null };
+
+/**
+ * The plugin's own record of an approval marker it posted: the GitHub comment
+ * id of the marker and the verdict it carried. A marker on the pull request
+ * counts only when its comment id is in the store's records, so a hand-typed
+ * lookalike (a different comment id) never satisfies the gate.
+ */
+export type ProjectApprovalRecord = { commentId: string | null; verdict: string };
+
+const APPROVAL_MARKER = /^<!--\s*bb-approval\b([^>]*?)-->/u;
+const MARKER_ATTR = /([A-Za-z][A-Za-z0-9_-]*)=(?:"((?:[^"\\]|\\.)*)"|(\S+))/gu;
+
+/** Quote a marker attribute value when it contains whitespace or a delimiter. */
+function markerAttr(value: string): string {
+  return /[\s"<>]/u.test(value) ? JSON.stringify(value) : value;
+}
+
+function unescapeMarker(value: string): string {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value;
+  }
+}
+
+/** The first line of a project-steward approval marker, as the plugin posts it. */
+export function approvalMarkerLine(fields: { sha: string; entry: string | null; verdict: "approved" | "declined" }): string {
+  const attrs = ["by=project-steward", `sha=${fields.sha}`];
+  if (fields.entry !== null && fields.entry.trim() !== "") attrs.push(`entry=${markerAttr(fields.entry.trim())}`);
+  if (fields.verdict === "declined") attrs.push("verdict=declined");
+  return `<!-- bb-approval ${attrs.join(" ")} -->`;
+}
+
+/**
+ * The project-steward approval marker on a comment, or null for any other
+ * comment. Any first line that opens a `bb-approval` comment is read, however
+ * its keys are spelled; an unreadable one is still a marker (with no verdict),
+ * so it never counts as an approval.
+ */
+export function projectApprovalMarker(body: string): ProjectApprovalMarker | null {
+  const first = body.split("\n", 1)[0]!.trim();
+  const m = APPROVAL_MARKER.exec(first);
+  if (m === null) return null;
+  const attrs = new Map<string, string>();
+  for (const t of m[1]!.matchAll(MARKER_ATTR)) attrs.set(t[1]!.toLowerCase(), t[2] !== undefined ? unescapeMarker(t[2]) : t[3]!);
+  return { by: attrs.get("by") ?? "", sha: attrs.get("sha") ?? "", entry: attrs.get("entry") ?? null, verdict: attrs.get("verdict") ?? null };
+}
+
+/**
+ * The newest `bb-approval` marker whose comment id the plugin itself recorded,
+ * by comment time. A marker with an id the store does not hold is a lookalike
+ * someone typed and is skipped.
+ */
+export function latestProjectApprovalMarker(comments: readonly SnapshotComment[], recordedCommentIds: ReadonlySet<string>): { marker: ProjectApprovalMarker; comment: SnapshotComment } | null {
+  let at = "";
+  let latest: { marker: ProjectApprovalMarker; comment: SnapshotComment } | null = null;
+  for (const c of comments) {
+    if (!recordedCommentIds.has(c.id)) continue;
+    const marker = projectApprovalMarker(c.body);
+    if (marker === null) continue;
+    if (c.createdAt >= at) {
+      at = c.createdAt;
+      latest = { marker, comment: c };
+    }
+  }
+  return latest;
+}
+
+/**
+ * The worker thread that posted build-tickets' "Independent review running"
+ * comment, or null. The worker is told the approval landed so it merges
+ * without a `github_watch` on the owner.
+ */
+export function reviewWorkerThread(comments: readonly SnapshotComment[]): string | null {
+  let found: string | null = null;
+  for (const c of comments) if (c.signedBy !== null && c.body.includes("Independent review running")) found = c.signedBy;
+  return found;
+}
+
 /**
  * The lane gate from the build-tickets skill, in one place: the reviewer's
  * latest marker has verdict `approved`, every check has passed, and, in the
@@ -449,16 +537,16 @@ export type PrGate = {
   needsProjectApproval: boolean;
   /** The decide mark applied to this pull request; `user` unless the project steward classified it under a `project` entry. */
   decision: "project" | "user";
-  /** Whether the project steward recorded an approval bound to this head sha. */
+  /** Whether the plugin posted a project-steward approval marker on this pull request. */
   projectApproved: boolean;
 };
 
-/** The project steward's side of the gate: the decide mark and the recorded approval. */
+/** The project steward's side of the gate: the decide mark and the plugin's own approval records. */
 export type PrGateOptions = {
   /** The mark for the entry the project steward classified the pull request under; omitted is `user` (fail closed). */
   decision?: "project" | "user";
-  /** Whether a project-steward approval exists in the store for this head sha. */
-  projectApproved?: boolean;
+  /** The plugin's own `project_approvals` records for this binding, matched to the marker by comment id. */
+  projectApprovals?: readonly ProjectApprovalRecord[];
 };
 
 export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate {
@@ -473,12 +561,25 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
   // Only an explicit `no-review` marker skips the owner; a marker the plugin
   // cannot read, or an unknown lane, is the user's (fail closed).
   const ownerLane = lane !== "no-review";
+  // The project steward's decision is the plugin's own record AND the marker
+  // it posted: only a `bb-approval` comment whose id the plugin recorded
+  // counts, so a hand-typed lookalike (a different comment id) never does.
+  // Every record is kept, declines included: the newest matching marker's
+  // verdict decides, so a decline at a later sha revokes an earlier approval
+  // rather than leaving its marker as the latest word. The record's head sha
+  // is not compared with the current head: a decision is of the pull request,
+  // and a later head is covered unless the worker added scope (AGENTS.md,
+  // "What counts as an approval").
+  const recorded = new Map((opts.projectApprovals ?? []).filter((r) => r.commentId !== null).map((r) => [r.commentId!, r.verdict] as const));
+  const approval = latestProjectApprovalMarker(entity.comments, new Set(recorded.keys()));
+  const approvalVerdict = approval === null ? null : (approval.marker.verdict ?? recorded.get(approval.comment.id) ?? "approved");
+  const projectApprovedRaw = approvalVerdict !== null && approvalVerdict !== "declined";
   // The gate belongs to whoever the decide list names. An explicit decision
-  // wins; without one, a recorded project approval means the project steward
-  // (a project approval is only ever recorded for a `project` entry), and
+  // wins; without one, a project approval means the project steward (a
+  // project approval is only ever recorded for a `project` entry), and
   // everything else is the user's (fail closed).
-  const decision: "project" | "user" = opts.decision === "project" || (opts.decision === undefined && opts.projectApproved === true) ? "project" : "user";
-  const projectApproved = opts.projectApproved === true && decision === "project";
+  const decision: "project" | "user" = opts.decision === "project" || (opts.decision === undefined && projectApprovedRaw) ? "project" : "user";
+  const projectApproved = projectApprovedRaw && decision === "project";
   const approved = decision === "project" ? projectApproved : owner.approved;
   const approvalNeeded = ownerLane && markerApproved && checksGreen && !approved;
   const gateMet = pull !== null && markerApproved && checksGreen && (!ownerLane || approved);

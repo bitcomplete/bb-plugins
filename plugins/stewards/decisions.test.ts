@@ -60,6 +60,14 @@ describe("the decide list fails closed", () => {
     expect(decideForPull([], decisions)).toBe("user");
     expect(decideForPull(null, decisions)).toBe("user");
     expect(decideForPull(["bb-plugins/plugins/stewards/store.ts"], decisions)).toBe("user");
+    // An identity path no project entry names is already the user's, whether or
+    // not a `user` entry lists it (BB-77).
+    const identity: BigDecision[] = [
+      { text: "Identity and access", decide: "user", paths: ["bb-gate/router/**"] },
+      { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    expect(decideForPull(["bb-gate/router/routes.go"], identity)).toBe("user");
+    expect(decideForPull(["bb-gate/docs/hooks.md"], identity)).toBe("project");
   });
 
   it("gives the failed files fetch its own refusal text, not the self-widening one (BB-51)", () => {

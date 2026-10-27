@@ -56,7 +56,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalMarkerLine, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, reviewWorkerThread, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -745,11 +745,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
       rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
 
-    /** Whether the project steward recorded an approval for this binding's current pull-request head. */
-    const projectApprovedFor = (b: Binding, entity: EntitySnapshot): boolean => {
-      const sha = entity.pull?.headSha ?? null;
-      return sha !== null && store.projectApproval(b.id, sha) !== null;
-    };
+    /** The plugin's own project-steward approval records for a binding; the gate matches a posted marker to one by comment id. */
+    const projectApprovalsFor = (b: Binding) => store.projectApprovals(b.id);
 
     /** The repo-relative paths a pull request changes, or null when they cannot be read (which fails closed to the user). */
     async function pullChangedFiles(entity: EntitySnapshot): Promise<string[] | null> {
@@ -1882,11 +1879,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         changes,
         needs: store.openNeeds(b.id),
         own: ownThreads(b),
-        projectApprovedShas: new Set(
-          [observed.entity, ...observed.pulls]
-            .map((e) => e.pull?.headSha)
-            .filter((sha): sha is string => sha !== null && sha !== undefined && store.projectApproval(b.id, sha) !== null),
-        ),
+        projectApprovals: projectApprovalsFor(b),
         label: config.file.label,
         conflicts: conflictsOf(b, store.open(b.projectId)),
         deployments: b.deployments,
@@ -3785,6 +3778,46 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const shortSha = (sha: string | null | undefined) => (sha === null || sha === undefined ? "?" : sha.slice(0, 7));
 
+    /**
+     * Post the plugin's `bb-approval` marker on a pull request as `byThread`
+     * and return the GitHub comment id. The marker is signed, so
+     * `ownerApproval` never reads it as the owner's unsigned approval, and the
+     * returned id is what the lane gate matches the store's record against.
+     */
+    async function postApprovalMarker(entity: EntitySnapshot, byThread: string, fields: { headSha: string; entry: string | null; verdict: "approved" | "declined"; reasoning: string }): Promise<string> {
+      const ref = parsePullRef(entity.url ?? entity.key);
+      if (ref === null) throw new Error(`I cannot tell which pull request ${entity.key} is.`);
+      if (fields.headSha.trim() === "") throw new Error("The pull request's head sha is not known yet, so the marker cannot name it. Retry once the pull request has been observed.");
+      const body = [approvalMarkerLine({ sha: fields.headSha, entry: fields.entry, verdict: fields.verdict }), "", fields.reasoning.trim(), "", signatureLine(byThread)].join("\n");
+      return github.comment(ref.repo, ref.number, body);
+    }
+
+    /**
+     * Tell the pull request's worker the project steward's decision landed, so
+     * it merges (or reworks) without a `github_watch` on the owner. The worker
+     * is the thread that posted build-tickets' "Independent review running"
+     * comment, or the newest worker still in flight. When it has ended and
+     * cannot be reached, the ticket steward is woken with the decision under
+     * "What changed" and starts a fresh worker at section 4c.
+     */
+    async function deliverProjectApproval(b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }): Promise<"worker" | "steward"> {
+      const signed = reviewWorkerThread(entity.comments);
+      const thread = (signed !== null && store.worker(signed)?.bindingId === b.id ? signed : null) ?? [...store.workers(b.id)].reverse().find((w) => workerInFlight(w))?.threadId ?? null;
+      const info = thread === null ? null : await threadInfo(thread).catch(() => null);
+      const label = decision.verdict === "approved" ? "approved" : "declined";
+      const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
+      const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets section 4c), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
+      if (info !== null && info.deletedAt === null && info.archivedAt === null) {
+        if ((await sendTo(thread!, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
+          store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}; its worker was told.`, true);
+          return "worker";
+        }
+      }
+      store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning} Start a worker at build-tickets section 4c ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
+      scheduleReconcile(b.id);
+      return "steward";
+    }
+
     /** Every pull request a binding observes: a pr binding's own entity, and a ticket's linked pulls. */
     function observedPulls(b: Binding, observed: Observed): EntitySnapshot[] {
       const own = observed.entity.pull === null ? [] : [observed.entity];
@@ -3948,11 +3981,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the change touches is the project steward's, and everything else is
         // the user's, filed on the page at once (BB-51). The files are read only
         // when the lane actually waits on an approval.
-        const preliminary = prGate(pull, { projectApproved: projectApprovedFor(b, pull) });
+        const preliminary = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
         let g = preliminary;
         if (preliminary.lane !== "no-review" && preliminary.marker?.verdict === "approved" && preliminary.checksGreen && !preliminary.ownerApproved && !preliminary.projectApproved) {
           const files = await pullChangedFiles(pull);
-          g = prGate(pull, { decision: decideForPull(files, decisions), projectApproved: projectApprovedFor(b, pull) });
+          g = prGate(pull, { decision: decideForPull(files, decisions), projectApprovals: projectApprovalsFor(b) });
         }
         const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
         const approvalEsc = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
@@ -5021,7 +5054,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const ref = parsePullRef(need.url);
           if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
           const pull = await freshPull();
-          const gate = pull === null ? null : prGate(pull, { projectApproved: pull === null ? false : projectApprovedFor(b, pull) });
+          const gate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(b) });
           if (pull === null || gate === null || !gate.gateMet) return { ok: false, message: `The gate is not met: ${gate?.missing ?? "the pull request could not be read"}.` };
           if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
           const lane = gate.lane ?? "no-review";
@@ -5670,7 +5703,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // The decide list places the pull request, so a steward cannot
               // file the user's item for the project steward's lane (BB-51).
               const decision = pull === undefined ? "user" : decideForPull(await pullChangedFiles(pull), config?.file.bigDecisions ?? []);
-              const gate = pull === undefined ? null : prGate(pull, { decision, projectApproved: projectApprovedFor(b, pull) });
+              const gate = pull === undefined ? null : prGate(pull, { decision, projectApprovals: projectApprovalsFor(b) });
               const holdable = gate !== null && (n.kind === "approve-pr" ? gate.needsOwnerApproval : gate.gateMet);
               if (!holdable) {
                 refused.push(`${n.kind} for ${url === "" ? "the pull request" : url} not filed: ${gate?.missing ?? "the pull request has not been observed yet"}. The owner is asked only once the reviewer's marker says approved; the worker must run the build-tickets review loop first.`);
@@ -6024,11 +6057,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const why = decideForRefusal(files, input.entry ?? null, config.file.bigDecisions) ?? "the change is not the project steward's to approve";
                 return toolError(new Error(`That pull request is the user's to approve: ${why}. Forward it with steward_update { binding: "${target.entityKey}", forward: "${prApproval.id}", resolution: "approve-decline", recommendation } instead.`));
               }
-              store.recordProjectApproval({ bindingId: target.id, headSha: prApproval.headSha ?? "", entry: input.entry ?? null, byThread: threadId });
               const answer = guidance ?? `Approved as ${JSON.stringify(input.entry)}.`;
+              if (pull === null) return toolError(new Error("The pull request could not be read, so the approval marker cannot be posted."));
+              let commentId: string;
+              try {
+                commentId = await postApprovalMarker(pull, threadId, { headSha: prApproval.headSha ?? "", entry: input.entry ?? null, verdict: "approved", reasoning: answer });
+              } catch (error) {
+                return toolError(error);
+              }
+              store.recordProjectApproval({ bindingId: target.id, headSha: prApproval.headSha ?? "", entry: input.entry ?? null, byThread: threadId, commentId, verdict: "approved" });
               store.addGuidance(target.id, answer, threadId);
               store.answerEscalation(prApproval.id, answer, threadId);
-              done.push(`recorded the project steward's approval of ${prApproval.url} bound to ${shortSha(prApproval.headSha)}`);
+              const reached = await deliverProjectApproval(target, pull, { verdict: "approved", sha: prApproval.headSha ?? "", entry: input.entry ?? null, reasoning: answer });
+              done.push(`posted the project steward's approval marker on ${prApproval.url} at ${shortSha(prApproval.headSha)} and ${reached === "worker" ? "told its worker" : "woke the steward"}`);
               return `${target.entityKey}: ${done.join("; ")}.`;
             }
             if (input.approve === true) {
@@ -6236,9 +6277,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (saved && resolve === undefined) notes.push(`New guidance: ${guidance}`);
           }
           if (resolving !== null) {
+            // A declined pull-request approval posts its marker before the
+            // escalation is resolved, so a GitHub failure leaves the request
+            // open to retry rather than recording a decision nobody can see.
+            const isDecline = resolving.kind === "approval" && resolving.resolutionKind === "approve-decline" && resolving.status === "open" && approval === null && classifyApproval(guidance) !== "approve";
+            const declinePull = isDecline && target.lastSnapshot !== null ? observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === resolving.url) ?? null : null;
+            const declineSha = resolving.headSha ?? declinePull?.pull?.headSha ?? null;
+            if (isDecline && declinePull !== null) {
+              const entry = input.entry ?? null;
+              try {
+                const commentId = await postApprovalMarker(declinePull, threadId, { headSha: declineSha ?? "", entry, verdict: "declined", reasoning: guidance ?? "" });
+                store.recordProjectApproval({ bindingId: target.id, headSha: declineSha ?? "", entry, byThread: threadId, commentId, verdict: "declined" });
+              } catch (error) {
+                return toolError(error);
+              }
+              await deliverProjectApproval(target, declinePull, { verdict: "declined", sha: declineSha ?? "", entry, reasoning: guidance ?? "" });
+            }
             // Already resolved (the binding ended, a retry) is no error: the answer is added to the record.
             const outcome = store.answerEscalation(resolving.id, guidance!, threadId);
-            if (resolving.kind === "approval" && resolving.resolutionKind === "approve-decline" && resolving.status === "open" && approval === null && classifyApproval(guidance) !== "approve") {
+            if (isDecline) {
               // A declined pull-request approval: remember the head and the
               // reviewer marker so the same one is not asked again (BB-51).
               const pull = target.lastSnapshot === null ? null : observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === resolving.url) ?? null;
@@ -6312,7 +6369,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (n.kind === "approve-pr" || n.kind === "merge") {
         const observed = b.lastSnapshot;
         const target = observed === null ? null : [observed.entity, ...observed.pulls].find((e) => (e.url ?? e.key) === n.url || e.key === n.url) ?? null;
-        const gate = target === null ? null : prGate(target, { projectApproved: projectApprovedFor(b, target) });
+        const gate = target === null ? null : prGate(target, { projectApprovals: projectApprovalsFor(b) });
         if (n.kind === "approve-pr") {
           actionable = gate?.needsOwnerApproval ?? false;
           why = actionable ? null : (gate?.missing ?? "the pull request has not been observed yet");

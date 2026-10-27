@@ -47,8 +47,12 @@ export function createGhTokenReader(): TokenReader {
 }
 
 export interface GithubWriter {
-  /** Post an unsigned comment as the connected user. */
-  comment(repo: string, number: number, body: string): Promise<void>;
+  /**
+   * Post a comment as the connected user and return GitHub's node id for it.
+   * The id ties the plugin's own approval record to the marker it posted, so a
+   * hand-typed lookalike never satisfies the lane gate.
+   */
+  comment(repo: string, number: number, body: string): Promise<string>;
   /** Squash-merge the pull request, with the given commit title and message. */
   squashMerge(repo: string, number: number, title: string, body: string): Promise<void>;
   /**
@@ -89,7 +93,11 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
   };
   return {
     async comment(repo, number, body) {
-      await request("POST", `/repos/${repo}/issues/${number}/comments`, { body });
+      const response = await request("POST", `/repos/${repo}/issues/${number}/comments`, { body });
+      const created = (await response.json().catch(() => null)) as { node_id?: unknown; id?: unknown } | null;
+      const nodeId = created?.node_id ?? created?.id;
+      if (nodeId === undefined || nodeId === null || String(nodeId) === "") throw new GithubApiError("GitHub created the comment but returned no id, so the approval marker cannot be recorded.");
+      return String(nodeId);
     },
     async squashMerge(repo, number, title, body) {
       await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });
