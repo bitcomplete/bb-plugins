@@ -81,7 +81,7 @@ import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuid
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
 import { allPullsMerged, atWork, conflictsOf, finished, normalizeTouches, overlapping, touchesOverlap, type Conflict } from "./schedule.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY } from "./sidebar-provider.js";
-import { NEEDS_YOU_CHANGED } from "./channels.js";
+import { PROJECT_CHANGED } from "./channels.js";
 import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
@@ -735,10 +735,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
-    // The store reports a project whose "needs you" set changed; the sidebar
-    // and the board page refetch on the channel. Keeping it a callback keeps
-    // store.ts free of bb, so steward-side mutations publish too.
-    const store = createStore(db, now, { onNeedsYouChange: (projectId) => bb.realtime.publish(NEEDS_YOU_CHANGED, { projectId }) });
+    // The store reports a project whose sidebar- or board-visible state
+    // changed; the sidebar, the board page and the overview refetch on the
+    // channel. Keeping it a callback keeps store.ts free of bb, so
+    // steward-side mutations publish too.
+    const store = createStore(db, now, { onProjectChange: (projectId) => bb.realtime.publish(PROJECT_CHANGED, { projectId }) });
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });

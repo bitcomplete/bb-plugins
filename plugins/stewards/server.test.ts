@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
-import { NEEDS_YOU_CHANGED } from "./channels.js";
+import { PROJECT_CHANGED } from "./channels.js";
 import { PROJECT_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
@@ -3597,8 +3597,8 @@ describe("the sidebar's needs you block (BB-46)", () => {
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which approach?", context: null });
-    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
-    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
+    expect(signals).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
   });
 
   it("publishes exactly one event when a question is answered, even when it resolves its escalation too", async () => {
@@ -3611,8 +3611,8 @@ describe("the sidebar's needs you block (BB-46)", () => {
     const before = t.harness.inspection.realtimeSignals.length;
     const result = await t.harness.callRpc("stewardsAnswerQuestion", { questionId: question.id, answer: "The safe one." }, { experimental_caller: { kind: "client" } });
     expect(result).toMatchObject({ ok: true });
-    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
-    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
+    expect(signals).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
   });
 
   it("publishes one event when a route-me escalation is filed directly", async () => {
@@ -3622,8 +3622,8 @@ describe("the sidebar's needs you block (BB-46)", () => {
     const b = t.hooks.store.find("ENG-12", "p1")!;
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.escalate({ bindingId: b.id, kind: "decision", question: "Forwarded?", meanwhile: "Wait.", route: "me", recommendation: null, projectId: "p1" });
-    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
-    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
+    expect(signals).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
   });
 
   it("publishes when a binding ends and its needs leave the set", async () => {
@@ -3634,8 +3634,81 @@ describe("the sidebar's needs you block (BB-46)", () => {
     t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.patch(b.id, { endedAt: t.now(), endReason: "merged" });
-    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === NEEDS_YOU_CHANGED);
-    expect(signals).toEqual([{ channel: NEEDS_YOU_CHANGED, payload: { projectId: "p1" } }]);
+    const signals = t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
+    expect(signals).toEqual([{ channel: PROJECT_CHANGED, payload: { projectId: "p1" } }]);
+  });
+});
+
+// BB-90: the channel is a generic "refetch this project" signal, so every
+// sidebar- and board-visible binding change publishes on it, not only the
+// "needs you" set.
+describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
+  const one = { channel: PROJECT_CHANGED, payload: { projectId: "p1" } };
+  const signalsSince = (t: Awaited<ReturnType<typeof setup>>, before: number) => t.harness.inspection.realtimeSignals.slice(before).filter((s) => s.channel === PROJECT_CHANGED);
+  /** A settled steward binding on p1, past the signals its adoption made. */
+  async function bound() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    return { t, b: t.hooks.store.find("ENG-12", "p1")! };
+  }
+
+  it("publishes one signal when the stage changes", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { stage: b.stage === "build" ? "review" : "build" });
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("publishes one signal when a hold is set and another when it is lifted", async () => {
+    const { t, b } = await bound();
+    let before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { hold: "waiting on the reviewer" });
+    expect(signalsSince(t, before)).toEqual([one]);
+    before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { hold: null });
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("publishes one signal when a status report is written", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, {
+      status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
+      advancedAt: t.now(),
+    });
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("publishes one signal when a deployment watch changes state", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { deployments: { "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t.now(), deadlineAt: null, note: null, workflowRuns: [] } } });
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("publishes one signal when a worker is added and another when it finishes", async () => {
+    const { t, b } = await bound();
+    let before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.addWorker("thr_worker", b.id, "Implement");
+    expect(signalsSince(t, before)).toEqual([one]);
+    before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.setWorker("thr_worker", "finished", "done");
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("stays silent when only a non-visible field changes", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { lastJudgmentAt: t.now() });
+    expect(signalsSince(t, before)).toEqual([]);
+  });
+
+  it("stays silent when a visible field is set to its current value", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { stage: b.stage, title: b.title, url: b.url });
+    expect(signalsSince(t, before)).toEqual([]);
   });
 });
 

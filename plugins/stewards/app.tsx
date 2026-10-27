@@ -31,7 +31,7 @@ import {
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { NEEDS_YOU_CHANGED } from "./channels.js";
+import { PROJECT_CHANGED } from "./channels.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
@@ -104,7 +104,13 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
 
 function useOverview(): { overview: Overview | null; error: string | null } {
   const rpc = useRpc<typeof rpcContract>();
-  const { data, error } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
+  const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
+  // The overview covers every project, so any project's visible change
+  // refetches it; the half-minute poll stays the fallback.
+  useRealtime(
+    PROJECT_CHANGED,
+    useCallback(() => refetch(), [refetch]),
+  );
   return { overview: data, error };
 }
 
@@ -457,9 +463,9 @@ function BoardPage({ subPath }: { subPath: string }) {
   useEffect(() => {
     if (wanted === null && boardProjectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(boardProjectId), replace: true });
   }, [wanted, boardProjectId, navigate]);
-  // A steward's question or item shows up here without the half-minute poll.
+  // A steward's visible change shows up here without the half-minute poll.
   useRealtime(
-    NEEDS_YOU_CHANGED,
+    PROJECT_CHANGED,
     useCallback(
       (payload) => {
         const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
@@ -1656,11 +1662,11 @@ function StewardsSidebarCore({
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
   // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
   const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, t.blocked.filter((e) => e.state === "you").length] as const)), [tabs]);
-  // A steward's question or item updates the badge and block within seconds;
+  // A steward's visible change updates the badge and block within seconds;
   // the half-minute poll stays the fallback. Only a project this sidebar shows
   // triggers a refetch.
   useRealtime(
-    NEEDS_YOU_CHANGED,
+    PROJECT_CHANGED,
     useCallback(
       (payload) => {
         const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
