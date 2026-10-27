@@ -387,6 +387,23 @@ Plugin code. No model turn.
    changed is kept as a quiet note and shown with the next turn something
    else makes due.
 
+Holds that wait behind other bindings (`holdBehind`) lift by state, not
+only by the event that finishes the work. On every reconcile of a waiter,
+when every binding it waits behind satisfies `finished` — every linked pull
+request merged and the binding ended, terminal, or its steward reported
+`noMorePulls` — the plugin releases the hold through the same path as a
+merge-time release: the waiter is woken, the binding note and the project
+note are written, and a lift that frees two waiters overlapping each other
+re-holds the second behind the first. So a hold placed after its target
+merged, or a `noMorePulls` report that arrives after the merge, lifts on
+the next reconcile instead of waiting for the deploy. A hold with an empty
+`holdBehind` is untouched. The `schedule` escalation the plugin files names
+each conflicting binding's phase and its pull request facts — how many
+linked pull requests are open and merged, and whether `noMorePulls` was
+reported (with a note when a linked pull request could not be read) — so
+the project steward can see merged-but-open work without a second look,
+with no recommendation beyond holding behind it or starting now.
+
 ### Judgment tier
 
 The steward is woken with one message in a fixed form:

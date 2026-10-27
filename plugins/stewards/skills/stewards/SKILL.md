@@ -151,7 +151,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   You may put your own binding on hold (`steward_update { hold }`), for
   instance when the user says to halt, but only your parent or the project
   steward lifts it. A hold placed `behind` other bindings lifts itself, and
-  wakes you, once each has merged its pull requests or ended.
+  wakes you, once each is finished — its pull requests merged and it ended,
+  terminal, or reported `noMorePulls` — checked on every look, so a hold
+  placed after a merge still lifts on the next one.
 - **Report what you touch, and let the project steward schedule you.** As
   soon as the spec names the repos and paths the work changes, report them
   with `steward_report { touches: ["<repo>/<path>", …] }` (repo directory
@@ -273,10 +275,16 @@ ticket that touches what another is building or reviewing reaches you as a
 `steward_update { binding, hold: "<why>", behind: [<keys>] }` holds it
 behind that work and closes the request, and the hold lifts itself, waking
 the steward, once every binding named has merged its pull requests or
-ended. The lift wakes you only when that work is not finished; when its
-ticket is terminal with its pull requests merged, or its steward reported
-`noMorePulls`, it is a note on the held binding and your next digest
-instead. If one lift frees two waiters that overlap each other, the first
+ended. The lift is by state: it is re-checked on every look, so a hold
+placed after a merge, or a `noMorePulls` report that arrives after it,
+lifts on the next look rather than waiting for the deploy. The lift wakes
+you only when that work is not finished; when its ticket is terminal with
+its pull requests merged, or its steward reported `noMorePulls`, it is a
+note on the held binding and your next digest instead. The `schedule`
+escalation names each conflicting binding's phase and its pull request
+facts — how many linked pull requests are open and merged, and whether
+`noMorePulls` was reported — so you can see merged-but-open work before
+deciding. If one lift frees two waiters that overlap each other, the first
 by priority then age is released and the rest wait behind it. When the
 overlap is harmless, or the new ticket matters more (then
 hold the other one instead), let it start with `guidance` ("Start now: …")
