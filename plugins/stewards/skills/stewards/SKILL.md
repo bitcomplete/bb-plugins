@@ -56,7 +56,9 @@ Two tools are yours; everything else you do with the tools every thread has.
 - **Decide what the project's guidance settles.** AGENTS.md, architecture
   and design docs, and the playbook are your guidance. Escalate only what
   they do not settle, with `steward_report { escalate: { kind, question,
-  meanwhile } }`: it goes to your parent steward, then the project steward.
+  context, meanwhile } }`: it goes to your parent steward, then the project
+  steward. The question is one line; the evidence and reasoning go in
+  `context`.
   The answer comes back as guidance and wakes you. The user hears only about
   the project's big decisions, and the project steward is the only layer
   that reaches them. A worker raises an escalation with
@@ -69,7 +71,9 @@ Two tools are yours; everything else you do with the tools every thread has.
   leaves open. Models, flags, lanes and who merges are settled there: never
   ask them. An escalation or approval request that is already open is on the
   Stewards page: do not ask for it again, and a reply that does counts like a
-  missed report toward `stuck`.
+  missed report toward `stuck`. The question is one line, written as the
+  sidebar row will show it; the evidence and reasoning go in `context`, and a
+  question longer than the limit is refused.
 - **A credential is an escalation the project steward forwards as a
   `provide-secret` item, not a code-writing worker's job to prompt.** Raise
   it with `steward_report { escalate }`, naming the variable and purpose,

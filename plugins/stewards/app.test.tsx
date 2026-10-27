@@ -715,4 +715,13 @@ describe("the Stewards page's sections and cards (BB-78)", () => {
     }
     board.lifecycle.unmount();
   });
+
+  it("shows a with-user escalation's context under its question (BB-79)", async () => {
+    const slot = await renderBoardWith({
+      withUser: [{ id: "esc_1", kind: "blocked", question: "Need cluster access", context: "The staging cluster is not on the tailnet.", recommendation: null, key: "ENG-1", url: null, threadId: null, createdAt: 1_000, rationaleWanted: null }],
+    });
+    await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
+    expect(slot.getByText("The staging cluster is not on the tailnet.")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
 });

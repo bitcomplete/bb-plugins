@@ -9,14 +9,14 @@ import { DEFAULT_BIG_DECISIONS, DEFAULT_LABEL, defaultDecideList } from "./confi
  * user sees.
  */
 const SECRET_REQUEST =
-  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, meanwhile } }`, naming the variable and what it is for. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. Never paste the secret, and never a script for the user to run.";
+  "A credential the work needs is a decision escalation, not a worker's job to prompt: raise it with `steward_report { escalate: { kind: \"decision\", question, context, meanwhile } }`, naming the variable and what it is for in `context`. The question is one line, as the sidebar row shows it; the evidence and reasoning go in `context`, and a question longer than 240 characters is refused. The project steward forwards it with `resolution: \"secret\"` and either the `writeEnv` dotenv path (or `worker`) for a worker's machine, or the `setting` for one of the stewards plugin's own secret settings; the plugin then opens bb's secure form in a requester thread. Never paste the secret, and never a script for the user to run.";
 
 /**
  * A build-time blocker is a `decision` in the same turn, never a follow-up,
  * in a playbook's build and review sections.
  */
 const buildBlocker = (what: string) =>
-  `A worker's finding that would stop the feature working once it ships, or that changes what ${what} needs (a credential, an access, a contract), is escalated as a \`decision\` in the same turn, with the worker's words quoted; never relay it as a follow-up.`;
+  `A worker's finding that would stop the feature working once it ships, or that changes what ${what} needs (a credential, an access, a contract), is escalated as a \`decision\` in the same turn, with the worker's words quoted; the question is one line and the evidence goes in \`context\`. Never relay it as a follow-up.`;
 
 export function projectFileTemplate(teams: string[]): string {
   return `${JSON.stringify(

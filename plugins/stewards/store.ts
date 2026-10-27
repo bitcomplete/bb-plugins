@@ -718,6 +718,8 @@ export type Escalation = {
   bindingId: string;
   kind: EscalationKind;
   question: string;
+  /** The evidence and reasoning behind the question; the sidebar never shows it. */
+  context: string | null;
   meanwhile: string;
   route: EscalationRoute;
   recommendation: string | null;
@@ -1039,6 +1041,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     bindingId: String(r.binding_id),
     kind: String(r.kind) as EscalationKind,
     question: String(r.question),
+    context: r.context === null || r.context === undefined ? null : String(r.context),
     meanwhile: String(r.meanwhile),
     route: String(r.route) as EscalationRoute,
     recommendation: r.recommendation === null ? null : String(r.recommendation),
@@ -1481,6 +1484,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       bindingId: string;
       kind: EscalationKind;
       question: string;
+      context?: string | null;
       meanwhile: string;
       route: EscalationRoute;
       recommendation: string | null;
@@ -1513,7 +1517,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         data: JSON.stringify(fields.data ?? {}),
         forwarded_from: fields.forwardedFrom ?? null,
         is_question: 0,
-        context: null,
+        context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
         head_sha: fields.headSha ?? null,
       });
       // A route-`me` escalation is a "needs you" item the moment it is filed.

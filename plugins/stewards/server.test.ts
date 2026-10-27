@@ -708,6 +708,46 @@ describe("a Linear ticket steward", () => {
     expect(back).toMatch(/Priority: high/u);
   });
 
+  it("refuses an escalation question over 240 characters, naming context, and stores context under it", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [, steward] = t.spawns.map((x) => x.id);
+
+    await expect(
+      t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "x".repeat(300), meanwhile: "Wait." } }, steward!),
+    ).rejects.toThrow(/context/u);
+
+    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", context: "The auth design doc leaves it open; two providers are viable.", meanwhile: "Wait." } }, steward!);
+    expect(reported.error).toBe(false);
+    const b = t.hooks.store.find("ENG-12")!;
+    const esc = t.hooks.store.openEscalations(b.id)[0]!;
+    expect(esc.question).toBe("Include SSO?");
+    expect(esc.context).toBe("The auth design doc leaves it open; two providers are viable.");
+
+    // An empty context is stored as null, not "", so the page renders no empty row.
+    const empty = await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", context: "", meanwhile: "Wait." } }, steward!);
+    expect(empty.error).toBe(false);
+    expect(t.hooks.store.openEscalations(b.id).at(-1)!.context).toBeNull();
+  });
+
+  it("forwards an escalation's context ahead of the kind, meanwhile and recommendation lines", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    await t.tool("steward_report", { phase: "Todo", summary: "Scope unclear.", nextAction: "Wait", actor: "other", escalate: { kind: "scope", question: "Include SSO?", context: "The auth doc lists both providers; the ticket does not say.", meanwhile: "Wait." } }, steward!);
+    const id = /(esc_[\w-]+) from ENG-12/u.exec(t.sends.filter((s) => s.threadId === project).at(-1)!.text)![1]!;
+    const forwarded = await t.tool("steward_update", { binding: "ENG-12", forward: id, recommendation: "Leave SSO out." }, project!);
+    const qst = /(qst_[\w-]+)/u.exec(forwarded.text)![1]!;
+    const q = t.hooks.store.question(qst)!;
+    expect(q.question).toBe("Include SSO?");
+    expect(q.context).toContain("The auth doc lists both providers; the ticket does not say.");
+    expect(q.context!.indexOf("The auth doc lists both providers")).toBeLessThan(q.context!.indexOf("A scope escalation from ENG-12"));
+    expect(q.context!.indexOf("A scope escalation from ENG-12")).toBeLessThan(q.context!.indexOf("Meanwhile: Wait."));
+    expect(q.context!.indexOf("Meanwhile: Wait.")).toBeLessThan(q.context!.indexOf("Recommendation: Leave SSO out."));
+  });
+
   it("has the project steward approve a substantial spec; the user only when they say so", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
@@ -3674,13 +3714,16 @@ describe("needs you items", () => {
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "ENG-12: Implement");
     const b = t.hooks.store.find("ENG-12")!;
-    const out = await t.harness.behavior.runCli(["escalate", "Which API version should I target?", "--meanwhile", "continue"], { threadId: "thr_w1", projectId: "p1" });
+    const out = await t.harness.behavior.runCli(["escalate", "Which API version should I target?", "--context", "The v1 client is still used by two repos.", "--meanwhile", "continue"], { threadId: "thr_w1", projectId: "p1" });
     expect(out.exitCode).toBe(0);
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.question === "Which API version should I target?")!;
-    expect(esc).toMatchObject({ route: "steward", meanwhile: "continue", origin: { threadId: "thr_w1", bindingId: b.id } });
+    expect(esc).toMatchObject({ route: "steward", meanwhile: "continue", context: "The v1 client is still used by two repos.", origin: { threadId: "thr_w1", bindingId: b.id } });
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
     expect(wake).toMatch(/Which API version should I target\?/);
+    // An over-long question is refused and names --context.
+    const long = await t.harness.behavior.runCli(["escalate", "x".repeat(300)], { threadId: "thr_w1", projectId: "p1" });
+    expect(long).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/context/u) });
   });
 
   it("delivers an answer to the originating worker as a tell, and never wakes the bindings between (BB-30)", async () => {
@@ -6340,6 +6383,11 @@ describe("Sentry stewards", () => {
     expect(first).toMatch(/steward_report \{ escalate: \{ kind: "decision", question: "Provide a Sentry auth token for/u);
     expect(first).toMatch(/variable SENTRY_TOKEN, setting sentryToken/u);
     expect(first).toMatch(/project:read and event:read and event:write/u);
+    // The question it tells the steward to raise stays within the 240 cap, and
+    // the evidence it moves into context is not lost.
+    const sentryQuestion = /steward_report \{ escalate: \{ kind: "decision", question: "([^"]*)"/u.exec(first)![1]!;
+    expect(sentryQuestion.length).toBeLessThanOrEqual(240);
+    expect(first).toMatch(/context: "variable SENTRY_TOKEN, setting sentryToken/u);
     // It does not instruct a refused `needs` filing (BB-51).
     expect(first).not.toMatch(/File one provide-secret need/u);
     expect(first).not.toMatch(/steward_report \{ needs/u);
