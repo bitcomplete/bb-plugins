@@ -179,6 +179,27 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
+  // BB-84: a truncated title is still readable on hover, through the native
+  // `title` tooltip on the row's title anchor.
+  it("puts the thread's full display title on the row's title anchor as a tooltip", async () => {
+    const plainTitle = "A one-off thread whose long title the sidebar truncates";
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: plainTitle })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    });
+    // The effort row's own title anchor carries the full title.
+    const effortAnchor = (await waitFor(() => slot.getByText("Fix login"))).closest("a")!;
+    expect(effortAnchor.getAttribute("title")).toBe("ENG-1: Fix login");
+    // So does a plain thread row's title anchor.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    const plainAnchor = (await waitFor(() => slot.getByText(plainTitle))).closest("a")!;
+    expect(plainAnchor.getAttribute("title")).toBe(plainTitle);
+    slot.lifecycle.unmount();
+  });
+
   it("shortens a pull-request key to #N and spells out the kind", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "acme/web#612: Read dashboard metrics" })] },
