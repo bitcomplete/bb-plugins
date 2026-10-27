@@ -1174,6 +1174,7 @@ function SidebarThreadRow({
           <a
             href={thread.href}
             className="min-w-0 flex-1 truncate text-sm"
+            title={thread.displayTitle}
             onClick={(e) => {
               e.preventDefault();
               navigate.toThread(thread.id);
@@ -1319,6 +1320,7 @@ function SidebarEffortRow({
             <a
               href={root.href}
               className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+              title={root.displayTitle}
               onClick={(e) => {
                 e.preventDefault();
                 navigate.toThread(root.id);
