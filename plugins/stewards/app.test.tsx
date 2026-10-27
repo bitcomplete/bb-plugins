@@ -544,10 +544,10 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const renderBoardWith = async (over: { stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[] } = {}): Promise<RenderedSlot> => {
+const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; questions?: unknown[]; withUser?: unknown[]; needs?: unknown[]; lessons?: unknown[]; lessonCounts?: unknown; digest?: unknown; ended?: unknown[]; stuck?: unknown[] } = {}): Promise<RenderedSlot> => {
   const captured = await loadApp();
   const panel = captured.navPanels[0]!;
-  return renderSlot(panel, { subPath: "" }, {
+  return renderSlot(panel, { subPath: over.subPath ?? "" }, {
     rpc: {
       stewardsBoard: () => ({
         projects: [{ projectId: "p1", name: "Acme" }],
@@ -557,15 +557,15 @@ const renderBoardWith = async (over: { stewards?: unknown[]; questions?: unknown
           paused: false,
           projectStewardThreadId: "thr_p",
           stages: [],
-          digest: null,
+          digest: over.digest ?? null,
           questions: over.questions ?? [],
           withUser: over.withUser ?? [],
           needs: over.needs ?? [],
-          lessons: [],
-          lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+          lessons: over.lessons ?? [],
+          lessonCounts: over.lessonCounts ?? { candidate: 0, trial: 0, promoted: 0, retired: 0 },
           stewards: over.stewards ?? [],
-          stuck: [],
-          ended: [],
+          stuck: over.stuck ?? [],
+          ended: over.ended ?? [],
         },
       }),
       stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
@@ -579,89 +579,98 @@ const lineTwoIn = (slot: RenderedSlot, title: string): string => {
   const li = slot.getByText(title).closest("li")!;
   return (li.querySelector("[data-steward-line-two]") ?? li.querySelector("[data-sidebar-line-two]"))?.textContent ?? "";
 };
+const headingGlyph = (slot: RenderedSlot): string | null => slot.container.querySelector("[data-steward-glyph]")?.getAttribute("data-steward-glyph") ?? null;
+const headingLineTwo = (slot: RenderedSlot): string => slot.container.querySelector("[data-steward-line-two]")?.textContent ?? "";
 
-describe("the Stewards page's sections and cards (BB-78)", () => {
-  it("places every open binding in the section the BB-76 rules put it in, with the shared glyph and phrase", async () => {
+const aLesson = (over: Record<string, unknown> = {}) => ({ id: "lsn_1", bindingId: null, key: null, file: "AGENTS.md", text: "A rule.", scope: "procedure", status: "pending", tier: "trial", hits: 2, corrections: 0, lastCitedAt: null, branch: null, mergeSha: null, note: null, escalationId: null, createdAt: 1_000, ...over });
+
+// BB-85: the page is no longer the list. `board/<project>` is the project
+// view and `board/<project>/<key>` is one effort's detail, opened from the
+// sidebar; the card columns are gone.
+describe("the Stewards page's project view and detail views (BB-85)", () => {
+  it("shows the project view: name, steward link, waiting on you, the count line, digest and collapsed lessons, with no card columns", async () => {
     const slot = await renderBoardWith({
       stewards: [
-        boardSteward({ key: "ENG-1", title: "Needs you", needsUser: true, phase: "In Review" }),
+        boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true }),
         boardSteward({ key: "ENG-2", title: "Held up", blockedOn: "bb-gate#88" }),
-        boardSteward({ key: "ENG-3", title: "Working", workers: [{ threadId: "thr_w", title: "w" }] }),
-        boardSteward({ key: "ENG-4", title: "Waiting", summary: "All done", nextAction: "wait for CI", actor: "steward" }),
-        boardSteward({ key: "acme/web", title: "Ops watch", kind: "ops", wokeAt: Date.now() - 60_000 }),
+        boardSteward({ key: "acme/web", title: "Ops watch", kind: "ops" }),
       ],
+      questions: [question({ id: "qst_project", key: null, question: "Which release?" })],
+      digest: { text: "All quiet.", at: 1_000 },
+      lessons: [aLesson()],
+      lessonCounts: { candidate: 0, trial: 1, promoted: 0, retired: 0 },
+      ended: [{ key: "ENG-0", url: null, title: "Old work", kind: "ticket", endReason: "done", endedAt: 1_000, threadId: "thr_old" }],
     });
-    await waitFor(() => expect(slot.getByText("Needs you")).toBeTruthy());
-    // The sections are in order, and the old stage grouping is gone.
-    const headings = [...slot.container.querySelectorAll("h2")].map((h) => h.textContent ?? "");
-    expect(headings[0]).toContain("Blocked");
-    expect(headings[1]).toContain("In flight");
-    expect(headings[2]).toContain("Monitors");
-    expect(headings[3]).toContain("Recently ended");
-    expect(slot.queryByRole("heading", { name: /Waiting on you/u })).toBeNull();
-    expect(slot.queryByRole("heading", { name: /Stuck or held/u })).toBeNull();
-    // Blocked holds the yellow and the red; In flight the running and the quiet; Monitors the ops.
-    const blockedSection = slot.getByRole("heading", { name: /^Blocked/u }).closest("section")!;
-    expect(blockedSection.textContent).toContain("Needs you");
-    expect(blockedSection.textContent).toContain("Held up");
-    const inflightSection = slot.getByRole("heading", { name: /^In flight/u }).closest("section")!;
-    expect(inflightSection.textContent).toContain("Working");
-    expect(inflightSection.textContent).toContain("Waiting");
-    const monitorsSection = slot.getByRole("heading", { name: /^Monitors/u }).closest("section")!;
-    expect(monitorsSection.textContent).toContain("Ops watch");
-    expect(monitorsSection.textContent).toContain("Last wake");
-    // The shared row: the same glyph and phrase the sidebar derives.
-    expect(glyphIn(slot, "Needs you")).toBe("you");
-    expect(lineTwoIn(slot, "Needs you")).toBe("ticket · In Review · needs you");
-    expect(glyphIn(slot, "Held up")).toBe("blocked");
-    expect(lineTwoIn(slot, "Held up")).toBe("ticket · blocked on bb-gate#88");
-    expect(glyphIn(slot, "Working")).toBe("running");
-    expect(lineTwoIn(slot, "Working")).toBe("ticket · 1 worker running");
-    expect(glyphIn(slot, "Waiting")).toBe("quiet");
-    expect(lineTwoIn(slot, "Waiting")).toBe("ticket · wait for CI");
+    await waitFor(() => expect(slot.getByText("Which release?")).toBeTruthy());
+    // The name and the project-steward link.
+    expect(slot.getByText("Acme")).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Open the project steward" })).toBeTruthy();
+    // Waiting on you holds only the item with no open binding.
+    expect(slot.queryByText("Stack or hold?")).toBeNull();
+    // The count line.
+    const count = slot.container.querySelector("[data-board-count-line]")!;
+    expect(count.textContent).toContain("3 open");
+    expect(count.textContent).toContain("2 blocked");
+    expect(count.textContent).toContain("1 monitors");
+    expect(count.textContent).toContain("1 recently ended");
+    // The latest digest and the collapsed lessons block.
+    expect(slot.getByText("All quiet.")).toBeTruthy();
+    expect(slot.getByText("A rule.")).toBeTruthy();
+    expect(slot.container.querySelector("details")!.open).toBe(false);
+    // No card columns any more.
+    for (const name of [/^Blocked/u, /^In flight/u, /^Monitors/u, /^Recently ended/u]) {
+      expect(slot.queryByRole("heading", { name })).toBeNull();
+    }
     slot.lifecycle.unmount();
   });
 
-  it("shows the summary, next action, actor and meta line under a non-needs-you card", async () => {
-    const slot = await renderBoardWith({
-      stewards: [boardSteward({ summary: "Everything is fine", nextAction: "wait for CI", actor: "steward", statusAt: 1_000, createdAt: 2_000, deployment: "deployed", hold: "a freeze" })],
-    });
-    await waitFor(() => expect(slot.getByText(/Everything is fine/u)).toBeTruthy());
-    const card = slot.getByText("Fix login").closest("li")!;
-    expect(card.textContent).toContain("Next: wait for CI (the steward)");
-    expect(card.textContent).toContain("Reported");
-    expect(card.textContent).toContain("adopted");
-    expect(card.textContent).toContain("deployed");
-    expect(card.textContent).toContain("On hold: a freeze");
-    expect(slot.getByRole("button", { name: "Open steward" })).toBeTruthy();
+  it("replaces the path with the server's project when the path names none", async () => {
+    const slot = await renderBoardWith({ stewards: [] });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1", replace: true } }));
     slot.lifecycle.unmount();
   });
 
-  it("attaches a needs-you item to its binding's card, and keeps a project-level question at the top of Blocked", async () => {
+  it("shows one effort's detail: the two-line heading, needs you with the page's controls, status, threads and lessons", async () => {
     const slot = await renderBoardWith({
-      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, summary: "In review" })],
-      questions: [question({ id: "qst_project", key: null, question: "Which release?" }), question({ id: "qst_eng1", key: "ENG-1", question: "Stack or hold?", choices: ["Stack", "Hold"] })],
+      subPath: "p1/ENG-1",
+      stewards: [
+        boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, phase: "In Review", summary: "In review", nextAction: "wait for CI", actor: "steward", statusAt: 1_000, createdAt: 2_000, stage: "build", deployment: "deployed", workers: [{ threadId: "thr_w", title: "Implement retry" }] }),
+      ],
+      questions: [question({ id: "qst_eng1", key: "ENG-1", question: "Stack or hold?", choices: ["Stack", "Hold"] })],
+      needs: [need({ id: "need_spec", kind: "approve-spec", key: "ENG-1", what: "Approve the spec", how: "Read the spec" })],
+      lessons: [aLesson({ key: "ENG-1" })],
     });
-    await waitFor(() => expect(slot.getByText("Stack or hold?")).toBeTruthy());
-    // The project-level question is its own card, before the binding's card.
-    const items = [...slot.container.querySelectorAll("li")];
-    expect(items[0]!.textContent).toContain("Which release?");
-    // The binding's question is inside the same card as its row header.
-    const card = slot.getByText("Fix login").closest("li")!;
-    expect(card.textContent).toContain("Stack or hold?");
-    expect(card.textContent).toContain("In review");
-    // Its controls are the page's, and they make the same RPC call.
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    // The heading is the sidebar's two-line row one size up, with a crumb back.
+    expect(headingGlyph(slot)).toBe("you");
+    expect(headingLineTwo(slot)).toBe("ticket · In Review · needs you");
+    expect(slot.getByRole("button", { name: /Acme/u })).toBeTruthy();
+    // Needs you carries the page's full controls.
+    expect(slot.getByText("Stack or hold?")).toBeTruthy();
+    expect(slot.getByText("Approve the spec")).toBeTruthy();
+    expect(slot.getByLabelText("Note for: Approve the spec")).toBeTruthy();
     fireEvent.click(slot.getByRole("button", { name: "Stack" }));
     await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_eng1", answer: null, choice: "Stack" } }));
+    // Status: summary, Next, stage and deployment.
+    expect(slot.getByText("In review")).toBeTruthy();
+    expect(slot.getByText(/Next: wait for CI \(the steward\)/u)).toBeTruthy();
+    expect(slot.getByText(/stage build/u)).toBeTruthy();
+    expect(slot.getByText(/deployed/u)).toBeTruthy();
+    // Threads: the steward, the worker and the pull request.
+    expect(slot.getByRole("button", { name: "Open the steward" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Implement retry" })).toBeTruthy();
+    // Lessons the effort wrote.
+    expect(slot.getByText("A rule.")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
-  it("keeps the page-only controls on a needs-you card: the secret form and the approve-spec note", async () => {
+  it("keeps the page-only controls on the detail's needs-you items: the secret form and the approve-spec note", async () => {
     const slot = await renderBoardWith({
-      stewards: [boardSteward({ needsUser: true, summary: "Waiting on you" })],
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, summary: "Waiting on you" })],
       needs: [
-        need({ id: "need_secret", kind: "provide-secret", what: "Add the token", destination: "the dotenv" }),
-        need({ id: "need_spec", kind: "approve-spec", what: "Approve the spec", how: "Read the spec first" }),
+        need({ id: "need_secret", key: "ENG-1", kind: "provide-secret", what: "Add the token", destination: "the dotenv" }),
+        need({ id: "need_spec", key: "ENG-1", kind: "approve-spec", what: "Approve the spec", how: "Read the spec first" }),
       ],
     });
     await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
@@ -674,7 +683,47 @@ describe("the Stewards page's sections and cards (BB-78)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("derives the same state and phrase on the page and the sidebar for the same binding", async () => {
+  it("shows the blocked, hold and stuck lines in the status", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", blockedOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
+      stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", why: "waiting on a decision", since: 1 }],
+    });
+    await waitFor(() => expect(slot.getByText("Blocked on bb-gate#88")).toBeTruthy());
+    expect(slot.getByText(/On hold: a freeze \(behind ENG-9\)/u)).toBeTruthy();
+    expect(slot.getByText(/Stuck: waiting on a decision/u)).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows what the board knows about an ended effort, and an unknown key says so", async () => {
+    const ended = await renderBoardWith({
+      subPath: "p1/ENG-0",
+      ended: [{ key: "ENG-0", url: "https://linear.app/x", title: "Old work", kind: "ticket", endReason: "done", endedAt: 1_000, threadId: "thr_old" }],
+    });
+    await waitFor(() => expect(ended.getByText("Old work")).toBeTruthy());
+    expect(ended.getByText("done")).toBeTruthy();
+    expect(ended.getByRole("button", { name: "Open the archived thread" })).toBeTruthy();
+    fireEvent.click(ended.getByRole("button", { name: "Open the archived thread" }));
+    await waitFor(() => expect(ended.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_old" }));
+    ended.lifecycle.unmount();
+
+    const unknown = await renderBoardWith({ subPath: "p1/ENG-404" });
+    await waitFor(() => expect(unknown.getByText(/No effort/u)).toBeTruthy());
+    expect(unknown.getByText("ENG-404")).toBeTruthy();
+    unknown.lifecycle.unmount();
+  });
+
+  it("resolves a pull-request key that keeps its own slash", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/acme/web#612",
+      stewards: [boardSteward({ key: "acme/web#612", title: "Read dashboard metrics", kind: "pr", url: "https://github.com/acme/web/pull/612" })],
+    });
+    await waitFor(() => expect(slot.getByText("Read dashboard metrics")).toBeTruthy());
+    expect(slot.getByText("#612")).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("derives the same state and phrase on the detail heading and the sidebar for the same binding", async () => {
     const bindings = [
       sidebarBinding({ key: "ENG-1", threadId: "thr_1", needsUser: true, phase: "In Review" }),
       sidebarBinding({ key: "ENG-2", threadId: "thr_2", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
@@ -704,19 +753,12 @@ describe("the Stewards page's sections and cards (BB-78)", () => {
     sidebar.lifecycle.unmount();
 
     const board = await renderBoardWith({
-      stewards: [
-        boardSteward({ key: "ENG-1", title: "Needs you", needsUser: true, phase: "In Review" }),
-        boardSteward({ key: "ENG-2", title: "Working", workers: [{ threadId: "thr_w", title: "w" }] }),
-        boardSteward({ key: "ENG-3", title: "Held up", blockedOn: "bb-gate#88" }),
-        boardSteward({ key: "ENG-4", title: "Waiting", deployment: "deployed" }),
-      ],
+      subPath: "p1/ENG-2",
+      stewards: [boardSteward({ key: "ENG-2", title: "Working", workers: [{ threadId: "thr_w", title: "w" }] })],
     });
-    await waitFor(() => expect(board.getByText("Needs you")).toBeTruthy());
-
-    for (const title of ["Needs you", "Working", "Held up", "Waiting"]) {
-      expect(glyphIn(board, title)).toBe(fromSidebar.get(title)!.glyph);
-      expect(lineTwoIn(board, title)).toBe(fromSidebar.get(title)!.lineTwo);
-    }
+    await waitFor(() => expect(board.getByText("Working")).toBeTruthy());
+    expect(headingGlyph(board)).toBe(fromSidebar.get("Working")!.glyph);
+    expect(headingLineTwo(board)).toBe(fromSidebar.get("Working")!.lineTwo);
     board.lifecycle.unmount();
   });
 
@@ -729,3 +771,4 @@ describe("the Stewards page's sections and cards (BB-78)", () => {
     slot.lifecycle.unmount();
   });
 });
+
