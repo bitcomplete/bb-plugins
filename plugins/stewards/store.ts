@@ -1535,8 +1535,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
       // A queued note is a reason for the next judgment turn, not a page
       // change, so it writes without a signal (BB-90). Its one visible effect,
       // the "worker finished" phrase, is published by `setWorker` when the
-      // worker's status changes; ringing here would double-signal that finish
-      // and break the per-operation coalescing.
+      // worker's status changes; ringing here would add a second signal for
+      // that finish and a second event in the answer path, where the note is
+      // written after `answer`'s operation has already flushed.
       return rowToBinding(writeBinding(id, { pending }));
     },
     /** Save guidance; false when it repeats the binding's last guidance by the same author within five minutes (a retry), which saves nothing. */
@@ -1880,10 +1881,12 @@ export function createStore(db: Database.Database, now: () => number, options: S
       return spawnsSince.get(bindingId, since)!.n;
     },
     setWorker(threadId: string, status: WorkerStatus, result: string | null): void {
+      const before = getWorker.get(threadId);
       setWorker.run(status, result, status === "running" ? null : now(), threadId);
-      // A worker finishing or being stopped moves its row at once too.
       const w = getWorker.get(threadId);
-      if (w !== undefined) projectChanged(projectIdForBinding(String(w.binding_id)));
+      // A worker finishing or being stopped moves its row at once, but a repeat
+      // write of the same status changes nothing visible and stays silent.
+      if (w !== undefined && (before === undefined || before.status !== w.status)) projectChanged(projectIdForBinding(String(w.binding_id)));
     },
     /** Whether the worker's model is still to be checked when its first turn is dispatched. */
     setWorkerModelCheckPending(threadId: string, pending: boolean): void {

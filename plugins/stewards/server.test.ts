@@ -9,7 +9,7 @@ import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
 import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
-import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS } from "./store.js";
+import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
 import { STANDING_RULES } from "./wake.js";
 
@@ -3687,6 +3687,25 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     expect(signalsSince(t, before)).toEqual([one]);
   });
 
+  it("publishes one signal for each of the remaining visible columns", async () => {
+    const cases: Array<[string, (b: Binding) => Partial<Binding>]> = [
+      ["phase", () => ({ phase: "Building" })],
+      ["holdBehind", () => ({ holdBehind: ["ENG-9"] })],
+      ["requeueAt", () => ({ requeueAt: 1_700_000_000_000 })],
+      ["title", () => ({ title: "A new title" })],
+      ["url", () => ({ url: "https://linear.app/acme/issue/ENG-12?new" })],
+      ["ending", () => ({ ending: "terminal" })],
+      ["threadId", () => ({ threadId: "thr_new" })],
+      ["pending", (b) => ({ pending: [...b.pending, { at: 1, text: "a queued note" }] })],
+    ];
+    for (const [name, make] of cases) {
+      const { t, b } = await bound();
+      const before = t.harness.inspection.realtimeSignals.length;
+      t.hooks.store.patch(b.id, make(b));
+      expect(signalsSince(t, before), name).toEqual([one]);
+    }
+  });
+
   it("publishes one signal when a worker is added and another when it finishes", async () => {
     const { t, b } = await bound();
     let before = t.harness.inspection.realtimeSignals.length;
@@ -3695,6 +3714,16 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.setWorker("thr_worker", "finished", "done");
     expect(signalsSince(t, before)).toEqual([one]);
+    before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.setWorker("thr_worker", "finished", "done");
+    expect(signalsSince(t, before)).toEqual([]);
+  });
+
+  it("stays silent when a note is queued for the next turn", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.note(b.id, "A quiet note for the next turn.");
+    expect(signalsSince(t, before)).toEqual([]);
   });
 
   it("stays silent when only a non-visible field changes", async () => {

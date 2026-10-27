@@ -448,11 +448,13 @@ server's refusal is shown in the row, and the row refetches on success. The item
 carries the binding's entity key as `bindingKey`, so a row owns its item; a
 project-level question with no binding has no row and stays on the Stewards
 page. The plugin publishes `needs-you-changed { projectId }` on its realtime
-channel whenever a question is opened or answered, an escalation is filed with
-or forwarded to the user or resolved, a need is filed, updated or closed, or a
-binding ends or reopens — including from a steward's own tools — so every open
-sidebar and the board page refresh within seconds. The half-minute poll stays
-as the fallback.
+channel whenever a sidebar- or board-visible binding state changes: a question
+opened or answered, an escalation filed with or forwarded to the user or
+resolved, a need filed, updated or closed, and a stage, phase, hold, status
+report, requeue time, deployment state, title, link, ending or worker starting
+or finishing — including from a steward's own tools — so every open sidebar,
+the board page and the overview refresh within seconds. The half-minute poll
+stays as the fallback.
 
 **The footer toggle.** A `ShieldCheck` icon in the sidebar footer (next to
 Settings) opens a small panel above the footer row with a **Stewards

@@ -4237,19 +4237,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (worker.status === "stopped") return;
         const result = lastAssistantText === null ? null : clip(lastAssistantText, 4000);
         store.setWorker(thread.id, "finished", result);
+        // The quiet-finish note is what the visible "worker finished" phrase
+        // reads, so write it before the awaits below: `setWorker` has already
+        // published the signal, and the refetch it triggers would otherwise
+        // read the store before the note lands (BB-90).
+        const finished = store.binding(worker.bindingId);
+        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
+        // the owner or a build is a quiet note. Only a question, an error
+        // report or a gone thread makes the turn due; a failed turn comes
+        // through thread.failed and wakes on its own. A binding following
+        // through is waiting on this worker's result, so its finish is news.
+        const needsSteward = finished !== null && (workerQuestion(result) !== null || workerReportedError(result) || followingThrough(finished));
+        if (finished !== null && finished.endedAt === null) store.note(finished.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
         await closeRequesterNeed(thread.id);
         // Its turn is over: the reviewers it read (or started and then waited
         // on) have had their round consumed (BB-47).
         await archiveConsumedReviewers(thread.id);
         const b = store.binding(worker.bindingId);
         if (b === null || b.endedAt !== null) return;
-        // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
-        // the owner or a build is a quiet note. Only a question, an error
-        // report or a gone thread makes the turn due; a failed turn comes
-        // through thread.failed and wakes on its own. A binding following
-        // through is waiting on this worker's result, so its finish is news.
-        const needsSteward = workerQuestion(result) !== null || workerReportedError(result) || followingThrough(b);
-        store.note(b.id, `Worker "${worker.title}" finished its turn.`, !needsSteward);
         // A quiet finish is consumed here, not by a wake: archive the worker
         // now (BB-47), keeping one that still has a question, a reviewer, or is
         // parked waiting on something that will wake it (BB-52 rule 3).

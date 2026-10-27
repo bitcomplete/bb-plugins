@@ -1646,19 +1646,31 @@ the board calls it unfiltered, the sidebar calls it with `actionableOnly`, and
 need is on the page but not in the sidebar's items.
 
 **Realtime, not the poll.** The store takes an optional
-`onNeedsYouChange(projectId)` callback, wired in `server.ts` to
+`onProjectChange(projectId)` callback, wired in `server.ts` to
 `bb.realtime.publish("needs-you-changed", { projectId })`; the store stays
-free of bb. The callback fires from the store's mutation points — a question
-filed (`ask`) or answered (`answer`, `answerQuestionOnly`, `answerEscalation`),
-an escalation filed route-`me` (`escalate`) or forwarded to the user or
-resolved (`reroute`, `resolve`, `approve`, `decline`), a need filed, updated or
-closed (`fileNeed`, `closeNeed`, `closeNeeds`, `closeNeedByKey`), and a binding
-ended or reopened (`patch`) — so a steward's own tools publish as well as the
-page's buttons. A synchronous coalescing guard makes one question filed or
+free of bb. The channel string is unchanged from the narrower "needs you"
+signal (BB-90), so a server and client built from different images keep
+talking across a restart. `patch` compares the binding before and after and
+fires when a sidebar/board-visible column changed (`stage`, `phase`, `hold`,
+`hold_behind`, `status`, `pending`, `requeue_at`, `advanced_at`,
+`deployments`, `title`, `url`, `ending`, `ended_at`, `thread_id`), staying
+silent for per-turn bookkeeping (`lastJudgmentAt`, `lastSnapshot`, `wokeAt`,
+`awaitingReport`, `missedReports`, `archiveWhenIdle`, `manualDetach`, the
+model-check flags) and same-value writes; `addWorker` and `setWorker` fire
+too. `note()` writes its queued-notes column without a signal — a note is a
+reason for the next judgment turn, and its one visible effect, the "worker
+finished" phrase, is published by `setWorker` when the worker's status
+changes. The callback also fires from the needs-you mutation points — a
+question filed (`ask`) or answered (`answer`, `answerQuestionOnly`,
+`answerEscalation`), an escalation filed route-`me` (`escalate`) or forwarded
+to the user or resolved (`reroute`, `resolve`, `approve`, `decline`), and a
+need filed, updated or closed (`fileNeed`, `closeNeed`, `closeNeeds`,
+`closeNeedByKey`). A synchronous coalescing guard makes one question filed or
 answered publish exactly one event even when the operation nests (`answer`
 resolves its escalation). Every open sidebar refetches when the event names a
-project it shows, and the board page refetches when it names its project; the
-half-minute poll remains the fallback.
+project it shows, the board page refetches when it names its project, and the
+overview (which covers every project) refetches on any event; the half-minute
+poll remains the fallback.
 
 **The default provider, checked (BB-44 criterion 1).** With
 `sidebar.threadListProvider` unset it is `__automatic__`, which bb resolves to
