@@ -27,7 +27,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { NEEDS_YOU_CHANGED } from "./channels.js";
-import { buildSidebar, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort } from "./sidebar.js";
+import { buildSidebar, effortTitle, isBusy, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -851,10 +851,11 @@ function InFlightRow({ steward: s, now }: { steward: Board["stewards"][number]; 
 // ---- The sidebar thread list -------------------------------------------------------------------
 //
 // The opt-in replacement for bb's sidebar list, registered through the
-// exclusive `experimental_threadList` slot. One project dropdown, in-flight
-// efforts grouped by the steward relationship, collapsed Watches and Recently
-// ended rows, and a demoted project-steward row. Every row carries bb's own
-// thread actions context menu, so nothing bb's rows can do is lost.
+// exclusive `experimental_threadList` slot. One project dropdown, two-line
+// effort rows with the four glyphs in the Blocked / In flight / Threads /
+// Monitors / Recently ended sections, and a demoted project-steward row. Every
+// row carries bb's own thread actions context menu, so nothing bb's rows can
+// do is lost.
 
 /** The live fields bb's thread actions read, from a sidebar row. */
 function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
@@ -881,14 +882,43 @@ function shortBindingKey(key: string): string {
   return pull === null ? key : `#${pull[1]}`;
 }
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-/** Whether the title names the key as a whole token, so `#612` is not swallowed by `#6123`. */
-function titleNamesKey(title: string, key: string): boolean {
-  return new RegExp(`${escapeRegExp(key)}(?!\\d)`).test(title);
+/** The effort's kind, spelled out for line two. */
+function kindLabel(kind: string | null): string {
+  if (kind === "pr") return "pull request";
+  if (kind === "ticket") return "ticket";
+  if (kind === "review") return "review";
+  if (kind === "ops") return "ops";
+  return kind ?? "thread";
 }
 
-/** One thread row: bb's glyph, title and context menu, expanding into its children. */
+/** The phrase's colour follows the glyph's (BB-76): yellow, red, blue, muted. */
+function phraseClass(state: SidebarEffortState): string {
+  if (state === "you") return "text-amber-600 dark:text-amber-500";
+  if (state === "blocked") return "text-destructive";
+  if (state === "running") return "text-blue-600 dark:text-blue-400";
+  return "text-muted-foreground";
+}
+
+/**
+ * The four glyphs, in precedence order (BB-76): a solid yellow dot when it
+ * waits on you, an empty red ring when blocked, a blue ring that pulses slowly
+ * while a worker or agent runs, an empty grey ring when quiet. The pulse is
+ * CSS only and stops under `prefers-reduced-motion`.
+ */
+function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
+  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className="size-2.5 shrink-0 rounded-full bg-amber-400" />;
+  const border = kind === "blocked" ? "border-red-500" : kind === "running" ? "border-blue-500" : "border-muted-foreground/50";
+  return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
+}
+
+/** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
+function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
+  if (thread.isUnread || thread.indicator === "unread-success" || thread.indicator === "unread-error") return "you";
+  if (isBusy(thread.status)) return "running";
+  return "quiet";
+}
+
+/** One thread row: a glyph, title and context menu, expanding into its children. */
 function SidebarThreadRow({
   thread,
   role,
@@ -898,6 +928,7 @@ function SidebarThreadRow({
   onNavigate,
   meta,
   titleAttr,
+  glyph,
 }: {
   thread: PluginSidebarThread;
   role: SidebarChildRole;
@@ -908,6 +939,8 @@ function SidebarThreadRow({
   meta?: ReactNode;
   /** The full binding key, kept on the row's `title` attribute when the row is an effort. */
   titleAttr?: string;
+  /** The four-glyph component for a one-off thread or the project steward row; drafts keep bb's glyph. */
+  glyph?: SidebarEffortState;
 }) {
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
@@ -916,6 +949,7 @@ function SidebarThreadRow({
   // The array-wide indicator never reports a draft; the row folds in the
   // client-local one, as bb's own row does.
   const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
+  const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
     <li className="flex flex-col">
@@ -938,7 +972,7 @@ function SidebarThreadRow({
               (none, dot, spinner) or its width. The spinner at size="compact"
               is the widest, so size-4 is the slot. */}
           <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
-            <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />
+            {useStewardGlyph ? <StewardGlyph kind={glyph!} /> : <ThreadStatusGlyph indicator={indicator} rowStatus={rowStatus} size="compact" />}
           </span>
           <a
             href={thread.href}
@@ -973,25 +1007,158 @@ function SidebarThreadRow({
   );
 }
 
-/** One effort's root row, title-first: the shortened key only when the title omits it, and the held/blocked badges. */
-function SidebarEffortRow({ effort, byId, onNavigate }: { effort: SidebarEffort; byId: ReadonlyMap<string, PluginSidebarThread>; onNavigate: () => void }) {
+/**
+ * The inline "needs you" block under an effort row's line two (BB-76): the
+ * question or need's text, then its one-click actions, exactly the RPC calls
+ * the old Needs you block made. A fixed-choice question answers through
+ * `stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
+ * choose`; an approve-pr or merge keeps its Open PR / Approve|Merge buttons;
+ * everything else opens the board.
+ */
+function SidebarInlineNeed({ item, onChanged, onOpenBoard }: { item: SidebarNeedItem; onChanged: () => void; onOpenBoard: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
+  const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  const text = item.type === "need" ? item.what : item.question;
+  const isApprovePr = item.type === "need" && item.kind === "approve-pr";
+  const isMerge = item.type === "need" && item.kind === "merge";
+  const choices = item.type === "question" ? item.choices : item.type === "need" && item.kind === "decide" ? item.choices : [];
+  const run = (call: Promise<{ ok: boolean; message: string }>) => {
+    setState("running");
+    call.then(
+      (r) => {
+        if (!r.ok) return setState({ error: r.message });
+        onChanged();
+      },
+      (e: unknown) => setState({ error: message(e) }),
+    );
+  };
+  const answer = (choice: string) => run(rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice }));
+  const choose = (choice: string) => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice }));
+  const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
+  const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
+  const button = "rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50";
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="min-w-0 break-words text-[11px] text-muted-foreground">{text}</p>
+      <div className="flex flex-wrap items-center gap-1">
+        {choices.length > 0 ? (
+          choices.map((choice) => (
+            <button key={choice} type="button" disabled={state === "running"} className={button} onClick={() => (item.type === "question" ? answer(choice) : choose(choice))}>
+              {choice}
+            </button>
+          ))
+        ) : isApprovePr || isMerge ? (
+          <>
+            {item.url !== null ? (
+              <button type="button" className={button} onClick={() => navigate.openUrl(item.url!)}>
+                Open PR
+              </button>
+            ) : null}
+            <button type="button" disabled={state === "running"} className={button} onClick={isApprovePr ? approve : merge}>
+              {isApprovePr ? "Approve" : "Merge"}
+            </button>
+          </>
+        ) : null}
+        <button type="button" className={button} onClick={onOpenBoard}>
+          Details
+        </button>
+        {typeof state === "object" ? <span className="text-[11px] text-destructive">{state.error}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One effort's root row, two lines (BB-76): glyph, entity key and title on
+ * line one; kind, phase and status phrase on line two; a needs-you row adds
+ * its prompt and actions under that, in the same row.
+ */
+function SidebarEffortRow({
+  effort,
+  needs,
+  byId,
+  onNavigate,
+  onChanged,
+  onOpenBoard,
+}: {
+  effort: SidebarEffort;
+  needs: readonly SidebarNeedItem[];
+  byId: ReadonlyMap<string, PluginSidebarThread>;
+  onNavigate: () => void;
+  onChanged: () => void;
+  onOpenBoard: () => void;
+}) {
   const root = byId.get(effort.rootThreadId);
+  const navigate = useBbNavigate();
+  const [open, setOpen] = useState(false);
   if (root === undefined) return null;
   const key = effort.bindingKey;
   const displayKey = key === null ? null : shortBindingKey(key);
-  // The title wins: a steward is titled after its binding, so showing the key again is noise.
-  const keyInTitle = key !== null && displayKey !== null && (titleNamesKey(root.displayTitle, key) || titleNamesKey(root.displayTitle, displayKey));
-  const showKey = displayKey !== null && !keyInTitle;
-  const badges = effort.hold !== null || effort.blockedOn !== null;
-  const meta =
-    !showKey && !badges ? null : (
-      <span className="flex min-w-0 shrink items-center gap-1 text-[11px] text-muted-foreground">
-        {showKey ? <span className="min-w-0 truncate font-medium">{displayKey}</span> : null}
-        {effort.hold !== null ? <Badge tone="warn">held</Badge> : null}
-        {effort.blockedOn !== null ? <Badge tone="bad">blocked</Badge> : null}
-      </span>
-    );
-  return <SidebarThreadRow thread={root} role="thread" children={effort.children} depth={0} byId={byId} onNavigate={onNavigate} meta={meta} titleAttr={key ?? undefined} />;
+  const title = effortTitle(root.displayTitle, key);
+  const count = countThreads(effort.children);
+  const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
+  return (
+    <li className="flex flex-col">
+      <ThreadActionsContextMenu thread={actionTarget(root)}>
+        <div className="flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover" style={{ paddingLeft: "4px" }} title={key ?? undefined}>
+          <div className="flex items-center gap-1">
+            {count > 0 ? (
+              <button
+                type="button"
+                aria-label={`${open ? "Collapse" : "Expand"} ${root.displayTitle}`}
+                aria-expanded={open}
+                className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
+                onClick={() => setOpen((v) => !v)}
+              >
+                <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
+              </button>
+            ) : (
+              <span className="flex size-4 shrink-0 items-center justify-center" />
+            )}
+            <span data-sidebar-status-slot="" className="flex size-4 shrink-0 items-center justify-center">
+              <StewardGlyph kind={effort.state} />
+            </span>
+            <a
+              href={root.href}
+              className="flex min-w-0 flex-1 items-baseline gap-1 text-sm"
+              onClick={(e) => {
+                e.preventDefault();
+                navigate.toThread(root.id);
+                onNavigate();
+              }}
+            >
+              {displayKey !== null ? <span className="shrink-0 font-semibold">{displayKey}</span> : null}
+              <span className="min-w-0 truncate">{title}</span>
+            </a>
+          </div>
+          <p className="text-[11px] text-muted-foreground" style={{ paddingLeft: "36px" }} data-sidebar-line-two="">
+            {kindLabel(effort.kind)}
+            {effort.phase !== null ? ` · ${effort.phase}` : ""}
+            {" · "}
+            <span className={phraseClass(effort.state)}>{effort.phrase}</span>
+          </p>
+        </div>
+      </ThreadActionsContextMenu>
+      {mine.length > 0 ? (
+        <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
+          {mine.map((item) => (
+            <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} onOpenBoard={onOpenBoard} />
+          ))}
+        </div>
+      ) : null}
+      {open && effort.children.length > 0 ? (
+        <ul className="flex flex-col">
+          {effort.children.map((c) => {
+            const child = byId.get(c.threadId);
+            return child === undefined ? null : (
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} />
+            );
+          })}
+        </ul>
+      ) : null}
+    </li>
+  );
 }
 
 function SidebarSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
@@ -1062,98 +1229,6 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
   );
 }
 
-/**
- * One item in the sidebar's "Needs you" block: the key, one line of text, and
- * Details, which opens the board at the project. The board carries the full
- * question, its context and its choices, so a `question` or `decide` row does
- * not render them here. An `approve-pr` or `merge` row keeps its one-click
- * button — the server re-checks the gate before acting — beside Open the pull
- * request; every other row opens the page.
- */
-function SidebarNeedRow({ item, onChanged, onOpenBoard }: { item: SidebarNeedItem; onChanged: () => void; onOpenBoard: () => void }) {
-  const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
-  const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  const text = item.type === "need" ? item.what : item.question;
-  const entityUrl = item.type === "need" ? item.entityUrl : item.url;
-  const prUrl = item.url;
-  // approve-pr and merge are the mechanical items the server verifies before
-  // acting; every other row opens the page.
-  const isApprovePr = item.type === "need" && item.kind === "approve-pr";
-  const isMerge = item.type === "need" && item.kind === "merge";
-  const run = (call: Promise<{ ok: boolean; message: string }>) => {
-    setState("running");
-    call.then(
-      (r) => {
-        if (!r.ok) return setState({ error: r.message });
-        onChanged();
-      },
-      (e: unknown) => setState({ error: message(e) }),
-    );
-  };
-  const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
-  const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
-  return (
-    <li className="flex flex-col gap-1 px-2 py-1.5">
-      <p className="flex flex-wrap items-center gap-2">
-        {item.key !== null ? <EntityLink entityKey={item.key} url={entityUrl} /> : null}
-        {item.type === "withUser" ? <Badge tone="bad">{item.kind === "approval" ? "approval request" : `${item.kind} escalation`}</Badge> : null}
-        {item.type === "need" ? <Badge tone="bad">{item.kind}</Badge> : null}
-      </p>
-      <p className={isApprovePr ? "min-w-0 break-words" : "min-w-0 truncate"}>{text}</p>
-      <div className="flex flex-wrap items-center gap-1">
-        {isApprovePr || isMerge ? (
-          <>
-            {prUrl !== null ? (
-              <button
-                type="button"
-                className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover"
-                onClick={() => navigate.openUrl(prUrl)}
-              >
-                Open the pull request
-              </button>
-            ) : null}
-            <button
-              type="button"
-              disabled={state === "running"}
-              className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50"
-              onClick={isApprovePr ? approve : merge}
-            >
-              {isApprovePr ? "Approve" : "Merge"}
-            </button>
-            <button type="button" className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover" onClick={onOpenBoard}>
-              Details
-            </button>
-          </>
-        ) : (
-          <button type="button" className="rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover" onClick={onOpenBoard}>
-            Details
-          </button>
-        )}
-        {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
-      </div>
-    </li>
-  );
-}
-
-/** The sidebar's "Needs you" block: the board's waiting items, above In flight. */
-function SidebarNeedsSection({ projectId, needs, onChanged }: { projectId: string; needs: SidebarNeeds; onChanged: () => void }) {
-  const navigate = useBbNavigate();
-  return (
-    <SidebarSection title="Needs you" count={needs.count}>
-      {needs.items.length === 0 ? (
-        <p className="px-2 py-1 text-muted-foreground">Nothing is waiting on you.</p>
-      ) : (
-        <ul className="flex flex-col">
-          {needs.items.map((item) => (
-            <SidebarNeedRow key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} onOpenBoard={() => navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(projectId) })} />
-          ))}
-        </ul>
-      )}
-    </SidebarSection>
-  );
-}
-
 function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -1161,7 +1236,8 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [] }), [projects, threads, data]);
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
-  const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, needsByProject.get(t.projectId)?.count ?? 0] as const)), [tabs, needsByProject]);
+  // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
+  const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, t.blocked.filter((e) => e.state === "you").length] as const)), [tabs]);
   // A steward's question or item updates the badge and block within seconds;
   // the half-minute poll stays the fallback. Only a project this sidebar shows
   // triggers a refetch.
@@ -1189,6 +1265,10 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
     if (active !== null) navigate.toCompose({ projectId: active.projectId });
     onNavigate();
   };
+  const openBoard = () => {
+    if (active !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: encodeURIComponent(active.projectId) });
+  };
+  const needItems = activeNeeds?.items ?? [];
   return (
     <div className="flex h-full flex-col text-sm">
       <ProjectTabs tabs={tabs} counts={counts} activeId={active?.projectId ?? null} onPick={setPicked} onNewThread={openNewThread} />
@@ -1198,14 +1278,22 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
         <p className="p-3 text-muted-foreground">No projects yet.</p>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
-          {activeNeeds !== undefined ? <SidebarNeedsSection projectId={active.projectId} needs={activeNeeds} onChanged={refetch} /> : null}
+          {active.blocked.length > 0 ? (
+            <SidebarSection title="Blocked" count={active.blocked.length}>
+              <ul className="flex flex-col">
+                {active.blocked.map((e) => (
+                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
+                ))}
+              </ul>
+            </SidebarSection>
+          ) : null}
           <SidebarSection title="In flight" count={active.efforts.length}>
             {active.efforts.length === 0 ? (
               <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>
             ) : (
               <ul className="flex flex-col">
                 {active.efforts.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
+                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
                 ))}
               </ul>
             )}
@@ -1213,17 +1301,20 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
           {active.threads.length > 0 ? (
             <SidebarCollapsible title="Threads" count={active.threads.length}>
               <ul className="flex flex-col">
-                {active.threads.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
-                ))}
+                {active.threads.map((e) => {
+                  const t = byId.get(e.rootThreadId);
+                  return t === undefined ? null : (
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} />
+                  );
+                })}
               </ul>
             </SidebarCollapsible>
           ) : null}
-          {active.watches.length > 0 ? (
-            <SidebarCollapsible title="Watches" count={active.watches.length}>
+          {active.monitors.length > 0 ? (
+            <SidebarCollapsible title="Monitors" count={active.monitors.length}>
               <ul className="flex flex-col">
-                {active.watches.map((e) => (
-                  <SidebarEffortRow key={e.key} effort={e} byId={byId} onNavigate={onNavigate} />
+                {active.monitors.map((e) => (
+                  <SidebarEffortRow key={e.key} effort={e} needs={needItems} byId={byId} onNavigate={onNavigate} onChanged={refetch} onOpenBoard={openBoard} />
                 ))}
               </ul>
             </SidebarCollapsible>
@@ -1264,6 +1355,7 @@ function StewardsSidebar({ activeProjectId, onNavigate }: PluginThreadListProps)
                 depth={0}
                 byId={byId}
                 onNavigate={onNavigate}
+                glyph="quiet"
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />
             </div>

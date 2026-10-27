@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
-// BB-44: the stewards sidebar thread list renders one tab per project, efforts
-// grouped by the steward relationship, collapsed Watches and Recently ended
-// rows, and bb's thread actions context menu on every row.
+// BB-44/BB-76: the stewards sidebar thread list renders one tab per project,
+// two-line effort rows with the four glyphs, inline needs-you actions, and the
+// Blocked / In flight / Threads / Monitors / Recently ended sections.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
@@ -48,12 +48,13 @@ const projects = [
   { id: "personal", name: "Personal", isPersonal: true, href: "/projects/personal", settingsHref: "/projects/personal/settings" },
 ];
 
-const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; projectStewardThreadId?: string | null } = {}) => ({
+const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; needs?: unknown; projectStewardThreadId?: string | null } = {}) => ({
   projects: [
     {
       projectId: "p1",
       name: "Acme",
       projectStewardThreadId: over.projectStewardThreadId ?? null,
+      needs: over.needs ?? { count: 0, items: [] },
       bindings: over.bindings ?? [],
       ended: over.ended ?? [],
     },
@@ -64,15 +65,76 @@ const binding = (over: Record<string, unknown> = {}) => ({
   key: "ENG-1",
   kind: "ticket",
   stage: "build",
+  phase: null,
   threadId: "thr_steward",
   hold: null,
+  holdBehind: [],
   blockedOn: null,
   needsUser: false,
+  stuck: false,
+  status: null,
+  deployment: null,
   advancedAt: null,
   workers: [],
   reviewers: [],
   ...over,
 });
+
+const questionItem = (over: Record<string, unknown> = {}) => ({
+  type: "question",
+  id: "qst_1",
+  question: "Stack or hold?",
+  context: null,
+  choices: [],
+  key: "ENG-1",
+  bindingKey: "ENG-1",
+  url: null,
+  escalationId: null,
+  createdAt: 0,
+  rationaleWanted: null,
+  ...over,
+});
+
+const needItem = (over: Record<string, unknown> = {}) => ({
+  type: "need",
+  id: "need_1",
+  bindingId: "b1",
+  key: "ENG-1",
+  bindingKey: "ENG-1",
+  kind: "approve-pr",
+  url: "https://github.com/acme/web/pull/1",
+  entityUrl: "https://github.com/acme/web/pull/1",
+  escalationId: null,
+  choices: [],
+  lessonId: null,
+  what: "Approve the pull request",
+  how: null,
+  destination: null,
+  threadId: null,
+  createdAt: 0,
+  actionable: true,
+  why: null,
+  ...over,
+});
+
+const withUserItem = (over: Record<string, unknown> = {}) => ({
+  type: "withUser",
+  id: "esc_1",
+  kind: "blocked",
+  question: "Need cluster access",
+  recommendation: null,
+  key: "ENG-1",
+  bindingKey: "ENG-1",
+  url: null,
+  threadId: null,
+  createdAt: 0,
+  rationaleWanted: null,
+  ...over,
+});
+
+const lineTwo = (slot: RenderedSlot, title: string): string => slot.getByText(title).closest("li")!.querySelector("[data-sidebar-line-two]")!.textContent ?? "";
+
+const glyphOf = (slot: RenderedSlot, title: string): string | null => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")?.getAttribute("data-steward-glyph") ?? null;
 
 let app: CapturedPluginApp | null = null;
 const loadApp = async () => {
@@ -97,62 +159,45 @@ describe("the stewards sidebar list (BB-44)", () => {
     expect(captured.threadLists[0]).toMatchObject({ id: "sidebar", title: "Stewards" });
   });
 
-  it("shows a tab per live project and a title-first row with the shortened key and badges", async () => {
+  it("shows a tab per live project and a two-line effort row with key, title, kind, phase and phrase", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "billing freeze" })] }) } as never,
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ phase: "In Review", status: { actor: "steward", nextAction: "wait for the review", at: 1 } })] }),
+      } as never,
     });
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme" })).toBeTruthy());
     expect(slot.getByRole("option", { name: "Personal" })).toBeTruthy();
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    // The title does not name the key, so the key shows; the stage does not.
+    // Line one: the shortened key and the title, the key stripped from the title.
     expect(slot.getByText("ENG-1")).toBeTruthy();
-    expect(slot.queryByText("build")).toBeNull();
-    expect(slot.getByText("held")).toBeTruthy();
-    // The full key stays on the row's title attribute.
     expect(slot.container.querySelector('[title="ENG-1"]')).not.toBeNull();
+    // Line two: kind, phase, phrase; no stage text anywhere.
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · wait for the review");
+    expect(slot.queryByText("build")).toBeNull();
     slot.lifecycle.unmount();
   });
 
-  it("drops the key when the title already names it, and keeps no stage text", async () => {
+  it("shortens a pull-request key to #N and spells out the kind", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Review acme/web#612: Read dashboard metrics" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612", stage: "review" })] }) } as never,
-    });
-    await waitFor(() => expect(slot.getByText("Review acme/web#612: Read dashboard metrics")).toBeTruthy());
-    expect(slot.queryByText("#612", { exact: true })).toBeNull();
-    expect(slot.queryByText("review", { exact: true })).toBeNull();
-    expect(slot.container.querySelector('[title="acme/web#612"]')).not.toBeNull();
-    slot.lifecycle.unmount();
-  });
-
-  it("shortens a pull-request key to #N when the title omits it", async () => {
-    const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612" })] }) } as never,
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "acme/web#612: Read dashboard metrics" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612", kind: "pr", phase: "open" })] }) } as never,
     });
     await waitFor(() => expect(slot.getByText("#612")).toBeTruthy());
     expect(slot.queryByText("acme/web#612", { exact: true })).toBeNull();
-    expect(slot.container.querySelector('[title="acme/web#612"]')).not.toBeNull();
+    expect(lineTwo(slot, "Read dashboard metrics")).toBe("pull request · open · no report yet");
     slot.lifecycle.unmount();
   });
 
-  it("does not swallow a key into a longer number in the title", async () => {
+  it("shows kind only for an ops binding, with no phase", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login #6123" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web#612" })] }) } as never,
+      sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", status: { actor: "steward", nextAction: "watching", at: 1 } })] }) } as never,
     });
-    await waitFor(() => expect(slot.getByText("#612", { exact: true })).toBeTruthy());
-    slot.lifecycle.unmount();
-  });
-
-  it("renders held and blocked badges without a stage", async () => {
-    const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ hold: "waiting", blockedOn: "a review" })] }) } as never,
-    });
-    await waitFor(() => expect(slot.getByText("held")).toBeTruthy());
-    expect(slot.getByText("blocked")).toBeTruthy();
+    const monitors = await waitFor(() => slot.getByRole("button", { name: /Monitors/u }));
+    fireEvent.click(monitors);
+    await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
+    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · watching");
     slot.lifecycle.unmount();
   });
 
@@ -160,132 +205,34 @@ describe("the stewards sidebar list (BB-44)", () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
-        threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" })],
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" })],
       },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry" }] })] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })] }) } as never,
     });
-    const expand = await waitFor(() => slot.getByRole("button", { name: "Expand Fix login" }));
+    const expand = await waitFor(() => slot.getByRole("button", { name: "Expand ENG-1: Fix login" }));
     expect(expand.textContent).toBe("");
     fireEvent.click(expand);
     await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
-    expect(slot.getByRole("button", { name: "Collapse Fix login" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
-  it("puts every row's status glyph in the same fixed-width slot so titles line up", async () => {
+  it("shows workers and reviewers only when the effort is expanded, as muted W/R tags", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
-        threads: [
-          thread({ id: "thr_none", displayTitle: "No indicator" }),
-          thread({ id: "thr_dot", displayTitle: "Dot indicator", indicator: "unread-success" }),
-          thread({ id: "thr_spinner", displayTitle: "Spinner indicator", indicator: "runtime" }),
-        ],
-      },
-      rpc: { stewardsSidebar: () => sidebarData() } as never,
-    });
-    // One-off threads live in the collapsed Threads section.
-    const threadsToggle = await waitFor(() => slot.getByRole("button", { name: /Threads/u }));
-    fireEvent.click(threadsToggle);
-    await waitFor(() => expect(slot.getByText("No indicator")).toBeTruthy());
-
-    const rows = ["No indicator", "Dot indicator", "Spinner indicator"].map((title) => {
-      const anchor = slot.getByText(title).closest("a")!;
-      const wrapper = anchor.previousElementSibling as HTMLElement;
-      return { anchor, wrapper };
-    });
-
-    // Every indicator, including none, occupies the same slot classes, and the
-    // title anchor is the element right after it.
-    for (const { anchor, wrapper } of rows) {
-      expect(wrapper.dataset.sidebarStatusSlot).toBe("");
-      expect(wrapper.classList.contains("flex")).toBe(true);
-      expect(wrapper.classList.contains("size-4")).toBe(true);
-      expect(wrapper.classList.contains("shrink-0")).toBe(true);
-      expect(wrapper.classList.contains("items-center")).toBe(true);
-      expect(wrapper.classList.contains("justify-center")).toBe(true);
-      expect(anchor.previousElementSibling).toBe(wrapper);
-    }
-    // None has no glyph; the dot and the spinner render inside the slot.
-    expect(rows[0]!.wrapper.querySelector("[data-thread-status-glyph]")).toBeNull();
-    expect(rows[1]!.wrapper.querySelector('[data-thread-status-glyph="unread-success"]')).not.toBeNull();
-    expect(rows[2]!.wrapper.querySelector('[data-thread-status-glyph="runtime"]')).not.toBeNull();
-    slot.lifecycle.unmount();
-  });
-
-  it("keeps the chevron slot the same width as the leaf slot", async () => {
-    const slot = await renderSidebar({
-      sidebarThreads: {
-        projects,
-        threads: [
-          thread({ id: "thr_parent", displayTitle: "With children" }),
-          thread({ id: "thr_worker", displayTitle: "A worker" }),
-          thread({ id: "thr_leaf", displayTitle: "Leaf binding" }),
-        ],
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" }), thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" })],
       },
       rpc: {
         stewardsSidebar: () =>
           sidebarData({
-            bindings: [
-              binding({ key: "ENG-1", threadId: "thr_parent", workers: [{ threadId: "thr_worker", title: "A worker" }] }),
-              binding({ key: "ENG-2", threadId: "thr_leaf" }),
-            ],
-          }),
-      } as never,
-    });
-    await waitFor(() => expect(slot.getByText("With children")).toBeTruthy());
-    expect(slot.getByText("Leaf binding")).toBeTruthy();
-
-    const chevronSlot = (title: string): HTMLElement => {
-      const anchor = slot.getByText(title).closest("a")!;
-      return anchor.previousElementSibling!.previousElementSibling as HTMLElement;
-    };
-    // The 14px expand icon and the empty leaf placeholder both sit in a size-4
-    // slot, so at equal depth the title starts at the same x either way.
-    const parentSlot = chevronSlot("With children");
-    const leafSlot = chevronSlot("Leaf binding");
-    expect(parentSlot.tagName).toBe("BUTTON");
-    expect(parentSlot.classList.contains("size-4")).toBe(true);
-    expect(parentSlot.classList.contains("shrink-0")).toBe(true);
-    expect(leafSlot.tagName).toBe("SPAN");
-    expect(leafSlot.classList.contains("size-4")).toBe(true);
-    expect(leafSlot.classList.contains("shrink-0")).toBe(true);
-    slot.lifecycle.unmount();
-  });
-
-  it("keeps one-off threads out of In flight, in a collapsed Threads section", async () => {
-    const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_oneoff", displayTitle: "My notes" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
-    });
-    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    const inFlight = slot.getByRole("heading", { name: /In flight/u });
-    expect(inFlight.textContent).toContain("1");
-    const threads = slot.getByRole("button", { name: /Threads/u });
-    expect(threads.textContent).toContain("1");
-    // Collapsed by default: the one-off's title is not rendered until it is opened.
-    expect(slot.queryByText("My notes")).toBeNull();
-    fireEvent.click(threads);
-    await waitFor(() => expect(slot.getByText("My notes")).toBeTruthy());
-    slot.lifecycle.unmount();
-  });
-
-  it("shows workers and reviewers only when the effort is expanded, as muted glyph tags", async () => {
-    const slot = await renderSidebar({
-      sidebarThreads: {
-        projects,
-        threads: [thread({ id: "thr_steward", displayTitle: "Fix login" }), thread({ id: "thr_worker", displayTitle: "Implement retry" }), thread({ id: "thr_reviewer", displayTitle: "Review the PR", parentThreadId: "thr_worker" })],
-      },
-      rpc: {
-        stewardsSidebar: () =>
-          sidebarData({
-            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
+            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
           }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(slot.queryByText("Implement retry")).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: /Expand Fix login/u }));
+    fireEvent.click(slot.getByRole("button", { name: /Expand ENG-1: Fix login/u }));
     await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
     expect(slot.getByTitle("worker").textContent).toBe("W");
     fireEvent.click(slot.getByRole("button", { name: /Expand Implement retry/u }));
@@ -296,7 +243,7 @@ describe("the stewards sidebar list (BB-44)", () => {
 
   it("wraps every row in bb's thread actions context menu", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
       threadActions: () =>
         [{ key: "archive", pluginId: "thread-list", group: "4_lifecycle", action: { label: "Archive", icon: "Archive", run: () => {} } }] as never,
@@ -309,7 +256,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("collapses Watches and Recently ended until opened", async () => {
+  it("collapses Monitors and Recently ended until opened", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ops" })] },
       rpc: {
@@ -320,10 +267,10 @@ describe("the stewards sidebar list (BB-44)", () => {
           }),
       } as never,
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: /Watches/u })).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: /Monitors/u })).toBeTruthy());
     expect(slot.queryByText("acme/web")).toBeNull();
     expect(slot.queryByText("Old work")).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: /Watches/u }));
+    fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("acme/web")).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
     await waitFor(() => expect(slot.getByText("Old work")).toBeTruthy());
@@ -391,7 +338,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     const onNavigate = vi.fn();
     const slot = await renderSidebar(
       {
-        sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "Fix login" })] },
+        sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
         rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
       },
       { onNavigate },
@@ -400,6 +347,246 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.click(slot.getByText("Fix login"));
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_steward" }));
     expect(onNavigate).toHaveBeenCalled();
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
+  it("puts a needs-you effort at the top of Blocked with a yellow dot and its phrase, not in In flight", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true, phase: "In Review" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("heading", { name: /Blocked/u })).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · needs you");
+    expect(glyphOf(slot, "Fix login")).toBe("you");
+    // The picker counts the yellow rows.
+    expect(slot.getByRole("option", { name: "Acme (1)" })).toBeTruthy();
+    // No separate Needs you section remains.
+    expect(slot.queryByRole("heading", { name: /Needs you/u })).toBeNull();
+    // The In flight section is empty.
+    expect(slot.getByRole("heading", { name: /In flight/u }).textContent).toContain("0");
+    slot.lifecycle.unmount();
+  });
+
+  it("puts a blocked effort in Blocked with a red ring and the rule's phrase", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ blockedOn: "bb-gate#88", phase: "In Progress" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Progress · blocked on bb-gate#88");
+    expect(glyphOf(slot, "Fix login")).toBe("blocked");
+    expect(slot.getByRole("heading", { name: /In flight/u }).textContent).toContain("0");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows held-behind, stuck and waiting-on-others as blocked", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "ENG-1: A" }), thread({ id: "thr_b", displayTitle: "ENG-2: B" }), thread({ id: "thr_c", displayTitle: "ENG-3: C" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_a", hold: "a freeze", holdBehind: ["ENG-9"] }),
+              binding({ key: "ENG-2", threadId: "thr_b", stuck: true }),
+              binding({ key: "ENG-3", threadId: "thr_c", status: { actor: "other", nextAction: "the vendor", at: 1 } }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("A")).toBeTruthy());
+    expect(lineTwo(slot, "A")).toContain("held behind ENG-9");
+    expect(lineTwo(slot, "B")).toContain("stuck");
+    expect(lineTwo(slot, "C")).toContain("waiting on the vendor");
+    expect(glyphOf(slot, "A")).toBe("blocked");
+    expect(glyphOf(slot, "B")).toBe("blocked");
+    expect(glyphOf(slot, "C")).toBe("blocked");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a running effort in In flight with a blue animated ring and a running-worker count", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({
+                phase: "In Review",
+                workers: [
+                  { threadId: "thr_w1", title: "w1", status: "running" },
+                  { threadId: "thr_w2", title: "w2", status: "running" },
+                  { threadId: "thr_w3", title: "w3", status: "finished" },
+                ],
+              }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · 2 workers running");
+    expect(glyphOf(slot, "Fix login")).toBe("running");
+    const glyph = slot.container.querySelector('[data-steward-glyph="running"]')!;
+    expect(glyph.className).toContain("motion-safe:animate-pulse");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a quiet effort in In flight with a grey ring and the next action", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ status: { actor: "steward", nextAction: "wait for CI", at: 1 } })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · wait for CI");
+    expect(glyphOf(slot, "Fix login")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a deployment watch's state as the phrase", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ deployment: "deployed" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · deployed");
+    expect(glyphOf(slot, "Fix login")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  it("shows yellow, blue and grey one-off thread glyphs, keeping bb's draft glyph", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_unread", displayTitle: "Unread reply", indicator: "unread-success" }),
+          thread({ id: "thr_running", displayTitle: "Running agent", status: "active" }),
+          thread({ id: "thr_quiet", displayTitle: "Read and idle" }),
+          thread({ id: "thr_draft", displayTitle: "Has a draft", indicator: "draft" }),
+        ],
+      },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Threads/u })));
+    await waitFor(() => expect(slot.getByText("Unread reply")).toBeTruthy());
+    expect(glyphOf(slot, "Unread reply")).toBe("you");
+    expect(glyphOf(slot, "Running agent")).toBe("running");
+    expect(glyphOf(slot, "Read and idle")).toBe("quiet");
+    // A draft keeps bb's own glyph, not the four-glyph component.
+    expect(glyphOf(slot, "Has a draft")).toBeNull();
+    expect(slot.container.querySelector('[data-thread-status-glyph="draft"]')).not.toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps an ops binding out of Monitors when it is blocked, and shows it in Blocked", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", blockedOn: "a rotation" })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("heading", { name: /Blocked/u })).toBeTruthy());
+    expect(slot.getByText("Ops watch: acme/web")).toBeTruthy();
+    expect(glyphOf(slot, "Ops watch: acme/web")).toBe("blocked");
+    expect(slot.queryByRole("button", { name: /Monitors/u })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("gives the project steward footer row a grey ring", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_p", displayTitle: "Acme project steward" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ projectStewardThreadId: "thr_p" }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Acme project steward")).toBeTruthy());
+    expect(glyphOf(slot, "Acme project steward")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+});
+
+describe("the inline needs-you actions (BB-76)", () => {
+  it("renders a fixed-choice question's buttons and answers through stewardsAnswerQuestion", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding({ needsUser: true })],
+            needs: { count: 1, items: [questionItem({ choices: ["Stack", "Hold"], question: "Stacked on BB-57. Merge order?" })] },
+          }),
+        stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Stacked on BB-57. Merge order?")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Stack" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: "Stack" } }));
+    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a decide need's choices and sends them through stewardsNeedAction choose", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding({ needsUser: true })],
+            needs: { count: 1, items: [needItem({ kind: "decide", choices: ["Merge", "Close"], what: "Merge or close?" })] },
+          }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Merge or close?")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "choose", note: null, choice: "Merge" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders an approve-pr need's Open PR / Approve / Details and approves in one click", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem()] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Approve the pull request")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "approve", note: null, choice: null } }));
+    fireEvent.click(slot.getByRole("button", { name: "Open PR" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: "https://github.com/acme/web/pull/1" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a with-user escalation with Details only", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [withUserItem()] } }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
+    expect(slot.queryByRole("button", { name: "Approve" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("refetches after an action so the row updates without a reload", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({
+            bindings: [binding({ needsUser: calls === 1 })],
+            needs: calls === 1 ? { count: 1, items: [questionItem({ choices: ["Stack", "Hold"] })] } : { count: 0, items: [] },
+          });
+        },
+        stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Stack" })).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Stack" }));
+    await waitFor(() => expect(slot.queryByRole("button", { name: "Stack" })).toBeNull());
+    expect(calls).toBeGreaterThan(1);
     slot.lifecycle.unmount();
   });
 });

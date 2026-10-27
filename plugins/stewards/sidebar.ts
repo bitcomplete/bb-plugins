@@ -1,7 +1,7 @@
 // The sidebar thread list's pure core: joining the host's live thread view to
-// the `stewardsSidebar` RPC result, grouping threads into efforts, and ordering
-// them. No React and no SDK, so the component and its tests share exactly this
-// code.
+// the `stewardsSidebar` RPC result, grouping threads into efforts, deriving each
+// effort's state / section / phrase, and ordering them. No React and no SDK, so
+// the component and its tests share exactly this code.
 //
 // Grouping comes from the steward relationship, not the thread tree. A worker
 // belongs to its binding through the plugin's `workers` table, which the RPC
@@ -10,15 +10,27 @@
 // for a pre-BB-23 worker whose parent is its steward (BB-23 removed that link,
 // so it is a fallback, never the rule).
 
+import type { DeployState } from "./deploy.js";
+
 /** A binding as `stewardsSidebar` reports it. */
 export interface SidebarBinding {
   key: string;
   kind: string;
   stage: string | null;
+  /** The entity's own state, as the playbook's `phases` table names it; null when the binding has none. */
+  phase: string | null;
   threadId: string | null;
   hold: string | null;
+  /** Entity keys this hold waits behind. */
+  holdBehind: string[];
   blockedOn: string | null;
   needsUser: boolean;
+  /** An open `stuck` escalation (BB-76): an external wait is a block. */
+  stuck: boolean;
+  /** The status report's actor, next action and timestamp, or null with no report. */
+  status: { actor: string; nextAction: string; at: number } | null;
+  /** The state of the newest deployment watch, or null with none (BB-76). */
+  deployment: DeployState | null;
   advancedAt: number | null;
   workers: SidebarWorker[];
   reviewers: SidebarReviewer[];
@@ -27,6 +39,8 @@ export interface SidebarBinding {
 export interface SidebarWorker {
   threadId: string;
   title: string;
+  /** The plugin's own worker status, so the running count is of running workers. */
+  status: string;
 }
 
 export interface SidebarReviewer {
@@ -78,6 +92,12 @@ export interface SidebarChild {
   children: SidebarChild[];
 }
 
+/** The four glyphs, in precedence order: you › blocked › running › quiet. */
+export type SidebarEffortState = "you" | "blocked" | "running" | "quiet";
+
+/** Which section an effort belongs to. `ops` bindings are `monitors` unless they need you or are blocked. */
+export type SidebarSection = "blocked" | "inflight" | "monitors";
+
 /** One effort: a root thread and the threads that belong to it. */
 export interface SidebarEffort {
   /** Stable identity: the binding key for a stewarded effort, `thread:<id>` for a one-off. */
@@ -88,13 +108,29 @@ export interface SidebarEffort {
   title: string;
   kind: string | null;
   stage: string | null;
+  /** The entity's own phase, shown on line two; null for ops and one-off threads. */
+  phase: string | null;
   hold: string | null;
+  holdBehind: string[];
   blockedOn: string | null;
   needsUser: boolean;
+  stuck: boolean;
+  statusActor: string | null;
+  statusNextAction: string | null;
+  statusAt: number | null;
+  deployment: DeployState | null;
+  /** How many of the binding's workers are running (worker-table status). */
+  runningWorkers: number;
   pinned: boolean;
   busy: boolean;
   /** The most recent activity anywhere in the effort, epoch ms. */
   recency: number;
+  /** Derived: the glyph. */
+  state: SidebarEffortState;
+  /** Derived: the section it sits in. */
+  section: SidebarSection;
+  /** Derived: line two's status phrase. */
+  phrase: string;
   children: SidebarChild[];
 }
 
@@ -102,12 +138,14 @@ export interface SidebarTab {
   projectId: string;
   name: string;
   isPersonal: boolean;
-  /** In-flight stewarded efforts, ordered. `ops` bindings are in `watches`, one-off threads in `threads`. */
+  /** Needs-you (yellow) then blocked (red) efforts: stewarded and ops. */
+  blocked: SidebarEffort[];
+  /** In-flight stewarded efforts, running before quiet. `ops` bindings are in `monitors`, one-off threads in `threads`. */
   efforts: SidebarEffort[];
   /** One-off threads (no steward binding), ordered. */
   threads: SidebarEffort[];
-  /** `ops`, Dependabot and Sentry bindings, grouped in a collapsed row. */
-  watches: SidebarEffort[];
+  /** `ops`, Dependabot and Sentry bindings that are neither waiting on you nor blocked. */
+  monitors: SidebarEffort[];
   projectStewardThreadId: string | null;
   ended: SidebarEnded[];
 }
@@ -119,6 +157,74 @@ export const isBusy = (status: string): boolean => BUSY.has(status);
 
 const parentOf = (t: Pick<SidebarLiveThread, "parentThreadId" | "lifecycleOwnerThreadId">): string | null => t.parentThreadId ?? t.lifecycleOwnerThreadId;
 
+/** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
+export const isRunning = (e: Pick<SidebarEffort, "busy" | "runningWorkers">): boolean => e.busy || e.runningWorkers > 0;
+
+/**
+ * The effort's glyph, first match wins (BB-76):
+ * needs you › blocked › running › quiet. An external wait (`actor = other`)
+ * is a block, and a running effort that also needs you is yellow.
+ */
+export function effortState(e: SidebarEffort): SidebarEffortState {
+  if (e.needsUser) return "you";
+  if (e.blockedOn !== null || e.hold !== null || e.stuck || e.statusActor === "other") return "blocked";
+  if (isRunning(e)) return "running";
+  return "quiet";
+}
+
+/** The section the effort sits in: blocked (you or red), monitors for a quiet/running `ops`, else in flight. */
+export function effortSection(e: SidebarEffort): SidebarSection {
+  if (e.state === "you" || e.state === "blocked") return "blocked";
+  return e.kind === "ops" ? "monitors" : "inflight";
+}
+
+/** A deployment watch's state, in words: the three the row shows. */
+export function deploymentPhrase(state: DeployState): string {
+  if (state === "deployed") return "deployed";
+  if (state === "failed") return "deploy failed";
+  return "deploying";
+}
+
+/**
+ * Line two's status phrase, first match wins (BB-76):
+ * needs you › blockedOn › hold › stuck › actor=other › running › deployment › nextAction › no report.
+ */
+export function effortPhrase(e: SidebarEffort): string {
+  if (e.needsUser) return "needs you";
+  if (e.blockedOn !== null) return `blocked on ${e.blockedOn}`;
+  if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
+  if (e.stuck) return "stuck";
+  if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
+  if (isRunning(e)) {
+    const n = e.runningWorkers;
+    return `${n} worker${n === 1 ? "" : "s"} running`;
+  }
+  if (e.deployment !== null) return deploymentPhrase(e.deployment);
+  if (e.statusNextAction !== null) return e.statusNextAction;
+  return "no report yet";
+}
+
+/** Fill in the derived fields. Grouping calls this once the effort's children are attached. */
+function derive(e: SidebarEffort): SidebarEffort {
+  e.state = effortState(e);
+  e.section = effortSection(e);
+  e.phrase = effortPhrase(e);
+  return e;
+}
+
+/**
+ * The title with the key prefix stripped, so line one can show the key and the
+ * title without repeating it. Steward threads are titled `<key>: <title>`, and
+ * a review `<Review key>: <title>`; the key is shown separately either way.
+ */
+export function effortTitle(displayTitle: string, key: string | null): string {
+  if (key === null) return displayTitle;
+  for (const prefix of [`Review ${key}: `, `${key}: `]) {
+    if (displayTitle.startsWith(prefix)) return displayTitle.slice(prefix.length);
+  }
+  return displayTitle;
+}
+
 /**
  * bb's precedence for its own list: pinned first, then threads that need the
  * user, then busy threads (`starting` / `active` / `stopping`), then most
@@ -128,6 +234,26 @@ export function compareEfforts(a: SidebarEffort, b: SidebarEffort): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   if (a.needsUser !== b.needsUser) return a.needsUser ? -1 : 1;
   if (a.busy !== b.busy) return a.busy ? -1 : 1;
+  if (b.recency !== a.recency) return b.recency - a.recency;
+  return a.title.localeCompare(b.title);
+}
+
+/** Blocked: pinned first, then needs-you (yellow) before red, then by recency. */
+export function compareBlocked(a: SidebarEffort, b: SidebarEffort): number {
+  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+  const aYou = a.state === "you" ? 0 : 1;
+  const bYou = b.state === "you" ? 0 : 1;
+  if (aYou !== bYou) return aYou - bYou;
+  if (b.recency !== a.recency) return b.recency - a.recency;
+  return a.title.localeCompare(b.title);
+}
+
+/** In flight: pinned first, then running (blue) before quiet (grey), then by recency. */
+export function compareInflight(a: SidebarEffort, b: SidebarEffort): number {
+  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+  const aRun = a.state === "running" ? 0 : 1;
+  const bRun = b.state === "running" ? 0 : 1;
+  if (aRun !== bRun) return aRun - bRun;
   if (b.recency !== a.recency) return b.recency - a.recency;
   return a.title.localeCompare(b.title);
 }
@@ -177,12 +303,23 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       title: root.displayTitle,
       kind: b.kind,
       stage: b.stage,
+      phase: b.phase,
       hold: b.hold,
+      holdBehind: b.holdBehind,
       blockedOn: b.blockedOn,
       needsUser: b.needsUser,
+      stuck: b.stuck,
+      statusActor: b.status?.actor ?? null,
+      statusNextAction: b.status?.nextAction ?? null,
+      statusAt: b.status?.at ?? null,
+      deployment: b.deployment,
+      runningWorkers: b.workers.filter((w) => w.status === "running").length,
       pinned: root.isPinned,
       busy: isBusy(root.status),
       recency: root.updatedAt,
+      state: "quiet",
+      section: "inflight",
+      phrase: "",
       children: [],
     };
     const byThread = new Map<string, SidebarChild>();
@@ -212,6 +349,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       byThread.set(thread.id, child);
       touch(effort, thread);
     }
+    derive(effort);
   }
 
   // The fallback the RPC records do not cover: a pre-BB-23 worker whose parent
@@ -236,6 +374,8 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       changed = true;
     }
   }
+  // A fallback child can flip busy after the effort was derived.
+  for (const effort of efforts) derive(effort);
 
   // One-off efforts: everything left, treed by parent / lifecycle owner.
   const remaining = threads.filter((t) => !claimed.has(t.id) && t.id !== stewardThreadId);
@@ -260,12 +400,23 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       title: root.displayTitle,
       kind: null,
       stage: null,
+      phase: null,
       hold: null,
+      holdBehind: [],
       blockedOn: null,
       needsUser: false,
+      stuck: false,
+      statusActor: null,
+      statusNextAction: null,
+      statusAt: null,
+      deployment: null,
+      runningWorkers: 0,
       pinned: root.isPinned,
       busy: isBusy(root.status),
       recency: root.updatedAt,
+      state: "quiet",
+      section: "inflight",
+      phrase: "",
       children: [],
     };
     const visit = (t: SidebarLiveThread): SidebarChild => {
@@ -273,16 +424,19 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       return { threadId: t.id, title: t.displayTitle, role: "thread", children: (childrenByParent.get(t.id) ?? []).map(visit) };
     };
     effort.children = (childrenByParent.get(root.id) ?? []).map(visit);
-    efforts.push(effort);
+    efforts.push(derive(effort));
   }
 
+  const nonOps = efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops");
+  const ops = efforts.filter((e) => e.kind === "ops");
   return {
     projectId: project.id,
     name: project.name,
     isPersonal: project.isPersonal,
-    efforts: efforts.filter((e) => e.bindingKey !== null && e.kind !== "ops").sort(compareEfforts),
+    blocked: [...nonOps, ...ops].filter((e) => e.section === "blocked").sort(compareBlocked),
+    efforts: nonOps.filter((e) => e.section === "inflight").sort(compareInflight),
     threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
-    watches: efforts.filter((e) => e.kind === "ops").sort(compareEfforts),
+    monitors: ops.filter((e) => e.section === "monitors").sort(compareEfforts),
     projectStewardThreadId: stewardThreadId,
     ended: data?.ended ?? [],
   };

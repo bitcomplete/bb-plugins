@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareEfforts, isBusy, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -17,9 +17,14 @@ const project = (over: Partial<SidebarLiveProject> & { id: string }): SidebarLiv
 const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: string; threadId: string }): SidebarProjectData["bindings"][number] => ({
   kind: "ticket",
   stage: "build",
+  phase: null,
   hold: null,
+  holdBehind: [],
   blockedOn: null,
   needsUser: false,
+  stuck: false,
+  status: null,
+  deployment: null,
   advancedAt: null,
   workers: [],
   reviewers: [],
@@ -40,12 +45,23 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   title: over.key,
   kind: null,
   stage: null,
+  phase: null,
   hold: null,
+  holdBehind: [],
   blockedOn: null,
   needsUser: false,
+  stuck: false,
+  statusActor: null,
+  statusNextAction: null,
+  statusAt: null,
+  deployment: null,
+  runningWorkers: 0,
   pinned: false,
   busy: false,
   recency: 0,
+  state: "quiet",
+  section: "inflight",
+  phrase: "",
   children: [],
   ...over,
 });
@@ -55,7 +71,7 @@ describe("stewards sidebar grouping", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker" })],
-      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement" }] })] })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })] })],
     });
     expect(tabs[0]!.efforts).toHaveLength(1);
     expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_worker", role: "worker" }]);
@@ -68,7 +84,7 @@ describe("stewards sidebar grouping", () => {
       data: [
         data({
           projectId: "p1",
-          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
         }),
       ],
     });
@@ -98,7 +114,7 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[0]!.threads[0]!.children).toMatchObject([{ threadId: "thr_child", role: "thread", children: [{ threadId: "thr_fork", role: "thread" }] }]);
   });
 
-  it("returns stewarded efforts, one-off threads and ops watches as separate lists", () => {
+  it("returns stewarded efforts, one-off threads and ops monitors as separate lists", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ops" }), thread({ id: "thr_oneoff" })],
@@ -111,7 +127,7 @@ describe("stewards sidebar grouping", () => {
     });
     expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
     expect(tabs[0]!.threads.map((e) => e.key)).toEqual(["thread:thr_oneoff"]);
-    expect(tabs[0]!.watches.map((e) => e.key)).toEqual(["acme/web"]);
+    expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/web"]);
   });
 
   it("skips a binding whose steward thread is not in the live view", () => {
@@ -134,7 +150,7 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[1]!.isPersonal).toBe(true);
   });
 
-  it("groups ops bindings under watches, not in flight", () => {
+  it("groups quiet ops bindings under monitors, not in flight", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_ticket" }), thread({ id: "thr_ops" })],
@@ -146,7 +162,41 @@ describe("stewards sidebar grouping", () => {
       ],
     });
     expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-1"]);
-    expect(tabs[0]!.watches.map((e) => e.key)).toEqual(["acme/web"]);
+    expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/web"]);
+  });
+
+  it("moves a blocked or needs-you ops binding into blocked, out of monitors", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_ops_blocked" }), thread({ id: "thr_ops_you" }), thread({ id: "thr_ops_quiet" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [
+            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, blockedOn: "a rotation" }),
+            binding({ key: "acme/deps", threadId: "thr_ops_you", kind: "ops", stage: null, needsUser: true }),
+            binding({ key: "acme/ns", threadId: "thr_ops_quiet", kind: "ops", stage: null }),
+          ],
+        }),
+      ],
+    });
+    expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/ns"]);
+    expect(tabs[0]!.blocked.map((e) => e.key)).toEqual(["acme/deps", "acme/sentry"]);
+  });
+
+  it("keeps a blocked non-ops effort out of in flight", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" }), thread({ id: "thr_ok" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", hold: "a freeze", holdBehind: ["ENG-9"] }), binding({ key: "ENG-2", threadId: "thr_ok" })],
+        }),
+      ],
+    });
+    expect(tabs[0]!.blocked.map((e) => e.key)).toEqual(["ENG-1"]);
+    expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-2"]);
   });
 });
 
@@ -166,12 +216,117 @@ describe("stewards sidebar ordering", () => {
     expect(["idle", "finished", "failed"].some(isBusy)).toBe(false);
   });
 
-  it("orders a tab's threads and watches with the same comparator", () => {
+  it("orders a tab's threads and monitors with the same comparator", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_quiet", updatedAt: 5 }), thread({ id: "thr_busy", status: "active", updatedAt: 1 })],
       data: [data({ projectId: "p1" })],
     });
     expect(tabs[0]!.threads.map((e) => e.rootThreadId)).toEqual(["thr_busy", "thr_quiet"]);
+  });
+
+  it("orders blocked: pinned, then needs-you (yellow) before red, then recency", () => {
+    const you = effort({ key: "you", needsUser: true, state: "you", recency: 1 });
+    const blockedOld = effort({ key: "blocked-old", blockedOn: "x", state: "blocked", recency: 5 });
+    const blockedNew = effort({ key: "blocked-new", blockedOn: "y", state: "blocked", recency: 50 });
+    const pinned = effort({ key: "pinned", pinned: true, blockedOn: "z", state: "blocked", recency: 0 });
+    const ordered = [blockedOld, you, pinned, blockedNew].sort(compareBlocked).map((e) => e.key);
+    expect(ordered).toEqual(["pinned", "you", "blocked-new", "blocked-old"]);
+  });
+
+  it("orders in flight: pinned, then running before quiet, then recency", () => {
+    const runningOld = effort({ key: "running-old", runningWorkers: 1, state: "running", recency: 1 });
+    const quietNew = effort({ key: "quiet-new", recency: 99 });
+    const pinned = effort({ key: "pinned", pinned: true, recency: 0 });
+    const ordered = [quietNew, runningOld, pinned].sort(compareInflight).map((e) => e.key);
+    expect(ordered).toEqual(["pinned", "running-old", "quiet-new"]);
+  });
+});
+
+describe("stewards sidebar state, section and phrase (BB-76)", () => {
+  it("takes the state in precedence order: you › blocked › running › quiet", () => {
+    // A running effort that also needs you is yellow.
+    expect(effortState(effort({ key: "a", needsUser: true, blockedOn: "x", runningWorkers: 1 }))).toBe("you");
+    expect(effortState(effort({ key: "b", blockedOn: "x", runningWorkers: 1 }))).toBe("blocked");
+    expect(effortState(effort({ key: "c", runningWorkers: 1 }))).toBe("running");
+    expect(effortState(effort({ key: "d" }))).toBe("quiet");
+  });
+
+  it("treats each block signal as blocked: blockedOn, hold, stuck, and actor = other", () => {
+    expect(effortState(effort({ key: "a", blockedOn: "a review" }))).toBe("blocked");
+    expect(effortState(effort({ key: "b", hold: "a freeze" }))).toBe("blocked");
+    expect(effortState(effort({ key: "c", stuck: true }))).toBe("blocked");
+    expect(effortState(effort({ key: "d", statusActor: "other", statusNextAction: "the vendor" }))).toBe("blocked");
+  });
+
+  it("counts a busy thread or a running worker as running", () => {
+    expect(effortState(effort({ key: "a", busy: true }))).toBe("running");
+    expect(effortState(effort({ key: "b", runningWorkers: 2 }))).toBe("running");
+  });
+
+  it("puts needs-you and blocked in the blocked section, ops in monitors, the rest in flight", () => {
+    expect(effortSection(effort({ key: "a", needsUser: true, state: "you" }))).toBe("blocked");
+    expect(effortSection(effort({ key: "b", blockedOn: "x", state: "blocked" }))).toBe("blocked");
+    expect(effortSection(effort({ key: "c", kind: "ops", state: "quiet" }))).toBe("monitors");
+    expect(effortSection(effort({ key: "d", kind: "ticket", state: "running" }))).toBe("inflight");
+  });
+
+  it("phrases every rule, first match wins", () => {
+    // 1. needs you
+    expect(effortPhrase(effort({ key: "a", needsUser: true, blockedOn: "x" }))).toBe("needs you");
+    // 2. blockedOn
+    expect(effortPhrase(effort({ key: "b", blockedOn: "bb-gate#88" }))).toBe("blocked on bb-gate#88");
+    // 3. hold
+    expect(effortPhrase(effort({ key: "c", hold: "a freeze", holdBehind: ["BB-57", "BB-61"] }))).toBe("held behind BB-57, BB-61");
+    expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");
+    // 4. stuck
+    expect(effortPhrase(effort({ key: "e", stuck: true }))).toBe("stuck");
+    // 5. actor = other
+    expect(effortPhrase(effort({ key: "f", statusActor: "other", statusNextAction: "an owner LGTM" }))).toBe("waiting on an owner LGTM");
+    // 6. running workers
+    expect(effortPhrase(effort({ key: "g", runningWorkers: 2 }))).toBe("2 workers running");
+    expect(effortPhrase(effort({ key: "h", runningWorkers: 1 }))).toBe("1 worker running");
+    // 7. deployment
+    expect(effortPhrase(effort({ key: "i", deployment: "merged" }))).toBe("deploying");
+    expect(effortPhrase(effort({ key: "j", deployment: "deployed" }))).toBe("deployed");
+    expect(effortPhrase(effort({ key: "k", deployment: "failed" }))).toBe("deploy failed");
+    // 8. nextAction
+    expect(effortPhrase(effort({ key: "l", statusNextAction: "wait for the review" }))).toBe("wait for the review");
+    // 9. no report
+    expect(effortPhrase(effort({ key: "m" }))).toBe("no report yet");
+  });
+
+  it("phrases a deployment watch's state", () => {
+    expect(deploymentPhrase("merged")).toBe("deploying");
+    expect(deploymentPhrase("deploying")).toBe("deploying");
+    expect(deploymentPhrase("deployed")).toBe("deployed");
+    expect(deploymentPhrase("failed")).toBe("deploy failed");
+  });
+
+  it("strips the key prefix so line one shows the key and title without repeating it", () => {
+    expect(effortTitle("ENG-1: Fix login", "ENG-1")).toBe("Fix login");
+    expect(effortTitle("Review acme/web#612: Read metrics", "acme/web#612")).toBe("Read metrics");
+    expect(effortTitle("A title that keeps its words", "ENG-1")).toBe("A title that keeps its words");
+    expect(effortTitle("Any title", null)).toBe("Any title");
+  });
+
+  it("derives state, section and phrase for every effort a tab builds", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_you" }), thread({ id: "thr_run" }), thread({ id: "thr_ops" })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [
+            binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
+            binding({ key: "ENG-2", threadId: "thr_run", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
+            binding({ key: "acme/web", threadId: "thr_ops", kind: "ops", stage: null }),
+          ],
+        }),
+      ],
+    });
+    expect(tabs[0]!.blocked.map((e) => `${e.key}:${e.state}:${e.phrase}`)).toEqual(["ENG-1:you:needs you"]);
+    expect(tabs[0]!.efforts.map((e) => `${e.key}:${e.state}`)).toEqual(["ENG-2:running"]);
+    expect(tabs[0]!.monitors.map((e) => `${e.key}:${e.state}:${e.phrase}`)).toEqual(["acme/web:quiet:no report yet"]);
   });
 });

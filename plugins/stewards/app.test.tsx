@@ -358,76 +358,96 @@ describe("the sidebar-footer toggle (BB-45)", () => {
   });
 });
 
-// BB-46: the sidebar's "Needs you" block, fed by the
-// `stewardsSidebar` call and refreshed over the realtime channel.
+// BB-46/BB-76: the sidebar's picker counts the yellow effort rows and refreshes
+// over the realtime channel; the needs-you items themselves live inline on the
+// effort row (covered in sidebar-app.test.tsx).
 const sidebarProjects = [
   { id: "p1", name: "Acme", isPersonal: false, href: "/projects/p1", settingsHref: "/projects/p1/settings" },
   { id: "p2", name: "Beta", isPersonal: false, href: "/projects/p2", settingsHref: "/projects/p2/settings" },
 ];
 
-const sidebarData = (p1Needs: { count: number; items: unknown[] }, p2Needs: { count: number; items: unknown[] } = { count: 0, items: [] }) => ({
+const sidebarThread = (id: string, projectId = "p1") => ({
+  id,
+  projectId,
+  title: id,
+  titleFallback: null,
+  displayTitle: id,
+  parentThreadId: null,
+  lifecycleOwnerThreadId: null,
+  sourceThreadId: null,
+  sectionId: null,
+  originKind: null,
+  originPluginId: null,
+  providerId: "pi",
+  status: "idle",
+  runtimeStatus: "idle",
+  queuedWork: "none",
+  hasPendingInteraction: false,
+  activity: { workflows: 0, backgroundAgents: 0, backgroundCommands: 0, planMode: 0, goals: 0 },
+  indicator: "none",
+  indicatorLabel: null,
+  isUnread: false,
+  isPinned: false,
+  pinnedAt: null,
+  pinSortKey: null,
+  isArchived: false,
+  archivedAt: null,
+  href: `/projects/${projectId}/threads/${id}`,
+  isHidden: false,
+  environment: null,
+  host: null,
+  createdAt: 0,
+  updatedAt: 0,
+  lastReadAt: null,
+  latestAttentionAt: 0,
+});
+
+const sidebarBinding = (over: Record<string, unknown>) => ({
+  key: "ENG-1",
+  kind: "ticket",
+  stage: null,
+  phase: null,
+  hold: null,
+  holdBehind: [],
+  blockedOn: null,
+  needsUser: false,
+  stuck: false,
+  status: null,
+  deployment: null,
+  advancedAt: null,
+  workers: [],
+  reviewers: [],
+  ...over,
+});
+
+const sidebarData = (over: { p1?: Record<string, unknown>; p2?: Record<string, unknown> } = {}) => ({
   projects: [
-    { projectId: "p1", name: "Acme", projectStewardThreadId: null, needs: p1Needs, bindings: [], ended: [] },
-    { projectId: "p2", name: "Beta", projectStewardThreadId: null, needs: p2Needs, bindings: [], ended: [] },
+    { projectId: "p1", name: "Acme", projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [], ...over.p1 },
+    { projectId: "p2", name: "Beta", projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [], ...over.p2 },
   ],
 });
 
-describe("the stewards sidebar's needs you block (BB-46)", () => {
-  const questionItem = (over: Record<string, unknown> = {}) => ({
-    type: "question",
-    id: "qst_1",
-    question: "Which approach?",
-    context: null,
-    choices: [],
-    key: "ENG-12",
-    url: "https://linear.app/acme/issue/ENG-12",
-    escalationId: null,
-    createdAt: 1_000,
-    ...over,
-  });
-  const needItem = (over: Record<string, unknown> = {}) => ({
-    type: "need",
-    id: "need_1",
-    bindingId: "bnd_1",
-    key: "ENG-12",
-    kind: "decide",
-    url: null,
-    entityUrl: "https://linear.app/acme/issue/ENG-12",
-    escalationId: null,
-    choices: [],
-    lessonId: null,
-    what: "Hold or start?",
-    how: null,
-    destination: null,
-    threadId: null,
-    createdAt: 1_000,
-    actionable: true,
-    why: null,
-    ...over,
-  });
-
-  const renderSidebar = async (rpc: Record<string, unknown>, props: Record<string, unknown> = {}): Promise<RenderedSlot> => {
+describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
+  const renderSidebar = async (rpc: Record<string, unknown>, props: Record<string, unknown> = {}, threads: unknown[] = []): Promise<RenderedSlot> => {
     const captured = await loadApp();
     const list = captured.threadLists[0]!;
     return renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "", ...props } as never, {
-      sidebarThreads: { projects: sidebarProjects, threads: [] },
+      sidebarThreads: { projects: sidebarProjects, threads },
       rpc,
     } as never);
   };
 
-  it("does not render a summed count badge beside the picker", async () => {
-    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }) });
-    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
-    await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
-    expect(slot.queryByLabelText("2 waiting on you")).toBeNull();
-    expect(slot.getByRole("option", { name: "Beta" })).toBeTruthy();
-    slot.lifecycle.unmount();
-  });
-
-  it.each([false, true])("shows per-project counts in its options and no summed badge (compact=%s)", async (isCompactViewport) => {
+  it("counts the yellow effort rows per project, with no summed badge beside the picker", async () => {
     const slot = await renderSidebar(
-      { stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem(), needItem()] }, { count: 1, items: [needItem({ id: "need_2" })] }) },
-      { isCompactViewport },
+      {
+        stewardsSidebar: () =>
+          sidebarData({
+            p1: { bindings: [sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true }), sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true })], needs: { count: 9, items: [] } },
+            p2: { bindings: [sidebarBinding({ key: "ENG-3", threadId: "thr_c", needsUser: true })] },
+          }),
+      },
+      {},
+      [sidebarThread("thr_a"), sidebarThread("thr_b"), sidebarThread("thr_c", "p2")],
     );
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (2)" })).toBeTruthy());
     expect(slot.getByRole("option", { name: "Beta (1)" })).toBeTruthy();
@@ -436,7 +456,7 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
   });
 
   it("sizes the picker and the New thread button as h-8 controls", async () => {
-    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 2, items: [questionItem()] }) });
+    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData() });
     const select = await waitFor(() => slot.getByLabelText("Project"));
     expect(select.className).toContain("h-8");
     const button = slot.getByRole("button", { name: "New thread" });
@@ -445,136 +465,12 @@ describe("the stewards sidebar's needs you block (BB-46)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("renders only Details for a question with choices, never the choices", async () => {
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [questionItem({ choices: ["Merge", "Close"] })] }),
-      stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
-    });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Merge" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Close" })).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: "Details" }));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
-    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsAnswerQuestion")).toBe(false);
-    slot.lifecycle.unmount();
-  });
-
-  it("renders only Details for a decide need with choices, never the choices", async () => {
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ choices: ["Hold", "Start"] })] }),
-      stewardsNeedAction: () => ({ ok: true, message: "done" }),
-    });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Hold" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Start" })).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: "Details" }));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
-    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsNeedAction")).toBe(false);
-    slot.lifecycle.unmount();
-  });
-
-  it("offers Merge, Open the pull request and Details on a merge row, and sends the merge action", async () => {
-    const url = "https://github.com/bitcomplete/bb-gate/pull/17";
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "merge", url })] }),
-      stewardsNeedAction: () => ({ ok: true, message: "merged" }),
-    });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Merge" })).toBeTruthy());
-    expect(slot.getByRole("button", { name: "Open the pull request" })).toBeTruthy();
-    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
-    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "merge", note: null, choice: null } }));
-    slot.lifecycle.unmount();
-  });
-
-  it("opens the board for a row without choices, under a Details label", async () => {
-    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "configure", choices: [] })] }) });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Details" })).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Open" })).toBeNull();
-    fireEvent.click(slot.getByRole("button", { name: "Details" }));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
-    slot.lifecycle.unmount();
-  });
-
-  it("offers Open the pull request, Approve and Details on an approve-pr row, with wrapped text", async () => {
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17", what: "Approve bitcomplete/bb-gate#17" })] }),
-    });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Open the pull request" })).toBeTruthy());
-    expect(slot.getByRole("button", { name: "Approve" })).toBeTruthy();
-    expect(slot.getByRole("button", { name: "Details" })).toBeTruthy();
-    const text = slot.getByText("Approve bitcomplete/bb-gate#17");
-    expect(text.className).not.toContain("truncate");
-    expect(text.className).toContain("break-words");
-    slot.lifecycle.unmount();
-  });
-
-  it("opens the pull request's url from the row and makes no RPC", async () => {
-    const url = "https://github.com/bitcomplete/bb-gate/pull/17";
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url })] }),
-      stewardsNeedAction: () => ({ ok: true, message: "done" }),
-    });
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Open the pull request" })));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url }));
-    expect(slot.inspection.rpcCalls.some((c) => c.method === "stewardsNeedAction")).toBe(false);
-    slot.lifecycle.unmount();
-  });
-
-  it("sends the approve action with no note or choice, and refetches on success", async () => {
-    let calls = 0;
-    const slot = await renderSidebar({
-      stewardsSidebar: () => {
-        calls += 1;
-        return sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] });
-      },
-      stewardsNeedAction: () => ({ ok: true, message: "approved" }),
-    });
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Approve" })));
-    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "approve", note: null, choice: null } }));
-    await waitFor(() => expect(calls).toBe(2));
-    slot.lifecycle.unmount();
-  });
-
-  it("shows the server's refusal in the row and re-enables the buttons", async () => {
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] }),
-      stewardsNeedAction: () => ({ ok: false, message: "the owner must approve first" }),
-    });
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Approve" })));
-    await waitFor(() => expect(slot.getByText("the owner must approve first")).toBeTruthy());
-    expect((slot.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
-    slot.lifecycle.unmount();
-  });
-
-  it("opens the board at the project from Details on an approve-pr row", async () => {
-    const slot = await renderSidebar({
-      stewardsSidebar: () => sidebarData({ count: 1, items: [needItem({ kind: "approve-pr", url: "https://github.com/bitcomplete/bb-gate/pull/17" })] }),
-    });
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Details" })));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
-    slot.lifecycle.unmount();
-  });
-
-  it("labels the page button Details on every other row, with no Open label", async () => {
-    const items = [
-      needItem({ id: "need_secret", kind: "provide-secret", choices: [] }),
-      needItem({ id: "need_config", kind: "configure", choices: [] }),
-      needItem({ id: "need_decide", kind: "decide", choices: [] }),
-      questionItem({ id: "qst_1", choices: [] }),
-    ];
-    const slot = await renderSidebar({ stewardsSidebar: () => sidebarData({ count: items.length, items }) });
-    await waitFor(() => expect(slot.getAllByRole("button", { name: "Details" })).toHaveLength(4));
-    expect(slot.queryByRole("button", { name: "Open" })).toBeNull();
-    slot.lifecycle.unmount();
-  });
-
   it("refetches on a realtime event for a shown project and ignores an unknown one", async () => {
     let calls = 0;
     const slot = await renderSidebar({
       stewardsSidebar: () => {
         calls += 1;
-        return sidebarData({ count: 0, items: [] });
+        return sidebarData();
       },
     });
     await waitFor(() => expect(calls).toBe(1));
