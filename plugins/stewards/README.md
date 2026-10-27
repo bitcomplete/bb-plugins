@@ -416,7 +416,12 @@ ring when quiet. One-off threads use the same four glyphs — yellow when unread
 blue animated while their agent runs, grey otherwise — except a draft, which
 keeps bb's own glyph. A worker or reviewer child row under an effort, and a
 one-off thread's children, share those glyphs and carry no role tag. An `ops`
-binding that needs you or is blocked moves from Monitors into Blocked.
+binding that needs you or is blocked moves from Monitors into Blocked. A
+**Recently ended** row is the same two-line effort row (BB-88): the grey quiet
+ring, the kind, the entity's final phase and the end reason (`terminal`,
+`label removed`, `deleted`) in place of the status phrase, no children, and the
+`ended N ago` stamp on the right. Its steward thread is usually archived, so the
+title comes from the server and the row still renders when the thread is gone.
 
 **Rows, highlighting and auto-expand (BB-85).** An effort row in Blocked, In
 flight or Monitors and a Recently ended row are real links to the effort's

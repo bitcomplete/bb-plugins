@@ -334,7 +334,7 @@ describe("the stewards sidebar list (BB-44)", () => {
         stewardsSidebar: () =>
           sidebarData({
             bindings: [binding(), binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops" })],
-            ended: [{ key: "ENG-0", kind: "ticket", threadId: null, title: "Old work", endedAt: 1_000 }],
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: null, title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }],
           }),
       } as never,
     });
@@ -344,7 +344,32 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
     await waitFor(() => expect(slot.getByText("acme/web")).toBeTruthy());
     fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
-    await waitFor(() => expect(slot.getByText("Old work")).toBeTruthy());
+    const old = await waitFor(() => slot.getByText("Old work"));
+    // BB-88: the same two-line effort row as a live binding, the end reason in
+    // the phrase slot, the grey quiet ring, and the ended stamp on the right.
+    expect(lineTwo(slot, "Old work")).toBe("ticket · Done · terminal");
+    expect(glyphOf(slot, "Old work")).toBe("quiet");
+    expect(old.closest("li")!.textContent).toMatch(/ago/u);
+    expect(old.closest("a")!.getAttribute("href")).toContain("/board/p1/ENG-0");
+    slot.lifecycle.unmount();
+  });
+
+  // BB-88 criterion 1: an ended binding whose steward thread is still in the
+  // live view renders through SidebarEffortRow, title stripped of the key.
+  it("renders a Recently ended binding with a live thread as the two-line effort row", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_old", displayTitle: "ENG-0: Old work" })] },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: Date.now() - 2 * 86_400_000 }] }),
+      } as never,
+    });
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Recently ended/u })));
+    const old = await waitFor(() => slot.getByText("Old work"));
+    expect(lineTwo(slot, "Old work")).toBe("ticket · Done · terminal");
+    expect(glyphOf(slot, "Old work")).toBe("quiet");
+    expect(old.closest("li")!.textContent).toMatch(/2d ago/u);
+    expect(old.closest("a")!.getAttribute("href")).toContain("/board/p1/ENG-0");
     slot.lifecycle.unmount();
   });
 
@@ -928,7 +953,7 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
     const ended = await renderSidebar(
       {
         sidebarThreads: { projects, threads: [] },
-        rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", endedAt: 1_000 }] }) } as never,
+        rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }] }) } as never,
       },
       { activeThreadId: "thr_old" },
     );
@@ -942,7 +967,7 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
     const panel = captured.navPanels[0]!;
     const slot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-0" }, {
       sidebarThreads: { projects, threads: [] },
-      rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", endedAt: 1_000 }] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ ended: [{ key: "ENG-0", kind: "ticket", threadId: "thr_old", title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }] }) } as never,
     });
     const old = await waitFor(() => slot.getByText("Old work"));
     expect(old.closest("a")!.getAttribute("aria-current")).toBe("page");

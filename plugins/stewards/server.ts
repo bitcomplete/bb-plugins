@@ -509,7 +509,7 @@ export const rpcContract = defineRpcContract({
               reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })),
             }),
           ),
-          ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), endedAt: z.number() })),
+          ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), phase: z.string().nullable(), endReason: z.string().nullable(), endedAt: z.number() })),
         }),
       ),
     }),
@@ -4796,7 +4796,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                     reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),
                   };
                 }),
-              ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, endedAt: b.endedAt! })),
+              ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt! })),
             };
           }),
         };

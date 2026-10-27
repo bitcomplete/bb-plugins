@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, isBusy, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -418,5 +418,56 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
     expect(tabs[0]!.blocked.map((e) => `${e.key}:${e.state}:${e.phrase}`)).toEqual(["ENG-1:you:needs you"]);
     expect(tabs[0]!.efforts.map((e) => `${e.key}:${e.state}`)).toEqual(["ENG-2:running"]);
     expect(tabs[0]!.monitors.map((e) => `${e.key}:${e.state}:${e.phrase}`)).toEqual(["acme/web:quiet:no report yet"]);
+  });
+});
+
+describe("stewards sidebar Recently ended efforts (BB-88)", () => {
+  const ended = (over: Partial<SidebarProjectData["ended"][number]> & { key: string }): SidebarProjectData["ended"][number] => ({
+    kind: "ticket",
+    threadId: null,
+    title: null,
+    phase: null,
+    endReason: null,
+    endedAt: 1_000,
+    ...over,
+  });
+
+  it("builds an ended binding as a quiet effort with the end reason as its phrase", () => {
+    const e = endedEffort(ended({ key: "ENG-0", title: "Old work", phase: "Done", endReason: "terminal", threadId: "thr_old" }));
+    expect(e).toMatchObject({
+      key: "ENG-0",
+      bindingKey: "ENG-0",
+      rootThreadId: "thr_old",
+      title: "Old work",
+      kind: "ticket",
+      phase: "Done",
+      state: "quiet",
+      phrase: "terminal",
+      children: [],
+      endedAt: 1_000,
+    });
+  });
+
+  it("tolerates a missing thread and null title, phase and reason", () => {
+    const e = endedEffort(ended({ key: "ENG-0" }));
+    expect(e.rootThreadId).toBe("");
+    expect(e.title).toBe("ENG-0");
+    expect(e.phase).toBeNull();
+    expect(e.phrase).toBe("ended");
+  });
+
+  it("spells `detach` as the label being removed and passes other reasons through", () => {
+    expect(endReasonPhrase("detach")).toBe("label removed");
+    expect(endReasonPhrase("deleted")).toBe("deleted");
+    expect(endReasonPhrase(null)).toBe("ended");
+  });
+
+  it("puts ended bindings in the tab's ended list, built as efforts", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [],
+      data: [data({ projectId: "p1", ended: [ended({ key: "ENG-0", title: "Old work", phase: "Done", endReason: "terminal" })] })],
+    });
+    expect(tabs[0]!.ended.map((e) => `${e.key}:${e.kind}:${e.phase}:${e.phrase}:${e.state}:${e.endedAt}`)).toEqual(["ENG-0:ticket:Done:terminal:quiet:1000"]);
   });
 });
