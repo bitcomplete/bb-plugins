@@ -400,9 +400,9 @@ the next reconcile instead of waiting for the deploy. A hold with an empty
 `holdBehind` is untouched. The `schedule` escalation the plugin files names
 each conflicting binding's phase and its pull request facts — how many
 linked pull requests are open and merged, and whether `noMorePulls` was
-reported — so the project steward can see merged-but-open work without a
-second look, with no recommendation beyond holding behind it or starting
-now.
+reported (with a note when a linked pull request could not be read) — so
+the project steward can see merged-but-open work without a second look,
+with no recommendation beyond holding behind it or starting now.
 
 ### Judgment tier
 

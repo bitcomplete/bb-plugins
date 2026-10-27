@@ -1082,7 +1082,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * (BB-54, BB-89): the schedule wake names the pull request facts from the
      * same read the judgement used.
      */
-    async function atWorkWithRead(b: Binding): Promise<{ atWork: boolean; observed: Observed } | null> {
+    async function atWorkWithRead(b: Binding): Promise<{ atWork: boolean; observed: Observed; complete: boolean } | null> {
       const running = store.workers(b.id).some((w) => w.status === "running");
       const fresh = await freshObserved(b);
       if (fresh === null) return null;
@@ -1091,13 +1091,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // this judgement: the project steward is woken rather than a request
       // skipped.
       const base = { ...b, lastSnapshot: fresh.observed, ...(fresh.complete ? {} : { noMorePulls: null }) };
-      return { atWork: atWork(base, { runningWorker: running }), observed: fresh.observed };
-    }
-
-    /** Whether `b` is at work, judged from a fresh GitHub read and its running workers (BB-54). */
-    async function atWorkFresh(b: Binding): Promise<boolean> {
-      const read = await atWorkWithRead(b);
-      return read === null ? atWork(b, { runningWorker: store.workers(b.id).some((w) => w.status === "running") }) : read.atWork;
+      return { atWork: atWork(base, { runningWorker: running }), observed: fresh.observed, complete: fresh.complete };
     }
 
     /**
@@ -1105,12 +1099,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * GitHub read (BB-54), each with the read the schedule wake reports from
      * (BB-89).
      */
-    async function conflictsFresh(b: Binding): Promise<Array<Conflict & { observed: Observed | null }>> {
-      const conflicts: Array<Conflict & { observed: Observed | null }> = [];
+    async function conflictsFresh(b: Binding): Promise<Array<Conflict & { observed: Observed | null; complete: boolean }>> {
+      const conflicts: Array<Conflict & { observed: Observed | null; complete: boolean }> = [];
       for (const c of overlapping(b, store.open(b.projectId))) {
         const read = await atWorkWithRead(c.with);
         if (read === null ? atWork(c.with, { runningWorker: store.workers(c.with.id).some((w) => w.status === "running") }) : read.atWork) {
-          conflicts.push({ ...c, observed: read?.observed ?? null });
+          conflicts.push({ ...c, observed: read?.observed ?? null, complete: read?.complete ?? false });
         }
       }
       return conflicts;
@@ -3707,7 +3701,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       cleared(false);
       store.patch(b.id, { scheduleAsked: keys });
-      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}; ${pullFacts(c.with, c.observed)}) on ${c.on.join(", ")}`).join("; ");
+      const overlap = conflicts.map((c) => `${c.with.entityKey} (${c.with.phase ?? "?"}; ${pullFacts(c.with, c.observed, c.complete)}) on ${c.on.join(", ")}`).join("; ");
       const x = store.escalate({
         bindingId: b.id,
         kind: "schedule",
@@ -3803,12 +3797,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * steward has reported that no more are coming. Facts only; the wake draws
      * no conclusion from them.
      */
-    function pullFacts(b: Binding, observed: Observed | null): string {
+    function pullFacts(b: Binding, observed: Observed | null, complete: boolean): string {
       if (observed === null) return "pull requests not read, no more pull requests: not reported";
       const pulls = observedPulls(b, observed);
       const merged = pulls.filter((p) => p.pull?.merged === true).length;
       const open = pulls.filter((p) => p.pull?.merged !== true && lc(p.state) !== "closed").length;
-      return `${open} open, ${merged} merged, no more pull requests: ${b.noMorePulls === true ? "reported" : "not reported"}`;
+      const facts = `${open} open, ${merged} merged, no more pull requests: ${b.noMorePulls === true ? "reported" : "not reported"}`;
+      return complete ? facts : `${facts} (read incomplete)`;
     }
 
     /**
