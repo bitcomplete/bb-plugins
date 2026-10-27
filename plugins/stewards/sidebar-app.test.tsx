@@ -300,9 +300,10 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
     });
     // An unread worker is the yellow dot even with no running worker; its busy
-    // reviewer is the pulsing blue ring.
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Expand ENG-1: Fix login/u })));
+    // reviewer is the pulsing blue ring. BB-80: the unread worker opens the
+    // effort by default, so there is no Expand click here.
     await waitFor(() => expect(slot.getByText("Unread worker")).toBeTruthy());
+    expect(slot.getByRole("button", { name: /Collapse ENG-1: Fix login/u })).toBeTruthy();
     expect(glyphOf(slot, "Unread worker")).toBe("you");
     fireEvent.click(slot.getByRole("button", { name: /Expand Unread worker/u }));
     await waitFor(() => expect(slot.getByText("Busy reviewer")).toBeTruthy());
@@ -696,7 +697,8 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
       },
       rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: /Threads/u })));
+    // BB-80: the unread one-off opens the Threads section by default.
+    await waitFor(() => expect(slot.getByRole("button", { name: /Threads/u }).closest("section")!.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
     await waitFor(() => expect(slot.getByText("Unread reply")).toBeTruthy());
     expect(glyphOf(slot, "Unread reply")).toBe("you");
     expect(glyphOf(slot, "Running agent")).toBe("running");
@@ -1169,6 +1171,142 @@ describe("the sidebar's row transitions (BB-91)", () => {
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
     await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-80: a group with an unread descendant starts expanded; a manual toggle
+// always wins, and an untouched group follows unread state as it changes.
+describe("the sidebar's unread auto-expand (BB-80)", () => {
+  const workersBody = (slot: RenderedSlot, title: string): HTMLElement => slot.getByText(title).closest("li")!.querySelector("[data-sidebar-workers]")!;
+  const sectionBody = (slot: RenderedSlot, name: RegExp): HTMLElement => slot.getByRole("button", { name }).closest("section")!.querySelector("[data-sidebar-collapsible]")!;
+
+  it("expands a one-off thread row and the Threads section when a descendant is unread on first render", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_parent", displayTitle: "One-off parent" }), thread({ id: "thr_child", displayTitle: "Unread child", parentThreadId: "thr_parent", isUnread: true })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    await waitFor(() => expect(sectionBody(slot, /Threads/u).className).toContain("grid-rows-[1fr]"));
+    // The parent row is open, so its child row is mounted.
+    await waitFor(() => expect(slot.getByText("Unread child")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Collapse One-off parent" })).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
+  it("expands an effort row and the Monitors section when a descendant is unread on first render", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" }), thread({ id: "thr_ops_worker", displayTitle: "Check Sentry", isUnread: true })],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", workers: [{ threadId: "thr_ops_worker", title: "Check Sentry", status: "finished" }] })] }),
+      } as never,
+    });
+    await waitFor(() => expect(sectionBody(slot, /Monitors/u).className).toContain("grid-rows-[1fr]"));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse Ops watch: acme/web" })).toBeTruthy());
+    expect(workersBody(slot, "Ops watch: acme/web").className).toContain("grid-rows-[1fr]");
+    slot.lifecycle.unmount();
+  });
+
+  it("leaves all-read groups collapsed on first render", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_worker", displayTitle: "Read worker" }), thread({ id: "thr_parent", displayTitle: "One-off parent" }), thread({ id: "thr_child", displayTitle: "Read child", parentThreadId: "thr_parent" })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Read worker", status: "finished" }] })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy();
+    expect(workersBody(slot, "Fix login").className).toContain("grid-rows-[0fr]");
+    expect(sectionBody(slot, /Threads/u).className).toContain("grid-rows-[0fr]");
+    expect(slot.queryByText("Read child")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("flips an untouched group with unread state: expands when unread arrives, collapses when it clears", async () => {
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker" });
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy();
+    const before = calls;
+    worker.isUnread = true;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(before));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    const afterExpand = calls;
+    worker.isUnread = false;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(afterExpand));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps a manually collapsed group collapsed when new unread arrives", async () => {
+    const first = thread({ id: "thr_w1", displayTitle: "Unread worker", isUnread: true });
+    const second = thread({ id: "thr_w2", displayTitle: "Second worker" });
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), first, second] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_w1", title: "Unread worker", status: "finished" }, { threadId: "thr_w2", title: "Second worker", status: "finished" }] })] });
+        },
+      } as never,
+    });
+    // Auto-expanded by the first worker's unread, then collapsed by hand.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    // New unread arrives on the second worker; the manual collapse stands.
+    const before = calls;
+    second.isUnread = true;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(before));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps a manually expanded group expanded after everything becomes read", async () => {
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker" });
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
+        },
+      } as never,
+    });
+    // All read: collapsed, then expanded by hand.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Expand ENG-1: Fix login" })));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    // Unread arrives and clears again; the manual expand stands.
+    const beforeUnread = calls;
+    worker.isUnread = true;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeUnread));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    const beforeRead = calls;
+    worker.isUnread = false;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeRead));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 });

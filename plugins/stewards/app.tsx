@@ -33,7 +33,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, isBusy, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
 type Client = ReturnType<typeof useRpc<typeof rpcContract>>;
@@ -1204,10 +1204,6 @@ function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
   };
 }
 
-function countThreads(children: readonly SidebarChild[]): number {
-  return children.reduce((n, c) => n + 1 + countThreads(c.children), 0);
-}
-
 /** A pull-request key like `acme/web#612` shortens to `#612`; a ticket key stays its key. */
 function shortBindingKey(key: string): string {
   const pull = /#(\d+)$/.exec(key);
@@ -1261,7 +1257,7 @@ function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
 
 /** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
 function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
-  if (thread.isUnread || thread.indicator === "unread-success" || thread.indicator === "unread-error") return "you";
+  if (isUnread(thread)) return "you";
   if (isBusy(thread.status)) return "running";
   return "quiet";
 }
@@ -1305,13 +1301,13 @@ function SidebarThreadRow({
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
   const draft = useSidebarThreadDraft(thread.id);
-  const [open, setOpen] = useState(false);
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const selected = activeThreadId !== null && thread.id === activeThreadId;
   // Navigation to a row inside this one expands it, so the highlighted row is revealed.
   const revealed = openThreads.has(thread.id);
-  useEffect(() => {
-    if (revealed) setOpen(true);
-  }, [revealed]);
+  // An untouched row follows the unread state of its descendants (BB-80); a
+  // manual toggle always wins.
+  const open = userOpen ?? (revealed || hasUnread(children, byId));
   // The array-wide indicator never reports a draft; the row folds in the
   // client-local one, as bb's own row does.
   const indicator = draft.hasUnsubmittedDraft && thread.indicator === "none" ? (isBusy(thread.status) ? "working-draft" : "draft") : thread.indicator;
@@ -1327,7 +1323,7 @@ function SidebarThreadRow({
               aria-label={`${open ? "Collapse" : "Expand"} ${thread.displayTitle}`}
               aria-expanded={open}
               className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-              onClick={() => setOpen((v) => !v)}
+              onClick={() => setUserOpen(!open)}
             >
               <Icon name={open ? "ChevronDown" : "ChevronRight"} className="size-3.5" />
             </button>
@@ -1483,7 +1479,7 @@ function SidebarEffortRow({
   const root = byId.get(effort.rootThreadId);
   const navigate = useBbNavigate();
   const pluginId = experimental_usePluginId();
-  const [open, setOpen] = useState(false);
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const key = effort.bindingKey;
   if (key === null) return null;
   const displayKey = shortBindingKey(key);
@@ -1495,9 +1491,9 @@ function SidebarEffortRow({
   const mine = needs.filter((item) => item.bindingKey !== null && item.bindingKey === key);
   const selected = activeKey !== null && activeKey === key;
   const revealed = openThreads.has(effort.rootThreadId);
-  useEffect(() => {
-    if (revealed) setOpen(true);
-  }, [revealed]);
+  // An untouched effort follows the unread state of its workers and reviewers
+  // (BB-80); a manual toggle always wins.
+  const open = userOpen ?? (revealed || hasUnread(effort.children, byId));
   const href = boardHref(pluginId, projectId, key);
   const body = (
     <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
@@ -1508,7 +1504,7 @@ function SidebarEffortRow({
             aria-label={`${open ? "Collapse" : "Expand"} ${root?.displayTitle ?? effort.title}`}
             aria-expanded={open}
             className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-            onClick={() => setOpen((v) => !v)}
+            onClick={() => setUserOpen(!open)}
           >
             <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200${open ? " rotate-90" : ""}`} />
           </button>
@@ -1579,12 +1575,11 @@ function SidebarSection({ title, count, children }: { title: string; count: numb
   );
 }
 
-function SidebarCollapsible({ title, count, revealed = false, children }: { title: string; count: number; revealed?: boolean; children: ReactNode }) {
-  const [open, setOpen] = useState(false);
-  // Navigation to a row inside this section expands it, so the row is revealed.
-  useEffect(() => {
-    if (revealed) setOpen(true);
-  }, [revealed]);
+function SidebarCollapsible({ title, count, revealed = false, unread = false, children }: { title: string; count: number; revealed?: boolean; /** Whether a thread in the section is unread, so an untouched section opens (BB-80). */ unread?: boolean; children: ReactNode }) {
+  // An untouched section follows the unread state of the threads in it
+  // (BB-80); a manual toggle always wins.
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? (revealed || unread);
   return (
     <section className="flex flex-col">
       {/* `<details>` only for its `open` attribute, which drives the chevron's
@@ -1597,7 +1592,7 @@ function SidebarCollapsible({ title, count, revealed = false, children }: { titl
           className="flex cursor-pointer list-none items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
           onClick={(e) => {
             e.preventDefault();
-            setOpen((v) => !v);
+            setUserOpen(!open);
           }}
         >
           <Icon name="ChevronRight" className="size-3.5 motion-safe:transition-transform group-open:rotate-90" />
@@ -1660,6 +1655,14 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
 /** Whether `id` is anywhere in a child tree. */
 function subtreeHas(children: readonly SidebarChild[], id: string): boolean {
   return children.some((c) => c.threadId === id || subtreeHas(c.children, id));
+}
+
+/** Whether any effort in a section has an unread root or descendant thread (BB-80). */
+function sectionHasUnread(efforts: readonly SidebarEffort[], byId: ReadonlyMap<string, PluginSidebarThread>): boolean {
+  return efforts.some((e) => {
+    const root = byId.get(e.rootThreadId);
+    return (root !== undefined && isUnread(root)) || hasUnread(e.children, byId);
+  });
 }
 
 /** The ancestor thread ids from the direct parent up, or null when `id` is not in the tree. */
@@ -1809,7 +1812,7 @@ function StewardsSidebarCore({
             )}
           </SidebarSection>
           {active.threads.length > 0 ? (
-            <SidebarCollapsible title="Threads" count={active.threads.length} revealed={openSections.has("Threads")}>
+            <SidebarCollapsible title="Threads" count={active.threads.length} revealed={openSections.has("Threads")} unread={sectionHasUnread(active.threads, byId)}>
               <ul className="flex flex-col">
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
@@ -1821,12 +1824,12 @@ function StewardsSidebarCore({
             </SidebarCollapsible>
           ) : null}
           {active.monitors.length > 0 ? (
-            <SidebarCollapsible title="Monitors" count={active.monitors.length} revealed={openSections.has("Monitors")}>
+            <SidebarCollapsible title="Monitors" count={active.monitors.length} revealed={openSections.has("Monitors")} unread={sectionHasUnread(active.monitors, byId)}>
               <ul className="flex flex-col">{rows(active.monitors)}</ul>
             </SidebarCollapsible>
           ) : null}
           {active.ended.length > 0 ? (
-            <SidebarCollapsible title="Recently ended" count={active.ended.length} revealed={openSections.has("Recently ended")}>
+            <SidebarCollapsible title="Recently ended" count={active.ended.length} revealed={openSections.has("Recently ended")} unread={sectionHasUnread(active.ended, byId)}>
               <ul className="flex flex-col">
                 {active.ended.map((e) => (
                   <SidebarEffortRow

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, isBusy, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -471,5 +471,35 @@ describe("stewards sidebar Recently ended efforts (BB-88)", () => {
       data: [data({ projectId: "p1", ended: [ended({ key: "ENG-0", title: "Old work", phase: "Done", endReason: "terminal" })] })],
     });
     expect(tabs[0]!.ended.map((e) => `${e.key}:${e.kind}:${e.phase}:${e.phrase}:${e.state}:${e.endedAt}`)).toEqual(["ENG-0:ticket:Done:terminal:quiet:1000"]);
+  });
+});
+
+// BB-80: the unread predicate and the descendant walk that decide a group's
+// default expansion.
+describe("stewards sidebar unread (BB-80)", () => {
+  const child = (threadId: string, children: SidebarChild[] = []): SidebarChild => ({ threadId, title: threadId, role: "thread", children });
+  const flags = (entries: Array<[string, Partial<{ isUnread: boolean; indicator: string }>]>): ReadonlyMap<string, { isUnread: boolean; indicator: string }> =>
+    new Map(entries.map(([id, over]) => [id, { isUnread: false, indicator: "none", ...over }] as const));
+
+  it("treats isUnread and both unread indicators as unread, and nothing else", () => {
+    expect(isUnread({ isUnread: true, indicator: "none" })).toBe(true);
+    expect(isUnread({ isUnread: false, indicator: "unread-success" })).toBe(true);
+    expect(isUnread({ isUnread: false, indicator: "unread-error" })).toBe(true);
+    expect(isUnread({ isUnread: false, indicator: "draft" })).toBe(false);
+    expect(isUnread({ isUnread: false, indicator: "none" })).toBe(false);
+  });
+
+  it("finds an unread thread at any depth", () => {
+    const tree = [child("a", [child("b", [child("c")])])];
+    expect(hasUnread(tree, flags([["a", {}]]))).toBe(false);
+    expect(hasUnread(tree, flags([["b", { isUnread: true }]]))).toBe(true);
+    expect(hasUnread(tree, flags([["c", { indicator: "unread-success" }]]))).toBe(true);
+    expect(hasUnread(tree, flags([["c", { indicator: "unread-error" }]]))).toBe(true);
+  });
+
+  it("is false for an empty tree, all-read threads, and threads missing from byId", () => {
+    expect(hasUnread([], flags([]))).toBe(false);
+    expect(hasUnread([child("a"), child("b")], flags([["a", {}], ["b", { indicator: "draft" }]]))).toBe(false);
+    expect(hasUnread([child("a", [child("b")])], flags([]))).toBe(false);
   });
 });
