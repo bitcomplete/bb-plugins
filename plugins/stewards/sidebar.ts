@@ -209,8 +209,11 @@ export function deploymentPhrase(state: DeployState): string {
 }
 
 /**
- * Line two's status phrase, first match wins (BB-76):
- * needs you › blockedOn › hold › stuck › running › actor=other › deployment › nextAction › no report.
+ * Line two's status phrase, first match wins (BB-76, BB-86):
+ * needs you › blockedOn › hold › stuck › running › deployment › nextAction › no report.
+ * An external wait is not a prefix: an `other` actor reads its `nextAction`
+ * verbatim like any other actor, and `the other party` only stands in when
+ * there is no report at all.
  */
 export function effortPhrase(e: EffortStatus): string {
   if (e.needsUser) return "needs you";
@@ -225,9 +228,9 @@ export function effortPhrase(e: EffortStatus): string {
     const n = e.runningWorkers;
     return `${n} worker${n === 1 ? "" : "s"} running`;
   }
-  if (e.statusActor === "other") return `waiting on ${e.statusNextAction ?? "the other party"}`;
   if (e.deployment !== null) return deploymentPhrase(e.deployment);
   if (e.statusNextAction !== null) return e.statusNextAction;
+  if (e.statusActor === "other") return "the other party";
   return "no report yet";
 }
 
