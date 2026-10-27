@@ -562,6 +562,41 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("clips a long project name to Slack's plain_text limit in the prompt", async () => {
+    const s = await live({ projects: [{ id: "prj-1", name: "p".repeat(120), kind: "standard" }] });
+    s.hooks.last().send(s.hooks.session({ session: "", thread: "", action: "invited", channel: "C0123", comment: { text: "", untrusted: false } }));
+    await tick();
+    const blocks = s.hooks.ephemerals[0]!.blocks as Array<Record<string, unknown>>;
+    const actions = blocks.find((b) => b.type === "actions") as { elements: Array<{ options: Array<{ text: { text: string } }> }> };
+    expect(actions.elements[0]!.options[0]!.text.text.length).toBeLessThanOrEqual(75);
+    await s.stop();
+  });
+
+  it("treats the Set button's own value as no choice, even for a project named 'set'", async () => {
+    const s = await live({
+      projects: [
+        { id: "prj-1", name: "set", kind: "standard" },
+        { id: "prj-2", name: "Personal", kind: "personal" },
+      ],
+    });
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "",
+        thread: "",
+        action: "block_action",
+        channel: "C0123",
+        actionId: "bb_set_project",
+        value: "set",
+        responseUrl: "https://hooks.slack.com/actions/T1/B1/cap",
+        comment: { text: "", untrusted: false },
+      }),
+    );
+    await tick();
+    expect(((await s.harness.callRpc("status")) as { channels: unknown }).channels).toEqual([]);
+    expect(String(s.hooks.responses.at(-1)?.body.text)).toContain("Pick a project");
+    await s.stop();
+  });
+
   it("refuses a map with no fallback", async () => {
     const s = await live();
     await expect(s.harness.callRpc("setMap", { fallback: "", channels: [] })).rejects.toThrow();

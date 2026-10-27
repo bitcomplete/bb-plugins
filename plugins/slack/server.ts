@@ -81,7 +81,7 @@ export function confirmationText(channel: string, project: string): string {
  * line saying a mention starts a thread in the chosen project.
  */
 export function projectPromptBlocks(channel: string, all: Project[]): unknown[] {
-  const options = all.slice(0, 100).map((p) => ({ text: { type: "plain_text", text: clipMention(p.name, 75) }, value: p.id }));
+  const options = all.slice(0, 100).map((p) => ({ text: { type: "plain_text", text: clipMention(p.name, 74) }, value: p.id }));
   return [
     { type: "section", text: { type: "mrkdwn", text: `bb joined <#${channel}>. Which project should a mention in this channel start a thread in?` } },
     {
@@ -542,6 +542,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Serialize routing-map read-modify-writes, so a `block_action` and the
+     * settings editor's `setMap` cannot lose one another's row.
+     */
+    let mapLock: Promise<unknown> = Promise.resolve();
+    function withMapLock<T>(fn: () => Promise<T>): Promise<T> {
+      const run = mapLock.then(fn, fn);
+      mapLock = run.catch(() => undefined);
+      return run;
+    }
+
+    /**
      * The app joined a channel: if this server has no routing row for it, ask
      * the owner which project a mention there should use, ephemerally in that
      * channel. An already-mapped channel says nothing. This is inert until the
@@ -584,27 +595,35 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await replacePrompt(event.responseUrl, "Only the person who invited bb can set this channel's project.");
         return;
       }
-      const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
-      const existing = channelProject(map.channels, event.channel);
-      if (existing !== null) {
-        await replacePrompt(event.responseUrl, `This channel is already set to ${existing}. Change it under Settings → Plugins → Slack.`);
+      // A click on the Set button (or a select change Slack did not carry a
+      // value for) names no project; ask for one instead of writing. Checked
+      // before findProject, so a project literally named "set" is not mapped
+      // by a bare button press.
+      const value = event.value.trim();
+      if (value === "" || value === "set") {
+        await replacePrompt(event.responseUrl, "Pick a project from the list, then press Set.");
         return;
       }
-      const chosen = findProject(await projects(), event.value);
-      if (chosen === null) {
-        // A click on the Set button (or a select change Slack did not carry a
-        // value for) names no project; ask for one instead of writing.
-        const hint =
-          event.value.trim() === "" || event.value === "set"
-            ? "Pick a project from the list, then press Set."
-            : "That project is not on this server. Pick one from the list, then press Set.";
-        await replacePrompt(event.responseUrl, hint);
+      const outcome = await withMapLock(async () => {
+        const map = parseChannelMap(await bb.storage.kv.get(CHANNEL_MAP_KEY));
+        const existing = channelProject(map.channels, event.channel);
+        if (existing !== null) return { kind: "stale" as const, existing };
+        const chosen = findProject(await projects(), event.value);
+        if (chosen === null) return { kind: "unknown" as const };
+        const channels = [...map.channels.filter((entry) => entry.channel !== event.channel), { channel: event.channel, project: chosen.name }];
+        await saveChannelMap({ fallback: map.fallback, channels });
+        return { kind: "set" as const, chosen };
+      });
+      if (outcome.kind === "stale") {
+        await replacePrompt(event.responseUrl, `This channel is already set to ${outcome.existing}. Change it under Settings → Plugins → Slack.`);
         return;
       }
-      const channels = [...map.channels.filter((entry) => entry.channel !== event.channel), { channel: event.channel, project: chosen.name }];
-      await saveChannelMap({ fallback: map.fallback, channels });
-      await replacePrompt(event.responseUrl, confirmationText(event.channel, chosen.name));
-      bb.log.info(`Slack channel ${event.channel} is now mapped to ${chosen.name}`);
+      if (outcome.kind === "unknown") {
+        await replacePrompt(event.responseUrl, "That project is not on this server. Pick one from the list, then press Set.");
+        return;
+      }
+      await replacePrompt(event.responseUrl, confirmationText(event.channel, outcome.chosen.name));
+      bb.log.info(`Slack channel ${event.channel} is now mapped to ${outcome.chosen.name}`);
     }
 
     /** Push the bb thread's title to Slack for every conversation it answers. */
@@ -907,7 +926,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         return { ok: true };
       },
       async setMap({ fallback, channels }) {
-        await saveChannelMap({ fallback, channels });
+        await withMapLock(() => saveChannelMap({ fallback, channels }));
         return { ok: true };
       },
     });
