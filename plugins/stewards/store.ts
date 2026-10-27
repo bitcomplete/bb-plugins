@@ -1517,7 +1517,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
         data: JSON.stringify(fields.data ?? {}),
         forwarded_from: fields.forwardedFrom ?? null,
         is_question: 0,
-        context: fields.context ?? null,
+        context: fields.context === undefined || fields.context === null || fields.context === "" ? null : fields.context,
         head_sha: fields.headSha ?? null,
       });
       // A route-`me` escalation is a "needs you" item the moment it is filed.

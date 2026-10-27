@@ -724,6 +724,11 @@ describe("a Linear ticket steward", () => {
     const esc = t.hooks.store.openEscalations(b.id)[0]!;
     expect(esc.question).toBe("Include SSO?");
     expect(esc.context).toBe("The auth design doc leaves it open; two providers are viable.");
+
+    // An empty context is stored as null, not "", so the page renders no empty row.
+    const empty = await t.tool("steward_report", { phase: "Todo", summary: "Spec drafted.", nextAction: "Decide on SSO", actor: "other", escalate: { kind: "decision", question: "Include SSO?", context: "", meanwhile: "Wait." } }, steward!);
+    expect(empty.error).toBe(false);
+    expect(t.hooks.store.openEscalations(b.id).at(-1)!.context).toBeNull();
   });
 
   it("forwards an escalation's context ahead of the kind, meanwhile and recommendation lines", async () => {
@@ -6378,6 +6383,11 @@ describe("Sentry stewards", () => {
     expect(first).toMatch(/steward_report \{ escalate: \{ kind: "decision", question: "Provide a Sentry auth token for/u);
     expect(first).toMatch(/variable SENTRY_TOKEN, setting sentryToken/u);
     expect(first).toMatch(/project:read and event:read and event:write/u);
+    // The question it tells the steward to raise stays within the 240 cap, and
+    // the evidence it moves into context is not lost.
+    const sentryQuestion = /steward_report \{ escalate: \{ kind: "decision", question: "([^"]*)"/u.exec(first)![1]!;
+    expect(sentryQuestion.length).toBeLessThanOrEqual(240);
+    expect(first).toMatch(/context: "variable SENTRY_TOKEN, setting sentryToken/u);
     // It does not instruct a refused `needs` filing (BB-51).
     expect(first).not.toMatch(/File one provide-secret need/u);
     expect(first).not.toMatch(/steward_report \{ needs/u);
