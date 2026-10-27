@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
+import { PROJECT_CHANGED } from "./channels.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
   projectId: "p1",
@@ -153,6 +154,7 @@ const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, pro
 
 afterEach(() => {
   app = null;
+  delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
 });
 
 describe("the stewards sidebar list (BB-44)", () => {
@@ -255,9 +257,12 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    expect(slot.queryByText("Implement retry")).toBeNull();
+    // BB-91: the worker list stays mounted and clips to `0fr` while collapsed.
+    const workers = slot.getByText("Fix login").closest("li")!.querySelector("[data-sidebar-workers]")!;
+    expect(workers.className).toContain("grid-rows-[0fr]");
     fireEvent.click(slot.getByRole("button", { name: /Expand ENG-1: Fix login/u }));
     await waitFor(() => expect(slot.getByText("Implement retry")).toBeTruthy());
+    expect(workers.className).toContain("grid-rows-[1fr]");
     // No W/R badge: nothing in the row names the role.
     expect(slot.queryByTitle("worker")).toBeNull();
     expect(slot.queryByTitle("reviewer")).toBeNull();
@@ -339,11 +344,16 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByRole("button", { name: /Monitors/u })).toBeTruthy());
-    expect(slot.queryByText("acme/web")).toBeNull();
-    expect(slot.queryByText("Old work")).toBeNull();
+    // BB-91: a collapsed section stays mounted and clips to `0fr`, so the
+    // expand/collapse can ease; the rows are present but clipped.
+    const monitors = slot.getByRole("button", { name: /Monitors/u }).closest("section")!;
+    const ended = slot.getByRole("button", { name: /Recently ended/u }).closest("section")!;
+    expect(monitors.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
+    expect(ended.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[0fr]");
     fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
-    await waitFor(() => expect(slot.getByText("acme/web")).toBeTruthy());
+    await waitFor(() => expect(monitors.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
     fireEvent.click(slot.getByRole("button", { name: /Recently ended/u }));
+    await waitFor(() => expect(ended.querySelector("[data-sidebar-collapsible]")!.className).toContain("grid-rows-[1fr]"));
     const old = await waitFor(() => slot.getByText("Old work"));
     // BB-88: the same two-line effort row as a live binding, the end reason in
     // the phrase slot, the grey quiet ring, and the ended stamp on the right.
@@ -1014,6 +1024,93 @@ describe("the board panel's own sidebar (BB-85)", () => {
     });
     const row = await waitFor(() => slot.getByText("acme/web"));
     expect(row.closest("a")!.getAttribute("aria-current")).toBe("page");
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-91: the sidebar's CSS-only row transitions.
+describe("the sidebar's row transitions (BB-91)", () => {
+  it("gives every rendered effort, thread and ended row a unique view-transition-name", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_oneoff", displayTitle: "A one-off thread" })],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [binding()],
+            ended: [{ key: "ENG-0", kind: "ticket", threadId: null, title: "Old work", phase: "Done", endReason: "terminal", endedAt: 1_000 }],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    const names = Array.from(slot.container.querySelectorAll<HTMLElement>("[style]"))
+      .map((el) => el.style.viewTransitionName)
+      .filter((name) => name !== "");
+    expect(names.length).toBeGreaterThan(0);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.some((name) => name.startsWith("stewards-effort-"))).toBe(true);
+    expect(names.some((name) => name.startsWith("stewards-ended-"))).toBe(true);
+    expect(names.some((name) => name.startsWith("stewards-thread-"))).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
+  it("adds the enter classes only once the first load has painted", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    });
+    // The initial render has no rows, so nothing animates.
+    expect(slot.container.querySelector("li.motion-safe\\:animate-in")).toBeNull();
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    await waitFor(() => expect(slot.getByText("Fix login").closest("li")!.className).toContain("motion-safe:animate-in"));
+    expect(slot.getByText("Fix login").closest("li")!.className).toContain("slide-in-from-top-1");
+    expect(slot.getByText("Fix login").closest("li")!.className).toContain("duration-200");
+    slot.lifecycle.unmount();
+  });
+
+  it("wraps a data update in a view transition when the document supports one", async () => {
+    const startViewTransition = vi.fn((update: () => void) => {
+      update();
+      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
+    });
+    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    startViewTransition.mockClear();
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(startViewTransition).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
+    slot.lifecycle.unmount();
+  });
+
+  it("still commits a data update when the document has no view transition API", async () => {
+    expect((document as unknown as { startViewTransition?: unknown }).startViewTransition).toBeUndefined();
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
     slot.lifecycle.unmount();
   });
 });
