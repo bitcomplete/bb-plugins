@@ -157,15 +157,35 @@ export const isBusy = (status: string): boolean => BUSY.has(status);
 
 const parentOf = (t: Pick<SidebarLiveThread, "parentThreadId" | "lifecycleOwnerThreadId">): string | null => t.parentThreadId ?? t.lifecycleOwnerThreadId;
 
+/**
+ * The fields the glyph, section and phrase rules read. A `SidebarEffort` has
+ * all of them; the Stewards page builds one from its board RPC's steward shape,
+ * so both surfaces derive the same state and phrase from the same rules (BB-78).
+ * `busy` is the live steward thread's status, so a surface with no live view
+ * passes `false` and relies on the running-worker count.
+ */
+export interface EffortStatus {
+  busy: boolean;
+  runningWorkers: number;
+  needsUser: boolean;
+  blockedOn: string | null;
+  hold: string | null;
+  holdBehind: string[];
+  stuck: boolean;
+  statusActor: string | null;
+  statusNextAction: string | null;
+  deployment: DeployState | null;
+}
+
 /** Whether a worker or reviewer thread is running: the binding is in flight, not quiet. */
-export const isRunning = (e: Pick<SidebarEffort, "busy" | "runningWorkers">): boolean => e.busy || e.runningWorkers > 0;
+export const isRunning = (e: Pick<EffortStatus, "busy" | "runningWorkers">): boolean => e.busy || e.runningWorkers > 0;
 
 /**
  * The effort's glyph, first match wins (BB-76):
  * needs you › blocked › running › quiet. An external wait (`actor = other`)
  * is a block, and a running effort that also needs you is yellow.
  */
-export function effortState(e: SidebarEffort): SidebarEffortState {
+export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
   if (e.blockedOn !== null || e.hold !== null || e.stuck || e.statusActor === "other") return "blocked";
   if (isRunning(e)) return "running";
@@ -173,7 +193,7 @@ export function effortState(e: SidebarEffort): SidebarEffortState {
 }
 
 /** The section the effort sits in: blocked (you or red), monitors for a quiet/running `ops`, else in flight. */
-export function effortSection(e: SidebarEffort): SidebarSection {
+export function effortSection(e: { state: SidebarEffortState; kind: string | null }): SidebarSection {
   if (e.state === "you" || e.state === "blocked") return "blocked";
   return e.kind === "ops" ? "monitors" : "inflight";
 }
@@ -189,7 +209,7 @@ export function deploymentPhrase(state: DeployState): string {
  * Line two's status phrase, first match wins (BB-76):
  * needs you › blockedOn › hold › stuck › actor=other › running › deployment › nextAction › no report.
  */
-export function effortPhrase(e: SidebarEffort): string {
+export function effortPhrase(e: EffortStatus): string {
   if (e.needsUser) return "needs you";
   if (e.blockedOn !== null) return `blocked on ${e.blockedOn}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
@@ -229,11 +249,29 @@ export function effortTitle(displayTitle: string, key: string | null): string {
 }
 
 /**
+ * The fields the ordering comparators read. A `SidebarEffort` has all of them;
+ * the Stewards page builds one from its board RPC's steward shape, so both
+ * surfaces order by the same rules (BB-78).
+ */
+export interface EffortOrder {
+  pinned: boolean;
+  state: SidebarEffortState;
+  recency: number;
+  title: string;
+}
+
+/** An effort's ordering plus the two flags bb's own precedence reads. */
+export interface EffortPriority extends EffortOrder {
+  needsUser: boolean;
+  busy: boolean;
+}
+
+/**
  * bb's precedence for its own list: pinned first, then threads that need the
  * user, then busy threads (`starting` / `active` / `stopping`), then most
  * recent activity. The tie-break by title keeps the order stable.
  */
-export function compareEfforts(a: SidebarEffort, b: SidebarEffort): number {
+export function compareEfforts(a: EffortPriority, b: EffortPriority): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   if (a.needsUser !== b.needsUser) return a.needsUser ? -1 : 1;
   if (a.busy !== b.busy) return a.busy ? -1 : 1;
@@ -242,7 +280,7 @@ export function compareEfforts(a: SidebarEffort, b: SidebarEffort): number {
 }
 
 /** Blocked: pinned first, then needs-you (yellow) before red, then by recency. */
-export function compareBlocked(a: SidebarEffort, b: SidebarEffort): number {
+export function compareBlocked(a: EffortOrder, b: EffortOrder): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   const aYou = a.state === "you" ? 0 : 1;
   const bYou = b.state === "you" ? 0 : 1;
@@ -252,7 +290,7 @@ export function compareBlocked(a: SidebarEffort, b: SidebarEffort): number {
 }
 
 /** In flight: pinned first, then running (blue) before quiet (grey), then by recency. */
-export function compareInflight(a: SidebarEffort, b: SidebarEffort): number {
+export function compareInflight(a: EffortOrder, b: EffortOrder): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
   const aRun = a.state === "running" ? 0 : 1;
   const bRun = b.state === "running" ? 0 : 1;

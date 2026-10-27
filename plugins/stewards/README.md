@@ -248,9 +248,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   the snapshot; a steward's `decide`, `configure` and `provide-secret` asks
   are the one `escalations` record with `route: me` and a `resolution`
   (`choice`, `text`, `approve-decline`, `secret`, `done`), forwarded by the
-  project steward (BB-30). Both are listed under "Waiting on you" on the
-  Stewards page with a link and a button each, in the digest, and by
-  `bb stewards needs`. The buttons run on the server as the connected user,
+  project steward (BB-30). Both appear on the Stewards page under **Blocked**,
+  attached to their binding's card, with a link and a button each, in the
+  digest, and by `bb stewards needs`. The buttons run on the server as the
+  connected user,
   unsigned: Approve posts the "Approved <sha> from the Stewards page"
   comment, Merge re-checks the lane gate and squash-merges through the
   server's `gh` login, and every action wakes the binding's steward with the
@@ -332,14 +333,22 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   02:45 so bb-gate's 03:00 restarts do not cut a turn) gives every open
   binding a turn, then wakes the project steward for the morning digest.
   A half-hourly mechanical sweep is the adoption and stuck backstop.
-- **The Stewards page** (a nav panel, [app.tsx](app.tsx)) has a tab per
-  stewarded project: what waits on you (needs items with their links and
-  buttons, questions the project steward put to you, which you can answer
-  and close there, forwarded escalations and approval requests), what is in
-  flight by stage with each status record and running workers, what is stuck
-  or held, what ended in the last two weeks, the latest digest with its date,
-  and one collapsed lessons details block at the bottom (counts by tier, rows
-  behind the disclosure, no buttons of its own).
+- **The Stewards page** (a nav panel, [app.tsx](app.tsx)) is the expanded
+  view of the sidebar list, with the same sections in the same order: a tab per
+  stewarded project showing **Blocked** (needs-you cards first, then blocked,
+  held, stuck and waiting-on-others), **In flight** (the other open non-`ops`
+  bindings, running before quiet), **Monitors** (the `ops` bindings with their
+  last wake) and **Recently ended**, then the latest digest with its date and
+  one collapsed lessons details block at the bottom (counts by tier, rows
+  behind the disclosure, no buttons of its own). Every card is headed by the
+  same two-line effort row the sidebar shows — glyph, key, title / kind, phase,
+  phrase — derived by the same `sidebar.ts` rules. A needs-you card adds the
+  prompt, the summary and the page's full controls (the free-text answer, the
+  fixed choices, the secret form and the `approve-spec` note, which the sidebar
+  does not have); every other card adds the summary, `Next: <nextAction>
+  (<actor>)` and the meta line. A needs-you item attaches to its binding's
+  card; a project-level question with no binding keeps a card of its own at the
+  top of Blocked.
 - **Questions and asks to you** are escalations with `route: me`, kept in
   the store from the moment the project steward asks
   (`steward_update { ask }`, or forwarding an escalation) until it records
