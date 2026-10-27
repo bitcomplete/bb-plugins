@@ -419,7 +419,9 @@ one-off thread's children, share those glyphs and carry no role tag. An `ops`
 binding that needs you or is blocked moves from Monitors into Blocked. A
 **Recently ended** row is the same two-line effort row (BB-88): the grey quiet
 ring, the kind, the entity's final phase and the end reason (`terminal`,
-`label removed`, `deleted`) in place of the status phrase, no children, and the
+`deleted`, `label removed` for a removed label, `no longer listed` when the
+entity is gone, `no longer configured` when the project stopped stewarding it)
+in place of the status phrase, no children, and the
 `ended N ago` stamp on the right. Its steward thread is usually archived, so the
 title comes from the server and the row still renders when the thread is gone.
 

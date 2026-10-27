@@ -1522,8 +1522,10 @@ callout box.
 
 A **Recently ended** row is that same row (BB-88): `sidebar.ts`'s
 `endedEffort` builds the ended binding as a quiet effort with no children, the
-entity's final phase, and the end reason (`terminal`, `label removed`,
-`deleted`) in the status-phrase slot, and the row keeps the `ended N ago` stamp
+entity's final phase, and the end reason in the status-phrase slot (`terminal`,
+`deleted`, `label removed` for a removed label, `no longer listed` when the
+entity is gone, `no longer configured` when the project stopped stewarding
+it), and the row keeps the `ended N ago` stamp
 at the right, which is what distinguishes the section. The steward thread is
 usually archived by then, so the title comes from the RPC and the row renders
 without the thread actions menu when the thread is no longer in the live view.
