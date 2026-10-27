@@ -439,6 +439,43 @@ describe("a Linear ticket steward", () => {
     expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
+  it("retries a lost adoption wake: a binding left with no thread is woken as adopted on the next reconcile (BB-92)", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    // Let the startup sweep finish before counting config reads, so the only
+    // reads are the ring's adoption and its first reconcile.
+    await t.flush();
+    t.entities.set("uuid-12", issue());
+    // The first reconcile after adoption reads the config as missing (the
+    // transient read behind BB-90): adoption still creates the binding, but
+    // the forced wake exits before the steward thread is spawned.
+    let projectFile = t.files[PROJECT_FILE];
+    let reads = 0;
+    Object.defineProperty(t.files, PROJECT_FILE, {
+      configurable: true,
+      get() {
+        reads += 1;
+        // Read 1 is the ring's stewardedProjects; read 2 is the forced
+        // adoption reconcile, which must find nothing and exit silently.
+        return reads === 2 ? null : projectFile;
+      },
+      set(value: string | null) {
+        projectFile = value;
+      },
+    });
+    await t.ring("linear", "uuid-12");
+    // Adopted, but the wake was lost: no thread at all (the project steward is
+    // spawned lazily with the first steward), and no wake recorded.
+    expect(t.spawns).toEqual([]);
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", threadId: null }]);
+    expect(t.hooks.store.find("ENG-12", "p1")!.wokeAt).toBeNull();
+
+    // A plain reconcile (force null) retries the adoption wake on its own.
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", threadId: t.spawns[1]!.id }]);
+    expect(t.spawns[1]).toMatchObject({ parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
+    expect(t.hooks.store.find("ENG-12", "p1")!.wokeAt).not.toBeNull();
+  });
+
   it("ignores unlabelled tickets, other teams, and rings from anyone but a source plugin", async () => {
     const t = await setup();
     t.entities.set("u1", issue({ id: "u1", key: "ENG-1", labels: [] }));
