@@ -1925,7 +1925,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let b = store.binding(bindingId);
       if (b === null) return;
       const config = await loadConfig(b.projectId);
-      if (config === null) return;
+      if (config === null) {
+        // The first reconcile after adoption forces the wake, but a transient
+        // read can exit here before it; leaving the binding un-threaded for
+        // the next sweep to retry, which the wake-reason fallback below makes
+        // sure it does (BB-92).
+        bb.log.debug(`stewards: could not read the configuration of project ${b.projectId} while reconciling ${b.entityKey}; leaving it for the next sweep`);
+        return;
+      }
       const playbook = bindingPlaybook(config, b);
       if (playbook === null) {
         // A dependency bot's pull request runs under deps-prs only. With the
@@ -1998,7 +2005,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
       const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file) });
-      let reason: WakeReason | null = force;
+      // A binding with no steward thread is still awaiting adoption: a first
+      // wake lost to a transient read is retried on the next reconcile, as the
+      // ops, deps and sentry paths already do (BB-92).
+      let reason: WakeReason | null = force ?? (b.threadId === null ? "adopted" : null);
       if (life.kind === "stay-ended") {
         const labelled = b.kind === "review" || b.playbook === depsPrsPlaybookName(config.file) || hasLabel(entity, config.file.label);
         store.patch(b.id, { lastSnapshot: observed, ...(b.manualDetach && !labelled ? { manualDetach: false } : {}) });
