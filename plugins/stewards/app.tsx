@@ -1,10 +1,11 @@
 // Two surfaces. The Stewards page (a nav panel, one tab per stewarded
-// project): what waits on you, what is in flight by stage, what is stuck or
-// held, what ended lately, and the latest digest; the one write is closing a
-// question put to you. Settings → Plugins → Stewards: which projects are
-// stewarded and whether their configuration is healthy, then every open
-// steward and where it stands. Steering stays with the project steward and
-// the CLI.
+// project) is the expanded view of the sidebar (BB-78): the Blocked, In flight,
+// Monitors and Recently ended sections, every card headed by the shared BB-76
+// effort row, and the latest digest and lessons block; the one write is closing
+// a question put to you or pressing a needs item's button. Settings → Plugins →
+// Stewards: which projects are stewarded and whether their configuration is
+// healthy, then every open steward and where it stands. Steering stays with the
+// project steward and the CLI.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Markdown,
