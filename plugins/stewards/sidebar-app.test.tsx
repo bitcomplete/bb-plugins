@@ -382,27 +382,77 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows held-behind, stuck and waiting-on-others as blocked", async () => {
+  it("shows held-behind and stuck as blocked", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "ENG-1: A" }), thread({ id: "thr_b", displayTitle: "ENG-2: B" }), thread({ id: "thr_c", displayTitle: "ENG-3: C" })] },
+      sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "ENG-1: A" }), thread({ id: "thr_b", displayTitle: "ENG-2: B" })] },
       rpc: {
         stewardsSidebar: () =>
           sidebarData({
-            bindings: [
-              binding({ key: "ENG-1", threadId: "thr_a", hold: "a freeze", holdBehind: ["ENG-9"] }),
-              binding({ key: "ENG-2", threadId: "thr_b", stuck: true }),
-              binding({ key: "ENG-3", threadId: "thr_c", status: { actor: "other", nextAction: "the vendor", at: 1 } }),
-            ],
+            bindings: [binding({ key: "ENG-1", threadId: "thr_a", hold: "a freeze", holdBehind: ["ENG-9"] }), binding({ key: "ENG-2", threadId: "thr_b", stuck: true })],
           }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText("A")).toBeTruthy());
     expect(lineTwo(slot, "A")).toContain("held behind ENG-9");
     expect(lineTwo(slot, "B")).toContain("stuck");
-    expect(lineTwo(slot, "C")).toContain("waiting on the vendor");
     expect(glyphOf(slot, "A")).toBe("blocked");
     expect(glyphOf(slot, "B")).toBe("blocked");
-    expect(glyphOf(slot, "C")).toBe("blocked");
+    slot.lifecycle.unmount();
+  });
+
+  // BB-81: an external wait is not a block. One row of each kind lands in the
+  // section its kind and state call for.
+  it("files one row of each kind into its section: blocked yellow and red, in flight, a monitor and a thread", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_you", displayTitle: "ENG-1: Needs you" }),
+          thread({ id: "thr_blocked", displayTitle: "ENG-2: Red row" }),
+          thread({ id: "thr_wait_ticket", displayTitle: "ENG-3: Waiting ticket" }),
+          thread({ id: "thr_wait_ops", displayTitle: "Ops watch: acme/web" }),
+          thread({ id: "thr_oneoff", displayTitle: "One-off" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", blockedOn: "a review" }),
+              binding({ key: "ENG-3", threadId: "thr_wait_ticket", status: { actor: "other", nextAction: "an author push", at: 1 } }),
+              binding({ key: "acme/web", threadId: "thr_wait_ops", kind: "ops", stage: null, status: { actor: "other", nextAction: "Next scheduled look", at: 1 } }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Needs you")).toBeTruthy());
+    // Blocked holds the yellow needs-you and the red blockedOn row, not the wait.
+    const blocked = slot.getByRole("heading", { name: /Blocked/u }).closest("section")!;
+    expect(blocked.textContent).toContain("Needs you");
+    expect(blocked.textContent).toContain("Red row");
+    expect(blocked.textContent).not.toContain("Waiting ticket");
+    expect(glyphOf(slot, "Needs you")).toBe("you");
+    expect(glyphOf(slot, "Red row")).toBe("blocked");
+    // In flight holds the waiting ticket, grey, with the wait phrase.
+    const inflight = slot.getByRole("heading", { name: /In flight/u }).closest("section")!;
+    expect(inflight.textContent).toContain("Waiting ticket");
+    expect(inflight.textContent).not.toContain("Needs you");
+    expect(glyphOf(slot, "Waiting ticket")).toBe("quiet");
+    expect(lineTwo(slot, "Waiting ticket")).toBe("ticket · waiting on an author push");
+    // Monitors holds the ops wait, grey, once opened.
+    fireEvent.click(slot.getByRole("button", { name: /Monitors/u }));
+    await waitFor(() => expect(slot.getByText("Ops watch: acme/web")).toBeTruthy());
+    // Threads holds the one-off thread.
+    fireEvent.click(slot.getByRole("button", { name: /Threads/u }));
+    await waitFor(() => expect(slot.getByText("One-off")).toBeTruthy());
+    // Both collapsibles now show their rows in their own sections.
+    const monitors = slot.getByRole("button", { name: /Monitors/u }).closest("section")!;
+    expect(monitors.textContent).toContain("Ops watch: acme/web");
+    expect(glyphOf(slot, "Ops watch: acme/web")).toBe("quiet");
+    expect(lineTwo(slot, "Ops watch: acme/web")).toBe("ops · waiting on Next scheduled look");
+    const threads = slot.getByRole("button", { name: /Threads/u }).closest("section")!;
+    expect(threads.textContent).toContain("One-off");
     slot.lifecycle.unmount();
   });
 

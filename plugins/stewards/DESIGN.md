@@ -1497,29 +1497,30 @@ callout box.
 
 The glyph is one of four shapes, in precedence order `you › blocked › running ›
 quiet`: a solid yellow dot when it waits on you, an empty red ring when
-blocked, a blue ring that pulses slowly while a worker or reviewer runs, and
-an empty grey ring when quiet. The pulse is CSS only and stops under
-`prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
+blocked (`blockedOn`, a hold or `stuck`), a blue ring that pulses slowly while
+a worker or reviewer runs, and an empty grey ring when quiet. The pulse is CSS
+only and stops under `prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
 when unread, blue animated while their agent runs, grey otherwise — except a
 draft, which keeps bb's own `ThreadStatusGlyph`. The project steward footer
 row is the grey ring.
 
 **The status phrase (BB-76).** First match wins: `needs you`; `blocked on
 <blockedOn>`; `held behind <holdBehind keys>` when `holdBehind` is non-empty,
-else `on hold`; `stuck` for an open stuck escalation; `waiting on
-<nextAction>` when the status actor is `other` (an external wait is a block);
-`N worker(s) running` counting only workers whose worker-table status is
-`running` (a busy steward or reviewer with no running worker falls through,
-rather than reading `0 workers running`); the newest deployment watch's state (`deploying`, `deployed`,
-`deploy failed`); the status `nextAction`; otherwise `no report yet`. The
-phrase's colour follows the glyph's. `sidebar.ts` derives `state`, `section`
+else `on hold`; `stuck` for an open stuck escalation; `N worker(s) running`
+counting only workers whose worker-table status is `running` (a busy steward or
+reviewer with no running worker falls through, rather than reading `0 workers
+running`); `waiting on <nextAction>` when the status actor is `other` (an
+external wait is not a block, so its colour follows the glyph); the newest
+deployment watch's state (`deploying`, `deployed`, `deploy failed`); the status
+`nextAction`; otherwise `no report yet`. The phrase's colour follows the
+glyph's. `sidebar.ts` derives `state`, `section`
 and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
 covers every rule and the precedence.
 
 **Sections.** Blocked holds the needs-you (yellow) and blocked (red) efforts,
-whether stewarded or `ops`; a blocked `ops` binding leaves Monitors for
-Blocked. In flight holds the rest of the stewarded, non-ops efforts, running
-before quiet, then by recency. Pinned rows stay first within their section.
+whether stewarded or `ops`; a needs-you, blockedOn, held or stuck `ops`
+binding leaves Monitors for Blocked. In flight holds the rest of the stewarded,
+non-ops efforts, running before quiet, then by recency. Pinned rows stay first within their section.
 `buildSidebar` returns `blocked`, `efforts`, `threads` and `monitors`
 separately, and the split is unit tested in `sidebar.test.ts`.
 
