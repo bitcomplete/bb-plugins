@@ -442,7 +442,18 @@ export const IDLE_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN idle_wake_now INTEGER NOT NULL DEFAULT 0`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS];
+// BB-77: the project-steward approval marker. The approval record gains the
+// GitHub comment id of the `bb-approval` marker the plugin posted (the lane
+// gate honours a marker only when its id is recorded, so a hand-typed lookalike
+// never counts) and the verdict it carried (approved or declined). Additive and
+// defaulted: a record made before this step reads as an approval with no marker
+// id, which the gate ignores.
+export const APPROVAL_MARKER_MIGRATIONS = [
+  `ALTER TABLE project_approvals ADD COLUMN comment_id TEXT`,
+  `ALTER TABLE project_approvals ADD COLUMN verdict TEXT NOT NULL DEFAULT 'approved'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -787,13 +798,23 @@ export type Escalation = {
   clusterKey: string | null;
 };
 
-/** A project steward's approval of an owner-reviewed pull request, bound to its head sha. */
+/**
+ * A project steward's approval (or decline) of an owner-reviewed pull request,
+ * bound to its head sha. `commentId` is the GitHub comment id of the
+ * `bb-approval` marker the plugin posted for it; the lane gate honours a marker
+ * only when its comment id is recorded here, so a hand-typed lookalike never
+ * counts.
+ */
 export type ProjectApproval = {
   bindingId: string;
   headSha: string;
   /** The decide-list entry the project steward classified it under. */
   entry: string | null;
   byThread: string;
+  /** The GitHub comment id of the marker the plugin posted, or null for a record made before markers. */
+  commentId: string | null;
+  /** The marker's verdict. */
+  verdict: "approved" | "declined";
   createdAt: number;
 };
 
@@ -1030,9 +1051,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const markDeliveryDoneStmt = db.prepare("UPDATE pending_deliveries SET delivered_at = ? WHERE id = ?");
 
   const insertProjectApproval = db.prepare(
-    "INSERT INTO project_approvals (binding_id, head_sha, entry, by_thread, created_at) VALUES (@binding_id, @head_sha, @entry, @by_thread, @created_at) ON CONFLICT (binding_id, head_sha) DO UPDATE SET entry = @entry, by_thread = @by_thread, created_at = @created_at",
+    "INSERT INTO project_approvals (binding_id, head_sha, entry, by_thread, comment_id, verdict, created_at) VALUES (@binding_id, @head_sha, @entry, @by_thread, @comment_id, @verdict, @created_at) ON CONFLICT (binding_id, head_sha) DO UPDATE SET entry = @entry, by_thread = @by_thread, comment_id = @comment_id, verdict = @verdict, created_at = @created_at",
   );
   const getProjectApproval = db.prepare<[string, string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
+  const projectApprovalsFor = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_approvals WHERE binding_id = ? ORDER BY created_at");
   const deleteProjectApproval = db.prepare("DELETE FROM project_approvals WHERE binding_id = ? AND head_sha = ?");
 
   const insertWorker = db.prepare("INSERT INTO workers (thread_id, binding_id, title, status, started_at) VALUES (?, ?, ?, 'running', ?)");
@@ -1208,6 +1230,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
     resolvedAt: x.resolvedAt,
   });
 
+  const toProjectApproval = (r: Record<string, unknown>): ProjectApproval => ({
+    bindingId: String(r.binding_id),
+    headSha: String(r.head_sha),
+    entry: r.entry === null || r.entry === undefined ? null : String(r.entry),
+    byThread: String(r.by_thread),
+    commentId: r.comment_id === null || r.comment_id === undefined ? null : String(r.comment_id),
+    verdict: String(r.verdict ?? "approved") === "declined" ? "declined" : "approved",
+    createdAt: Number(r.created_at),
+  });
   const toWorker = (r: Record<string, unknown>): Worker => ({
     threadId: String(r.thread_id),
     bindingId: String(r.binding_id),
@@ -1636,19 +1667,21 @@ export function createStore(db: Database.Database, now: () => number, options: S
      */
     projectApproval(bindingId: string, headSha: string): ProjectApproval | null {
       const r = getProjectApproval.get(bindingId, headSha);
-      return r === undefined
-        ? null
-        : { bindingId: String(r.binding_id), headSha: String(r.head_sha), entry: r.entry === null || r.entry === undefined ? null : String(r.entry), byThread: String(r.by_thread), createdAt: Number(r.created_at) };
+      return r === undefined ? null : toProjectApproval(r);
+    },
+    /** Every approval or decline the plugin recorded for a binding, oldest first; the gate matches a marker to one by comment id. */
+    projectApprovals(bindingId: string): ProjectApproval[] {
+      return projectApprovalsFor.all(bindingId).map(toProjectApproval);
     },
     /**
-     * Record a project-steward approval, bound to the pull request's head sha.
-     * The caller is responsible for checking that the approver is the project
+     * Record a project-steward approval or decline, bound to the pull
+     * request's head sha and to the marker comment the plugin posted. The
+     * caller is responsible for checking that the approver is the project
      * steward's thread; this is the store half.
      */
-    recordProjectApproval(fields: { bindingId: string; headSha: string; entry: string | null; byThread: string }): ProjectApproval {
-      insertProjectApproval.run({ binding_id: fields.bindingId, head_sha: fields.headSha, entry: fields.entry, by_thread: fields.byThread, created_at: now() });
-      const r = getProjectApproval.get(fields.bindingId, fields.headSha)!;
-      return { bindingId: String(r.binding_id), headSha: String(r.head_sha), entry: r.entry === null || r.entry === undefined ? null : String(r.entry), byThread: String(r.by_thread), createdAt: Number(r.created_at) };
+    recordProjectApproval(fields: { bindingId: string; headSha: string; entry: string | null; byThread: string; commentId?: string | null; verdict?: "approved" | "declined" }): ProjectApproval {
+      insertProjectApproval.run({ binding_id: fields.bindingId, head_sha: fields.headSha, entry: fields.entry, by_thread: fields.byThread, comment_id: fields.commentId ?? null, verdict: fields.verdict ?? "approved", created_at: now() });
+      return toProjectApproval(getProjectApproval.get(fields.bindingId, fields.headSha)!);
     },
     /** Drop a recorded approval (a new push voids it by sha; this is for an explicit retraction). */
     clearProjectApproval(bindingId: string, headSha: string): boolean {

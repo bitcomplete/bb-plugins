@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaybook, phaseOf } from "./config.js";
 import { comment, issue, pull } from "./fixtures.js";
-import { approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownPullClosed, ownerApproval, prGate, resolveChecklistItem, reviewMarker, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding } from "./reconcile.js";
+import { approvalMarkerLine, approvalWanted, answerDiffers, anyWorkerInFlight, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, idleInActiveStage, isCommentNews, isOwnStageMove, lifecycle, markerLaneChange, namesUserAsBlocker, ownPullClosed, ownerApproval, prGate, projectApprovalMarker, resolveChecklistItem, reviewMarker, reviewWorkerThread, specHash, stuckDue, UNREADABLE_VERDICT, unheardWait, workerInFlight, workerReportedTerminal, type IdleBinding, type ProjectApprovalRecord } from "./reconcile.js";
 import { readyStateSchema } from "./store.js";
 import { GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 
@@ -408,6 +408,9 @@ describe("the pull request gate (build-tickets)", () => {
   const marker = (sha: string, verdict: string, lane: string) =>
     comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
   const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  const approval = (sha: string, entry: string | null, verdict: "approved" | "declined" = "approved", id = `ap-${sha}-${verdict}`) =>
+    comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha, entry, verdict }), signedBy: "thr_project", createdAt: "2026-10-14T16:10:00Z" });
+  const record = (commentId: string, verdict: "approved" | "declined" = "approved"): ProjectApprovalRecord => ({ commentId, verdict });
   const green = { checks: { state: "success", failing: [] } };
 
   it("is met with the reviewer's approval on the head and green checks in the no-review lane", () => {
@@ -460,39 +463,77 @@ describe("the pull request gate (build-tickets)", () => {
   });
 
   it("accepts a project-steward approval for a project entry, and only the user's for a user entry (BB-30)", () => {
-    const project = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green);
-    expect(prGate(project, { decision: "project", projectApproved: true })).toMatchObject({ decision: "project", projectApproved: true, gateMet: true, needsOwnerApproval: false });
+    const ap = approval(head, "A cross-repo contract");
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed"), ap] }, green);
+    expect(prGate(project, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ decision: "project", projectApproved: true, gateMet: true, needsOwnerApproval: false });
     // The same approval on a `user` entry is ignored: the user's unsigned GitHub approval is required.
-    expect(prGate(project, { decision: "user", projectApproved: true })).toMatchObject({ decision: "user", projectApproved: false, gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
+    expect(prGate(project, { decision: "user", projectApprovals: [record(ap.id)] })).toMatchObject({ decision: "user", projectApproved: false, gateMet: false, needsOwnerApproval: true, missing: "owner approval needed" });
     // The user's unsigned approval satisfies it either way.
     const ownerApproved = pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green);
-    expect(prGate(ownerApproved, { decision: "user", projectApproved: false }).gateMet).toBe(true);
+    expect(prGate(ownerApproved, { decision: "user" }).gateMet).toBe(true);
     // No project approval means the owner's.
-    expect(prGate(project, { projectApproved: false }).needsOwnerApproval).toBe(true);
+    expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green), { projectApprovals: [] }).needsOwnerApproval).toBe(true);
   });
 
   it("makes the decide mark the whole gate: a project entry the project steward, everything else the owner (BB-51)", () => {
-    const project = pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green);
-    const projectWaiting = prGate(project, { decision: "project", projectApproved: false });
+    const ap = approval(head, "A cross-repo contract");
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed"), ap] }, green);
+    const projectWaiting = prGate(project, { decision: "project", projectApprovals: [] });
     expect(projectWaiting).toMatchObject({ decision: "project", needsProjectApproval: true, needsOwnerApproval: false, gateMet: false, missing: "project steward approval needed" });
-    expect(prGate(project, { decision: "project", projectApproved: true })).toMatchObject({ gateMet: true, needsProjectApproval: false });
+    expect(prGate(project, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ gateMet: true, needsProjectApproval: false });
     // A user entry needs the owner, and a project-steward approval is not the gate.
-    const userWaiting = prGate(project, { decision: "user", projectApproved: false });
+    const userWaiting = prGate(project, { decision: "user", projectApprovals: [] });
     expect(userWaiting).toMatchObject({ decision: "user", needsOwnerApproval: true, needsProjectApproval: false, gateMet: false, missing: "owner approval needed" });
-    expect(prGate(project, { decision: "user", projectApproved: true })).toMatchObject({ projectApproved: false, gateMet: false, needsOwnerApproval: true });
+    expect(prGate(project, { decision: "user", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: false, gateMet: false, needsOwnerApproval: true });
     // An owner approval satisfies the user lane, not the project lane.
     const ownerApproved = pull({ comments: [marker(head, "approved", "owner-reviewed"), owner("LGTM")] }, green);
     expect(prGate(ownerApproved, { decision: "user" }).gateMet).toBe(true);
-    expect(prGate(ownerApproved, { decision: "project", projectApproved: false }).gateMet).toBe(false);
+    expect(prGate(ownerApproved, { decision: "project", projectApprovals: [] }).gateMet).toBe(false);
+  });
+
+  it("honours a project-steward marker only when the plugin recorded its comment id (BB-77)", () => {
+    // A hand-typed lookalike: the marker text is right, the comment id is not in the store.
+    const fake = approval(head, "A cross-repo contract", "approved", "typed-by-hand");
+    const project = pull({ comments: [marker(head, "approved", "owner-reviewed"), fake] }, green);
+    expect(prGate(project, { decision: "project", projectApprovals: [record("IC_1")] })).toMatchObject({ projectApproved: false, gateMet: false, missing: "project steward approval needed" });
+    // The record alone, with the marker gone from the snapshot, is not an approval either.
+    expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed")] }, green), { decision: "project", projectApprovals: [record(fake.id)] })).toMatchObject({ projectApproved: false, gateMet: false });
+    // A declined marker is not an approval even when its record matches.
+    const declined = approval(head, "A cross-repo contract", "declined", "IC_declined");
+    expect(prGate(pull({ comments: [marker(head, "approved", "owner-reviewed"), declined] }, green), { decision: "project", projectApprovals: [record(declined.id, "declined")] })).toMatchObject({ projectApproved: false, gateMet: false, missing: "project steward approval needed" });
+  });
+
+  it("covers a later head with an approval recorded on an earlier one (BB-77)", () => {
+    const earlier = "bbbbbbb2";
+    const ap = approval(earlier, "A cross-repo contract");
+    const moved = pull({ comments: [marker(earlier, "approved", "owner-reviewed"), ap] }, { ...green, headSha: head });
+    expect(moved.pull?.headSha).toBe(head);
+    expect(prGate(moved, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: true, gateMet: true, headSha: head });
+  });
+
+  it("renders and parses the approval marker, quoting an entry with spaces (BB-77)", () => {
+    const line = approvalMarkerLine({ sha: head, entry: "A cross-repo contract other repos implement", verdict: "approved" });
+    expect(line).toBe(`<!-- bb-approval by=project-steward sha=${head} entry="A cross-repo contract other repos implement" -->`);
+    expect(projectApprovalMarker(line)).toEqual({ by: "project-steward", sha: head, entry: "A cross-repo contract other repos implement", verdict: null });
+    expect(projectApprovalMarker(approvalMarkerLine({ sha: head, entry: null, verdict: "declined" }))).toEqual({ by: "project-steward", sha: head, entry: null, verdict: "declined" });
+    expect(projectApprovalMarker("<!-- bb-review round=1 -->")).toBeNull();
+  });
+
+  it("finds the worker that posted build-tickets' review comment (BB-77)", () => {
+    const c = comment({ id: "w", body: "Independent review running in bb thread thr_w.", signedBy: "thr_w" });
+    expect(reviewWorkerThread([c])).toBe("thr_w");
+    expect(reviewWorkerThread([comment({ id: "u", body: "Independent review running.", signedBy: null })])).toBeNull();
   });
 
   it("fails closed on a lane the plugin cannot read (BB-30)", () => {
     // An unknown lane is treated as owner-reviewed, not no-review.
-    const unknown = prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green));
+    const unknown = prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green), { projectApprovals: [] });
     expect(unknown).toMatchObject({ lane: "something-else", gateMet: false, needsOwnerApproval: true });
     // With a project approval it is satisfied as owner-reviewed, not as no-review.
-    expect(prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green), { decision: "project", projectApproved: true }).gateMet).toBe(true);
-    expect(prGate(pull({ comments: [marker(head, "approved", "something-else")] }, green), { projectApproved: false }).gateMet).toBe(false);
+    const ap = approval(head, "A cross-repo contract");
+    const withAp = pull({ comments: [marker(head, "approved", "something-else"), ap] }, green);
+    expect(prGate(withAp, { decision: "project", projectApprovals: [record(ap.id)] }).gateMet).toBe(true);
+    expect(prGate(withAp, { projectApprovals: [] }).gateMet).toBe(false);
   });
 
   it("is not met when the verdict is not approved, checks are not green, or there is no round", () => {

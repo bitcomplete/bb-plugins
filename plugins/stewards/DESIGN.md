@@ -685,10 +685,13 @@ entry marked `decide: project | user`. The plugin raises an
 marker puts a pull request in the owner-reviewed lane. The project
 steward classifies it into an entry and either records a project-steward
 approval for a `project` entry (`steward_update { binding, approve,
-entry }`, bound to the pull request's head sha so a new push voids it and
-kept only in the store, never as a GitHub comment or review) or forwards
-it to you for a `user` one. A missing entry, an unknown mark, a `user`
-entry, or a change to the decide list, `bigDecisions`, `prGate` or the
+entry }`), which posts a signed `bb-approval` marker on the pull request,
+keeps its comment id in the store and wakes the worker, or forwards it to
+you for a `user` one. Only a marker whose comment id the store recorded
+counts, so a hand-typed lookalike never does, and an approval is of the
+pull request, so a later head is covered unless the worker added scope.
+A missing entry, an unknown mark, a `user` entry, or a change to the
+decide list, `bigDecisions`, `prGate` or the
 approval code is always yours, whatever the list says; a signed comment
 never satisfies either. `prGate` accepts the project-steward approval for
 a `project` entry, and the user's unsigned GitHub approval is unchanged.
@@ -1166,9 +1169,10 @@ The rules that hold:
   gate: the reviewer's latest marker has verdict `approved`,
   every check has passed, and, in the owner-reviewed lane, the owner has
   approved — an unsigned approving comment or an APPROVED review by the
-  connected user, or, for an entry the decide list marks `project`, a
-  project-steward approval recorded in the store and bound to the head sha
-  (BB-30); a signed comment is a thread's, never the owner's. An unknown
+  connected user, or, for an entry the decide list marks `project`, the
+  `bb-approval` marker the project steward posted, whose comment id the
+  store records (BB-30, BB-77); a signed comment is a thread's, never the
+  owner's. An unknown
   lane is owner-reviewed, not no-review. Any comment whose first line opens
   a `bb-review` marker is a round, however it is spelled: a marker missing
   `verdict=` reads its verdict from a bare word (`changes-requested`) or as

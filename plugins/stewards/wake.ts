@@ -12,7 +12,7 @@ import { FINDING_CLASSES, type FindingClass, type OpsFinding, type OpsLook } fro
 import type { DepsFinding, DepsLook } from "./deps.js";
 import { dueDate } from "./deps.js";
 import { NO_TOKEN, TOKEN_PAGE, TOKEN_SCOPES, TOKEN_SETTING, type SentryFinding, type SentryLook, type SentryReason } from "./sentry.js";
-import { newHumanComments, prGate, reportedItem, unheardWait, type GateState } from "./reconcile.js";
+import { newHumanComments, prGate, reportedItem, unheardWait, type GateState, type ProjectApprovalRecord } from "./reconcile.js";
 import { conflictsOf, type Conflict } from "./schedule.js";
 import type { EntitySnapshot, SessionWake, SnapshotComment, WorkflowRun } from "./source-contract.js";
 import { needChoices, ESCALATED_NEED_KINDS, RESOLUTION_KINDS, STEWARD_NEED_KINDS, type Binding, type Escalation, type Lesson, type Need, type Observed, type Question, type Worker } from "./store.js";
@@ -242,8 +242,8 @@ export type WakeInput = {
   needs?: Need[];
   /** The steward's thread and its workers': their comments are not news. */
   own: ReadonlySet<string>;
-  /** Head shas the project steward has approved in the store, so the lane gate reads the same as the button. */
-  projectApprovedShas?: ReadonlySet<string>;
+  /** The plugin's own project-steward approval records, so the lane gate reads the same as the button. */
+  projectApprovals?: readonly ProjectApprovalRecord[];
   /** The project's adoption label. */
   label: string;
   /** Per-pull-request deployment state (BB-53); empty when the playbook names no deployment target. */
@@ -265,7 +265,7 @@ function commentLines(comments: SnapshotComment[]): string[] {
   return lines;
 }
 
-function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovedShas?: ReadonlySet<string>): string[] {
+function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>, heading: string, projectApprovals?: readonly ProjectApprovalRecord[]): string[] {
   const lines = [`### ${heading}`, ""];
   lines.push(`- ${e.key}: ${e.title ?? "(untitled)"}${e.url === null ? "" : ` — ${e.url}`}`);
   lines.push(`- State: ${e.state}${e.stateType === null ? "" : ` (${e.stateType})`}`);
@@ -277,7 +277,7 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
     lines.push(`- Branch: ${p.head ?? "?"} → ${p.base ?? "?"} at ${p.headSha?.slice(0, 7) ?? "?"}${p.headAuthor === null ? "" : ` (by ${p.headAuthor})`}`);
     lines.push(`- Checks: ${p.checks === null ? "none" : `${p.checks.state}${p.checks.failing.length > 0 ? ` — failing: ${p.checks.failing.join(", ")}` : ""}`}`);
     lines.push(`- Review decision: ${p.reviewDecision ?? "(none)"}; requested: ${p.requestedReviewers.join(", ") || "(none)"}`);
-    const gate = prGate(e, { projectApproved: e.pull?.headSha !== null && e.pull?.headSha !== undefined && projectApprovedShas?.has(e.pull.headSha) === true });
+    const gate = prGate(e, { projectApprovals });
     const lane = gate.lane === null ? "" : `lane ${gate.lane}`;
     if (gate.gateMet) {
       const approved = gate.marker === null ? "?" : gate.marker.sha.slice(0, 7);
@@ -459,8 +459,8 @@ export function formatWake(input: WakeInput): string {
 
   const head = out.splice(0);
   out.push("", "## 4. Snapshot", "");
-  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovedShas));
-  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovedShas));
+  out.push(...entityLines(e, binding.commentCursor, input.own, "The entity", input.projectApprovals));
+  for (const pull of observed.pulls) out.push("", ...entityLines(pull, binding.commentCursor, input.own, `Linked pull request ${pull.key}`, input.projectApprovals));
   if (input.workers.length > 0) {
     out.push("", "### Workers", "");
     for (const w of input.workers) {
