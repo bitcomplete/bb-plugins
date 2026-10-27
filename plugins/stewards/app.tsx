@@ -1233,14 +1233,17 @@ function phraseClass(state: SidebarEffortState): string {
 }
 
 /**
- * A CSS-safe `view-transition-name` for one row, from the row kind and its key
- * (BB-91). The kind keeps an effort row and an ended row with the same binding
- * key apart; the hash keeps two keys that sanitise alike apart.
+ * A CSS-safe `view-transition-name` for one row, from the surface, row kind and
+ * key (BB-91). The surface keeps the two sidebar instances (the pinned thread
+ * list and the board panel's own sidebar) apart, since both can be mounted at
+ * once and duplicate names skip the whole transition; the kind keeps an effort
+ * row and an ended row with the same binding key apart; the hash keeps two keys
+ * that sanitise alike apart.
  */
-function viewTransitionName(kind: "effort" | "ended" | "thread", key: string): string {
+function viewTransitionName(surface: string, kind: "effort" | "ended" | "thread", key: string): string {
   let hash = 0;
   for (let i = 0; i < key.length; i += 1) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
-  return `stewards-${kind}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
+  return `stewards-${kind}-${surface}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
 }
 
 /**
@@ -1275,6 +1278,7 @@ function SidebarThreadRow({
   glyph,
   activeThreadId,
   openThreads,
+  viewTransitionPrefix,
   entered = false,
 }: {
   thread: PluginSidebarThread;
@@ -1293,6 +1297,8 @@ function SidebarThreadRow({
   activeThreadId: string | null;
   /** The rows that must be open so the active thread is revealed (BB-85). */
   openThreads: ReadonlySet<string>;
+  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
+  viewTransitionPrefix: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 }) {
@@ -1312,7 +1318,7 @@ function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName("thread", thread.id) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, "thread", thread.id) }}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1355,7 +1361,7 @@ function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
             );
           })}
         </ul>
@@ -1448,6 +1454,7 @@ function SidebarEffortRow({
   trailing,
   rowKind = "effort",
   viewTransitionKey,
+  viewTransitionPrefix,
   entered = false,
 }: {
   effort: SidebarEffort;
@@ -1468,6 +1475,8 @@ function SidebarEffortRow({
   rowKind?: "effort" | "ended";
   /** The row's stable key for the view-transition name, when it differs from the effort key (an ended row's `endedAt`). */
   viewTransitionKey?: string;
+  /** The surface this row is rendered on, so its view-transition name is unique across mounted sidebars (BB-91). */
+  viewTransitionPrefix: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 }) {
@@ -1501,7 +1510,7 @@ function SidebarEffortRow({
             className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
             onClick={() => setOpen((v) => !v)}
           >
-            <Icon name="ChevronRight" className={`size-3.5 transition-transform duration-200${open ? " rotate-90" : ""}`} />
+            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200${open ? " rotate-90" : ""}`} />
           </button>
         ) : (
           <span className="flex size-4 shrink-0 items-center justify-center" />
@@ -1534,7 +1543,7 @@ function SidebarEffortRow({
     </div>
   );
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(rowKind, viewTransitionKey ?? effort.key) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(viewTransitionPrefix, rowKind, viewTransitionKey ?? effort.key) }}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
@@ -1544,12 +1553,12 @@ function SidebarEffortRow({
         </div>
       ) : null}
       {effort.children.length > 0 ? (
-        <div data-sidebar-workers="" className={`grid motion-safe:transition-[grid-template-rows] motion-safe:duration-200 ${open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"}`}>
+        <div data-sidebar-workers="" className={`grid motion-safe:transition-[grid-template-rows,visibility] motion-safe:duration-200 ${open ? "visible grid-rows-[1fr]" : "invisible grid-rows-[0fr]"}`}>
           <ul className="flex min-h-0 flex-col overflow-hidden">
             {effort.children.map((c) => {
               const child = byId.get(c.threadId);
               return child === undefined ? null : (
-                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
+                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={viewTransitionPrefix} entered={entered} />
               );
             })}
           </ul>
@@ -1591,11 +1600,11 @@ function SidebarCollapsible({ title, count, revealed = false, children }: { titl
             setOpen((v) => !v);
           }}
         >
-          <Icon name="ChevronRight" className="size-3.5 transition-transform group-open:rotate-90" />
+          <Icon name="ChevronRight" className="size-3.5 motion-safe:transition-transform group-open:rotate-90" />
           {title} <span className="font-normal">{count}</span>
         </summary>
       </details>
-      <div data-sidebar-collapsible="" className={`grid motion-safe:transition-[grid-template-rows] motion-safe:duration-200 ${open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"}`}>
+      <div data-sidebar-collapsible="" className={`grid motion-safe:transition-[grid-template-rows,visibility] motion-safe:duration-200 ${open ? "visible grid-rows-[1fr]" : "invisible grid-rows-[0fr]"}`}>
         <div className="min-h-0 overflow-hidden">{children}</div>
       </div>
     </section>
@@ -1700,6 +1709,7 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
  * and navigates on a project pick; the thread list passes the route's thread.
  */
 function StewardsSidebarCore({
+  surface,
   activeProjectId,
   activeKey,
   activeThreadId,
@@ -1707,6 +1717,8 @@ function StewardsSidebarCore({
   onPickProject,
   onNewThread,
 }: {
+  /** Which mounted sidebar this is; folded into each row's view-transition name (BB-91). */
+  surface: "sidebar" | "panel";
   activeProjectId: string | null;
   activeKey: string | null;
   activeThreadId: string | null;
@@ -1763,6 +1775,7 @@ function StewardsSidebarCore({
         openThreads={openThreads}
         onNavigate={onNavigate}
         onChanged={refetch}
+        viewTransitionPrefix={surface}
         entered={loaded}
       />
     ));
@@ -1801,7 +1814,7 @@ function StewardsSidebarCore({
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
                   return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} entered={loaded} />
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} viewTransitionPrefix={surface} entered={loaded} />
                   );
                 })}
               </ul>
@@ -1830,6 +1843,7 @@ function StewardsSidebarCore({
                     trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
                     rowKind="ended"
                     viewTransitionKey={`${e.key}-${e.endedAt}`}
+                    viewTransitionPrefix={surface}
                     entered={loaded}
                   />
                 ))}
@@ -1848,6 +1862,7 @@ function StewardsSidebarCore({
                 glyph="quiet"
                 activeThreadId={activeThreadId}
                 openThreads={openThreads}
+                viewTransitionPrefix={surface}
                 entered={loaded}
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />
@@ -1865,6 +1880,7 @@ function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: Plugin
   const navigate = useBbNavigate();
   return (
     <StewardsSidebarCore
+      surface="sidebar"
       activeProjectId={activeProjectId}
       activeKey={null}
       activeThreadId={activeThreadId}
@@ -1883,6 +1899,7 @@ function StewardsPanelSidebar({ subPath }: PluginNavPanelProps) {
   const { projectId, key } = parseBoardPath(subPath);
   return (
     <StewardsSidebarCore
+      surface="panel"
       activeProjectId={projectId}
       activeKey={key}
       activeThreadId={null}

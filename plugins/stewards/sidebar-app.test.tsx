@@ -1056,6 +1056,64 @@ describe("the sidebar's row transitions (BB-91)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("keeps view-transition-names unique when the thread list and the board panel sidebar are both mounted", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const panel = captured.navPanels[0]!;
+    const options = {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+    };
+    const listSlot = renderSlot(list, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+    const panelSlot = renderSlot({ component: panel.experimental_sidebar! }, { subPath: "p1/ENG-1" }, options);
+    // Both slots render into the same document, so wait on each container.
+    await waitFor(() => expect(listSlot.container.querySelector("[style*='view-transition-name']")).not.toBeNull());
+    await waitFor(() => expect(panelSlot.container.querySelector("[style*='view-transition-name']")).not.toBeNull());
+    const names = Array.from(document.querySelectorAll<HTMLElement>("[style]"))
+      .map((el) => el.style.viewTransitionName)
+      .filter((name) => name !== "");
+    expect(names.length).toBeGreaterThan(0);
+    expect(new Set(names).size).toBe(names.length);
+    listSlot.lifecycle.unmount();
+    panelSlot.lifecycle.unmount();
+  });
+
+  it("eases glyph and phrase colours and rotates both chevrons", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }),
+          thread({ id: "thr_worker", displayTitle: "Implement retry" }),
+          thread({ id: "thr_oneoff", displayTitle: "A one-off thread" }),
+        ],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })] }) } as never,
+    });
+    const row = await waitFor(() => slot.getByText("Fix login"));
+    const effort = row.closest("li")!;
+    // Criterion 4: the glyph's border/background and the phrase text ease colour.
+    const glyph = effort.querySelector('[data-steward-glyph="running"]')!;
+    expect(glyph.className).toContain("motion-safe:transition-colors");
+    expect(glyph.className).toContain("duration-300");
+    const phrase = effort.querySelector("[data-sidebar-line-two] span")!;
+    expect(phrase.className).toContain("motion-safe:transition-colors");
+    expect(phrase.className).toContain("duration-300");
+    // Criterion 5: the effort chevron eases its rotation and turns when open.
+    const expand = slot.getByRole("button", { name: /Expand ENG-1: Fix login/u });
+    const effortChevron = expand.querySelector('[data-icon="ChevronRight"]')!;
+    expect(effortChevron.className).toContain("motion-safe:transition-transform");
+    expect(effortChevron.className).not.toContain("rotate-90");
+    fireEvent.click(expand);
+    await waitFor(() => expect(expand.querySelector('[data-icon="ChevronRight"]')!.className).toContain("rotate-90"));
+    // The collapsible chevron uses the github-watcher `group-open` rotation pattern.
+    const collapsible = slot.getByRole("button", { name: /Threads/u });
+    const collapsibleChevron = collapsible.querySelector('[data-icon="ChevronRight"]')!;
+    expect(collapsibleChevron.className).toContain("motion-safe:transition-transform");
+    expect(collapsibleChevron.className).toContain("group-open:rotate-90");
+    slot.lifecycle.unmount();
+  });
+
   it("adds the enter classes only once the first load has painted", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
