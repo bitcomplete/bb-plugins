@@ -1754,6 +1754,29 @@ describe("sidebar grouping by status", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("takes a thread tagged with the single switch out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_plain", sectionId: null }),
+      // Filed before its plugin asked for thread-briefs to leave it alone.
+      groupedThread({ id: "thr_steward", sectionId: "sec_3", originPluginId: "stewards" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: false },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_plain", storedBrief("thr_plain", done));
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await plugin(bb);
+
+    await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
+
   it("takes a worker keyed on its steward's namespace out of the sections", async () => {
     const threads = [
       groupedThread({ id: "thr_steward", sectionId: null, originPluginId: "stewards" }),
