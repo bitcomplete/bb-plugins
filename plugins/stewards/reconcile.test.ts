@@ -614,6 +614,15 @@ describe("a correction from a comment", () => {
     expect(commentDiffersFromRecommendation(comment({ author: "jane", body: "No, do it the other way.", signedBy: "thr_w" }), "jane", "Do it the recommended way.")).toBe(false);
   });
 
+  it("never counts a thread's marker comment as the owner's correction, signed or not (BB-110)", () => {
+    const marked = comment({ author: "jane", body: "<!-- bb-review round=1 sha=abc verdict=approved lane=owner-reviewed -->\n\nNo, do it the other way.", signedBy: null });
+    expect(commentDiffersFromRecommendation(marked, "jane", "Do it the recommended way.")).toBe(false);
+    const approvalMarked = comment({ author: "jane", body: `${approvalMarkerLine({ sha: "abc", entry: null, verdict: "approved" })}\n\nNo, do it the other way.`, signedBy: null });
+    expect(commentDiffersFromRecommendation(approvalMarked, "jane", "Do it the recommended way.")).toBe(false);
+    // The same words without the marker still correct.
+    expect(commentDiffersFromRecommendation(comment({ author: "jane", body: "No, do it the other way.", signedBy: null }), "jane", "Do it the recommended way.")).toBe(true);
+  });
+
   it("treats an empty side as no difference", () => {
     expect(answerDiffers("", "Do it.")).toBe(false);
     expect(answerDiffers("Do it.", "")).toBe(false);

@@ -162,6 +162,8 @@ export function answerDiffers(answer: string, recommendation: string): boolean {
 export function commentDiffersFromRecommendation(c: SnapshotComment, viewer: string | null, recommendation: string | null): boolean {
   if (viewer === null || recommendation === null || c.signedBy !== null) return false;
   if (c.author.toLowerCase() !== viewer.toLowerCase()) return false;
+  // A marker comment is a thread's, signed or not: never the owner's words (BB-110).
+  if (isMarkerComment(c.body)) return false;
   return answerDiffers(c.body, recommendation);
 }
 
