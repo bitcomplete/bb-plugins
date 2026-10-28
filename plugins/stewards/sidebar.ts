@@ -5,11 +5,11 @@
 //
 // Grouping comes from the steward relationship, then the thread tree. A worker
 // belongs to its binding through the plugin's `workers` table, which the RPC
-// carries; a reviewer through its worker, which the RPC names. The thread tree
-// covers what the records do not: a one-off thread's children, and a worker an
-// older steward left with only its lifecycle owner. Since BB-72 a worker's
-// parent is its steward and a reviewer's is its worker, so the fallback and
-// the records agree.
+// carries; a reviewer is a live thread whose parent is a claimed worker, which
+// the fallback tree attaches. The thread tree covers what the records do not: a
+// one-off thread's children, and a worker an older steward left with only its
+// lifecycle owner. Since BB-72 a worker's parent is its steward and a
+// reviewer's is its worker, so the fallback and the records agree.
 
 import type { DeployState } from "./deploy.js";
 
@@ -38,7 +38,6 @@ export interface SidebarBinding {
   requeueAt: number | null;
   advancedAt: number | null;
   workers: SidebarWorker[];
-  reviewers: SidebarReviewer[];
 }
 
 export interface SidebarWorker {
@@ -46,11 +45,6 @@ export interface SidebarWorker {
   title: string;
   /** The plugin's own worker status, so the running count is of running workers. */
   status: string;
-}
-
-export interface SidebarReviewer {
-  threadId: string;
-  workerThreadId: string;
 }
 
 export interface SidebarEnded {
@@ -573,17 +567,9 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       const child: SidebarChild = { threadId: thread.id, title: thread.displayTitle, role: "worker", children: [] };
       effort.children.push(child);
       byThread.set(thread.id, child);
-      touch(effort, thread);
-    }
-    // Reviewers, each under the worker the RPC names.
-    for (const r of b.reviewers) {
-      const thread = byId.get(r.threadId);
-      if (thread === undefined) continue;
-      claimed.add(thread.id);
-      roleByThread.set(thread.id, "reviewer");
-      const child: SidebarChild = { threadId: thread.id, title: thread.displayTitle, role: "reviewer", children: [] };
-      (byThread.get(r.workerThreadId)?.children ?? effort.children).push(child);
-      byThread.set(thread.id, child);
+      // Indexed so the fallback tree attaches a reviewer whose parent is this
+      // worker, now that the RPC no longer names reviewers (BB-100).
+      index.set(thread.id, { effort, byThread });
       touch(effort, thread);
     }
     derive(effort, now);

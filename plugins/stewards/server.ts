@@ -13,7 +13,7 @@
 // Configuration lives in the project's `.bb`, read through multi-repo's RPC
 // from the canonical checkout's committed HEAD. Nothing here reads a file.
 import { randomBytes } from "node:crypto";
-import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   DEFAULT_FOLLOW_THROUGH_MS,
@@ -279,6 +279,23 @@ const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
   needViewSchema.extend({ type: z.literal("need"), bindingKey: z.string() }),
 ]);
 
+/** One RPC method's or CLI command's in-memory stat (BB-100). */
+const methodStatSchema = z.object({
+  count: z.number(),
+  totalMs: z.number(),
+  maxMs: z.number(),
+  lastMs: z.number(),
+  lastAt: z.number().nullable(),
+});
+/** The plugin's in-memory handler table, read by `bb stewards stats` and the Status section (BB-100). */
+const statsSchema = z.object({
+  rpc: z.record(z.string(), methodStatSchema),
+  cli: z.record(z.string(), methodStatSchema),
+  /** Signals published per project in the last hour. */
+  signals: z.record(z.string(), z.number()),
+});
+export type StewardStats = z.infer<typeof statsSchema>;
+
 /** The steward's own surface for the app and the CLI. Cross-plugin methods are in source-contract.ts. */
 export const rpcContract = defineRpcContract({
   ...stewardsContract,
@@ -309,6 +326,8 @@ export const rpcContract = defineRpcContract({
     output: z.object({
       paused: z.boolean(),
       lastSweepAt: z.number().nullable(),
+      /** The plugin's in-memory per-method stat, for the Status section (BB-100). */
+      stats: statsSchema,
       projects: z.array(
         z.object({
           projectId: z.string(),
@@ -460,58 +479,62 @@ export const rpcContract = defineRpcContract({
         .nullable(),
     }),
   },
-  // The sidebar thread list's one call: every stewarded project's bindings,
-  // their workers and known reviewers, the project steward, what ended, and
-  // the project's "needs you" count and items. One call for all projects, so a
-  // replaced sidebar does not refetch per tab.
+  // The sidebar thread list's one call: one project's bindings, workers and
+  // "needs you" items, plus the picker's per-project needs count. The requested
+  // project is the input, or the first by name when null; a client built from
+  // the previous image still validates because `reviewers` stays optional for
+  // one release (BB-100).
   stewardsSidebar: {
-    input: z.null(),
+    input: z.object({ projectId: z.string().min(1).max(100).nullable() }),
     output: z.object({
-      projects: z.array(
+      /** Every stewarded project, for the picker, with its needs-you binding count. */
+      projects: z.array(z.object({ projectId: z.string(), name: z.string(), needsCount: z.number() })),
+      /** The project the rest of the payload is for; null when nothing is stewarded. */
+      projectId: z.string().nullable(),
+      projectStewardThreadId: z.string().nullable(),
+      /**
+       * The board's "waiting on you" items, in the sidebar's own shape: the
+       * same questions, with-user escalations and actionable needs, tagged
+       * so the app knows which write a choice makes. `count` is their sum;
+       * a non-actionable need is in neither the items nor the count.
+       */
+      needs: z.object({ count: z.number(), items: z.array(sidebarNeedsItemSchema) }),
+      bindings: z.array(
         z.object({
-          projectId: z.string(),
-          name: z.string(),
-          projectStewardThreadId: z.string().nullable(),
+          key: z.string(),
+          kind: z.string(),
+          stage: z.string().nullable(),
+          /** The entity's own phase, for line two; null when the binding has none (ops). */
+          phase: z.string().nullable(),
+          threadId: z.string().nullable(),
+          hold: z.string().nullable(),
+          /** Entity keys this hold waits behind, for `held behind <keys>`. */
+          holdBehind: z.array(z.string()),
+          blockedOn: z.string().nullable(),
+          needsUser: z.boolean(),
+          /** An open `stuck` escalation: the row is blocked (BB-76). */
+          stuck: z.boolean(),
+          /** The status report's actor, next action and timestamp; null with no report. */
+          status: z.object({ actor: z.string(), nextAction: z.string(), at: z.number() }).nullable(),
+          /** The newest deployment watch's state, or null with none (BB-76). */
+          deployment: z.enum(DEPLOY_STATES).nullable(),
+          /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
+          pending: z.array(z.object({ text: z.string(), quiet: z.boolean().optional() })),
+          /** When the binding is next due a look, for `next look <time>` (BB-83). */
+          requeueAt: z.number().nullable(),
+          advancedAt: z.number().nullable(),
+          /** The binding's live workers: running, finished, or ended within the last hour (BB-100). */
+          workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string() })),
           /**
-           * The board's "waiting on you" items, in the sidebar's own shape: the
-           * same questions, with-user escalations and actionable needs, tagged
-           * so the app knows which write a choice makes. `count` is their sum;
-           * a non-actionable need is in neither the items nor the count.
+           * Retained as an optional output for one release so a client built
+           * from the previous image tolerates its absence across a restart;
+           * the server no longer sends it, and the client derives reviewers
+           * from the thread tree (BB-100).
            */
-          needs: z.object({ count: z.number(), items: z.array(sidebarNeedsItemSchema) }),
-          bindings: z.array(
-            z.object({
-              key: z.string(),
-              kind: z.string(),
-              stage: z.string().nullable(),
-              /** The entity's own phase, for line two; null when the binding has none (ops). */
-              phase: z.string().nullable(),
-              threadId: z.string().nullable(),
-              hold: z.string().nullable(),
-              /** Entity keys this hold waits behind, for `held behind <keys>`. */
-              holdBehind: z.array(z.string()),
-              blockedOn: z.string().nullable(),
-              needsUser: z.boolean(),
-              /** An open `stuck` escalation: the row is blocked (BB-76). */
-              stuck: z.boolean(),
-              /** The status report's actor, next action and timestamp; null with no report. */
-              status: z.object({ actor: z.string(), nextAction: z.string(), at: z.number() }).nullable(),
-              /** The newest deployment watch's state, or null with none (BB-76). */
-              deployment: z.enum(DEPLOY_STATES).nullable(),
-              /** Notes queued for the next turn, so a quiet worker finish can be shown (BB-83). */
-              pending: z.array(z.object({ text: z.string(), quiet: z.boolean().optional() })),
-              /** When the binding is next due a look, for `next look <time>` (BB-83). */
-              requeueAt: z.number().nullable(),
-              advancedAt: z.number().nullable(),
-              /** Every worker, running or not, with the plugin's own status so the row counts running ones. */
-              workers: z.array(z.object({ threadId: z.string(), title: z.string(), status: z.string() })),
-              /** Reviewer threads, each under the worker it reviews. */
-              reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })),
-            }),
-          ),
-          ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), phase: z.string().nullable(), endReason: z.string().nullable(), endedAt: z.number() })),
+          reviewers: z.array(z.object({ threadId: z.string(), workerThreadId: z.string() })).optional(),
         }),
       ),
+      ended: z.array(z.object({ key: z.string(), kind: z.string(), threadId: z.string().nullable(), title: z.string().nullable(), phase: z.string().nullable(), endReason: z.string().nullable(), endedAt: z.number() })),
     }),
   },
   // The user closes a question from the page, with or without an answer, or
@@ -543,9 +566,6 @@ export const rpcContract = defineRpcContract({
 
 /** How long an ended binding stays on the page. */
 const ENDED_ON_BOARD_MS = 14 * 86_400_000;
-
-/** How long a worker's reviewer lookup is cached across `stewardsSidebar` calls (BB-95). */
-const REVIEWER_CACHE_MS = 5_000;
 
 type ProjectConfig = {
   projectId: string;
@@ -736,6 +756,58 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const fetchImpl = deps.fetch ?? globalThis.fetch;
     const env = deps.env ?? process.env;
 
+    // The in-memory per-method handler table (BB-100). bb core's own handler
+    // stat is keyed by plugin id only, so RPCs, doorbells, CLI commands and the
+    // nightly schedule share one bucket and a core change is out of scope; this
+    // table is the plugin's own, read by `bb stewards stats` and the Status
+    // section. It is per process, like the debug lines BB-95 added.
+    type MethodStat = { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null };
+    const methodStats = { rpc: new Map<string, MethodStat>(), cli: new Map<string, MethodStat>() };
+    /** Published signals, for the per-project count in the last hour. */
+    const signalLog: Array<{ projectId: string; at: number }> = [];
+    function recordStat(kind: "rpc" | "cli", name: string, ms: number): void {
+      const table = methodStats[kind];
+      const entry = table.get(name) ?? { count: 0, totalMs: 0, maxMs: 0, lastMs: 0, lastAt: null };
+      entry.count += 1;
+      entry.totalMs += ms;
+      entry.maxMs = Math.max(entry.maxMs, ms);
+      entry.lastMs = ms;
+      entry.lastAt = now();
+      table.set(name, entry);
+    }
+    async function measured<T>(kind: "rpc" | "cli", name: string, fn: () => T | Promise<T>): Promise<T> {
+      const started = now();
+      try {
+        return await fn();
+      } finally {
+        recordStat(kind, name, now() - started);
+      }
+    }
+    function statsSnapshot(): StewardStats {
+      const table = (m: Map<string, MethodStat>) => Object.fromEntries([...m.entries()].map(([name, stat]) => [name, { ...stat }]));
+      const cutoff = now() - 3_600_000;
+      const signals: Record<string, number> = {};
+      for (const s of signalLog) if (s.at >= cutoff) signals[s.projectId] = (signals[s.projectId] ?? 0) + 1;
+      return { rpc: table(methodStats.rpc), cli: table(methodStats.cli), signals };
+    }
+    /** Wrap every RPC handler with `measured`, so the table covers every method, not a hand-picked list. */
+    function measuredHandlers<T extends Record<string, (...args: never[]) => unknown>>(kind: "rpc" | "cli", handlers: T): T {
+      return Object.fromEntries(
+        Object.entries(handlers).map(([name, handler]) => [
+          name,
+          (...args: unknown[]) => measured(kind, name, () => (handler as (...a: unknown[]) => unknown)(...args)),
+        ]),
+      ) as unknown as T;
+    }
+    /** Wrap every CLI command's `run` with `measured`, keeping its declaration inert. */
+    function measuredCommands(commands: Record<string, PluginCliCommand>): Record<string, PluginCliCommand> {
+      const out: Record<string, PluginCliCommand> = {};
+      for (const [name, command] of Object.entries(commands)) {
+        out[name] = { ...command, run: (input, ctx) => measured("cli", name, () => command.run(input, ctx)) };
+      }
+      return out;
+    }
+
     const db = bb.storage.database();
     bb.storage.migrate(db, MIGRATIONS);
     // The store reports a project whose sidebar- or board-visible state
@@ -747,6 +819,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // One debug line per published signal, with the project and the
         // coalesced columns, so the next slowdown has numbers (BB-95).
         bb.log.debug(`stewards: signal for project ${projectId} (${columns.length === 0 ? "no columns" : columns.join(", ")})`);
+        // The per-project signal count keeps only the last hour (BB-100).
+        signalLog.push({ projectId, at: now() });
+        const cutoff = now() - 3_600_000;
+        while (signalLog.length > 0 && signalLog[0]!.at < cutoff) signalLog.shift();
         bb.realtime.publish(PROJECT_CHANGED, { projectId });
       },
     });
@@ -1518,9 +1594,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /**
      * The worker a thread is a child of, if any. A reviewer is spawned with
-     * its worker as parent (`--parent-self`, what build-tickets uses), which is
-     * also how the sidebar RPC and `reviewersOf` find it. Null for a worker
-     * itself and for anything else.
+     * its worker as parent (`--parent-self`, what build-tickets uses). Null
+     * for a worker itself and for anything else.
      */
     function reviewerOwner(thread: { parentThreadId: string | null }): Worker | null {
       return thread.parentThreadId === null ? null : store.worker(thread.parentThreadId);
@@ -1530,7 +1605,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * A worker's reviewer threads, as bb lists them: its children, hidden or
      * not, not archived. Null when bb could not be asked, so a caller that must
      * not guess — archiving a worker that might still have a reviewer — can
-     * tell "none" from "unknown".
+     * tell "none" from "unknown". Kept per worker for the two reconcile paths
+     * that need a reviewer's own status or its direct-children relationship;
+     * the batch paths use `descendantsOfMany` (BB-100).
      */
     async function reviewersOf(workerThreadId: string): Promise<Array<{ id: string; status: string }> | null> {
       try {
@@ -1540,6 +1617,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.warn(`stewards: could not list the reviewers of worker ${workerThreadId}: ${errorMessage(error)}`);
         return null;
       }
+    }
+
+    /**
+     * The live threads below each of `workerThreadIds`, in one
+     * `experimental_listDescendants` call per batch of up to 200 ids, rather
+     * than one `threads.list` per worker (BB-100). Archived threads are
+     * omitted by default; hidden ones are included. A worker with any live
+     * descendant must not be archived, so the caller reads presence, not the
+     * exact child relationship. Null when bb could not be asked, so a caller
+     * that must not guess can tell "none" from "unknown".
+     */
+    async function descendantsOfMany(workerThreadIds: readonly string[]): Promise<Map<string, string[]> | null> {
+      const unique = [...new Set(workerThreadIds)];
+      const out = new Map<string, string[]>();
+      for (let i = 0; i < unique.length; i += 200) {
+        try {
+          const { threads } = await bb.sdk.threads.experimental_listDescendants({ threadIds: unique.slice(i, i + 200), includeHidden: true });
+          for (const row of threads) out.set(row.threadId, row.descendantIds);
+        } catch (error) {
+          bb.log.warn(`stewards: could not list the descendants of ${unique.length} thread(s): ${errorMessage(error)}`);
+          return null;
+        }
+      }
+      return out;
     }
 
     /**
@@ -1572,20 +1673,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function archiveFinishedWorkers(b: Binding): Promise<void> {
       if (needsUser(b)) return;
-      for (const w of store.workers(b.id)) {
-        if (w.status !== "finished" || workerQuestion(w.result) !== null) continue;
-        // A worker parked on a watch or an approval is left in flight: the
-        // watch wakes it again, and its own pull request's activity stays quiet
-        // (BB-52 rule 3).
-        if (workerWaiting(w.result)) continue;
-        // A worker whose reviewer is still unarchived must stay. bb core
-        // releases a thread's unarchived children from it when it is archived,
-        // so archiving the worker would clear the reviewer's parent: it could
-        // no longer wake the worker, and `reviewersOf` could never find it to
-        // archive it. A listing that failed is "unknown", so the worker waits
-        // rather than risking the orphan (BB-47).
-        const reviewers = await reviewersOf(w.threadId);
-        if (reviewers === null || reviewers.length > 0) continue;
+      const candidates = store.workers(b.id).filter((w) => w.status === "finished" && workerQuestion(w.result) === null && !workerWaiting(w.result));
+      if (candidates.length === 0) return;
+      // A worker whose reviewer is still unarchived must stay. bb core
+      // releases a thread's unarchived children from it when it is archived,
+      // so archiving the worker would clear the reviewer's parent: it could
+      // no longer wake the worker, and no later pass could find it to archive
+      // it. One batched descendant lookup covers every candidate (BB-100); a
+      // listing that failed is "unknown", so all the workers wait rather than
+      // risking an orphan (BB-47).
+      const descendants = await descendantsOfMany(candidates.map((w) => w.threadId));
+      if (descendants === null) return;
+      for (const w of candidates) {
+        if ((descendants.get(w.threadId) ?? []).length > 0) continue;
         const info = await threadInfo(w.threadId).catch(() => null);
         if (info === null || info.deletedAt !== null || info.archivedAt !== null || busy(info.status)) continue;
         await quietly(`archive finished worker ${w.threadId}`, () => bb.sdk.threads.archive({ threadId: w.threadId }));
@@ -1607,10 +1707,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let failed = false;
       for (const b of store.open()) {
         if (b.threadId !== null && !(await showIfHidden(b.threadId))) failed = true;
-        for (const w of store.workers(b.id)) {
-          if (!(await showIfHidden(w.threadId))) failed = true;
-          for (const r of (await reviewersOf(w.threadId)) ?? []) if (!(await showIfHidden(r.id))) failed = true;
+        const workerIds = store.workers(b.id).map((w) => w.threadId);
+        for (const workerId of workerIds) if (!(await showIfHidden(workerId))) failed = true;
+        // One batched descendant lookup per binding instead of one
+        // `threads.list` per worker (BB-100). A failed lookup leaves the
+        // marker unset so the next start retries.
+        const descendants = await descendantsOfMany(workerIds);
+        if (descendants === null) {
+          failed = true;
+          continue;
         }
+        for (const ids of descendants.values()) for (const id of ids) if (!(await showIfHidden(id))) failed = true;
       }
       // A transient show failure must not burn the one-time marker: leaving it
       // unset makes the next start retry, as the old show-on-every-wake path
@@ -4627,13 +4734,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the RPC -------------------------------------------------------------------------------------
 
-    // A short-lived cache of each worker's reviewer threads, so N open clients
-    // and a burst of signals share one `threads.list` per worker instead of one
-    // per refetch (BB-95). Keyed by worker thread id; entries expire after
-    // `REVIEWER_CACHE_MS`.
-    const reviewerCache = new Map<string, { at: number; ids: string[] }>();
-
-    bb.rpc.register(rpcContract, {
+    const rawRpcHandlers: ExperimentalPluginRpcHandlersWithContext<typeof rpcContract> = {
       async stewardsRing({ source, id, deployment, workflow_run }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
         if (workflow_run !== undefined) {
@@ -4731,7 +4832,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           };
         });
         projects.sort((a, b) => a.name.localeCompare(b.name));
-        return { paused: (await settings.get()).paused, lastSweepAt, projects };
+        return { paused: (await settings.get()).paused, lastSweepAt, stats: statsSnapshot(), projects };
       },
       async stewardsCheck({ projectId }) {
         return check(projectId);
@@ -4808,11 +4909,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           },
         };
       },
-      // The sidebar's one call: every stewarded project's bindings, their
-      // workers, and the reviewers known under them. The reviewers come from a
-      // cached `threads.list` per worker; everything else is the store's own
-      // records.
-      async stewardsSidebar() {
+      // The sidebar's one call: one project's bindings and "needs you" items,
+      // plus the picker's per-project needs count. The project is the input, or
+      // the first by name when null. There is no per-worker `threads.list`: the
+      // client derives reviewers from the live thread tree (BB-100).
+      async stewardsSidebar({ projectId: wanted }) {
         const started = now();
         // One project list for both the names and the configurations (BB-95),
         // instead of `bb.sdk.projects.list()` twice.
@@ -4821,80 +4922,73 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const projects = projectIds((await stewardedProjects(false, projectList)).map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
-        const workerIds = [
-          ...new Set(projects.flatMap((p) => store.all(p.projectId).filter((b) => b.endedAt === null).flatMap((b) => store.workers(b.id).map((w) => w.threadId)))),
-        ];
-        // The reviewer lookup is the expensive part: cache it for a few seconds
-        // so a burst of signals and N open clients share one call per worker.
-        for (const [id, entry] of reviewerCache) if (started - entry.at >= REVIEWER_CACHE_MS) reviewerCache.delete(id);
-        const reviewersByWorker = new Map<string, string[]>();
-        await Promise.all(
-          workerIds.map(async (workerId) => {
-            const cached = reviewerCache.get(workerId);
-            if (cached !== undefined) {
-              reviewersByWorker.set(workerId, cached.ids);
-              return;
-            }
-            const children = await bb.sdk.threads.list({ parentThreadId: workerId, includeHidden: true }).catch(() => []);
-            const ids = children.map((c) => c.id);
-            reviewerCache.set(workerId, { at: started, ids });
-            reviewersByWorker.set(workerId, ids);
-          }),
-        );
-        const result = {
-          projects: projects.map(({ projectId, name }) => {
-            const all = store.all(projectId);
-            const ended = all
-              .filter((b) => b.endedAt !== null && b.endedAt >= now() - ENDED_ON_BOARD_MS)
-              .sort((a, b) => b.endedAt! - a.endedAt!)
-              .slice(0, 30);
-            const { questions, withUser, needs } = needsYou(projectId, { actionableOnly: true });
+        // The picker's count is the server's own: the open bindings that need
+        // the user, so the pill and the yellow rows cannot disagree (BB-100).
+        const picker = projects.map((p) => ({
+          ...p,
+          needsCount: store.all(p.projectId).filter((b) => b.endedAt === null && needsUser(b)).length,
+        }));
+        const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
+        if (picked === undefined) {
+          return { projects: picker, projectId: null, projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
+        }
+        const { projectId } = picked;
+        const all = store.all(projectId);
+        const ended = all
+          .filter((b) => b.endedAt !== null && b.endedAt >= started - ENDED_ON_BOARD_MS)
+          .sort((a, b) => b.endedAt! - a.endedAt!)
+          .slice(0, 30);
+        const { questions, withUser, needs } = needsYou(projectId, { actionableOnly: true });
+        // Only the workers the row can show: running or finished, plus any
+        // other worker that ended within the last hour (BB-100).
+        const liveSince = started - 3_600_000;
+        const bindings = all
+          .filter((b) => b.endedAt === null)
+          .map((b) => {
+            const workers = store
+              .workers(b.id)
+              .filter((w) => w.status === "running" || w.status === "finished" || (w.endedAt !== null && w.endedAt >= liveSince))
+              .map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
+            // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
+            const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
             return {
-              projectId,
-              name,
-              projectStewardThreadId: store.project(projectId).threadId,
-              needs: {
-                count: questions.length + withUser.length + needs.length,
-                items: [
-                  ...questions.map((q) => ({ type: "question" as const, ...q, bindingKey: q.key })),
-                  ...withUser.map((w) => ({ type: "withUser" as const, ...w, bindingKey: w.key })),
-                  ...needs.map((n) => ({ type: "need" as const, ...n, bindingKey: n.key })),
-                ],
-              },
-              bindings: all
-                .filter((b) => b.endedAt === null)
-                .map((b) => {
-                  const workers = store.workers(b.id).map((w) => ({ threadId: w.threadId, title: w.title, status: w.status }));
-                  // The newest deployment watch, whatever its state (BB-76); the row shows `merged` as deploying too.
-                  const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
-                  return {
-                    key: b.entityKey,
-                    kind: b.kind,
-                    stage: b.stage,
-                    phase: b.phase,
-                    threadId: b.threadId,
-                    hold: b.hold,
-                    holdBehind: b.holdBehind,
-                    blockedOn: b.status?.blockedOn ?? null,
-                    needsUser: needsUser(b),
-                    stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
-                    status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
-                    deployment: newestDeployment === null ? null : newestDeployment.state,
-                    pending: b.pending,
-                    requeueAt: b.requeueAt,
-                    advancedAt: b.advancedAt,
-                    workers,
-                    reviewers: workers.flatMap((w) => (reviewersByWorker.get(w.threadId) ?? []).map((threadId) => ({ threadId, workerThreadId: w.threadId }))),
-                  };
-                }),
-              ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt! })),
+              key: b.entityKey,
+              kind: b.kind,
+              stage: b.stage,
+              phase: b.phase,
+              threadId: b.threadId,
+              hold: b.hold,
+              holdBehind: b.holdBehind,
+              blockedOn: b.status?.blockedOn ?? null,
+              needsUser: needsUser(b),
+              stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
+              status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
+              deployment: newestDeployment === null ? null : newestDeployment.state,
+              pending: b.pending,
+              requeueAt: b.requeueAt,
+              advancedAt: b.advancedAt,
+              workers,
             };
-          }),
+          });
+        const result = {
+          projects: picker,
+          projectId,
+          projectStewardThreadId: store.project(projectId).threadId,
+          needs: {
+            count: questions.length + withUser.length + needs.length,
+            items: [
+              ...questions.map((q) => ({ type: "question" as const, ...q, bindingKey: q.key })),
+              ...withUser.map((w) => ({ type: "withUser" as const, ...w, bindingKey: w.key })),
+              ...needs.map((n) => ({ type: "need" as const, ...n, bindingKey: n.key })),
+            ],
+          },
+          bindings,
+          ended: ended.map((b) => ({ key: b.entityKey, kind: b.kind, threadId: b.threadId, title: b.title, phase: b.phase, endReason: b.endReason, endedAt: b.endedAt! })),
         };
         // One debug line per call, with its duration and binding/worker counts,
         // so the next slowdown has numbers (BB-95).
-        const bindingCount = result.projects.reduce((n, p) => n + p.bindings.length, 0);
-        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${result.projects.length} projects, ${bindingCount} bindings, ${workerIds.length} workers)`);
+        const workerCount = bindings.reduce((n, b) => n + b.workers.length, 0);
+        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${projectId}: ${bindings.length} bindings, ${workerCount} workers)`);
         return result;
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
@@ -5214,7 +5308,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await wakeProjectOnForwardedAnswer(b, closure, forwarded);
         return { ok: true, message: `Closed; ${b.entityKey}'s steward has been told.` };
       },
-    });
+    };
+    bb.rpc.register(rpcContract, measuredHandlers("rpc", rawRpcHandlers));
 
     /** Stewarded projects, and those whose configuration went away but still have stewards. */
     function projectIds(configured: Iterable<string>): string[] {
@@ -6751,12 +6846,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return lines;
     }
 
-    bb.cli.register(
-      defineCli({
-        name: "stewards",
-        summary: "Long-lived threads that manage labelled Linear tickets and GitHub pull requests, and watch production",
-        description: "Configuration lives in the project's .bb (stewards/project.json and stewards/playbooks/), read from committed HEAD through multi-repo.",
-        commands: {
+    const stewardsCommands: Record<string, PluginCliCommand> = {
           init: cliCommand({
             summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
             description:
@@ -7287,7 +7377,42 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               return { exitCode: 0, stdout: `Imported ${setting}; the dotenv is gone.` };
             },
           }),
-        },
+
+          stats: cliCommand({
+            summary: "Per-method RPC and CLI call counts and timings, and published signals in the last hour",
+            description:
+              "The in-memory table bb core's own handler stat cannot show: one row per RPC method and CLI command, plus the signals each project published in the last hour (BB-100). Reset by a restart.",
+            options: { json: JSON_OPTION },
+            async run(input) {
+              const stats = statsSnapshot();
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(stats) };
+              const lines: string[] = [];
+              const section = (title: string, rows: Array<[string, MethodStat]>) => {
+                lines.push(title);
+                if (rows.length === 0) {
+                  lines.push("  (none)");
+                  return;
+                }
+                for (const [name, s] of rows.sort((a, b) => a[0].localeCompare(b[0]))) {
+                  lines.push(`  ${name}: ${s.count} call${s.count === 1 ? "" : "s"}, total ${s.totalMs}ms, max ${s.maxMs}ms, last ${s.lastMs}ms${s.lastAt === null ? "" : ` at ${iso(s.lastAt)}`}`);
+                }
+              };
+              section("RPC methods:", Object.entries(stats.rpc));
+              section("CLI commands:", Object.entries(stats.cli));
+              lines.push("Signals published in the last hour:");
+              const signals = Object.entries(stats.signals).sort((a, b) => a[0].localeCompare(b[0]));
+              if (signals.length === 0) lines.push("  (none)");
+              else for (const [projectId, count] of signals) lines.push(`  ${projectId}: ${count}`);
+              return { exitCode: 0, stdout: lines.join("\n") };
+            },
+          }),
+    };
+    bb.cli.register(
+      defineCli({
+        name: "stewards",
+        summary: "Long-lived threads that manage labelled Linear tickets and GitHub pull requests, and watch production",
+        description: "Configuration lives in the project's .bb (stewards/project.json and stewards/playbooks/), read from committed HEAD through multi-repo.",
+        commands: measuredCommands(stewardsCommands),
       }),
     );
 

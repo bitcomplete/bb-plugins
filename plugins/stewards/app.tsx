@@ -42,8 +42,8 @@ type Project = Overview["projects"][number];
 type Steward = Project["stewards"][number];
 type BoardResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { board: unknown }> : never;
 type Board = NonNullable<BoardResult["board"]>;
-type SidebarResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { projects: Array<{ needs: unknown }> }> : never;
-type SidebarNeeds = SidebarResult["projects"][number]["needs"];
+type SidebarResult = Awaited<ReturnType<Client["call"]>> extends infer R ? Extract<R, { needs: unknown; bindings: unknown }> : never;
+type SidebarNeeds = SidebarResult["needs"];
 type SidebarNeedItem = SidebarNeeds["items"][number];
 type CheckResult = { ok: boolean; lines: string[] };
 
@@ -202,6 +202,28 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 // ---- Status ---------------------------------------------------------------------------------------
 
+/** The plugin's in-memory per-method stat (BB-100), shown in the Status section. */
+function MethodStats({ title, rows }: { title: string; rows: Record<string, { count: number; totalMs: number; maxMs: number; lastMs: number; lastAt: number | null }> }) {
+  const entries = Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0]));
+  return (
+    <div>
+      <p className="font-medium">{title}</p>
+      {entries.length === 0 ? (
+        <p className="text-muted-foreground">none</p>
+      ) : (
+        <ul>
+          {entries.map(([name, s]) => (
+            <li key={name}>
+              {name}: {s.count} call{s.count === 1 ? "" : "s"}, total {s.totalMs}ms, max {s.maxMs}ms, last {s.lastMs}ms
+              {s.lastAt === null ? "" : ` (${ago(s.lastAt, Date.now())})`}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function StatusSection() {
   const { overview, error } = useOverview();
   if (overview === null) return <Loading error={error} />;
@@ -222,6 +244,29 @@ function StatusSection() {
         overview.projects.map((p) => <ProjectStatus key={p.projectId} project={p} now={now} />)
       )}
       <p className="text-xs text-muted-foreground">Last sweep {ago(overview.lastSweepAt, now)}; the sweep runs every half hour. Configuration is reread from committed HEAD every few minutes.</p>
+      <details className="rounded-lg border border-border p-3 text-xs">
+        <summary className="cursor-pointer font-medium text-muted-foreground">Handler stats (this process)</summary>
+        <div className="mt-2 flex flex-col gap-2">
+          <MethodStats title="RPC methods" rows={overview.stats.rpc} />
+          <MethodStats title="CLI commands" rows={overview.stats.cli} />
+          <div>
+            <p className="font-medium">Signals published in the last hour</p>
+            {Object.keys(overview.stats.signals).length === 0 ? (
+              <p className="text-muted-foreground">none</p>
+            ) : (
+              <ul>
+                {Object.entries(overview.stats.signals)
+                  .sort((a, b) => a[0].localeCompare(b[0]))
+                  .map(([projectId, count]) => (
+                    <li key={projectId}>
+                      {projectId}: {count}
+                    </li>
+                  ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      </details>
       {error !== null ? <p className="text-xs text-destructive">Refresh failed: {error}</p> : null}
     </div>
   );
@@ -1830,33 +1875,6 @@ function StewardsSidebarCore({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const { status, threads, projects } = experimental_useSidebarThreads();
-  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
-  // The previous tabs, so `buildSidebar` can hand back the same effort and
-  // thread objects for unchanged rows and the memoised rows skip a render
-  // (BB-95). The ref is written during render; the call is idempotent.
-  const previousTabs = useRef<readonly SidebarTab[]>([]);
-  const tabs = useMemo(() => {
-    const next = buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }, previousTabs.current);
-    previousTabs.current = next;
-    return next;
-  }, [projects, threads, data]);
-  const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
-  // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
-  const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, t.blocked.filter((e) => e.state === "you").length] as const)), [tabs]);
-  // A steward's visible change updates the badge and block within seconds;
-  // the half-minute poll stays the fallback. Only a project this sidebar shows
-  // triggers a refetch.
-  useRealtime(
-    PROJECT_CHANGED,
-    useCallback(
-      (payload) => {
-        const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
-        if (typeof projectId === "string" && projects.some((p) => p.id === projectId)) refetch();
-      },
-      [projects, refetch],
-    ),
-  );
-  const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
   // The Stewards page's route, when that panel is mounted (BB-94). It is null
   // on a thread route, where the props above are the source.
   const boardRoute = useBoardRoute();
@@ -1865,9 +1883,55 @@ function StewardsSidebarCore({
   // The active tab follows the panel route, then the thread route; a pick only
   // lasts until one of them moves.
   useEffect(() => setPicked(null), [activeProjectId, boardRoute.projectId]);
+  // The one project the RPC is asked for; null lets the server pick the first
+  // by name. `load` depends on it, so a pick refetches like the board's `wanted`.
   const wanted = picked ?? boardRoute.projectId ?? activeProjectId;
-  const active = tabs.find((t) => t.projectId === wanted) ?? tabs[0] ?? null;
-  const activeNeeds = active === null ? undefined : needsByProject.get(active.projectId);
+  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  // The previous tabs, so `buildSidebar` can hand back the same effort and
+  // thread objects for unchanged rows and the memoised rows skip a render
+  // (BB-95). The ref is written during render; the call is idempotent.
+  const previousTabs = useRef<readonly SidebarTab[]>([]);
+  const tabs = useMemo(() => {
+    // The RPC carries one project's data; that tab is the only one whose rows
+    // render, so the others are built from the live threads alone (BB-100).
+    const projectData =
+      data === null || data.projectId === null
+        ? []
+        : [
+            {
+              projectId: data.projectId,
+              name: data.projects.find((p) => p.projectId === data.projectId)?.name ?? data.projectId,
+              projectStewardThreadId: data.projectStewardThreadId,
+              bindings: data.bindings,
+              ended: data.ended,
+            },
+          ];
+    const next = buildSidebar({ projects, threads, data: projectData, now: Date.now() }, previousTabs.current);
+    previousTabs.current = next;
+    return next;
+  }, [projects, threads, data]);
+  // The picker's count is the server's needs-you binding count, so the pill and
+  // the yellow rows cannot disagree (BB-100).
+  const counts = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needsCount] as const)), [data]);
+  const active = tabs.find((t) => t.projectId === wanted) ?? tabs.find((t) => t.projectId === data?.projectId) ?? tabs[0] ?? null;
+  // A steward's visible change updates the badge and block within seconds; the
+  // half-minute poll stays the fallback. Only a signal that names the shown
+  // project triggers a refetch, not one for another listed project (BB-100).
+  const shownProjectId = active?.projectId ?? data?.projectId ?? wanted;
+  useRealtime(
+    PROJECT_CHANGED,
+    useCallback(
+      (payload) => {
+        const projectId = payload === null || typeof payload !== "object" ? null : (payload as { projectId?: unknown }).projectId;
+        if (typeof projectId === "string" && projectId === shownProjectId) refetch();
+      },
+      [shownProjectId, refetch],
+    ),
+  );
+  const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
+  // The requested project's needs items, only while the data matches the tab on
+  // screen; a stale answer for a previous project shows nothing (BB-100).
+  const needItems = active !== null && data?.projectId === active.projectId ? data.needs.items : EMPTY_NEEDS;
   const now = Date.now();
   const activeKey = boardRoute.key;
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
@@ -1885,7 +1949,6 @@ function StewardsSidebarCore({
   const newThread = useCallback(() => {
     if (active !== null) onNewThread(active.projectId);
   }, [active, onNewThread]);
-  const needItems = activeNeeds?.items ?? EMPTY_NEEDS;
   const rows = (list: readonly SidebarEffort[]) =>
     list.map((e) => (
       <SidebarEffortRow

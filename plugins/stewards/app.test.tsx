@@ -442,12 +442,20 @@ const sidebarBinding = (over: Record<string, unknown>) => ({
   ...over,
 });
 
-const sidebarData = (over: { p1?: Record<string, unknown>; p2?: Record<string, unknown> } = {}) => ({
-  projects: [
-    { projectId: "p1", name: "Acme", projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [], ...over.p1 },
-    { projectId: "p2", name: "Beta", projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [], ...over.p2 },
-  ],
-});
+const sidebarData = (over: { p1?: Record<string, unknown>; p2?: Record<string, unknown>; needsCounts?: Record<string, number> } = {}) => {
+  const p1 = over.p1 ?? {};
+  return {
+    projects: [
+      { projectId: "p1", name: "Acme", needsCount: over.needsCounts?.p1 ?? 0 },
+      { projectId: "p2", name: "Beta", needsCount: over.needsCounts?.p2 ?? 0 },
+    ],
+    projectId: "p1",
+    projectStewardThreadId: (p1.projectStewardThreadId as string | null) ?? null,
+    needs: p1.needs ?? { count: 0, items: [] },
+    bindings: p1.bindings ?? [],
+    ended: p1.ended ?? [],
+  };
+};
 
 describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
   const renderSidebar = async (rpc: Record<string, unknown>, props: Record<string, unknown> = {}, threads: unknown[] = []): Promise<RenderedSlot> => {
@@ -464,8 +472,8 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
       {
         stewardsSidebar: () =>
           sidebarData({
+            needsCounts: { p1: 2, p2: 1 },
             p1: { bindings: [sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true }), sidebarBinding({ key: "ENG-2", threadId: "thr_b", needsUser: true })], needs: { count: 9, items: [] } },
-            p2: { bindings: [sidebarBinding({ key: "ENG-3", threadId: "thr_c", needsUser: true })] },
           }),
       },
       {},
@@ -542,7 +550,7 @@ describe("the stewards overview's refresh (BB-90)", () => {
       rpc: {
         stewardsOverview: () => {
           calls += 1;
-          return { paused: false, projects: [], lastSweepAt: 0 };
+          return { paused: false, projects: [], lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} } };
         },
       },
     } as never);

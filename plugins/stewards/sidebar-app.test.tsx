@@ -51,17 +51,13 @@ const projects = [
   { id: "personal", name: "Personal", isPersonal: true, href: "/projects/personal", settingsHref: "/projects/personal/settings" },
 ];
 
-const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; needs?: unknown; projectStewardThreadId?: string | null } = {}) => ({
-  projects: [
-    {
-      projectId: "p1",
-      name: "Acme",
-      projectStewardThreadId: over.projectStewardThreadId ?? null,
-      needs: over.needs ?? { count: 0, items: [] },
-      bindings: over.bindings ?? [],
-      ended: over.ended ?? [],
-    },
-  ],
+const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; needs?: unknown; projectStewardThreadId?: string | null; projectId?: string; needsCount?: number } = {}) => ({
+  projects: [{ projectId: "p1", name: "Acme", needsCount: over.needsCount ?? 0 }],
+  projectId: over.projectId ?? "p1",
+  projectStewardThreadId: over.projectStewardThreadId ?? null,
+  needs: over.needs ?? { count: 0, items: [] },
+  bindings: over.bindings ?? [],
+  ended: over.ended ?? [],
 });
 
 const binding = (over: Record<string, unknown> = {}) => ({
@@ -81,7 +77,6 @@ const binding = (over: Record<string, unknown> = {}) => ({
   requeueAt: null,
   advancedAt: null,
   workers: [],
-  reviewers: [],
   ...over,
 });
 
@@ -260,7 +255,7 @@ describe("the stewards sidebar list (BB-44)", () => {
       rpc: {
         stewardsSidebar: () =>
           sidebarData({
-            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
+            bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Implement retry", status: "running" }] })],
           }),
       } as never,
     });
@@ -301,7 +296,6 @@ describe("the stewards sidebar list (BB-44)", () => {
             bindings: [
               binding({
                 workers: [{ threadId: "thr_unread_worker", title: "Unread worker", status: "finished" }],
-                reviewers: [{ threadId: "thr_busy_reviewer", workerThreadId: "thr_unread_worker" }],
               }),
             ],
           }),
@@ -521,12 +515,12 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
   it("puts a needs-you effort at the top of Blocked with a yellow dot and its phrase, not in In flight", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true, phase: "In Review" })] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ needsCount: 1, bindings: [binding({ needsUser: true, phase: "In Review" })] }) } as never,
     });
     await waitFor(() => expect(slot.getByRole("heading", { name: /Blocked/u })).toBeTruthy());
     expect(lineTwo(slot, "Fix login")).toBe("ticket · In Review · needs you");
     expect(glyphOf(slot, "Fix login")).toBe("you");
-    // The picker counts the yellow rows.
+    // The picker count follows the server's needsCount (BB-100).
     expect(slot.getByRole("option", { name: "Acme (1)" })).toBeTruthy();
     // No separate Needs you section remains.
     expect(slot.queryByRole("heading", { name: /Needs you/u })).toBeNull();
@@ -1536,6 +1530,51 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
     worker.isUnread = false;
     slot.lifecycle.rerender(<list.component {...props} />);
     await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("quiet"));
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-100: the sidebar asks for one project, the picker's count comes from the
+// server, and a signal for another project does not refetch.
+describe("the sidebar's one-project RPC (BB-100)", () => {
+  it("picking a project calls the RPC with that project", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsSidebar", input: { projectId: "personal" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("a signal for another project does not refetch the shown project", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding()] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "personal" });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toBe(1);
+    // A signal for the shown project still refetches.
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    slot.lifecycle.unmount();
+  });
+
+  it("the picker count follows the server's needsCount", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData({ needsCount: 3 }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("option", { name: "Acme (3)" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 });
