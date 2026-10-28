@@ -1037,6 +1037,22 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const allForProject = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE project_id = ? ORDER BY created_at");
   const allOpen = db.prepare<[], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL ORDER BY created_at");
   const all = db.prepare<[], BindingRow>("SELECT * FROM bindings ORDER BY created_at");
+  /**
+   * The picker's needs count (BB-104): one statement per project, so the
+   * sidebar does not parse every binding and run three more queries each. It
+   * mirrors `needsUser`: the actor is `user`, or an open escalation, need or
+   * question. The open predicates are the ones `openEscalations`, `openNeeds`
+   * and `openQuestions` use, so the count and the yellow rows cannot disagree.
+   */
+  const countNeedsUserStmt = db.prepare<[string], { n: number }>(
+    `SELECT COUNT(*) AS n FROM bindings b
+     WHERE b.project_id = ? AND b.ended_at IS NULL AND (
+       (CASE WHEN json_valid(b.status) THEN json_extract(b.status, '$.actor') END) = 'user'
+       OR EXISTS (SELECT 1 FROM escalations e WHERE e.binding_id = b.id AND e.status = 'open')
+       OR EXISTS (SELECT 1 FROM needs n WHERE n.binding_id = b.id AND n.status = 'open')
+       OR EXISTS (SELECT 1 FROM escalations q WHERE q.binding_id = b.id AND q.is_question = 1 AND q.status = 'open' AND (q.resolution_kind IS NULL OR q.resolution_kind NOT IN ('secret', 'done')))
+     )`,
+  );
   const children = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE parent_binding_id = ? AND ended_at IS NULL ORDER BY created_at");
   const isPlaced = db.prepare<[string], { thread_id: string }>("SELECT thread_id FROM placed_threads WHERE thread_id = ?");
   const markPlaced = db.prepare<[string, number]>("INSERT OR IGNORE INTO placed_threads (thread_id, placed_at) VALUES (?, ?)");
@@ -1617,6 +1633,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     all(projectId?: string): Binding[] {
       return (projectId === undefined ? all.all() : allForProject.all(projectId)).map(rowToBinding);
+    },
+    /** The open bindings of a project that `needsUser` would flag, counted in SQL (BB-104). */
+    countNeedsUser(projectId: string): number {
+      return countNeedsUserStmt.get(projectId)?.n ?? 0;
     },
     children(bindingId: string): Binding[] {
       return children.all(bindingId).map(rowToBinding);

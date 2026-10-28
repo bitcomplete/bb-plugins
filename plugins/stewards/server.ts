@@ -890,6 +890,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // ---- configuration ----------------------------------------------------------------
 
     const configs = new Map<string, { at: number; value: ProjectConfig | null }>();
+    /**
+     * The read in flight for a project, so a burst of calls after the TTL
+     * makes one read rather than one per caller (BB-104).
+     */
+    const configReads = new Map<string, Promise<ProjectConfig | null>>();
 
     async function readFiles(projectId: string, paths: string[]): Promise<Map<string, string | null>> {
       const out = await rpc(MULTI_REPO_PLUGIN_ID, "readProjectFiles", { projectId, paths }, readFilesOutput);
@@ -898,24 +903,48 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Read a project's configuration once: on success the result replaces the
+     * cache entry, on failure the last good entry is kept. A call while a read
+     * is in flight joins it, so a burst makes one read (BB-104).
+     */
+    function readConfigShared(projectId: string): Promise<ProjectConfig | null> {
+      const inFlight = configReads.get(projectId);
+      if (inFlight !== undefined) return inFlight;
+      const promise = readConfig(projectId)
+        .then((value) => {
+          configs.set(projectId, { at: now(), value });
+          return value;
+        })
+        .catch((error: unknown) => {
+          // Unreachable `.bb` is not "no stewards": keep what we had.
+          bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${errorMessage(error)}`);
+          return configs.get(projectId)?.value ?? null;
+        })
+        .finally(() => {
+          if (configReads.get(projectId) === promise) configReads.delete(projectId);
+        });
+      configReads.set(projectId, promise);
+      return promise;
+    }
+
+    /**
      * The project's stewards configuration, or null when the project has none.
      * A file that fails to parse falls back to the last good copy, kept in kv,
      * and the failure is reported as a problem rather than stopping anything.
+     *
+     * Stale-while-revalidate (BB-104): with an entry in hand it is returned at
+     * once, and one background read refreshes it once it is older than the TTL,
+     * so the `.bb` read never blocks the sidebar. A miss still blocks, so the
+     * first read after a restart is unchanged, and `force` still awaits a fresh
+     * copy for the callers that need one (the sweep, the reconcile, nightly).
      */
     async function loadConfig(projectId: string, force = false): Promise<ProjectConfig | null> {
       const cached = configs.get(projectId);
-      if (!force && cached !== undefined && now() - cached.at < timing.configTtlMs) return cached.value;
-      let value: ProjectConfig | null;
-      try {
-        value = await readConfig(projectId);
-      } catch (error) {
-        // Unreachable `.bb` is not "no stewards": keep what we had.
-        bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${errorMessage(error)}`);
-        if (cached !== undefined) return cached.value;
-        return null;
+      if (!force && cached !== undefined) {
+        if (now() - cached.at >= timing.configTtlMs) void readConfigShared(projectId);
+        return cached.value;
       }
-      configs.set(projectId, { at: now(), value });
-      return value;
+      return readConfigShared(projectId);
     }
 
     async function readConfig(projectId: string): Promise<ProjectConfig | null> {
@@ -4999,7 +5028,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // the user, so the pill and the yellow rows cannot disagree (BB-100).
         const picker = projects.map((p) => ({
           ...p,
-          needsCount: store.all(p.projectId).filter((b) => b.endedAt === null && needsUser(b)).length,
+          // One SQL count per project, so the picker never parses every binding
+          // and runs three more queries each (BB-104).
+          needsCount: store.countNeedsUser(p.projectId),
         }));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) {
@@ -7560,12 +7591,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), settle: () => Promise.all([...chains.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
