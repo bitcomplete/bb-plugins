@@ -1246,11 +1246,11 @@ function kindLabel(kind: string | null): string {
 
 /** The phrase's colour follows the glyph's (BB-76): yellow, red, blue, muted. */
 function phraseClass(state: SidebarEffortState): string {
-  const transition = " motion-safe:transition-colors duration-300";
-  if (state === "you") return `text-amber-600 dark:text-amber-500${transition}`;
-  if (state === "blocked") return `text-destructive${transition}`;
-  if (state === "running") return `text-blue-600 dark:text-blue-400${transition}`;
-  return `text-muted-foreground${transition}`;
+  const transition = "motion-safe:transition-colors duration-300";
+  if (state === "you") return `text-amber-600 dark:text-amber-500 ${transition}`;
+  if (state === "blocked") return `text-destructive ${transition}`;
+  if (state === "running") return `text-blue-600 dark:text-blue-400 ${transition}`;
+  return `text-muted-foreground ${transition}`;
 }
 
 /**
@@ -1260,10 +1260,10 @@ function phraseClass(state: SidebarEffortState): string {
  * CSS only and stops under `prefers-reduced-motion`.
  */
 function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
-  const transition = " motion-safe:transition-colors duration-300";
-  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className={`size-2.5 shrink-0 rounded-full bg-amber-400${transition}`} />;
+  const transition = "motion-safe:transition-colors duration-300";
+  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className={`size-2.5 shrink-0 rounded-full bg-amber-400 ${transition}`} />;
   const border = kind === "blocked" ? "border-red-500" : kind === "running" ? "border-blue-500" : "border-muted-foreground/50";
-  return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border}${transition}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
+  return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border} ${transition}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
 }
 
 /** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
@@ -1385,7 +1385,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
+    <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1606,7 +1606,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
             className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
             onClick={() => setUserOpen(!open)}
           >
-            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200${open ? " rotate-90" : ""}`} />
+            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200 ${open ? " rotate-90" : ""}`} />
           </button>
         ) : (
           <span className="flex size-4 shrink-0 items-center justify-center" />
@@ -1639,7 +1639,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
     </div>
   );
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
+    <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
