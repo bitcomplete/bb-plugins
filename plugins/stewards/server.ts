@@ -130,6 +130,10 @@ export interface Timing {
   missedReportsForStuck: number;
   /** How far back a user's words are looked for when an approval is recorded. */
   approvalLookbackMs: number;
+  /** How often `spawnSteward` re-checks the project steward's environment while it attaches (BB-111). */
+  environmentPollMs: number;
+  /** How long `spawnSteward` waits for that environment before giving the steward its own (BB-111). */
+  environmentWaitMs: number;
 }
 
 export const DEFAULT_TIMING: Timing = {
@@ -141,6 +145,8 @@ export const DEFAULT_TIMING: Timing = {
   endingTimeoutMs: 60 * 60_000,
   missedReportsForStuck: 3,
   approvalLookbackMs: 24 * 60 * 60_000,
+  environmentPollMs: 1000,
+  environmentWaitMs: 60_000,
 };
 
 /** BB-55: the backstop wake when a report passes the ready gate and the turn ends with no worker started. */
@@ -1859,11 +1865,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.add(threadId);
     }
 
+    /**
+     * The project steward's environment, for a new steward to share, waiting
+     * for it to attach. `ensureProjectSteward` returns before the provider has
+     * created it, so a read taken at once is null and the first stewards of a
+     * new project would each get their own environment (BB-111). Polls until
+     * the environment has an id and is ready; an already-ready one returns on
+     * the first poll. Returns null on timeout, or when the environment is
+     * destroyed, so the caller gives the steward a fresh one.
+     */
+    async function sharedEnvironment(projectThread: string, entityKey: string): Promise<string | null> {
+      // A bounded number of polls, so the wait is deterministic and injectable
+      // in tests; the last poll is not followed by a sleep.
+      const polls = Math.max(1, Math.ceil(timing.environmentWaitMs / timing.environmentPollMs));
+      for (let poll = 0; poll < polls; poll += 1) {
+        const info = await threadInfo(projectThread).catch(() => null);
+        if (info !== null) {
+          if (environmentGone(info)) {
+            bb.log.info(`stewards: the project steward's environment is destroyed; giving ${entityKey}'s steward its own`);
+            return null;
+          }
+          // An environment id with no readiness field counts as ready.
+          if (info.environmentId !== null && (info.environmentStatus === null || info.environmentStatus === "ready")) return info.environmentId;
+        }
+        if (poll + 1 < polls) await new Promise((resolve) => setTimeout(resolve, timing.environmentPollMs));
+      }
+      bb.log.info(`stewards: timed out waiting up to ${timing.environmentWaitMs}ms for the project steward's environment; giving ${entityKey}'s steward its own`);
+      return null;
+    }
+
     async function spawnSteward(b: Binding, config: ProjectConfig, playbook: Playbook, prompt: string): Promise<string | null> {
       const projectThread = await ensureProjectSteward(config);
       // Stewards decide and delegate; they need no checkout of their own. They
       // share the project steward's environment, and workers get fresh ones.
-      const env = projectThread === null ? null : (await threadInfo(projectThread))?.environmentId ?? null;
+      const env = projectThread === null ? null : await sharedEnvironment(projectThread, b.entityKey);
       const sectionId = await projectSection(b.projectId);
       const base = {
         projectId: b.projectId,
