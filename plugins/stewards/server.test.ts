@@ -7931,6 +7931,52 @@ describe("roles.json (BB-105)", () => {
     expect(await problemsOf(t)).toContain("No role for Jane in stewards/roles.json");
   });
 
+  it("says the no-role line in the sidebar too", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ boss: { projectSteward: true } });
+    await t.hooks.sweep();
+    await t.flush();
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { roleProblem: string | null };
+    expect(sidebar.roleProblem).toBe("No role for Jane in stewards/roles.json");
+
+    await t.flush();
+    t.viewers.github = "boss";
+    await t.hooks.loadConfig("p1", true);
+    const withRole = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { roleProblem: string | null };
+    expect(withRole.roleProblem).toBeNull();
+  });
+
+  it("keeps the migration line and lets roles.json win when both files carry ops", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "legacy-ns" }] } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await problemsOf(t)).toContain("ops now belongs in stewards/roles.json");
+    // roles.json wins for what runs: jane watches nothing, so no legacy-ns binding.
+    expect(await t.list()).toEqual([]);
+  });
+
+  it("reports no project steward even when no login has a role", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({});
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await problemsOf(t)).some((p) => p.includes("no one is the project steward"))).toBe(true);
+  });
+
+  it("runs no roles when only the Linear login cannot be read", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.viewers.linear = null;
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual([]);
+    expect((await problemsOf(t)).some((p) => p.includes("Linear login cannot be read"))).toBe(true);
+  });
+
   it("reports two logins naming one namespace on the project steward's server only", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roles({ jane: { projectSteward: true }, bob: { ops: { k8sNamespaces: ["web-production"] } }, sue: { ops: { k8sNamespaces: ["web-production"] } } });
@@ -8042,6 +8088,27 @@ describe("roles.json (BB-105)", () => {
     await t.hooks.sweep();
     await t.flush();
     expect(t.writes).toEqual([]);
+  });
+
+  it("retires the project steward thread when roles.json gives the role to another login", async () => {
+    const kubectl = async (args: string[]): Promise<KubectlResult> => {
+      const a = args.filter((x) => !x.startsWith("--"));
+      if (a[0] === "auth") return { exitCode: 1, stdout: "no\n", stderr: "" };
+      if (a[0] === "get") return { exitCode: 0, stdout: a.includes("json") ? JSON.stringify({ items: [] }) : "", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const t = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    const project = t.spawns.find((s) => String(s.title) === "Acme project steward")!.id;
+    expect(t.hooks.store.project("p1").threadId).toBe(project);
+    t.files[ROLES_FILE] = roles({ boss: { projectSteward: true } });
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.project("p1").threadId).toBeNull();
+    expect(t.threads.get(project)!.archivedAt).not.toBeNull();
   });
 
   it("runs the watches in this server's role", async () => {

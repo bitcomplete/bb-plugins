@@ -508,6 +508,13 @@ export const rpcContract = defineRpcContract({
       projectId: z.string().nullable(),
       projectStewardThreadId: z.string().nullable(),
       /**
+       * The picked project's role problem for this server (BB-105), e.g. `No
+       * role for <login> in stewards/roles.json`; null when it has a role (or
+       * no roles.json). The sidebar shows it where the home page shows the
+       * same line.
+       */
+      roleProblem: z.string().nullable(),
+      /**
        * The board's "waiting on you" items, in the sidebar's own shape: the
        * same questions, with-user escalations and actionable needs, tagged
        * so the app knows which write a choice makes. `count` is their sum;
@@ -1062,8 +1069,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
       } else {
         role = legacyRole(file);
-        if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
       }
+      // The migration line stays whether or not roles.json is present: the
+      // legacy ops no longer runs once roles.json wins, but the watch is not
+      // moved until the project file drops it.
+      if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
 
       const kinds = KINDS.filter((k) => usesKind(file, k, role));
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
@@ -1143,7 +1153,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (role?.projectSteward === true) {
           if (stewardProblem !== null) problems.push(stewardProblem);
           problems.push(...watchProblems(file, roles, repos, depsAlerts !== null));
-        } else if (role !== null && stewardProblem !== null && stewardProblem.startsWith("no one")) {
+        } else if (stewardProblem !== null && stewardProblem.startsWith("no one")) {
+          // No server has the role, so every server that reads roles.json shows
+          // the missing project steward rather than only the "No role" line.
           problems.push(stewardProblem);
         }
       }
@@ -1913,6 +1925,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const title = await projectStewardTitle(projectId);
       if (info.title !== title) await quietly(`retitle the project steward ${row.threadId}`, () => bb.sdk.threads.update({ threadId: row.threadId!, title }));
       if (row.title !== title) store.patchProject(projectId, { title });
+    }
+
+    /**
+     * Retire a project steward whose server roles.json no longer names for it
+     * (BB-105): archive the thread and clear the row, so it does not stay in
+     * the sidebar and the board while never being woken again. A login that
+     * could not be read is left alone: that is a transient read failure, not a
+     * role change.
+     */
+    async function retireProjectSteward(config: ProjectConfig): Promise<void> {
+      if (!config.rolesPresent || config.rolesUnreadable || config.role?.projectSteward === true) return;
+      const row = store.project(config.projectId);
+      if (row.threadId === null) return;
+      const threadId = row.threadId;
+      store.patchProject(config.projectId, { threadId: null, title: null });
+      await quietly(`archive the retired project steward ${threadId}`, () => bb.sdk.threads.archive({ threadId }));
+      bb.log.info(`stewards: ${config.projectId} is no longer this server's project steward; archived ${threadId}`);
     }
 
     async function ensureProjectSteward(config: ProjectConfig): Promise<string | null> {
@@ -5200,7 +5229,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // instead of `bb.sdk.projects.list()` twice.
         const projectList = await bb.sdk.projects.list();
         const named = new Map(projectList.map((p) => [p.id, p.name] as const));
-        const projects = projectIds((await stewardedProjects(false, projectList)).map((c) => c.projectId))
+        const configs = await stewardedProjects(false, projectList);
+        const projects = projectIds(configs.map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
         // The picker's count is the server's own: the open bindings that need
@@ -5213,9 +5243,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) {
-          return { projects: picker, projectId: null, projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
+          return { projects: picker, projectId: null, projectStewardThreadId: null, roleProblem: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
         }
         const { projectId } = picked;
+        const roleProblem = configs.find((c) => c.projectId === projectId)?.problems.find((p) => p.startsWith("No role for ")) ?? null;
         const all = store.all(projectId);
         const ended = all
           .filter((b) => b.endedAt !== null && b.endedAt >= started - ENDED_ON_BOARD_MS)
@@ -5257,6 +5288,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           projects: picker,
           projectId,
           projectStewardThreadId: store.project(projectId).threadId,
+          roleProblem,
           needs: {
             count: questions.length + withUser.length + needs.length,
             items: [
@@ -6880,6 +6912,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pushInterest();
       for (const config of projects) {
         if (!(await settings.get()).paused) await adoptionPass(config);
+        await retireProjectSteward(config);
         await keepProjectSteward(config.projectId);
         await syncOpsBindings(config);
         await reconcileLessons(config);

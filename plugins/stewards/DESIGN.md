@@ -214,6 +214,11 @@ needs an entry.
   the migration line stays until the `ops` block is removed.
 - A parse error keeps the last good copy in the plugin's own store; nothing
   per-server is ever written under `.bb`.
+- Each server keeps its own bindings, so the project steward's server cannot
+  see another server's. An escalation routed to `project` on a server that is
+  not the project steward waits on its own binding; cross-server routing is a
+  later change. A review binding adopted before `roles.json` landed keeps
+  reviewing until its pull request closes, and is detached by hand to stop.
 
 ### Reading `.bb`
 

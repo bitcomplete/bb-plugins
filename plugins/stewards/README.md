@@ -561,6 +561,13 @@ server and adds one problem line saying the watches now belong in
 `roles.json`; once `roles.json` is present it wins, and the migration line
 stays.
 
+Each server keeps its own bindings, so the project steward's server does not
+see another server's. An escalation routed to `project` on a server that is
+not the project steward therefore waits on its own binding; cross-server
+routing is a later change. A review binding adopted before `roles.json`
+landed keeps reviewing until its pull request closes — detach one by hand to
+stop it.
+
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
 window a medium or low alert may wait for company), and `autoAdopt` (the

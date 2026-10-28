@@ -391,8 +391,8 @@ export function parseProjectFile(text: string): Parsed<ProjectFile> {
  * GitHub requested reviewer, and need no entry.
  */
 
-/** A GitHub login, folded to lower case by the parser. */
-const githubLogin = z.string().trim().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u, "a GitHub login such as jane-doe");
+/** A GitHub login, folded to lower case by the parser. GitHub caps logins at 39 characters. */
+const githubLogin = z.string().trim().min(1).max(39).regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u, "a GitHub login such as jane-doe");
 
 const sentryProjectSchema = z.object({ org: sentrySlug, project: sentrySlug }).strict();
 
@@ -437,11 +437,12 @@ const rolesFileRawSchema = z.object({ version: z.literal(1), roles: z.record(z.s
 export const rolesFileSchema = rolesFileRawSchema.transform((file, ctx): RolesFile => {
   const roles: Record<string, Role> = {};
   for (const [key, role] of Object.entries(file.roles)) {
-    const login = key.trim().toLowerCase();
-    if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(login)) {
+    const parsed = githubLogin.safeParse(key);
+    if (!parsed.success) {
       ctx.addIssue({ code: "custom", path: ["roles", key], message: `${JSON.stringify(key)} is not a GitHub login` });
       return z.NEVER;
     }
+    const login = parsed.data.toLowerCase();
     if (roles[login] !== undefined) {
       ctx.addIssue({ code: "custom", path: ["roles", key], message: `${key} names the same login as another entry, ignoring case` });
       return z.NEVER;
