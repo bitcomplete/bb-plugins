@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { depsTargets, isTerminal, k8sTargets, opsTeam, sentryTargets, usesKind, modelSpecSchema, parsePlaybook, parseProjectFile, phaseInstructions, phaseOf, playbookStates } from "./config.js";
+import {
+  depsTargets,
+  isTerminal,
+  k8sTargets,
+  legacyOpsPresent,
+  legacyRole,
+  modelSpecSchema,
+  opsTeam,
+  parsePlaybook,
+  parseProjectFile,
+  parseRolesFile,
+  phaseInstructions,
+  phaseOf,
+  playbookStates,
+  projectStewardProblem,
+  roleDepsTargets,
+  roleK8sTargets,
+  roleOpsTeam,
+  roleSentryTargets,
+  roleUsesOps,
+  sentryTargets,
+  usesKind,
+  watchProblems,
+} from "./config.js";
 import { DEPS_ALERTS, DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, projectFileTemplate } from "./templates.js";
 
 describe("the project file", () => {
@@ -299,5 +322,84 @@ describe("model specs", () => {
     // "high" alone after the provider is a model, as before.
     expect(parse("claude/high")).toMatchObject({ model: "high", reasoningLevel: null });
     for (const bad of ["/x", "claude/", "claude//high", "pi/a//b"]) expect(modelSpecSchema.safeParse(bad).success, bad).toBe(false);
+  });
+});
+
+describe("roles.json (BB-105)", () => {
+  const roles = (entries: Record<string, unknown>, extra: Record<string, unknown> = {}) => parseRolesFile(JSON.stringify({ version: 1, roles: entries, ...extra }));
+
+  it("parses roles, folds logins to lower case and fills the defaults", () => {
+    const parsed = roles({ "Jane-Doe": { projectSteward: true, ops: { k8sNamespaces: ["prod"], team: "eng", sentry: { projects: [{ org: " Acme ", project: "Web-API" }] }, dependabot: ["acme/web"] } }, Bob: {} });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(Object.keys(parsed.value.roles)).toEqual(["jane-doe", "bob"]);
+    const role = parsed.value.roles["jane-doe"]!;
+    expect(role.projectSteward).toBe(true);
+    expect(role.ops).toMatchObject({ k8sNamespaces: ["prod"], team: "ENG", autoAdopt: [], sentry: { projects: [{ org: "acme", project: "web-api" }], resolveOnDone: false }, dependabot: ["acme/web"] });
+    expect(parsed.value.roles["bob"]).toEqual({ projectSteward: false, ops: undefined });
+    // The role getters read the entry, not the legacy project.ops.
+    expect(roleK8sTargets(role)).toEqual([{ kind: "k8s-namespace", name: "prod" }]);
+    expect(roleSentryTargets(role)).toEqual([{ kind: "sentry-project", org: "acme", project: "web-api" }]);
+    expect(roleDepsTargets(role, ["acme/web", "acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }]);
+    expect(roleDepsTargets(parsed.value.roles["bob"]!, ["acme/web"])).toEqual([]);
+    expect(roleUsesOps(role)).toBe(true);
+    expect(roleUsesOps(parsed.value.roles["bob"]!)).toBe(false);
+  });
+
+  it("takes dependabot: all, and names the file in a parse error", () => {
+    const parsed = roles({ jane: { ops: { dependabot: "all" } } });
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(roleDepsTargets(parsed.value.roles["jane"]!, ["acme/web", "acme/other"])).toEqual([{ kind: "dependabot", repo: "acme/web" }, { kind: "dependabot", repo: "acme/other" }]);
+    const bad = roles({ jane: { ops: { k8sNamespaces: ["Prod_1"] } } });
+    expect(bad).toMatchObject({ ok: false });
+    if (!bad.ok) expect(bad.error).toMatch(/stewards\/roles\.json: roles\.jane\.ops\.k8sNamespaces\.0: a namespace name/u);
+  });
+
+  it("rejects unknown keys, a bad version, and two keys naming one login ignoring case", () => {
+    expect(roles({ jane: { projectSteward: true } }, { extra: true })).toMatchObject({ ok: false });
+    expect(roles({ jane: { unknown: true } })).toMatchObject({ ok: false });
+    expect(parseRolesFile(JSON.stringify({ version: 2, roles: {} }))).toMatchObject({ ok: false });
+    expect(roles({ Jane: {}, jane: {} })).toMatchObject({ ok: false, error: expect.stringMatching(/same login as another entry/u) });
+    expect(parseRolesFile("{")).toMatchObject({ ok: false });
+  });
+
+  it("keeps the project file strict, so an unknown key is still refused", () => {
+    expect(parseProjectFile(JSON.stringify({ version: 1, ops: { targets: [], watch: true } }))).toMatchObject({ ok: false });
+    expect(parseProjectFile(JSON.stringify({ version: 1, roles: {} }))).toMatchObject({ ok: false });
+  });
+
+  it("builds a legacy role from project.ops, and flags only non-empty ops as migration", () => {
+    const empty = parseProjectFile(JSON.stringify({ version: 1, ops: { targets: [], autoAdopt: [] } }));
+    if (!empty.ok) throw new Error(empty.error);
+    expect(legacyOpsPresent(empty.value)).toBe(false);
+
+    const legacy = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }], team: "eng", context: "bc-prod", autoAdopt: ["urgent"], sentry: { resolveOnDone: true } } }));
+    if (!legacy.ok) throw new Error(legacy.error);
+    expect(legacyOpsPresent(legacy.value)).toBe(true);
+    const role = legacyRole(legacy.value);
+    expect(role.projectSteward).toBe(true);
+    expect(role.ops).toMatchObject({ team: "ENG", context: "bc-prod", autoAdopt: ["urgent"], sentry: { projects: [{ org: "acme", project: "web" }], resolveOnDone: true }, dependabot: "all" });
+    expect(roleOpsTeam(role, legacy.value)).toBe("ENG");
+    expect(usesKind(legacy.value, "ops", role)).toBe(true);
+  });
+
+  it("counts the project stewards and reports an unowned or doubly owned watch", () => {
+    const project = parseProjectFile(JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "web-production" }, { kind: "sentry-project", org: "acme", project: "web" }] } }));
+    if (!project.ok) throw new Error(project.error);
+    const none = roles({ jane: {}, bob: {} });
+    if (!none.ok) throw new Error(none.error);
+    expect(projectStewardProblem(none.value)).toMatch(/no one is the project steward/u);
+
+    const two = roles({ jane: { projectSteward: true }, bob: { projectSteward: true } });
+    if (!two.ok) throw new Error(two.error);
+    expect(projectStewardProblem(two.value)).toMatch(/two people are the project steward: jane, bob/u);
+
+    const doubled = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["web-production"] } }, bob: { ops: { k8sNamespaces: ["web-production"] } } });
+    if (!doubled.ok) throw new Error(doubled.error);
+    // No explicit dependabot target: the default (every repo) is expected.
+    const problems = watchProblems(project.value, doubled.value, ["acme/web", "acme/other"], true);
+    expect(problems).toContain("two people run the web-production watch: jane, bob");
+    expect(problems).toContain("nobody runs the Sentry watch for acme/web");
+    expect(problems).toContain("nobody runs the Dependabot watch for acme/web");
+    expect(problems).toContain("nobody runs the Dependabot watch for acme/other");
   });
 });

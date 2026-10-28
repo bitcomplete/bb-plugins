@@ -23,30 +23,40 @@ import {
   ESCALATION_KINDS,
   KINDS,
   PROJECT_FILE,
+  ROLES_FILE,
   depsAlertsPlaybookName,
   depsPrsPlaybookName,
-  depsTargets,
   durationSchema,
   formatDuration,
   isTerminal,
-  k8sTargets,
+  legacyOpsPresent,
+  legacyRole,
   modelSpecSchema,
-  opsTeam,
   parsePlaybook,
   parseProjectFile,
+  parseRolesFile,
   phaseOf,
   playbookNameFor,
   playbookPath,
   playbookStates,
-  sentryTargets,
+  projectStewardProblem,
+  roleDepsTargets,
+  roleK8sTargets,
+  roleOpsTargets,
+  roleOpsTeam,
+  roleSentryTargets,
+  roleUsesOps,
   STAGES,
   usesKind,
+  watchProblems,
   type BindingKind,
   type EscalationKind,
   type LessonRules,
   type ModelSpec,
   type Playbook,
   type ProjectFile,
+  type Role as StewardRole,
+  type RolesFile,
 } from "./config.js";
 import { decideFor, decideForPull, decideForRefusal } from "./decisions.js";
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
@@ -498,6 +508,13 @@ export const rpcContract = defineRpcContract({
       projectId: z.string().nullable(),
       projectStewardThreadId: z.string().nullable(),
       /**
+       * The picked project's role problem for this server (BB-105), e.g. `No
+       * role for <login> in stewards/roles.json`; null when it has a role (or
+       * no roles.json). The sidebar shows it where the home page shows the
+       * same line.
+       */
+      roleProblem: z.string().nullable(),
+      /**
        * The board's "waiting on you" items, in the sidebar's own shape: the
        * same questions, with-user escalations and actionable needs, tagged
        * so the app knows which write a choice makes. `count` is their sum;
@@ -575,6 +592,18 @@ const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 type ProjectConfig = {
   projectId: string;
   file: ProjectFile;
+  /** The roles file, when one is present and parses (or its last good copy). */
+  roles: RolesFile | null;
+  /** Whether roles.json is present, so role dispatch is on rather than the legacy project.ops. */
+  rolesPresent: boolean;
+  /** Whether roles.json is present but this server's GitHub or Linear login could not be read. */
+  rolesUnreadable: boolean;
+  /** This server's signed-in GitHub login, as the github plugin reads it, or null. */
+  githubLogin: string | null;
+  /** This server's connected Linear user, as the linear plugin reads it, or null. */
+  linearLogin: string | null;
+  /** The role this server runs: its login's entry, a legacy project.ops role, or null. */
+  role: StewardRole | null;
   playbooks: Partial<Record<BindingKind, Playbook>>;
   /** The dependency watch's alert playbook, when it parses. */
   depsAlerts: Playbook | null;
@@ -837,6 +866,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const sourceRpc = <T>(source: Source, method: string, input: unknown, outputSchema: z.ZodType<T>): Promise<T> =>
       rpc(SOURCE_PLUGIN_IDS[source], method, input, outputSchema);
 
+    /**
+     * The login a source acts as: the gh login github-watcher reads, or the
+     * connected Linear user's name. A source that is not connected, or cannot
+     * be asked, answers null; roles.json then runs no roles rather than every
+     * role (BB-105).
+     */
+    async function readViewer(source: Source): Promise<string | null> {
+      try {
+        const out = await sourceRpc(source, "sourceValidate", { units: [], label: "", states: [] }, sourceContract.sourceValidate.output);
+        return out.viewer;
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the ${source} login: ${errorMessage(error)}`);
+        return null;
+      }
+    }
+
     /** The plugin's own project-steward approval records for a binding; the gate matches a posted marker to one by comment id. */
     const projectApprovalsFor = (b: Binding) => store.projectApprovals(b.id);
 
@@ -955,7 +1000,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function readConfig(projectId: string): Promise<ProjectConfig | null> {
       const problems: string[] = [];
-      const projectText = (await readFiles(projectId, [PROJECT_FILE])).get(PROJECT_FILE) ?? null;
+      const configFiles = await readFiles(projectId, [PROJECT_FILE, ROLES_FILE]);
+      const projectText = configFiles.get(PROJECT_FILE) ?? null;
       if (projectText === null) return null;
       let file: ProjectFile;
       const parsed = parseProjectFile(projectText);
@@ -973,7 +1019,63 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         file = lastParsed.value;
       }
 
-      const kinds = KINDS.filter((k) => usesKind(file, k));
+      /**
+       * The per-person roles file (BB-105). It is optional: without it a
+       * project runs the legacy `project.ops` on every server, exactly as
+       * before. A file that fails to parse falls back to the last good copy,
+       * kept in kv, and the failure is a problem. A file present with no good
+       * copy runs no roles rather than falling back to the legacy ops.
+       */
+      const rolesText = configFiles.get(ROLES_FILE) ?? null;
+      const rolesPresent = rolesText !== null;
+      let roles: RolesFile | null = null;
+      if (rolesText !== null) {
+        const rolesParsed = parseRolesFile(rolesText);
+        if (rolesParsed.ok) {
+          roles = rolesParsed.value;
+          await bb.storage.kv.set(`good/${projectId}/roles`, rolesText);
+        } else {
+          problems.push(rolesParsed.error);
+          const last = await bb.storage.kv.get<string>(`good/${projectId}/roles`);
+          const lastParsed = typeof last === "string" ? parseRolesFile(last) : null;
+          if (lastParsed !== null && lastParsed.ok) {
+            roles = lastParsed.value;
+            problems.push(`${ROLES_FILE} keeps running under the last good copy.`);
+          }
+        }
+      }
+
+      /**
+       * The role this server runs. With no roles.json, the legacy project.ops
+       * is every server's role, as before. With one, the entry keyed by this
+       * server's GitHub login; no entry runs no watches and no project
+       * steward, and the home page says so. A login that cannot be read runs
+       * no roles and never falls back to running every role.
+       */
+      let githubLogin: string | null = null;
+      let linearLogin: string | null = null;
+      let role: StewardRole | null;
+      let rolesUnreadable = false;
+      if (rolesPresent) {
+        githubLogin = await readViewer("github");
+        linearLogin = await readViewer("linear");
+        if (githubLogin === null || linearLogin === null) {
+          rolesUnreadable = true;
+          role = null;
+          problems.push(`${ROLES_FILE} is present but this server's ${githubLogin === null ? "GitHub" : "Linear"} login cannot be read; running no roles`);
+        } else {
+          role = roles?.roles[lc(githubLogin)] ?? null;
+          if (roles !== null && role === null) problems.push(`No role for ${githubLogin} in ${ROLES_FILE}`);
+        }
+      } else {
+        role = legacyRole(file);
+      }
+      // The migration line stays whether or not roles.json is present: the
+      // legacy ops no longer runs once roles.json wins, but the watch is not
+      // moved until the project file drops it.
+      if (legacyOpsPresent(file)) problems.push(`ops now belongs in ${ROLES_FILE}`);
+
+      const kinds = KINDS.filter((k) => usesKind(file, k, role));
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
@@ -1038,7 +1140,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       } catch (error) {
         problems.push(`could not read the repo set: ${errorMessage(error)}`);
       }
-      return { projectId, file, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
+
+      /**
+       * The project steward's cross-server problems (BB-105): no or two
+       * project stewards, a watch nobody runs, a watch two people run. They
+       * are computed here and shown on the project steward's server. With no
+       * project steward at all there is no such server, so every server with a
+       * role shows the "no one is the project steward" line instead.
+       */
+      if (roles !== null) {
+        const stewardProblem = projectStewardProblem(roles);
+        if (role?.projectSteward === true) {
+          if (stewardProblem !== null) problems.push(stewardProblem);
+          problems.push(...watchProblems(file, roles, repos, depsAlerts !== null));
+        } else if (stewardProblem !== null && stewardProblem.startsWith("no one")) {
+          // No server has the role, so every server that reads roles.json shows
+          // the missing project steward rather than only the "No role" line.
+          problems.push(stewardProblem);
+        }
+      }
+      return { projectId, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -1333,7 +1454,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // Every repo the project watches for Dependabot alerts. A server
           // whose gh login cannot read alerts has each lease refused as
           // `forbidden`, which it skips; stewards check says so.
-          dependabot: [...new Set(projects.flatMap((p) => (p.depsAlerts === null ? [] : depsTargets(p.file, p.repos).map((t) => t.repo))))].sort(),
+          dependabot: [...new Set(projects.flatMap((p) => (p.depsAlerts === null ? [] : roleDepsTargets(p.role, p.repos).map((t) => t.repo))))].sort(),
           // Every repo a playbook names as a deployment target. A login
           // without `deployments:read` has each lease refused as `forbidden`,
           // which it skips; stewards check says so.
@@ -1806,7 +1927,27 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (row.title !== title) store.patchProject(projectId, { title });
     }
 
+    /**
+     * Retire a project steward whose server roles.json no longer names for it
+     * (BB-105): archive the thread and clear the row, so it does not stay in
+     * the sidebar and the board while never being woken again. A login that
+     * could not be read is left alone: that is a transient read failure, not a
+     * role change.
+     */
+    async function retireProjectSteward(config: ProjectConfig): Promise<void> {
+      if (!config.rolesPresent || config.rolesUnreadable || config.role?.projectSteward === true) return;
+      const row = store.project(config.projectId);
+      if (row.threadId === null) return;
+      const threadId = row.threadId;
+      store.patchProject(config.projectId, { threadId: null, title: null });
+      await quietly(`archive the retired project steward ${threadId}`, () => bb.sdk.threads.archive({ threadId }));
+      bb.log.info(`stewards: ${config.projectId} is no longer this server's project steward; archived ${threadId}`);
+    }
+
     async function ensureProjectSteward(config: ProjectConfig): Promise<string | null> {
+      // Only the login roles.json names as project steward runs it. Without a
+      // roles.json the legacy role is every server's, so this is unchanged.
+      if (config.role?.projectSteward !== true) return null;
       let threadId: string | null = null;
       await serial(`project:${config.projectId}`, async () => {
         const row = store.project(config.projectId);
@@ -2509,8 +2650,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return hostClient.call("opsKubectl", { args, timeoutMs: KUBECTL_TIMEOUT_MS }, { hostId, timeoutMs: KUBECTL_TIMEOUT_MS + 10_000 });
     }
 
-    const opsReaderFor = (config: ProjectConfig): OpsReader =>
-      createKubectlReader((args) => runKubectl(config.projectId, args), config.file.ops.context === undefined ? {} : { context: config.file.ops.context });
+    const opsReaderFor = (config: ProjectConfig): OpsReader => {
+      const context = config.role?.ops?.context;
+      return createKubectlReader((args) => runKubectl(config.projectId, args), context === undefined ? {} : { context });
+    };
 
     /** The states of the tickets a look's problems are filed under, read through linear; null for one that cannot be read. */
     async function ticketStates(keys: string[]): Promise<Map<string, TicketState>> {
@@ -2523,7 +2666,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /** Every ops target a project watches: the k8s namespaces, the Sentry projects and the Dependabot repositories. */
-    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...k8sTargets(config.file), ...sentryTargets(config.file), ...depsTargets(config.file, config.repos)];
+    const allOpsTargets = (config: ProjectConfig): OpsTarget[] => [...roleK8sTargets(config.role), ...roleSentryTargets(config.role), ...roleDepsTargets(config.role, config.repos)];
 
     /** One look at an ops binding's target, its problems entered in the fingerprint map and classified against it. */
     async function lookAt(b: Binding, config: ProjectConfig, target: K8sTarget, playbook: Playbook): Promise<OpsLook> {
@@ -2701,9 +2844,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: opsTeam(config.file),
+        team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
-        autoAdopt: config.file.ops.autoAdopt,
+        autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
@@ -2758,7 +2901,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: opsTeam(config.file),
+        team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
         autoAdopt: config.file.deps.autoAdopt,
         timeZone: config.file.nightly.timezone,
@@ -2914,7 +3057,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function reconcileSentry(b: Binding, config: ProjectConfig, playbook: Playbook, target: SentryTarget, force: WakeReason | null): Promise<void> {
       const before = b.sentryLook;
-      const look = await lookAtSentry(b, target, playbook, config.file.ops.sentry.resolveOnDone);
+      const look = await lookAtSentry(b, target, playbook, config.role?.ops?.sentry?.resolveOnDone ?? false);
       const requeueCame = b.requeueAt !== null && b.requeueAt <= now();
       const requeueAt = requeueCame || b.requeueAt === null ? now() + playbook.requeueDefaultMs : b.requeueAt;
       b = store.patch(b.id, { sentryLook: look, requeueAt });
@@ -2953,9 +3096,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         binding: b,
         playbook,
         look,
-        team: opsTeam(config.file),
+        team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
-        autoAdopt: config.file.ops.autoAdopt,
+        autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
@@ -2988,7 +3131,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       for (const c of configs.values()) {
         if (c.value === null) continue;
-        for (const t of sentryTargets(c.value.file)) add("project", `${t.org}/${t.project}`);
+        for (const t of roleSentryTargets(c.value.role)) add("project", `${t.org}/${t.project}`);
       }
       const recent = now() - ISSUE_LEASE_WINDOW_MS;
       for (const { binding } of openSentryBindings()) {
@@ -3029,7 +3172,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         for (const { binding } of openSentryBindings()) scheduleReconcile(binding.id);
       },
     });
-    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && sentryTargets(c.value.file).length > 0);
+    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && roleSentryTargets(c.value.role).length > 0);
 
     /**
      * One ops binding per configured target. A target taken out of the
@@ -3042,8 +3185,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function syncOpsBindings(config: ProjectConfig): Promise<void> {
       const wanted = new Map<string, { target: OpsTarget; playbook: Playbook }>();
       const opsPlaybook = playbookFor(config, "ops");
-      if (opsPlaybook !== null) for (const target of [...k8sTargets(config.file), ...sentryTargets(config.file)]) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
-      if (config.depsAlerts !== null) for (const target of depsTargets(config.file, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
+      if (opsPlaybook !== null) for (const target of roleOpsTargets(config.role)) wanted.set(opsTargetKey(target), { target, playbook: opsPlaybook });
+      if (config.depsAlerts !== null) for (const target of roleDepsTargets(config.role, config.repos)) wanted.set(opsTargetKey(target), { target, playbook: config.depsAlerts });
       const existing = store.all(config.projectId).filter((b) => b.kind === "ops");
       for (const b of existing) {
         if (wanted.has(b.entityId)) continue;
@@ -3209,14 +3352,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const projectFor = (configs: ProjectConfig[], entity: Pick<EntitySnapshot, "source" | "unit">) =>
       configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
 
-    /** Which kind of binding an entity wants in this project, or null for none. */
-    function adoptionKind(config: ProjectConfig, e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string }, viewer: string | null): BindingKind | null {
+    /**
+     * Whether a roles.json names a project steward, so ticket and review
+     * adoption narrows to this server's owner (BB-105, addendum 1). Without a
+     * roles.json adoption is exactly as before: every managed ticket and
+     * teammate pull request is adopted.
+     */
+    const rolesNameProjectSteward = (config: ProjectConfig): boolean => config.roles !== null && Object.values(config.roles.roles).some((r) => r.projectSteward);
+
+    /**
+     * Which kind of binding an entity wants in this project, or null for none.
+     * `assignees` and `requestedReviewers` are absent on the nightly pass's
+     * list, which is permissive: `maybeAdopt` re-checks with the full snapshot.
+     */
+    function adoptionKind(
+      config: ProjectConfig,
+      e: { source: Source; kind: "issue" | "pull"; state: string; labels: string[]; author: string | null; draft: boolean; unit: string; assignees?: string[]; requestedReviewers?: string[] },
+      viewer: string | null,
+    ): BindingKind | null {
       const labelled = e.labels.some((l) => lc(l) === lc(config.file.label));
       if (e.source === "linear") {
         const playbook = playbookFor(config, "ticket");
-        return labelled && playbook !== null && !isTerminal(playbook, e.state) ? "ticket" : null;
+        if (!labelled || playbook === null || isTerminal(playbook, e.state)) return null;
+        // roles.json present but this server's login unreadable: run no roles.
+        if (config.rolesUnreadable) return null;
+        if (rolesNameProjectSteward(config) && e.assignees !== undefined) {
+          // The Linear assignee decides; an unassigned ticket belongs to the
+          // project steward's server, so none is orphaned.
+          const mine = config.linearLogin !== null && e.assignees.some((a) => lc(a) === lc(config.linearLogin));
+          if (!mine && !(e.assignees.length === 0 && config.role?.projectSteward === true)) return null;
+        }
+        return "ticket";
       }
       if (e.kind !== "pull") return null;
+      // A labelled pull request is the project's own work, whatever the login.
       if (labelled) {
         const playbook = playbookFor(config, "pr");
         return playbook !== null && !isTerminal(playbook, e.state) ? "pr" : null;
@@ -3224,11 +3393,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // The dependency watch adopts the bot's version-update pull requests in
       // the repos it watches, whether or not they are labelled. deps-prs
       // reviews them and escalates for a human merge; it never merges.
-      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && depsTargets(config.file, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
+      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && roleDepsTargets(config.role, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
       const review = playbookFor(config, "review");
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;
       if (review.skipAuthors.some((a) => lc(a) === lc(e.author))) return null;
+      if (config.rolesUnreadable) return null;
+      // Once a project steward is named, a review steward is made only where
+      // the viewer is a requested reviewer.
+      if (rolesNameProjectSteward(config) && e.requestedReviewers !== undefined && !e.requestedReviewers.some((r) => lc(r) === lc(viewer))) return null;
       return "review";
     }
 
@@ -3250,7 +3423,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const config = projectFor(projects, entity);
       if (config === null) return null;
       if (store.byEntity(entity.source, entity.id) !== null) return null;
-      const kind = adoptionKind(config, { ...entity, draft: entity.pull?.draft ?? false }, entity.viewer);
+      const kind = adoptionKind(config, { ...entity, draft: entity.pull?.draft ?? false, requestedReviewers: entity.pull?.requestedReviewers ?? [] }, entity.viewer);
       if (kind === null) return null;
       const depBot = kind === "pr" && entity.author !== null && DEPENDENCY_BOTS.has(lc(entity.author));
       const playbook = (depBot ? config.depsPrs : null) ?? playbookFor(config, kind);
@@ -4934,7 +5107,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             playbooks:
               config === null
                 ? []
-                : KINDS.filter((k) => usesKind(config.file, k)).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
+                : KINDS.filter((k) => usesKind(config.file, k, config.role)).map((kind) => ({ kind, name: playbookNameFor(config.file, kind), version: config.playbooks[kind]?.version ?? null })),
             problems: config?.problems ?? [],
             nightly: config === null ? null : { at: config.file.nightly.at, timezone: config.file.nightly.timezone },
             lastNight: row.nightlyDate,
@@ -5056,7 +5229,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // instead of `bb.sdk.projects.list()` twice.
         const projectList = await bb.sdk.projects.list();
         const named = new Map(projectList.map((p) => [p.id, p.name] as const));
-        const projects = projectIds((await stewardedProjects(false, projectList)).map((c) => c.projectId))
+        const configs = await stewardedProjects(false, projectList);
+        const projects = projectIds(configs.map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
         // The picker's count is the server's own: the open bindings that need
@@ -5069,9 +5243,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) {
-          return { projects: picker, projectId: null, projectStewardThreadId: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
+          return { projects: picker, projectId: null, projectStewardThreadId: null, roleProblem: null, needs: { count: 0, items: [] }, bindings: [], ended: [] };
         }
         const { projectId } = picked;
+        const roleProblem = configs.find((c) => c.projectId === projectId)?.problems.find((p) => p.startsWith("No role for ")) ?? null;
         const all = store.all(projectId);
         const ended = all
           .filter((b) => b.endedAt !== null && b.endedAt >= started - ENDED_ON_BOARD_MS)
@@ -5113,6 +5288,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           projects: picker,
           projectId,
           projectStewardThreadId: store.project(projectId).threadId,
+          roleProblem,
           needs: {
             count: questions.length + withUser.length + needs.length,
             items: [
@@ -6736,6 +6912,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       pushInterest();
       for (const config of projects) {
         if (!(await settings.get()).paused) await adoptionPass(config);
+        await retireProjectSteward(config);
         await keepProjectSteward(config.projectId);
         await syncOpsBindings(config);
         await reconcileLessons(config);
@@ -6915,7 +7092,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
       const ticket = config.playbooks.ticket;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
-      for (const kind of KINDS.filter((k) => usesKind(config.file, k))) {
+      lines.push(
+        config.rolesPresent
+          ? `roles: ${config.githubLogin ?? "(login unreadable)"}${config.role === null ? " has no entry" : config.role.projectSteward ? " (project steward)" : ""}`
+          : "roles: none (legacy project.ops, run on every server)",
+      );
+      for (const kind of KINDS.filter((k) => usesKind(config.file, k, config.role))) {
         const p = config.playbooks[kind];
         lines.push(`${kind}: ${p === undefined ? `no usable playbook (${playbookNameFor(config.file, kind)})` : `${p.name}@${p.version}`}`);
       }
@@ -6937,14 +7119,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       await validate("linear", config.file.linear.teams, ticket === undefined ? [] : playbookStates(ticket));
       await validate("github", config.repos, []);
-      if (usesKind(config.file, "ops")) {
-        const auto = config.file.ops.autoAdopt;
-        lines.push(`ops: tickets filed in ${opsTeam(config.file) ?? "(no team)"}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
+      if (usesKind(config.file, "ops", config.role)) {
+        const auto = config.role?.ops?.autoAdopt ?? [];
+        const context = config.role?.ops?.context;
+        lines.push(`ops: tickets filed in ${roleOpsTeam(config.role, config.file) ?? "(no team)"}${auto.length > 0 ? `, adopted when filed at ${auto.join(", ")}` : ""}`);
         const host = await projectHost(projectId);
-        lines.push(`ops: kubectl runs on ${host ?? "no machine"}${config.file.ops.context === undefined ? ", in its current context" : `, in context ${config.file.ops.context}`}`);
+        lines.push(`ops: kubectl runs on ${host ?? "no machine"}${context === undefined ? ", in its current context" : `, in context ${context}`}`);
         const reader = opsReaderFor(config);
-        for (const target of k8sTargets(config.file)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
-        const sentry = sentryTargets(config.file);
+        for (const target of roleK8sTargets(config.role)) lines.push(...opsAccessLines(opsTargetKey(target), await reader.access(target).catch((error: unknown): OpsAccess => ({ error: errorMessage(error), reads: [], logs: null, writes: [] }))));
+        const sentry = roleSentryTargets(config.role);
         if (sentry.length > 0) {
           if ((await sentryToken()) === null) lines.push(`problem: sentry: ${NO_TOKEN}: set the Sentry token in the stewards plugin's settings (a user auth token with ${TOKEN_SCOPES.join(" and ")})`);
           const sentryApi = await sentryReader();
@@ -6964,7 +7147,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       lines.push(`deps: sla critical=${slaText(deps.sla.critical)} high=${slaText(deps.sla.high)} medium=${slaText(deps.sla.medium)} low=${slaText(deps.sla.low)}; batch medium=${formatDuration(deps.batch.medium)} low=${formatDuration(deps.batch.low)}; autoAdopt ${deps.autoAdopt.join(", ") || "(none)"}`);
       const deployTargets = deploymentTargets(config);
       if (deployTargets.length > 0) lines.push(`deployment: ${deployTargets.map((t) => `${t.repo} ${t.environment} (timeout ${formatDuration(t.timeout)})`).join(", ")}`);
-      const depsRepos = depsTargets(config.file, config.repos);
+      const depsRepos = roleDepsTargets(config.role, config.repos);
       if (config.depsAlerts !== null && depsRepos.length > 0) {
         lines.push(`deps: watching ${depsRepos.length} repo${depsRepos.length === 1 ? "" : "s"} for alerts: ${depsRepos.map((t) => t.repo).join(", ")}`);
         try {

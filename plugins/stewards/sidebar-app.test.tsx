@@ -51,10 +51,11 @@ const projects = [
   { id: "personal", name: "Personal", isPersonal: true, href: "/projects/personal", settingsHref: "/projects/personal/settings" },
 ];
 
-const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; needs?: unknown; projectStewardThreadId?: string | null; projectId?: string; needsCount?: number } = {}) => ({
+const sidebarData = (over: { bindings?: unknown[]; ended?: unknown[]; needs?: unknown; projectStewardThreadId?: string | null; projectId?: string; needsCount?: number; roleProblem?: string | null } = {}) => ({
   projects: [{ projectId: "p1", name: "Acme", needsCount: over.needsCount ?? 0 }],
   projectId: over.projectId ?? "p1",
   projectStewardThreadId: over.projectStewardThreadId ?? null,
+  roleProblem: over.roleProblem ?? null,
   needs: over.needs ?? { count: 0, items: [] },
   bindings: over.bindings ?? [],
   ended: over.ended ?? [],
@@ -165,6 +166,17 @@ describe("the stewards sidebar list (BB-44)", () => {
     const captured = await loadApp();
     expect(captured.threadLists).toHaveLength(1);
     expect(captured.threadLists[0]).toMatchObject({ id: "sidebar", title: "Stewards" });
+  });
+
+  // BB-105: the sidebar carries the home page's no-role line for a server
+  // whose roles.json has no entry for its login.
+  it("shows the no-role line when this server has no roles.json entry", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: () => sidebarData({ roleProblem: "No role for jane in stewards/roles.json" }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("No role for jane in stewards/roles.json")).toBeTruthy());
+    slot.lifecycle.unmount();
   });
 
   it("shows a tab per live project and a two-line effort row with key, title, kind, phase and phrase", async () => {

@@ -7,11 +7,13 @@
 import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { SENTRY_SLUG, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
+import { SENTRY_SLUG, opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
 import { DEPENDABOT_SEVERITIES } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
+/** The per-person roles: which watches and the project stewardship a GitHub login's server runs. */
+export const ROLES_FILE = `${STEWARDS_DIR}/roles.json`;
 export const playbookPath = (name: string) => `${STEWARDS_DIR}/playbooks/${name}.md`;
 
 export const DEFAULT_LABEL = "bb-managed";
@@ -378,10 +380,130 @@ export function parseProjectFile(text: string): Parsed<ProjectFile> {
   return parsed.success ? { ok: true, value: parsed.data } : { ok: false, error: `${PROJECT_FILE}: ${zodMessage(parsed.error)}` };
 }
 
-export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string => project.playbooks[kind] ?? DEFAULT_PLAYBOOKS[kind];
+// ---- roles: per-person watches, keyed by GitHub login ------------------------------
 
-/** Whether a project uses a kind of binding at all: reviews can be turned off, and ops needs a target. */
-export const usesKind = (project: ProjectFile, kind: BindingKind): boolean => (kind === "review" ? project.reviews.enabled : kind === "ops" ? project.ops.targets.length > 0 : true);
+/**
+ * The per-person roles file (BB-105). It is read like the project file, from
+ * the canonical checkout's committed HEAD, and each server runs only the entry
+ * whose key is its own signed-in GitHub login. The watches with no natural
+ * owner (namespace, Sentry project, Dependabot repo) are assigned here; the
+ * ticket and review stewards are dispatched by the Linear assignee and the
+ * GitHub requested reviewer, and need no entry.
+ */
+
+/** A GitHub login, folded to lower case by the parser. GitHub caps logins at 39 characters. */
+const githubLogin = z.string().trim().min(1).max(39).regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/u, "a GitHub login such as jane-doe");
+
+const sentryProjectSchema = z.object({ org: sentrySlug, project: sentrySlug }).strict();
+
+const roleSentrySchema = z
+  .object({
+    projects: z.array(sentryProjectSchema).max(50).default([]),
+    /** On, the Sentry look resolves a mapped issue whose ticket is Done (the project file's `ops.sentry.resolveOnDone`). */
+    resolveOnDone: z.boolean().default(false),
+  })
+  .strict()
+  .default({ projects: [], resolveOnDone: false });
+
+/** A role's watches: namespaces, Sentry projects, Dependabot repos, and where its tickets file. */
+export const roleOpsSchema = z
+  .object({
+    k8sNamespaces: z.array(z.string().trim().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/u, "a namespace name such as bb-gate-production")).max(50).default([]),
+    /** The kubeconfig context kubectl uses on this person's machine; its current context when left out. */
+    context: z.string().trim().min(1).max(200).regex(/^[^\s-][^\s]*$/u, "a kubeconfig context name").optional(),
+    /** Where this person's ops tickets are filed (the first of linear.teams when left out). */
+    team: teamKey.optional(),
+    autoAdopt: z.array(z.enum(LINEAR_PRIORITIES)).max(4).default([]),
+    sentry: roleSentrySchema,
+    /** Repos whose Dependabot alerts this person watches; `"all"` is every repo in repos.json less github.exclude. */
+    dependabot: z.union([z.literal("all"), z.array(dependabotRepoSchema).max(200)]).optional(),
+  })
+  .strict();
+export type RoleOps = z.infer<typeof roleOpsSchema>;
+
+/** One person's role: whether their server is the project steward, and the watches it runs. */
+export const roleSchema = z.object({ projectSteward: z.boolean().default(false), ops: roleOpsSchema.optional() }).strict();
+export type Role = z.infer<typeof roleSchema>;
+
+export type RolesFile = { version: 1; roles: Record<string, Role> };
+
+const rolesFileRawSchema = z.object({ version: z.literal(1), roles: z.record(z.string(), roleSchema) }).strict();
+
+/**
+ * Folds every login to lower case and refuses two keys that name the same
+ * login ignoring case. Duplicate JSON keys are collapsed by `JSON.parse`
+ * before this runs; the check catches `Jane` and `jane` in one file.
+ */
+export const rolesFileSchema = rolesFileRawSchema.transform((file, ctx): RolesFile => {
+  const roles: Record<string, Role> = {};
+  for (const [key, role] of Object.entries(file.roles)) {
+    const parsed = githubLogin.safeParse(key);
+    if (!parsed.success) {
+      ctx.addIssue({ code: "custom", path: ["roles", key], message: `${JSON.stringify(key)} is not a GitHub login` });
+      return z.NEVER;
+    }
+    const login = parsed.data.toLowerCase();
+    if (roles[login] !== undefined) {
+      ctx.addIssue({ code: "custom", path: ["roles", key], message: `${key} names the same login as another entry, ignoring case` });
+      return z.NEVER;
+    }
+    roles[login] = role;
+  }
+  return { version: 1, roles };
+});
+
+export function parseRolesFile(text: string): Parsed<RolesFile> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, error: `${ROLES_FILE} is not JSON: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const parsed = rolesFileSchema.safeParse(raw);
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false, error: `${ROLES_FILE}: ${zodMessage(parsed.error)}` };
+}
+
+// ---- the role one server runs --------------------------------------------------------
+
+/** The k8s namespaces a role watches, which are read with kubectl. */
+export const roleK8sTargets = (role: Role | null): K8sTarget[] => (role?.ops?.k8sNamespaces ?? []).map((name) => ({ kind: "k8s-namespace", name }));
+
+/** The Sentry projects a role watches, which are read with the plugin's Sentry token and rung by bb-gate-hooks. */
+export const roleSentryTargets = (role: Role | null): SentryTarget[] => (role?.ops?.sentry?.projects ?? []).map((p) => ({ kind: "sentry-project", org: p.org, project: p.project }));
+
+/** The namespace and Sentry targets a role watches; the Dependabot watch is separate because it defaults to every repo. */
+export const roleOpsTargets = (role: Role | null): OpsTarget[] => [...roleK8sTargets(role), ...roleSentryTargets(role)];
+
+/**
+ * The Dependabot alert targets a role watches: `"all"` is every repo in the
+ * project's derived set (`repos.json` less `github.exclude`), an explicit list
+ * is exactly those, and no `dependabot` key is none.
+ */
+export function roleDepsTargets(role: Role | null, repos: readonly string[]): DependabotTarget[] {
+  const dep = role?.ops?.dependabot;
+  return (dep === "all" ? [...repos] : dep ?? []).map((repo) => ({ kind: "dependabot" as const, repo }));
+}
+
+/** The Linear team a role's ops steward files in (the first of linear.teams when the role names none). */
+export const roleOpsTeam = (role: Role | null, project: ProjectFile): string | null => role?.ops?.team ?? project.linear.teams[0] ?? null;
+
+/**
+ * Whether a role watches a namespace or Sentry project, so the ops-watch
+ * playbook is needed. The Dependabot watch runs the separate deps-alerts
+ * playbook, so it does not count here.
+ */
+export const roleUsesOps = (role: Role | null): boolean => roleK8sTargets(role).length > 0 || roleSentryTargets(role).length > 0;
+
+/**
+ * Whether a project uses a kind of binding at all: reviews can be turned off,
+ * and ops needs a target. `role` is the server's resolved role: omitted, the
+ * legacy `project.ops` is read (a project without a roles.json); null, the
+ * server has no role and runs no ops.
+ */
+export const usesKind = (project: ProjectFile, kind: BindingKind, role?: Role | null): boolean =>
+  kind === "review" ? project.reviews.enabled : kind === "ops" ? (role === undefined ? project.ops.targets.length > 0 : roleUsesOps(role)) : true;
+
+export const playbookNameFor = (project: ProjectFile, kind: BindingKind): string => project.playbooks[kind] ?? DEFAULT_PLAYBOOKS[kind];
 
 export const opsTargets = (project: ProjectFile): OpsTarget[] => project.ops.targets;
 
@@ -407,6 +529,101 @@ export const depsPrsPlaybookName = (project: ProjectFile): string => project.pla
 
 /** The Linear team an ops steward files in. */
 export const opsTeam = (project: ProjectFile): string | null => project.ops.team ?? project.linear.teams[0] ?? null;
+
+// ---- migration and the project steward's role problems ---------------------------------
+
+/**
+ * Whether a project file still carries watches that now belong in roles.json.
+ * An empty `ops` block (the init template's) is not carrying anything.
+ */
+export const legacyOpsPresent = (project: ProjectFile): boolean =>
+  project.ops.targets.length > 0 || project.ops.team !== undefined || project.ops.context !== undefined || project.ops.autoAdopt.length > 0 || project.ops.sentry.resolveOnDone;
+
+/**
+ * A project file's legacy `ops` as a role, so a project with no roles.json runs
+ * exactly as before: every server is the project steward and runs every watch.
+ * The Dependabot default (every repo) becomes `"all"`.
+ */
+export function legacyRole(project: ProjectFile): Role {
+  const explicit = project.ops.targets.filter((t): t is DependabotTarget => t.kind === "dependabot").map((t) => t.repo);
+  return {
+    projectSteward: true,
+    ops: {
+      k8sNamespaces: k8sTargets(project).map((t) => t.name),
+      ...(project.ops.team === undefined ? {} : { team: project.ops.team }),
+      ...(project.ops.context === undefined ? {} : { context: project.ops.context }),
+      autoAdopt: [...project.ops.autoAdopt],
+      sentry: { projects: sentryTargets(project).map((t) => ({ org: t.org, project: t.project })), resolveOnDone: project.ops.sentry.resolveOnDone },
+      dependabot: explicit.length > 0 ? explicit : "all",
+    },
+  };
+}
+
+/** The words the project steward's problem lines use for one watch. */
+function watchLabel(key: string): string {
+  if (key.startsWith("k8s-namespace/")) return `the ${key.slice("k8s-namespace/".length)} watch`;
+  if (key.startsWith("sentry-project/")) return `the Sentry watch for ${key.slice("sentry-project/".length)}`;
+  return `the Dependabot watch for ${key.slice("dependabot/".length)}`;
+}
+
+/** Every watch a role runs, keyed as `opsTargetKey` keys the same target. */
+function roleWatchKeys(role: Role, repos: readonly string[]): string[] {
+  return [...roleOpsTargets(role), ...roleDepsTargets(role, repos)].map(opsTargetKey);
+}
+
+/**
+ * The watches the project expects someone to run: the legacy `ops` targets,
+ * and the Dependabot default (every repo) while the dependency watch is on. A
+ * watch in no role is unowned; one in two roles is doubly owned.
+ */
+export function expectedWatches(project: ProjectFile, repos: readonly string[], depsEnabled: boolean): { key: string; label: string }[] {
+  const out: { key: string; label: string }[] = [];
+  const seen = new Set<string>();
+  const add = (key: string) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ key, label: watchLabel(key) });
+  };
+  for (const t of k8sTargets(project)) add(opsTargetKey(t));
+  for (const t of sentryTargets(project)) add(opsTargetKey(t));
+  const explicit = project.ops.targets.filter((t): t is DependabotTarget => t.kind === "dependabot").map((t) => t.repo);
+  if (explicit.length > 0) for (const repo of explicit) add(opsTargetKey({ kind: "dependabot", repo }));
+  else if (depsEnabled) for (const repo of repos) add(opsTargetKey({ kind: "dependabot", repo }));
+  return out;
+}
+
+/**
+ * The project steward's problem lines about who owns what: a watch nobody
+ * runs, and a watch two people run. Credentials are checked on each server,
+ * never here: a role whose machine lacks kubectl or a Sentry token is that
+ * server's own problem line.
+ */
+export function watchProblems(project: ProjectFile, roles: RolesFile, repos: readonly string[], depsEnabled: boolean): string[] {
+  const problems: string[] = [];
+  const owners = new Map<string, string[]>();
+  for (const [login, role] of Object.entries(roles.roles)) {
+    for (const key of roleWatchKeys(role, repos)) owners.set(key, [...(owners.get(key) ?? []), login]);
+  }
+  const expected = expectedWatches(project, repos, depsEnabled);
+  for (const watch of expected) {
+    const list = owners.get(watch.key) ?? [];
+    if (list.length === 0) problems.push(`nobody runs ${watch.label}`);
+    else if (list.length > 1) problems.push(`two people run ${watch.label}: ${list.join(", ")}`);
+  }
+  // A watch two roles name that the project does not otherwise expect: a namespace, say.
+  for (const [key, list] of owners) {
+    if (list.length > 1 && !expected.some((w) => w.key === key)) problems.push(`two people run ${watchLabel(key)}: ${list.join(", ")}`);
+  }
+  return problems;
+}
+
+/** The project steward count problem, or null when exactly one login holds it. */
+export function projectStewardProblem(roles: RolesFile): string | null {
+  const stewards = Object.entries(roles.roles).filter(([, role]) => role.projectSteward).map(([login]) => login);
+  if (stewards.length === 0) return "no one is the project steward: set projectSteward: true on one login in roles.json";
+  if (stewards.length > 1) return `two people are the project steward: ${stewards.join(", ")}`;
+  return null;
+}
 
 // ---- playbooks ---------------------------------------------------------------------
 

@@ -1981,6 +1981,9 @@ function StewardsSidebarCore({
         <p className="p-3 text-muted-foreground">No projects yet.</p>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
+          {data !== null && data.roleProblem !== null ? (
+            <p className="rounded-md border border-border bg-state-hover px-2 py-1 text-xs text-attention">{data.roleProblem}</p>
+          ) : null}
           {active.blocked.length > 0 ? (
             <SidebarSection title="Blocked" count={active.blocked.length}>
               <ul className="flex flex-col">{rows(active.blocked)}</ul>
