@@ -188,21 +188,19 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   refuses an archived thread, so it runs `bb thread unarchive <id>` first, or
   starts a fresh worker.
 - **thread-briefs.** Every steward, the project steward included, is
-  spawned with `threadBriefs: { rename: false, group: false, archive: false }`
-  in this plugin's metadata namespace (see thread-briefs' "Threads a plugin
-  runs"). thread-briefs then never renames a steward, whose title carries
-  its entity key, never moves one into a status section or auto-archives
-  it, since between wakes it reads done while its entity is still open.
+  spawned with `threadBriefs: false` in this plugin's metadata namespace (see
+  thread-briefs' "Threads a plugin runs"). That turns thread-briefs off for
+  the thread entirely: no summary, no stored brief, no rename, no status
+  section, no ring and no auto-archive. A steward's title carries its entity
+  key, and between wakes it reads done while its entity is still open, so a
+  brief would be wrong on every count — and one is a model call per idle.
   Workers and reviewers a steward spawns are tagged the same way, so
-  thread-briefs leaves them in the project's section too.
-  A ticket or pull request steward's row draws the stage ring like any
-  thread's. The project steward also gets `ring: false`: it has no stage of
-  its own, so its row keeps bb's own indicators. The project steward
-  is titled "<project name> project steward". The sweep tags threads
-  spawned before this, sets parent notifications off on a steward an earlier
-  version parented to the project steward (keeping the parent), and renames an
-  older project steward once. After that, a project steward renamed by hand
-  keeps its name.
+  thread-briefs leaves them in the project's section too. The project steward
+  is titled "<project name> project steward". The sweep tags threads spawned
+  before this, sets parent notifications off on a steward an earlier version
+  parented to the project steward (keeping the parent), and renames an older
+  project steward once. After that, a project steward renamed by hand keeps
+  its name.
 - **The sidebar and the unread dot.** A steward is put in its project's
   section when it is spawned, and a worker or reviewer the plugin did not
   place is filed there by the `thread.created` handler. A finished worker

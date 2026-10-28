@@ -446,8 +446,8 @@ Other things worth knowing:
 - **Turning it off does not undo anything.** bb's original title is not kept
   anywhere; the last name the plugin wrote stays. Rename by hand to change it.
 - Branch names are derived at thread creation and are unaffected.
-- A thread whose spawning plugin set `threadBriefs.rename: false` in its own
-  metadata namespace is never renamed. See
+- A thread whose spawning plugin set `threadBriefs: false` in its own
+  metadata namespace is left alone entirely. See
   [Threads a plugin exempted](#threads-a-plugin-exempted).
 
 ## Sidebar glyphs
@@ -823,26 +823,25 @@ no preference writes.
 
 ## Threads a plugin exempted
 
-A plugin that spawns a thread can exempt it from three things by setting
-`threadBriefs: { rename: false, group: false, archive: false, ring: false }` (any subset)
-in its own metadata namespace on that thread. thread-briefs reads it through
-the thread's `originPluginId`. Stewards does this: no steward is renamed or
-auto-archived, and every steward, the project steward included, is kept out of
-the status sections. Ticket and pull request steward rows draw the ring; the
-project steward's does not.
+A plugin that spawns a thread can turn thread-briefs off for it entirely by
+setting `threadBriefs: false` in its own metadata namespace on that thread.
+thread-briefs reads it through the thread's `originPluginId`. Stewards does
+this for every steward, the project steward included, and for the workers and
+reviewers a steward spawns.
 
-- A thread kept out of the sections sits in bb's **Threads** group. Pin it to
-  keep it at the top.
-- An exempt thread still gets a brief and a board card. With `ring: false`
-  its row shows only bb's own indicators; otherwise it still goes grey when
-  done and idle, but with `archive: false` its label does not say "archiving
-  soon". The stored copy the sidebar reads is refreshed by the ten-minute
-  sweep, so a newly asked-for opt-out shows within ten minutes.
-- If the origin plugin's namespace cannot be read (the plugin is gone, or the
-  request fails), the thread is not renamed or archived and is not moved
-  between sections. The logs show `could not read <plugin>'s metadata`.
-- To see what a thread asked for: `optOut` on its stored brief, written at
-  each summary, or the origin plugin's namespace itself.
+- Off means no summary, no stored brief, no rename, no status section, no
+  ring, no auto-archive and no re-entry refresher. The Brief panel says the
+  thread's plugin keeps it out of briefs. The plugin that spawned the thread
+  archives it, if it archives it at all.
+- A thread tagged before this was a single switch carries the old
+  `threadBriefs: { rename, group, archive, ring }` object; any one key being
+  `false` reads as off, so it needs no re-tag. That reading can go a release
+  later.
+- If the owning plugin's namespace cannot be read (the plugin is gone, or the
+  request fails), the thread is treated as off for that pass: it is skipped
+  and its brief is kept, rather than read as on and deleted. The logs show
+  `could not read <plugin>'s metadata`.
+- To see what a thread asked for: the origin plugin's namespace itself.
 
 ## Diagnosing
 

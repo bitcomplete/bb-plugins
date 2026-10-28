@@ -108,9 +108,10 @@ These were settled while designing; each changes what gets built.
   a later wake brings it back. A steward waiting on someone else stays in
   the sidebar between wakes too, and its finished workers and their reviewers
   stay with it (§5, "Waiting"). thread-briefs is asked,
-  through each thread's metadata, not to archive or rename stewards and not
-  to group the project steward: between wakes a steward reads done while
-  its entity is still open, and its title carries the entity key. (This
+  through each thread's metadata, to leave stewards alone entirely: between
+  wakes a steward reads done while its entity is still open, and its title
+  carries the entity key, so a brief is wrong on every count — and one is a
+  model call per idle. (This
   first left archiving to thread-briefs, which archived every steward whose
   brief read done, whoever was next. The plugin now decides from the status
   record instead.)
@@ -844,13 +845,14 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   stewarded, the sweep deletes its section once nothing unarchived is left
   in it, since its stewards are archived as their bindings end; a thread
   filed there by hand keeps it.
-- Stewards, the project steward included, are kept out of thread-briefs'
-  status sections (`group: false`), where one idle between wakes would read
-  done. thread-briefs only moves threads in and out of its own sections, so
-  it leaves the project section alone. Workers and reviewers are tagged the
-  same way when the `thread.created` handler files them, so thread-briefs
-  never moves one out of the section or auto-archives it. The project
-  steward is titled "<project name> project steward".
+- Stewards, the project steward included, are kept out of thread-briefs
+  entirely (`threadBriefs: false`): no summary, no stored brief, no status
+  section, no ring, no auto-archive. One idle between wakes would read done,
+  and a summary would be a model call per idle. thread-briefs only moves
+  threads in and out of its own sections, so it leaves the project section
+  alone. Workers and reviewers are tagged the same way when the
+  `thread.created` handler files them. The project steward is titled
+  "<project name> project steward".
 - Workers are children of their steward, owned by it through
   `--lifecycle-owner-thread` and started with `bb thread spawn --project …
   --parent-self --parent-notifications off --lifecycle-owner-thread
@@ -1560,7 +1562,9 @@ when unread, blue animated while their agent runs, grey otherwise — except a
 draft, which keeps bb's own `ThreadStatusGlyph`. A worker or reviewer child row
 under an effort, and a one-off thread's own children, use those same one-off
 glyphs and carry no role tag; the indent is the only sign of the role. The
-project steward footer row is the grey ring.
+project steward footer row is the grey ring. Steward rows carry no
+thread-briefs ring at all: the single off switch leaves every steward thread
+with no brief, so this list's own glyph is the only one they draw.
 
 **The status phrase (BB-76).** First match wins: `needs you`; `blocked on
 <blockedOn>`; `held behind <holdBehind keys>` when `holdBehind` is non-empty,

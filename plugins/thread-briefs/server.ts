@@ -46,11 +46,7 @@ import {
 } from "./config.js";
 import { endsWithQuestion, renderTranscript, type OutlineItem } from "./transcript.js";
 import {
-  FULL_OPT_OUT,
-  NO_OPT_OUT,
-  optsOutOfAnything,
   readOptOut,
-  type OptOut,
 } from "./optout.js";
 import {
   mergeSectionOrder,
@@ -408,24 +404,25 @@ export default async function plugin(bb: BbPluginApi) {
   const pluginOwner = new Map<string, string | null>();
 
   /**
-   * Each thread's opt-out, read from the namespace of the plugin that owns
-   * it: its own origin plugin, or the nearest ancestor's through the
+   * Whether each thread is off, read from the namespace of the plugin that
+   * owns it: its own origin plugin, or the nearest ancestor's through the
    * lifecycle-owner chain when it has none (a worker or reviewer spawned by
    * the CLI). See `optout.ts`.
    *
    * A thread no plugin owns costs nothing. The rest are batched per plugin,
    * so a pass over the whole sidebar is one request per plugin rather than one
    * per thread. null means that namespace could not be read, and each caller
-   * decides what not knowing means for it.
+   * decides what not knowing means for it: off for this pass, keeping the
+   * brief and skipping the thread rather than reading the failure as "on".
    */
-  async function optOutsFor(
+  async function briefsOffFor(
     threads: readonly {
       id: string;
       originPluginId: string | null;
       lifecycleOwnerThreadId?: string | null;
     }[],
-  ): Promise<Map<string, OptOut | null>> {
-    const result = new Map<string, OptOut | null>();
+  ): Promise<Map<string, boolean | null>> {
+    const result = new Map<string, boolean | null>();
     const byPlugin = new Map<string, string[]>();
     // A thread's owning plugin never changes, so the answer is kept across
     // passes: a hidden steward is absent from some batches, and its workers
@@ -476,13 +473,13 @@ export default async function plugin(bb: BbPluginApi) {
       else if (thread.lifecycleOwnerThreadId == null) pluginId = null;
       else pluginId = await ownerPlugin(thread.lifecycleOwnerThreadId);
       if (pluginId === undefined) {
-        // A read failed: unknown, which every caller treats fail-safe (see
-        // `FULL_OPT_OUT`), rather than opted in.
+        // A read failed: unknown, which every caller treats as off for this
+        // pass rather than opted in.
         result.set(thread.id, null);
         continue;
       }
       if (pluginId === null) {
-        result.set(thread.id, NO_OPT_OUT);
+        result.set(thread.id, false);
         continue;
       }
       const ids = byPlugin.get(pluginId) ?? [];
@@ -651,6 +648,17 @@ export default async function plugin(bb: BbPluginApi) {
       await deleteBrief(threadId);
       return true;
     }
+    // A thread its plugin keeps out of briefs entirely: drop any stored brief
+    // and stop. Everything else — the panel, the board, the ring, the sections
+    // and the archive sweep — skips it because there is no brief. null is a
+    // namespace we could not read: off for this pass, so the thread is skipped
+    // and its brief kept rather than deleted on a read failure.
+    const off = (await briefsOffFor([thread])).get(thread.id) ?? null;
+    if (off === null) return false;
+    if (off) {
+      await deleteBrief(threadId);
+      return true;
+    }
 
     const outline = await bb.sdk.threads.conversationOutline({ threadId });
     if (outline.items.length === 0) return false;
@@ -667,7 +675,6 @@ export default async function plugin(bb: BbPluginApi) {
 
     const config = await completionConfig();
     const { output } = await bb.sdk.threads.output({ threadId });
-    const optOut = (await optOutsFor([thread])).get(threadId) ?? null;
 
     // A stage override in force is passed to the model as fixed; one the thread
     // has moved past is dropped here, which is what "sticks until real thread
@@ -736,10 +743,8 @@ export default async function plugin(bb: BbPluginApi) {
 
     // A thread bb has already named waits for its first turn to end before this
     // plugin renames it; one showing nothing but its own opening prompt does
-    // not. See {@link summarizeThread}. A thread whose plugin keeps its title,
-    // or whose plugin we could not ask, is never renamed.
-    const appliedTitle = (beforeFirstTurn && thread.title !== null) ||
-        (optOut ?? FULL_OPT_OUT).rename
+    // not. See {@link summarizeThread}.
+    const appliedTitle = beforeFirstTurn && thread.title !== null
       ? (stored?.appliedTitle ?? null)
       : await applyTitle({
           threadId,
@@ -784,65 +789,35 @@ export default async function plugin(bb: BbPluginApi) {
       endedWithQuestion: endsWithQuestion(output),
       appliedTitle,
       refresher,
-      ...exemptionsToStore(optOut, stored),
       lastSummarizedAt: Date.now(),
       lastActivitySeen: outline.maxSeq,
     });
     return true;
   }
 
-  /**
-   * The `optOut` a fresh brief row carries: this summary's reading, or the
-   * last one when the namespace could not be read. Left off entirely for a
-   * thread exempt from nothing, which is nearly every thread.
-   */
-  const exemptionsToStore = (
-    optOut: OptOut | null,
-    stored: StoredBrief | null,
-  ): { optOut?: OptOut } => {
-    const kept = optOut ?? (stored?.optOut ? { ring: false, ...stored.optOut } : null);
-    return kept !== null && optsOutOfAnything(kept) ? { optOut: kept } : {};
-  };
-
-  /**
-   * Bring the `optOut` stored on briefs up to date with each thread's plugin.
-   *
-   * A summary refreshes it, but a steward can sit idle for days, and a plugin
-   * can ask for something new of threads it spawned long ago. The sidebar
-   * draws from the stored copy alone, so without this a ring a plugin turned
-   * off would stay until the thread's next turn. Only rows that change are
-   * written, and the sidebar is told once.
-   */
-  async function syncStoredOptOuts(
-    threads: readonly {
-      id: string;
-      originPluginId: string | null;
-      lifecycleOwnerThreadId?: string | null;
-    }[],
-  ): Promise<void> {
-    const fromPlugins = threads.filter(
-      (thread) => thread.originPluginId !== null || thread.lifecycleOwnerThreadId != null,
-    );
-    if (fromPlugins.length === 0) return;
-    let changed = 0;
-    for (const [threadId, optOut] of await optOutsFor(fromPlugins)) {
-      if (optOut === null) continue;
-      const stored = await readBrief(threadId);
-      if (stored === null) continue;
-      const next = exemptionsToStore(optOut, stored).optOut;
-      if (JSON.stringify(next) === JSON.stringify(stored.optOut)) continue;
-      const { optOut: _old, ...rest } = stored;
-      await writeBrief(next === undefined ? rest : { ...rest, optOut: next });
-      changed += 1;
-    }
-    if (changed > 0) announce();
-  }
-
   // -------------------------------------------------------------- reading
+
+  /**
+   * One thread's off switch, fetched fresh. Used by `briefState` to tell a
+   * thread its plugin keeps out of briefs from one that simply has none yet.
+   * null means the namespace could not be read, which reads as on here: the
+   * panel should not claim an opt-out it could not confirm.
+   */
+  const briefOffFor = async (threadId: string): Promise<boolean | null> => {
+    const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    if (thread === null) return null;
+    return (await briefsOffFor([thread])).get(thread.id) ?? null;
+  };
 
   const briefState = async (threadId: string): Promise<BriefState> => {
     const stored = await readBrief(threadId);
     if (stored === null) {
+      // A thread its plugin keeps out of briefs has no brief and never will,
+      // so say that rather than offering to summarize it. Only asked when there
+      // is no brief: a stale one is removed by the next summary, and checking
+      // the namespace on every panel read of every thread would cost a
+      // `threads.get` for nothing.
+      if ((await briefOffFor(threadId)) === true) return { state: "off" };
       if (!hasApiKey(await settings.get())) {
         return {
           state: "unconfigured",
@@ -1259,17 +1234,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const threads = await listGroupableThreads();
-    const optOuts = await optOutsFor(threads);
+    const briefsOff = await briefsOffFor(threads);
     const targets = await sectionIdByThreadId(sectionIds);
     // A thread its plugin keeps out of the grouping is planned as briefless,
     // which takes it out of our sections and back to bb's Threads group. One
-    // whose plugin we could not ask is left exactly where it is: a failed
+    // whose plugin we could not read is left exactly where it is: a failed
     // read should not shuffle the sidebar for one pass.
-    for (const [threadId, optOut] of optOuts) {
-      if (optOut === null || optOut.group) targets.delete(threadId);
+    for (const [threadId, off] of briefsOff) {
+      if (off) targets.delete(threadId);
     }
     const moves = planAssignments({
-      threads: threads.filter((thread) => optOuts.get(thread.id) !== null),
+      threads: threads.filter((thread) => briefsOff.get(thread.id) !== null),
       sectionIdByThreadId: targets,
       ownedSectionIds: new Set(sectionIds.values()),
     });
@@ -1393,10 +1368,6 @@ export default async function plugin(bb: BbPluginApi) {
    */
   bb.background.schedule("brief-sweep", SWEEP_CRON, async () => {
     const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
-    // Reads no summarizer, so it runs with or without a key.
-    await syncStoredOptOuts(
-      threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
-    );
 
     const values = await settings.get();
     if (!hasApiKey(values)) return;
@@ -1449,7 +1420,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (archiveAfterMs <= 0) return;
 
     const threads = await bb.sdk.threads.list({ limit: ARCHIVE_LIMIT });
-    const optOuts = await optOutsFor(
+    const briefsOff = await briefsOffFor(
       threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
     );
     const candidates: ArchiveCandidate[] = threads.map((thread) => ({
@@ -1460,8 +1431,8 @@ export default async function plugin(bb: BbPluginApi) {
       deletedAt: thread.deletedAt,
       visibility: thread.visibility,
       status: thread.status,
-      // Not knowing is a reason to keep it: see `FULL_OPT_OUT`.
-      optedOut: (optOuts.get(thread.id) ?? FULL_OPT_OUT).archive,
+      // Not knowing is a reason to keep it: a failed read is off for this pass.
+      optedOut: briefsOff.get(thread.id) ?? true,
     }));
 
     // Briefs read per candidate rather than by scanning the kv prefix: the

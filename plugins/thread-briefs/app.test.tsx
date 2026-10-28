@@ -357,6 +357,18 @@ describe("the brief panel", () => {
     slot.lifecycle.unmount();
   });
 
+  it("says the thread's plugin keeps it out of briefs, with no summarize offer", async () => {
+    const slot = await render({ getBrief: () => ({ state: "off" }) });
+
+    expect(
+      await slot.findByText("This thread's plugin keeps it out of briefs."),
+    ).toBeTruthy();
+    // No summary is coming and none can be asked for.
+    expect(slot.queryByText("Summarizing…")).toBeNull();
+    expect(slot.queryByRole("button", { name: "Summarize now" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
   it("surfaces the unconfigured message instead of an empty brief", async () => {
     const slot = await render({
       getBrief: () => ({ state: "unconfigured", message: "Add an API key." }),

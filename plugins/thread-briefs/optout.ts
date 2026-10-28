@@ -1,5 +1,5 @@
 /**
- * Which of this plugin's hands-on behaviours a thread is exempt from.
+ * Whether a plugin asked thread-briefs to leave a thread alone entirely.
  *
  * Pure: the lookups live in `server.ts`. The exemption is asked for by the
  * plugin that spawned the thread, not by this one: a plugin that runs a
@@ -8,7 +8,7 @@
  * the one thread you always want where you left it. So it seeds
  *
  * ```ts
- * pluginMetadata: { threadBriefs: { rename: false, group: false, archive: false, ring: false } }
+ * pluginMetadata: { threadBriefs: false }
  * ```
  *
  * in its own metadata namespace when it spawns the thread, and this plugin
@@ -19,54 +19,36 @@
  * `lifecycleOwnerThreadId` chain, and the tag still lives in that plugin's
  * namespace. This plugin never has to know which plugins exist.
  *
- * Each key is an opt-out: `false` turns that behaviour off for the thread,
- * and anything else — absent, `true`, a typo — leaves it on. The brief itself
- * is still written: the panel and the board show it. What is covered is the
- * three things that change the thread or the sidebar without being asked,
- * and the row's ring, which for a thread that idles between wakes mostly
- * says "done" about work that is not.
+ * Off is one switch for the whole thread: no summary, no stored brief, no
+ * rename, no section, no ring, no auto-archive, no re-entry refresher and no
+ * Stage/Status actions — the brief's absence is what makes every one of those
+ * skip it.
+ *
+ * The legacy per-key object is read too, and off when any one of its keys is
+ * `false`, so a thread tagged before the switch needs no re-tag. That reading
+ * can go a release later.
  */
 
 /** The key a spawning plugin sets in its own metadata namespace. */
 export const OPT_OUT_KEY = "threadBriefs";
 
-/** True means the thread is exempt from that behaviour. */
-export interface OptOut {
-  /** Keep the thread's title: never rename it to the brief's. */
-  rename: boolean;
-  /** Keep the thread out of the status sections. */
-  group: boolean;
-  /** Never auto-archive the thread. */
-  archive: boolean;
-  /** Draw no ring on the thread's sidebar row; bb's own indicators show. */
-  ring: boolean;
-}
-
-export const NO_OPT_OUT: OptOut = { rename: false, group: false, archive: false, ring: false };
-
 /**
- * Used when the origin plugin's namespace could not be read. Every behaviour
- * here is one the user did not ask for, so not knowing is a reason to hold
- * back: a thread left unrenamed or in the sidebar costs nothing, one archived
- * against its plugin's wishes is the case this exists to prevent.
+ * Whether the owning plugin's metadata namespace turns thread-briefs off.
+ *
+ * `threadBriefs: false` is off. A legacy `{ rename, group, archive, ring }`
+ * object is off when at least one key is `false`. Anything else — no value at
+ * all, `true`, or an object with every key true — leaves the thread on.
  */
-export const FULL_OPT_OUT: OptOut = { rename: true, group: true, archive: true, ring: true };
-
-/** The opt-out a plugin's metadata namespace asks for. */
-export function readOptOut(metadata: unknown): OptOut {
-  if (typeof metadata !== "object" || metadata === null) return NO_OPT_OUT;
+export function readOptOut(metadata: unknown): boolean {
+  if (typeof metadata !== "object" || metadata === null) return false;
   const value = (metadata as Record<string, unknown>)[OPT_OUT_KEY];
-  if (typeof value !== "object" || value === null) return NO_OPT_OUT;
+  if (value === false) return true;
+  if (typeof value !== "object" || value === null) return false;
   const entry = value as Record<string, unknown>;
-  return {
-    rename: entry.rename === false,
-    group: entry.group === false,
-    archive: entry.archive === false,
-    ring: entry.ring === false,
-  };
-}
-
-/** Whether an opt-out turns anything off at all. */
-export function optsOutOfAnything(optOut: OptOut): boolean {
-  return optOut.rename || optOut.group || optOut.archive || optOut.ring;
+  return (
+    entry.rename === false ||
+    entry.group === false ||
+    entry.archive === false ||
+    entry.ring === false
+  );
 }

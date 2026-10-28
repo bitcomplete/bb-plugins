@@ -424,7 +424,7 @@ describe("a Linear ticket steward", () => {
     const [project, steward] = t.spawns;
     expect(project).toMatchObject({ title: "Acme project steward", providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high" });
     // thread-briefs keeps its hands off: no renames, auto-archiving or grouping for any steward, and no row ring for the project steward.
-    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } } });
+    expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: false } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
     // Both in the project's own sidebar section, and nothing pinned.
@@ -434,7 +434,7 @@ describe("a Linear ticket steward", () => {
     expect(project).not.toHaveProperty("pinned");
     // A child of the project steward, so the sidebar trees it there, with
     // notifications off so a finished steward turn does not wake the parent.
-    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: { rename: false, group: false, archive: false } } });
+    expect(steward).toMatchObject({ title: "ENG-12: Fix login", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5", pluginMetadata: { role: "steward", threadBriefs: false } });
     const prompt = String(steward!.prompt);
     expect(prompt).toMatch(/# Steward wake: ENG-12 — Fix login/u);
     expect(prompt).toMatch(/You have just been bound/u);
@@ -2281,8 +2281,8 @@ describe("the project steward", () => {
     t.hooks.forgetTags();
     await t.hooks.sweep();
     expect(t.threads.get(project!.id)!.title).toBe("Acme project steward");
-    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: { rename: false, group: false, archive: false, ring: false } });
-    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get(project!.id)).toEqual({ role: "project", threadBriefs: false });
+    expect(t.metadata.get(steward!.id)).toEqual({ role: "steward", threadBriefs: false });
 
     // A name given by hand afterwards sticks.
     t.threads.get(project!.id)!.title = "Acme overseer";
@@ -7121,8 +7121,8 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward);
     await t.created("thr_r1", "thr_w1", "Review the pull request");
-    expect(t.metadata.get("thr_w1")).toEqual({ threadBriefs: { rename: false, group: false, archive: false } });
-    expect(t.metadata.get("thr_r1")).toEqual({ threadBriefs: { rename: false, group: false, archive: false } });
+    expect(t.metadata.get("thr_w1")).toEqual({ threadBriefs: false });
+    expect(t.metadata.get("thr_r1")).toEqual({ threadBriefs: false });
   });
 
   it("marks a steward read after a report that needs nobody, and leaves it unread when it needs the user", async () => {

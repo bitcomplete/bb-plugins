@@ -1754,6 +1754,29 @@ describe("sidebar grouping by status", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("takes a thread tagged with the single switch out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_plain", sectionId: null }),
+      // Filed before its plugin asked for thread-briefs to leave it alone.
+      groupedThread({ id: "thr_steward", sectionId: "sec_3", originPluginId: "stewards" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: false },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_plain", storedBrief("thr_plain", done));
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await plugin(bb);
+
+    await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
+
   it("takes a worker keyed on its steward's namespace out of the sections", async () => {
     const threads = [
       groupedThread({ id: "thr_steward", sectionId: null, originPluginId: "stewards" }),
@@ -2031,6 +2054,8 @@ describe("renaming threads", () => {
     ownerMetadata?: Record<string, unknown>;
     /** The CLI-spawned worker's own opt-out under the owning plugin's namespace. */
     workerMetadata?: Record<string, unknown>;
+    /** Fail every plugin-metadata read, as a transient error would. */
+    metadataFails?: boolean;
   }) {
     const ownerId = "thr_steward";
     const chain = options.ownerMetadata !== undefined;
@@ -2102,7 +2127,12 @@ describe("renaming threads", () => {
             maxSeq: seq,
           }),
           interactions: { list: async () => [] },
-          experimental_listPluginMetadata: metadataFrom(metadata),
+          experimental_listPluginMetadata:
+            options.metadataFails === true
+              ? async () => {
+                  throw new Error("503");
+                }
+              : metadataFrom(metadata),
         },
       },
     });
@@ -2200,67 +2230,58 @@ describe("renaming threads", () => {
     await current.harness.lifecycle.dispose();
   });
 
-  it("keeps the title of a thread its plugin asked to keep", async () => {
+  it("writes no brief for a thread its plugin keeps out of briefs", async () => {
+    const current = renameHost({
+      title: "ENG-42: Fix the flaky test",
+      originMetadata: { role: "steward", threadBriefs: false },
+    });
+    await plugin(current.bb);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
+    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
+    expect(current.fetchMock).not.toHaveBeenCalled();
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeUndefined();
+    const state = (await current.harness.behavior.callRpc("getBrief", {
+      threadId: "thr_1",
+    })) as BriefState;
+    expect(state.state).toBe("off");
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("reads the legacy per-key object as off, without a re-tag", async () => {
+    // A thread tagged before the single switch: any one key false is off, so
+    // it needs no re-tag and gets no brief.
     const current = renameHost({
       title: "ENG-42: Fix the flaky test",
       originMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
     });
     await plugin(current.bb);
-    await summarize(current);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(current.live.title).toBe("ENG-42: Fix the flaky test");
-    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
-    // Stored, so the sidebar knows not to promise an archiving.
-    const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
-    expect(stored?.optOut).toEqual({ rename: true, group: false, archive: true, ring: false });
-    const { signals } = (await current.harness.behavior.callRpc("listRowSignals", null)) as {
-      signals: { autoArchive: boolean }[];
-    };
-    expect(signals[0]?.autoArchive).toBe(false);
+    expect(current.fetchMock).not.toHaveBeenCalled();
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeUndefined();
     await current.harness.lifecycle.dispose();
   });
 
-  it("keeps the title of a CLI-spawned worker whose steward asked to keep it", async () => {
+  it("keeps a brief when the owning plugin's namespace cannot be read", async () => {
+    // A read failure is off for this pass, not an opt-out: the thread is
+    // skipped and its existing brief kept, so a transient error never deletes
+    // a one-off thread's brief.
     const current = renameHost({
-      title: "ENG-42: Fix the flaky test",
-      ownerMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
-      workerMetadata: { role: "worker", threadBriefs: { rename: false, archive: false } },
+      originMetadata: { role: "worker" },
+      metadataFails: true,
     });
+    await current.bb.storage.kv.set("brief:thr_1", storedBrief("thr_1", {}));
     await plugin(current.bb);
-    await summarize(current);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    // The worker has no origin plugin of its own; the opt-out is found through
-    // its lifecycle owner and still keeps its title.
-    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
-    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
-    await current.harness.lifecycle.dispose();
-  });
-
-  it("brings a stored opt-out up to date in the sweep, without a summary", async () => {
-    // A steward idle since before its plugin asked for no ring: the sidebar
-    // draws from the stored copy, so the sweep has to refresh it.
-    const current = renameHost({
-      originMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
-    });
-    await plugin(current.bb);
-    await summarize(current);
-    const before = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
-    expect(before?.optOut?.ring).toBe(false);
-
-    current.metadata.thr_1 = {
-      role: "steward",
-      threadBriefs: { rename: false, archive: false, ring: false },
-    };
-    await current.harness.behavior.runSchedule("brief-sweep");
-
-    const after = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
-    expect(after?.optOut).toEqual({ rename: true, group: false, archive: true, ring: true });
-    // Nothing else on the row moved.
-    expect(after?.lastSummarizedAt).toBe(before?.lastSummarizedAt);
-    const { signals } = (await current.harness.behavior.callRpc("listRowSignals", null)) as {
-      signals: { ring: boolean }[];
-    };
-    expect(signals[0]?.ring).toBe(false);
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeDefined();
+    expect(current.fetchMock).not.toHaveBeenCalled();
     await current.harness.lifecycle.dispose();
   });
 
@@ -2270,8 +2291,6 @@ describe("renaming threads", () => {
     await summarize(current);
 
     expect(current.live.title).toBe("Sidebar grouping by status");
-    const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
-    expect(stored?.optOut).toBeUndefined();
     await current.harness.lifecycle.dispose();
   });
 

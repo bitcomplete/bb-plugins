@@ -324,27 +324,13 @@ export const storedBriefSchema = z
      */
     autoArchivedAt: z.number().nullable().optional(),
     /**
-     * What the plugin that spawned this thread exempted it from, as of the
-     * last summary: see `optout.ts`. Absent means nothing, which is every
-     * thread a person started.
-     *
-     * Stored for the sidebar and the board, which draw from stored briefs
-     * alone: `ring` decides whether the row draws one, and `archive` whether
-     * "archiving soon" is true. Refreshed at each summary and by the brief
-     * sweep. The rename, the grouping and the archive sweep read the live
-     * namespace instead, so a stale copy here never decides those.
-     *
-     * `ring` is optional because rows were written before it existed.
+     * The per-key `optOut` that used to sit here is gone with the single
+     * switch (BB-101). A row written before this carries it, and `.strict()`
+     * makes that row fail to parse, so `readBrief` drops it. That is the
+     * intended one-time cleanup: the only rows that ever carried `optOut` were
+     * the threads whose plugin had opted them out of something, and those are
+     * exactly the threads this change turns off entirely.
      */
-    optOut: z
-      .object({
-        rename: z.boolean(),
-        group: z.boolean(),
-        archive: z.boolean(),
-        ring: z.boolean().optional(),
-      })
-      .strict()
-      .optional(),
     lastSummarizedAt: z.number(),
     /** The thread's `conversationOutline().maxSeq` at summarize time. */
     lastActivitySeen: z.number(),
@@ -371,15 +357,19 @@ export type ResolvedBrief = z.infer<typeof resolvedBriefSchema>;
 /**
  * What the frontend sees for one thread.
  *
- * `summarizing` means work is genuinely pending — queued or in flight. `absent` means there is no brief and none is coming, which is the
- * normal state for a thread that was already dormant when the plugin arrived:
- * briefs are not backfilled, so the UI offers to make one on demand rather
- * than claiming a summary is on its way.
+ * `summarizing` means work is genuinely pending — queued or in flight. `absent`
+ * means there is no brief and none is coming, which is the normal state for a
+ * thread that was already dormant when the plugin arrived: briefs are not
+ * backfilled, so the UI offers to make one on demand rather than claiming a
+ * summary is on its way. `off` means the thread's owning plugin asked for
+ * thread-briefs to leave it alone entirely (see `optout.ts`): there is no brief
+ * and there never will be, so the UI explains rather than offering a summary.
  */
 export const briefStateSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("ready"), brief: resolvedBriefSchema }).strict(),
   z.object({ state: z.literal("summarizing") }).strict(),
   z.object({ state: z.literal("absent") }).strict(),
+  z.object({ state: z.literal("off") }).strict(),
   z.object({ state: z.literal("unconfigured"), message: z.string() }).strict(),
   z.object({ state: z.literal("error"), message: z.string() }).strict(),
 ]);

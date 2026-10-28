@@ -268,12 +268,11 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
       : { nextStepActor: resolved.nextStepActor }),
     blockedOn: resolved.blockedOn,
     lastSummarizedAt: resolved.lastSummarizedAt,
-    autoArchive: autoArchives(stored),
+    // Always true now: the per-key opt-out is gone, so a thread with a stored
+    // brief is always auto-archivable. Kept on the wire for the board's shape.
+    autoArchive: true,
   };
 }
-
-/** Whether the archive sweep may take this thread, as far as its brief knows. */
-const autoArchives = (stored: StoredBrief): boolean => !(stored.optOut?.archive ?? false);
 
 export function rowSignalFor(stored: StoredBrief): RowSignal {
   const brief = resolveBrief(stored);
@@ -286,8 +285,11 @@ export function rowSignalFor(stored: StoredBrief): RowSignal {
     pinned,
     stageOverride: brief.stageOverride,
     statusOverride: brief.statusOverride,
-    autoArchive: autoArchives(stored),
-    ring: !(stored.optOut?.ring ?? false),
+    // Both always true now that the single off switch removes a thread's brief
+    // entirely: a stored brief is always auto-archivable and always draws a
+    // ring. Kept on the wire for the client's shape.
+    autoArchive: true,
+    ring: true,
   };
 }
 
