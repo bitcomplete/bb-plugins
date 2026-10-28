@@ -164,6 +164,18 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   rather than being hidden or archived: it stays addressable, so a later wake
   reaches it, and its finished workers and their reviewers stay visible with
   it. Binding end still archives.
+- **A steward whose environment is gone.** If a wake cannot be delivered —
+  the thread's environment is `destroyed` at wake time, or bb refuses the
+  send with `thread_environment_unavailable` — the plugin spawns a fresh
+  steward on the project steward's environment, re-points the binding,
+  archives the old thread (never deletes, so the binding is not marked
+  manually detached), and delivers the wake as the new thread's first
+  prompt. The respawn is logged and noted on the binding. An operator can
+  re-point a binding by hand with `bb stewards rebind <key> <thread>
+  [--project <id>]`, for example at a fork of the dead thread kept with
+  `bb thread fork <old> --environment <env>`: it refuses a thread in
+  another project, a deleted thread, a live binding's steward or a worker,
+  sends the wake at once, and archives the previous thread.
 - **Finished workers and reviewers.** A worker whose turn ends is marked
   `finished`; once the reconcile that consumed its report has woken the
   steward, its thread is archived, so the sidebar keeps only work in flight.
