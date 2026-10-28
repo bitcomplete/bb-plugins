@@ -29,7 +29,6 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   requeueAt: null,
   advancedAt: null,
   workers: [],
-  reviewers: [],
   ...over,
 });
 
@@ -81,20 +80,30 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_worker", role: "worker" }]);
   });
 
-  it("puts a reviewer under its worker, not at the effort root", () => {
+  it("puts a reviewer under its worker through the thread tree, with no reviewers field in the data (BB-100)", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker" }), thread({ id: "thr_reviewer", parentThreadId: "thr_worker" })],
       data: [
         data({
           projectId: "p1",
-          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }], reviewers: [{ threadId: "thr_reviewer", workerThreadId: "thr_worker" }] })],
+          bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })],
         }),
       ],
     });
     const workers = tabs[0]!.efforts[0]!.children;
     expect(workers).toHaveLength(1);
     expect(workers[0]!.children).toMatchObject([{ threadId: "thr_reviewer", role: "reviewer" }]);
+  });
+
+  it("attaches a live stopped worker absent from the data as a worker child through the tree (BB-100)", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_steward" }), thread({ id: "thr_stopped", parentThreadId: "thr_steward" })],
+      data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward" })] })],
+    });
+    expect(tabs[0]!.efforts[0]!.children).toMatchObject([{ threadId: "thr_stopped", role: "worker" }]);
+    expect(tabs[0]!.efforts[0]!.runningWorkers).toBe(0);
   });
 
   // BB-72: stewards nest under the project steward, workers under their

@@ -1623,8 +1623,8 @@ for the length of the crossfade.
 
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
-through the worker the RPC names, so the grouping survives a worker spawned
-without a parent. The thread tree (`parentThreadId ?? lifecycleOwnerThreadId`)
+through the live thread whose parent is a claimed worker, so the grouping
+survives a worker spawned without a parent. The thread tree (`parentThreadId ?? lifecycleOwnerThreadId`)
 places what the records do not cover: a worker an older steward parented under
 it, and a one-off thread's children. BB-72 restored the parent link — stewards
 under the project steward, workers under their steward, reviewers under their
@@ -1648,9 +1648,10 @@ lane gate re-checked server-side). There is no **Details** button: the row
 itself opens the effort's detail view (BB-85), where the free-text answer and
 the secret form live. The inline block adds no write path the page does not
 already make. The
-project dropdown carries each project's count in its option label, and that
-count is the number of yellow effort rows, so the picker and the sections
-cannot disagree. `stewardsSidebar` carries, per project,
+project dropdown carries each project's count in its option label, and the
+server counts the needs-you bindings (`needsCount`, the open bindings with
+`needsUser`), so the picker and the sections cannot disagree. `stewardsSidebar`
+carries, per project,
 `needs: { count, items }` with the board's row shapes, each tagged
 `question`/`withUser`/`need` and carrying the binding's entity key as
 `bindingKey` so a row owns its item; the effort row filters the items by that
@@ -1685,7 +1686,7 @@ to the user or resolved (`reroute`, `resolve`, `approve`, `decline`), and a
 need filed, updated or closed (`fileNeed`, `closeNeed`, `closeNeeds`,
 `closeNeedByKey`). A synchronous coalescing guard makes one question filed or
 answered publish exactly one event even when the operation nests (`answer`
-resolves its escalation). Every open sidebar refetches when the event names a
+resolves its escalation). Every open sidebar refetches when the event names the
 project it shows, the board page refetches when it names its project, and the
 overview (which covers every project) refetches on any event; the half-minute
 poll remains the fallback.

@@ -204,6 +204,19 @@ function world() {
               (parentThreadId === undefined || (t.parentThreadId ?? null) === parentThreadId),
           )
           .map(([id, t]) => makeThreadResponse({ id, status: t.status as never, archivedAt: t.archivedAt, parentThreadId: t.parentThreadId ?? null, sectionId: t.sectionId ?? null })),
+      experimental_listDescendants: async ({ threadIds, includeArchived, includeHidden }: { threadIds: string[]; includeArchived?: boolean; includeHidden?: boolean }) => {
+        const descendants = (id: string): string[] => {
+          const out: string[] = [];
+          for (const [childId, child] of threads) {
+            if ((child.parentThreadId ?? null) !== id) continue;
+            if (includeArchived !== true && child.archivedAt !== null) continue;
+            if (includeHidden !== true && child.visibility === "hidden") continue;
+            out.push(childId, ...descendants(childId));
+          }
+          return out;
+        };
+        return { threads: threadIds.map((threadId) => ({ threadId, descendantIds: descendants(threadId) })) };
+      },
       archive: async ({ threadId }: { threadId: string }) => {
         threads.get(threadId)!.archivedAt = 1;
         return {};
@@ -1048,11 +1061,11 @@ describe("a Linear ticket steward", () => {
     // The reviewer is a child of the worker, filed under it, not a worker.
     await t.created("thr_r1", "thr_w1", "Review acme/web#7");
     expect(t.hooks.store.worker("thr_r1")).toBeNull();
-    const result = (await t.harness.callRpc("stewardsSidebar", null)) as { projects: Array<{ bindings: Array<{ workers: Array<{ threadId: string }>; reviewers: Array<{ threadId: string; workerThreadId: string }> }> }> };
-    expect(result.projects[0]!.bindings[0]).toMatchObject({
-      workers: [{ threadId: "thr_w1" }],
-      reviewers: [{ threadId: "thr_r1", workerThreadId: "thr_w1" }],
-    });
+    // The sidebar RPC no longer names reviewers; the client derives them from
+    // the live thread tree, so the field is absent (BB-100).
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ workers: Array<{ threadId: string }>; reviewers?: unknown }> };
+    expect(result.bindings[0]).toMatchObject({ workers: [{ threadId: "thr_w1" }] });
+    expect(result.bindings[0]!.reviewers).toBeUndefined();
   });
 
   it("keeps a running worker's own pull request activity for the next turn instead of waking for it", async () => {
@@ -2580,8 +2593,8 @@ describe("the status report actor (BB-97)", () => {
   }
   const status = (t: Awaited<ReturnType<typeof bound>>) => t.hooks.store.find("ENG-12")!.status;
   const needsUser = async (t: Awaited<ReturnType<typeof bound>>) => {
-    const sidebar = (await t.harness.callRpc("stewardsSidebar", null)) as { projects: Array<{ bindings: Array<{ key: string; needsUser: boolean }> }> };
-    return sidebar.projects[0]!.bindings.find((b) => b.key === "ENG-12")!.needsUser;
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; needsUser: boolean }> };
+    return sidebar.bindings.find((b) => b.key === "ENG-12")!.needsUser;
   };
 
   it("records `user` as the server's owner, so the row needs you; `steward` and `other` do not", async () => {
@@ -2772,7 +2785,7 @@ describe("archiving finished workers and reviewers (BB-47)", () => {
     const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward);
     // "Unknown" is not "no reviewers": the worker waits for a listing that works.
-    t.harness.sdk.stub("threads.list", async () => {
+    t.harness.sdk.stub("threads.experimental_listDescendants", async () => {
       throw new Error("listing is down");
     });
     await t.idle("thr_w1", "Implemented the fix.");
@@ -3425,53 +3438,82 @@ describe("questions to the user", () => {
 
 describe("the stewards sidebar call", () => {
   type Sidebar = {
-    projects: Array<{
-      projectId: string;
-      name: string;
-      projectStewardThreadId: string | null;
-      bindings: Array<{
-        key: string;
-        kind: string;
-        stage: string | null;
-        phase: string | null;
-        threadId: string | null;
-        hold: string | null;
-        holdBehind: string[];
-        blockedOn: string | null;
-        needsUser: boolean;
-        stuck: boolean;
-        status: { actor: string; nextAction: string; at: number } | null;
-        deployment: string | null;
-        advancedAt: number | null;
-        workers: Array<{ threadId: string; title: string; status: string }>;
-        reviewers: Array<{ threadId: string; workerThreadId: string }>;
-      }>;
-      needs: { count: number; items: Array<{ type: string; id: string; bindingKey: string | null }> };
-      ended: Array<{ key: string; kind: string; threadId: string | null; title: string | null; endedAt: number }>;
+    projects: Array<{ projectId: string; name: string; needsCount: number }>;
+    projectId: string | null;
+    projectStewardThreadId: string | null;
+    needs: { count: number; items: Array<{ type: string; id: string; bindingKey: string | null }> };
+    bindings: Array<{
+      key: string;
+      kind: string;
+      stage: string | null;
+      phase: string | null;
+      threadId: string | null;
+      hold: string | null;
+      holdBehind: string[];
+      blockedOn: string | null;
+      needsUser: boolean;
+      stuck: boolean;
+      status: { actor: string; nextAction: string; at: number } | null;
+      deployment: string | null;
+      advancedAt: number | null;
+      workers: Array<{ threadId: string; title: string; status: string }>;
+      reviewers?: unknown;
     }>;
+    ended: Array<{ key: string; kind: string; threadId: string | null; title: string | null; endedAt: number }>;
   };
 
-  it("returns every stewarded project's bindings, workers and reviewers, the project steward and what ended", async () => {
+  it("returns the requested project's bindings and a needsCount for every project (BB-100)", async () => {
     const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Beta" }]);
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    // One open need makes p1's needs count 1; p2 has none.
+    t.hooks.store.fileNeed({ bindingId: b.id, kind: "configure", url: "", what: "Enable the flag", how: null });
+
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(result.projects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ projectId: "p1", name: "Acme", needsCount: 1 }),
+        expect.objectContaining({ projectId: "p2", name: "Beta", needsCount: 0 }),
+      ]),
+    );
+    expect(result.projectId).toBe("p1");
+    expect(result.projectStewardThreadId).toBe(project);
+    expect(result.bindings).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward, needsUser: true }]);
+    expect(result.ended).toEqual([]);
+  });
+
+  it("null picks the first project by name, as the board does (BB-100)", async () => {
+    const t = await setup();
+    const originalProjects = t.sdk.projects.list;
+    // "Aardvark" sorts before "Acme".
+    t.harness.sdk.stub("projects.list", async () => [...(await originalProjects()), { id: "p2", name: "Aardvark" }]);
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: null })) as Sidebar;
+    expect(result.projectId).toBe("p2");
+  });
+
+  it("makes no per-worker threads.list call (BB-100)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
     await t.created("thr_w1", steward, "Implement retry");
     await t.created("thr_r1", "thr_w1", "Review the pull request");
 
-    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
-    expect(result.projects).toMatchObject([{ projectId: "p1", name: "Acme", projectStewardThreadId: project }]);
-    expect(result.projects[0]!.bindings).toMatchObject([
-      {
-        key: "ENG-12",
-        kind: "ticket",
-        threadId: steward,
-        needsUser: false,
-        workers: [{ threadId: "thr_w1", title: "Implement retry" }],
-        reviewers: [{ threadId: "thr_r1", workerThreadId: "thr_w1" }],
-      },
-    ]);
-    expect(result.projects[0]!.ended).toEqual([]);
+    let listCalls = 0;
+    const originalList = t.sdk.threads.list;
+    t.harness.sdk.stub("threads.list", async (args: { parentThreadId?: string }) => {
+      listCalls += 1;
+      return originalList(args);
+    });
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+    expect(listCalls).toBe(0);
   });
 
   it("carries phase, status, holdBehind, stuck, deployment, worker status and a needs item's bindingKey (BB-76)", async () => {
@@ -3496,8 +3538,8 @@ describe("the stewards sidebar call", () => {
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
     const q = t.hooks.store.ask({ projectId: "p1", bindingId: b.id, escalationId: null, question: "Which option?", context: null });
 
-    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
-    const binding = result.projects[0]!.bindings.find((x) => x.key === "ENG-12")!;
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    const binding = result.bindings.find((x) => x.key === "ENG-12")!;
     expect(binding).toMatchObject({
       phase: "In Review",
       hold: "a freeze",
@@ -3507,7 +3549,7 @@ describe("the stewards sidebar call", () => {
       deployment: "deployed",
       workers: [{ threadId: "thr_w1", title: "Implement retry", status: "running" }],
     });
-    expect(result.projects[0]!.needs.items).toContainEqual(expect.objectContaining({ type: "question", id: q.id, bindingKey: "ENG-12" }));
+    expect(result.needs.items).toContainEqual(expect.objectContaining({ type: "question", id: q.id, bindingKey: "ENG-12" }));
   });
 
   it("lists an ended binding in `ended` and drops it from the bindings", async () => {
@@ -3517,49 +3559,44 @@ describe("the stewards sidebar call", () => {
     const binding = t.hooks.store.find("ENG-12")!;
     t.hooks.store.patch(binding.id, { endedAt: t.now(), endReason: "merged" });
 
-    const result = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
-    expect(result.projects[0]!.bindings).toEqual([]);
-    expect(result.projects[0]!.ended).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
-    expect(result.projects[0]!.ended[0]!.endedAt).toBe(t.now());
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    expect(result.bindings).toEqual([]);
+    expect(result.ended).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
+    expect(result.ended[0]!.endedAt).toBe(t.now());
   });
 
-  it("caches the per-worker reviewer lookup and lists projects once per call (BB-95)", async () => {
+  it("sends running and finished workers, and any other that ended within the last hour (BB-100)", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.created("thr_w1", steward, "Implement retry");
-    await t.created("thr_r1", "thr_w1", "Review the pull request");
+    for (const [id, title] of [["thr_run", "Run"], ["thr_fin", "Finish"], ["thr_stop_old", "Old stop"], ["thr_stop_new", "New stop"]] as const) await t.created(id, steward, title);
+    // The old stop and the finish end now; two hours pass; the new stop ends
+    // then, and the running worker stays running.
+    t.hooks.store.setWorker("thr_stop_old", "stopped", null);
+    t.hooks.store.setWorker("thr_fin", "finished", "done");
+    t.advance(2 * 3_600_000);
+    t.hooks.store.setWorker("thr_stop_new", "stopped", null);
+    t.hooks.store.setWorker("thr_run", "running", null);
 
-    let listCalls = 0;
-    let projectListCalls = 0;
-    const originalList = t.sdk.threads.list;
-    t.harness.sdk.stub("threads.list", async (args: { parentThreadId?: string }) => {
-      listCalls += 1;
-      return originalList(args);
-    });
-    const originalProjects = t.sdk.projects.list;
-    t.harness.sdk.stub("projects.list", async () => {
-      projectListCalls += 1;
-      return originalProjects();
-    });
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    const workers = result.bindings.find((x) => x.key === "ENG-12")!.workers.map((w) => w.threadId).sort();
+    // The old stop is absent; the finished one rides regardless of age.
+    expect(workers).toEqual(["thr_fin", "thr_run", "thr_stop_new"]);
+  });
 
-    const first = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
-    expect(first.projects[0]!.bindings[0]!.reviewers).toEqual([{ threadId: "thr_r1", workerThreadId: "thr_w1" }]);
-    expect(listCalls).toBe(1);
-    expect(projectListCalls).toBe(1);
-
-    // A second call inside the cache window shares the lookup and lists
-    // projects once more.
-    const second = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
-    expect(second.projects[0]!.bindings[0]!.reviewers).toEqual([{ threadId: "thr_r1", workerThreadId: "thr_w1" }]);
-    expect(listCalls).toBe(1);
-    expect(projectListCalls).toBe(2);
-
-    // Past the window the lookup runs again.
-    t.advance(6_000);
-    await t.harness.callRpc("stewardsSidebar", null);
-    expect(listCalls).toBe(2);
+  it("reports a call and a signal in bb stewards stats (BB-100)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    const before = JSON.parse((await t.harness.behavior.runCli(["stats", "--json"])).stdout) as { rpc: Record<string, { count: number }>; signals: Record<string, number> };
+    await t.harness.callRpc("stewardsSidebar", { projectId: "p1" });
+    // One visible patch publishes one signal.
+    t.hooks.store.patch(b.id, { phase: "In Review" });
+    const after = JSON.parse((await t.harness.behavior.runCli(["stats", "--json"])).stdout) as { rpc: Record<string, { count: number }>; signals: Record<string, number> };
+    expect(after.rpc.stewardsSidebar!.count).toBe((before.rpc.stewardsSidebar?.count ?? 0) + 1);
+    expect(after.signals.p1).toBe((before.signals.p1 ?? 0) + 1);
   });
 });
 
@@ -3571,9 +3608,9 @@ describe("the sidebar's needs you block (BB-46)", () => {
     withUser: Array<{ id: string }>;
     needs: Array<{ id: string; kind: string; actionable: boolean }>;
   };
-  type SidebarView = { projects: Array<{ projectId: string; needs: { count: number; items: Array<{ type: string; id: string }> } }> };
+  type SidebarView = { projectId: string | null; needs: { count: number; items: Array<{ type: string; id: string }> } };
   const boardView = async (t: Awaited<ReturnType<typeof setup>>): Promise<BoardView> => ((await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: BoardView }).board;
-  const sidebarView = async (t: Awaited<ReturnType<typeof setup>>) => ((await t.harness.callRpc("stewardsSidebar", null)) as SidebarView).projects.find((p) => p.projectId === "p1")!;
+  const sidebarView = async (t: Awaited<ReturnType<typeof setup>>) => (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as SidebarView;
 
   it("agrees with the board, excluding a non-actionable need and a with-user escalation a question covers", async () => {
     const t = await setup();
