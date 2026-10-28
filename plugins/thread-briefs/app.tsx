@@ -448,6 +448,15 @@ function BriefBody({
   if (state.state === "summarizing") {
     return <div className="text-sm text-muted-foreground">Summarizing…</div>;
   }
+  if (state.state === "off") {
+    // The thread's plugin keeps it out of briefs entirely: there is no brief
+    // and no summary coming, so explain rather than offer to make one.
+    return (
+      <div className="text-sm text-muted-foreground">
+        This thread's plugin keeps it out of briefs.
+      </div>
+    );
+  }
   if (state.state === "absent") {
     // Threads that were already dormant when the plugin arrived are not
     // backfilled, so say so and offer to make one rather than spinning.

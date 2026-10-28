@@ -103,16 +103,15 @@ export const BRIEF_MAX_CHARS = 3800;
  * a plugin runs"). Every steward keeps the title it was given, which carries
  * the entity key, and is archived by this plugin when its binding ends, or
  * when a wake turn ends waiting on someone else, rather than whenever its
- * brief reads done between wakes. Stewards stay out of the status
- * sections, where one idle between wakes would read done: the project
- * steward is never finished, and a steward is finished when its binding ends.
- * A ticket or pull request steward's row draws the stage ring like any
- * thread's, following its entity's work. The project steward's draws none:
- * it has no stage to show, and its ring would only say done about a project
- * that is not.
+ * brief reads done between wakes. Stewards stay out of the status sections,
+ * where one idle between wakes would read done: the project steward is never
+ * finished, and a steward is finished when its binding ends. Their rows draw
+ * no ring either: a brief would say done about work that is still open.
+ *
+ * One switch for every thread this plugin spawns — steward, project steward,
+ * worker or reviewer — so thread-briefs writes no brief for any of them.
  */
-export const STEWARD_BRIEFS = { rename: false, group: false, archive: false } as const;
-export const PROJECT_BRIEFS = { ...STEWARD_BRIEFS, ring: false } as const;
+export const THREAD_BRIEFS_OFF = false;
 
 export interface Timing {
   /** Rings for one entity within this long are one look. */
@@ -1562,7 +1561,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * process. A spawn seeds it; this covers threads spawned before it was.
      */
     const tagged = new Set<string>();
-    async function tagThread(threadId: string, briefs: typeof STEWARD_BRIEFS | typeof PROJECT_BRIEFS): Promise<void> {
+    async function tagThread(threadId: string, briefs: typeof THREAD_BRIEFS_OFF): Promise<void> {
       if (tagged.has(threadId)) return;
       try {
         await bb.sdk.threads.updatePluginMetadata({ threadId, set: { threadBriefs: briefs } });
@@ -1764,7 +1763,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (row.threadId === null) return;
       const info = await threadInfo(row.threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return;
-      await tagThread(row.threadId, PROJECT_BRIEFS);
+      await tagThread(row.threadId, THREAD_BRIEFS_OFF);
       await placeOnce(projectId, info);
       if (row.title !== null && info.title !== row.title) return;
       const title = await projectStewardTitle(projectId);
@@ -1792,7 +1791,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           title,
           ...modelArgs(config.file.projectSteward.model ?? null),
           ...(sectionId === null ? {} : { sectionId }),
-          pluginMetadata: { role: "project", threadBriefs: PROJECT_BRIEFS },
+          pluginMetadata: { role: "project", threadBriefs: THREAD_BRIEFS_OFF },
         });
         tagged.add(thread.id);
         if (sectionId !== null) store.markPlaced(thread.id);
@@ -1814,7 +1813,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const kept = new Set<string>();
     async function keepSteward(projectId: string, threadId: string): Promise<void> {
       if (kept.has(threadId)) return;
-      await tagThread(threadId, STEWARD_BRIEFS);
+      await tagThread(threadId, THREAD_BRIEFS_OFF);
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return;
       const parent = info.parentThreadId;
@@ -1848,7 +1847,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         prompt,
         title: b.kind === "review" ? `Review ${b.entityKey}: ${b.title ?? ""}`.trim() : b.kind === "ops" ? (b.title ?? `Ops watch: ${b.entityKey}`) : `${b.entityKey}: ${b.title ?? ""}`.trim(),
         ...modelArgs(stewardModel(b, playbook)),
-        pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: STEWARD_BRIEFS },
+        pluginMetadata: { role: "steward", bindingId: b.id, threadBriefs: THREAD_BRIEFS_OFF },
       };
       let thread: { id: string };
       try {
@@ -4385,7 +4384,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const spawned = spawnedOwner(thread);
       if (spawned !== null) {
         await placeOnce(spawned.projectId, { id: thread.id, sectionId: thread.sectionId ?? null });
-        await tagThread(thread.id, STEWARD_BRIEFS);
+        await tagThread(thread.id, THREAD_BRIEFS_OFF);
       }
       // A reviewer is a child of a worker. The newest round supersedes the
       // older ones, so they are archived as it is created (BB-47).
