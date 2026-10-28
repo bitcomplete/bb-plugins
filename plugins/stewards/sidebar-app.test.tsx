@@ -8,7 +8,7 @@ import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } 
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute } from "./board-route.js";
-import { rowRenderCounts } from "./app.js";
+import { resetOpenPrHandoff, rowRenderCounts } from "./app.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
   projectId: "p1",
@@ -118,6 +118,35 @@ const needItem = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+const boardSteward = (over: Record<string, unknown> = {}) => ({
+  key: "ENG-1",
+  url: null,
+  title: "Fix login",
+  kind: "ticket",
+  phase: null,
+  stage: null,
+  threadId: "thr_steward",
+  summary: null,
+  nextAction: null,
+  actor: null,
+  waitingOn: null,
+  priority: null,
+  hold: null,
+  holdBehind: [],
+  needsUser: false,
+  stuck: false,
+  deployment: null,
+  pending: [],
+  requeueAt: null,
+  ending: null,
+  statusAt: null,
+  createdAt: 1_000,
+  wokeAt: null,
+  advancedAt: null,
+  workers: [],
+  ...over,
+});
+
 const withUserItem = (over: Record<string, unknown> = {}) => ({
   type: "withUser",
   id: "esc_1",
@@ -157,6 +186,7 @@ const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, pro
 
 afterEach(() => {
   app = null;
+  resetOpenPrHandoff();
   setBoardRoute({ projectId: null, key: null });
   delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
 });
@@ -1149,6 +1179,70 @@ describe("the board route store (BB-94)", () => {
     await waitFor(() => expect(listSlot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
     panelSlot.lifecycle.unmount();
     listSlot.lifecycle.unmount();
+  });
+});
+
+// BB-102: the sidebar's Open PR button hands the PR URL to the effort detail
+// page, which sits inside a pane and can open it in bb's in-app browser.
+describe("the sidebar's Open PR handoff to the detail page (BB-102)", () => {
+  const prUrl = "https://github.com/acme/web/pull/1";
+  const detailBoard = () => ({
+    projects: [{ projectId: "p1", name: "Acme" }],
+    board: {
+      projectId: "p1",
+      name: "Acme",
+      paused: false,
+      projectStewardThreadId: null,
+      stages: [],
+      digest: null,
+      questions: [],
+      withUser: [],
+      needs: [],
+      lessons: [],
+      lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+      stewards: [boardSteward()],
+      stuck: [],
+      ended: [],
+    },
+  });
+  const options = {
+    sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+    rpc: {
+      stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem()] } }),
+      stewardsBoard: () => detailBoard(),
+    } as never,
+  };
+  const renderList = (captured: CapturedPluginApp) =>
+    renderSlot(captured.threadLists[0]!, { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" }, options);
+
+  it("records the navigation in the sidebar, then opens the PR once from the page", async () => {
+    const captured = await loadApp();
+    const listSlot = renderList(captured);
+    fireEvent.click(await waitFor(() => listSlot.getByRole("button", { name: "Open PR" })));
+    await waitFor(() => expect(listSlot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
+    // The page mounts on the detail view the click navigated to and opens the
+    // PR from inside its pane.
+    const panelSlot = renderSlot(captured.navPanels[0]!, { subPath: "p1/ENG-1" }, options);
+    await waitFor(() => expect(panelSlot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: prUrl }));
+    expect(panelSlot.inspection.navigateCalls.filter((call) => call.method === "openUrl")).toHaveLength(1);
+    // The handoff is one-shot: a remount records no second open.
+    panelSlot.lifecycle.unmount();
+    const remount = renderSlot(captured.navPanels[0]!, { subPath: "p1/ENG-1" }, options);
+    await waitFor(() => expect(remount.getByText("Fix login")).toBeTruthy());
+    expect(remount.inspection.navigateCalls.filter((call) => call.method === "openUrl")).toHaveLength(0);
+    remount.lifecycle.unmount();
+    listSlot.lifecycle.unmount();
+  });
+
+  it("still opens the PR when Open PR is pressed while that detail view is showing", async () => {
+    const captured = await loadApp();
+    const panelSlot = renderSlot(captured.navPanels[0]!, { subPath: "p1/ENG-1" }, options);
+    await waitFor(() => expect(panelSlot.getByText("Fix login")).toBeTruthy());
+    const listSlot = renderList(captured);
+    fireEvent.click(await waitFor(() => listSlot.getByRole("button", { name: "Open PR" })));
+    await waitFor(() => expect(panelSlot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: prUrl }));
+    listSlot.lifecycle.unmount();
+    panelSlot.lifecycle.unmount();
   });
 });
 

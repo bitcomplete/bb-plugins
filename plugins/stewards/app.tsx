@@ -10,7 +10,7 @@
 // item's button. Settings → Plugins → Stewards: which projects are stewarded
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   Markdown,
   ThreadTitle,
@@ -52,10 +52,62 @@ const BOARD_PATH = "board";
 const POLL_MS = 30_000;
 /** How long a burst of refetch requests is coalesced into one RPC (BB-95). */
 const REFETCH_DEBOUNCE_MS = 300;
+/** How long the sidebar's Open PR handoff waits for the detail page before opening externally (BB-102). */
+const OPEN_PR_HANDOFF_MS = 500;
 
 /** Stable empties, so a memoised row's props keep their identity (BB-95). */
 const EMPTY_NEEDS: readonly SidebarNeedItem[] = [];
 const NO_CHILDREN: readonly SidebarChild[] = [];
+
+// A one-shot handoff from the sidebar's Open PR button to the effort detail
+// page (BB-102). The sidebar is mounted outside the route content, so its
+// `openUrl` never reaches the in-app browser; the detail page sits inside a
+// pane whose `openUrl` does. The URL is carried in memory, not in the route, so
+// back, forward and a refresh do not replay the open.
+type OpenPrHandoff = { url: string; seq: number };
+let openPrHandoff: OpenPrHandoff | null = null;
+let openPrSeq = 0;
+const openPrListeners = new Set<() => void>();
+
+/** Record the URL for the page to open; the returned sequence is the consumer's ticket. */
+function setOpenPrHandoff(url: string): number {
+  openPrSeq += 1;
+  openPrHandoff = { url, seq: openPrSeq };
+  for (const listener of openPrListeners) listener();
+  return openPrSeq;
+}
+
+/** Take the URL once, only while `seq` is still the slot's; a stale or repeated call gets null. */
+function takeOpenPrHandoff(seq: number): string | null {
+  if (openPrHandoff === null || openPrHandoff.seq !== seq) return null;
+  const { url } = openPrHandoff;
+  openPrHandoff = null;
+  for (const listener of openPrListeners) listener();
+  return url;
+}
+
+function subscribeOpenPr(listener: () => void): () => void {
+  openPrListeners.add(listener);
+  return () => {
+    openPrListeners.delete(listener);
+  };
+}
+
+function getOpenPrHandoff(): OpenPrHandoff | null {
+  return openPrHandoff;
+}
+
+/** The pending Open PR handoff, so the page re-renders when one arrives. */
+function useOpenPrHandoff(): OpenPrHandoff | null {
+  return useSyncExternalStore(subscribeOpenPr, getOpenPrHandoff, getOpenPrHandoff);
+}
+
+/** Drop any pending handoff; tests use it so one case cannot leak into the next. */
+export function resetOpenPrHandoff(): void {
+  if (openPrHandoff === null) return;
+  openPrHandoff = null;
+  for (const listener of openPrListeners) listener();
+}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -808,6 +860,17 @@ function LessonsBlock({ lessons, counts, now }: { lessons: Board["lessons"]; cou
 function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKey: string; refetch: () => void }) {
   const now = Date.now();
   const navigate = useBbNavigate();
+  // BB-102: the sidebar's Open PR button leaves the PR URL in the one-shot
+  // handoff; this page is inside a pane, so its `openUrl` reaches the in-app
+  // browser. One effect keyed on the sequence opens it and clears the slot, so
+  // an unmount/remount (or a back/forward) does not replay it.
+  const handoff = useOpenPrHandoff();
+  const handoffSeq = handoff?.seq ?? null;
+  useEffect(() => {
+    if (handoffSeq === null) return;
+    const url = takeOpenPrHandoff(handoffSeq);
+    if (url !== null) navigate.openUrl(url);
+  }, [handoffSeq, navigate]);
   const { efforts } = boardEfforts(b);
   const effort = efforts.find((e) => e.steward.key === effortKey);
   if (effort === undefined) {
@@ -1489,10 +1552,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
  * choose`; an approve-pr or merge keeps its Open PR / Approve|Merge buttons.
  * The row itself opens the detail view (BB-85), so there is no Details button.
  */
-function SidebarInlineNeed({ item, onChanged }: { item: SidebarNeedItem; onChanged: () => void }) {
+function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: SidebarNeedItem; projectId: string; effortKey: string; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
+  // The fallback timer that opens the PR externally when the page never takes
+  // the handoff (a hidden panel, a chunk that failed to load) (BB-102).
+  const openPrFallback = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (openPrFallback.current !== null) window.clearTimeout(openPrFallback.current);
+  }, []);
   const text = item.type === "need" ? item.what : item.question;
   const isApprovePr = item.type === "need" && item.kind === "approve-pr";
   const isMerge = item.type === "need" && item.kind === "merge";
@@ -1516,6 +1585,21 @@ function SidebarInlineNeed({ item, onChanged }: { item: SidebarNeedItem; onChang
   const choose = (choice: string) => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice }));
   const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
   const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
+  // BB-102: hand the URL to the detail page, which is inside a pane and can
+  // open it in bb's in-app browser, then go there as the row does. If nothing
+  // takes the slot in time, fall back to the sidebar's own (external) openUrl.
+  const openPr = () => {
+    const url = item.url;
+    if (url === null) return;
+    if (openPrFallback.current !== null) window.clearTimeout(openPrFallback.current);
+    const seq = setOpenPrHandoff(url);
+    navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, effortKey) });
+    openPrFallback.current = window.setTimeout(() => {
+      openPrFallback.current = null;
+      const pending = takeOpenPrHandoff(seq);
+      if (pending !== null) navigate.openUrl(pending);
+    }, OPEN_PR_HANDOFF_MS);
+  };
   const button = "rounded-md border border-input px-2 py-0.5 text-[11px] hover:bg-state-hover disabled:opacity-50";
   return (
     <div className="flex flex-col gap-1">
@@ -1530,7 +1614,7 @@ function SidebarInlineNeed({ item, onChanged }: { item: SidebarNeedItem; onChang
         ) : isApprovePr || isMerge ? (
           <>
             {item.url !== null ? (
-              <button type="button" className={button} onClick={() => navigate.openUrl(item.url!)}>
+              <button type="button" className={button} onClick={openPr}>
                 Open PR
               </button>
             ) : null}
@@ -1688,7 +1772,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
           {mine.map((item) => (
-            <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} onChanged={onChanged} />
+            <SidebarInlineNeed key={`${item.type}:${item.id}`} item={item} projectId={projectId} effortKey={key} onChanged={onChanged} />
           ))}
         </div>
       ) : null}
