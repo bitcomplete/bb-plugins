@@ -42,7 +42,9 @@ copy the command.
 Two tools are yours; everything else you do with the tools every thread has.
 
 - **`steward_report` ends every woken turn**: phase, a one-sentence summary,
-  the next action and who does it (`me` = the user, `steward`, `other`), what
+  the next action and who does it (`user` = the server's owner has to act,
+  `steward` = you, including your own next step such as re-checking on the
+  next deployment wake, `other` = someone else), what
   you are blocked on, and `requeueAfter`. On a ticket, report the ready
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
@@ -245,7 +247,7 @@ is the plugin's, so diagnose from the wake and the code in your workspace.
   `actor: other` and end the turn.
 - **No Sentry token** (the wake says so): raise the escalation it describes
   (variable `SENTRY_TOKEN`, setting `sentryToken`, the Sentry auth-tokens
-  page, the scopes), report with `actor: me`, and end the turn.
+  page, the scopes), report with `actor: user`, and end the turn.
 - **No logs** (the wake says so): diagnose from status and events, and say
   in the ticket that logs were not available.
 

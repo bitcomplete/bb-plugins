@@ -109,7 +109,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 - **Two tools.** `steward_report` ends a turn with the status record and,
   when needed, an escalation; `steward_update` steers a binding (guidance,
   deciding or forwarding escalations, priority, holds, models, approving a
-  spec).
+  spec). The report's `actor` names who acts next: `user` (the server's
+  owner has to act), `steward` (the steward itself, including its own next
+  step such as re-checking on the next deployment wake) or `other`
+  (someone else).
 - **Scheduling.** Two tickets changing the same files at once end in a
   rebase for whichever merges second, so the project steward sequences
   them. Each steward reports the repo-relative paths its work changes

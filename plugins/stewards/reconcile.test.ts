@@ -270,7 +270,7 @@ describe("approval words", () => {
   });
 
   it("flags a report that asks for an approval already open, and only that", () => {
-    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "me" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "user" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
     const open = [{ kind: "approval" } as never];
     expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), open)).toMatch(/already open/u);
     // Waiting on the request, or on the project steward, is not asking again.
