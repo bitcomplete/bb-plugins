@@ -142,6 +142,11 @@ const lineTwo = (slot: RenderedSlot, title: string): string => slot.getByText(ti
 
 const glyphOf = (slot: RenderedSlot, title: string): string | null => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")?.getAttribute("data-steward-glyph") ?? null;
 
+// BB-99: the glyph's and phrase's own class lists, so a test can assert the
+// theme tokens they paint with.
+const glyphClassOf = (slot: RenderedSlot, title: string): string => slot.getByText(title).closest("li")!.querySelector("[data-steward-glyph]")!.className;
+const phraseClassOf = (slot: RenderedSlot, title: string): string => slot.getByText(title).closest("li")!.querySelector("[data-sidebar-line-two] span")!.className;
+
 let app: CapturedPluginApp | null = null;
 const loadApp = async () => {
   app ??= await loadPluginApp(() => import("./app.js"));
@@ -651,6 +656,52 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(lineTwo(slot, "Fix login")).toBe("ticket · wait for CI");
     expect(glyphOf(slot, "Fix login")).toBe("quiet");
+    slot.lifecycle.unmount();
+  });
+
+  // BB-99: the glyph and phrase paint with bb's theme tokens, so Tailwind keeps
+  // a rule for each class and the colours follow bb's theme, not the OS.
+  it("paints the four glyphs and phrases with bb theme tokens", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [
+          thread({ id: "thr_you", displayTitle: "ENG-1: Needs you" }),
+          thread({ id: "thr_blocked", displayTitle: "ENG-2: Red row" }),
+          thread({ id: "thr_running", displayTitle: "ENG-3: Working" }),
+          thread({ id: "thr_quiet", displayTitle: "ENG-4: Waiting" }),
+        ],
+      },
+      rpc: {
+        stewardsSidebar: () =>
+          sidebarData({
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", blockedOn: "a review" }),
+              binding({ key: "ENG-3", threadId: "thr_running", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
+              binding({ key: "ENG-4", threadId: "thr_quiet", status: { actor: "steward", nextAction: "wait for CI", at: 1 } }),
+            ],
+          }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Needs you")).toBeTruthy());
+    await waitFor(() => expect(slot.getByText("Waiting")).toBeTruthy());
+    expect(glyphOf(slot, "Needs you")).toBe("you");
+    expect(glyphClassOf(slot, "Needs you")).toContain("bg-attention");
+    expect(phraseClassOf(slot, "Needs you")).toContain("text-attention");
+    expect(glyphOf(slot, "Red row")).toBe("blocked");
+    expect(glyphClassOf(slot, "Red row")).toContain("border-destructive");
+    expect(phraseClassOf(slot, "Red row")).toContain("text-destructive");
+    expect(glyphOf(slot, "Working")).toBe("running");
+    expect(glyphClassOf(slot, "Working")).toContain("border-timeline-accent");
+    expect(phraseClassOf(slot, "Working")).toContain("text-timeline-accent");
+    expect(glyphOf(slot, "Waiting")).toBe("quiet");
+    expect(glyphClassOf(slot, "Waiting")).toContain("border-muted-foreground/50");
+    expect(phraseClassOf(slot, "Waiting")).toContain("text-muted-foreground");
+    // Criterion 3: no raw palette class remains on any of the four rows.
+    for (const title of ["Needs you", "Red row", "Working", "Waiting"]) {
+      expect(`${glyphClassOf(slot, title)} ${phraseClassOf(slot, title)}`).not.toMatch(/\b(?:text|bg|border)-(?:blue|amber|red)-/u);
+    }
     slot.lifecycle.unmount();
   });
 
