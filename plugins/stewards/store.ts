@@ -5,9 +5,11 @@
 // The binding row is the truth a steward is woken from. Its transcript is
 // not: a wake carries everything the steward needs, read from here and from a
 // fresh snapshot, so compaction loses nothing that matters.
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
+import { effortPhrase } from "./sidebar.js";
 import { entitySnapshotSchema, type Source } from "./source-contract.js";
 import type { BindingKind, EscalationKind, Stage } from "./config.js";
 import { depsLookSchema, type DepsLook } from "./deps.js";
@@ -726,10 +728,11 @@ export type BindingPatch = Partial<Pick<Binding, keyof typeof COLUMNS>>;
 /**
  * The binding columns the sidebar, the board and the overview show (BB-90).
  * `patch` rings the realtime channel only when one of these actually changed
- * before and after; a write to `lastJudgmentAt`, `lastSnapshot`, `wokeAt`,
- * `awaitingReport`, `missedReports`, `archiveWhenIdle`, `manualDetach`, a
- * model-check flag or the like changes nothing a page renders and stays
- * silent, as does setting a field to the value it already had.
+ * before and after, and `status` / `pending` only when the row's derived phrase
+ * (`sidebar.ts` rules) changed too (BB-95); a write to `lastJudgmentAt`,
+ * `lastSnapshot`, `wokeAt`, `awaitingReport`, `missedReports`, `archiveWhenIdle`,
+ * `advancedAt`, a model-check flag or the like changes nothing a page renders
+ * and stays silent, as does setting a field to the value it already had.
  */
 const VISIBLE_COLUMNS = [
   "stage",
@@ -739,7 +742,6 @@ const VISIBLE_COLUMNS = [
   "status",
   "pending",
   "requeue_at",
-  "advanced_at",
   "deployments",
   "title",
   "url",
@@ -1009,7 +1011,7 @@ export const newId = (prefix: string) => `${prefix}_${randomBytes(9).toString("b
  * channel; the store itself knows nothing about bb.
  */
 export interface StoreOptions {
-  onProjectChange?: (projectId: string) => void;
+  onProjectChange?: (projectId: string, columns: string[]) => void;
 }
 
 export function createStore(db: Database.Database, now: () => number, options: StoreOptions = {}) {
@@ -1341,24 +1343,85 @@ export function createStore(db: Database.Database, now: () => number, options: S
     return b === undefined ? null : String(b.project_id);
   }
 
-  // A project-visible change is coalesced within one synchronous store
-  // operation, so one question filed or answered publishes exactly one event
-  // even when the operation nests (answer -> resolve) or closes a migrated
-  // need through resolve, and a turn that writes several fields publishes one
-  // signal. The flush runs when the outermost operation finishes.
-  let notifyDepth = 0;
-  const dirtyProjects = new Set<string>();
-
-  function flushProjectChanged(): void {
-    const projects = [...dirtyProjects];
-    dirtyProjects.clear();
-    if (onProjectChange !== undefined) for (const projectId of projects) onProjectChange(projectId);
+  /**
+   * Whether the row would show "needs you" (BB-76). Mirrors server.ts's
+   * `needsUser`, since a `status`/`pending` write can only ring when it changes
+   * the row's derived phrase, and "needs you" is the first rule.
+   */
+  function needsUserFor(b: Binding): boolean {
+    return (
+      b.status?.actor === "me" ||
+      openEscalations.all(b.id).length > 0 ||
+      needsFor.all(b.id, 0).length > 0 ||
+      openQuestions.all(b.projectId).some((q) => q.binding_id === b.id)
+    );
   }
 
-  /** Mark a project's visible state changed; publishes now, or on the way out of a nested operation. */
-  function projectChanged(projectId: string | null | undefined): void {
+  /**
+   * The phrase the sidebar row shows for a binding, from the rules in
+   * `sidebar.ts` (BB-76). A `status` or `pending` write rings the refetch
+   * channel only when this changes, so a rewrite that reads the same stays
+   * silent (BB-95). `now` is the clock for a `next look` phrase.
+   */
+  function bindingPhrase(b: Binding, now: number): string {
+    const newestDeployment = Object.values(b.deployments).sort((x, y) => y.at - x.at)[0] ?? null;
+    return effortPhrase(
+      {
+        busy: false,
+        runningWorkers: 0,
+        needsUser: needsUserFor(b),
+        blockedOn: b.status?.blockedOn ?? null,
+        hold: b.hold,
+        holdBehind: b.holdBehind,
+        stuck: openEscalations.all(b.id).some((x) => x.kind === "stuck"),
+        statusActor: b.status?.actor ?? null,
+        statusNextAction: b.status?.nextAction ?? null,
+        deployment: newestDeployment === null ? null : newestDeployment.state,
+        pending: b.pending,
+        requeueAt: b.requeueAt,
+      },
+      now,
+    );
+  }
+
+  // A project-visible change is coalesced: within one synchronous store
+  // operation (a nested write publishes once), and across a whole steward turn
+  // when one is wrapped in `coalescingTurn`, so a turn that reports status,
+  // changes stage and starts a worker publishes one signal per project. The
+  // columns that changed ride along so the published signal can be logged.
+  let notifyDepth = 0;
+  const dirtyProjects = new Map<string, Set<string>>();
+
+  function addDirty(projects: Map<string, Set<string>>, projectId: string, columns: readonly string[]): void {
+    const set = projects.get(projectId) ?? new Set<string>();
+    for (const column of columns) set.add(column);
+    projects.set(projectId, set);
+  }
+
+  function publish(projects: Map<string, Set<string>>): void {
+    if (onProjectChange === undefined) return;
+    for (const [projectId, columns] of projects) onProjectChange(projectId, [...columns]);
+  }
+
+  function flushProjectChanged(): void {
+    if (dirtyProjects.size === 0) return;
+    const entries = new Map(dirtyProjects);
+    dirtyProjects.clear();
+    publish(entries);
+  }
+
+  /** The turn a tool handler or event handler is running in, when one is. */
+  const turnDirty = new AsyncLocalStorage<Map<string, Set<string>>>();
+
+  /** Mark a project's visible state changed; publishes now, or on the way out of a nested operation or turn. */
+  function projectChanged(projectId: string | null | undefined, columns: readonly string[] = []): void {
     if (onProjectChange === undefined || projectId === null || projectId === undefined || projectId === "") return;
-    dirtyProjects.add(projectId);
+    const turn = turnDirty.getStore();
+    if (turn !== undefined) {
+      addDirty(turn, projectId, columns);
+      return;
+    }
+    addDirty(dirtyProjects, projectId, columns);
     if (notifyDepth === 0) flushProjectChanged();
   }
 
@@ -1376,6 +1439,30 @@ export function createStore(db: Database.Database, now: () => number, options: S
       if (notifyDepth === 0) dirtyProjects.clear();
       throw error;
     }
+  }
+
+  /**
+   * Run an async steward turn, flushing one signal per project when it ends.
+   * `AsyncLocalStorage` keeps each turn's marks to itself, so two turns that
+   * overlap (a tool call and a thread event) never merge, and a nested call
+   * joins the turn already under way. On error the marks are published too: a
+   * write before the failure is still visible to the next refetch.
+   */
+  function coalescingTurn<T>(fn: () => Promise<T>): Promise<T> {
+    if (turnDirty.getStore() !== undefined) return fn();
+    const dirty = new Map<string, Set<string>>();
+    return turnDirty.run(dirty, async () => {
+      try {
+        return await fn();
+      } finally {
+        publish(dirty);
+      }
+    });
+  }
+
+  /** Wrap an async handler so its whole body is one turn (the tool and event registrations). */
+  function coalescingTool<A extends unknown[], R>(fn: (...args: A) => Promise<R>): (...args: A) => Promise<R> {
+    return (...args: A) => coalescingTurn(() => fn(...args));
   }
 
   /**
@@ -1460,15 +1547,34 @@ export function createStore(db: Database.Database, now: () => number, options: S
     const after = writeBinding(id, fields);
     const b = rowToBinding(after);
     // A field the sidebar or board shows changing rings the refetch channel;
-    // per-turn bookkeeping (lastJudgmentAt, lastSnapshot, wokeAt, …) and a
-    // same-value write change nothing visible and stay silent. Ending or
+    // per-turn bookkeeping (lastJudgmentAt, lastSnapshot, wokeAt, advancedAt, …)
+    // and a same-value write change nothing visible and stay silent. Ending or
     // reopening a binding is covered here too: endedAt is one of these fields,
     // so its needs and with-user escalations leave or return with the signal.
-    if (before !== undefined && VISIBLE_COLUMNS.some((c) => before[c] !== after[c])) projectChanged(b.projectId);
+    // `status` and `pending` change on almost every turn, so they ring only
+    // when the row's derived phrase (`sidebar.ts` rules) actually changed
+    // (BB-95).
+    if (before !== undefined) {
+      const changed = VISIBLE_COLUMNS.filter((c) => before[c] !== after[c]);
+      if (changed.length > 0) {
+        const phraseGated = changed.every((c) => c === "status" || c === "pending");
+        if (!phraseGated) projectChanged(b.projectId, changed);
+        else {
+          const at = now();
+          if (bindingPhrase(rowToBinding(before), at) !== bindingPhrase(b, at)) projectChanged(b.projectId, changed);
+        }
+      }
+    }
     return b;
   }
 
   return {
+    /** Run a synchronous handler as one operation, publishing at most one signal per project (BB-90). */
+    coalescing,
+    /** Run an async handler as one turn, publishing at most one signal per project (BB-95). */
+    coalescingTurn,
+    /** Wrap an async handler so its whole body is one turn (BB-95). */
+    coalescingTool,
     binding(id: string): Binding | null {
       const r = getBinding.get(id);
       return r === undefined ? null : rowToBinding(r);
@@ -1868,7 +1974,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     addWorker(threadId: string, bindingId: string, title: string): void {
       insertWorker.run(threadId, bindingId, title, now());
       // A worker starting moves its row at once, like any visible field.
-      projectChanged(projectIdForBinding(bindingId));
+      projectChanged(projectIdForBinding(bindingId), ["workers"]);
     },
     worker(threadId: string): Worker | null {
       const r = getWorker.get(threadId);
@@ -1886,7 +1992,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const w = getWorker.get(threadId);
       // A worker finishing or being stopped moves its row at once, but a repeat
       // write of the same status changes nothing visible and stays silent.
-      if (w !== undefined && (before === undefined || before.status !== w.status)) projectChanged(projectIdForBinding(String(w.binding_id)));
+      if (w !== undefined && (before === undefined || before.status !== w.status)) projectChanged(projectIdForBinding(String(w.binding_id)), ["workers"]);
     },
     /** Whether the worker's model is still to be checked when its first turn is dispatched. */
     setWorkerModelCheckPending(threadId: string, pending: boolean): void {

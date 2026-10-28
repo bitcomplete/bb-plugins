@@ -429,13 +429,21 @@ export function compareInflight(a: EffortOrder, b: EffortOrder): number {
 }
 
 /** Every live project gets a tab; a project with no stewards still gets its one-off threads. */
-export function buildSidebar(input: {
-  projects: readonly SidebarLiveProject[];
-  threads: readonly SidebarLiveThread[];
-  data: readonly SidebarProjectData[];
-  /** The clock for relative phrases (BB-83); the wall clock when left out. */
-  now?: number;
-}): SidebarTab[] {
+export function buildSidebar(
+  input: {
+    projects: readonly SidebarLiveProject[];
+    threads: readonly SidebarLiveThread[];
+    data: readonly SidebarProjectData[];
+    /** The clock for relative phrases (BB-83); the wall clock when left out. */
+    now?: number;
+  },
+  /**
+   * The tabs from the previous call, if any. An effort whose inputs are
+   * unchanged is handed back by identity, so a memoised row skips a render on
+   * a same-content refetch or a host thread-list tick (BB-95).
+   */
+  previous?: readonly SidebarTab[],
+): SidebarTab[] {
   const now = input.now ?? Date.now();
   const dataByProject = new Map(input.data.map((d) => [d.projectId, d] as const));
   const threadsByProject = new Map<string, SidebarLiveThread[]>();
@@ -444,7 +452,61 @@ export function buildSidebar(input: {
     list.push(t);
     threadsByProject.set(t.projectId, list);
   }
-  return input.projects.map((project) => buildTab(project, dataByProject.get(project.id), threadsByProject.get(project.id) ?? [], now));
+  const previousById = new Map((previous ?? []).map((t) => [t.projectId, t] as const));
+  return input.projects.map((project) => reconcileTab(buildTab(project, dataByProject.get(project.id), threadsByProject.get(project.id) ?? [], now), previousById.get(project.id)));
+}
+
+/**
+ * Hand back the previous effort objects whose inputs are unchanged. The
+ * comparison is the whole derived object, so the reused object is exactly the
+ * one this call would have built (BB-95).
+ */
+function reconcileEfforts(next: SidebarEffort[], previous: readonly SidebarEffort[] | undefined): SidebarEffort[] {
+  if (previous === undefined || previous.length === 0) return next;
+  const byKey = new Map(previous.map((e) => [e.key, e] as const));
+  return next.map((effort) => {
+    const before = byKey.get(effort.key);
+    return before !== undefined && JSON.stringify(before) === JSON.stringify(effort) ? before : effort;
+  });
+}
+
+function reconcileEnded(next: SidebarEndedEffort[], previous: readonly SidebarEndedEffort[] | undefined): SidebarEndedEffort[] {
+  if (previous === undefined || previous.length === 0) return next;
+  const byKey = new Map(previous.map((e) => [e.key, e] as const));
+  return next.map((effort) => {
+    const before = byKey.get(effort.key);
+    return before !== undefined && JSON.stringify(before) === JSON.stringify(effort) ? before : effort;
+  });
+}
+
+/** Whether every effort in `next` is the same object the previous tab held, in the same order. */
+function sameEfforts(next: readonly SidebarEffort[], previous: readonly SidebarEffort[] | undefined): boolean {
+  return previous !== undefined && next.length === previous.length && next.every((e, i) => e === previous[i]);
+}
+
+/** Hand back the previous tab object when nothing in it changed. */
+function reconcileTab(next: SidebarTab, previous: SidebarTab | undefined): SidebarTab {
+  if (previous === undefined) return next;
+  const blocked = reconcileEfforts(next.blocked, previous.blocked);
+  const efforts = reconcileEfforts(next.efforts, previous.efforts);
+  const threads = reconcileEfforts(next.threads, previous.threads);
+  const monitors = reconcileEfforts(next.monitors, previous.monitors);
+  const ended = reconcileEnded(next.ended, previous.ended);
+  if (
+    next.projectId === previous.projectId &&
+    next.name === previous.name &&
+    next.isPersonal === previous.isPersonal &&
+    next.projectStewardThreadId === previous.projectStewardThreadId &&
+    sameEfforts(blocked, previous.blocked) &&
+    sameEfforts(efforts, previous.efforts) &&
+    sameEfforts(threads, previous.threads) &&
+    sameEfforts(monitors, previous.monitors) &&
+    ended.length === previous.ended.length &&
+    ended.every((e, i) => e === previous.ended[i])
+  ) {
+    return previous;
+  }
+  return { ...next, blocked, efforts, threads, monitors, ended };
 }
 
 function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefined, threads: readonly SidebarLiveThread[], now: number): SidebarTab {

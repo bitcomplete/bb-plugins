@@ -10,8 +10,7 @@
 // item's button. Settings → Plugins → Stewards: which projects are stewarded
 // and whether their configuration is healthy, then every open steward and
 // where it stands. Steering stays with the project steward and the CLI.
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Markdown,
   ThreadTitle,
@@ -51,6 +50,12 @@ type CheckResult = { ok: boolean; lines: string[] };
 const BOARD_PATH = "board";
 
 const POLL_MS = 30_000;
+/** How long a burst of refetch requests is coalesced into one RPC (BB-95). */
+const REFETCH_DEBOUNCE_MS = 300;
+
+/** Stable empties, so a memoised row's props keep their identity (BB-95). */
+const EMPTY_NEEDS: readonly SidebarNeedItem[] = [];
+const NO_CHILDREN: readonly SidebarChild[] = [];
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -65,37 +70,14 @@ function ago(at: number | null, now: number): string {
   return `${Math.round(s / 86_400)}d ago`;
 }
 
-/** `document.startViewTransition`, where the browser supports it (Chromium). */
-type ViewTransitionDocument = Document & { startViewTransition?: (update: () => void) => unknown };
-
-/** `Element.checkVisibility`, where the browser supports it. */
-type CheckVisibilityElement = Element & { checkVisibility?: (options?: { visibilityProperty?: boolean }) => boolean };
-
-/**
- * Whether `el` is on screen for the user, so a view transition around it is
- * worth starting (BB-91). The host keeps the sidebar mounted but hidden when
- * it is closed: on a phone the drawer sits under the page content and is
- * `inert`, and on desktop the collapsed sidebar is `inert` (rail) or
- * `visibility: hidden` (offcanvas). A view transition hoists every element
- * with a `view-transition-name` into the top layer for the crossfade, so one
- * started while the list is hidden paints its rows over whatever page is
- * showing. Without `checkVisibility` the element is taken as visible.
- */
-function onScreen(el: Element | null): boolean {
-  if (el === null || !el.isConnected) return false;
-  if (el.closest("[inert]") !== null) return false;
-  const check = (el as CheckVisibilityElement).checkVisibility;
-  return typeof check === "function" ? check.call(el, { visibilityProperty: true }) : true;
-}
-
 /**
  * What `load` returns, refetched every half minute while the page is visible,
- * and on demand. With `animate`, a commit that it approves is wrapped in a view
- * transition so the browser animates rows moving between sections (BB-91); the
- * caller passes a check that its animated surface is on screen, since a
- * transition captures every named element in the document, hidden or not.
+ * and on demand. A burst of `refetch()` calls — a steward turn publishing
+ * several signals — is coalesced over `REFETCH_DEBOUNCE_MS`, so the burst makes
+ * one RPC; a payload deep-equal to the current one is dropped, so an unchanged
+ * answer re-renders nothing. The 30 s poll stays the fallback (BB-95).
  */
-function usePolled<T>(load: () => Promise<T>, animate?: () => boolean): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
+function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   // True once a load has been on screen for a paint, so the first load's rows
@@ -104,51 +86,58 @@ function usePolled<T>(load: () => Promise<T>, animate?: () => boolean): { data: 
   const mounted = useRef(true);
   // Only the latest call lands, so a slow answer for the last project does not replace this one's.
   const latest = useRef(0);
-  const refetch = useCallback(() => {
+  // The payload last committed, so a byte-identical answer is dropped (BB-95).
+  const current = useRef<T | null>(null);
+  const pending = useRef<number | null>(null);
+  const run = useCallback(() => {
+    pending.current = null;
     const call = ++latest.current;
     load().then(
       (o) => {
         if (!mounted.current || call !== latest.current) return;
-        const commit = () => {
-          setData(o);
+        if (current.current !== null && JSON.stringify(current.current) === JSON.stringify(o)) {
           setError(null);
-        };
-        // A view transition around the commit lets the browser animate a row
-        // moving between sections; without the API, or when the caller's
-        // surface is off screen, the commit is plain (BB-91).
-        const start = (document as ViewTransitionDocument).startViewTransition;
-        if (typeof start !== "function" || animate === undefined || !animate()) return commit();
-        try {
-          start.call(document, () => flushSync(commit));
-        } catch {
-          commit();
+          return;
         }
+        current.current = o;
+        setData(o);
+        setError(null);
       },
       (e: unknown) => {
         if (mounted.current && call === latest.current) setError(message(e));
       },
     );
-  }, [load, animate]);
+  }, [load]);
+  const refetch = useCallback(() => {
+    if (pending.current !== null) window.clearTimeout(pending.current);
+    pending.current = window.setTimeout(() => {
+      pending.current = null;
+      run();
+    }, REFETCH_DEBOUNCE_MS);
+  }, [run]);
   // A paint after the first successful load, so rows that mount later animate.
   useEffect(() => {
     if (data !== null) setLoaded(true);
   }, [data]);
   useEffect(() => {
     mounted.current = true;
-    refetch();
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") refetch();
+    // The first load and the fallback poll are immediate; only the burst a
+    // realtime signal makes is debounced (BB-95).
+    run();
+    const poll = window.setInterval(() => {
+      if (document.visibilityState === "visible") run();
     }, POLL_MS);
     const onVisibility = () => {
-      if (document.visibilityState === "visible") refetch();
+      if (document.visibilityState === "visible") run();
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       mounted.current = false;
-      window.clearInterval(timer);
+      window.clearInterval(poll);
+      if (pending.current !== null) window.clearTimeout(pending.current);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [refetch]);
+  }, [run]);
   return { data, error, loaded, refetch };
 }
 
@@ -1265,17 +1254,6 @@ function phraseClass(state: SidebarEffortState): string {
 }
 
 /**
- * A CSS-safe `view-transition-name` for one row, from the row kind and key
- * (BB-91): the kind keeps an effort row and an ended row with the same binding
- * key apart, and the hash keeps two keys that sanitise alike apart.
- */
-function viewTransitionName(kind: "effort" | "ended" | "thread", key: string): string {
-  let hash = 0;
-  for (let i = 0; i < key.length; i += 1) hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
-  return `stewards-${kind}-${key.replace(/[^A-Za-z0-9_-]/gu, "-")}-${(hash >>> 0).toString(36)}`;
-}
-
-/**
  * The four glyphs, in precedence order (BB-76): a solid yellow dot when it
  * waits on you, an empty red ring when blocked, a blue ring that pulses slowly
  * while a worker or agent runs, an empty grey ring when quiet. The pulse is
@@ -1295,20 +1273,22 @@ function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
   return "quiet";
 }
 
-/** One thread row: a glyph, title and context menu, expanding into its children. */
-function SidebarThreadRow({
-  thread,
-  children,
-  depth,
-  byId,
-  onNavigate,
-  meta,
-  titleAttr,
-  glyph,
-  activeThreadId,
-  openThreads,
-  entered = false,
-}: {
+/**
+ * Per-row render counters, for the sidebar tests to assert that a same-content
+ * refetch or host tick re-renders only the row whose data changed (BB-95).
+ * Exported for `sidebar-app.test.tsx`; the production cost is one map write per
+ * row render.
+ */
+export const rowRenderCounts = new Map<string, number>();
+function useRenderProbe(key: string): void {
+  useEffect(() => {
+    // A cap keeps the probe from growing without bound over a long session.
+    if (rowRenderCounts.size > 500) rowRenderCounts.clear();
+    rowRenderCounts.set(key, (rowRenderCounts.get(key) ?? 0) + 1);
+  });
+}
+
+type SidebarThreadRowProps = {
   thread: PluginSidebarThread;
   role: SidebarChildRole;
   children: readonly SidebarChild[];
@@ -1327,7 +1307,45 @@ function SidebarThreadRow({
   openThreads: ReadonlySet<string>;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
-}) {
+};
+
+/**
+ * Whether two `SidebarThreadRow` prop sets render the same output. `byId` is
+ * ignored: it is a new Map whenever the host's thread list ticks, and the row
+ * only reads it for threads whose own changes already arrive through `thread`
+ * and `children`. `openThreads` is compared only for this row's own
+ * membership, so a new Set with the same members is not a change (BB-95).
+ */
+function sameThreadRowProps(a: SidebarThreadRowProps, b: SidebarThreadRowProps): boolean {
+  return (
+    a.thread === b.thread &&
+    a.children === b.children &&
+    a.depth === b.depth &&
+    a.onNavigate === b.onNavigate &&
+    a.meta === b.meta &&
+    a.titleAttr === b.titleAttr &&
+    a.glyph === b.glyph &&
+    a.activeThreadId === b.activeThreadId &&
+    a.entered === b.entered &&
+    a.openThreads.has(a.thread.id) === b.openThreads.has(b.thread.id)
+  );
+}
+
+/** One thread row: a glyph, title and context menu, expanding into its children. */
+const SidebarThreadRow = memo(function SidebarThreadRow({
+  thread,
+  children,
+  depth,
+  byId,
+  onNavigate,
+  meta,
+  titleAttr,
+  glyph,
+  activeThreadId,
+  openThreads,
+  entered = false,
+}: SidebarThreadRowProps) {
+  useRenderProbe(`thread:${thread.id}`);
   const navigate = useBbNavigate();
   const rowStatus = useSidebarThreadRowStatus(thread.id);
   const draft = useSidebarThreadDraft(thread.id);
@@ -1347,7 +1365,7 @@ function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName("thread", thread.id) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1397,7 +1415,7 @@ function SidebarThreadRow({
       ) : null}
     </li>
   );
-}
+}, sameThreadRowProps);
 
 /**
  * The inline "needs you" block under an effort row's line two (BB-76): the
@@ -1470,21 +1488,7 @@ function SidebarInlineNeed({ item, onChanged }: { item: SidebarNeedItem; onChang
  * a real link to its detail view (BB-85) and is highlighted while the board
  * shows that effort.
  */
-function SidebarEffortRow({
-  effort,
-  needs,
-  byId,
-  projectId,
-  activeKey,
-  activeThreadId,
-  openThreads,
-  onNavigate,
-  onChanged,
-  trailing,
-  rowKind = "effort",
-  viewTransitionKey,
-  entered = false,
-}: {
+type SidebarEffortRowProps = {
   effort: SidebarEffort;
   needs: readonly SidebarNeedItem[];
   byId: ReadonlyMap<string, PluginSidebarThread>;
@@ -1499,13 +1503,53 @@ function SidebarEffortRow({
   onChanged: () => void;
   /** A right-aligned stamp after the title, for a Recently ended row's `ended N ago` (BB-88). */
   trailing?: ReactNode;
-  /** Which row this is for the view-transition name: a live effort or a Recently ended one (BB-91). */
-  rowKind?: "effort" | "ended";
-  /** The row's stable key for the view-transition name, when it differs from the effort key (an ended row's `endedAt`). */
-  viewTransitionKey?: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
-}) {
+};
+
+/**
+ * Whether two `SidebarEffortRow` prop sets render the same output. `effort` is
+ * structurally shared by `buildSidebar`, so an unchanged effort keeps its
+ * identity. `byId` is ignored (a new Map on every host tick); the needs this
+ * row shows are compared by content, since the RPC hands back fresh objects
+ * (BB-95).
+ */
+function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps): boolean {
+  if (
+    a.effort !== b.effort ||
+    a.projectId !== b.projectId ||
+    a.activeKey !== b.activeKey ||
+    a.activeThreadId !== b.activeThreadId ||
+    a.onNavigate !== b.onNavigate ||
+    a.onChanged !== b.onChanged ||
+    a.trailing !== b.trailing ||
+    a.entered !== b.entered ||
+    a.openThreads.has(a.effort.rootThreadId) !== b.openThreads.has(b.effort.rootThreadId)
+  ) {
+    return false;
+  }
+  const key = a.effort.bindingKey;
+  const aMine = key === null ? EMPTY_NEEDS : a.needs.filter((item) => item.bindingKey === key);
+  const bMine = key === null ? EMPTY_NEEDS : b.needs.filter((item) => item.bindingKey === key);
+  if (aMine.length !== bMine.length) return false;
+  for (let i = 0; i < aMine.length; i += 1) if (JSON.stringify(aMine[i]) !== JSON.stringify(bMine[i])) return false;
+  return true;
+}
+
+const SidebarEffortRow = memo(function SidebarEffortRow({
+  effort,
+  needs,
+  byId,
+  projectId,
+  activeKey,
+  activeThreadId,
+  openThreads,
+  onNavigate,
+  onChanged,
+  trailing,
+  entered = false,
+}: SidebarEffortRowProps) {
+  useRenderProbe(`effort:${effort.key}`);
   const root = byId.get(effort.rootThreadId);
   const navigate = useBbNavigate();
   const pluginId = experimental_usePluginId();
@@ -1572,7 +1616,7 @@ function SidebarEffortRow({
     </div>
   );
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`} style={{ viewTransitionName: viewTransitionName(rowKind, viewTransitionKey ?? effort.key) }}>
+    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
@@ -1595,7 +1639,7 @@ function SidebarEffortRow({
       ) : null}
     </li>
   );
-}
+}, sameEffortRowProps);
 
 function SidebarSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
   return (
@@ -1608,7 +1652,7 @@ function SidebarSection({ title, count, children }: { title: string; count: numb
   );
 }
 
-function SidebarCollapsible({ title, count, revealed = false, unread = false, children }: { title: string; count: number; revealed?: boolean; /** Whether a thread in the section is unread, so an untouched section opens (BB-80). */ unread?: boolean; children: ReactNode }) {
+const SidebarCollapsible = memo(function SidebarCollapsible({ title, count, revealed = false, unread = false, children }: { title: string; count: number; revealed?: boolean; /** Whether a thread in the section is unread, so an untouched section opens (BB-80). */ unread?: boolean; children: ReactNode }) {
   // An untouched section follows the unread state of the threads in it
   // (BB-80); a manual toggle always wins.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
@@ -1641,7 +1685,7 @@ function SidebarCollapsible({ title, count, revealed = false, unread = false, ch
       </div>
     </section>
   );
-}
+});
 
 /**
  * The project dropdown, always a native `<select>`, with the per-project needs
@@ -1649,7 +1693,7 @@ function SidebarCollapsible({ title, count, revealed = false, unread = false, ch
  * project — the host's own New thread button cannot be retargeted from a thread
  * list — then closes the mobile drawer.
  */
-function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
+const ProjectTabs = memo(function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Array<{ projectId: string; name: string }>; counts: ReadonlyMap<string, number>; activeId: string | null; onPick: (projectId: string) => void; onNewThread: () => void }) {
   return (
     <div className="flex items-center gap-1 px-2 py-1.5">
       <div className="relative min-w-0 flex-1">
@@ -1687,7 +1731,7 @@ function ProjectTabs({ tabs, counts, activeId, onPick, onNewThread }: { tabs: Ar
       ) : null}
     </div>
   );
-}
+});
 
 /** Whether `id` is anywhere in a child tree. */
 function subtreeHas(children: readonly SidebarChild[], id: string): boolean {
@@ -1763,14 +1807,16 @@ function StewardsSidebarCore({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const { status, threads, projects } = experimental_useSidebarThreads();
-  // The list's root, so a poll animates only while the list is on screen and
-  // not from under a closed drawer (BB-91).
-  const root = useRef<HTMLDivElement>(null);
-  const { data, error, loaded, refetch } = usePolled(
-    useCallback(() => rpc.call("stewardsSidebar", null), [rpc]),
-    useCallback(() => onScreen(root.current), []),
-  );
-  const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }), [projects, threads, data]);
+  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
+  // The previous tabs, so `buildSidebar` can hand back the same effort and
+  // thread objects for unchanged rows and the memoised rows skip a render
+  // (BB-95). The ref is written during render; the call is idempotent.
+  const previousTabs = useRef<readonly SidebarTab[]>([]);
+  const tabs = useMemo(() => {
+    const next = buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }, previousTabs.current);
+    previousTabs.current = next;
+    return next;
+  }, [projects, threads, data]);
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
   // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
   const counts = useMemo(() => new Map(tabs.map((t) => [t.projectId, t.blocked.filter((e) => e.state === "you").length] as const)), [tabs]);
@@ -1804,12 +1850,19 @@ function StewardsSidebarCore({
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
   // The picker changes local state and, while the Stewards panel is mounted,
-  // moves the page so the two cannot disagree.
-  const pick = (projectId: string) => {
-    setPicked(projectId);
-    if (boardRoute.projectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
-  };
-  const needItems = activeNeeds?.items ?? [];
+  // moves the page so the two cannot disagree. Stable, so `ProjectTabs` can be
+  // memoised (BB-95).
+  const pick = useCallback(
+    (projectId: string) => {
+      setPicked(projectId);
+      if (boardRoute.projectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
+    },
+    [boardRoute.projectId, navigate],
+  );
+  const newThread = useCallback(() => {
+    if (active !== null) onNewThread(active.projectId);
+  }, [active, onNewThread]);
+  const needItems = activeNeeds?.items ?? EMPTY_NEEDS;
   const rows = (list: readonly SidebarEffort[]) =>
     list.map((e) => (
       <SidebarEffortRow
@@ -1827,15 +1880,13 @@ function StewardsSidebarCore({
       />
     ));
   return (
-    <div ref={root} className="flex h-full flex-col text-sm">
+    <div className="flex h-full flex-col text-sm">
       <ProjectTabs
         tabs={tabs}
         counts={counts}
         activeId={active?.projectId ?? null}
         onPick={pick}
-        onNewThread={() => {
-          if (active !== null) onNewThread(active.projectId);
-        }}
+        onNewThread={newThread}
       />
       {status === "loading" && data === null ? (
         <p className="p-3 text-muted-foreground">Loading…</p>
@@ -1888,8 +1939,6 @@ function StewardsSidebarCore({
                     onNavigate={onNavigate}
                     onChanged={refetch}
                     trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
-                    rowKind="ended"
-                    viewTransitionKey={`${e.key}-${e.endedAt}`}
                     entered={loaded}
                   />
                 ))}
@@ -1901,7 +1950,7 @@ function StewardsSidebarCore({
               <SidebarThreadRow
                 thread={byId.get(active.projectStewardThreadId)!}
                 role="thread"
-                children={[]}
+                children={NO_CHILDREN}
                 depth={0}
                 byId={byId}
                 onNavigate={onNavigate}
