@@ -1,10 +1,13 @@
 // The host entry: the part of stewards that runs on the developer's machine,
 // where kubectl and its kubeconfig are. It runs only what kubectlRefusal
-// allows (get, describe, logs, auth can-i), whatever the server sends.
+// allows (get, describe, logs, auth can-i), whatever the server sends, and it
+// reads a project checkout's `.bb` from `origin/<default>` for the native
+// project source (project-git.ts).
 import { execFile } from "node:child_process";
 import { experimental_defineHostEntry, experimental_sanitizeInheritedChildProcessEnv } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./host-contract.js";
 import { kubectlRefusal } from "./kubectl.js";
+import { readProjectGit } from "./project-git.js";
 
 /** A namespace's pods as JSON can be large; past this, kubectl's output is cut and fails to parse rather than flooding the call. */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -31,5 +34,6 @@ export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
     opsKubectl: ({ args, timeoutMs }) => runKubectlHere(args, timeoutMs),
+    gitProjectFiles: ({ path, files, fetch }) => readProjectGit({ path, files, fetch }),
   },
 });

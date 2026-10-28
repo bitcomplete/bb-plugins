@@ -509,8 +509,10 @@ the choice is per developer.
 
 ## Configuration
 
-In the project's `.bb` (the multi-repo project repo), read from committed
-HEAD through multi-repo's `readProjectFiles` and `repoSet`:
+In the project's `.bb`, read from the default branch's committed tip through
+multi-repo's `readProjectFiles` and `repoSet`, or — when multi-repo is not
+installed — through native git on the project checkout's `origin/<default>`
+(`project-source.ts`):
 
 ```
 stewards/

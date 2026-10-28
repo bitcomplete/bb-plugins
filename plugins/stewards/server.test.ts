@@ -3752,6 +3752,141 @@ describe("stale-while-revalidate project configuration (BB-104)", () => {
   });
 });
 
+// BB-107: without the multi-repo plugin, stewards reads `.bb` from native git
+// on the project checkout and spawns on core's project-default environment.
+// Only a missing-plugin RPC error selects native; any other failure keeps the
+// last good multi-repo source and shows a problem line.
+describe("the native project source (BB-107)", () => {
+  type Loaded = { source: { kind: string }; file: { linear: { teams: string[] } }; repos: string[]; problems: string[] };
+  const load = (t: Awaited<ReturnType<typeof setup>>) => t.hooks.loadConfig("p1", true) as Promise<Loaded | null>;
+
+  /** A default `.bb` for the git fake, matching what world() seeds multi-repo with. */
+  const defaultFiles = (): Record<string, string | null> => ({
+    [PROJECT_FILE]: projectFileTemplate(["ENG"]),
+    [playbookPath("linear-tickets")]: LINEAR_TICKETS,
+    [playbookPath("github-prs")]: GITHUB_PRS,
+    [playbookPath("github-reviews")]: GITHUB_REVIEWS,
+  });
+
+  /** A world whose multi-repo plugin is missing: native git serves `.bb`, and every multi-repo RPC is a 404. */
+  const nativeWorld = async (missing = true) => {
+    let files: Record<string, string | null> = defaultFiles();
+    let hostError: string | null = null;
+    const gitCalls: Array<{ path: string; hostId: string | null; files: string[]; fetch: boolean }> = [];
+    const t = await setup({
+      git: async ({ hostId, path, files: paths, fetch }) => {
+        gitCalls.push({ path, hostId, files: paths, fetch });
+        return { head: "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: "https://github.com/acme/web.git", defaultBranch: "main", layout: "primary" as const, error: hostError };
+      },
+    });
+    files = t.files;
+    t.hooks.forgetConfigs();
+    const original = t.sdk.plugins.callRpc;
+    if (missing) {
+      t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+        if (args.pluginId === "multi-repo") throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
+        return original(args);
+      });
+    }
+    return { t, gitCalls, setHostError: (message: string | null) => (hostError = message) };
+  };
+
+  it("loads from native git when the multi-repo RPC reports unknown plugin", async () => {
+    const { t, gitCalls } = await nativeWorld();
+    const config = await load(t);
+    expect(config).not.toBeNull();
+    expect(config!.source.kind).toBe("native");
+    expect(config!.file.linear.teams).toEqual(["ENG"]);
+    // The repo set is the checkout's own origin.
+    expect(config!.repos).toEqual(["acme/web"]);
+    // It read the project file through the git handler, on the checkout.
+    expect(gitCalls.some((c) => c.files.includes(PROJECT_FILE))).toBe(true);
+  });
+
+  it("keeps the multi-repo source and reports a problem line when the RPC fails for another reason", async () => {
+    const t = await setup();
+    await t.flush();
+    const before = await load(t);
+    expect(before!.source.kind).toBe("multi-repo");
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.method === "readProjectFiles") throw Object.assign(new Error("the .bb is unreachable"), { code: "handler_error" });
+      return original(args);
+    });
+    const after = await load(t);
+    expect(after).not.toBeNull();
+    expect(after!.source.kind).toBe("multi-repo");
+    expect(after!.problems.some((p) => p.includes("the .bb is unreachable"))).toBe(true);
+  });
+
+  it("spawns on project-default and carries no multi-repo flag in native mode", async () => {
+    const { t } = await nativeWorld();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    expect(t.spawns[0]).toMatchObject({ environment: { type: "project-default" } });
+    const flags = await t.harness.behavior.runCli(["spawn-flags", "ENG-12", "--project", "p1"]);
+    expect(flags.stdout).toContain("bb thread spawn");
+    expect(flags.stdout).not.toContain("--environment-provider multi-repo-workspace");
+    expect(flags.stdout).not.toContain("--machine");
+    expect(t.sends.map((s) => s.text).join("\n")).not.toContain("--environment-provider multi-repo-workspace");
+  });
+
+  it("keeps an existing binding when the source switches to native", async () => {
+    // Start on multi-repo, adopt a binding, then let multi-repo disappear.
+    const { t } = await nativeWorld(false);
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const before = t.hooks.store.find("ENG-12", "p1");
+    expect(before).not.toBeNull();
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.pluginId === "multi-repo") throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
+      return original(args);
+    });
+    t.hooks.forgetConfigs();
+    const config = await load(t);
+    expect(config!.source.kind).toBe("native");
+    expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ id: before!.id, entityKey: "ENG-12" });
+    expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toContain("ENG-12");
+  });
+
+  it("fetches once per window and skips the next read's fetch", async () => {
+    const { t, gitCalls } = await nativeWorld();
+    t.advance(2 * 60_000);
+    gitCalls.length = 0;
+    await load(t);
+    expect(gitCalls.some((c) => c.fetch)).toBe(true);
+    const before = gitCalls.length;
+    await load(t);
+    const after = gitCalls.slice(before);
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.every((c) => c.fetch === false)).toBe(true);
+  });
+
+  it("surfaces a host read error as a problem line", async () => {
+    const { t, setHostError } = await nativeWorld();
+    expect(await load(t)).not.toBeNull();
+    setHostError("Larger than 200000 characters, so not read: stewards/big.md");
+    const after = await load(t);
+    expect(after).not.toBeNull();
+    expect(after!.problems.some((p) => p.includes("Larger than 200000 characters"))).toBe(true);
+  });
+
+  it("names the project source in check and the overview, for both sources", async () => {
+    const multi = await setup();
+    await multi.flush();
+    expect((await multi.harness.behavior.runCli(["check", "--project", "p1"])).stdout).toContain("Project source: multi-repo plugin");
+    const multiOverview = (await multi.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; source: string | null }> };
+    expect(multiOverview.projects.find((p) => p.projectId === "p1")?.source).toBe("multi-repo");
+
+    const { t } = await nativeWorld();
+    await t.flush();
+    expect((await t.harness.behavior.runCli(["check", "--project", "p1"])).stdout).toContain("Project source: native git");
+    const nativeOverview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; source: string | null }> };
+    expect(nativeOverview.projects.find((p) => p.projectId === "p1")?.source).toBe("native");
+  });
+});
+
 describe("the stewards sidebar call", () => {
   type Sidebar = {
     projects: Array<{ projectId: string; name: string; needsCount: number }>;
