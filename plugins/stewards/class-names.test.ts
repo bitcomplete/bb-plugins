@@ -57,13 +57,12 @@ describe("class template literals", () => {
 
 describe("built stylesheet", () => {
   // `bb plugin build` writes dist/app.css; when it has been run, check that
-  // Tailwind actually emitted every glyph and phrase colour (BB-98).
+  // Tailwind emitted the dark-mode running phrase colour. CI does not build, so
+  // this runs locally only. The scanner reads this test file too, so a class
+  // spelled out here would be emitted whatever app.tsx says: `dark:text-blue-400`
+  // is the one glyph/phrase class this file does not spell out (BB-98).
   const builtCss = join(root, "dist", "app.css");
-  it.skipIf(!existsSync(builtCss))("emits the sidebar glyph and phrase colours", () => {
-    const css = readFileSync(builtCss, "utf8");
-    for (const cls of ["bg-amber-400", "border-red-500", "border-blue-500", "text-blue-400"]) {
-      expect(css).toContain(cls);
-    }
-    expect(css).toMatch(/border-muted-foreground\\?\/50/);
+  it.skipIf(!existsSync(builtCss))("emits the dark-mode running phrase colour", () => {
+    expect(readFileSync(builtCss, "utf8")).toMatch(/\.dark\\:text-blue-400/);
   });
 });
