@@ -418,7 +418,7 @@ export const VALIDATION_MIGRATIONS = [
 // Stewards page can offer to review it, Drop can close it, and the merge is
 // observed through the source contract. Additive and defaulted: a lesson from
 // before this step has no pull request and behaves as before.
-export const LESSON_PR_MIGRATIONS = [`ALTER TABLE lessons ADD COLUMN pr TEXT`];
+export const LESSON_PR_MIGRATIONS = [`ALTER TABLE lessons ADD COLUMN pr TEXT`, `ALTER TABLE lessons ADD COLUMN retire_pr TEXT`];
 
 // BB-35 step 6: the hand-written guidance's meter. One row per (project, unit,
 // binding): the distinct-binding count is the number of rows, and the newest
@@ -986,6 +986,8 @@ export type Lesson = {
   branch: string | null;
   /** The pull request it lands as (BB-108), or null before one is opened. */
   pr: string | null;
+  /** The pull request that removes its anchored text (BB-108 retire), or null. */
+  retirePr: string | null;
   /** The canonical `.bb` commit it landed at, once merged. */
   mergeSha: string | null;
   /** The last refusal or explanation from a merge attempt, for the nightly prompt. */
@@ -1224,6 +1226,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   const lessonsFor = db.prepare<[string, number], Record<string, unknown>>("SELECT * FROM lessons WHERE project_id = ? AND (? = 1 OR status = 'pending') ORDER BY created_at");
   const setLessonBranchStmt = db.prepare("UPDATE lessons SET branch = ?, updated_at = ? WHERE id = ? AND status = 'pending'");
   const setLessonPrStmt = db.prepare("UPDATE lessons SET pr = ?, updated_at = ? WHERE id = ?");
+  const setLessonRetirePrStmt = db.prepare("UPDATE lessons SET retire_pr = ?, updated_at = ? WHERE id = ?");
   const setLessonNoteStmt = db.prepare("UPDATE lessons SET note = ?, updated_at = ? WHERE id = ?");
   const resolveLessonStmt = db.prepare(
     "UPDATE lessons SET status = ?, merge_sha = COALESCE(?, merge_sha), branch = COALESCE(?, branch), note = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?) WHERE id = ?",
@@ -1366,6 +1369,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     supersededBy: r.superseded_by === null || r.superseded_by === undefined ? null : String(r.superseded_by),
     branch: r.branch === null || r.branch === undefined ? null : String(r.branch),
     pr: r.pr === null || r.pr === undefined ? null : String(r.pr),
+    retirePr: r.retire_pr === null || r.retire_pr === undefined ? null : String(r.retire_pr),
     mergeSha: r.merge_sha === null || r.merge_sha === undefined ? null : String(r.merge_sha),
     note: r.note === null || r.note === undefined ? null : String(r.note),
     hits: Number(r.hits ?? 0),
@@ -2162,6 +2166,10 @@ export function createStore(db: Database.Database, now: () => number, options: S
     /** Remember the pull request a lesson lands as (BB-108). */
     setLessonPr(id: string, pr: string | null): void {
       setLessonPrStmt.run(pr, now(), id);
+    },
+    /** Remember the pull request that removes a lesson's anchored text (BB-108 retire). */
+    setLessonRetirePr(id: string, pr: string | null): void {
+      setLessonRetirePrStmt.run(pr, now(), id);
     },
     /** Record the last refusal or explanation from a merge attempt, for the prompt. */
     noteLesson(id: string, note: string | null): void {
