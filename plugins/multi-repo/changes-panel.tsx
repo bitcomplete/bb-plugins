@@ -625,6 +625,18 @@ export function ChangesPanel({ threadId }: { threadId: string }) {
           </div>
         )}
 
+        {workspace.predatesAdopt && (
+          <div className="rounded-md border px-3 py-2 text-xs">
+            <div className="font-medium">This workspace predates the adopt</div>
+            <p className="text-muted-foreground mt-1">
+              It was built from the standalone <code className="font-mono">.bb</code> at{" "}
+              <span className="font-mono">{workspace.projectSourcePath}</span>, and the project source is now a
+              primary repo. Guidance published from this thread goes to the old checkout; re-apply such a branch to
+              the primary by hand.
+            </p>
+          </div>
+        )}
+
         {workspace.sharedWith.length > 0 && (
           <div className="rounded-md border px-3 py-2 text-xs">
             <div className="flex items-center gap-1.5 font-medium">

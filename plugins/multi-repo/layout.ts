@@ -19,6 +19,8 @@
  * ceiling is testable without a server.
  */
 
+import type { ProjectLayout } from "./paths.js";
+
 /** Core truncates a contribution at 4096 characters. Stay under it deliberately. */
 export const INSTRUCTIONS_MAX = 4096;
 
@@ -53,6 +55,8 @@ export interface WorkspaceManifest {
   projectId: string;
   /** The shared thread branch, from `context.suggestedBranchName`. */
   branchName: string;
+  /** Which layout the project source had when this workspace was provisioned. */
+  layout: ProjectLayout;
   /** The canonical `.bb` checkout on this machine, outside the sandbox. */
   projectSourcePath: string;
   repos: WorkspaceRepo[];
@@ -129,7 +133,9 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
 
   lines.push("");
   lines.push(
-    "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
+    manifest.layout === "primary"
+      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. Changes to it are reviewed like code: commit them, publish the branch with `workspace_publish_guidance`, and land them with a pull request."
+      : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
   );
   lines.push("");
   lines.push(

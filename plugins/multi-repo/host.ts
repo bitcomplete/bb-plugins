@@ -21,10 +21,13 @@ import { readPullRequests, runPrAction } from "./gh.js";
 import { EMPTY_REPOS, resolveRepoEntry, type ReposFile } from "./repos.js";
 import type { RepoSeed } from "./contract.js";
 import {
+  adoptProjectSource,
   bootstrapProjectSource,
   cloneProjectSource,
   defaultProjectSourcePath,
+  detectProjectLayout,
   mergeGuidance,
+  preparePrimaryProjectSource,
   projectSourceBranch,
   projectSourceRemote,
   pushGuidance,
@@ -95,11 +98,13 @@ export function createMultiRepoHostEntry() {
         if (!bootstrap.bootstrapped) {
           warnings.push(...(await refreshProjectSource(input.path, input.fetchTtlMs, context.signal)));
         }
+        const layout = await detectProjectLayout(input.path, context.signal);
         return {
           bootstrapped: bootstrap.bootstrapped,
-          reposJson: await readReposJson(input.path),
+          reposJson: await readReposJson(input.path, layout, context.signal),
           remote: await projectSourceRemote(input.path, context.signal),
           defaultBranch: await projectSourceBranch(input.path, context.signal),
+          layout,
           warnings: warnings.slice(0, 20),
         };
       },
@@ -107,7 +112,10 @@ export function createMultiRepoHostEntry() {
       async readProjectSourceFiles(input, context) {
         // Never bootstraps: a read must not `git init` anyone's directory.
         const warnings = await refreshProjectSource(input.path, input.fetchTtlMs, context.signal);
-        const read = await readCommittedFiles(input.path, input.files, PROJECT_FILE_MAX_CHARS, context.signal);
+        const layout = await detectProjectLayout(input.path, context.signal);
+        const read = await readCommittedFiles(input.path, input.files, PROJECT_FILE_MAX_CHARS, context.signal, {
+          prefix: layout === "primary" ? ".bb/" : "",
+        });
         return { ...read, warnings: warnings.slice(0, 20) };
       },
 
@@ -120,7 +128,13 @@ export function createMultiRepoHostEntry() {
       },
 
       async writeProjectSourceRepos(input, context) {
-        const result = await writeReposJson(input.path, input.reposJson, input.message, context.signal);
+        const result = await writeReposJson(
+          input.path,
+          input.reposJson,
+          input.message,
+          context.signal,
+          input.layout ?? "standalone",
+        );
         return { committed: result.committed, head: result.head, message: result.message };
       },
 
@@ -139,6 +153,8 @@ export function createMultiRepoHostEntry() {
           dataDir: context.experimental_paths.dataDir,
           pathKey: input.pathKey,
           projectSourcePath: input.projectSourcePath,
+          layout: input.layout ?? "standalone",
+          primaryDir: input.primaryDir ?? null,
           repos: input.repos,
           branchName: input.branchName,
           fetchTtlMs: input.fetchTtlMs,
@@ -255,6 +271,29 @@ export function createMultiRepoHostEntry() {
           input.text,
           context.signal,
         );
+      },
+
+      async adoptProjectSource(input, context) {
+        return adoptProjectSource({
+          standalonePath: input.standalonePath,
+          primaryUrl: input.primaryUrl,
+          primaryPath: input.primaryPath,
+          branch: input.branch,
+          openPullRequest: input.openPullRequest,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        });
+      },
+
+      async preparePrimaryProjectSource(input, context) {
+        const parsed = JSON.parse(input.seed) as ReposFile;
+        return preparePrimaryProjectSource({
+          url: input.url,
+          path: input.path,
+          seed: parsed,
+          branch: input.branch,
+          openPullRequest: input.openPullRequest,
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        });
       },
     },
   });
