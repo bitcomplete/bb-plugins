@@ -34,7 +34,7 @@ function world() {
   /** Every lesson merge the plugin asked multi-repo for, and what it answered. */
   const mergeGuidanceCalls: Record<string, unknown>[] = [];
   let mergeGuidanceResult: { ok: boolean; sha: string | null; branch: string | null; message: string } | null = null;
-  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null }>();
+  const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; projectId?: string; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null; environmentStatus?: string | null; environmentPhase?: string | null; sendError?: { code: string; status: number; message: string } }>();
   /** Every `threads.delete` the plugin asked for; the plugin must only ever archive. */
   const deletes: string[] = [];
   const writes: Array<{ path: string; hostId?: string }> = [];
@@ -175,6 +175,8 @@ function world() {
         return makeThreadResponse({ id });
       },
       send: async (args: { threadId: string; input: Array<{ text: string }> }) => {
+        const t = threads.get(args.threadId);
+        if (t?.sendError !== undefined) throw Object.assign(new Error(t.sendError.message), { code: t.sendError.code, status: t.sendError.status });
         sends.push({ threadId: args.threadId, text: args.input.map((i) => i.text).join("") });
         return {};
       },
@@ -182,8 +184,8 @@ function world() {
         const t = threads.get(threadId);
         if (t === undefined) throw Object.assign(new Error("not found"), { status: 404 });
         return {
-          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, parentNotifications: (t.parentNotifications ?? "auto") as never, sectionId: t.sectionId ?? null }),
-          ...(t.hostId === undefined && t.environmentProviderId === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null, branchName: t.branchName ?? null } }),
+          ...makeThreadResponse({ id: threadId, title: t.title ?? null, status: t.status as never, archivedAt: t.archivedAt, visibility: (t.visibility ?? "visible") as never, projectId: t.projectId ?? "p1", environmentId: "env1", providerId: t.providerId ?? "claude-code", parentThreadId: t.parentThreadId ?? null, parentNotifications: (t.parentNotifications ?? "auto") as never, sectionId: t.sectionId ?? null }),
+          ...(t.hostId === undefined && t.environmentProviderId === undefined && t.environmentStatus === undefined && t.environmentPhase === undefined ? {} : { environment: { hostId: t.hostId ?? null, environmentProviderId: t.environmentProviderId ?? null, branchName: t.branchName ?? null, status: t.environmentStatus ?? "ready", lifecycle: { phase: t.environmentPhase ?? "active" } } }),
         };
       },
       // What the server answers: the thread's own execution once a turn ran, and before that the
@@ -1328,6 +1330,76 @@ describe("a Linear ticket steward", () => {
     expect((await t.list())[0]).toMatchObject({ ended: false, threadId: steward });
     expect(t.sends.at(-1)!.text).toMatch(/came back from a terminal or detached state/u);
     expect(t.spawns).toHaveLength(2);
+  });
+});
+
+describe("recovering a steward whose environment is gone (BB-103)", () => {
+  it("respawns the steward and re-points the binding when the wake send reports the environment unavailable", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    // The steward's environment is gone: bb refuses the next wake with 409
+    // thread_environment_unavailable, as it did for the eight stuck stewards.
+    t.threads.get(steward!)!.sendError = { code: "thread_environment_unavailable", status: 409, message: "Thread environment is unavailable" };
+    // A new comment makes the next reconcile wake the steward.
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+
+    // A fresh steward was spawned on the project steward's environment...
+    expect(t.spawns).toHaveLength(3);
+    const respawned = t.spawns[2]!;
+    expect(respawned).toMatchObject({ environment: { type: "reuse", environmentId: "env1" }, parentThreadId: project, parentNotifications: "off" });
+    // ...with the wake as its first prompt, saying it was respawned...
+    expect(String(respawned.prompt)).toMatch(/This steward was respawned/u);
+    expect(String(respawned.prompt)).toMatch(/1 new comment from Sam/u);
+    // ...the old thread archived, never deleted...
+    expect(t.deletes).toEqual([]);
+    expect(t.threads.get(steward!)!.archivedAt).not.toBeNull();
+    // ...and the binding re-pointed, with the wait open until the new thread has the wake.
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.threadId).toBe(respawned.id);
+    expect(b.awaitingReport).toBe(true);
+    // The respawn is noted on the binding so the next report says so.
+    expect(b.pending.some((n) => /respawned/u.test(n.text))).toBe(true);
+  });
+
+  it("a review binding's rebind refuses a thread that is already another binding's steward", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    t.entities.set("acme/web#7", pull());
+    await t.ring("linear", "uuid-12");
+    await t.ring("github", "acme/web#7");
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "ENG-12", kind: "ticket" }), expect.objectContaining({ key: "acme/web#7", kind: "review" })]));
+    const ticketSteward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    const out = await t.harness.behavior.runCli(["rebind", "acme/web#7", ticketSteward]);
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr).toMatch(/already ENG-12's steward/u);
+    // The review binding still points at its own steward.
+    expect(t.hooks.store.find("acme/web#7", "p1")!.threadId).not.toBe(ticketSteward);
+  });
+
+  it("rebind re-points the binding, archives the old thread, and sends the wake at once", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    // A fork of the dead thread, kept with `bb thread fork`, in the same project.
+    t.threads.set("thr_fork", { status: "idle", archivedAt: null, projectId: "p1" });
+    t.hooks.store.patch(t.hooks.store.find("ENG-12", "p1")!.id, { awaitingReport: true });
+    const before = t.sends.length;
+    const out = await t.harness.behavior.runCli(["rebind", "ENG-12", "thr_fork"]);
+    expect(out).toMatchObject({ exitCode: 0 });
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.threadId).toBe("thr_fork");
+    // The wake went to the fork at once, and it carries the rebind in the action log.
+    expect(t.sends.length).toBeGreaterThan(before);
+    expect(t.sends.at(-1)).toMatchObject({ threadId: "thr_fork" });
+    expect(t.sends.at(-1)!.text).toMatch(/Rebound from/u);
+    expect(b.awaitingReport).toBe(true);
+    // The old thread is archived through the plugin, never deleted.
+    expect(t.threads.get(steward)!.archivedAt).not.toBeNull();
+    expect(t.deletes).toEqual([]);
   });
 });
 

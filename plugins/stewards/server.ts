@@ -1320,11 +1320,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- threads ----------------------------------------------------------------------------
 
-    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; visibility: string | null; environmentId: string | null; environmentHostId: string | null; providerId: string; parentThreadId: string | null; parentNotifications: string; sectionId: string | null };
+    type ThreadInfo = { id: string; title: string | null; status: string; archivedAt: number | null; deletedAt: number | null; visibility: string | null; projectId: string | null; environmentId: string | null; environmentHostId: string | null; environmentStatus: string | null; environmentPhase: string | null; providerId: string; parentThreadId: string | null; parentNotifications: string; sectionId: string | null };
 
     async function threadInfo(threadId: string): Promise<ThreadInfo | null> {
       try {
-        const t = (await bb.sdk.threads.get({ threadId })) as unknown as Partial<ThreadInfo> & { environment?: { hostId?: string | null } | null };
+        const t = (await bb.sdk.threads.get({ threadId, include: "environment" })) as unknown as Partial<ThreadInfo> & { environment?: { hostId?: string | null; status?: string | null; lifecycle?: { phase?: string | null } | null } | null };
         return {
           id: threadId,
           title: t.title ?? null,
@@ -1332,9 +1332,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           archivedAt: t.archivedAt ?? null,
           deletedAt: t.deletedAt ?? null,
           visibility: t.visibility === undefined ? null : String(t.visibility),
+          projectId: t.projectId ?? null,
           environmentId: t.environmentId ?? null,
-          // The SDK's thread carries its machine on `environment`, not at the top level.
+          // The SDK's thread carries its machine and environment state on
+          // `environment`, not at the top level.
           environmentHostId: t.environment?.hostId ?? t.environmentHostId ?? null,
+          environmentStatus: t.environment?.status ?? t.environmentStatus ?? null,
+          environmentPhase: t.environment?.lifecycle?.phase ?? t.environmentPhase ?? null,
           providerId: String(t.providerId ?? ""),
           parentThreadId: t.parentThreadId ?? null,
           parentNotifications: String(t.parentNotifications ?? "auto"),
@@ -1349,14 +1353,25 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const busy = (status: string) => status === "active" || status === "starting" || status === "pending" || status === "stopping";
 
-    /** Message a thread; "gone" when it no longer exists. */
-    async function send(threadId: string, text: string): Promise<"sent" | "gone" | "failed"> {
+    /** True when a thread's environment was destroyed, so it can no longer run the thread. */
+    const environmentGone = (info: Pick<ThreadInfo, "environmentStatus" | "environmentPhase">): boolean => info.environmentStatus === "destroyed" || info.environmentPhase === "destroyed";
+
+    /** True when an error is bb's `thread_environment_unavailable`: the thread's environment cannot run it. */
+    function isEnvironmentUnavailable(error: unknown): boolean {
+      const e = error as { code?: string; message?: unknown };
+      if (e.code === "thread_environment_unavailable") return true;
+      return typeof e.message === "string" && /environment is unavailable/iu.test(e.message);
+    }
+
+    /** Message a thread; "gone" when it no longer exists, "unavailable" when its environment cannot run it. */
+    async function send(threadId: string, text: string): Promise<"sent" | "gone" | "failed" | "unavailable"> {
       try {
         await bb.sdk.threads.send({ threadId, input: [{ type: "text", text, mentions: [] }], mode: "auto" });
         return "sent";
       } catch (error) {
         const e = error as { code?: string; status?: number };
         if (e.code === "NOT_FOUND" || e.status === 404 || e.status === 410) return "gone";
+        if (isEnvironmentUnavailable(error)) return "unavailable";
         bb.log.warn(`stewards: could not message thread ${threadId}: ${errorMessage(error)}`);
         return "failed";
       }
@@ -1367,7 +1382,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * waited. A function for the text is called just before the send, after
      * those awaits, so it reads the store as of the send.
      */
-    async function sendTo(threadId: string, text: string | (() => string)): Promise<"sent" | "gone" | "failed"> {
+    async function sendTo(threadId: string, text: string | (() => string)): Promise<"sent" | "gone" | "failed" | "unavailable"> {
       const info = await threadInfo(threadId).catch(() => null);
       if (info === null || info.deletedAt !== null) return "gone";
       if (info.archivedAt !== null) await quietly(`unarchive ${threadId}`, () => bb.sdk.threads.unarchive({ threadId }));
@@ -1952,11 +1967,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return store.children(b.id).flatMap((child) => store.openEscalations(child.id).filter((x) => x.route === "parent").map((escalation) => ({ escalation, from: child })));
     }
 
+    /** A delivered wake, and the respawn the recovery path made, when it made one (BB-103). */
+    type WakeDelivery = false | { delivered: true; respawned: { from: string | null; to: string } | null };
+
     /** Send a wake, spawning the steward's thread on the first; false when nothing was delivered. */
-    async function deliverWake(b: Binding, config: ProjectConfig, playbook: Playbook, text: string): Promise<boolean> {
+    async function deliverWake(b: Binding, config: ProjectConfig, playbook: Playbook, text: string): Promise<WakeDelivery> {
       if (b.threadId === null) {
         await spawnSteward(b, config, playbook, text);
-        return true;
+        return { delivered: true, respawned: null };
+      }
+      // A thread whose environment was destroyed at wake time cannot run the
+      // wake. Respawn it rather than detach: the binding is not the user's to
+      // end, and `bb thread restore-environment` has no multi-repo restore.
+      const info = await threadInfo(b.threadId).catch(() => null);
+      if (info !== null && info.deletedAt === null && environmentGone(info)) {
+        return respawnSteward(b, config, playbook, text, `its environment is ${info.environmentStatus ?? info.environmentPhase ?? "destroyed"}`);
       }
       // A wake can be the thing that pushes the transcript over the limit;
       // compact first (criterion 4). If compaction makes the thread busy,
@@ -1969,7 +1994,43 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         pushInterest();
         return false;
       }
-      return sent === "sent";
+      if (sent === "unavailable") {
+        // bb refused the message because the thread's environment cannot run
+        // it: recover the steward on a live environment (BB-103).
+        return respawnSteward(b, config, playbook, text, "the thread's environment is unavailable");
+      }
+      return sent === "sent" ? { delivered: true, respawned: null } : false;
+    }
+
+    /**
+     * A steward whose environment is gone is respawned on the project
+     * steward's environment (the `spawnSteward` path): the old thread is
+     * archived, never deleted, so `thread.deleted` never marks the binding
+     * manually detached; the binding is re-pointed; and the wake becomes the
+     * new thread's first prompt. The caller notes the respawn on the binding
+     * after it clears the delivered notes, so the next report says so.
+     */
+    async function respawnSteward(b: Binding, config: ProjectConfig, playbook: Playbook, text: string, why: string): Promise<WakeDelivery> {
+      const from = b.threadId;
+      const respawned = `${text}\n\n## This steward was respawned\n\nYour previous thread${from === null ? "" : ` (${from})`} could not be woken because ${why}. This is a fresh thread on the project steward's environment, and the binding now points here.`;
+      let to: string | null;
+      try {
+        to = await spawnSteward(b, config, playbook, respawned);
+      } catch (error) {
+        bb.log.warn(`stewards: could not respawn ${b.entityKey}'s steward: ${errorMessage(error)}`);
+        return false;
+      }
+      if (to === null || to === "") return false;
+      if (from !== null && from !== to) await quietly(`archive the unreachable steward thread ${from}`, () => bb.sdk.threads.archive({ threadId: from }));
+      bb.log.warn(`stewards: ${b.entityKey}'s steward ${from ?? "(none)"} could not be woken (${why}); respawned as ${to}`);
+      pushInterest();
+      return { delivered: true, respawned: { from, to } };
+    }
+
+    /** Queue the respawn after the caller clears the delivered notes, so the next report names it. */
+    function noteRespawn(b: Binding, respawned: { from: string | null; to: string } | null): void {
+      if (respawned === null) return;
+      store.note(b.id, `The steward was respawned from ${respawned.from ?? "(none)"} to ${respawned.to}: its environment could not deliver the wake.`);
     }
 
     /** Wake the steward, spawning its thread on the first wake. */
@@ -1999,7 +2060,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         lessons: store.lessonsByTier(b.projectId, "trial").slice(0, config.file.lessons.trial.max),
         now: now(),
       });
-      if (!(await deliverWake(b, config, playbook, text))) return false;
+      const delivery = await deliverWake(b, config, playbook, text);
+      if (delivery === false) return false;
       const cursor = newestCommentAt(observed);
       const deployDeadline = deploymentDeadline(b.deployments);
       store.patch(b.id, {
@@ -2013,6 +2075,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // deployment's timeout, so the no-deployment wake is not missed.
         requeueAt: deployDeadline === null ? now() + playbook.requeueDefaultMs : Math.min(now() + playbook.requeueDefaultMs, deployDeadline),
       });
+      noteRespawn(b, delivery.respawned);
       return true;
     }
 
@@ -2581,8 +2644,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
-      if (!(await deliverWake(b, config, playbook, text))) return;
+      const delivery = await deliverWake(b, config, playbook, text);
+      if (delivery === false) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
@@ -2637,8 +2702,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
-      if (!(await deliverWake(b, config, playbook, text))) return;
+      const delivery = await deliverWake(b, config, playbook, text);
+      if (delivery === false) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
@@ -2829,8 +2896,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
       });
-      if (!(await deliverWake(b, config, playbook, text))) return;
+      const delivery = await deliverWake(b, config, playbook, text);
+      if (delivery === false) return;
       store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false, requeueAt: now() + playbook.requeueDefaultMs });
+      noteRespawn(b, delivery.respawned);
       // The steward now has the workers' reports: archive the finished ones (BB-47).
       await archiveFinishedWorkers(store.binding(b.id) ?? b);
     }
@@ -4692,7 +4761,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const bound = store.byEntity("linear", w.issue.id);
         if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
           const config = await loadConfig(bound.projectId);
-          const sent = { outcome: "failed" as "sent" | "gone" | "failed" };
+          const sent = { outcome: "failed" as "sent" | "gone" | "failed" | "unavailable" };
           await serial(`b:${bound.id}`, async () => {
             const b = store.binding(bound.id);
             if (b === null || b.endedAt !== null || b.threadId === null) return;
@@ -7299,6 +7368,45 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 else await beginEnding(fresh, config, playbook, "detach", fresh.lastSnapshot);
               });
               return { exitCode: 0, stdout: `Detaching ${b.entityKey}.` };
+            },
+          }),
+
+          rebind: cliCommand({
+            summary: "Point a binding at another steward thread, for operator recovery",
+            description:
+              "Re-points a live binding at another thread (for example a fork of its dead thread, kept with `bb thread fork <old> --environment <env>`), sends the binding's wake to it at once, and archives the previous thread. It never deletes a thread, so the binding is not marked manually detached. It refuses a thread in another project, a deleted thread, or one that is already another binding's steward or a worker.",
+            positionals: [
+              { name: "key", description: "The entity key or binding id", required: true },
+              { name: "thread", description: "The thread that should steward the binding", required: true },
+            ],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
+              if (b.endedAt !== null) throw new PluginCliError(`${b.entityKey} has ended (${b.endReason}); rebind is for a live binding.`, { code: "binding_ended", hint: "bb stewards list --all shows ended bindings." });
+              const threadId = input.positionals.thread.trim();
+              if (threadId === "") throw new PluginCliError("No thread: pass the thread id to rebind to.", { code: "no_thread" });
+              const info = await threadInfo(threadId).catch(() => null);
+              if (info === null || info.deletedAt !== null) throw new PluginCliError(`Thread ${threadId} does not exist.`, { code: "thread_not_found", hint: "bb thread list shows the threads." });
+              if (info.projectId !== null && info.projectId !== b.projectId) throw new PluginCliError(`Thread ${threadId} is in project ${info.projectId}, not ${b.projectId}.`, { code: "thread_other_project" });
+              const other = store.byThread(threadId);
+              if (other !== null && other.id !== b.id) throw new PluginCliError(`Thread ${threadId} is already ${other.entityKey}'s steward.`, { code: "thread_taken", hint: `bb stewards show ${other.entityKey} shows it.` });
+              const worker = store.worker(threadId);
+              if (worker !== null) throw new PluginCliError(`Thread ${threadId} is a worker of ${store.binding(worker.bindingId)?.entityKey ?? worker.bindingId}.`, { code: "thread_worker" });
+              const previous = b.threadId;
+              // Clear the wait before the wake: the new thread has not had the
+              // wake yet, and the old thread's report is not coming.
+              store.patch(b.id, { threadId, awaitingReport: false });
+              if (previous !== null && previous !== threadId) await quietly(`archive the previous steward thread ${previous}`, () => bb.sdk.threads.archive({ threadId: previous }));
+              // The action log: the wake carries it, so the new thread's first
+              // report knows where it came from.
+              store.note(b.id, `Rebound from ${previous ?? "(none)"} to ${threadId} with bb stewards rebind.`);
+              bb.log.info(`stewards: rebound ${b.entityKey} from ${previous ?? "(none)"} to ${threadId}`);
+              const config = await loadConfig(b.projectId);
+              const playbook = config === null ? null : bindingPlaybook(config, b);
+              if (config === null || playbook === null) return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}, but its playbook is missing so no wake was sent.` };
+              // Send the binding's wake now, not at the next requeue.
+              await serial(`b:${b.id}`, () => reconcileBinding(b.id, "requeue"));
+              return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}; its wake was sent.` };
             },
           }),
 
