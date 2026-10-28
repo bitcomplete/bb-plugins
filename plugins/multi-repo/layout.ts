@@ -59,6 +59,8 @@ export interface WorkspaceManifest {
   layout: ProjectLayout;
   /** The canonical `.bb` checkout on this machine, outside the sandbox. */
   projectSourcePath: string;
+  /** The default-branch commit `.bb/` was materialized from, for a primary project. */
+  definitionBase: string | null;
   repos: WorkspaceRepo[];
   createdAt: number;
 }
@@ -134,7 +136,7 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
   lines.push("");
   lines.push(
     manifest.layout === "primary"
-      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. Changes to it are reviewed like code: commit them, publish the branch with `workspace_publish_guidance`, and land them with a pull request."
+      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. Changes to it are reviewed like code: edit them and publish the branch with `workspace_publish_guidance` (it commits for you), then land them with a pull request."
       : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
   );
   lines.push("");

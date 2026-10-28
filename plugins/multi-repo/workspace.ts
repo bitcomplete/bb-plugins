@@ -302,25 +302,30 @@ export async function materializePrimaryDefinition(args: {
   projectSourcePath: string;
   primaryDir?: string | null;
   signal?: AbortSignal;
-}): Promise<WorkspaceRepo> {
+}): Promise<{ repo: WorkspaceRepo; base: string | null }> {
   const dest = path.join(args.root, PROJECT_SOURCE_DIR);
   const remote = args.primaryDir === undefined || args.primaryDir === null
     ? args.projectSourcePath
     : path.join(args.root, args.primaryDir);
   const options = { timeoutMs: GIT_TIMEOUT_MS, ...(args.signal === undefined ? {} : { signal: args.signal }) };
-  const failed = (message: string): WorkspaceRepo => ({
-    dir: PROJECT_SOURCE_DIR,
-    path: dest,
-    branch: "",
-    baseBranch: "",
-    remote,
-    status: "failed",
-    message: message.slice(0, 600),
+  const failed = (message: string): { repo: WorkspaceRepo; base: string | null } => ({
+    repo: {
+      dir: PROJECT_SOURCE_DIR,
+      path: dest,
+      branch: "",
+      baseBranch: "",
+      remote,
+      status: "failed",
+      message: message.slice(0, 600),
+    },
+    base: null,
+  });
+  const ready = (base: string | null): { repo: WorkspaceRepo; base: string | null } => ({
+    repo: { dir: PROJECT_SOURCE_DIR, path: dest, branch: "default", baseBranch: "default", remote, status: "ready" },
+    base,
   });
   // Idempotent per path key: a re-entered `create()` leaves the copy alone.
-  if (await exists(path.join(dest, "repos.json"))) {
-    return { dir: PROJECT_SOURCE_DIR, path: dest, branch: "default", baseBranch: "default", remote, status: "ready" };
-  }
+  if (await exists(path.join(dest, "repos.json"))) return ready(null);
   await rm(dest, { recursive: true, force: true });
 
   // Read the default branch's committed tip, not the canonical checkout's
@@ -331,6 +336,7 @@ export async function materializePrimaryDefinition(args: {
   // contend on; it runs host-side, outside the agent's sandbox.
   const base = await resolveDefaultBranchRef(args.projectSourcePath, args.signal);
   if (base === null) return failed(`${args.projectSourcePath} is not a git repo with a default branch to read.`);
+  const baseSha = await gitLine(args.projectSourcePath, ["rev-parse", `${base}^{commit}`], options);
   const temp = await mkdtemp(path.join(tmpdir(), "bb-definition-"));
   try {
     const cloned = await git(
@@ -352,12 +358,12 @@ export async function materializePrimaryDefinition(args: {
   } finally {
     await rm(temp, { recursive: true, force: true }).catch(() => undefined);
   }
-  return { dir: PROJECT_SOURCE_DIR, path: dest, branch: "default", baseBranch: "default", remote, status: "ready" };
+  return ready(baseSha);
 }
 
 export async function provisionWorkspace(
   args: ProvisionArgs,
-): Promise<{ root: string; repos: WorkspaceRepo[] }> {
+): Promise<{ root: string; repos: WorkspaceRepo[]; definitionBase: string | null }> {
   const root = workspaceRoot(args.dataDir, args.pathKey);
   await mkdir(root, { recursive: true });
 
@@ -370,22 +376,27 @@ export async function provisionWorkspace(
   }
 
   args.report?.step("Preparing the project definition");
-  const source =
-    args.layout === "primary"
-      ? await materializePrimaryDefinition({
-          root,
-          projectSourcePath: args.projectSourcePath,
-          primaryDir: args.primaryDir ?? null,
-          ...(args.signal === undefined ? {} : { signal: args.signal }),
-        })
-      : await materializeProjectSource({
-          root,
-          projectSourcePath: args.projectSourcePath,
-          ...(args.signal === undefined ? {} : { signal: args.signal }),
-        });
+  let source: WorkspaceRepo;
+  let definitionBase: string | null = null;
+  if (args.layout === "primary") {
+    const materialized = await materializePrimaryDefinition({
+      root,
+      projectSourcePath: args.projectSourcePath,
+      primaryDir: args.primaryDir ?? null,
+      ...(args.signal === undefined ? {} : { signal: args.signal }),
+    });
+    source = materialized.repo;
+    definitionBase = materialized.base;
+  } else {
+    source = await materializeProjectSource({
+      root,
+      projectSourcePath: args.projectSourcePath,
+      ...(args.signal === undefined ? {} : { signal: args.signal }),
+    });
+  }
   repos.push(source);
 
-  return { root, repos };
+  return { root, repos, definitionBase };
 }
 
 export async function addWorkspaceRepo(args: {

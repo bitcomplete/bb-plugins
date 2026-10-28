@@ -149,6 +149,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     // rows default to `standalone`, which is what they are; a workspace whose
     // layout no longer matches the project's is one that predates an adopt.
     `ALTER TABLE workspaces ADD COLUMN layout TEXT NOT NULL DEFAULT 'standalone'`,
+    // The default-branch commit `.bb/` was materialized from, so guidance
+    // publish can warn when `.bb/` moved on the default branch since.
+    `ALTER TABLE workspaces ADD COLUMN definition_base TEXT`,
   ]);
 
   const host = bb.hosts.experimental_client({
@@ -176,8 +179,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   function saveManifest(manifest: WorkspaceManifest): void {
     db.prepare(
       `INSERT INTO workspaces
-         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, repos, instructions, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, definition_base, repos, instructions, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (host_id, path_key) DO UPDATE SET
          thread_id = excluded.thread_id,
          project_id = excluded.project_id,
@@ -185,6 +188,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
          branch_name = excluded.branch_name,
          project_source_path = excluded.project_source_path,
          layout = excluded.layout,
+         definition_base = excluded.definition_base,
          repos = excluded.repos,
          instructions = excluded.instructions,
          created_at = excluded.created_at`,
@@ -197,6 +201,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       manifest.branchName,
       manifest.projectSourcePath,
       manifest.layout,
+      manifest.definitionBase,
       JSON.stringify(manifest.repos),
       formatInstructions(manifest),
       manifest.createdAt,
@@ -214,6 +219,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         branchName: String(row.branch_name),
         layout: row.layout === "primary" ? "primary" : "standalone",
         projectSourcePath: String(row.project_source_path),
+        definitionBase: typeof row.definition_base === "string" ? row.definition_base : null,
         repos: JSON.parse(String(row.repos)) as WorkspaceRepo[],
         createdAt: Number(row.created_at),
       };
@@ -836,6 +842,22 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         ) {
           repoRequests.push(primaryRequest);
         }
+        // A repos.json entry with the same directory name as the primary but a
+        // different remote (a fork) would clone two repos into one directory
+        // and fail the provision; name it instead.
+        if (primaryRequest !== null) {
+          const clash = repoRequests.find(
+            (repo) =>
+              repo.dir.toLowerCase() === primaryRequest.dir.toLowerCase() &&
+              normalizeRemoteUrl(repo.url) !== normalizeRemoteUrl(primaryRequest.url),
+          );
+          if (clash !== undefined) {
+            return {
+              status: "failed",
+              message: `repos.json has "${clash.dir}", which collides with the primary repo's directory "${primaryRequest.dir}". Rename the entry or set the primary's directory.`,
+            };
+          }
+        }
 
         // Claim before writing. Two environments must never share a root, and
         // the claim is what makes that core's answer rather than a race here.
@@ -870,6 +892,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           branchName: context.suggestedBranchName,
           layout,
           projectSourcePath: location.path,
+          definitionBase: provisioned.definitionBase,
           repos: provisioned.repos,
           createdAt: Date.now(),
         };
@@ -1165,9 +1188,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   bb.agents.registerTool({
     name: "workspace_publish_guidance",
     description:
-      "Publish commits made in this workspace's .bb directory (AGENTS.md, skills, repos.json) back to the project's canonical checkout, as a branch to review and merge.",
+      "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
     instructions:
-      "Commit inside .bb first, then call workspace_publish_guidance. The canonical checkout is outside your sandbox, so a plain git push will not reach it.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side and publishes a guidance-<thread> branch — there is no need (and, where .bb/ is a directory rather than a repo, no way) to commit inside .bb yourself.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {
@@ -1181,6 +1204,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         {
           projectSourcePath: manifest.projectSourcePath,
           workspaceBbPath: source.path,
+          definitionBase: manifest.definitionBase,
           // The calling thread, not the workspace's creator: two threads
           // sharing one checkout must not push onto one `guidance-<thread>`
           // ref and silently overwrite each other's proposal.

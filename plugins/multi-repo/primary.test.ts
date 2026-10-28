@@ -242,6 +242,19 @@ describe("guidance on a primary repo", () => {
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/pull request/u);
   });
+
+  it("commits the workspace's uncommitted .bb edits before publishing (standalone)", async () => {
+    const canonical = path.join(scratch, "standalone-canonical");
+    await mkdir(canonical, { recursive: true });
+    await bootstrapProjectSource(canonical, EMPTY_REPOS);
+    const workspaceBb = path.join(scratch, "standalone-workspace-bb");
+    await git(["clone", "--quiet", canonical, workspaceBb]);
+    await writeFile(path.join(workspaceBb, "AGENTS.md"), "edited but not committed\n", "utf8");
+
+    const result = await pushGuidance(canonical, workspaceBb, "thr_uncommitted");
+    expect(result.ok).toBe(true);
+    expect(await gitLine(canonical, ["show", "guidance-thr_uncommitted:AGENTS.md"])).toBe("edited but not committed");
+  });
 });
 
 describe("adopting a standalone .bb into a primary repo", () => {
@@ -370,5 +383,49 @@ describe("seeding a new primary project", () => {
     const source = result.repos.find((repo) => repo.dir === ".bb");
     expect(source?.status).toBe("ready");
     expect(await exists(path.join(result.root, ".bb", "AGENTS.md"))).toBe(true);
+  });
+
+  it("seeds a checkout sitting on a feature branch without touching it or pushing its work", async () => {
+    const primary = await makeRepo("primary");
+    const checkout = path.join(scratch, "primary-clone");
+    await git(["clone", "--quiet", primary, checkout]);
+    await gitIn(checkout, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(checkout, ["config", "user.name", "Test"]);
+    await gitIn(checkout, ["checkout", "--quiet", "-b", "feature"]);
+    await writeFile(path.join(checkout, "wip.txt"), "unpushed work\n", "utf8");
+    await gitIn(checkout, ["add", "-A"]);
+    await gitIn(checkout, ["commit", "--quiet", "-m", "wip"]);
+
+    const result = await preparePrimaryProjectSource({
+      url: primary,
+      path: checkout,
+      seed: EMPTY_REPOS,
+      branch: "bb/seed-bb-test",
+      openPullRequest: false,
+    });
+    expect(result.ok).toBe(true);
+    // The seed is on its branch and on the local default branch...
+    expect(await gitLine(checkout, ["show", "bb/seed-bb-test:.bb/repos.json"])).toContain('"repos"');
+    expect(await gitLine(checkout, ["show", "main:.bb/repos.json"])).toContain('"repos"');
+    // ...not on the feature branch, and the feature branch's WIP is not on the seed.
+    expect(await gitLine(checkout, ["show", "feature:.bb/repos.json"])).toBeNull();
+    expect(await gitLine(checkout, ["show", "bb/seed-bb-test:wip.txt"])).toBeNull();
+    expect(await gitLine(checkout, ["show", "feature:wip.txt"])).toBe("unpushed work");
+    expect(await gitLine(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("feature");
+  });
+});
+
+describe("the default-branch ref", () => {
+  it("uses origin/main when origin/HEAD is absent rather than the checked-out branch", async () => {
+    const remote = await makeRepo("primary");
+    await commitDefinition(remote);
+    const checkout = path.join(scratch, "primary-clone");
+    await git(["clone", "--quiet", remote, checkout]);
+    await gitIn(checkout, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(checkout, ["config", "user.name", "Test"]);
+    await gitIn(checkout, ["remote", "set-head", "origin", "-d"]);
+    await gitIn(checkout, ["checkout", "--quiet", "-b", "feature"]);
+
+    expect(await resolveDefaultBranchRef(checkout)).toBe("refs/heads/main");
   });
 });

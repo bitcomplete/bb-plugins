@@ -84,7 +84,7 @@ function hostResponder(call: HostRpcCall): unknown {
     case "discoverCheckouts":
       return { checkouts: [] };
     case "provisionWorkspace":
-      return { root: ROOT, repos: WORKSPACE_REPOS };
+      return { root: ROOT, repos: WORKSPACE_REPOS, definitionBase: null };
     case "workspaceStatus":
       return {
         repos: WORKSPACE_REPOS.map((repo) => ({

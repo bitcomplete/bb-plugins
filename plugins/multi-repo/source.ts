@@ -57,6 +57,18 @@ export async function resolveDefaultBranchRef(dir: string, signal?: AbortSignal)
   const originHead = await gitLine(dir, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], options);
   let branch =
     originHead !== null && originHead.startsWith("origin/") ? originHead.slice("origin/".length) : null;
+  // A hand-made checkout may have no `origin/HEAD`. The conventional default
+  // names are tried before the checked-out branch, so a feature branch is
+  // never mistaken for the default; the refresh also runs
+  // `git remote set-head origin --auto` to set it properly.
+  if (branch === null || branch.length === 0) {
+    for (const candidate of ["main", "master"]) {
+      if (await refExists(dir, `refs/remotes/origin/${candidate}`, signal)) {
+        branch = candidate;
+        break;
+      }
+    }
+  }
   if (branch === null || branch.length === 0) {
     const current = await gitLine(dir, ["rev-parse", "--abbrev-ref", "HEAD"], options);
     if (current !== null && current !== "HEAD") branch = current;
@@ -82,8 +94,10 @@ export async function resolveDefaultBranchRef(dir: string, signal?: AbortSignal)
  *
  * Decided from the default branch's committed tree, never the working tree, so
  * an uncommitted `.bb/` someone is halfway through creating does not flip the
- * layout under them. A directory that is not a repo at all is `standalone`:
- * that is the layout `bootstrapProjectSource` initializes.
+ * layout under them. A directory that is not a repo, or has no commit yet, is
+ * `standalone` — that is the layout `bootstrapProjectSource` initializes, and
+ * the fallback only reaches a directory whose committed tree has neither
+ * definition.
  */
 export async function detectProjectLayout(dir: string, signal?: AbortSignal): Promise<ProjectLayout> {
   const ref = await resolveDefaultBranchRef(dir, signal);
@@ -372,6 +386,10 @@ export async function refreshProjectSource(
     return warnings;
   }
   await writeFile(markerPath, String(Date.now()), "utf8").catch(() => undefined);
+  // Keep `origin/HEAD` pointing at the remote's default branch, so a read
+  // never has to guess it from the checked-out branch. Best-effort: a remote
+  // that cannot answer leaves the ref as it was.
+  await gitIn(dir, ["remote", "set-head", "origin", "--auto"], options).catch(() => undefined);
 
   const merged = await gitIn(dir, ["merge", "--ff-only", "--quiet", "@{u}"], options);
   if (merged.code !== 0) {
@@ -523,10 +541,11 @@ export async function pushGuidance(
   workspaceBbPath: string,
   threadId: string,
   signal?: AbortSignal,
+  definitionBase?: string | null,
 ): Promise<{ ok: boolean; ref: string | null; message: string }> {
   const layout = await detectProjectLayout(projectSourcePath, signal);
   return layout === "primary"
-    ? pushGuidancePrimary(projectSourcePath, workspaceBbPath, threadId, signal)
+    ? pushGuidancePrimary(projectSourcePath, workspaceBbPath, threadId, signal, definitionBase ?? null)
     : pushGuidanceStandalone(projectSourcePath, workspaceBbPath, threadId, signal);
 }
 
@@ -539,6 +558,12 @@ async function pushGuidanceStandalone(
   const safeId = threadId.replace(/[^A-Za-z0-9._-]+/gu, "-").slice(0, 60);
   const ref = `refs/heads/guidance-${safeId}`;
   const options = { timeoutMs: FETCH_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
+
+  // Commit whatever the agent left uncommitted. Publishing must not depend on
+  // the agent remembering a `git commit`: in the primary layout `.bb/` has no
+  // git repo at all, and the tool has to mean the same thing in both layouts.
+  await gitIn(workspaceBbPath, ["add", "-A"], options);
+  await commitAll(workspaceBbPath, `Guidance from ${threadId}`, signal);
 
   const head = await gitLine(workspaceBbPath, ["rev-parse", "HEAD"], options);
   if (head === null) {
@@ -573,12 +598,26 @@ async function pushGuidancePrimary(
   workspaceBbPath: string,
   threadId: string,
   signal?: AbortSignal,
+  definitionBase?: string | null,
 ): Promise<{ ok: boolean; ref: string | null; message: string }> {
   const ref = guidanceRef(threadId);
   const options = { timeoutMs: FETCH_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
   const base = await resolveDefaultBranchRef(projectSourcePath, signal);
   if (base === null) {
     return { ok: false, ref: null, message: `${projectSourcePath} has no default branch to publish against.` };
+  }
+  const warnings: string[] = [];
+  // A `.bb/` change merged on the default branch after this workspace was
+  // provisioned would be reverted by replacing `.bb/` wholesale, so say so
+  // loudly. The guidance branch is still published; the reviewer sees it.
+  if (definitionBase !== undefined && definitionBase !== null) {
+    const baseTree = await gitLine(projectSourcePath, ["rev-parse", `${definitionBase}:${PROJECT_SOURCE_DIR}`], options);
+    const headTree = await gitLine(projectSourcePath, ["rev-parse", `${base}:${PROJECT_SOURCE_DIR}`], options);
+    if (baseTree !== null && headTree !== null && baseTree !== headTree) {
+      warnings.push(
+        ".bb/ on the default branch has changed since this workspace was provisioned; check the guidance branch does not revert those changes.",
+      );
+    }
   }
   const worktree = await mkdtemp(path.join(tmpdir(), "bb-guidance-"));
   try {
@@ -595,7 +634,7 @@ async function pushGuidancePrimary(
       sha = await gitLine(projectSourcePath, ["rev-parse", base], options);
       if (sha === null) return { ok: false, ref: null, message: `Could not resolve ${base}.` };
       await gitIn(projectSourcePath, ["update-ref", ref, sha], options);
-      return { ok: true, ref, message: `No .bb changes to publish; ${ref} points at the default branch.` };
+      return { ok: true, ref, message: [`No .bb changes to publish; ${ref} points at the default branch.`, ...warnings].join(" ") };
     }
     const commit = await commitAll(worktree, `Publish guidance from ${threadId}`, signal);
     if (!commit.committed || commit.head === null) {
@@ -604,10 +643,15 @@ async function pushGuidancePrimary(
     sha = commit.head;
     const updated = await gitIn(projectSourcePath, ["update-ref", ref, sha], options);
     if (updated.code !== 0) return { ok: false, ref: null, message: firstProblemLine(updated) };
+    // Publish the branch to origin so a person (or BB-108) can open the pull
+    // request without finding the host-data path. Best-effort: a protected or
+    // unreachable remote leaves the branch in the local canonical checkout.
+    const pushed = await gitIn(projectSourcePath, ["push", "--quiet", "origin", `${ref}:${ref}`], options);
+    const pushedNote = pushed.code === 0 ? " It is pushed to origin." : " Push it to origin to open a pull request.";
     return {
       ok: true,
       ref,
-      message: `Published ${sha.slice(0, 8)} to ${ref} in ${projectSourcePath}. Open a pull request to land it.`,
+      message: [`Published ${sha.slice(0, 8)} to ${ref} in ${projectSourcePath}.${pushedNote}`, ...warnings].join(" "),
     };
   } finally {
     await gitIn(projectSourcePath, ["worktree", "remove", "--force", worktree], options).catch(() => undefined);
@@ -961,11 +1005,26 @@ export async function preparePrimaryProjectSource(
     };
   }
 
-  const seeded = await seedPrimaryDefinition(args.path, args.seed, args.signal);
-  warnings.push(...seeded.warnings);
-  if (!seeded.bootstrapped) return fail(warnings.join("; ") || "Could not seed .bb/.");
+  // Build the seed commit in a detached worktree at the default-branch base,
+  // never on the checkout's current branch: a checkout the user points at may
+  // sit on a feature branch, and seeding there would publish their unpushed
+  // work on the seed branch. `adoptProjectSource` uses the same pattern.
+  const worktree = await mkdtemp(path.join(tmpdir(), "bb-seed-"));
+  let seedSha: string | null = null;
+  try {
+    const added = await gitIn(args.path, ["worktree", "add", "--detach", "--force", worktree, base], options);
+    if (added.code !== 0) return fail(firstProblemLine(added));
+    const seeded = await seedPrimaryDefinition(worktree, args.seed, args.signal);
+    warnings.push(...seeded.warnings);
+    if (!seeded.bootstrapped) return fail(warnings.join("; ") || "Could not seed .bb/.");
+    seedSha = await gitLine(worktree, ["rev-parse", "HEAD"], options);
+  } finally {
+    await gitIn(args.path, ["worktree", "remove", "--force", worktree], options).catch(() => undefined);
+    await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+  }
+  if (seedSha === null) return fail("Could not commit the seed.");
 
-  const branchCreated = await gitIn(args.path, ["branch", "--force", args.branch, "HEAD"], options);
+  const branchCreated = await gitIn(args.path, ["update-ref", `refs/heads/${args.branch}`, seedSha], options);
   if (branchCreated.code !== 0) warnings.push(`Could not create ${args.branch}: ${firstProblemLine(branchCreated)}`);
   const pushed = await gitIn(
     args.path,
@@ -974,6 +1033,27 @@ export async function preparePrimaryProjectSource(
   );
   if (pushed.code !== 0) {
     warnings.push(`The seed branch was committed locally but not pushed: ${firstProblemLine(pushed)}`);
+  }
+
+  // Make the seed visible to provisioning without touching a feature branch:
+  // fast-forward the checked-out default branch, or advance the local default
+  // branch when it is not checked out and the seed descends from it. A diverged
+  // default branch is left alone — the seed waits on its pull request.
+  const checkedOut = await gitLine(args.path, ["rev-parse", "--abbrev-ref", "HEAD"], options);
+  if (checkedOut === defaultBranch) {
+    const merged = await gitIn(args.path, ["merge", "--ff-only", "--quiet", seedSha], options);
+    if (merged.code !== 0) warnings.push(`Could not fast-forward ${defaultBranch} to the seed: ${firstProblemLine(merged)}`);
+  } else {
+    const localRef = `refs/heads/${defaultBranch}`;
+    const present = await refExists(args.path, localRef, args.signal);
+    const ancestor =
+      present && (await gitIn(args.path, ["merge-base", "--is-ancestor", localRef, seedSha], options)).code === 0;
+    if (!present || ancestor) {
+      const updated = await gitIn(args.path, ["update-ref", localRef, seedSha], options);
+      if (updated.code !== 0) warnings.push(`Could not advance ${defaultBranch} to the seed: ${firstProblemLine(updated)}`);
+    } else {
+      warnings.push(`${defaultBranch} has diverged from origin; the seed is only on ${args.branch} until it merges.`);
+    }
   }
 
   let prUrl: string | null = null;

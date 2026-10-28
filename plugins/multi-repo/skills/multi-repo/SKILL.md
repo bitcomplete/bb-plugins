@@ -65,11 +65,13 @@ It is the **wrong** place for anything specific to one thread.
 The canonical `.bb` checkout lives outside your sandbox, so `git push` from
 `.bb` will not reach it. Instead:
 
-1. Commit inside `<workspace>/.bb` as normal.
+1. Edit the files under `<workspace>/.bb`.
 2. Call `workspace_publish_guidance`.
 
-That lands your commits on a `guidance-<thread>` branch in the canonical
-checkout, for a person to review and merge.
+It commits them host-side and lands them on a `guidance-<thread>` branch in
+the canonical checkout, for a person to review and merge. There is no need to
+commit inside `.bb` yourself — and in the primary layout `.bb` is a plain
+directory with no git repo, so you cannot.
 
 ## A shared checkout
 

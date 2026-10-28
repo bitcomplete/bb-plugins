@@ -162,7 +162,7 @@ export function createMultiRepoHostEntry() {
           report,
           signal: context.signal,
         });
-        return { root: result.root, repos: result.repos };
+        return { root: result.root, repos: result.repos, definitionBase: result.definitionBase };
       },
 
       async addWorkspaceRepo(input, context) {
@@ -260,6 +260,7 @@ export function createMultiRepoHostEntry() {
           input.workspaceBbPath,
           input.threadId,
           context.signal,
+          input.definitionBase ?? null,
         );
       },
 

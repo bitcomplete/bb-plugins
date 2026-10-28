@@ -355,6 +355,8 @@ export const hostContract = defineRpcContract({
       .object({
         root: absolutePath,
         repos: z.array(workspaceRepoSchema).max(64),
+        /** The default-branch commit `.bb/` was materialized from, or null. */
+        definitionBase: z.string().max(64).nullable(),
       })
       .strict(),
   },
@@ -491,6 +493,8 @@ export const hostContract = defineRpcContract({
         projectSourcePath: absolutePath,
         workspaceBbPath: absolutePath,
         threadId: z.string().min(1).max(100),
+        /** The default-branch commit the workspace `.bb/` was materialized from. */
+        definitionBase: z.string().max(64).nullable().optional(),
       })
       .strict(),
     output: z
