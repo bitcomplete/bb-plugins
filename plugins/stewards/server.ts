@@ -1861,7 +1861,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
         if (poll + 1 < polls) await new Promise((resolve) => setTimeout(resolve, timing.environmentPollMs));
       }
-      bb.log.info(`stewards: timed out after ${timing.environmentWaitMs}ms waiting for the project steward's environment; giving ${entityKey}'s steward its own`);
+      bb.log.info(`stewards: timed out waiting up to ${timing.environmentWaitMs}ms for the project steward's environment; giving ${entityKey}'s steward its own`);
       return null;
     }
 
