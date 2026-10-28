@@ -293,6 +293,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   each entry `decide: project | user`): the project steward approves a
   `project` entry (recorded in the store, bound to the pull request's head
   sha, never a GitHub comment or review) and forwards a `user` one to you.
+  An unsigned comment or review whose first line carries a `bb-review` or
+  `bb-approval` marker is a thread's, never the owner's approval, whether or
+  not it is signed (BB-110).
   A missing or unknown mark, a change to the list, `bigDecisions`, `prGate`
   or the approval code is always yours.
 - **Lessons** are a project steward's general judgements, made permanent in

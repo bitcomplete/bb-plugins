@@ -162,6 +162,8 @@ export function answerDiffers(answer: string, recommendation: string): boolean {
 export function commentDiffersFromRecommendation(c: SnapshotComment, viewer: string | null, recommendation: string | null): boolean {
   if (viewer === null || recommendation === null || c.signedBy !== null) return false;
   if (c.author.toLowerCase() !== viewer.toLowerCase()) return false;
+  // A marker comment is a thread's, signed or not: never the owner's words (BB-110).
+  if (isMarkerComment(c.body)) return false;
   return answerDiffers(c.body, recommendation);
 }
 
@@ -400,9 +402,22 @@ export function diffObserved(before: Observed, after: Observed, ctx: ObservedDif
 // ---- the merge gate -------------------------------------------------------------------
 
 /**
+ * Whether a comment body opens with a thread's machine-readable marker on its
+ * first line: a reviewer's `bb-review` round or the project steward's
+ * `bb-approval` decision. A marker comment is a thread's by construction, so
+ * it is never the owner's own words, signed or not (BB-110).
+ */
+export function isMarkerComment(body: string): boolean {
+  return reviewMarker(body) !== null || projectApprovalMarker(body) !== null;
+}
+
+/**
  * Whether the owner has approved a pull request: an unsigned approving comment
  * by the connected user, or an APPROVED review from them. A signed comment is
- * a thread's (the reviewer's marker, a worker's), never the owner's.
+ * a thread's (the reviewer's marker, a worker's), never the owner's. So is an
+ * unsigned comment that carries a `bb-review` or `bb-approval` marker: the
+ * reviewer posts as the connected user, and its marker is a thread's whatever
+ * the signature line says (BB-110).
  */
 export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: string | null } {
   const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
@@ -410,6 +425,7 @@ export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: 
   let at: string | null = null;
   for (const c of entity.comments) {
     if (c.signedBy !== null || c.author.toLowerCase() !== viewer) continue;
+    if (isMarkerComment(c.body)) continue;
     if (classifyApproval(c.body) !== "approve") continue;
     if (at === null || c.createdAt > at) at = c.createdAt;
   }

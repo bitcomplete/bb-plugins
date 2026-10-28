@@ -4193,6 +4193,21 @@ describe("needs you items", () => {
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
   });
 
+  it("files approve-pr and the user's approval escalation for an unsigned reviewer marker (BB-110)", async () => {
+    // The reviewer posts as the connected user. When it leaves the signature
+    // off, its marker comment still carries the marker, so it is a thread's,
+    // not the owner's approval: the plugin must still file the page item and
+    // the approval escalation routed to the user.
+    const unsigned = comment({ id: "m-unsigned", author: "jane", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed -->\n\nLGTM, approved.`, signedBy: null, createdAt: "2026-10-14T16:00:00Z" });
+    const t = await withPull([unsigned]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc).toMatchObject({ route: "me" });
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+  });
+
   it("refuses an approve-pr the gate cannot hold, names the missing step and files nothing (BB-21)", async () => {
     const t = await withPull([]);
     const b = t.binding();
