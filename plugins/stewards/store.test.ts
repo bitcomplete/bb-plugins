@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema } from "./store.js";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema, type Binding } from "./store.js";
 
 /** MIGRATIONS without the groups appended after the ones these order tests assert. */
 const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.length - ACTOR_MIGRATIONS.length);
@@ -119,6 +119,55 @@ describe("needs you items", () => {
     const refiled = s.fileNeed({ bindingId: binding.id, kind: "configure", url: "https://linear.app/secret", what: "Add the client secret again", how: null, filedBy: "steward" });
     expect(refiled.id).not.toBe(first.id);
     expect(s.needs(binding.id, true)).toHaveLength(3);
+  });
+});
+
+describe("countNeedsUser (BB-104)", () => {
+  // The same predicate `needsUser` in server.ts evaluates from the store's own
+  // reads, so the SQL count and the yellow rows cannot drift.
+  const needsUser = (s: ReturnType<typeof store>["s"], b: Binding): boolean =>
+    b.status?.actor === "user" || s.openEscalations(b.id).length > 0 || s.openNeeds(b.id).length > 0 || s.openQuestions(b.projectId).some((q) => q.bindingId === b.id);
+
+  const add = (s: ReturnType<typeof store>["s"], n: number) =>
+    s.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+
+  const userStatus = (at: number) => ({ phase: "Todo", summary: "Waiting", nextAction: "On the user", actor: "user" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at });
+
+  it("counts exactly the open bindings needsUser flags: each condition once, and once when a binding has all four", () => {
+    const { s, binding } = store();
+    // The base binding: actor `user`.
+    s.patch(binding.id, { status: userStatus(1_000) });
+    // One binding per remaining condition.
+    const escalation = add(s, 13);
+    s.escalate({ bindingId: escalation.id, kind: "decision", question: "Q", meanwhile: "m", route: "project", recommendation: null });
+    const need = add(s, 14);
+    s.fileNeed({ bindingId: need.id, kind: "configure", url: "", what: "Enable it", how: null });
+    const question = add(s, 15);
+    s.ask({ projectId: "p1", bindingId: question.id, escalationId: null, question: "Which?", context: null });
+    // All four on one binding: still one row.
+    const all = add(s, 16);
+    s.patch(all.id, { status: userStatus(1_000) });
+    s.escalate({ bindingId: all.id, kind: "decision", question: "Q", meanwhile: "m", route: "project", recommendation: null });
+    s.fileNeed({ bindingId: all.id, kind: "configure", url: "", what: "Enable it", how: null });
+    s.ask({ projectId: "p1", bindingId: all.id, escalationId: null, question: "Which?", context: null });
+    // An ended binding, and one whose escalation and need are resolved: neither counts.
+    const ended = add(s, 17);
+    s.patch(ended.id, { endedAt: 2_000 });
+    const resolved = add(s, 18);
+    s.resolve(s.escalate({ bindingId: resolved.id, kind: "decision", question: "Q", meanwhile: "m", route: "project", recommendation: null }).id, "Done.");
+    s.closeNeed(s.fileNeed({ bindingId: resolved.id, kind: "configure", url: "", what: "Enable it", how: null }).id, "done");
+    // A NULL status column is not the `user` actor, and another project's
+    // open need is not this project's.
+    add(s, 19);
+    const other = s.create({ projectId: "p2", source: "linear", entityId: "uuid-99", entityKey: "ENG-99", url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    s.fileNeed({ bindingId: other.id, kind: "configure", url: "", what: "Enable it", how: null });
+
+    const open = s.open("p1");
+    const expected = open.filter((b) => needsUser(s, b)).length;
+    expect(expected).toBe(5); // actor user, escalation, need, question, and all four
+    expect(s.countNeedsUser("p1")).toBe(expected);
+    expect(s.countNeedsUser("p1")).not.toBe(s.countNeedsUser("p2"));
+    expect(s.countNeedsUser("p2")).toBe(1);
   });
 });
 

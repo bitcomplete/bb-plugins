@@ -455,36 +455,25 @@ describe("a Linear ticket steward", () => {
   });
 
   it("retries a lost adoption wake: a binding left with no thread is woken as adopted on the next reconcile (BB-92)", async () => {
-    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
-    // Let the startup sweep finish before counting config reads, so the only
-    // reads are the ring's adoption and its first reconcile.
+    const t = await setup();
+    // Let the startup sweep finish, then start from the state a restart leaves:
+    // the binding exists with no thread, and no configuration cached.
     await t.flush();
     t.entities.set("uuid-12", issue());
-    // The first reconcile after adoption reads the config as missing (the
-    // transient read behind BB-90): adoption still creates the binding, but
-    // the forced wake exits before the steward thread is spawned.
-    let projectFile = t.files[PROJECT_FILE];
-    let reads = 0;
-    Object.defineProperty(t.files, PROJECT_FILE, {
-      configurable: true,
-      get() {
-        reads += 1;
-        // Read 1 is the ring's stewardedProjects; read 2 is the forced
-        // adoption reconcile, which must find nothing and exit silently.
-        return reads === 2 ? null : projectFile;
-      },
-      set(value: string | null) {
-        projectFile = value;
-      },
-    });
+    t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-12", entityKey: "ENG-12", url: null, title: "Fix login", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.forgetConfigs();
+    const projectFile = t.files[PROJECT_FILE];
+    t.files[PROJECT_FILE] = null;
+    // The cold read behind BB-90 finds no configuration, so the reconcile
+    // exits before the steward thread is spawned, leaving it for the next.
     await t.ring("linear", "uuid-12");
-    // Adopted, but the wake was lost: no thread at all (the project steward is
-    // spawned lazily with the first steward), and no wake recorded.
     expect(t.spawns).toEqual([]);
     expect(await t.list()).toMatchObject([{ key: "ENG-12", threadId: null }]);
     expect(t.hooks.store.find("ENG-12", "p1")!.wokeAt).toBeNull();
 
     // A plain reconcile (force null) retries the adoption wake on its own.
+    t.files[PROJECT_FILE] = projectFile;
+    t.hooks.forgetConfigs();
     await t.ring("linear", "uuid-12");
     expect(await t.list()).toMatchObject([{ key: "ENG-12", threadId: t.spawns[1]!.id }]);
     expect(t.spawns[1]).toMatchObject({ parentThreadId: t.spawns[0]!.id, parentNotifications: "off" });
@@ -3531,6 +3520,127 @@ describe("questions to the user", () => {
   });
 });
 
+// BB-104: the project configuration is served stale and refreshed in the
+// background, so the first poll after the TTL never blocks on the multi-repo
+// read, and a burst of polls makes one read.
+describe("stale-while-revalidate project configuration (BB-104)", () => {
+  type LoadConfig = (projectId: string, force?: boolean) => Promise<{ loadedAt: number } | null>;
+
+  /** Hold every `readProjectFiles` open until released, and count them. */
+  const gated = (t: Awaited<ReturnType<typeof setup>>) => {
+    const original = t.sdk.plugins.callRpc;
+    const reads: string[][] = [];
+    let gate: Promise<void> | null = null;
+    let release: () => void = () => {};
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.method === "readProjectFiles") {
+        reads.push((args.input as { paths: string[] }).paths);
+        if (gate !== null) await gate;
+      }
+      return original(args);
+    });
+    return {
+      reads,
+      hold() {
+        gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      release() {
+        release();
+        gate = null;
+      },
+    };
+  };
+
+  const load = (t: Awaited<ReturnType<typeof setup>>, force?: boolean) => (t.hooks.loadConfig as LoadConfig)("p1", force);
+
+  it("returns the stale entry at once, refreshes it in the background, and replaces it afterwards", async () => {
+    const t = await setup();
+    await t.flush();
+    const stale = await load(t);
+    expect(stale).not.toBeNull();
+    const gate = gated(t);
+    gate.hold();
+    t.advance(10 * 60_000);
+
+    // The sidebar does not wait for the refresh.
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { projectId: string | null };
+    expect(result.projectId).toBe("p1");
+    expect(gate.reads.filter((paths) => paths.includes(PROJECT_FILE))).toHaveLength(1);
+
+    // The background read replaces the entry.
+    gate.release();
+    await t.flush();
+    const refreshed = await load(t);
+    expect(refreshed!.loadedAt).toBe(t.now());
+    expect(refreshed!.loadedAt).not.toBe(stale!.loadedAt);
+  });
+
+  it("shares one in-flight read between concurrent stale calls", async () => {
+    const t = await setup();
+    await t.flush();
+    const gate = gated(t);
+    gate.hold();
+    t.advance(10 * 60_000);
+    const first = load(t);
+    const second = load(t);
+    await Promise.resolve();
+    expect(gate.reads.filter((paths) => paths.includes(PROJECT_FILE))).toHaveLength(1);
+    gate.release();
+    await Promise.all([first, second]);
+  });
+
+  it("keeps the last good entry and logs when the refresh fails", async () => {
+    const t = await setup();
+    await t.flush();
+    const before = await load(t);
+    const original = t.sdk.plugins.callRpc;
+    t.harness.sdk.stub("plugins.callRpc", async (args: { pluginId: string; method: string; input?: unknown; outputSchema: { parse(v: unknown): unknown } }) => {
+      if (args.method === "readProjectFiles") throw new Error("the .bb is unreachable");
+      return original(args);
+    });
+    t.advance(10 * 60_000);
+    expect((await load(t))!.loadedAt).toBe(before!.loadedAt);
+    await t.flush();
+    expect(t.harness.logEntries.some((entry) => entry.level === "warn" && entry.message.includes("could not read the configuration of project p1"))).toBe(true);
+    // The old entry is still served, and the next call refreshes again.
+    expect((await load(t))!.loadedAt).toBe(before!.loadedAt);
+  });
+
+  it("still awaits the read for a forced call and for a cold cache", async () => {
+    const t = await setup();
+    await t.flush();
+    // force: the TTL does not matter, the caller waits for the read.
+    const forcedGate = gated(t);
+    forcedGate.hold();
+    t.advance(10 * 60_000);
+    let forcedSettled = false;
+    const forced = load(t, true).then((v) => {
+      forcedSettled = true;
+      return v;
+    });
+    await Promise.resolve();
+    expect(forcedSettled).toBe(false);
+    forcedGate.release();
+    expect((await forced)!.loadedAt).toBe(t.now());
+
+    // cold: no entry, so the call blocks on the read as it always did.
+    t.hooks.forgetConfigs();
+    const coldGate = gated(t);
+    coldGate.hold();
+    let coldSettled = false;
+    const cold = load(t).then((v) => {
+      coldSettled = true;
+      return v;
+    });
+    await Promise.resolve();
+    expect(coldSettled).toBe(false);
+    coldGate.release();
+    expect(await cold).not.toBeNull();
+  });
+});
+
 describe("the stewards sidebar call", () => {
   type Sidebar = {
     projects: Array<{ projectId: string; name: string; needsCount: number }>;
@@ -3579,6 +3689,25 @@ describe("the stewards sidebar call", () => {
     expect(result.projectStewardThreadId).toBe(project);
     expect(result.bindings).toMatchObject([{ key: "ENG-12", kind: "ticket", threadId: steward, needsUser: true }]);
     expect(result.ended).toEqual([]);
+  });
+
+  it("counts the picker's needs from the same rows as the yellow ones (BB-104)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const first = t.hooks.store.find("ENG-12", "p1")!;
+    // One binding needs the user through its report actor, another through an
+    // open need; an ended one must not count.
+    t.hooks.store.patch(first.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
+    const second = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.fileNeed({ bindingId: second.id, kind: "configure", url: "", what: "Enable it", how: null });
+    const ended = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-14", entityKey: "ENG-14", url: null, title: "Ended", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(ended.id, { endedAt: t.now() });
+
+    const result = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as Sidebar;
+    const yellow = result.bindings.filter((b) => b.needsUser).length;
+    expect(yellow).toBe(2);
+    expect(result.projects.find((p) => p.projectId === "p1")!.needsCount).toBe(yellow);
   });
 
   it("null picks the first project by name, as the board does (BB-100)", async () => {
