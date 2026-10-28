@@ -382,8 +382,14 @@ owner never reaches you until the owner confirms it by id.
 
 ## Setting up a project (`bb stewards …`)
 
-The project must be a multi-repo project: configuration is read from its
-`.bb` repo, committed HEAD only.
+Configuration is read from the project's `.bb` at the default branch's
+committed tip only. With the multi-repo plugin installed that is the
+canonical checkout's committed `HEAD`; without it, stewards falls back to a
+native git read of `.bb` from the checkout's `origin/<default>`, and spawns
+workers on bb's own `project-default` environment. `bb stewards check` and
+`bb stewards show` name the source in use. The worker spawn command always
+comes from `bb stewards spawn-flags` (or the wake): never hand-write an
+`--environment-provider`.
 
 1. From a thread in the project: `bb stewards init` writes
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams

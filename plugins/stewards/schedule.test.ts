@@ -29,6 +29,18 @@ describe("touches", () => {
     expect(touchesOverlap(["web/src"], ["web/srcs", "api/src"])).toEqual([]);
     expect(touchesOverlap(["bb-plugins/plugins/stewards", "bb-gate"], ["bb-gate/docker", "bb-plugins/plugins/linear"])).toEqual(["bb-gate/docker"]);
   });
+
+  it("overlap across the repo-prefixed and native repo-relative forms (BB-107)", () => {
+    // Both repo-relative (native).
+    expect(touchesOverlap(["plugins/stewards"], ["plugins/stewards/wake.ts"])).toEqual(["plugins/stewards/wake.ts"]);
+    // Mixed: a multi-repo touch that moved to native keeps overlapping.
+    expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["plugins/stewards/wake.ts"])).toEqual(["bb-plugins/plugins/stewards"]);
+    expect(touchesOverlap(["plugins/stewards/wake.ts"], ["bb-plugins/plugins/stewards"])).toEqual(["bb-plugins/plugins/stewards"]);
+    expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["plugins/stewards"])).toEqual(["bb-plugins/plugins/stewards"]);
+    // Two repos' same-named tails must not meet, in either direction.
+    expect(touchesOverlap(["bb-plugins/plugins/stewards"], ["bb-gate/plugins/stewards"])).toEqual([]);
+    expect(touchesOverlap(["web/src"], ["api/src"])).toEqual([]);
+  });
 });
 
 describe("conflicts", () => {

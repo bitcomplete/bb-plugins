@@ -97,7 +97,8 @@ These were settled while designing; each changes what gets built.
   and repos the project holds.
 - **Models are a playbook field per role**, and whichever thread spawned a
   binding may override them.
-- **Configuration lives in the project's `.bb`**, read through multi-repo.
+- **Configuration lives in the project's `.bb`**, read through multi-repo, or
+  through native git on the checkout when multi-repo is not installed (BB-107).
 - **People make only the big decisions.** Stewards and the project steward
   decide everything the project's own guidance (AGENTS.md, architecture and
   design docs, the playbooks) settles. Only what the project file lists as a
@@ -236,10 +237,19 @@ it on the host. It gains one small cross-plugin RPC contract:
   checkout's committed `master`.
 - `repoSet({ projectId })` — the parsed repo set.
 
-multi-repo still depends on no other plugin; stewards depends on it. Only
-committed `master` is read, so a playbook edit published from a thread lands as
-a `guidance-<threadId>` branch and takes effect when it is merged. That is the
+multi-repo still depends on no other plugin; stewards uses it when it is
+installed and falls back to native git when it is not (BB-107). Only committed
+`master` is read, so a playbook edit published from a thread lands as a
+`guidance-<threadId>` branch and takes effect when it is merged. That is the
 review step, and it is deliberate.
+
+When multi-repo is not installed, stewards reads `.bb` through a git handler in
+its own host entry: `origin/<default>` after a fetch, never the developer's
+working tree, with the repo set taken from the checkout's own `origin`. The two
+reads sit behind one `ProjectSource` seam (`project-source.ts`), chosen once
+per project at config load and cached with the config; only an unknown-plugin
+RPC error selects native, and a spawn in native mode uses core's
+`project-default` environment.
 
 multi-repo's host-side read fetches and fast-forwards (`--ff-only`) the
 canonical checkout at most once every ten minutes, then reads committed

@@ -10,8 +10,9 @@
 // below looks, compares with the last observation, and wakes the steward only
 // when something actionable changed.
 //
-// Configuration lives in the project's `.bb`, read through multi-repo's RPC
-// from the canonical checkout's committed HEAD. Nothing here reads a file.
+// Configuration lives in the project's `.bb`, read through a project source
+// (project-source.ts): multi-repo's RPCs when it is installed, native git on
+// the project checkout when it is not. Nothing here reads a file.
 import { randomBytes } from "node:crypto";
 import { PluginCliError, cliCommand, defineCli, defineRpcContract, type BbPluginApi, type ExperimentalPluginRpcHandlersWithContext, type PluginCliCommand } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -61,6 +62,7 @@ import {
 import { decideFor, decideForPull, decideForRefusal } from "./decisions.js";
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
+import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
@@ -96,9 +98,7 @@ import { PLAYBOOK_TEMPLATES, projectFileTemplate } from "./templates.js";
 import type { DeploymentTarget } from "./config.js";
 import { PROJECT_STEWARD_INTRO, choicesNote, formatBrief, formatDepsWake, formatOpsWake, formatProjectWake, formatSentryWake, formatSessionWake, formatWake, spawnCommand, workerQuestion, workerReportedError, workerWaiting, workflowRunLine, type DigestRecords, type PendingRequest, type WakeReason, type WorkerQuestion } from "./wake.js";
 
-export const MULTI_REPO_PLUGIN_ID = "multi-repo";
-/** multi-repo's environment provider: where every thread of a stewards project works. */
-export const MULTI_REPO_ENVIRONMENT_PROVIDER_ID = "multi-repo-workspace";
+export { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID };
 
 /**
  * The per-turn system context the SDK injects is truncated at 4096 characters;
@@ -167,6 +167,8 @@ export interface StewardsDeps {
   timing?: Partial<Timing>;
   /** Runs kubectl for ops bindings: on the project's machine, through the host entry, by default. */
   kubectl?: (args: string[], where: { projectId: string; hostId: string | null }) => Promise<KubectlResult>;
+  /** Reads the project's `.bb` from `origin/<default>` for the native source: the host entry by default. */
+  git?: (input: { projectId: string; hostId: string | null; path: string; files: string[] }) => Promise<NativeGitRead>;
   /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
   github?: GithubWriter;
   /** What reads Sentry and subscribes to bb-gate-hooks for it; global fetch by default. */
@@ -228,6 +230,13 @@ const repoSetOutput = z
     error: z.string().nullable(),
   })
   .loose();
+const mergeGuidanceOutput = z.object({ ok: z.boolean(), sha: z.string().nullable(), branch: z.string().nullable(), message: z.string() }).loose();
+
+/** A project checkout fetch can be slow; the git host call is allowed this long. */
+const GIT_TIMEOUT_MS = 60_000;
+
+/** The checkout directory's own name, for a native project's single repo entry. */
+const checkoutDirName = (path: string): string => path.replace(/[\\/]+$/u, "").split(/[\\/]/u).filter((part) => part !== "").at(-1) ?? "project";
 
 /**
  * The `guidance-<thread>` ref a thread's `.bb` commits are published on.
@@ -355,6 +364,8 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           name: z.string(),
           configured: z.boolean(),
+          /** Which project source reads this project's `.bb`: multi-repo or native git (BB-107). */
+          source: z.enum(["multi-repo", "native"]).nullable(),
           label: z.string().nullable(),
           linearTeams: z.array(z.string()),
           repos: z.array(z.string()),
@@ -598,6 +609,8 @@ const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 
 type ProjectConfig = {
   projectId: string;
+  /** The chosen project source (multi-repo or native), cached with the config. */
+  source: ProjectSource;
   file: ProjectFile;
   /** The roles file, when one is present and parses (or its last good copy). */
   roles: RolesFile | null;
@@ -954,10 +967,76 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     const configReads = new Map<string, Promise<ProjectConfig | null>>();
 
+    /** The RPC-backed multi-repo source for one project: the three RPCs as they always were. */
+    function multiRepoSourceFor(projectId: string): ProjectSource {
+      return multiRepoSource({
+        readFiles: async (paths) => {
+          const out = await rpc(MULTI_REPO_PLUGIN_ID, "readProjectFiles", { projectId, paths }, readFilesOutput);
+          if (out.error !== null && out.files.length === 0) throw new Error(out.error);
+          return new Map(out.files.map((f) => [f.path, f.content]));
+        },
+        repoSet: async () => {
+          const set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
+          return { repos: set.repos, primary: set.primary, layout: set.layout, error: set.error };
+        },
+        mergeGuidance: (threadId, file, text) => rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file, text }, mergeGuidanceOutput),
+      });
+    }
+
+    /**
+     * The git-backed native source for one project. The host entry does the
+     * fetch and the read (project-git.ts), on the checkout's own machine; the
+     * server never touches a file. `deps.git` is the test seam.
+     */
+    function nativeSourceFor(projectId: string): ProjectSource {
+      const run = async (files: string[]): Promise<{ read: NativeGitRead; path: string | null }> => {
+        const checkout = await projectCheckout(projectId);
+        if (checkout === null) return { read: { head: null, files: [], remote: null, defaultBranch: null, layout: "primary", error: null }, path: null };
+        const read =
+          deps.git !== undefined
+            ? await deps.git({ projectId, hostId: checkout.hostId, path: checkout.path, files })
+            : await (hostClient ??= bb.hosts.experimental_client({ contract: hostContract })).call("gitProjectFiles", { path: checkout.path, files }, { hostId: checkout.hostId, timeoutMs: GIT_TIMEOUT_MS });
+        return { read, path: checkout.path };
+      };
+      return nativeSource({
+        readFiles: async (paths) => {
+          const { read } = await run(paths);
+          if (read.error !== null && read.files.length === 0) throw new Error(read.error);
+          return new Map(read.files.map((f) => [f.path, f.content]));
+        },
+        repoSet: async () => {
+          const { read, path } = await run([]);
+          const entry = read.remote === null || path === null ? null : { dir: checkoutDirName(path), url: read.remote };
+          return { repos: entry === null ? [] : [entry], primary: entry, layout: read.layout, error: read.error };
+        },
+      });
+    }
+
+    /**
+     * Choose the project source once per config load. The multi-repo read is
+     * the probe: only a missing-plugin error selects native (BB-107); any
+     * other failure keeps multi-repo and propagates, so the last good config
+     * is kept and the failure is shown as a problem line (readConfigShared).
+     */
+    async function selectProjectSource(projectId: string): Promise<{ source: ProjectSource; files: Map<string, string | null> | null }> {
+      try {
+        const out = await rpc(MULTI_REPO_PLUGIN_ID, "readProjectFiles", { projectId, paths: [PROJECT_FILE, ROLES_FILE] }, readFilesOutput);
+        if (out.error !== null && out.files.length === 0) throw new Error(out.error);
+        return { source: multiRepoSourceFor(projectId), files: new Map(out.files.map((f) => [f.path, f.content])) };
+      } catch (error) {
+        if (sourceRpcMissing(error)) {
+          bb.log.info(`stewards: multi-repo is not installed; reading project ${projectId} from native git`);
+          return { source: nativeSourceFor(projectId), files: null };
+        }
+        throw error;
+      }
+    }
+
+    /** Read `.bb` files through the project's chosen source, for callers that do not already hold the config. */
     async function readFiles(projectId: string, paths: string[]): Promise<Map<string, string | null>> {
-      const out = await rpc(MULTI_REPO_PLUGIN_ID, "readProjectFiles", { projectId, paths }, readFilesOutput);
-      if (out.error !== null && out.files.length === 0) throw new Error(out.error);
-      return new Map(out.files.map((f) => [f.path, f.content]));
+      const config = await loadConfig(projectId);
+      if (config === null) throw new Error(`no ${PROJECT_FILE} for project ${projectId}`);
+      return config.source.readFiles(paths);
     }
 
     /**
@@ -974,9 +1053,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return value;
         })
         .catch((error: unknown) => {
-          // Unreachable `.bb` is not "no stewards": keep what we had.
+          // Unreachable `.bb` is not "no stewards": keep what we had. A
+          // non-missing RPC failure stays on the last good source (BB-107) and
+          // is shown as a problem line rather than silently swallowed.
           bb.log.warn(`stewards: could not read the configuration of project ${projectId}: ${errorMessage(error)}`);
-          return configs.get(projectId)?.value ?? null;
+          const last = configs.get(projectId)?.value ?? null;
+          if (last !== null) {
+            const line = `could not read the configuration: ${errorMessage(error)}`;
+            if (!last.problems.includes(line)) last.problems.push(line);
+          }
+          return last;
         })
         .finally(() => {
           if (configReads.get(projectId) === promise) configReads.delete(projectId);
@@ -1007,7 +1093,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     async function readConfig(projectId: string): Promise<ProjectConfig | null> {
       const problems: string[] = [];
-      const configFiles = await readFiles(projectId, [PROJECT_FILE, ROLES_FILE]);
+      const selected = await selectProjectSource(projectId);
+      const source = selected.source;
+      const configFiles = selected.files ?? (await source.readFiles([PROJECT_FILE, ROLES_FILE]));
       const projectText = configFiles.get(PROJECT_FILE) ?? null;
       if (projectText === null) return null;
       let file: ProjectFile;
@@ -1086,7 +1174,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const names = new Map(kinds.map((k) => [k, playbookNameFor(file, k)] as const));
       const depsAlertsName = depsAlertsPlaybookName(file);
       const depsPrsName = depsPrsPlaybookName(file);
-      const texts = await readFiles(projectId, [...new Set([...names.values(), depsAlertsName, depsPrsName])].map(playbookPath));
+      const texts = await source.readFiles([...new Set([...names.values(), depsAlertsName, depsPrsName])].map(playbookPath));
       const playbooks: Partial<Record<BindingKind, Playbook>> = {};
       for (const [kind, name] of names) {
         const text = texts.get(playbookPath(name)) ?? null;
@@ -1136,7 +1224,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       let repos: string[] = [];
       try {
-        const set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
+        const set = await source.repoSet();
         if (set.error !== null) problems.push(`repos.json: ${set.error}`);
         const all = set.repos.map((r) => githubRepoOf(r.url)).filter((r): r is string => r !== null);
         repos = all.filter((r) => !file.github.exclude.some((x) => lc(x) === lc(r)));
@@ -1166,7 +1254,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           problems.push(stewardProblem);
         }
       }
-      return { projectId, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -1192,7 +1280,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (config.depsAlerts !== null) names.add(config.depsAlerts.name);
           if (config.depsPrs !== null) names.add(config.depsPrs.name);
           const paths = ["AGENTS.md", ...[...names].map(playbookPath)];
-          const files = await readFiles(projectId, paths);
+          const files = await config.source.readFiles(paths);
           for (const path of paths) {
             const content = files.get(path) ?? null;
             if (content !== null) value.push(...parseGuidanceUnits(path, content));
@@ -1588,7 +1676,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * cannot await this.
      */
     const projectHostCache = new Map<string, { at: number; hostId: string | null }>();
-    async function projectHost(projectId: string): Promise<string | null> {
+
+    /**
+     * The project's checkout on a machine bb can reach: a `local_path` source,
+     * preferring one on a connected host. Null when the project has none. The
+     * native project source reads `.bb` here (server.ts, project-git.ts).
+     */
+    async function projectCheckout(projectId: string): Promise<{ hostId: string; path: string } | null> {
       try {
         const [project, hosts] = await Promise.all([bb.sdk.projects.get({ projectId }), bb.sdk.hosts.list().catch(() => [])]);
         const sources = project.sources.filter((source) => source.type === "local_path");
@@ -1598,13 +1692,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           sources.find((source) => connected.has(source.hostId)) ??
           sources.find((source) => source.isDefault) ??
           sources[0];
-        projectHostCache.set(projectId, { at: now(), hostId: pick?.hostId ?? null });
-        return pick?.hostId ?? null;
+        return pick === undefined ? null : { hostId: pick.hostId, path: pick.path };
       } catch (error) {
-        bb.log.warn(`stewards: could not find the machine for ${projectId} (${errorMessage(error)}); leaving it to bb's default`);
-        projectHostCache.set(projectId, { at: now(), hostId: null });
+        bb.log.warn(`stewards: could not find the checkout of ${projectId} (${errorMessage(error)}); leaving it to bb's default`);
         return null;
       }
+    }
+
+    async function projectHost(projectId: string): Promise<string | null> {
+      const checkout = await projectCheckout(projectId);
+      projectHostCache.set(projectId, { at: now(), hostId: checkout?.hostId ?? null });
+      return checkout?.hostId ?? null;
     }
 
     /**
@@ -1619,14 +1717,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return entry === undefined || now() - entry.at > timing.sweepMs ? undefined : entry.hostId;
     }
 
-    /** A fresh environment for a project's thread: a multi-repo workspace on its machine. */
-    const freshEnvironment = (hostId: string | null) =>
-      hostId === null
-        ? ({ type: "project-default" } as const)
-        : ({ type: "provider", environmentProviderId: MULTI_REPO_ENVIRONMENT_PROVIDER_ID, inputs: null, machine: { type: "existing", hostId } } as const);
+    /**
+     * A fresh environment for a project's thread, from its chosen source. A
+     * null source (no config) keeps the old multi-repo choice, so a spawn that
+     * outlives its configuration is unchanged.
+     */
+    const freshEnvironment = (source: ProjectSource | null, hostId: string | null): FreshEnvironment =>
+      source === null ? multiRepoFreshEnvironment(hostId) : source.freshEnvironment(hostId);
 
     /** The same, as `bb thread spawn` flags, for the worker command a wake shows. */
-    const environmentFlags = (hostId: string | null) => (hostId === null ? "" : `--environment-provider ${MULTI_REPO_ENVIRONMENT_PROVIDER_ID} --machine ${hostId}`);
+    const environmentFlags = (source: ProjectSource | null, hostId: string | null): string =>
+      source === null ? multiRepoEnvironmentFlags(hostId) : source.environmentFlags(hostId);
 
     /** The project's name in bb, or "" when bb cannot say. */
     const projectName = (projectId: string): Promise<string> =>
@@ -1969,7 +2070,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         const sectionId = await projectSection(config.projectId);
         const thread = await bb.sdk.threads.spawn({
           projectId: config.projectId,
-          environment: freshEnvironment(await projectHost(config.projectId)),
+          environment: freshEnvironment(config.source, await projectHost(config.projectId)),
           prompt: PROJECT_STEWARD_INTRO,
           title,
           ...modelArgs(config.file.projectSteward.model ?? null),
@@ -2063,11 +2164,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       };
       let thread: { id: string };
       try {
-        thread = await bb.sdk.threads.spawn({ ...base, environment: env === null ? freshEnvironment(await projectHost(b.projectId)) : { type: "reuse", environmentId: env } });
+        thread = await bb.sdk.threads.spawn({ ...base, environment: env === null ? freshEnvironment(config.source, await projectHost(b.projectId)) : { type: "reuse", environmentId: env } });
       } catch (error) {
         if (env === null) throw error;
         bb.log.warn(`stewards: could not share the project steward's environment for ${b.entityKey} (${errorMessage(error)}); giving it its own`);
-        thread = await bb.sdk.threads.spawn({ ...base, environment: freshEnvironment(await projectHost(b.projectId)) });
+        thread = await bb.sdk.threads.spawn({ ...base, environment: freshEnvironment(config.source, await projectHost(b.projectId)) });
       }
       tagged.add(thread.id);
       kept.add(thread.id);
@@ -2121,7 +2222,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const sectionId = await projectSection(b.projectId);
       const thread = await bb.sdk.threads.spawn({
         projectId: b.projectId,
-        environment: freshEnvironment(hostId),
+        environment: freshEnvironment(config?.source ?? null, hostId),
         prompt: requesterPrompt(b, need, writeEnv),
         title,
         ...modelArgs(model),
@@ -2259,7 +2360,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         workers: store.workers(b.id),
         workerQuestions,
         children: store.children(b.id).map((c) => ({ binding: c, openEscalations: store.openEscalations(c.id) })),
-        workerFlags: [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
+        workerFlags: [environmentFlags(config.source, await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" "),
         sectionId: await projectSection(b.projectId),
         changes,
         needs: store.openNeeds(b.id),
@@ -3678,22 +3779,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * The primary repo a lesson's pull request opens on, from multi-repo's repo
-     * set.
-     *
-     * TODO(BB-107): when stewards has a native git project source, this must
-     * read the primary repo from that seam instead, and the publish in
-     * `workspace_publish_guidance` must be replaced by the native handler. Until
-     * BB-107 lands, a project with no multi-repo reports the lesson PR refused
-     * rather than opening one; the branch push is multi-repo's.
+     * The primary repo a lesson's pull request opens on, from the project's
+     * chosen source (BB-107): multi-repo's repo set, or native git's checkout
+     * `origin`. A native project can open the pull request the same way once
+     * its `guidance-<thread>` branch is published; the branch push itself is
+     * still multi-repo's `workspace_publish_guidance`.
      */
     async function lessonRepo(projectId: string): Promise<{ repo: string } | { error: string }> {
-      let set: z.infer<typeof repoSetOutput>;
+      const config = await loadConfig(projectId);
+      if (config === null) return { error: "the project has no readable configuration to read its primary repo from" };
+      let set: Awaited<ReturnType<ProjectSource["repoSet"]>>;
       try {
-        set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
+        set = await config.source.repoSet();
       } catch (error) {
         bb.log.warn(`stewards: could not read the repo set for a lesson pull request: ${errorMessage(error)}`);
-        return { error: "could not read the project's primary repo; is multi-repo installed?" };
+        return { error: "could not read the project's primary repo" };
       }
       if (set.primary === null) return { error: "the project source has no origin to open a lesson pull request on" };
       const repo = githubRepoOf(set.primary.url);
@@ -3925,7 +4025,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // failure — must not stop every other lesson being checked.
         let content: string | null = null;
         try {
-          content = (await readFiles(config.projectId, [lesson.file])).get(lesson.file) ?? null;
+          content = (await config.source.readFiles([lesson.file])).get(lesson.file) ?? null;
         } catch (error) {
           bb.log.warn(`stewards: could not read lesson ${lesson.id}'s file ${lesson.file}: ${errorMessage(error)}`);
           continue;
@@ -4782,12 +4882,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
     async function validateWorkerSpawn(thread: { id: string; providerId: string }, owner: Binding): Promise<void> {
       const config = await loadConfig(owner.projectId);
-      const playbook = config === null ? null : bindingPlaybook(config, owner);
+      if (config === null) return;
+      const playbook = bindingPlaybook(config, owner);
       if (playbook === null || playbook.kind === "ops") return;
       const expected = workerModel(owner, playbook);
       if (expected === null) return;
       const hostId = await projectHost(owner.projectId);
-      const expectedEnv = hostId === null ? null : MULTI_REPO_ENVIRONMENT_PROVIDER_ID;
+      const expectedEnv = config.source.kind === "native" || hostId === null ? null : MULTI_REPO_ENVIRONMENT_PROVIDER_ID;
       // undefined means "could not read it": validate what is known, never
       // stop a worker over a fact the plugin could not observe.
       let actualModel: string | null = null;
@@ -4821,7 +4922,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return;
       }
       store.setWorkerModelCheckPending(thread.id, false);
-      const flags = [environmentFlags(hostId), workerFlags(expected)].filter((f) => f !== "").join(" ");
+      const flags = [environmentFlags(config.source, hostId), workerFlags(expected)].filter((f) => f !== "").join(" ");
       store.setWorker(thread.id, "stopped", `Started with the wrong ${problems.join(", ")}; stopped.`);
       await quietly(`stop mis-spawned worker ${thread.id}`, () => bb.sdk.threads.stop({ threadId: thread.id }));
       bb.log.warn(`stewards: stopped worker ${thread.id}: ${problems.join(", ")}`);
@@ -5321,6 +5422,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId,
             name: named.get(projectId) ?? projectId,
             configured: config !== null,
+            source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
             linearTeams: config?.file.linear.teams ?? [],
             repos: config?.repos ?? [],
@@ -5935,7 +6037,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ].join("\n");
       }
       const hostId = cachedProjectHost(b.projectId);
-      const flags = hostId === undefined ? null : [environmentFlags(hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
+      const flags = hostId === undefined ? null : [environmentFlags(config?.source ?? null, hostId), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
       const cachedSection = sectionCache.get(b.projectId);
       const sectionId = cachedSection === undefined ? store.project(b.projectId).sectionId : cachedSection;
       return formatBrief(
@@ -7306,15 +7408,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return own;
     }
 
-    /** The worker spawn flags for a binding: the project's environment first, then the playbook's worker model. */
-    async function workerFlagsFor(b: Binding, playbook: Playbook): Promise<string> {
-      return [environmentFlags(await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
+    /** The worker spawn flags for a binding: the project source's environment first, then the playbook's worker model. */
+    async function workerFlagsFor(b: Binding, playbook: Playbook, source: ProjectSource | null): Promise<string> {
+      return [environmentFlags(source, await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
     }
 
     async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
+      lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
       const ticket = config.playbooks.ticket;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
       lines.push(
@@ -7452,7 +7555,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
               return {
                 exitCode: 0,
-                stdout: formatBrief({ binding: b, playbook, gate: briefGate(b, playbook), workerFlags: await workerFlagsFor(b, playbook), sectionId: await projectSection(b.projectId), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
+                stdout: formatBrief({ binding: b, playbook, gate: briefGate(b, playbook), workerFlags: await workerFlagsFor(b, playbook, config.source), sectionId: await projectSection(b.projectId), escalations: store.openEscalations(b.id), conflicts: conflictsOf(b, store.open(b.projectId)) }),
               };
             },
           }),
@@ -7467,7 +7570,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const config = await loadConfig(b.projectId);
               const playbook = config === null ? null : bindingPlaybook(config, b);
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
-              return { exitCode: 0, stdout: spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: await workerFlagsFor(b, playbook), sectionId: await projectSection(b.projectId) }) };
+              return { exitCode: 0, stdout: spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: await workerFlagsFor(b, playbook, config.source), sectionId: await projectSection(b.projectId) }) };
             },
           }),
 
@@ -7569,9 +7672,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             options: { project: PROJECT_OPTION, json: JSON_OPTION },
             async run(input, ctx) {
               const b = bindingOrThrow(input.positionals.key, input.options.project ?? ctx.projectId);
+              const config = await loadConfig(b.projectId);
               const detail = { binding: b, escalations: store.escalations(b.id), needs: store.needs(b.id, true), workers: store.workers(b.id), children: store.children(b.id).map((c) => c.entityKey), fingerprints: store.fingerprints(b.id) };
-              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(detail) };
-              const lines = [formatBindings([b]), "", `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
+              if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ...detail, projectSource: config?.source.kind ?? null }) };
+              const lines = [formatBindings([b]), "", `Project source: ${projectSourceLabel(config?.source.kind ?? null)}`, `Playbook ${b.playbook}@${b.playbookVersion}; stage ${b.stage ?? "?"}; created ${iso(b.createdAt)}${b.requeueAt === null ? "" : `; requeue ${iso(b.requeueAt)}`}`];
               if (b.kind !== "ops") lines.push(`Ready: ${b.ready.checklist.map((c) => `[${c.met ? "x" : " "}] ${c.item}`).join("; ") || "not reported"}; substantial ${b.ready.substantial ?? "?"}; approval ${b.ready.approval === null ? "none" : iso(b.ready.approval.at)}`);
               if (b.kind !== "ops") {
                 const conflicts = conflictsOf(b, store.open(b.projectId));

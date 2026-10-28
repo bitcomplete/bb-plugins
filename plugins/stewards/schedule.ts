@@ -3,11 +3,16 @@
 // and acts on what it says (a `schedule` escalation to the project steward, a
 // hold placed behind the binding already at work).
 //
-// A touch is a repo-relative path with the repo directory first, as the
-// steward reports it: "bb-plugins/plugins/stewards", "bb-gate/docker". Two
-// bindings overlap when one touch is the other or a parent directory of it,
-// so "bb-plugins" overlaps everything in that repo and
-// "bb-plugins/plugins/stewards/wake.ts" overlaps "bb-plugins/plugins/stewards".
+// A touch is a path the steward reported: with the repo directory first when
+// the project is read through multi-repo ("bb-plugins/plugins/stewards"), and
+// repo-relative without it when it is read through the native git source
+// ("plugins/stewards"). Two bindings overlap when one touch is the other or a
+// parent directory of it, comparing both the path as reported and the path
+// with its first segment stripped, so a repo-prefixed touch and a native
+// repo-relative touch can meet. That stripping is what lets a project that
+// moved from multi-repo to native keep its old bindings' touches meaningful;
+// it can also match two different repos' same-named directory, which is
+// harmless (an extra schedule question) and unavoidable without the repo set.
 import type { Binding, Observed } from "./store.js";
 
 /** A touch as compared: lower case, forward slashes, no leading "./" or surrounding slashes, inner runs of slashes collapsed. */
@@ -28,10 +33,33 @@ export function normalizeTouches(raw: readonly string[]): string[] {
 
 const under = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
 
-/** Whether two touch sets name the same place: a touch of one is, or is inside, a touch of the other. */
+/**
+ * A touch's repo-relative form: the path with its first segment stripped,
+ * when it has one. Null when it is already a single segment.
+ */
+function stripped(touch: string): string | null {
+  const slash = touch.indexOf("/");
+  return slash > 0 ? touch.slice(slash + 1) : null;
+}
+
+/**
+ * Whether two touches name the same place: either full path is the other or
+ * inside it, or one full path is the other's repo-relative form or inside
+ * that. Comparing a stripped form only against a full path (never against
+ * another stripped form) is what stops `web/src` matching `api/src`: they
+ * share a tail, not a place.
+ */
+function touchesMeet(x: string, y: string): boolean {
+  if (under(x, y) || under(y, x)) return true;
+  const sx = stripped(x);
+  const sy = stripped(y);
+  return (sx !== null && (under(sx, y) || under(y, sx))) || (sy !== null && (under(x, sy) || under(sy, x)));
+}
+
+/** Whether two touch sets name the same place, in either form. */
 export function touchesOverlap(a: readonly string[], b: readonly string[]): string[] {
   const hits = new Set<string>();
-  for (const x of a) for (const y of b) if (under(x, y) || under(y, x)) hits.add(x.length >= y.length ? x : y);
+  for (const x of a) for (const y of b) if (touchesMeet(x, y)) hits.add(x.length >= y.length ? x : y);
   return [...hits].sort();
 }
 
