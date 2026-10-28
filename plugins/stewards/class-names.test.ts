@@ -1,10 +1,9 @@
 // BB-98: Tailwind's source scanner does not extract a utility that is glued to
-// a template substitution (`bg-amber-400${transition}`), so no rule is emitted
+// a template substitution (`bg-attention${transition}`), so no rule is emitted
 // and the element renders without that class. Every class template literal
-// needs a space before `${`. This guard fails if one is missing, so the
-// invisible unread "you" dot and the lost dark-mode phrase colour cannot come
-// back.
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+// needs a space before `${`. This guard fails if one is missing, so the unread
+// "you" dot and the running phrase colour cannot go invisible again.
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -45,24 +44,12 @@ function gluedUtilities(): string[] {
 
 describe("class template literals", () => {
   it("flags a glued utility and not a spaced one", () => {
-    expect([..."`bg-amber-400${transition}`".matchAll(GLUED)].map((m) => m[1])).toEqual(["bg-amber-400"]);
-    expect([..."`bg-amber-400 ${transition}`".matchAll(GLUED)]).toEqual([]);
+    expect([..."`bg-attention${transition}`".matchAll(GLUED)].map((m) => m[1])).toEqual(["bg-attention"]);
+    expect([..."`bg-attention ${transition}`".matchAll(GLUED)]).toEqual([]);
     expect([..."`border-2 ${border} ${transition}`".matchAll(GLUED)]).toEqual([]);
   });
 
   it("never glues a utility to a template substitution", () => {
     expect(gluedUtilities()).toEqual([]);
-  });
-});
-
-describe("built stylesheet", () => {
-  // `bb plugin build` writes dist/app.css; when it has been run, check that
-  // Tailwind emitted the dark-mode running phrase colour. CI does not build, so
-  // this runs locally only. The scanner reads this test file too, so a class
-  // spelled out here would be emitted whatever app.tsx says: `dark:text-blue-400`
-  // is the one glyph/phrase class this file does not spell out (BB-98).
-  const builtCss = join(root, "dist", "app.css");
-  it.skipIf(!existsSync(builtCss))("emits the dark-mode running phrase colour", () => {
-    expect(readFileSync(builtCss, "utf8")).toMatch(/\.dark\\:text-blue-400/);
   });
 });

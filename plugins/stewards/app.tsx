@@ -177,7 +177,7 @@ function ThreadLink({ threadId, children }: { threadId: string; children: ReactN
 
 function Badge({ children, tone = "muted" }: { children: ReactNode; tone?: "muted" | "warn" | "bad" }) {
   const colors =
-    tone === "bad" ? "border-destructive/40 text-destructive" : tone === "warn" ? "border-amber-500/40 text-amber-600 dark:text-amber-500" : "border-border text-muted-foreground";
+    tone === "bad" ? "border-destructive/40 text-destructive" : tone === "warn" ? "border-amber-500/40 text-attention" : "border-border text-muted-foreground";
   return <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] ${colors}`}>{children}</span>;
 }
 
@@ -210,7 +210,7 @@ function StatusSection() {
     <div className="flex flex-col gap-4 text-sm">
       {overview.paused ? (
         <p className="flex items-start gap-2">
-          <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="paused" />
+          <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />
           <span>Stewards are paused: nothing is woken or adopted. Changes queue up until you turn Pause stewards off.</span>
         </p>
       ) : null}
@@ -237,7 +237,7 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
         <p className="flex items-center gap-2 font-medium">
           <Icon
             name={healthy ? "CircleCheck" : "CircleAlert"}
-            className={`size-4 shrink-0 ${healthy ? "text-success" : "text-amber-600 dark:text-amber-500"}`}
+            className={`size-4 shrink-0 ${healthy ? "text-success" : "text-attention"}`}
             aria-label={healthy ? "healthy" : "needs attention"}
           />
           {p.name}
@@ -421,7 +421,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
         </p>
       )}
       {s.blockedOn !== null ? <p className="text-muted-foreground">Blocked on {s.blockedOn}</p> : null}
-      {s.hold !== null ? <p className="text-amber-600 dark:text-amber-500">On hold: {s.hold}</p> : null}
+      {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "me" ? "text-destructive" : "text-muted-foreground"}>
           {x.kind} escalation with {x.route === "me" ? "you" : x.route === "parent" ? "the parent steward" : "the project steward"}: {x.question}
@@ -693,7 +693,7 @@ function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void 
       </div>
       {b.paused ? (
         <p className="flex items-start gap-2">
-          <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" aria-label="paused" />
+          <Icon name="CirclePause" className="mt-0.5 size-4 shrink-0 text-attention" aria-label="paused" />
           <span>Stewards are paused: nothing is woken or adopted.</span>
         </p>
       ) : null}
@@ -800,7 +800,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
             {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
           </p>
           {s.blockedOn !== null ? <p className="text-destructive">Blocked on {s.blockedOn}</p> : null}
-          {s.hold !== null ? <p className="text-amber-600 dark:text-amber-500">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
+          {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
           <p className="text-xs text-muted-foreground">
             {s.kind === "ops" ? `Last wake ${ago(s.wokeAt, now)}` : `Reported ${ago(s.statusAt, now)} · adopted ${ago(s.createdAt, now)}`}
@@ -983,7 +983,7 @@ function NeedsYouPrompt({ entry, now }: { entry: NeedsYouItem; now: number }) {
       <p>{n.what}</p>
       {n.kind === "provide-secret" ? <p className="text-xs text-muted-foreground">The form opens in a thread; the value goes to {n.destination ?? "the destination the item names"}.</p> : null}
       {n.how !== null ? <div className="text-muted-foreground"><Markdown content={n.how} /></div> : null}
-      {!n.actionable ? <p className="text-xs text-amber-600 dark:text-amber-500">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
+      {!n.actionable ? <p className="text-xs text-attention">Not actionable yet: {n.why ?? "the server cannot verify it now"}.</p> : null}
     </>
   );
 }
@@ -1244,29 +1244,29 @@ function kindLabel(kind: string | null): string {
   return kind ?? "thread";
 }
 
-/** The phrase's colour follows the glyph's (BB-76): yellow, red, blue, muted. */
+/** The phrase's colour follows the glyph's (BB-76), in bb's theme tokens (BB-99): attention, destructive, timeline-accent, muted. */
 function phraseClass(state: SidebarEffortState): string {
   const transition = "motion-safe:transition-colors duration-300";
-  if (state === "you") return `text-amber-600 dark:text-amber-500 ${transition}`;
+  if (state === "you") return `text-attention ${transition}`;
   if (state === "blocked") return `text-destructive ${transition}`;
-  if (state === "running") return `text-blue-600 dark:text-blue-400 ${transition}`;
+  if (state === "running") return `text-timeline-accent ${transition}`;
   return `text-muted-foreground ${transition}`;
 }
 
 /**
- * The four glyphs, in precedence order (BB-76): a solid yellow dot when it
- * waits on you, an empty red ring when blocked, a blue ring that pulses slowly
- * while a worker or agent runs, an empty grey ring when quiet. The pulse is
- * CSS only and stops under `prefers-reduced-motion`.
+ * The four glyphs, in precedence order (BB-76): a solid attention dot when it
+ * waits on you, an empty destructive ring when blocked, a timeline-accent ring
+ * that pulses slowly while a worker or agent runs, an empty muted ring when
+ * quiet. The pulse is CSS only and stops under `prefers-reduced-motion`.
  */
 function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
   const transition = "motion-safe:transition-colors duration-300";
-  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className={`size-2.5 shrink-0 rounded-full bg-amber-400 ${transition}`} />;
-  const border = kind === "blocked" ? "border-red-500" : kind === "running" ? "border-blue-500" : "border-muted-foreground/50";
+  if (kind === "you") return <span data-steward-glyph="you" aria-hidden="true" className={`size-2.5 shrink-0 rounded-full bg-attention ${transition}`} />;
+  const border = kind === "blocked" ? "border-destructive" : kind === "running" ? "border-timeline-accent" : "border-muted-foreground/50";
   return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border} ${transition}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
 }
 
-/** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
+/** A one-off thread's glyph: attention when unread, timeline-accent animated while its agent runs, muted otherwise. */
 function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
   if (isUnread(thread)) return "you";
   if (isBusy(thread.status)) return "running";
