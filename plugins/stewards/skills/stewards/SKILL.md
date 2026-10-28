@@ -14,8 +14,8 @@ steward** per project sits above all of them.
 |---|---|---|
 | `ticket` | the project's label (default `bb-managed`) is on a Linear issue in a listed team | `linear-tickets` |
 | `pr` | the label is on a pull request in one of the project's repos | `github-prs` |
-| `review` | a teammate opens, or marks ready, a pull request in one of the project's repos | `github-reviews` |
-| `ops` | `project.json` lists a target in `ops.targets` (a Kubernetes namespace or a Sentry project) | `ops-watch` |
+| `review` | a teammate opens, or marks ready, a pull request in one of the project's repos; once `roles.json` names a project steward, only where your review is requested | `github-reviews` |
+| `ops` | this server's `roles.json` entry watches a namespace or Sentry project | `ops-watch` |
 
 ## If you are a steward
 
@@ -375,10 +375,16 @@ The project must be a multi-repo project: configuration is read from its
 1. From a thread in the project: `bb stewards init` writes
    `.bb/stewards/project.json` (Linear teams you belong to, or `--teams
    ENG,OPS`) and the four default playbooks into the workspace's `.bb`.
-   To watch production, list targets in `ops.targets`, such as
-   `{ "kind": "k8s-namespace", "name": "bb-gate-production" }` or
-   `{ "kind": "sentry-project", "org": "acme", "project": "web" }` (the
-   latter needs the plugin's Sentry token setting).
+   The project file holds conventions only. Each person's watches go in
+   `.bb/stewards/roles.json`, keyed by GitHub login: `projectSteward: true`
+   on one login, and `ops.k8sNamespaces` / `ops.sentry.projects` /
+   `ops.dependabot` for the namespaces, Sentry projects and Dependabot repos
+   that server watches (`ops.sentry` needs the plugin's Sentry token
+   setting). A login with no entry runs no watches and is not the project
+   steward; its home page says so. Until `roles.json` exists, the legacy
+   `ops.targets` in `project.json` still runs on every server, with one
+   problem line saying it now belongs in `roles.json`. Nothing per-server is
+   written under `.bb`.
 2. Review them, commit inside `.bb`, publish with
    `workspace_publish_guidance`, and merge the `guidance-<thread>` branch.
    Edits take effect only once merged.
@@ -420,7 +426,7 @@ above which a steward is compacted after its turn.
   target` and `bb stewards check` says why: kubectl on the project's
   machine cannot reach the cluster (not installed, the machine not on the
   tailnet as the developer or a tagged node, no kubeconfig or context for
-  it; `ops.context` picks one), or it may not list pods there. For a Sentry
+  it; the role's `ops.context` picks one), or it may not list pods there. For a Sentry
   project: no token in the plugin's settings (the steward is woken once to
   ask for it), or the token cannot read the project.
   Otherwise it takes a turn every `requeue-default`, healthy or not.

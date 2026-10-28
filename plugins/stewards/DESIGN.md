@@ -42,7 +42,8 @@ existing bb-gate-hooks pipeline; workers for bounded tasks.
 | **Project steward** | One per bb project. Reads every binding's status record, sets priorities and holds, routes escalations, writes the morning digest. |
 | **Worker** | A short-lived child thread a steward starts for one bounded task: implement, fix CI, review a round. Archived with its steward. |
 | **Playbook** | A file in `.bb/stewards/playbooks/`: adoption, phases keyed by entity state, the ready gate, allowed actions, models, terminal states. |
-| **Project file** | `.bb/stewards/project.json`: Linear teams, excluded repos, adoption label, nightly schedule, the project steward's model. |
+| **Project file** | `.bb/stewards/project.json`: the project's conventions — Linear teams, excluded repos, adoption label, nightly schedule, the project steward's model, `deps`, `bigDecisions`. |
+| **Roles file** | `.bb/stewards/roles.json`: per-person watches keyed by GitHub login — project steward, ops namespaces, Sentry projects, Dependabot repos (BB-105). |
 | **Spec** | What the entity should become: the playbook's terminal state, the ticket's description and acceptance criteria, its spec comments, and standing guidance. |
 | **Snapshot** | The observed state, built by plugin code. |
 | **Status record** | What a steward writes at the end of every judgment turn. |
@@ -76,7 +77,9 @@ These were settled while designing; each changes what gets built.
   truth, so compaction loses nothing important.
 - **Opt-in by label** for tickets and pull requests: `bb-managed`.
 - **Every pull request in the project's repos gets a review steward.** Not
-  only the ones your review is requested on.
+  only the ones your review is requested on — until a `roles.json` names a
+  project steward, when a review steward is made only where your review is
+  requested (BB-105).
 - **Comments, not description edits.** A steward adds to a ticket with
   comments. It edits the description only when the scope changes.
 - **Approval before substantial implementation.** A ticket must be fully
@@ -123,12 +126,15 @@ These were settled while designing; each changes what gets built.
   repos.json                   owned by multi-repo; the GitHub repos
   stewards/
     project.json               Linear teams, excluded repos, label, nightly,
-                               project steward
+                               project steward, deps, bigDecisions
+    roles.json                 per-person watches keyed by GitHub login:
+                               projectSteward, ops, Sentry, Dependabot (BB-105)
     playbooks/
       linear-tickets.md
       github-prs.md
       github-reviews.md
-      ops-watch.md             only read when ops.targets lists something (§18)
+      ops-watch.md             only read when a role watches a namespace or
+                               Sentry project (§18)
 ```
 
 ### `project.json`
@@ -166,6 +172,49 @@ These were settled while designing; each changes what gets built.
 - `bb stewards check` validates the file and every playbook against Linear and
   GitHub.
 
+### `roles.json`
+
+The watches with no natural owner are assigned here, keyed by the signed-in
+GitHub login the github plugin reads. Every server runs only its own entry, so
+two developers never watch the same namespace, Sentry project or Dependabot
+repo, and a project has one project steward. Ticket stewards follow the Linear
+assignee and review stewards follow the GitHub requested reviewer; neither
+needs an entry.
+
+```jsonc
+{
+  "version": 1,
+  "roles": {
+    "jane": {
+      "projectSteward": true,
+      "ops": {
+        "k8sNamespaces": ["bb-gate-production"],
+        "context": "bc-prod",
+        "team": "OPS",
+        "autoAdopt": ["urgent"],
+        "sentry": { "projects": [{ "org": "acme", "project": "web" }], "resolveOnDone": false },
+        "dependabot": "all"
+      }
+    },
+    "sam": { "ops": { "k8sNamespaces": ["devbox-production"], "dependabot": ["acme/web"] } }
+  }
+}
+```
+
+- A login with no entry runs no watches and is not the project steward for
+  the project; the home page says `No role for <login> in roles.json`. A file
+  that is present but whose login cannot be read runs no roles — never every
+  role — and says so.
+- The project steward's server reports cross-server problems: a watch nobody
+  runs, a watch two logins run, and no or two project stewards. A role whose
+  machine lacks a credential (no kubectl, no Sentry token) is that server's
+  own `bb stewards check` line.
+- A `project.json` that still carries `ops` runs exactly as before on every
+  server and adds one problem line; once `roles.json` is present it wins, and
+  the migration line stays until the `ops` block is removed.
+- A parse error keeps the last good copy in the plugin's own store; nothing
+  per-server is ever written under `.bb`.
+
 ### Reading `.bb`
 
 `.bb` here is the multi-repo project's own repo — the one holding `repos.json`,
@@ -197,8 +246,8 @@ HEAD; a checkout with local commits is left as it is and read as it is.
 |---|---|---|
 | `ticket` | `bb-managed` added to an issue in a listed Linear team | `linear-tickets` |
 | `pr` | `bb-managed` added to a pull request in a repo from `repos.json` not in `github.exclude` | `github-prs` |
-| `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` not in `github.exclude` | `github-reviews` |
-| `ops` | a target listed in the project file's `ops.targets` (§18) | `ops-watch` |
+| `review` | a non-draft pull request, authored by someone other than you, opened or marked ready in a repo from `repos.json` not in `github.exclude`; once `roles.json` names a project steward, only where your review is requested | `github-reviews` |
+| `ops` | a namespace, Sentry project or Dependabot repo in this server's `roles.json` entry (§18) | `ops-watch`, `deps-alerts` |
 
 - The plugin hears triggers through bb-gate-hooks `team` and `repo` leases,
   which already exist. The nightly pass re-lists labelled tickets and open

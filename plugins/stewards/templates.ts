@@ -27,8 +27,8 @@ export function projectFileTemplate(teams: string[]): string {
       nightly: { at: "01:00", timezone: "America/New_York", until: "02:45", max: 100 },
       projectSteward: { model: "claude/claude-opus-5-5/high" },
       bigDecisions: defaultDecideList(),
-      // Add a target, such as { "kind": "k8s-namespace", "name": "bb-gate-production" }, to watch it.
-      ops: { targets: [], autoAdopt: [] },
+      // Watches are per person now: put namespaces, Sentry projects and
+      // Dependabot repos in stewards/roles.json, keyed by GitHub login.
       // Dependabot alerts: a per-severity SLA, the batch window a medium or low
       // alert may wait for company, and the severities adopted when filed.
       deps: { sla: { critical: "asap", high: "1d", medium: "7d", low: "30d" }, batch: { medium: "7d", low: "30d" }, autoAdopt: ["critical", "high"] },

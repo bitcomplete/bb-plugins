@@ -20,8 +20,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   of its first 96 turns on bithub, so stewards were top-level.) A project's
   stewards share one sidebar section, named after the project; see
   DESIGN.md §15.
-- **Ops stewards.** Each target in the project file's `ops.targets` (a
-  Kubernetes namespace or a Sentry project) gets an `ops` steward, reporting to the project
+- **Ops stewards.** Each namespace and Sentry project in a login's
+  `roles.json` `ops` entry gets an `ops` steward, reporting to the project
   steward, for as long as it is listed. The plugin looks at the target with
   `kubectl` on the project's machine, the developer's own, as them (through
   its host entry, [host.ts](host.ts), and [kubectl.ts](kubectl.ts)): pods,
@@ -43,9 +43,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   wall. Until kubectl can read a target, its binding waits and `bb stewards
   check` says "cannot read the target". DESIGN.md §18.
 - **Dependency stewards.** GitHub scans; the stewards turn Dependabot alerts
-  into tickets. Every repo in `repos.json` not in `github.exclude` (or the
-  explicit `{ kind: "dependabot", repo }` targets in `ops.targets`) gets an
-  `ops` binding that runs `deps-alerts` and is woken by the
+  into tickets. A login whose role lists `dependabot` (or `dependabot: "all"`)
+  gets an `ops` binding for each named repo, or every repo in `repos.json` not
+  in `github.exclude` for `"all"`; each runs `deps-alerts` and is woken by the
   `dependabot_alert` doorbell; the github plugin reads the alerts with the
   developer's token and leases each repo as a `dependabot_repo` (a `repo`
   lease does not receive alert doorbells). Severity sets the Linear priority
@@ -508,6 +508,7 @@ HEAD through multi-repo's `readProjectFiles` and `repoSet`:
 ```
 stewards/
   project.json          Linear teams, excluded repos, label, nightly, project steward model
+  roles.json            per-person watches keyed by GitHub login (ops, Sentry, Dependabot)
   playbooks/
     linear-tickets.md   front matter + one ## section per phase
     github-prs.md
@@ -523,25 +524,42 @@ fails to parse is reported and bindings keep running under the last good
 version. Project file fields beyond the design: `nightly.until`,
 `nightly.max`, `playbooks` (which playbook governs each kind),
 `reviews.enabled`, `adoption.perPass`, `bigDecisions` (what reaches you;
-defaults in [config.ts](config.ts)), and `ops`: `targets` (`{ kind:
-"k8s-namespace", name }`, at most ten), `team` (where tickets are filed; the
-first of `linear.teams` by default, and it must be one of them) and
-`context` (the kubeconfig context kubectl uses; the machine's current one
-when left out) and `autoAdopt` (Linear priorities, `urgent`, `high`, `medium`, `low`, whose
-tickets the ops steward labels for a steward itself when it files them).
-A `{ kind: "sentry-project", org, project }` target watches a Sentry
-project with the plugin's **Sentry token** setting (a user auth token with
-`project:read`, `event:read` and `event:write`; `Sentry API` for a
-self-hosted server), rung by bb-gate-hooks the moment an issue is created
-or regresses and backed by the same periodic look; the Sentry issue id is
-the fingerprint, and the wake carries the issue's title, culprit,
-permalink, counts and latest stack trace ([sentry.ts](sentry.ts), DESIGN.md
-§18). With `ops.sentry.resolveOnDone` on (it defaults off), the look
-resolves a mapped issue whose ticket is Done while Sentry still shows it
-unresolved — the plugin's only Sentry write — and notes it in the look;
-`event:write` is the scope that write needs.
-`ops-watch.md` is read only when `ops.targets` lists a k8s namespace or a
-Sentry project.
+defaults in [config.ts](config.ts)) and `deps` (below). `project.json` holds
+conventions only; the watches that need an owner live in `roles.json`.
+
+`roles.json` (BB-105) assigns what each person's server runs. It is keyed by
+the signed-in GitHub login the github plugin reads, and every server runs only
+its own entry: no entry means no watches and no project steward for that
+server, and its home page says `No role for <login> in roles.json`. An entry
+is `{ projectSteward?: boolean, ops?: { k8sNamespaces, context?, team?,
+autoAdopt?, sentry?: { projects: [{ org, project }], resolveOnDone? },
+dependabot?: [repo, …] | "all" } }`. `k8sNamespaces` are watched with
+kubectl on that person's machine (their kubeconfig `context` when named);
+`team` is where their ops tickets are filed (the first of `linear.teams` by
+default, and it must be one of them); `autoAdopt` names the Linear priorities
+whose tickets the ops steward labels for a steward itself when it files them.
+`sentry.projects` watches Sentry projects with the plugin's **Sentry token**
+setting (a user auth token with `project:read`, `event:read` and
+`event:write`; `Sentry API` for a self-hosted server), rung by bb-gate-hooks
+the moment an issue is created or regresses and backed by the same periodic
+look; the Sentry issue id is the fingerprint, and the wake carries the issue's
+title, culprit, permalink, counts and latest stack trace
+([sentry.ts](sentry.ts), DESIGN.md §18). With `sentry.resolveOnDone` on (it
+defaults off), the look resolves a mapped issue whose ticket is Done while
+Sentry still shows it unresolved — the plugin's only Sentry write — and notes
+it in the look; `event:write` is the scope that write needs. `dependabot`
+lists the repos whose alerts that person watches, or `"all"` for every repo in
+`repos.json` not in `github.exclude`. `ops-watch.md` is read only when a role
+watches a namespace or a Sentry project.
+
+The project steward's server reports cross-server configuration problems: a
+watch nobody runs, a watch two logins run, and no or two project stewards. A
+role whose credential is missing on a machine (no kubectl, no Sentry token)
+is that server's own `bb stewards check` line, not a project-wide problem.
+A `project.json` that still carries `ops` runs exactly as before on every
+server and adds one problem line saying the watches now belong in
+`roles.json`; once `roles.json` is present it wins, and the migration line
+stays.
 
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the

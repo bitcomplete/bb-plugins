@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createFakePluginHost, makePluginAgentConfigurationContext, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
 import { PROJECT_CHANGED } from "./channels.js";
-import { PROJECT_FILE, playbookPath } from "./config.js";
+import { PROJECT_FILE, ROLES_FILE, playbookPath } from "./config.js";
 import { comment, crashingPod, issue, pull, warningEvent } from "./fixtures.js";
 import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
@@ -28,6 +28,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** The login `sourceValidate` reports, per source; tests override one to make it unreadable (BB-105). */
+  const viewers: Partial<Record<"linear" | "github", string | null>> = {};
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
   const sourceDeployments = new Map<string, unknown[]>();
   const rpcCalls: Call[] = [];
@@ -90,7 +92,11 @@ function world() {
           .map((e) => ({ id: e.id, key: e.key, unit: e.unit, kind: e.kind, state: e.state, labels: e.labels, author: e.author, draft: e.pull?.draft ?? false, createdAt: e.createdAt })),
         errors: [],
       };
-    } else if (args.method === "sourceValidate") out = { viewer: "Jane", units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
+    } else if (args.method === "sourceValidate") {
+      const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
+      const viewer = source in viewers ? viewers[source]! : "Jane";
+      out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
+    }
     else if (args.method === "sourceDependabotAlerts") {
       const units = input.units as string[];
       out = { viewer: "jane", alerts: units.flatMap((u) => dependabotAlerts.get(u.toLowerCase()) ?? []), errors: [] };
@@ -278,7 +284,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, entities, dependabotAlerts, sourceDeployments, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, entities, dependabotAlerts, sourceDeployments, viewers, rpcCalls, mergeGuidanceCalls, setMergeGuidanceResult: (value: typeof mergeGuidanceResult) => { mergeGuidanceResult = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -5793,15 +5799,19 @@ describe("ops stewards", () => {
     c.state.logs = false;
     c.state.deployments = false;
     const readable = await check();
-    expect(readable.stdout).not.toMatch(/problem:/u);
-    expect(readable.exitCode).toBe(0);
+    // The only problem is the migration line: the legacy ops still runs, and
+    // says it now belongs in roles.json.
+    expect(readable.stdout).toMatch(/problem: ops now belongs in stewards\/roles\.json/u);
+    expect(readable.stdout.split("\n").filter((l) => l.startsWith("problem:") && !l.includes("ops now belongs"))).toEqual([]);
+    expect(readable.exitCode).toBe(1);
     expect(readable.stdout).toMatch(/ops: k8s-namespace\/bb-gate-production is readable \(get pods, get events\); logs not readable, so diagnosis is from status and events/u);
     expect(readable.stdout).toMatch(/cannot get deployments \(Error from server \(Forbidden\): deployments\.apps is forbidden.*\); looks go without it/u);
 
     // kubectl acts as the developer, whose rights are broad: said, not a problem.
     c.state.writes = true;
     const writable = await check();
-    expect(writable.exitCode).toBe(0);
+    expect(writable.exitCode).toBe(1);
+    expect(writable.stdout.split("\n").filter((l) => l.startsWith("problem:") && !l.includes("ops now belongs"))).toEqual([]);
     expect(writable.stdout).toMatch(/this identity may also delete pods, create pods\/exec, patch deployments; the plugin and the playbook keep to get, describe, logs, auth can-i/u);
     expect(c.calls.every((x) => kubectlRefusal(x.args) === null)).toBe(true);
 
@@ -7075,7 +7085,10 @@ describe("Sentry stewards", () => {
   it("with a token, check reads the project and says how doorbells arrive; a refused project is a problem", async () => {
     const { t, sentry } = await watching({ env: { BB_HOOKS_URL: "http://hooks.test:8081" } });
     const ok = (await t.harness.callRpc("stewardsCheck", { projectId: "p1" })) as { ok: boolean; lines: string[] };
-    expect(ok.ok).toBe(true);
+    // The legacy ops still runs; the migration line is the one problem.
+    expect(ok.ok).toBe(false);
+    expect(ok.lines).toContain("problem: ops now belongs in stewards/roles.json");
+    expect(ok.lines.filter((l) => l.startsWith("problem:") && !l.includes("ops now belongs"))).toEqual([]);
     expect(ok.lines).toContain("sentry: sentry-project/acme/web is readable (Web)");
     expect(ok.lines).toContain("sentry: doorbells from bb-gate-hooks: stopped");
     sentry.setStatus(403);
@@ -7894,5 +7907,170 @@ describe("a steward idle in an active stage (BB-83)", () => {
     await t.flush();
     expect(toSteward()).toHaveLength(afterDeploy + 2);
     expect(toSteward().at(-1)!.text).toMatch(idleLine);
+  });
+});
+
+// BB-105: per-person roles in .bb/stewards/roles.json. Each server runs only
+// its own login's entry; watches are assigned there, ticket and review
+// stewards follow the Linear assignee and the GitHub requested reviewer.
+describe("roles.json (BB-105)", () => {
+  const roles = (entries: Record<string, unknown>) => JSON.stringify({ version: 1, roles: entries });
+  const problemsOf = async (t: Awaited<ReturnType<typeof setup>>): Promise<string[]> => {
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ problems: string[] }> };
+    return overview.projects[0]!.problems;
+  };
+
+  it("starts no ops binding and no project steward for a login with no entry, and says so", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ boss: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual([]);
+    expect(t.spawns).toEqual([]);
+    expect(await problemsOf(t)).toContain("No role for Jane in stewards/roles.json");
+  });
+
+  it("reports two logins naming one namespace on the project steward's server only", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true }, bob: { ops: { k8sNamespaces: ["web-production"] } }, sue: { ops: { k8sNamespaces: ["web-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect((await problemsOf(t)).some((p) => p.includes("two people run the web-production watch"))).toBe(true);
+
+    const other = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    other.viewers.github = "bob";
+    other.files[ROLES_FILE] = roles({ jane: { projectSteward: true }, bob: { ops: { k8sNamespaces: ["web-production"] } }, sue: { ops: { k8sNamespaces: ["web-production"] } } });
+    other.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await other.hooks.sweep();
+    await other.flush();
+    expect((await problemsOf(other)).some((p) => p.includes("two people run"))).toBe(false);
+  });
+
+  it("reports a Sentry project and the Dependabot watch nobody runs", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "sentry-project", org: "acme", project: "web" }] } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true } });
+    t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
+    await t.hooks.sweep();
+    await t.flush();
+    const problems = await problemsOf(t);
+    expect(problems).toContain("nobody runs the Sentry watch for acme/web");
+    expect(problems).toContain("nobody runs the Dependabot watch for acme/web");
+  });
+
+  it("adopts only a ticket assigned to this server's Linear user", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: {}, boss: { projectSteward: true } });
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"] }));
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual([]);
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-13");
+    expect(await t.list()).toMatchObject([{ key: "ENG-13", kind: "ticket" }]);
+  });
+
+  it("adopts an unassigned ticket on the project steward's server only", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true } });
+    t.entities.set("uuid-12", issue({ assignees: [] }));
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
+
+    const other = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    other.files[ROLES_FILE] = roles({ jane: {}, boss: { projectSteward: true } });
+    other.entities.set("uuid-12", issue({ assignees: [] }));
+    await other.ring("linear", "uuid-12");
+    expect(await other.list()).toEqual([]);
+  });
+
+  it("makes a review steward only when the viewer is a requested reviewer", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: {}, boss: { projectSteward: true } });
+    t.entities.set("acme/web#7", pull());
+    await t.ring("github", "acme/web#7");
+    expect(await t.list()).toEqual([]);
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8" }, { requestedReviewers: ["jane"] }));
+    await t.ring("github", "acme/web#8");
+    expect(await t.list()).toMatchObject([{ key: "acme/web#8", kind: "review" }]);
+  });
+
+  it("still adopts a legacy project's unassigned ticket and says ops belongs in roles.json", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }] } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    t.entities.set("uuid-12", issue({ assignees: [] }));
+    await t.hooks.sweep();
+    await t.flush();
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "ENG-12", kind: "ticket" })]));
+    expect(await problemsOf(t)).toContain("ops now belongs in stewards/roles.json");
+  });
+
+  it("runs no roles and says so when roles.json is present but the login cannot be read", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.viewers.github = null;
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toEqual([]);
+    expect(t.spawns).toEqual([]);
+    const problems = await problemsOf(t);
+    expect(problems.some((p) => p.includes("GitHub login cannot be read"))).toBe(true);
+  });
+
+  it("keeps the last good roles.json when the new copy does not parse", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: "k8s-namespace/bb-gate-production", kind: "ops" }]);
+    t.files[ROLES_FILE] = "{ not json";
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/roles\.json is not JSON/u);
+    expect(check.stdout).toMatch(/keeps running under the last good copy/u);
+    expect(await t.list()).toMatchObject([{ key: "k8s-namespace/bb-gate-production", kind: "ops" }]);
+  });
+
+  it("writes nothing under .bb for a per-server role", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.writes).toEqual([]);
+  });
+
+  it("runs the watches in this server's role", async () => {
+    const kubectl = async (args: string[]): Promise<KubectlResult> => {
+      const a = args.filter((x) => !x.startsWith("--"));
+      if (a[0] === "auth") return { exitCode: 1, stdout: "no\n", stderr: "" };
+      if (a[0] === "get") return { exitCode: 0, stdout: a.includes("json") ? JSON.stringify({ items: [] }) : "", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const t = await setup({ kubectl, timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true, ops: { k8sNamespaces: ["bb-gate-production"] } } });
+    t.files[playbookPath("ops-watch")] = OPS_WATCH;
+    await t.hooks.sweep();
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: "k8s-namespace/bb-gate-production", kind: "ops" }]);
+    expect(t.spawns.map((s) => String(s.title))).toEqual(expect.arrayContaining(["Acme project steward", "Ops watch: bb-gate-production"]));
+  });
+
+  it("reports no project steward, and two, where the roles name them", async () => {
+    const two = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    two.files[ROLES_FILE] = roles({ jane: { projectSteward: true }, bob: { projectSteward: true } });
+    await two.hooks.sweep();
+    await two.flush();
+    expect((await problemsOf(two)).some((p) => p.includes("two people are the project steward: jane, bob"))).toBe(true);
+
+    const none = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    none.files[ROLES_FILE] = roles({ jane: {}, bob: {} });
+    await none.hooks.sweep();
+    await none.flush();
+    expect((await problemsOf(none)).some((p) => p.includes("no one is the project steward"))).toBe(true);
   });
 });
