@@ -10,7 +10,13 @@ import { readProjectGit } from "./project-git.js";
 
 const roots: string[] = [];
 
-const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+const git = (cwd: string, ...args: string[]) =>
+  execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    // A CI runner has no global git identity; every commit in these tests gets one.
+    env: { ...process.env, GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "test@example.com" },
+  });
 
 async function tempRoot(): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "bb-stewards-git-"));
@@ -81,6 +87,8 @@ describe("the native git project source", () => {
     const { origin, checkout } = await world();
     const standalone = path.join(path.dirname(checkout), "standalone");
     git(path.dirname(checkout), "clone", "--quiet", origin, standalone);
+    git(standalone, "config", "user.email", "test@example.com");
+    git(standalone, "config", "user.name", "Test");
     // A standalone checkout keeps the definition at the root instead of `.bb/`.
     await rm(path.join(standalone, ".bb"), { recursive: true, force: true });
     await mkdir(path.join(standalone, "stewards"), { recursive: true });
@@ -101,5 +109,18 @@ describe("the native git project source", () => {
     const read = await readProjectGit({ path: checkout, files: ["../secret"] });
     expect(read.error).toMatch(/not a project file path/u);
     expect(read.files).toEqual([]);
+  });
+
+  it("names an oversized file instead of returning a bare git error", async () => {
+    const { checkout } = await world();
+    await writeFile(path.join(checkout, ".bb", "stewards", "big.json"), "x".repeat(700_000), "utf8");
+    git(checkout, "add", "-A");
+    git(checkout, "commit", "--quiet", "-m", "big");
+    git(checkout, "push", "--quiet", "origin", "main");
+    const read = await readProjectGit({ path: checkout, files: ["stewards/project.json", "stewards/big.json"] });
+    expect(read.error).toMatch(/Larger than 200000 characters, so not read: stewards\/big\.json/u);
+    const byPath = new Map(read.files.map((f) => [f.path, f.content]));
+    expect(byPath.get("stewards/big.json")).toBeNull();
+    expect(byPath.get("stewards/project.json")).not.toBeNull();
   });
 });

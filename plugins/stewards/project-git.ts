@@ -13,6 +13,8 @@
 // file name can never become an option. Paths are validated again here even
 // though the host contract already checks them: this is the boundary.
 import { execFile } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { experimental_sanitizeInheritedChildProcessEnv } from "@get-bb/plugin-sdk/host";
 import type { NativeGitRead, ProjectGitFile } from "./project-source.js";
 
@@ -22,23 +24,28 @@ const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_CHARS = 200_000;
 const REGULAR_FILE_MODES = new Set(["100644", "100755"]);
 const SAFE_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/u;
+/** One config load makes several reads; only the first fetches within this window. */
+const FETCH_TTL_MS = 60_000;
+const FETCH_MARKER = ".git/bb-stewards-fetched-at";
 
 type GitRun = { code: number; stdout: string; stderr: string; truncated: boolean };
 
 function runGit(dir: string, args: string[], opts: { timeoutMs?: number; maxBytes?: number } = {}): Promise<GitRun> {
+  const maxBytes = opts.maxBytes ?? MAX_OUTPUT_BYTES;
   return new Promise((resolve) => {
     execFile(
       "git",
       ["-C", dir, ...args],
       {
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
-        maxBuffer: opts.maxBytes ?? MAX_OUTPUT_BYTES,
+        maxBuffer: maxBytes,
         env: { ...experimental_sanitizeInheritedChildProcessEnv({ env: process.env }), NO_COLOR: "1", GIT_TERMINAL_PROMPT: "0" },
         windowsHide: true,
       },
       (error, stdout, stderr) => {
         const e = error as (Omit<NodeJS.ErrnoException, "code"> & { code?: string | number; killed?: boolean }) | null;
         if (e?.code === "ENOENT") return resolve({ code: 127, stdout: "", stderr: "git: not found", truncated: false });
+        if (e?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return resolve({ code: 1, stdout: "", stderr: `git output exceeded ${maxBytes} bytes`, truncated: true });
         const exitCode = e === null ? 0 : typeof e.code === "number" ? e.code : 1;
         resolve({ code: exitCode, stdout: String(stdout), stderr: e !== null && e.killed ? `git did not finish in ${(opts.timeoutMs ?? GIT_TIMEOUT_MS) / 1000}s` : String(stderr), truncated: false });
       },
@@ -53,6 +60,20 @@ async function gitLine(dir: string, args: string[]): Promise<string | null> {
 }
 
 const firstProblemLine = (r: GitRun): string => r.stderr.split(/\r?\n/u).map((l) => l.trim()).find((l) => l !== "") ?? `git exited ${r.code}`;
+
+/**
+ * Fetch `origin`, at most once per {@link FETCH_TTL_MS}, and return the run
+ * (null when the TTL skipped it). A failed fetch still reads the last fetched
+ * commit, and does not mark the window, so the next call retries.
+ */
+async function fetchOrigin(dir: string): Promise<GitRun | null> {
+  const marker = join(dir, FETCH_MARKER);
+  const last = await readFile(marker, "utf8").then((raw) => Number.parseInt(raw.trim(), 10), () => Number.NaN);
+  if (Number.isFinite(last) && Date.now() - last < FETCH_TTL_MS) return null;
+  const fetched = await runGit(dir, ["fetch", "--quiet", "origin"]);
+  if (fetched.code === 0) await writeFile(marker, String(Date.now()), "utf8").catch(() => undefined);
+  return fetched;
+}
 
 async function refExists(dir: string, ref: string): Promise<boolean> {
   const r = await runGit(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
@@ -107,15 +128,16 @@ export async function readProjectGit(input: { path: string; files: readonly stri
     if (problem !== null) return { head: null, files: [], remote: null, defaultBranch: null, layout: "primary", error: problem };
   }
   const remote = await gitLine(dir, ["config", "--get", "remote.origin.url"]);
-  const fetched = await runGit(dir, ["fetch", "--quiet", "origin"]);
+  const fetched = await fetchOrigin(dir);
   const branch = await originDefaultBranch(dir);
   if (branch === null) {
-    return { head: null, files: [], remote, defaultBranch: null, layout: "primary", error: fetched.code === 0 ? `${dir} has no origin default branch to read.` : `Could not fetch the project source: ${firstProblemLine(fetched)}` };
+    const why = fetched === null || fetched.code === 0 ? `${dir} has no origin default branch to read.` : `Could not fetch the project source: ${firstProblemLine(fetched)}`;
+    return { head: null, files: [], remote, defaultBranch: null, layout: "primary", error: why };
   }
   const ref = `refs/remotes/origin/${branch}`;
   const head = await gitLine(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
   if (head === null) {
-    return { head: null, files: [], remote, defaultBranch: branch, layout: "primary", error: `Could not fetch the project source: ${firstProblemLine(fetched)}` };
+    return { head: null, files: [], remote, defaultBranch: branch, layout: "primary", error: `Could not fetch the project source: ${fetched === null ? "no commit on origin's default branch" : firstProblemLine(fetched)}` };
   }
   const prefix = await definitionPrefix(dir, head);
   const layout = prefix === "" ? ("standalone" as const) : ("primary" as const);
@@ -133,6 +155,7 @@ export async function readProjectGit(input: { path: string; files: readonly stri
   }
 
   const files: ProjectGitFile[] = [];
+  const tooLarge: string[] = [];
   for (const file of input.files) {
     const object = blobs.get(`${prefix}${file}`);
     if (object === undefined) {
@@ -140,8 +163,21 @@ export async function readProjectGit(input: { path: string; files: readonly stri
       continue;
     }
     const read = await runGit(dir, ["cat-file", "blob", object], { maxBytes: MAX_FILE_CHARS * 3 + 1 });
-    if (read.code !== 0) return { head, files: [], remote, defaultBranch: branch, layout, error: firstProblemLine(read) };
-    files.push({ path: file, content: read.stdout.length > MAX_FILE_CHARS ? null : read.stdout });
+    if (read.code !== 0) {
+      if (read.truncated) {
+        tooLarge.push(file);
+        files.push({ path: file, content: null });
+        continue;
+      }
+      return { head, files: [], remote, defaultBranch: branch, layout, error: firstProblemLine(read) };
+    }
+    if (read.stdout.length > MAX_FILE_CHARS) {
+      tooLarge.push(file);
+      files.push({ path: file, content: null });
+      continue;
+    }
+    files.push({ path: file, content: read.stdout });
   }
-  return { head, files, remote, defaultBranch: branch, layout, error: null };
+  const error = tooLarge.length === 0 ? null : `Larger than ${MAX_FILE_CHARS} characters, so not read: ${tooLarge.join(", ")}`;
+  return { head, files, remote, defaultBranch: branch, layout, error };
 }

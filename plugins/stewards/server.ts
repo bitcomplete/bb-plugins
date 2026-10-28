@@ -6721,7 +6721,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             const cluster = lessonClusterFor(bindingId, escalationId);
             const lesson = store.addLesson({ projectId: projectOf!, bindingId, escalationId, file: input.lesson!.file, text: input.lesson!.text, scope: input.lesson!.scope, branch, ...(cluster === null ? {} : { clusterKey: cluster }), ...(input.lesson!.supersedes === undefined ? {} : { supersedes: input.lesson!.supersedes }) });
             if (cluster !== null) store.settleClusterRationale(projectOf!, cluster);
-            return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. To land it now, add \`${withLessonAnchor(lesson.text, lesson.id)}\` to ${lesson.file}, commit, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
+            return `lesson ${lesson.id} recorded (${lesson.scope}, ${lesson.tier}); it is injected into wakes and the nightly pass promotes it when it earns it. To land it now, add \`${withLessonAnchor(lesson.text, lesson.id)}\` to ${lesson.file}, commit, publish it with workspace_publish_guidance on a multi-repo project (on a native project, commit and open the pull request yourself), then complete it with steward_update { lessonAction: { id: "${lesson.id}", action: "complete" } }`;
           };
           if (projectOf !== null && resolve?.startsWith("qst_") === true) {
             const q = store.question(resolve);
@@ -7505,7 +7505,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           init: cliCommand({
             summary: "Write stewards/project.json and the default playbooks into a .bb checkout",
             description:
-              "Run from a thread in a multi-repo workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. Then commit inside .bb and publish it (workspace_publish_guidance); stewards reads committed HEAD only.",
+              "Run from a thread in a project workspace: writes into <cwd>/.bb on the thread's machine unless --dir is given. Existing files are left alone unless --force. Then commit inside .bb and publish it (workspace_publish_guidance on a multi-repo project; on a native project, commit and merge the guidance branch yourself); stewards reads committed HEAD only.",
             options: {
               teams: { type: "string", description: "Linear team keys, comma-separated; the teams you belong to when left out" },
               dir: { type: "string", description: "The .bb directory to write into" },
@@ -7535,7 +7535,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
                 lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
               }
-              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance, merge the guidance branch, then run bb stewards check.");
+              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.");
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
