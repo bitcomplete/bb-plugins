@@ -1043,6 +1043,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
    * mirrors `needsUser`: the actor is `user`, or an open escalation, need or
    * question. The open predicates are the ones `openEscalations`, `openNeeds`
    * and `openQuestions` use, so the count and the yellow rows cannot disagree.
+   * It reads `$.actor` from the JSON column and so assumes a schema-valid
+   * `status` record or NULL; writes go through the store's typed `StatusRecord`,
+   * so it agrees with the zod parse behind `needsUser`.
    */
   const countNeedsUserStmt = db.prepare<[string], { n: number }>(
     `SELECT COUNT(*) AS n FROM bindings b
