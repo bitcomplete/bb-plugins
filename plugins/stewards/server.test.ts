@@ -66,6 +66,8 @@ function world() {
   let mergePullError: string | null = null;
   /** The changed paths `github.files` reports, by "owner/repo#n". */
   const githubFiles = new Map<string, string[]>();
+  /** Overrides for `github.fileContent`, by "owner/repo#n:path". */
+  const githubFileContents = new Map<string, string>();
   const github = {
     comment: async (repo: string, number: number, body: string) => {
       githubComments.push({ repo, number, body });
@@ -76,7 +78,23 @@ function world() {
       githubMerges.push({ repo, number, title, body });
       return { sha: "c".repeat(40) };
     },
-    files: async (repo: string, number: number) => githubFiles.get(`${repo}#${number}`) ?? [],
+    files: async (repo: string, number: number) => {
+      const explicit = githubFiles.get(`${repo}#${number}`);
+      if (explicit !== undefined) return explicit;
+      // A lesson PR's changed file is the one named in its body.
+      const pr = githubPulls.find((p) => p.repo === repo && p.number === number);
+      const m = pr === undefined ? null : /in `([^`]+)`/u.exec(pr.body);
+      return m === null ? [] : [`.bb/${m[1]}`];
+    },
+    fileContent: async (repo: string, path: string, ref: string) => {
+      const explicit = githubFileContents.get(`${repo}#${ref}:${path}`);
+      if (explicit !== undefined) return explicit;
+      // The branch ref carries the latest publish, so the last PR on it.
+      const pr = githubPulls.filter((p) => p.repo === repo && (p.head === ref || `refs/heads/${p.head}` === ref)).at(-1);
+      if (pr === undefined) return null;
+      const m = /in `([^`]+)`/u.exec(pr.body);
+      return m === null || path !== `.bb/${m[1]}` ? null : pr.body;
+    },
     defaultBranch: async (repo: string) => githubDefaultBranches.get(repo) ?? "main",
     createPull: async (repo: string, args: { head: string; base: string; title: string; body: string }) => {
       if (createPullError !== null) throw new Error(createPullError);
@@ -300,7 +318,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -6224,6 +6242,29 @@ describe("lessons", () => {
     const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
     expect(done.text).toMatch(/pull request refused: Pull request is not mergeable/u);
     expect(t.hooks.store.lesson(id)).toMatchObject({ status: "pending", pr: expect.stringContaining("acme/bb/pull/"), note: "Pull request is not mergeable: required status check is expected." });
+  });
+
+  it("refuses to merge a procedure lesson's pull request that carries a second file", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    // The published branch smuggled an edit to the project file alongside the lesson.
+    t.githubFiles.set("acme/bb#1", [".bb/AGENTS.md", ".bb/stewards/project.json"]);
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done.text).toMatch(/pull request refused: .*other than the lesson's own/u);
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "pending", note: expect.stringContaining("other than the lesson's own") });
+  });
+
+  it("refuses to merge a procedure lesson's pull request whose file lacks the anchor", async () => {
+    const t = await adopted();
+    const recorded = await t.tool("steward_update", { binding: "ENG-12", lesson: { text: lesson, file: "AGENTS.md", scope: "procedure" } }, t.project);
+    const id = /(lsn_[\w-]+)/u.exec(recorded.text)![1]!;
+    t.githubFileContents.set(`acme/bb#guidance-${t.project}:.bb/AGENTS.md`, "# Guidance\n\nNo anchor here.\n");
+    const done = await t.tool("steward_update", { lessonAction: { id, action: "complete" } }, t.project);
+    expect(done.text).toMatch(/pull request refused: .*does not carry the lesson's anchor/u);
+    expect(t.githubMerges).toEqual([]);
+    expect(t.hooks.store.lesson(id)).toMatchObject({ status: "pending" });
   });
 
   it("a boundary lesson opens a pull request and is filed for the owner with Review PR/Drop", async () => {

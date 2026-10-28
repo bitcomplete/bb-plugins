@@ -1543,8 +1543,12 @@ A **lesson** makes the answer a record and, for most of them, lands it.
 - **The guard.** The self-widening guard is enforced in the PR path before a
   branch is pushed or a pull request is opened, so a lesson row that predates
   the record-time guard can never move the decide list or the roles split.
-  The pull request changes only the lesson's own file and carries the anchor
-  the call names, and a reviewer sees the diff like any other change.
+  Before a procedure merge the plugin re-checks the pull request: every changed
+  path must be a file of a lesson published on that branch, and this lesson's
+  file must carry the anchor the call names. Anything else is refused and noted
+  on the lesson, so a lesson can never smuggle a second change into an
+  auto-merged pull request. A reviewer still sees the diff like any other
+  change.
 - **Status is observed, not assumed.** Every sweep and nightly pass reads
   each pending lesson's file at `.bb` HEAD and marks it `merged` when the
   anchored text is there, however it got there, and reads a pending lesson's

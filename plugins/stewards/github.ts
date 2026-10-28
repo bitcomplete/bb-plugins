@@ -67,6 +67,12 @@ export interface GithubWriter {
   createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
   /** Close a pull request without merging it (BB-108 Drop). */
   closePull(repo: string, number: number): Promise<void>;
+  /**
+   * One file's UTF-8 content at a ref, or null when it is not there. Used to
+   * check a lesson's anchored block is really in the pull request before a
+   * procedure merge (BB-108).
+   */
+  fileContent?(repo: string, path: string, ref: string): Promise<string | null>;
 }
 
 /** "owner/repo#12" or "https://github.com/owner/repo/pull/12" → { repo, number }. */
@@ -130,6 +136,17 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
     },
     async closePull(repo, number) {
       await request("PATCH", `/repos/${repo}/pulls/${number}`, { state: "closed" });
+    },
+    async fileContent(repo, path, ref) {
+      try {
+        const response = await request("GET", `/repos/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`, undefined);
+        const body = (await response.json().catch(() => null)) as { content?: unknown; encoding?: unknown } | null;
+        if (body === null || typeof body.content !== "string") return null;
+        return body.encoding === "base64" ? Buffer.from(body.content, "base64").toString("utf8") : body.content;
+      } catch (error) {
+        if (error instanceof GithubApiError && / 404 /u.test(error.message)) return null;
+        throw error;
+      }
     },
   };
 }

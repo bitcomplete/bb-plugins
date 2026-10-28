@@ -3768,13 +3768,59 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** Squash-merge a lesson's pull request as the project steward, and mark the lesson merged. A refused merge is recorded as a note, like a refused open, so the nightly wake shows it. */
-    async function mergeLessonPr(lesson: Lesson, result: LessonPrResult, note: string, verb = "merged"): Promise<{ ok: boolean; message: string }> {
+    /** The `.bb` files the lessons published on one branch may change: a lesson only ever edits its own file, and several lessons in one publish share the branch. */
+    function lessonPrFiles(projectId: string, branch: string | null): string[] {
+      if (branch === null) return [];
+      return [...new Set(store.allLessons(projectId).filter((l) => l.branch === branch).map((l) => l.file))];
+    }
+
+    /**
+     * The narrow guard the old fast-forward enforced, on the pull request
+     * (BB-35 limit 1, BB-108): the PR must change only the files of the lessons
+     * published on its branch, and this lesson's file must carry its anchor.
+     * Returns why it refuses, or null when the PR is safe to merge. Fails
+     * closed when the read is unavailable.
+     */
+    async function verifyLessonPr(lesson: Lesson, result: LessonPrResult, anchor: string): Promise<string | null> {
+      if (result.repo === null || result.number === null || result.branch === null) return "the pull request could not be read";
+      if (github.files === undefined) return "the pull request's changed files cannot be read";
+      let files: string[];
+      try {
+        files = await github.files(result.repo, result.number);
+      } catch (error) {
+        return `could not read the pull request's changed files: ${errorMessage(error)}`;
+      }
+      // `files` reads one page; a full page means there may be more to check.
+      if (files.length >= 100) return "the pull request changes too many files to verify";
+      const allowed = lessonPrFiles(lesson.projectId, result.branch);
+      const bad = files.filter((path) => !allowed.some((file) => path === file || path === `.bb/${file}`));
+      if (bad.length > 0) return `the pull request changes files other than the lesson's own: ${bad.slice(0, 5).join(", ")}`;
+      const path = files.find((p) => p === lesson.file || p === `.bb/${lesson.file}`);
+      if (path === undefined) return `the pull request does not change ${lesson.file}`;
+      if (github.fileContent === undefined) return `${path} cannot be read from the pull request`;
+      let content: string | null;
+      try {
+        content = await github.fileContent(result.repo, path, result.branch.replace(/^refs\/heads\//u, ""));
+      } catch (error) {
+        return `could not read ${path} from the pull request: ${errorMessage(error)}`;
+      }
+      if (content === null || !content.includes(anchor)) return `${path} does not carry the lesson's anchor`;
+      return null;
+    }
+
+    /** Squash-merge a lesson's pull request as the project steward, and mark the lesson merged. The narrow guard is checked first, and a refusal is recorded as a note, like a refused open, so the nightly wake shows it. */
+    async function mergeLessonPr(lesson: Lesson, result: LessonPrResult, note: string, opts: { retire?: boolean; verb?: string } = {}): Promise<{ ok: boolean; message: string }> {
       if (result.repo === null || result.number === null) return { ok: true, message: `pull request opened at ${result.url ?? "?"}` };
+      const retire = opts.retire === true;
+      const problem = await verifyLessonPr(lesson, result, retire ? retiredLessonAnchor(lesson.id) : lessonAnchor(lesson.id));
+      if (problem !== null) {
+        store.noteLesson(lesson.id, problem);
+        return { ok: false, message: `pull request refused: ${problem}` };
+      }
       try {
         const { sha } = await github.squashMerge(result.repo, result.number, `Lesson ${lesson.id}`, note);
         store.markLessonMerged(lesson.id, sha, result.branch ?? lesson.branch, note);
-        return { ok: true, message: `${verb} at ${sha ?? result.url ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}` };
+        return { ok: true, message: `${opts.verb ?? "merged"} at ${sha ?? result.url ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}` };
       } catch (error) {
         const message = errorMessage(error);
         store.noteLesson(lesson.id, message);
@@ -3838,6 +3884,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         store.markLessonDropped(lesson.id, "Retired before it reached the file.");
         return "retired (it was not in the file)";
       }
+      // A publish that retired several lessons in one branch may already have
+      // put this one's retired anchor at HEAD when an earlier retire merged.
+      const atHead = (await readFiles(lesson.projectId, [lesson.file]).catch(() => new Map<string, string | null>())).get(lesson.file) ?? null;
+      if (atHead !== null && atHead.includes(retiredLessonAnchor(lesson.id))) {
+        store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
+        closeLessonNeed(lesson, "Already retired at .bb HEAD.");
+        return "already retired at .bb HEAD";
+      }
       const result = await openLessonPr(lesson, retiredLessonAnchor(lesson.id), { retire: true });
       if (!result.ok) {
         store.noteLesson(lesson.id, result.message);
@@ -3847,7 +3901,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         fileBoundaryLessonNeed(lesson, result.branch, result.url, true);
         return `boundary retire; Review PR/Drop filed for the user at ${result.url ?? "?"}`;
       }
-      const merged = await mergeLessonPr(lesson, result, `Retired; the anchored text was removed from ${lesson.file}.`, "retired");
+      const merged = await mergeLessonPr(lesson, result, `Retired; the anchored text was removed from ${lesson.file}.`, { retire: true, verb: "retired" });
       if (merged.ok) store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
       return merged.message;
     }
