@@ -10,9 +10,15 @@ containing a checkout of each**.
   .bb/                  the project definition: repos.json, AGENTS.md, skills/
 ```
 
-A project's source stops being *code* and becomes the **workspace definition**:
-a small `.bb` git repo holding the repo set, cross-repo guidance, and project
-skills. Every repo is equal — there is no privileged primary repo.
+A project's source is the **primary repo** — one real repo whose default
+branch carries `.bb/`, a directory holding the repo set, cross-repo guidance
+and project skills. `.bb/repos.json` lists only the *other* repos; the primary
+is derived from the project source's own `origin` and is not repeated. The
+standalone `.bb`-repo layout is still supported, so a machine that has not
+adopted keeps working; `bb repos adopt` moves a standalone definition into the
+primary, per machine.
+
+Every repo is equal in the workspace; the primary is one of them.
 
 Standalone: no bb fork, no bb-internal packages, no dependency on any other
 plugin.
@@ -94,7 +100,7 @@ parse fails the launch with a message naming the offending entry.
 | **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form that creates a multi-repo project in one step. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
 | **Changes** thread panel | Per-repo diff and pull request. Opened from the thread panel's Actions list. |
 | Composer banner | One row above the composer naming the repos that changed, their file counts and the `+`/`−` totals. Click it to open the Changes panel. Hidden when nothing has changed. |
-| `bb repos` | `list`, `add`, `remove` (each takes `--project`), and `status` for the current thread. |
+| `bb repos` | `list`, `add`, `remove` (each takes `--project`), `adopt <primary>`, and `status` for the current thread. |
 | Agent tools | `workspace_list_repos`, `workspace_add_repo`, `workspace_remove_repo`, `workspace_publish_guidance`. |
 | Agent instructions | A generated table of `repo → branch → path`, plus a `multi-repo` skill. |
 
@@ -125,6 +131,26 @@ to a worktree's.
 A second benefit: two threads cannot both check out `main` as worktrees of one
 repo, but independent clones can — and `.bb` is on its default branch in every
 workspace.
+
+### Where `.bb` lives
+
+`.bb/` is a directory on the primary repo's default branch, next to the code,
+reviewed like code. The project source is a clone of that primary repo, and
+core reads `<workspace>/.bb/AGENTS.md` and `<workspace>/.bb/skills` from the
+workspace root — so each thread materialises `.bb/` there from the primary's
+`.bb/`. Reads (`readProjectFiles`, `repoSet`) come from the default branch's
+committed tip, never the working tree or a feature branch.
+
+The **standalone** layout — a small `.bb` git repo that is the project source —
+is still read and written exactly as before. `bb repos adopt <primary>` copies
+a standalone tree into `.bb/` on a branch of the primary and opens a pull
+request; once it merges, running `bb repos adopt` again re-points
+`project_sources.path` in place. The project id, every stewards binding and
+every thread stay as they are (BB-106, Case A).
+
+A workspace built before an adopt keeps publishing guidance to the old
+standalone checkout; `bb repos status` and the Changes panel say so, and a
+branch it publishes has to be re-applied to the primary by hand.
 
 ### The object cache
 
@@ -174,17 +200,24 @@ the generated block cannot be edited.
 ### Writing back to `.bb`
 
 The canonical `.bb` checkout is outside the agent's sandbox, so the write is
-inverted: the canonical repo *fetches* from the workspace clone, initiated by
-the plugin's host entry.
+inverted: the plugin's host entry does it.
+
+On the **standalone** layout, the canonical repo *fetches* from the workspace
+clone:
 
 ```
 git -C <canonical-.bb> fetch <workspace>/.bb HEAD:refs/heads/guidance-<threadId>
 ```
 
-That avoids the sandbox and `receive.denyCurrentBranch` at once, and leaves a
-named branch to review and merge. `workspace_publish_guidance` is the agent's
-entry point; `repos.json` edits from the tools, the CLI and the panel take the
-same host-side route, which is why they work under `accept-edits`.
+On the **primary** layout, `.bb/` is a directory in the primary repo and the
+default branch is reviewed like code, so `workspace_publish_guidance` builds a
+`guidance-<threadId>` branch with the workspace's `.bb/` content and stops
+there — it never moves the default branch. `mergeGuidance` reports that a
+lesson needs a pull request (BB-108 adds that flow). That avoids the sandbox and
+`receive.denyCurrentBranch` at once, and leaves a named branch to review and
+merge. `workspace_publish_guidance` is the agent's entry point; `repos.json`
+edits from the tools, the CLI and the panel take the same host-side route,
+which is why they work under `accept-edits`.
 
 ### Reading `.bb` from another plugin
 

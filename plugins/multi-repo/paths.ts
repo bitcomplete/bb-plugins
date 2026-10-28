@@ -37,6 +37,29 @@ export function assertSafeSegment(value: string, what: string): string {
 export const PROJECT_SOURCE_DIR = ".bb";
 
 /**
+ * Which of the two shapes a project source has.
+ *
+ * - `standalone` — the project source is a `.bb` git repo of its own; the
+ *   definition (`repos.json`, `AGENTS.md`, `skills/`) sits at its root. This is
+ *   the original layout, still supported so a machine that has not adopted yet
+ *   keeps working.
+ * - `primary` — the project source is a clone of the primary repo P and the
+ *   definition sits at `P/.bb/`. `repos.json` lists only the *other* repos;
+ *   P is derived from the checkout's `origin`.
+ */
+export type ProjectLayout = "standalone" | "primary";
+
+/**
+ * The path prefix under the project source that holds the definition.
+ *
+ * Empty for `standalone`, `.bb/` for `primary` — always a POSIX-style prefix
+ * because it is used both as a filesystem path segment and as a git pathspec.
+ */
+export function projectDefinitionPrefix(layout: ProjectLayout): string {
+  return layout === "primary" ? `${PROJECT_SOURCE_DIR}/` : "";
+}
+
+/**
  * A stable cache directory name for a repo URL.
  *
  * The readable prefix is for a human reading `ls` on the cache; the hash is

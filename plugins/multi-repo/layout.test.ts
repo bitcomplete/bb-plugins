@@ -17,7 +17,9 @@ function manifest(overrides: Partial<WorkspaceManifest> = {}): WorkspaceManifest
     threadId: "thr_1",
     projectId: "proj_1",
     branchName: "dylan/fix-the-thing",
+    layout: "standalone",
     projectSourcePath: "/home/me/projects/acme",
+    definitionBase: null,
     createdAt: 0,
     repos: [
       {

@@ -54,7 +54,7 @@ import {
   type RepoEntry,
   type ReposFile,
 } from "./repos.js";
-import { PROJECT_SOURCE_DIR, normalizeRemoteUrl } from "./paths.js";
+import { PROJECT_SOURCE_DIR, normalizeRemoteUrl, type ProjectLayout } from "./paths.js";
 import {
   CACHE_BACKGROUND_MS,
   CACHE_FRESH_MS,
@@ -145,6 +145,13 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     `CREATE INDEX IF NOT EXISTS workspace_threads_workspace ON workspace_threads (host_id, path_key)`,
     `INSERT OR IGNORE INTO workspace_threads (thread_id, host_id, path_key, bound_at)
        SELECT thread_id, host_id, path_key, created_at FROM workspaces`,
+    // The project-source layout this workspace was provisioned from. Existing
+    // rows default to `standalone`, which is what they are; a workspace whose
+    // layout no longer matches the project's is one that predates an adopt.
+    `ALTER TABLE workspaces ADD COLUMN layout TEXT NOT NULL DEFAULT 'standalone'`,
+    // The default-branch commit `.bb/` was materialized from, so guidance
+    // publish can warn when `.bb/` moved on the default branch since.
+    `ALTER TABLE workspaces ADD COLUMN definition_base TEXT`,
   ]);
 
   const host = bb.hosts.experimental_client({
@@ -172,14 +179,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   function saveManifest(manifest: WorkspaceManifest): void {
     db.prepare(
       `INSERT INTO workspaces
-         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, repos, instructions, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, definition_base, repos, instructions, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (host_id, path_key) DO UPDATE SET
          thread_id = excluded.thread_id,
          project_id = excluded.project_id,
          root = excluded.root,
          branch_name = excluded.branch_name,
          project_source_path = excluded.project_source_path,
+         layout = excluded.layout,
+         definition_base = excluded.definition_base,
          repos = excluded.repos,
          instructions = excluded.instructions,
          created_at = excluded.created_at`,
@@ -191,6 +200,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       manifest.root,
       manifest.branchName,
       manifest.projectSourcePath,
+      manifest.layout,
+      manifest.definitionBase,
       JSON.stringify(manifest.repos),
       formatInstructions(manifest),
       manifest.createdAt,
@@ -206,7 +217,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         projectId: String(row.project_id),
         root: String(row.root),
         branchName: String(row.branch_name),
+        layout: row.layout === "primary" ? "primary" : "standalone",
         projectSourcePath: String(row.project_source_path),
+        definitionBase: typeof row.definition_base === "string" ? row.definition_base : null,
         repos: JSON.parse(String(row.repos)) as WorkspaceRepo[],
         createdAt: Number(row.created_at),
       };
@@ -443,6 +456,116 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   }
 
   /**
+   * True when a workspace was built from a standalone `.bb` and the project's
+   * source is now a primary checkout — i.e. a machine has run adopt since.
+   *
+   * Such a workspace keeps publishing guidance to the old canonical checkout
+   * until it ends; the branch it publishes has to be re-applied to the primary
+   * by hand. Every surface that describes the workspace says so.
+   */
+  async function predatesAdopt(manifest: WorkspaceManifest): Promise<boolean> {
+    if (manifest.layout !== "standalone") return false;
+    try {
+      const current = await projectSource(manifest.projectId);
+      return current !== null && current.path !== manifest.projectSourcePath;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The adopt flow behind both the RPC and `bb repos adopt`.
+   *
+   * Runs host-side on the project's machine, then, when the primary already
+   * carries `.bb/`, re-points `project_sources.path` in place. That is the
+   * whole of Case A: no new project, no store re-key, no respawn.
+   */
+  async function performAdopt(
+    projectId: string,
+    primary: string,
+    path: string,
+    openPullRequest: boolean,
+  ): Promise<{
+    status: "already" | "pull-request" | "failed";
+    message: string;
+    prUrl: string | null;
+    warnings: string[];
+    primaryPath: string;
+    defaultBranch: string | null;
+    repointed: boolean;
+  }> {
+    const location = await projectSource(projectId);
+    if (location === null) {
+      return {
+        status: "failed",
+        message: "This project has no checkout on any machine.",
+        prUrl: null,
+        warnings: [],
+        primaryPath: path,
+        defaultBranch: null,
+        repointed: false,
+      };
+    }
+    const branch = `bb/adopt-bb-${Date.now().toString(36)}`;
+    let result: {
+      status: "already" | "pull-request" | "failed";
+      message: string;
+      prUrl: string | null;
+      warnings: string[];
+      primaryPath: string;
+      defaultBranch: string | null;
+    };
+    try {
+      result = await host.call(
+        "adoptProjectSource",
+        {
+          standalonePath: location.path,
+          primaryUrl: primary,
+          primaryPath: path,
+          branch,
+          openPullRequest,
+        },
+        { hostId: location.hostId, timeoutMs: CREATE_TIMEOUT_MS },
+      );
+    } catch (error) {
+      return {
+        status: "failed",
+        message: errorMessage(error),
+        prUrl: null,
+        warnings: [],
+        primaryPath: path,
+        defaultBranch: null,
+        repointed: false,
+      };
+    }
+
+    let repointed = false;
+    if (result.status === "already") {
+      try {
+        const project = await bb.sdk.projects.get({ projectId });
+        const source = project.sources.find(
+          (entry) => entry.type === "local_path" && entry.hostId === location.hostId && entry.path === location.path,
+        );
+        if (source !== undefined) {
+          await bb.sdk.projects.sources.update({
+            projectId,
+            sourceId: source.id,
+            type: "local_path",
+            path: result.primaryPath,
+          });
+          repointed = true;
+          changed();
+        } else {
+          result.warnings.push("The project source row could not be found; re-point it by hand.");
+        }
+      } catch (error) {
+        result.warnings.push(`Could not re-point the project source: ${errorMessage(error)}`);
+      }
+    }
+    return { ...result, repointed };
+  }
+
+  /**
    * Read the repo set.
    *
    * `bootstrap` is true only where an absent `.git` genuinely should be
@@ -454,17 +577,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     location: SourceLocation,
     options: { bootstrap: boolean },
     signal?: AbortSignal,
-  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null }> {
+  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null; layout: ProjectLayout; remote: string | null }> {
     const prepared = await host.call(
       "prepareProjectSource",
       { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: options.bootstrap },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
-    if (prepared.reposJson === null) return { text: null, file: EMPTY_REPOS, error: null };
+    if (prepared.reposJson === null) {
+      return { text: null, file: EMPTY_REPOS, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote };
+    }
     const parsed = parseReposFile(prepared.reposJson);
     return parsed.ok
-      ? { text: prepared.reposJson, file: parsed.value, error: null }
-      : { text: prepared.reposJson, file: null, error: parsed.error };
+      ? { text: prepared.reposJson, file: parsed.value, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote }
+      : { text: prepared.reposJson, file: null, error: parsed.error, layout: prepared.layout ?? "standalone", remote: prepared.remote };
   }
 
   async function writeRepoSet(
@@ -472,10 +597,11 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     file: ReposFile,
     message: string,
     signal?: AbortSignal,
+    layout: ProjectLayout = "standalone",
   ): Promise<void> {
     const result = await host.call(
       "writeProjectSourceRepos",
-      { path: location.path, reposJson: serializeReposFile(file), message },
+      { path: location.path, reposJson: serializeReposFile(file), message, layout },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
     // The file is written either way, but an uncommitted change is not shared
@@ -518,7 +644,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = addRepo(current.file, entry);
     if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
-    await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal);
+    await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout);
     return { ok: true, dir: entry.dir };
   }
 
@@ -533,7 +659,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = removeRepo(current.file, dir);
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
-    await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal);
+    await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout);
     return { ok: true, dir };
   }
 
@@ -551,7 +677,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
     const next = edited.value.repos.find((repo) => repo.dir === dir)?.branch;
     const message = next === undefined ? `Use the default branch for ${dir}` : `Base ${dir} on ${next}`;
-    await writeRepoSet(location, edited.value, message, signal);
+    await writeRepoSet(location, edited.value, message, signal, current.layout);
     return { ok: true, dir };
   }
 
@@ -667,21 +793,70 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         context.report.step("Looking for repos already on this machine");
         const mirrors = await localCheckouts(hostId, location.path, context.signal);
 
+        // A primary project's repo set is `repos.json`'s entries *plus* the
+        // primary, which is not repeated in the file. It is identified by the
+        // project source's own `origin`, so a source without one cannot say
+        // which clone is the primary.
+        const layout: ProjectLayout = prepared.layout ?? "standalone";
+
+        if (layout === "primary" && prepared.remote === null) {
+          return {
+            status: "failed",
+            message: `The project source is a primary repo with no origin. Add one so the primary can be identified, or make it a standalone .bb repo.`,
+          };
+        }
+        const primaryRequest =
+          layout === "primary" && prepared.remote !== null
+            ? primaryRepoRequest(prepared.remote)
+            : null;
+        if (layout === "primary" && primaryRequest === null) {
+          return {
+            status: "failed",
+            message: `Could not derive a directory name for the primary repo from ${prepared.remote}.`,
+          };
+        }
+
         if (repoSet.repos.length === 0) {
           const seeded = proposeRepoSet(mirrors);
-          if (seeded.repos.length === 0) {
+          if (seeded.repos.length === 0 && layout !== "primary") {
             return {
               status: "failed",
               message: `No repos are configured. Add some to ${REPOS_FILE} in ${location.path}, or run \`bb repos add <url>\`.`,
             };
           }
-          context.report.log(
-            `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
-              .map((repo) => repo.dir)
-              .join(", ")}`,
+          if (seeded.repos.length > 0) {
+            context.report.log(
+              `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
+                .map((repo) => repo.dir)
+                .join(", ")}`,
+            );
+            await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
+            repoSet = seeded;
+          }
+        }
+
+        const repoRequests = repoSet.repos.map(toRepoRequest);
+        if (
+          primaryRequest !== null &&
+          !repoRequests.some((repo) => normalizeRemoteUrl(repo.url) === normalizeRemoteUrl(primaryRequest.url))
+        ) {
+          repoRequests.push(primaryRequest);
+        }
+        // A repos.json entry with the same directory name as the primary but a
+        // different remote (a fork) would clone two repos into one directory
+        // and fail the provision; name it instead.
+        if (primaryRequest !== null) {
+          const clash = repoRequests.find(
+            (repo) =>
+              repo.dir.toLowerCase() === primaryRequest.dir.toLowerCase() &&
+              normalizeRemoteUrl(repo.url) !== normalizeRemoteUrl(primaryRequest.url),
           );
-          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal);
-          repoSet = seeded;
+          if (clash !== undefined) {
+            return {
+              status: "failed",
+              message: `repos.json has "${clash.dir}", which collides with the primary repo's directory "${primaryRequest.dir}". Rename the entry or set the primary's directory.`,
+            };
+          }
         }
 
         // Claim before writing. Two environments must never share a root, and
@@ -691,14 +866,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           return { status: "failed", message: `${root} is already in use by another environment.` };
         }
 
-        context.report.step(`Preparing ${repoSet.repos.length} repo(s)`);
+        context.report.step(`Preparing ${repoRequests.length} repo(s)`);
         const provisioned = await host.call(
           "provisionWorkspace",
           {
             operationId,
             pathKey: context.pathKey,
             projectSourcePath: location.path,
-            repos: repoSet.repos.map(toRepoRequest),
+            layout,
+            primaryDir: primaryRequest?.dir ?? null,
+            repos: repoRequests,
             branchName: context.suggestedBranchName,
             fetchTtlMs: CACHE_FRESH_MS,
             mirrors,
@@ -713,7 +890,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           threadId: context.thread.id,
           projectId: context.project.id,
           branchName: context.suggestedBranchName,
+          layout,
           projectSourcePath: location.path,
+          definitionBase: provisioned.definitionBase,
           repos: provisioned.repos,
           createdAt: Date.now(),
         };
@@ -800,6 +979,24 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
 
   function toRepoRequest(repo: { dir: string; url: string; branch?: string }): RepoRequest {
     return { dir: repo.dir, url: repo.url, branch: repo.branch ?? null };
+  }
+
+  /**
+   * The primary repo as a workspace repo request, from the project source's
+   * `origin`. It is not repeated in `repos.json`, so every primary project's
+   * workspace gets one clone of it in addition to the entries in the file.
+   */
+  function primaryRepoRequest(remote: string): RepoRequest | null {
+    const dir = dirFromUrl(remote);
+    if (dir === null || dir === PROJECT_SOURCE_DIR) return null;
+    return { dir, url: remote, branch: null };
+  }
+
+  /** The primary repo as the panel's read-only view (no `branch`). */
+  function primaryView(remote: string | null): { dir: string; url: string } | null {
+    if (remote === null) return null;
+    const request = primaryRepoRequest(remote);
+    return request === null ? null : { dir: request.dir, url: request.url };
   }
 
   /**
@@ -991,9 +1188,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   bb.agents.registerTool({
     name: "workspace_publish_guidance",
     description:
-      "Publish commits made in this workspace's .bb directory (AGENTS.md, skills, repos.json) back to the project's canonical checkout, as a branch to review and merge.",
+      "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
     instructions:
-      "Commit inside .bb first, then call workspace_publish_guidance. The canonical checkout is outside your sandbox, so a plain git push will not reach it.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side and publishes a guidance-<thread> branch — there is no need (and, where .bb/ is a directory rather than a repo, no way) to commit inside .bb yourself.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {
@@ -1007,6 +1204,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         {
           projectSourcePath: manifest.projectSourcePath,
           workspaceBbPath: source.path,
+          definitionBase: manifest.definitionBase,
           // The calling thread, not the workspace's creator: two threads
           // sharing one checkout must not push onto one `guidance-<thread>`
           // ref and silently overwrite each other's proposal.
@@ -1113,10 +1311,21 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
             if (input.options.json) {
               return {
                 exitCode: 0,
-                stdout: JSON.stringify({ source: location, repos: set.file.repos, cache: cache.entries }, null, 2),
+                stdout: JSON.stringify(
+                  {
+                    source: location,
+                    layout: set.layout,
+                    primary: primaryView(set.remote),
+                    repos: set.file.repos,
+                    cache: cache.entries,
+                  },
+                  null,
+                  2,
+                ),
               };
             }
-            if (set.file.repos.length === 0) {
+            const primaryDir = set.layout === "primary" && set.remote !== null ? dirFromUrl(set.remote) : null;
+            if (set.file.repos.length === 0 && primaryDir === null) {
               return { exitCode: 0, stdout: `No repos configured in ${location.path}/${REPOS_FILE}.` };
             }
             const byUrl = new Map(cache.entries.map((entry) => [entry.url, entry]));
@@ -1125,7 +1334,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               const state = entry === undefined || !entry.present ? "not cached" : describeCacheEntry(entry);
               return `${repo.dir}\t${repo.branch ?? "(default)"}\t${repo.url}\t${state}`;
             });
-            return { exitCode: 0, stdout: ["dir\tbranch\turl\tcache", ...lines].join("\n") };
+            const primaryLine =
+              primaryDir === null || set.remote === null
+                ? []
+                : [`${primaryDir}\t(default)\t${set.remote}\t(primary)`];
+            return {
+              exitCode: 0,
+              stdout: [
+                `layout\t${set.layout}`,
+                "dir\tbranch\turl\tcache",
+                ...primaryLine,
+                ...lines,
+              ].join("\n"),
+            };
           },
         }),
 
@@ -1196,10 +1417,18 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                 `${repo.dir}\t${repo.branch ?? "-"}\t+${repo.ahead}/-${repo.behind}\t${repo.dirty} changed, ${repo.untracked} untracked${repo.error === null ? "" : `\t${repo.error}`}`,
             );
             const shared = sharingThreads(manifest, ctx.threadId);
+            const stale = await predatesAdopt(manifest);
             return {
               exitCode: 0,
               stdout: [
                 `${manifest.root} (branch ${manifest.branchName})`,
+                `layout\t${manifest.layout}`,
+                ...(stale
+                  ? [
+                      `This workspace predates the adopt: it was built from the standalone .bb at ${manifest.projectSourcePath}.`,
+                      "Guidance published from it goes to that checkout, not the primary repo; re-apply such a branch to the primary by hand.",
+                    ]
+                  : []),
                 ...(shared.length === 0
                   ? []
                   : [
@@ -1210,6 +1439,35 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                 ...lines,
               ].join("\n"),
             };
+          },
+        }),
+
+        adopt: cliCommand({
+          summary: "Copy a standalone .bb into a primary repo and re-point the project source",
+          positionals: [
+            { name: "primary", description: "URL or local path of the primary repo", required: true },
+          ],
+          options: {
+            project: PROJECT_OPTION,
+            path: { type: "string", description: "Where the primary clone lives (default: beside the .bb checkout)" },
+            "no-pr": { type: "boolean", description: "Do not open a pull request for the seed branch" },
+          },
+          async run(input, ctx) {
+            const projectId = await resolveProjectId(ctx, input.options.project);
+            const location = await requireSource(projectId);
+            const primaryPath =
+              input.options.path ?? `${parentOf(location.path)}/${dirFromUrl(input.positionals.primary) ?? "primary"}`;
+            const result = await performAdopt(projectId, input.positionals.primary, primaryPath, !input.options["no-pr"]);
+            const lines = [
+              result.message,
+              ...(result.repointed
+                ? [`Re-pointed the project source to ${result.primaryPath}.`]
+                : result.status === "pull-request"
+                  ? ["Merge the pull request, then run `bb repos adopt` again to re-point the project source."]
+                  : []),
+              ...result.warnings,
+            ];
+            return { exitCode: result.status === "failed" ? 1 : 0, stdout: lines.join("\n") };
           },
         }),
       },
@@ -1252,7 +1510,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async repoSet({ projectId }) {
       const location = await projectSource(projectId);
       if (location === null) {
-        return { projectSourcePath: null, hostId: null, reposJson: null, repos: [], error: null, cache: [] };
+        return {
+          projectSourcePath: null,
+          hostId: null,
+          layout: "standalone" as const,
+          primary: null,
+          reposJson: null,
+          repos: [],
+          error: null,
+          cache: [],
+        };
       }
       try {
         const set = await readRepoSet(location, { bootstrap: false });
@@ -1273,6 +1540,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         return {
           projectSourcePath: location.path,
           hostId: location.hostId,
+          layout: set.layout,
+          primary: primaryView(set.remote),
           reposJson: set.text,
           repos,
           error: set.error,
@@ -1282,6 +1551,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         return {
           projectSourcePath: location.path,
           hostId: location.hostId,
+          layout: "standalone" as const,
+          primary: null,
           reposJson: null,
           repos: [],
           error: errorMessage(error),
@@ -1360,12 +1631,12 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         // directory, which made this panel unable to be the thing that sets a
         // project up. Committing a repo set is a deliberate enough act to
         // stand up the repo that holds it.
-        await host.call(
+        const prepared = await host.call(
           "prepareProjectSource",
           { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true },
           { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
         );
-        await writeRepoSet(location, parsed.value, `Update the repo set`);
+        await writeRepoSet(location, parsed.value, `Update the repo set`, undefined, prepared.layout ?? "standalone");
         return { ok: true, error: null };
       } catch (error) {
         return { ok: false, error: errorMessage(error) };
@@ -1429,7 +1700,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
 
     async createProject({ name, hostId, path, source }) {
       const warnings: string[] = [];
-      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings });
+      let layout: ProjectLayout | null = null;
+      let prUrl: string | null = null;
+      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings, layout, prUrl });
 
       // Refuse to stack a second project on a directory one already owns. Core
       // may or may not reject it, and either way the panel would then show two
@@ -1451,6 +1724,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
             { hostId, timeoutMs: READ_TIMEOUT_MS },
           );
           warnings.push(...prepared.warnings);
+          layout = prepared.layout ?? "standalone";
           if (!prepared.bootstrapped && source.repos.length > 0) {
             // Adopting a directory that is already a `.bb` repo: the seed was
             // not written, so merge the entries in the ordinary way.
@@ -1460,13 +1734,34 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               if (!outcome.ok) warnings.push(outcome.error);
             }
           }
-        } else {
+        } else if (source.kind === "clone") {
           const cloned = await host.call(
             "cloneProjectSource",
             { url: source.url, path },
             { hostId, timeoutMs: CREATE_TIMEOUT_MS },
           );
           if (!cloned.ok) return fail(cloned.message ?? "Could not clone the .bb repo.");
+          layout = "standalone";
+        } else {
+          // A primary repo: clone it if it is not here, seed `.bb/` when it
+          // does not carry one, and publish the seed for review.
+          const resolved = resolveSeed(source.repos);
+          if (!resolved.ok) return fail(resolved.error);
+          const prepared = await host.call(
+            "preparePrimaryProjectSource",
+            {
+              url: source.url,
+              path,
+              seed: serializeReposFile({ version: 1, repos: resolved.repos }),
+              branch: `bb/seed-bb-${Date.now().toString(36)}`,
+              openPullRequest: source.openPullRequest ?? true,
+            },
+            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
+          );
+          warnings.push(...prepared.warnings);
+          if (!prepared.ok) return fail(prepared.message);
+          layout = prepared.layout ?? "standalone";
+          prUrl = prepared.prUrl;
         }
       } catch (error) {
         return fail(errorMessage(error));
@@ -1478,12 +1773,25 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           source: { type: "local_path", hostId, path },
         });
         changed();
-        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20) };
+        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20), layout, prUrl };
       } catch (error) {
         return fail(
           `${path} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${path}\`.`,
         );
       }
+    },
+
+    /**
+     * Adopt a standalone `.bb` into a primary repo, per machine (BB-106).
+     *
+     * The first run copies the tree to `.bb/` on a branch and opens a pull
+     * request; a later run, once `.bb/` is on the default branch, re-points the
+     * project source at the primary checkout. Case A: `projects.sources.update`
+     * re-points the row in place, so the project id, every stewards binding and
+     * every thread stay as they are.
+     */
+    async adoptProjectSource({ projectId, primary, path, openPullRequest }) {
+      return performAdopt(projectId, primary, path, openPullRequest ?? true);
     },
 
     async workspace({ threadId }) {
@@ -1495,6 +1803,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           branchName: manifest.branchName,
           hostId: manifest.hostId,
           projectSourcePath: manifest.projectSourcePath,
+          predatesAdopt: await predatesAdopt(manifest),
           repos: manifest.repos,
           sharedWith: await describeSharing(manifest, threadId),
         },

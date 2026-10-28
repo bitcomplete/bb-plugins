@@ -20,7 +20,9 @@ Core references below were verified against bb at commit `611e34892` (2026-09-24
 
 ## 1. Concepts
 
-A **project's source is a `.bb` git repo** — the workspace definition, not the code. It contains:
+A **project's source is the primary repo** — one real repo whose default
+branch carries `.bb/`, a directory holding the workspace definition, not the
+code. `.bb/` contains:
 
 ```
 repos.json      the repo set
@@ -68,14 +70,39 @@ Keep it strict JSON. Documentation lives in the seeded `AGENTS.md` and the plugi
 
 ### Where `.bb` lives
 
-`project_sources.path` is the canonical `.bb` checkout, per `(projectId, hostId)` — one per machine (`packages/db/src/schema.ts:496`).
+`project_sources.path` is the canonical project-source checkout, per
+`(projectId, hostId)` — one per machine (`packages/db/src/schema.ts:496`).
+There are two layouts, detected from the default branch's committed tree:
 
-Two ways in, same code path afterwards:
+- **primary** — the checkout is a clone of the primary repo and the definition
+  sits at `P/.bb/`. `repos.json` lists only the other repos; P is derived from
+  the checkout's `origin` and materialised into the workspace in addition to
+  them. `.bb/` is copied from the canonical checkout to `<workspace>/.bb`,
+  because core reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the
+  workspace root only.
+- **standalone** — the checkout is a `.bb` git repo with the definition at its
+  root. This is the original layout, still read and written as before so a
+  machine that has not adopted keeps working.
 
-- **Shared** — the `.bb` repo has a remote. Clone it, create the project pointing at it. A teammate gets the whole workspace definition from one URL.
-- **Local, from scratch** — create the project pointing at a fresh directory. The plugin initializes `.bb` on first use. No remote, no setup.
+Reads (`readProjectFiles`, `repoSet`) resolve the default branch's committed
+tip — `origin/<default>`, or the local default branch when the plugin's own
+commit is ahead of it — never the working tree or a feature branch.
 
-The local variant upgrades to shared with `git remote add` and a push. Nothing else in the design changes and there is no migration.
+Ways in:
+
+- **Primary, from an existing repo** — point the project at a clone of P. If it
+  does not carry `.bb/`, the plugin seeds it on the default branch and publishes
+  a `guidance-<seed>` branch with a pull request.
+- **Shared** — the standalone `.bb` repo has a remote. Clone it, create the
+  project pointing at it.
+- **Local, from scratch** — create the project pointing at a fresh directory;
+  the plugin initializes a standalone `.bb` there.
+
+`bb repos adopt <primary>` (and the panel) copies a standalone tree into
+`.bb/` on a branch of the primary and opens a pull request; once it merges, a
+later run re-points `project_sources.path` in place. That is BB-106 Case A: the
+SDK's `bb.sdk.projects.sources.update` re-points the source row for the same
+project id, so no store re-key and no steward respawn is needed.
 
 ## 3. Why a plain-directory workspace root
 

@@ -272,6 +272,11 @@ export function ReposPanel() {
   const [jsonOpen, setJsonOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [adopting, setAdopting] = useState(false);
+  const [adoptPrimary, setAdoptPrimary] = useState("");
+  const [adoptPath, setAdoptPath] = useState("");
+  const [adoptBusy, setAdoptBusy] = useState(false);
+  const [adoptResult, setAdoptResult] = useState<string[] | null>(null);
 
   // Only the latest request may land. Loads overlap whenever the project
   // changes under a realtime refresh — creating a project publishes the change
@@ -371,6 +376,29 @@ export function ReposPanel() {
   );
 
   const editing = draft !== null;
+
+  const runAdopt = useCallback(() => {
+    if (projectId === null || adoptPrimary.trim().length === 0 || adoptPath.trim().length === 0) return;
+    setAdoptBusy(true);
+    setAdoptResult(null);
+    void rpc
+      .call("adoptProjectSource", {
+        projectId,
+        primary: adoptPrimary.trim(),
+        path: adoptPath.trim(),
+        openPullRequest: true,
+      })
+      .then((result) => {
+        setAdoptResult([result.message, ...result.warnings]);
+        if (result.status === "already") {
+          setAdopting(false);
+          reload();
+          load();
+        }
+      })
+      .catch((error: unknown) => setAdoptResult([error instanceof Error ? error.message : "Could not adopt."]))
+      .finally(() => setAdoptBusy(false));
+  }, [rpc, projectId, adoptPrimary, adoptPath, reload, load]);
   const save = useCallback(() => {
     if (projectId === null || draft === null) return;
     setSaving(true);
@@ -539,7 +567,97 @@ export function ReposPanel() {
                 Each change is committed to the project's <code className="font-mono">.bb</code> repo. Existing
                 workspaces keep the repos they were created with; changes apply to new threads.
               </p>
+              <p className="text-muted-foreground text-xs">
+                Layout: <code className="font-mono">{view.layout}</code>
+                {view.primary === null ? null : (
+                  <>
+                    {" · primary "}
+                    <code className="font-mono">{view.primary.dir}</code> (from the source's origin, not repeated in
+                    repos.json)
+                  </>
+                )}
+              </p>
             </section>
+
+            {view.layout === "standalone" && (
+              <section className="space-y-2">
+                <div className="flex items-baseline justify-between gap-2">
+                  <h2 className="text-sm font-medium">Adopt into a primary repo</h2>
+                  {!adopting && (
+                    <button
+                      type="button"
+                      className="hover:bg-muted shrink-0 rounded-md border px-2.5 py-1 text-xs"
+                      onClick={() => {
+                        setAdopting(true);
+                        setAdoptResult(null);
+                      }}
+                    >
+                      Adopt…
+                    </button>
+                  )}
+                </div>
+                {adopting && (
+                  <div className="space-y-2 rounded-md border p-3">
+                    <p className="text-muted-foreground text-xs">
+                      Copies this standalone <code className="font-mono">.bb</code> tree to <code className="font-mono">.bb/</code> on
+                      a branch of the primary repo and opens a pull request. Once it merges, run Adopt again to
+                      re-point the project source. The project id, bindings and threads are unchanged.
+                    </p>
+                    <label className="block space-y-1 text-sm">
+                      <span className="text-muted-foreground text-xs">URL or path of the primary repo</span>
+                      <input
+                        type="text"
+                        className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
+                        placeholder="git@github.com:you/your-product.git"
+                        value={adoptPrimary}
+                        spellCheck={false}
+                        autoComplete="off"
+                        disabled={adoptBusy}
+                        onChange={(event) => setAdoptPrimary(event.target.value)}
+                      />
+                    </label>
+                    <label className="block space-y-1 text-sm">
+                      <span className="text-muted-foreground text-xs">Where the primary clone lives</span>
+                      <input
+                        type="text"
+                        className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
+                        placeholder="/home/me/your-product"
+                        value={adoptPath}
+                        spellCheck={false}
+                        autoComplete="off"
+                        disabled={adoptBusy}
+                        onChange={(event) => setAdoptPath(event.target.value)}
+                      />
+                    </label>
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        className="text-muted-foreground hover:text-foreground rounded-md px-2 py-1 text-xs"
+                        onClick={() => setAdopting(false)}
+                        disabled={adoptBusy}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="bg-primary text-primary-foreground rounded-md px-2.5 py-1 text-xs disabled:opacity-50"
+                        onClick={runAdopt}
+                        disabled={adoptBusy || adoptPrimary.trim().length === 0 || adoptPath.trim().length === 0}
+                      >
+                        {adoptBusy ? "Adopting…" : "Adopt"}
+                      </button>
+                    </div>
+                    {adoptResult !== null && (
+                      <ul className="text-muted-foreground list-disc pl-4 text-xs">
+                        {adoptResult.map((line) => (
+                          <li key={line}>{line}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </section>
+            )}
 
             <details
               className="space-y-2"

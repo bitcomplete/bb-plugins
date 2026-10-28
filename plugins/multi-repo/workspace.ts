@@ -17,14 +17,16 @@
  * leaves the object store in the source repo, outside `cwd`, where every
  * commit would fail on a sandboxed write.
  */
-import { mkdir, readdir, rm, writeFile, access } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile, access, cp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { experimental_killProcessesWithCwdUnder as killProcessesUnder } from "@get-bb/plugin-sdk/host";
 import { cacheDefaultBranch, cacheHasBranch, ensureCache, type CacheProgress } from "./cache.js";
 import { git, gitIn, gitLine, firstProblemLine } from "./git.js";
 import type { RepoRequest } from "./contract.js";
 import type { WorkspaceRepo } from "./layout.js";
-import { PROJECT_SOURCE_DIR, assertSafeSegment } from "./paths.js";
+import { PROJECT_SOURCE_DIR, assertSafeSegment, type ProjectLayout } from "./paths.js";
+import { resolveDefaultBranchRef } from "./source.js";
 
 export const WORKSPACES_DIR_NAME = "workspaces";
 export const STATE_DIR_NAME = "workspace-state";
@@ -268,6 +270,13 @@ export interface ProvisionArgs {
   dataDir: string;
   pathKey: string;
   projectSourcePath: string;
+  /** Which shape the project source has; decides how `.bb/` is materialized. */
+  layout?: ProjectLayout;
+  /**
+   * The directory of the primary work clone inside the workspace. Present only
+   * for the `primary` layout, and the repo `.bb/` is copied out of.
+   */
+  primaryDir?: string | null;
   repos: readonly RepoRequest[];
   branchName: string;
   fetchTtlMs: number;
@@ -276,9 +285,85 @@ export interface ProvisionArgs {
   signal?: AbortSignal;
 }
 
+/**
+ * Materialize `<workspace>/.bb` from the primary work clone.
+ *
+ * Core reads `.bb/AGENTS.md` and `.bb/skills` from the workspace root only
+ * (`host.read_workspace_agent_context` joins them onto `workspacePath`), so
+ * the primary's `.bb/` cannot be read in place at `<workspace>/<primary>/.bb`
+ * — it is copied to `<workspace>/.bb`. A plain copy, not a clone: `.bb` is a
+ * directory in the primary repo now, and the workspace clone of the primary is
+ * on the thread branch, where the agent's code work lives. Keeping `.bb` a
+ * separate copy is what lets guidance be published from it without dragging
+ * the thread's code commits along.
+ */
+export async function materializePrimaryDefinition(args: {
+  root: string;
+  projectSourcePath: string;
+  primaryDir?: string | null;
+  signal?: AbortSignal;
+}): Promise<{ repo: WorkspaceRepo; base: string | null }> {
+  const dest = path.join(args.root, PROJECT_SOURCE_DIR);
+  const remote = args.primaryDir === undefined || args.primaryDir === null
+    ? args.projectSourcePath
+    : path.join(args.root, args.primaryDir);
+  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(args.signal === undefined ? {} : { signal: args.signal }) };
+  const failed = (message: string): { repo: WorkspaceRepo; base: string | null } => ({
+    repo: {
+      dir: PROJECT_SOURCE_DIR,
+      path: dest,
+      branch: "",
+      baseBranch: "",
+      remote,
+      status: "failed",
+      message: message.slice(0, 600),
+    },
+    base: null,
+  });
+  const ready = (base: string | null): { repo: WorkspaceRepo; base: string | null } => ({
+    repo: { dir: PROJECT_SOURCE_DIR, path: dest, branch: "default", baseBranch: "default", remote, status: "ready" },
+    base,
+  });
+  // Idempotent per path key: a re-entered `create()` leaves the copy alone.
+  if (await exists(path.join(dest, "repos.json"))) return ready(null);
+  await rm(dest, { recursive: true, force: true });
+
+  // Read the default branch's committed tip, not the canonical checkout's
+  // working tree: the plugin's own seed and `repos.json` commits live on the
+  // local default branch before they are pushed, while an uncommitted edit in
+  // the checkout is not the project's. A throwaway shared clone gives exactly
+  // that tree without a worktree lock that two concurrent thread starts would
+  // contend on; it runs host-side, outside the agent's sandbox.
+  const base = await resolveDefaultBranchRef(args.projectSourcePath, args.signal);
+  if (base === null) return failed(`${args.projectSourcePath} is not a git repo with a default branch to read.`);
+  const baseSha = await gitLine(args.projectSourcePath, ["rev-parse", `${base}^{commit}`], options);
+  const temp = await mkdtemp(path.join(tmpdir(), "bb-definition-"));
+  try {
+    const cloned = await git(
+      ["clone", "--quiet", "--shared", "--no-checkout", args.projectSourcePath, temp],
+      options,
+    );
+    if (cloned.code !== 0) return failed(firstProblemLine(cloned));
+    const checked = await gitIn(temp, ["checkout", base, "--", PROJECT_SOURCE_DIR], options);
+    if (checked.code !== 0) {
+      return failed(`${args.projectSourcePath} does not carry .bb/ on the default branch; merge the .bb pull request first.`);
+    }
+    const source = path.join(temp, PROJECT_SOURCE_DIR);
+    if (!(await exists(source))) {
+      return failed(`${args.projectSourcePath} does not carry .bb/ on the default branch; merge the .bb pull request first.`);
+    }
+    await cp(source, dest, { recursive: true, filter: (entry) => path.basename(entry) !== ".git" });
+  } catch (error) {
+    return failed(error instanceof Error ? error.message : String(error));
+  } finally {
+    await rm(temp, { recursive: true, force: true }).catch(() => undefined);
+  }
+  return ready(baseSha);
+}
+
 export async function provisionWorkspace(
   args: ProvisionArgs,
-): Promise<{ root: string; repos: WorkspaceRepo[] }> {
+): Promise<{ root: string; repos: WorkspaceRepo[]; definitionBase: string | null }> {
   const root = workspaceRoot(args.dataDir, args.pathKey);
   await mkdir(root, { recursive: true });
 
@@ -291,14 +376,27 @@ export async function provisionWorkspace(
   }
 
   args.report?.step("Preparing the project definition");
-  const source = await materializeProjectSource({
-    root,
-    projectSourcePath: args.projectSourcePath,
-    ...(args.signal === undefined ? {} : { signal: args.signal }),
-  });
+  let source: WorkspaceRepo;
+  let definitionBase: string | null = null;
+  if (args.layout === "primary") {
+    const materialized = await materializePrimaryDefinition({
+      root,
+      projectSourcePath: args.projectSourcePath,
+      primaryDir: args.primaryDir ?? null,
+      ...(args.signal === undefined ? {} : { signal: args.signal }),
+    });
+    source = materialized.repo;
+    definitionBase = materialized.base;
+  } else {
+    source = await materializeProjectSource({
+      root,
+      projectSourcePath: args.projectSourcePath,
+      ...(args.signal === undefined ? {} : { signal: args.signal }),
+    });
+  }
   repos.push(source);
 
-  return { root, repos };
+  return { root, repos, definitionBase };
 }
 
 export async function addWorkspaceRepo(args: {

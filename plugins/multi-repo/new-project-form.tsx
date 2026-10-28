@@ -31,7 +31,7 @@ interface NewProjectFormProps {
   onCreated: (projectId: string, warnings: readonly string[]) => void;
 }
 
-type Mode = "fresh" | "clone";
+type Mode = "fresh" | "clone" | "primary";
 
 export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const rpc = useRpc<typeof rpcContract>();
@@ -43,6 +43,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   const [pathExists, setPathExists] = useState(false);
   const [mode, setMode] = useState<Mode>("fresh");
   const [cloneUrl, setCloneUrl] = useState("");
+  const [primaryUrl, setPrimaryUrl] = useState("");
   const [repos, setRepos] = useState<RepoSeed[]>([]);
   const [suggestions, setSuggestions] = useState<DiscoveredCheckout[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -97,7 +98,7 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
   // Local checkouts on the chosen machine, for the add row's completions.
   // Keyed on the path so the sibling scan looks beside where `.bb` will go.
   useEffect(() => {
-    if (hostId === null || path.length === 0 || mode !== "fresh") return;
+    if (hostId === null || path.length === 0 || mode === "clone") return;
     let cancelled = false;
     void rpc
       .call("suggestRepos", { hostId, path })
@@ -127,23 +128,32 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
     hostId !== null &&
     name.trim().length > 0 &&
     path.trim().length > 0 &&
-    (mode === "fresh" || cloneUrl.trim().length > 0);
+    (mode === "fresh" || (mode === "clone" && cloneUrl.trim().length > 0) || (mode === "primary" && primaryUrl.trim().length > 0));
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!ready || hostId === null) return;
     setSubmitting(true);
     setError(null);
+    const source =
+      mode === "fresh"
+        ? { kind: "fresh" as const, repos }
+        : mode === "clone"
+          ? { kind: "clone" as const, url: cloneUrl.trim() }
+          : { kind: "primary" as const, url: primaryUrl.trim(), repos, openPullRequest: true };
     void rpc
       .call("createProject", {
         name: name.trim(),
         hostId,
         path: path.trim(),
-        source: mode === "fresh" ? { kind: "fresh", repos } : { kind: "clone", url: cloneUrl.trim() },
+        source,
       })
       .then((result) => {
         if (result.ok && result.projectId !== null) {
-          onCreated(result.projectId, result.warnings);
+          onCreated(result.projectId, [
+            ...result.warnings,
+            ...(result.prUrl === null ? [] : [`Seed pull request: ${result.prUrl}`]),
+          ]);
         } else {
           setError(result.error ?? "Could not create the project.");
         }
@@ -232,6 +242,11 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
         {pathExists && mode === "clone" && (
           <span className="text-destructive block text-xs">Something is already there, and a clone needs an empty directory.</span>
         )}
+        {pathExists && mode === "primary" && (
+          <span className="text-muted-foreground block text-xs">
+            An existing checkout of the primary repo is fetched and used as it is.
+          </span>
+        )}
       </label>
 
       <fieldset className="space-y-2">
@@ -245,10 +260,14 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
             <input type="radio" name="mode" checked={mode === "clone"} disabled={submitting} onChange={() => setMode("clone")} />
             An existing <code className="font-mono">.bb</code> repo
           </label>
+          <label className="flex items-center gap-1.5">
+            <input type="radio" name="mode" checked={mode === "primary"} disabled={submitting} onChange={() => setMode("primary")} />
+            This repo carries <code className="font-mono">.bb</code>
+          </label>
         </div>
       </fieldset>
 
-      {mode === "clone" ? (
+      {mode === "clone" && (
         <label className="block space-y-1 text-sm">
           <span className="text-muted-foreground text-xs">Clone URL of the .bb repo</span>
           <input
@@ -265,7 +284,29 @@ export function NewProjectForm({ onCancel, onCreated }: NewProjectFormProps) {
             Its repos.json, AGENTS.md and skills come with it. Nothing is written back to it here.
           </span>
         </label>
-      ) : (
+      )}
+
+      {mode === "primary" && (
+        <label className="block space-y-1 text-sm">
+          <span className="text-muted-foreground text-xs">URL of the primary repo</span>
+          <input
+            type="text"
+            className="bg-background w-full rounded-md border px-2 py-1 font-mono text-xs"
+            placeholder="git@github.com:you/your-product.git"
+            value={primaryUrl}
+            spellCheck={false}
+            autoComplete="off"
+            disabled={submitting}
+            onChange={(event) => setPrimaryUrl(event.target.value)}
+          />
+          <span className="text-muted-foreground block text-xs">
+            The repo whose default branch carries <code className="font-mono">.bb/</code>. If it does not yet, the
+            plugin commits a seed and opens a pull request.
+          </span>
+        </label>
+      )}
+
+      {mode !== "clone" && (
         <section className="space-y-2">
           <h3 className="text-sm font-medium">Repos</h3>
           {repos.length === 0 ? (
