@@ -308,7 +308,7 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
 
 // ---- Stewards -------------------------------------------------------------------------------------
 
-const ACTOR_LABEL: Record<string, string> = { me: "you", steward: "the steward", other: "someone else" };
+const ACTOR_LABEL: Record<string, string> = { user: "you", steward: "the steward", other: "someone else" };
 
 /**
  * The BB-76 effort row (BB-78): the glyph, the shortened key and the title on

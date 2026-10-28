@@ -422,7 +422,7 @@ which writes the status record:
 | Field | Holds |
 |---|---|
 | phase, summary | Where the entity is, in a sentence. |
-| next action, actor | What happens next, and who does it: `me`, `steward`, `other`. |
+| next action, actor | What happens next, and who does it: `user` (the server's owner has to act), `steward` (the steward itself, including its own next step such as re-checking on the next deployment wake) or `other` (someone else). The actor is a party, not a pronoun: BB-95 misread `me` as the steward and filed its own re-check as needing the user. |
 | blocked on | Who or what outside the thread it waits for. |
 | requeue after | When to wake it if nothing else does. Defaults to the playbook's `requeue-default`. |
 | conditions | Open escalations, `stuck`. |
