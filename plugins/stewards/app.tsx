@@ -1385,7 +1385,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
   const useStewardGlyph = glyph !== undefined && indicator !== "draft" && indicator !== "working-draft";
   const count = countThreads(children);
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
+    <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       <ThreadActionsContextMenu thread={actionTarget(thread)}>
         <div className={`flex items-center gap-1 rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: `${4 + depth * 14}px` }} title={titleAttr}>
           {count > 0 ? (
@@ -1606,7 +1606,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
             className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
             onClick={() => setUserOpen(!open)}
           >
-            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200${open ? " rotate-90" : ""}`} />
+            <Icon name="ChevronRight" className={`size-3.5 motion-safe:transition-transform motion-safe:duration-200 ${open ? " rotate-90" : ""}`} />
           </button>
         ) : (
           <span className="flex size-4 shrink-0 items-center justify-center" />
@@ -1639,7 +1639,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
     </div>
   );
   return (
-    <li className={`flex flex-col${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
+    <li className={`flex flex-col ${entered ? " motion-safe:animate-in fade-in-0 slide-in-from-top-1 duration-200" : ""}`}>
       {root === undefined ? body : <ThreadActionsContextMenu thread={actionTarget(root)}>{body}</ThreadActionsContextMenu>}
       {mine.length > 0 ? (
         <div className="flex flex-col gap-1 pb-1" style={{ paddingLeft: "40px" }}>
