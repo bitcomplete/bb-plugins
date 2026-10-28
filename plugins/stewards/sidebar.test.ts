@@ -20,7 +20,7 @@ const binding = (over: Partial<SidebarProjectData["bindings"][number]> & { key: 
   phase: null,
   hold: null,
   holdBehind: [],
-  blockedOn: null,
+  waitingOn: null,
   needsUser: false,
   stuck: false,
   status: null,
@@ -49,7 +49,7 @@ const effort = (over: Partial<SidebarEffort> & { key: string }): SidebarEffort =
   phase: null,
   hold: null,
   holdBehind: [],
-  blockedOn: null,
+  waitingOn: null,
   needsUser: false,
   stuck: false,
   statusActor: null,
@@ -198,7 +198,7 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/web"]);
   });
 
-  it("moves a blocked or needs-you ops binding into blocked, out of monitors", () => {
+  it("moves a held or needs-you ops binding into blocked, out of monitors", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_ops_blocked" }), thread({ id: "thr_ops_you" }), thread({ id: "thr_ops_quiet" })],
@@ -206,7 +206,7 @@ describe("stewards sidebar grouping", () => {
         data({
           projectId: "p1",
           bindings: [
-            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, blockedOn: "a rotation" }),
+            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, hold: "a rotation" }),
             binding({ key: "acme/deps", threadId: "thr_ops_you", kind: "ops", stage: null, needsUser: true }),
             binding({ key: "acme/ns", threadId: "thr_ops_quiet", kind: "ops", stage: null }),
           ],
@@ -232,9 +232,10 @@ describe("stewards sidebar grouping", () => {
     expect(tabs[0]!.efforts.map((e) => e.key)).toEqual(["ENG-2"]);
   });
 
-  // BB-81: an external wait is not a block, so it files by kind and the wait
-  // phrase comes after the running-worker count.
-  it("files an external wait by kind: ops in monitors grey, ticket and review in flight, only blockedOn and needsUser blocked", () => {
+  // BB-81/BB-109: an external wait is not a block, so it files by kind and the
+  // wait phrase comes after the running-worker count; only a hold, an open
+  // `stuck` escalation or needsUser is blocked.
+  it("files a wait by kind: ops in monitors grey, ticket and review in flight, only needsUser blocked", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_ops_wait" }), thread({ id: "thr_ops_blocked" }), thread({ id: "thr_ops_you" }), thread({ id: "thr_ticket_wait" }), thread({ id: "thr_review_wait" }), thread({ id: "thr_worker" })],
@@ -243,7 +244,7 @@ describe("stewards sidebar grouping", () => {
           projectId: "p1",
           bindings: [
             binding({ key: "acme/deps", threadId: "thr_ops_wait", kind: "ops", stage: null, status: { actor: "other", nextAction: "Next scheduled look", at: 1 } }),
-            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, blockedOn: "a rotation" }),
+            binding({ key: "acme/sentry", threadId: "thr_ops_blocked", kind: "ops", stage: null, waitingOn: "a rotation" }),
             binding({ key: "acme/ns", threadId: "thr_ops_you", kind: "ops", stage: null, needsUser: true }),
             binding({ key: "ENG-1", threadId: "thr_ticket_wait", status: { actor: "other", nextAction: "an author push", at: 1 } }),
             binding({ key: "acme/web#728", threadId: "thr_review_wait", kind: "review", status: { actor: "other", nextAction: "an author push", at: 1 }, workers: [{ threadId: "thr_worker", title: "Review", status: "running" }] }),
@@ -252,12 +253,15 @@ describe("stewards sidebar grouping", () => {
       ],
     });
     const tab = tabs[0]!;
-    // ops + other is a monitor, grey, with the wait phrase.
-    expect(tab.monitors.map((e) => e.key)).toEqual(["acme/deps"]);
-    expect(tab.monitors[0]!.state).toBe("quiet");
-    expect(tab.monitors[0]!.phrase).toBe("Next scheduled look");
-    // ops with blockedOn or needsUser is still blocked, out of monitors.
-    expect(tab.blocked.map((e) => e.key).sort()).toEqual(["acme/ns", "acme/sentry"]);
+    // ops + other is a monitor, grey, with the wait phrase; an ops wait stays a
+    // monitor too (BB-109).
+    expect(tab.monitors.map((e) => e.key).sort()).toEqual(["acme/deps", "acme/sentry"]);
+    expect(tab.monitors.find((e) => e.key === "acme/deps")!.state).toBe("quiet");
+    expect(tab.monitors.find((e) => e.key === "acme/deps")!.phrase).toBe("Next scheduled look");
+    expect(tab.monitors.find((e) => e.key === "acme/sentry")!.state).toBe("quiet");
+    expect(tab.monitors.find((e) => e.key === "acme/sentry")!.phrase).toBe("no report yet");
+    // needsUser is the only blocked ops.
+    expect(tab.blocked.map((e) => e.key).sort()).toEqual(["acme/ns"]);
     // ticket + other is in flight, grey, with the wait phrase; review + other
     // with a running worker is blue and reads the count.
     expect(tab.efforts.map((e) => e.key).sort()).toEqual(["ENG-1", "acme/web#728"]);
@@ -297,9 +301,9 @@ describe("stewards sidebar ordering", () => {
 
   it("orders blocked: pinned, then needs-you (yellow) before red, then recency", () => {
     const you = effort({ key: "you", needsUser: true, state: "you", recency: 1 });
-    const blockedOld = effort({ key: "blocked-old", blockedOn: "x", state: "blocked", recency: 5 });
-    const blockedNew = effort({ key: "blocked-new", blockedOn: "y", state: "blocked", recency: 50 });
-    const pinned = effort({ key: "pinned", pinned: true, blockedOn: "z", state: "blocked", recency: 0 });
+    const blockedOld = effort({ key: "blocked-old", waitingOn: "x", state: "blocked", recency: 5 });
+    const blockedNew = effort({ key: "blocked-new", waitingOn: "y", state: "blocked", recency: 50 });
+    const pinned = effort({ key: "pinned", pinned: true, waitingOn: "z", state: "blocked", recency: 0 });
     const ordered = [blockedOld, you, pinned, blockedNew].sort(compareBlocked).map((e) => e.key);
     expect(ordered).toEqual(["pinned", "you", "blocked-new", "blocked-old"]);
   });
@@ -316,14 +320,15 @@ describe("stewards sidebar ordering", () => {
 describe("stewards sidebar state, section and phrase (BB-76)", () => {
   it("takes the state in precedence order: you › blocked › running › quiet", () => {
     // A running effort that also needs you is yellow.
-    expect(effortState(effort({ key: "a", needsUser: true, blockedOn: "x", runningWorkers: 1 }))).toBe("you");
-    expect(effortState(effort({ key: "b", blockedOn: "x", runningWorkers: 1 }))).toBe("blocked");
+    expect(effortState(effort({ key: "a", needsUser: true, waitingOn: "x", runningWorkers: 1 }))).toBe("you");
+    // A wait never blocks: with a running worker it is running (BB-109).
+    expect(effortState(effort({ key: "b", waitingOn: "x", runningWorkers: 1 }))).toBe("running");
     expect(effortState(effort({ key: "c", runningWorkers: 1 }))).toBe("running");
     expect(effortState(effort({ key: "d" }))).toBe("quiet");
   });
 
-  it("treats each block signal as blocked: blockedOn, hold and stuck", () => {
-    expect(effortState(effort({ key: "a", blockedOn: "a review" }))).toBe("blocked");
+  it("treats a hold and an open stuck escalation as blocked, and a wait as not", () => {
+    expect(effortState(effort({ key: "a", waitingOn: "a review" }))).toBe("quiet");
     expect(effortState(effort({ key: "b", hold: "a freeze" }))).toBe("blocked");
     expect(effortState(effort({ key: "c", stuck: true }))).toBe("blocked");
   });
@@ -340,16 +345,19 @@ describe("stewards sidebar state, section and phrase (BB-76)", () => {
 
   it("puts needs-you and blocked in the blocked section, ops in monitors, the rest in flight", () => {
     expect(effortSection(effort({ key: "a", needsUser: true, state: "you" }))).toBe("blocked");
-    expect(effortSection(effort({ key: "b", blockedOn: "x", state: "blocked" }))).toBe("blocked");
+    expect(effortSection(effort({ key: "b", waitingOn: "x", state: "blocked" }))).toBe("blocked");
     expect(effortSection(effort({ key: "c", kind: "ops", state: "quiet" }))).toBe("monitors");
     expect(effortSection(effort({ key: "d", kind: "ticket", state: "running" }))).toBe("inflight");
   });
 
   it("phrases every rule, first match wins", () => {
     // 1. needs you
-    expect(effortPhrase(effort({ key: "a", needsUser: true, blockedOn: "x" }))).toBe("needs you");
-    // 2. blockedOn
-    expect(effortPhrase(effort({ key: "b", blockedOn: "bb-gate#88" }))).toBe("blocked on bb-gate#88");
+    expect(effortPhrase(effort({ key: "a", needsUser: true, waitingOn: "x" }))).toBe("needs you");
+    // 2. a free-text wait is not a prefix (BB-109): it reads the next action
+    // verbatim, and a running worker reads the count, never `blocked on …`.
+    expect(effortPhrase(effort({ key: "b", waitingOn: "bb-gate#88", statusNextAction: "Wait for checks" }))).toBe("Wait for checks");
+    expect(effortPhrase(effort({ key: "b2", waitingOn: "bb-gate#88" }))).toBe("no report yet");
+    expect(effortPhrase(effort({ key: "b3", waitingOn: "a review", runningWorkers: 1 }))).toBe("1 worker running");
     // 3. hold
     expect(effortPhrase(effort({ key: "c", hold: "a freeze", holdBehind: ["BB-57", "BB-61"] }))).toBe("held behind BB-57, BB-61");
     expect(effortPhrase(effort({ key: "d", hold: "a freeze" }))).toBe("on hold");

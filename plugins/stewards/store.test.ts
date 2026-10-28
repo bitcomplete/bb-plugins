@@ -131,7 +131,7 @@ describe("countNeedsUser (BB-104)", () => {
   const add = (s: ReturnType<typeof store>["s"], n: number) =>
     s.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: null, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
 
-  const userStatus = (at: number) => ({ phase: "Todo", summary: "Waiting", nextAction: "On the user", actor: "user" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at });
+  const userStatus = (at: number) => ({ phase: "Todo", summary: "Waiting", nextAction: "On the user", actor: "user" as const, waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at });
 
   it("counts exactly the open bindings needsUser flags: each condition once, and once when a binding has all four", () => {
     const { s, binding } = store();
@@ -409,10 +409,11 @@ describe("the actor rename migration (BB-97)", () => {
 
   it("rewrites `me` to `user` in the stored status, leaving the rest of the record alone", () => {
     const db = legacy();
+    // A pre-BB-109 record carries `blockedOn`; it reads back as `waitingOn`.
     insert(db, "bnd_1", "ENG-12", JSON.stringify({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me", blockedOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 }));
     for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
     const s = createStore(db, () => 2_000);
-    expect(s.find("ENG-12", "p1")!.status).toEqual({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", blockedOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 });
+    expect(s.find("ENG-12", "p1")!.status).toEqual({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 });
   });
 
   it("is idempotent, and leaves `steward` and `other` untouched", () => {

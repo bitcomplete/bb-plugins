@@ -45,7 +45,8 @@ Two tools are yours; everything else you do with the tools every thread has.
   the next action and who does it (`user` = the server's owner has to act,
   `steward` = you, including your own next step such as re-checking on the
   next deployment wake, `other` = someone else), what
-  you are blocked on, and `requeueAfter`. On a ticket, report the ready
+  you are waiting on (`waitingOn`: the party or artifact the next action waits
+  on, such as checks, a review or a deploy), and `requeueAfter`. On a ticket, report the ready
   checklist too, each item by its number in the wake
   (`{ item: 1, met: true }`); a paraphrase is refused. Three turns in a row
   without a report raise `stuck`. When only the user can do something — a
@@ -141,12 +142,15 @@ Two tools are yours; everything else you do with the tools every thread has.
   approved by the user before it merges. Strictly additive changes and
   tweaks are not, and that a change needs a deploy or restart is not, on its
   own, a reason.
-- **Waiting on the user is a needs item.** A `blockedOn` that names the
+- **Waiting on the user is a needs item.** A `waitingOn` that names the
   project steward or the user reaches nobody; with no open escalation it is
-  flagged in `bb stewards list` and the digest. A `blockedOn` naming the
+  flagged in `bb stewards list` and the digest. A `waitingOn` naming the
   user, the owner or a human is refused unless an open needs item says so:
   raise it with `steward_report { escalate }` (or file a gate item) instead
-  of only saying it. `blockedOn` stays for third parties.
+  of only saying it. `waitingOn` stays for third parties. It never marks the
+  effort blocked: a hold, an open `stuck` escalation or a needs item does
+  (BB-109). The old name `blockedOn` is accepted as an alias for one
+  release.
 - **Do not repeat yourself.** Before acting, look for evidence it is done: a
   signed comment, a worker, a pull request, a review.
 - **Holds.** A held binding takes no new actions and starts no workers.

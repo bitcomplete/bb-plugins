@@ -24,7 +24,8 @@ export interface SidebarBinding {
   hold: string | null;
   /** Entity keys this hold waits behind. */
   holdBehind: string[];
-  blockedOn: string | null;
+  /** The party or artifact the next action waits on; it never marks the effort blocked (BB-109). */
+  waitingOn: string | null;
   needsUser: boolean;
   /** An open `stuck` escalation (BB-76). */
   stuck: boolean;
@@ -115,7 +116,8 @@ export interface SidebarEffort {
   phase: string | null;
   hold: string | null;
   holdBehind: string[];
-  blockedOn: string | null;
+  /** The party or artifact the next action waits on; shown as a plain line, never as a block (BB-109). */
+  waitingOn: string | null;
   needsUser: boolean;
   stuck: boolean;
   statusActor: string | null;
@@ -210,7 +212,6 @@ export interface EffortStatus {
   busy: boolean;
   runningWorkers: number;
   needsUser: boolean;
-  blockedOn: string | null;
   hold: string | null;
   holdBehind: string[];
   stuck: boolean;
@@ -228,14 +229,14 @@ export const isRunning = (e: Pick<EffortStatus, "busy" | "runningWorkers">): boo
 
 /**
  * The effort's glyph, first match wins (BB-76):
- * needs you › blocked › running › quiet. Blocked is `blockedOn`, a hold or
- * `stuck` only; an external wait (`actor = other`) is not a block, so it is
- * running when a worker or reviewer runs and quiet otherwise. A running
- * effort that also needs you is yellow.
+ * needs you › blocked › running › quiet. Blocked is a hold or an open `stuck`
+ * escalation only (BB-109); the free-text wait (`waitingOn`) never makes an
+ * effort blocked, so a waiting effort is running when a worker or reviewer
+ * runs and quiet otherwise. A running effort that also needs you is yellow.
  */
 export function effortState(e: EffortStatus): SidebarEffortState {
   if (e.needsUser) return "you";
-  if (e.blockedOn !== null || e.hold !== null || e.stuck) return "blocked";
+  if (e.hold !== null || e.stuck) return "blocked";
   if (isRunning(e)) return "running";
   return "quiet";
 }
@@ -280,10 +281,11 @@ export function untilPhrase(at: number, now: number): string {
 
 /**
  * Line two's status phrase, first match wins (BB-76, BB-86, BB-83):
- * needs you › blockedOn › hold › stuck › running › quiet worker finish ›
- * deployment › nextAction › no report. An external wait is not a prefix: an
- * `other` actor reads its `nextAction` verbatim like any other actor, and
- * `the other party` only stands in when there is no report at all.
+ * needs you › hold › stuck › running › quiet worker finish ›
+ * deployment › nextAction › no report. The free-text `waitingOn` is not a
+ * prefix (BB-109): a running worker reads the count, and otherwise the
+ * `nextAction` reads verbatim, whatever the actor. `the other party` only
+ * stands in when there is no report at all.
  *
  * The quiet worker finish (BB-83) sits after the running count and before the
  * external wait: a binding whose worker finished and has nothing to wait on
@@ -293,7 +295,6 @@ export function untilPhrase(at: number, now: number): string {
  */
 export function effortPhrase(e: EffortStatus, now: number = Date.now()): string {
   if (e.needsUser) return "needs you";
-  if (e.blockedOn !== null) return `blocked on ${e.blockedOn}`;
   if (e.hold !== null) return e.holdBehind.length > 0 ? `held behind ${e.holdBehind.join(", ")}` : "on hold";
   if (e.stuck) return "stuck";
   // A running worker or reviewer paints the blue ring, but the count is of
@@ -337,7 +338,7 @@ export function endedEffort(e: SidebarEnded): SidebarEndedEffort {
     phase: e.phase ?? null,
     hold: null,
     holdBehind: [],
-    blockedOn: null,
+    waitingOn: null,
     needsUser: false,
     stuck: false,
     statusActor: null,
@@ -535,7 +536,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       phase: b.phase,
       hold: b.hold,
       holdBehind: b.holdBehind,
-      blockedOn: b.blockedOn,
+      waitingOn: b.waitingOn,
       needsUser: b.needsUser,
       stuck: b.stuck,
       statusActor: b.status?.actor ?? null,
@@ -626,7 +627,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
       phase: null,
       hold: null,
       holdBehind: [],
-      blockedOn: null,
+      waitingOn: null,
       needsUser: false,
       stuck: false,
       statusActor: null,

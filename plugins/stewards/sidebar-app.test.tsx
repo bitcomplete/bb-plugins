@@ -69,7 +69,7 @@ const binding = (over: Record<string, unknown> = {}) => ({
   threadId: "thr_steward",
   hold: null,
   holdBehind: [],
-  blockedOn: null,
+  waitingOn: null,
   needsUser: false,
   stuck: false,
   status: null,
@@ -541,15 +541,15 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("puts a blocked effort in Blocked with a red ring and the rule's phrase", async () => {
+  it("keeps a waiting effort in In flight, grey, reading the next action (BB-109)", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ blockedOn: "bb-gate#88", phase: "In Progress" })] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ waitingOn: "bb-gate#88", phase: "In Progress", status: { actor: "steward", nextAction: "Wait for checks", at: 1 } })] }) } as never,
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Progress · blocked on bb-gate#88");
-    expect(glyphOf(slot, "Fix login")).toBe("blocked");
-    expect(slot.getByRole("heading", { name: /In flight/u }).textContent).toContain("0");
+    expect(lineTwo(slot, "Fix login")).toBe("ticket · In Progress · Wait for checks");
+    expect(glyphOf(slot, "Fix login")).toBe("quiet");
+    expect(slot.getByRole("heading", { name: /In flight/u }).textContent).toContain("1");
     slot.lifecycle.unmount();
   });
 
@@ -590,7 +590,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
           sidebarData({
             bindings: [
               binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
-              binding({ key: "ENG-2", threadId: "thr_blocked", blockedOn: "a review" }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", hold: "a freeze" }),
               binding({ key: "ENG-3", threadId: "thr_wait_ticket", status: { actor: "other", nextAction: "an author push", at: 1 } }),
               binding({ key: "acme/web", threadId: "thr_wait_ops", kind: "ops", stage: null, status: { actor: "other", nextAction: "Next scheduled look", at: 1 } }),
             ],
@@ -598,7 +598,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Needs you")).toBeTruthy());
-    // Blocked holds the yellow needs-you and the red blockedOn row, not the wait.
+    // Blocked holds the yellow needs-you and the red held row, not the wait.
     const blocked = slot.getByRole("heading", { name: /Blocked/u }).closest("section")!;
     expect(blocked.textContent).toContain("Needs you");
     expect(blocked.textContent).toContain("Red row");
@@ -683,7 +683,7 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
           sidebarData({
             bindings: [
               binding({ key: "ENG-1", threadId: "thr_you", needsUser: true }),
-              binding({ key: "ENG-2", threadId: "thr_blocked", blockedOn: "a review" }),
+              binding({ key: "ENG-2", threadId: "thr_blocked", hold: "a freeze" }),
               binding({ key: "ENG-3", threadId: "thr_running", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
               binding({ key: "ENG-4", threadId: "thr_quiet", status: { actor: "steward", nextAction: "wait for CI", at: 1 } }),
             ],
@@ -769,10 +769,10 @@ describe("the stewards sidebar sections, glyphs and phrases (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("keeps an ops binding out of Monitors when it is blocked, and shows it in Blocked", async () => {
+  it("keeps an ops binding out of Monitors when it is held, and shows it in Blocked", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_ops", displayTitle: "Ops watch: acme/web" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", blockedOn: "a rotation" })] }) } as never,
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ key: "acme/web", kind: "ops", stage: null, threadId: "thr_ops", hold: "a rotation" })] }) } as never,
     });
     await waitFor(() => expect(slot.getByRole("heading", { name: /Blocked/u })).toBeTruthy());
     expect(slot.getByText("Ops watch: acme/web")).toBeTruthy();

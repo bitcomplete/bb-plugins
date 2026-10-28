@@ -238,10 +238,10 @@ describe("a worker in flight between its turns (BB-11)", () => {
 });
 
 describe("waits nobody hears", () => {
-  const status = (blockedOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, blockedOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+  const status = (waitingOn: string | null) => ({ phase: "Todo", summary: "s", nextAction: "n", actor: "other" as const, waitingOn, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
   const open = [{ id: "esc_1", bindingId: "b", kind: "decision" as const, question: "q", context: null, meanwhile: "m", route: "project" as const, recommendation: null, choices: [], status: "open" as const, resolution: null, createdAt: 1, resolvedAt: null, deliveredAt: null, projectId: null, origin: { threadId: null, bindingId: null, chain: [] }, resolutionKind: null, url: null, data: {}, answeredBy: null, forwardedFrom: null, headSha: null, isQuestion: false, citedLessons: [], correctionsCounted: false, rationaleWanted: null, rationaleAsked: false, rationaleGiven: false, clusterKey: null }];
 
-  it("flags a status blocked on the project steward or the user with no escalation open", () => {
+  it("flags a status waiting on the project steward or the user with no escalation open", () => {
     expect(unheardWait(status("project steward's approval of the new spec"), [])).toMatch(/project steward/u);
     expect(unheardWait(status("the user's answer on scope"), [])).toMatch(/the user/u);
     expect(unheardWait(status("project steward's approval"), open)).toBeNull();
@@ -270,7 +270,7 @@ describe("approval words", () => {
   });
 
   it("flags a report that asks for an approval already open, and only that", () => {
-    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "user" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
+    const status = (summary: string, nextAction: string) => ({ phase: "Todo", summary, nextAction, actor: "user" as const, waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 });
     const open = [{ kind: "approval" } as never];
     expect(asksForOpenApproval(status("Spec posted.", "Ask the user to approve the spec"), open)).toMatch(/already open/u);
     // Waiting on the request, or on the project steward, is not asking again.
@@ -585,7 +585,7 @@ describe("the pull request gate (build-tickets)", () => {
   });
 });
 
-describe("a blockedOn naming the user", () => {
+describe("a waitingOn naming the user", () => {
   it("is refused without an item and allowed with one", () => {
     expect(namesUserAsBlocker("the user's answer on scope")).toBe(true);
     expect(namesUserAsBlocker("the owner's approval")).toBe(true);

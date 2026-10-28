@@ -19,7 +19,7 @@ function world() {
   return { s, bind };
 }
 
-const status = (summary: string) => ({ phase: "In Progress", summary, nextAction: "Open the PR", actor: "steward" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T });
+const status = (summary: string) => ({ phase: "In Progress", summary, nextAction: "Open the PR", actor: "steward" as const, waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: T });
 
 function wakeInput(over: Partial<WakeInput> = {}): WakeInput {
   const { s, bind } = world();
