@@ -478,7 +478,7 @@ which writes the status record:
 |---|---|
 | phase, summary | Where the entity is, in a sentence. |
 | next action, actor | What happens next, and who does it: `user` (the server's owner has to act), `steward` (the steward itself, including its own next step such as re-checking on the next deployment wake) or `other` (someone else). The actor is a party, not a pronoun: BB-95 misread `me` as the steward and filed its own re-check as needing the user. |
-| blocked on | Who or what outside the thread it waits for. |
+| waiting on | The party or artifact the next action waits on: checks, a review, a deployment, another team. It never marks the effort blocked; a hold, an open `stuck` escalation or a needs item does. The old name `blockedOn` is accepted as an alias for one release (BB-109). |
 | requeue after | When to wake it if nothing else does. Defaults to the playbook's `requeue-default`. |
 | conditions | Open escalations, `stuck`. |
 | resources | Active workers, open pull requests, child stewards. |
@@ -720,7 +720,7 @@ escalations; the plugin-filed gate items (`approve-spec`, `approve-pr`,
   changes while one of its escalations is with you, the project steward is
   woken with the change, and resolves the escalation or leaves it open.
   The steward's own signed description edit does not count.
-- **Waits nobody hears.** A status whose `blockedOn` names the project
+- **Waits nobody hears.** A status whose `waitingOn` names the project
   steward or you, with no open escalation, is flagged in `bb stewards list`
   and the project steward's wakes, so the nightly digest shows the drift.
 - **Backstop:** a status record that has not advanced within the playbook's
@@ -1312,9 +1312,11 @@ The rules that hold:
 - **Dedupe.** A need is keyed by (binding, kind, url) while open: a steward
   that re-reports updates the wording rather than adding a row. The store
   enforces it with a partial unique index.
-- **`blockedOn` stays for third parties.** A `steward_report` whose `blockedOn`
-  names the user, the owner or a human with no open needs item is refused and
-  told to file one, so the ask reaches the page instead of only the prose.
+- **`waitingOn` stays for third parties.** A `steward_report` whose
+  `waitingOn` names the user, the owner or a human with no open needs item is
+  refused and told to file one, so the ask reaches the page instead of only
+  the prose. The wait is a plain line on the card, not a block: blocked is
+  only a hold, an open `stuck` escalation or a needs item (BB-109).
 
 ## 19. Dependency stewards
 
@@ -1619,7 +1621,8 @@ without the thread actions menu when the thread is no longer in the live view.
 
 The glyph is one of four shapes, in precedence order `you › blocked › running ›
 quiet`: a solid yellow dot when it waits on you, an empty red ring when
-blocked (`blockedOn`, a hold or `stuck`), a blue ring that pulses slowly while
+blocked (a hold or an open `stuck` escalation, BB-109 — the free-text
+`waitingOn` never blocks), a blue ring that pulses slowly while
 a worker or reviewer runs, and an empty grey ring when quiet. The pulse is CSS
 only and stops under `prefers-reduced-motion`. One-off threads use the same four glyphs — yellow
 when unread, blue animated while their agent runs, grey otherwise — except a
@@ -1630,8 +1633,8 @@ project steward footer row is the grey ring. Steward rows carry no
 thread-briefs ring at all: the single off switch leaves every steward thread
 with no brief, so this list's own glyph is the only one they draw.
 
-**The status phrase (BB-76).** First match wins: `needs you`; `blocked on
-<blockedOn>`; `held behind <holdBehind keys>` when `holdBehind` is non-empty,
+**The status phrase (BB-76, BB-109).** First match wins: `needs you`;
+`held behind <holdBehind keys>` when `holdBehind` is non-empty,
 else `on hold`; `stuck` for an open stuck escalation; `N worker(s) running`
 counting only workers whose worker-table status is `running` (a busy steward or
 reviewer with no running worker falls through, rather than reading `0 workers
@@ -1649,7 +1652,7 @@ and `phrase` as pure functions and sorts by the section rules; `sidebar.test.ts`
 covers every rule and the precedence.
 
 **Sections.** Blocked holds the needs-you (yellow) and blocked (red) efforts,
-whether stewarded or `ops`; a needs-you, blockedOn, held or stuck `ops`
+whether stewarded or `ops`; a needs-you, held or stuck `ops`
 binding leaves Monitors for Blocked. In flight holds the rest of the stewarded,
 non-ops efforts, running before quiet, then by recency. Pinned rows stay first within their section.
 Recently ended holds the ended bindings, newest first, each built by

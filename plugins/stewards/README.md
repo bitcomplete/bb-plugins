@@ -256,7 +256,7 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   third round. When the entity changes while one of its
   escalations is with you, the project steward is woken with the change too,
   since you may have answered on the ticket rather than in its thread. A
-  status blocked on the project steward or the user with no open
+  status waiting on the project steward or the user with no open
   escalation or needs item is flagged in `bb stewards list` and the digest.
 - **"Needs you" items** are the structured things only the user can do. The
   plugin files the gate items (`approve-spec`, `approve-pr`, `merge`) from
@@ -276,8 +276,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   labels (two to six): the page shows one button per choice, a note field
   and **Other…** instead of a free-text **Answer**, and a choice is saved as
   guidance. `bb stewards done <id> --choice <label>` records the same from a
-  thread. A `blockedOn` naming the user, the owner or a human is refused
-  unless an open item says so. The sidebar's **Needs you** block and count
+  thread. A `waitingOn` naming the user, the owner or a human is refused
+  unless an open item says so; it never marks the effort blocked (BB-109). The sidebar's **Needs you** block and count
   badge show the same items, so a question reaches you where you already look
   (BB-46).
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
@@ -423,9 +423,10 @@ switchable from where you are.
 **The row and the glyphs (BB-76).** An effort row is two lines: the glyph, the
 entity key in bold and the title on line one; the kind (`ticket`, `pull
 request`, `review`, `ops`), the entity's phase when it has one, and the status
-phrase on line two (first match wins: `needs you`, `blocked on …`, a hold,
+phrase on line two (first match wins: `needs you`, a hold,
 `stuck`, `N worker(s) running`, the deployment state, then the report's
-`nextAction` verbatim). A row that needs you adds its prompt and one-click actions
+`nextAction` verbatim). A free-text `waitingOn` is a plain line on the effort
+card, never a block or a phrase prefix (BB-109). A row that needs you adds its prompt and one-click actions
 under line two, in the same row. The glyph is one of four, in precedence order
 `you › blocked › running › quiet`: a solid yellow dot when it waits on you, an
 empty red ring when blocked, a blue ring that pulses slowly while a worker or

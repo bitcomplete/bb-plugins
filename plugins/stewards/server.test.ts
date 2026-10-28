@@ -925,7 +925,7 @@ describe("a Linear ticket steward", () => {
     const [project, steward] = t.spawns.map((x) => x.id);
     const toProject = () => t.sends.filter((s) => s.threadId === project);
     const met = { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true, why: "two repos" };
-    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", blockedOn: "project steward's approval of the new spec" };
+    const base = { phase: "Todo", summary: "Spec posted.", nextAction: "Wait for approval", actor: "other", waitingOn: "project steward's approval of the new spec" };
 
     const reported = await t.tool("steward_report", { ...base, ready: met }, steward!);
     expect(reported.text).toMatch(/Approval of the spec is requested from the project steward \(esc_[\w-]+\); wait for it, and do not escalate for it\./u);
@@ -1061,7 +1061,7 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "other", blockedOn: "the project steward's call on scope" }, steward);
+    await t.tool("steward_report", { phase: "Todo", summary: "Waiting.", nextAction: "Wait", actor: "other", waitingOn: "the project steward's call on scope" }, steward);
     expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toMatch(/waits on the project steward, with no open escalation/u);
   });
 
@@ -2552,7 +2552,7 @@ describe("pull requests", () => {
 });
 
 describe("stewards waiting on others", () => {
-  const waiting = { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", blockedOn: "sam" };
+  const waiting = { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", waitingOn: "sam" };
 
   it("keeps a review steward visible after a wake turn that ends waiting", async () => {
     const t = await setup();
@@ -2585,7 +2585,7 @@ describe("stewards waiting on others", () => {
     t.entities.set("uuid-12", issue({ state: "In Review", stateType: "started" }));
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...waiting, phase: "In Review", blockedOn: "reviewers on acme/web#7" }, steward);
+    await t.tool("steward_report", { ...waiting, phase: "In Review", waitingOn: "reviewers on acme/web#7" }, steward);
     await t.idle(steward);
     expect(t.threads.get(steward)!.visibility).toBe("visible");
   });
@@ -2802,7 +2802,7 @@ describe("the status report actor (BB-97)", () => {
     expect(status(t)!.actor).toBe("other");
     expect(await needsUser(t)).toBe(false);
 
-    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", blockedOn: "a bb-gate deployment" }, t.steward);
+    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", waitingOn: "a bb-gate deployment" }, t.steward);
     expect(status(t)!.actor).toBe("user");
     expect(await needsUser(t)).toBe(true);
   });
@@ -3590,7 +3590,7 @@ describe("questions to the user", () => {
       phase: "In Review",
       hold: "a freeze",
       holdBehind: ["ENG-9"],
-      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
+      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
       deployments: {
         "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
@@ -3766,7 +3766,7 @@ describe("the stewards sidebar call", () => {
       threadId: string | null;
       hold: string | null;
       holdBehind: string[];
-      blockedOn: string | null;
+      waitingOn: string | null;
       needsUser: boolean;
       stuck: boolean;
       status: { actor: string; nextAction: string; at: number } | null;
@@ -3809,7 +3809,7 @@ describe("the stewards sidebar call", () => {
     const first = t.hooks.store.find("ENG-12", "p1")!;
     // One binding needs the user through its report actor, another through an
     // open need; an ended one must not count.
-    t.hooks.store.patch(first.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
+    t.hooks.store.patch(first.id, { status: { phase: "In Review", summary: "Waiting", nextAction: "On the user", actor: "user", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() } });
     const second = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-13", entityKey: "ENG-13", url: null, title: "Other", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
     t.hooks.store.fileNeed({ bindingId: second.id, kind: "configure", url: "", what: "Enable it", how: null });
     const ended = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-14", entityKey: "ENG-14", url: null, title: "Ended", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
@@ -3864,7 +3864,7 @@ describe("the stewards sidebar call", () => {
       phase: "In Review",
       hold: "a freeze",
       holdBehind: ["ENG-9"],
-      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
+      status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
       deployments: {
         "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
@@ -4065,7 +4065,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     const { t, b } = await bound();
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.patch(b.id, {
-      status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
+      status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
       advancedAt: t.now(),
     });
     expect(signalsSince(t, before)).toEqual([one]);
@@ -4137,7 +4137,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     await t.hooks.store.coalescingTurn(async () => {
       t.hooks.store.patch(b.id, {
         stage: "build",
-        status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
+        status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
       });
       t.hooks.store.addWorker("thr_turn_worker", b.id, "Implement");
     });
@@ -4146,7 +4146,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
 
   it("stays silent when a status rewrite leaves the derived phrase unchanged", async () => {
     const { t, b } = await bound();
-    const status = { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() };
+    const status = { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward" as const, waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() };
     t.hooks.store.patch(b.id, { status, statusAt: t.now() });
     const before = t.harness.inspection.realtimeSignals.length;
     // Same actor and next action: the row's phrase does not change.
@@ -4711,16 +4711,35 @@ describe("needs you items", () => {
     expect((await t.hooks.settings.get()).sentryToken).toBeUndefined();
   });
 
-  it("refuses a blockedOn naming the user with no item, and accepts one with an item", async () => {
+  it("refuses a waitingOn naming the user with no item, and accepts one with an item", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    const bad = await t.tool("steward_report", { ...base, actor: "user", blockedOn: "the user's answer" }, steward);
+    const bad = await t.tool("steward_report", { ...base, actor: "user", waitingOn: "the user's answer" }, steward);
     expect(bad.error).toBe(true);
     expect(bad.text).toMatch(/File it as a needs item/u);
-    const ok = await t.tool("steward_report", { ...base, actor: "user", blockedOn: "the user's answer", needs: [{ kind: "decide", what: "Answer the scope question", url: "https://linear.app/acme/issue/ENG-12" }] }, steward);
+    const ok = await t.tool("steward_report", { ...base, actor: "user", waitingOn: "the user's answer", needs: [{ kind: "decide", what: "Answer the scope question", url: "https://linear.app/acme/issue/ENG-12" }] }, steward);
     expect(ok.error).toBe(false);
+  });
+
+  it("accepts the old blockedOn name as an alias, with waitingOn winning (BB-109)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    // The old skill text still says blockedOn; it records as waitingOn.
+    const old = await t.tool("steward_report", { ...base, actor: "other", blockedOn: "checks on 24376fd" }, steward);
+    expect(old.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12", "p1")!.status!.waitingOn).toBe("checks on 24376fd");
+    // When both are given, the new name wins.
+    const both = await t.tool("steward_report", { ...base, actor: "other", blockedOn: "the old name", waitingOn: "the new name" }, steward);
+    expect(both.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12", "p1")!.status!.waitingOn).toBe("the new name");
+    // An empty wait is no wait: it stores null, not a bare "Waiting on ".
+    const empty = await t.tool("steward_report", { ...base, actor: "other", waitingOn: "" }, steward);
+    expect(empty.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12", "p1")!.status!.waitingOn).toBeNull();
   });
 
   it("shows the items on the board with their actionability", async () => {
@@ -7554,7 +7573,7 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     const marks = () => t.harness.sdk.callsTo("threads.markRead").map(([args]) => (args as { threadId: string }).threadId);
 
     // Waiting on someone else, nothing for the user: read.
-    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", blockedOn: "sam" }, steward);
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Sam addresses the review", actor: "other", waitingOn: "sam" }, steward);
     expect(marks()).toContain(steward);
 
     // The user is next: left unread.

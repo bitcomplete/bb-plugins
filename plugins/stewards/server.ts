@@ -377,7 +377,7 @@ export const rpcContract = defineRpcContract({
               summary: z.string().nullable(),
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
-              blockedOn: z.string().nullable(),
+              waitingOn: z.string().nullable(),
               priority: z.string().nullable(),
               hold: z.string().nullable(),
               /** Entity keys this hold waits behind, for the row's `held behind <keys>` phrase. */
@@ -467,7 +467,7 @@ export const rpcContract = defineRpcContract({
               summary: z.string().nullable(),
               nextAction: z.string().nullable(),
               actor: z.string().nullable(),
-              blockedOn: z.string().nullable(),
+              waitingOn: z.string().nullable(),
               priority: z.string().nullable(),
               /** The hold reason, for the card's `On hold` line; null when not held. */
               hold: z.string().nullable(),
@@ -539,7 +539,7 @@ export const rpcContract = defineRpcContract({
           hold: z.string().nullable(),
           /** Entity keys this hold waits behind, for `held behind <keys>`. */
           holdBehind: z.array(z.string()),
-          blockedOn: z.string().nullable(),
+          waitingOn: z.string().nullable(),
           needsUser: z.boolean(),
           /** An open `stuck` escalation: the row is blocked (BB-76). */
           stuck: z.boolean(),
@@ -5345,7 +5345,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
-              blockedOn: b.status?.blockedOn ?? null,
+              waitingOn: b.status?.waitingOn ?? null,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -5418,7 +5418,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               summary: b.status?.summary ?? null,
               nextAction: b.status?.nextAction ?? null,
               actor: b.status?.actor ?? null,
-              blockedOn: b.status?.blockedOn ?? null,
+              waitingOn: b.status?.waitingOn ?? null,
               priority: b.priority,
               hold: b.hold,
               holdBehind: b.holdBehind,
@@ -5494,7 +5494,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               threadId: b.threadId,
               hold: b.hold,
               holdBehind: b.holdBehind,
-              blockedOn: b.status?.blockedOn ?? null,
+              waitingOn: b.status?.waitingOn ?? null,
               needsUser: needsUser(b),
               stuck: store.openEscalations(b.id).some((x) => x.kind === "stuck"),
               status: b.status === null ? null : { actor: b.status.actor, nextAction: b.status.nextAction, at: b.status.at },
@@ -6067,7 +6067,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         summary: z.string().trim().min(1).max(600).describe("Where the entity is, in a sentence."),
         nextAction: z.string().trim().min(1).max(600).describe("What happens next."),
         actor: z.enum([...ACTORS, "me"]).describe("Who does the next action. `user` means the server's owner has to act — a decision, a credential, a step outside the repos — and leaves the row needing them (unread and ringing). `steward` is you: your own next step, including re-checking on the next deployment wake, is `steward`, not `user`. On BB-95 a steward filed \"On the next deployment wake, re-run the carries check and report deployed or not-yet\" as `me` and the row wrongly read \"needs you\"; that next step is `steward`. `other` is someone else."),
-        blockedOn: z.string().trim().max(300).optional().describe("Who or what outside this thread it waits for."),
+        waitingOn: z.string().trim().max(300).optional().describe("The party or artifact the next action waits on: checks, a review, a deployment, another team. It never marks the effort blocked — a hold, an open `stuck` escalation or a needs item does."),
+        blockedOn: z.string().trim().max(300).optional().describe("Deprecated alias for `waitingOn`, accepted for one release; `waitingOn` wins when both are given."),
         requeueAfter: durationSchema.optional().describe('When to wake you if nothing else does, such as "4h" or "2d". The playbook\'s default when left out.'),
         conditions: z.array(z.string().trim().min(1).max(200)).max(10).optional().describe("Anything else a reader of the status should know at a glance."),
         ready: z
@@ -6245,12 +6246,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             };
           }
           if (input.voidApproval === true && ready.approval !== null) ready = { ...ready, approval: null, voidedAt: now() };
+          // BB-109: `blockedOn` is the old name for `waitingOn`. Accept it for
+          // one release so a steward whose prompt predates the rename still
+          // reports cleanly; `waitingOn` wins when both are given, and only the
+          // new name is stored. An empty string is no wait, so it stores null
+          // rather than rendering a bare "Waiting on ".
+          const rawWaitingOn = input.waitingOn ?? input.blockedOn ?? null;
+          const waitingOn = rawWaitingOn === "" ? null : rawWaitingOn;
+          if (input.blockedOn !== undefined && input.waitingOn === undefined) bb.log.info(`stewards: steward_report blockedOn is renamed to waitingOn; recording this report's wait (thread ${threadId}).`);
           // A status that waits on the user, the owner or a human has to say so
           // with an item, not only in prose: the item is what reaches the page.
-          if (input.blockedOn !== undefined && namesUserAsBlocker(input.blockedOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
+          if (waitingOn !== null && namesUserAsBlocker(waitingOn) && store.openNeeds(b.id).length === 0 && (input.needs ?? []).length === 0) {
             return toolError(
               new Error(
-                `blockedOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; blockedOn stays for third parties.`,
+                `waitingOn names the user, the owner or a human, but nothing is filed for them. File it as a needs item (steward_report { needs: [{ kind, url, what, how }] }) — or, for a credential, a step outside the repos or a decision, raise it with steward_report { escalate: { kind, question, meanwhile } } — and it appears on the Stewards page; waitingOn stays for third parties.`,
               ),
             );
           }
@@ -6287,7 +6296,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             summary: input.summary,
             nextAction: input.nextAction,
             actor,
-            blockedOn: input.blockedOn ?? null,
+            waitingOn,
             requeueAfterMs: requeueMs,
             conditions: [...(input.conditions ?? []), ...open.map((x) => `${x.kind} escalation with ${x.route}`)],
             resources: {
@@ -7072,7 +7081,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   : `looked ${iso(sentry.at)}: ${sentry.findings.length === 0 ? "nothing new" : `${sentry.findings.length} issue(s) new, regressed or rung`}`;
           const needs = store.openNeeds(b.id);
           const flags = [b.endedAt === null ? null : `ended: ${b.endReason}`, watch, b.priority === null ? null : `priority ${b.priority}`, b.noMorePulls === true ? "no more pull requests" : null, b.hold === null ? null : `HOLD: ${b.hold}${b.holdBehind.length === 0 ? "" : ` (behind ${b.holdBehind.join(", ")})`}`, ...open.map((x) => `${x.kind} escalation ${x.id} with ${x.route}`), ...needs.map((n) => `${n.kind} need ${n.id}${n.url === "" ? "" : ` (${n.url})`}`), unheardWait(s, open, needs), asksForOpenApproval(s, open, needs)].filter((f) => f !== null);
-          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.blockedOn === null ? "" : `; blocked on ${s.blockedOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
+          return `${b.entityKey} — ${b.kind}, ${b.phase ?? "?"}${b.threadId === null ? "" : `, thread ${b.threadId}`}\n  ${s === null ? "no report yet" : `${s.summary} Next: ${s.nextAction} (${s.actor})${s.waitingOn === null ? "" : `; waiting on ${s.waitingOn}`}`}${flags.length > 0 ? `\n  [${flags.join("; ")}]` : ""}`;
         })
         .join("\n");
     }

@@ -429,7 +429,7 @@ const sidebarBinding = (over: Record<string, unknown>) => ({
   phase: null,
   hold: null,
   holdBehind: [],
-  blockedOn: null,
+  waitingOn: null,
   needsUser: false,
   stuck: false,
   status: null,
@@ -574,7 +574,7 @@ const boardSteward = (over: Record<string, unknown> = {}) => ({
   summary: null,
   nextAction: null,
   actor: null,
-  blockedOn: null,
+  waitingOn: null,
   priority: null,
   hold: null,
   holdBehind: [],
@@ -640,7 +640,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const slot = await renderBoardWith({
       stewards: [
         boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true }),
-        boardSteward({ key: "ENG-2", title: "Held up", blockedOn: "bb-gate#88" }),
+        boardSteward({ key: "ENG-2", title: "Held up", hold: "a freeze" }),
         boardSteward({ key: "acme/web", title: "Ops watch", kind: "ops" }),
       ],
       questions: [question({ id: "qst_project", key: null, question: "Which release?" })],
@@ -741,13 +741,16 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows the blocked, hold and stuck lines in the status", async () => {
+  it("shows the waiting, hold and stuck lines in the status", async () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",
-      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", blockedOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", waitingOn: "bb-gate#88", hold: "a freeze", holdBehind: ["ENG-9"], stuck: true, summary: "x", nextAction: "y" })],
       stuck: [{ key: "ENG-1", url: null, threadId: "thr_s", why: "waiting on a decision", since: 1 }],
     });
-    await waitFor(() => expect(slot.getByText("Blocked on bb-gate#88")).toBeTruthy());
+    // The wait is a plain muted line, not a destructive one (BB-109).
+    const waiting = await waitFor(() => slot.getByText("Waiting on bb-gate#88"));
+    expect(waiting.className).toContain("text-muted-foreground");
+    expect(waiting.className).not.toContain("text-destructive");
     expect(slot.getByText(/On hold: a freeze \(behind ENG-9\)/u)).toBeTruthy();
     expect(slot.getByText(/Stuck: waiting on a decision/u)).toBeTruthy();
     slot.lifecycle.unmount();
@@ -785,7 +788,7 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     const bindings = [
       sidebarBinding({ key: "ENG-1", threadId: "thr_1", needsUser: true, phase: "In Review" }),
       sidebarBinding({ key: "ENG-2", threadId: "thr_2", workers: [{ threadId: "thr_w", title: "w", status: "running" }] }),
-      sidebarBinding({ key: "ENG-3", threadId: "thr_3", blockedOn: "bb-gate#88" }),
+      sidebarBinding({ key: "ENG-3", threadId: "thr_3", waitingOn: "bb-gate#88" }),
       sidebarBinding({ key: "ENG-4", threadId: "thr_4", deployment: "deployed" }),
     ];
     const captured = await loadApp();

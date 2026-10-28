@@ -632,9 +632,9 @@ export function prGate(entity: EntitySnapshot, opts: PrGateOptions = {}): PrGate
 }
 
 /**
- * A `blockedOn` that names the user, the owner or a human. A status record
+ * A `waitingOn` that names the user, the owner or a human. A status record
  * naming one of them without an open `needs` item is refused: the item is what
- * puts the ask on the Stewards page.
+ * puts the ask on the Stewards page (BB-109 keeps the refusal for `waitingOn`).
  */
 export function namesUserAsBlocker(text: string): boolean {
   return /(?:^|[^\p{L}\p{N}])(?:user|owner|human)(?:[^\p{L}\p{N}]|$)/iu.test(text);
@@ -776,9 +776,9 @@ export const approvalWanted = (gate: GateState): boolean => !gate.none && gate.c
  * none of its escalations is open: a wait nobody above it hears about.
  */
 export function unheardWait(status: Binding["status"], open: readonly Escalation[], needs: readonly Pick<Need, "kind">[] = []): string | null {
-  if (status === null || status.blockedOn === null || open.length > 0 || needs.length > 0) return null;
-  if (/project steward/iu.test(status.blockedOn)) return "waits on the project steward, with no open escalation";
-  if (/\buser\b/iu.test(status.blockedOn)) return "waits on the user, with no open escalation";
+  if (status === null || status.waitingOn === null || open.length > 0 || needs.length > 0) return null;
+  if (/project steward/iu.test(status.waitingOn)) return "waits on the project steward, with no open escalation";
+  if (/\buser\b/iu.test(status.waitingOn)) return "waits on the user, with no open escalation";
   return null;
 }
 

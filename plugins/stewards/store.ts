@@ -508,13 +508,45 @@ export const statusRecordSchema = z.object({
   summary: z.string(),
   nextAction: z.string(),
   actor: z.enum(ACTORS),
-  blockedOn: z.string().nullable(),
+  /** The party or artifact the next action waits on; it never marks the effort blocked (BB-109). */
+  waitingOn: z.string().nullable(),
   requeueAfterMs: z.number().nullable(),
   conditions: z.array(z.string()),
   resources: z.object({ workers: z.array(z.string()), pullRequests: z.array(z.string()), children: z.array(z.string()) }),
   at: z.number(),
 });
 export type StatusRecord = z.infer<typeof statusRecordSchema>;
+
+/**
+ * Reads a stored status record (BB-109). A record written before the rename
+ * still carries `blockedOn` and no `waitingOn`; it parses and surfaces as
+ * `waitingOn`, with `waitingOn` winning when both are present. New writes use
+ * `statusRecordSchema`, which has no `blockedOn` key.
+ */
+export const storedStatusRecordSchema = z
+  .object({
+    phase: z.string(),
+    summary: z.string(),
+    nextAction: z.string(),
+    actor: z.enum(ACTORS),
+    waitingOn: z.string().nullable().optional(),
+    blockedOn: z.string().nullable().optional(),
+    requeueAfterMs: z.number().nullable(),
+    conditions: z.array(z.string()),
+    resources: z.object({ workers: z.array(z.string()), pullRequests: z.array(z.string()), children: z.array(z.string()) }),
+    at: z.number(),
+  })
+  .transform((s): StatusRecord => ({
+    phase: s.phase,
+    summary: s.summary,
+    nextAction: s.nextAction,
+    actor: s.actor,
+    waitingOn: s.waitingOn ?? s.blockedOn ?? null,
+    requeueAfterMs: s.requeueAfterMs,
+    conditions: s.conditions,
+    resources: s.resources,
+    at: s.at,
+  }));
 
 /**
  * What the mechanical tier last observed: the entity, and for a ticket the
@@ -656,7 +688,7 @@ function rowToBinding(r: BindingRow): Binding {
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
     modelWorker: str("model_worker"),
-    status: json(statusRecordSchema.nullable(), str("status"), null),
+    status: json(storedStatusRecordSchema.nullable(), str("status"), null),
     statusAt: num("status_at"),
     advancedAt: num("advanced_at"),
     requeueAt: num("requeue_at"),
@@ -1418,7 +1450,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
         busy: false,
         runningWorkers: 0,
         needsUser: needsUserFor(b),
-        blockedOn: b.status?.blockedOn ?? null,
         hold: b.hold,
         holdBehind: b.holdBehind,
         stuck: openEscalations.all(b.id).some((x) => x.kind === "stuck"),

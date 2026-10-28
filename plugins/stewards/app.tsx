@@ -396,7 +396,6 @@ function overviewEffortStatus(s: Steward): EffortStatus {
     busy: false,
     runningWorkers: s.workers,
     needsUser: s.needsUser,
-    blockedOn: s.blockedOn,
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
@@ -465,7 +464,7 @@ function StewardRow({ steward: s, now }: { steward: Steward; now: number }) {
           {s.summary} <span className="text-muted-foreground">Next: {s.nextAction}{s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}</span>
         </p>
       )}
-      {s.blockedOn !== null ? <p className="text-muted-foreground">Blocked on {s.blockedOn}</p> : null}
+      {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
       {s.hold !== null ? <p className="text-attention">On hold: {s.hold}</p> : null}
       {s.escalations.map((x, i) => (
         <p key={i} className={x.route === "me" ? "text-destructive" : "text-muted-foreground"}>
@@ -641,7 +640,6 @@ function boardEffortStatus(s: BoardSteward): EffortStatus {
     busy: false,
     runningWorkers: s.workers.length,
     needsUser: s.needsUser,
-    blockedOn: s.blockedOn,
     hold: s.hold,
     holdBehind: s.holdBehind,
     stuck: s.stuck,
@@ -844,7 +842,7 @@ function EffortDetail({ board: b, effortKey, refetch }: { board: Board; effortKe
             Next: {s.nextAction ?? "—"}
             {s.actor === null ? "" : ` (${ACTOR_LABEL[s.actor] ?? s.actor})`}
           </p>
-          {s.blockedOn !== null ? <p className="text-destructive">Blocked on {s.blockedOn}</p> : null}
+          {s.waitingOn !== null ? <p className="text-muted-foreground">Waiting on {s.waitingOn}</p> : null}
           {s.hold !== null ? <p className="text-attention">On hold: {s.hold}{s.holdBehind.length > 0 ? ` (behind ${s.holdBehind.join(", ")})` : ""}</p> : null}
           {s.stuck ? <p className="text-destructive">Stuck{stuck === null ? "" : `: ${stuck.why}`}</p> : null}
           <p className="text-xs text-muted-foreground">
