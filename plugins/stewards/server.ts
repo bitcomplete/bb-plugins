@@ -544,6 +544,9 @@ export const rpcContract = defineRpcContract({
 /** How long an ended binding stays on the page. */
 const ENDED_ON_BOARD_MS = 14 * 86_400_000;
 
+/** How long a worker's reviewer lookup is cached across `stewardsSidebar` calls (BB-95). */
+const REVIEWER_CACHE_MS = 5_000;
+
 type ProjectConfig = {
   projectId: string;
   file: ProjectFile;
@@ -739,7 +742,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     // changed; the sidebar, the board page and the overview refetch on the
     // channel. Keeping it a callback keeps store.ts free of bb, so
     // steward-side mutations publish too.
-    const store = createStore(db, now, { onProjectChange: (projectId) => bb.realtime.publish(PROJECT_CHANGED, { projectId }) });
+    const store = createStore(db, now, {
+      onProjectChange: (projectId, columns) => {
+        // One debug line per published signal, with the project and the
+        // coalesced columns, so the next slowdown has numbers (BB-95).
+        bb.log.debug(`stewards: signal for project ${projectId} (${columns.length === 0 ? "no columns" : columns.join(", ")})`);
+        bb.realtime.publish(PROJECT_CHANGED, { projectId });
+      },
+    });
 
     const rpc = <T>(pluginId: string, method: string, input: unknown, outputSchema: z.ZodType<T>, signal?: AbortSignal): Promise<T> =>
       bb.sdk.plugins.callRpc<T>({ pluginId, method, input: input as never, outputSchema, ...(signal === undefined ? {} : { signal }) });
@@ -958,11 +968,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return value;
     }
 
-    /** Every project with a stewards configuration. */
-    async function stewardedProjects(force = false): Promise<ProjectConfig[]> {
-      const projects = await bb.sdk.projects.list();
+    /** Every project with a stewards configuration. `projects` reuses a list already fetched this call (BB-95). */
+    async function stewardedProjects(force = false, projects?: Awaited<ReturnType<typeof bb.sdk.projects.list>>): Promise<ProjectConfig[]> {
+      const list = projects ?? (await bb.sdk.projects.list());
       const out: ProjectConfig[] = [];
-      for (const p of projects) {
+      for (const p of list) {
         const config = await loadConfig(p.id, force);
         if (config !== null) out.push(config);
       }
@@ -4189,7 +4199,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       scheduleReconcile(owner.id);
     }
 
-    bb.events.on("thread.created", async ({ thread }) => {
+    bb.events.on("thread.created", store.coalescingTool(async ({ thread }) => {
       // Stewards this plugin spawned (a promoted child under its parent) are not workers.
       if (thread.originPluginId === bb.pluginId) return;
       // A worker (its lifecycle owner or parent is a steward) or a reviewer (a
@@ -4220,18 +4230,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       bb.log.warn(`stewards: ${owner.entityKey} started more than ${limit} workers in an hour; stopped ${thread.id}`);
       store.note(owner.id, `Runaway guard: more than ${limit} workers in the last hour, so worker ${thread.id} was stopped. If something is looping, stop and escalate.`);
       scheduleReconcile(owner.id);
-    });
+    }));
 
-    bb.events.on("thread.idle", async ({ thread, lastAssistantText }) => {
+    bb.events.on("thread.idle", store.coalescingTool(async ({ thread, lastAssistantText }) => {
       const worker = store.worker(thread.id);
       if (worker !== null) {
         if (worker.status === "stopped") return;
         const result = lastAssistantText === null ? null : clip(lastAssistantText, 4000);
         store.setWorker(thread.id, "finished", result);
         // The quiet-finish note is what the visible "worker finished" phrase
-        // reads, so write it before the awaits below: `setWorker` has already
-        // published the signal, and the refetch it triggers would otherwise
-        // read the store before the note lands (BB-90).
+        // reads. The whole idle handler is one coalesced turn (BB-95), so the
+        // signal that refetches is published after the note lands, never before.
         const finished = store.binding(worker.bindingId);
         // BB-52 rule 3: a worker that ends its turn waiting on its reviewer,
         // the owner or a build is a quiet note. Only a question, an error
@@ -4312,7 +4321,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await compactIfLarge(thread.id);
       const after = store.binding(b.id)!;
       if (after.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
-    });
+    }));
 
     /**
      * The questions the binding's workers ended their last turn with. A
@@ -4398,7 +4407,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // A worker that ended its turn to wait (on a watch, a reviewer) is
     // running again when that wakes it; it is working its pull request.
-    bb.events.on("thread.active", async ({ thread }) => {
+    bb.events.on("thread.active", store.coalescingTool(async ({ thread }) => {
       const worker = store.worker(thread.id);
       if (worker === null) return;
       if (worker.status === "finished") store.setWorker(thread.id, "running", worker.result);
@@ -4408,40 +4417,44 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         store.setWorkerModelCheckPending(thread.id, false);
         if (owner !== null && owner.endedAt === null) await validateWorkerSpawn(thread, owner);
       }
-    });
+    }));
 
-    bb.events.on("thread.failed", async ({ thread, error }) => {
+    bb.events.on("thread.failed", store.coalescingTool(async ({ thread, error }) => {
       const worker = store.worker(thread.id);
       if (worker === null || !workerInFlight(worker)) return;
       store.setWorker(thread.id, "failed", error);
       await closeRequesterNeed(thread.id);
       store.note(worker.bindingId, `Worker "${worker.title}" failed: ${error ?? "no detail"}`);
       scheduleReconcile(worker.bindingId);
-    });
+    }));
 
     // An archived steward is still bound: a wake brings it back, whoever
     // archived it. Only a deleted steward thread
     // ends its binding: someone meant it, and the label staying on does not
     // bring it back until it is removed and re-added.
-    bb.events.on("thread.archived", ({ thread }) => {
-      const worker = store.worker(thread.id);
-      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
-      if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
-      // An archived requester can no longer import; drop its binding so the
-      // page's next Provide spawns a fresh one.
-      if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
-    });
-    bb.events.on("thread.deleted", ({ thread }) => {
-      const worker = store.worker(thread.id);
-      if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
-      if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
-      const b = store.byThread(thread.id);
-      if (b === null || b.endedAt !== null) return;
-      store.patch(b.id, { threadId: null, endedAt: now(), endReason: "deleted", manualDetach: true, awaitingReport: false, ending: null });
-      for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The steward was deleted.");
-      bb.log.info(`stewards: ${b.entityKey}'s steward was deleted; detached`);
-      pushInterest();
-    });
+    bb.events.on("thread.archived", ({ thread }) =>
+      store.coalescing(() => {
+        const worker = store.worker(thread.id);
+        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+        if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
+        // An archived requester can no longer import; drop its binding so the
+        // page's next Provide spawns a fresh one.
+        if (store.secretRequester(thread.id) !== null) store.clearSecretRequester(thread.id);
+      }),
+    );
+    bb.events.on("thread.deleted", ({ thread }) =>
+      store.coalescing(() => {
+        const worker = store.worker(thread.id);
+        if (worker !== null && workerInFlight(worker)) store.setWorker(thread.id, "stopped", worker.result);
+        if (worker?.modelCheckPending) store.setWorkerModelCheckPending(thread.id, false);
+        const b = store.byThread(thread.id);
+        if (b === null || b.endedAt !== null) return;
+        store.patch(b.id, { threadId: null, endedAt: now(), endReason: "deleted", manualDetach: true, awaitingReport: false, ending: null });
+        for (const x of store.openEscalations(b.id)) store.resolve(x.id, "The steward was deleted.");
+        bb.log.info(`stewards: ${b.entityKey}'s steward was deleted; detached`);
+        pushInterest();
+      }),
+    );
 
     // ---- @bb mentions ----------------------------------------------------------------------------------
     //
@@ -4613,6 +4626,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     // ---- the RPC -------------------------------------------------------------------------------------
+
+    // A short-lived cache of each worker's reviewer threads, so N open clients
+    // and a burst of signals share one `threads.list` per worker instead of one
+    // per refetch (BB-95). Keyed by worker thread id; entries expire after
+    // `REVIEWER_CACHE_MS`.
+    const reviewerCache = new Map<string, { at: number; ids: string[] }>();
 
     bb.rpc.register(rpcContract, {
       async stewardsRing({ source, id, deployment, workflow_run }, { experimental_caller: caller }) {
@@ -4790,24 +4809,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         };
       },
       // The sidebar's one call: every stewarded project's bindings, their
-      // workers, and the reviewers known under them. One `threads.list` per
-      // worker finds the reviewers; everything else is the store's own records.
+      // workers, and the reviewers known under them. The reviewers come from a
+      // cached `threads.list` per worker; everything else is the store's own
+      // records.
       async stewardsSidebar() {
-        const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const projects = projectIds((await stewardedProjects()).map((c) => c.projectId))
+        const started = now();
+        // One project list for both the names and the configurations (BB-95),
+        // instead of `bb.sdk.projects.list()` twice.
+        const projectList = await bb.sdk.projects.list();
+        const named = new Map(projectList.map((p) => [p.id, p.name] as const));
+        const projects = projectIds((await stewardedProjects(false, projectList)).map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
         const workerIds = [
           ...new Set(projects.flatMap((p) => store.all(p.projectId).filter((b) => b.endedAt === null).flatMap((b) => store.workers(b.id).map((w) => w.threadId)))),
         ];
+        // The reviewer lookup is the expensive part: cache it for a few seconds
+        // so a burst of signals and N open clients share one call per worker.
+        for (const [id, entry] of reviewerCache) if (started - entry.at >= REVIEWER_CACHE_MS) reviewerCache.delete(id);
         const reviewersByWorker = new Map<string, string[]>();
         await Promise.all(
           workerIds.map(async (workerId) => {
+            const cached = reviewerCache.get(workerId);
+            if (cached !== undefined) {
+              reviewersByWorker.set(workerId, cached.ids);
+              return;
+            }
             const children = await bb.sdk.threads.list({ parentThreadId: workerId, includeHidden: true }).catch(() => []);
-            reviewersByWorker.set(workerId, children.map((c) => c.id));
+            const ids = children.map((c) => c.id);
+            reviewerCache.set(workerId, { at: started, ids });
+            reviewersByWorker.set(workerId, ids);
           }),
         );
-        return {
+        const result = {
           projects: projects.map(({ projectId, name }) => {
             const all = store.all(projectId);
             const ended = all
@@ -4857,6 +4891,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             };
           }),
         };
+        // One debug line per call, with its duration and binding/worker counts,
+        // so the next slowdown has numbers (BB-95).
+        const bindingCount = result.projects.reduce((n, p) => n + p.bindings.length, 0);
+        bb.log.debug(`stewards: stewardsSidebar took ${now() - started}ms (${result.projects.length} projects, ${bindingCount} bindings, ${workerIds.length} workers)`);
+        return result;
       },
       async stewardsAnswerQuestion({ questionId, answer, choice, rationale }, { experimental_caller: caller }) {
         if (caller.kind !== "client") throw new Error("questions are closed by the user, from the stewards page");
@@ -5494,7 +5533,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .optional()
           .describe("Ops stewards only: every ticket you filed, commented on or reopened this turn, by fingerprint. The next look then treats the problem as filed under that ticket, so a recurrence is a comment there and nothing new."),
       }),
-      async execute(input, { threadId }) {
+      execute: store.coalescingTool(async (input, { threadId }) => {
         try {
           let b = ownBinding(threadId);
           // Validate the input that does not depend on which pull request the
@@ -5768,7 +5807,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } catch (error) {
           return toolError(error);
         }
-      },
+      }),
     });
 
     bb.agents.registerTool({
@@ -5850,7 +5889,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .optional()
           .describe("Project steward only: finish a pending lesson after applying and publishing it, retire a retired one, or drop it."),
       }),
-      async execute(input, { threadId }) {
+      execute: store.coalescingTool(async (input, { threadId }) => {
         try {
           const done: string[] = [];
           const notes: string[] = [];
@@ -6325,7 +6364,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         } catch (error) {
           return toolError(error);
         }
-      },
+      }),
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */

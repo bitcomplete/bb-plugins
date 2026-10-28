@@ -503,3 +503,30 @@ describe("stewards sidebar unread (BB-80)", () => {
     expect(hasUnread([child("a", [child("b")])], flags([]))).toBe(false);
   });
 });
+
+// BB-95: buildSidebar hands back the previous objects for unchanged rows, so a
+// memoised row skips a render on a same-content refetch or a host tick.
+describe("stewards sidebar structural sharing (BB-95)", () => {
+  const baseInput = () => ({
+    projects: [project({ id: "p1" })],
+    threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker", parentThreadId: "thr_steward" })],
+    data: [data({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_steward", workers: [{ threadId: "thr_worker", title: "Implement", status: "running" }] })] })],
+    now: 0,
+  });
+
+  it("returns the same tab, effort and child objects for unchanged inputs", () => {
+    const first = buildSidebar(baseInput());
+    const second = buildSidebar(baseInput(), first);
+    expect(second[0]).toBe(first[0]);
+    expect(second[0]!.efforts[0]).toBe(first[0]!.efforts[0]);
+    expect(second[0]!.efforts[0]!.children[0]).toBe(first[0]!.efforts[0]!.children[0]);
+  });
+
+  it("rebuilds only the effort whose thread changed on a host tick", () => {
+    const first = buildSidebar(baseInput());
+    const ticked = { ...baseInput(), threads: [thread({ id: "thr_steward" }), thread({ id: "thr_worker", parentThreadId: "thr_steward", status: "active" })] };
+    const second = buildSidebar(ticked, first);
+    expect(second[0]!.efforts[0]).not.toBe(first[0]!.efforts[0]);
+    expect(second[0]!.efforts[0]!.busy).toBe(true);
+  });
+});

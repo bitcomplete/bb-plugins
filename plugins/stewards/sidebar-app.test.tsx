@@ -8,6 +8,7 @@ import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } 
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute } from "./board-route.js";
+import { rowRenderCounts } from "./app.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
   projectId: "p1",
@@ -1096,7 +1097,8 @@ describe("the board route store (BB-94)", () => {
 
 // BB-91: the sidebar's CSS-only row transitions.
 describe("the sidebar's row transitions (BB-91)", () => {
-  it("gives every rendered effort, thread and ended row a unique view-transition-name", async () => {
+  // BB-95: the root view transition is gone, so no row carries a name for it.
+  it("leaves no view-transition-name on any row", async () => {
     const slot = await renderSidebar({
       sidebarThreads: {
         projects,
@@ -1114,11 +1116,7 @@ describe("the sidebar's row transitions (BB-91)", () => {
     const names = Array.from(slot.container.querySelectorAll<HTMLElement>("[style]"))
       .map((el) => el.style.viewTransitionName)
       .filter((name) => name !== "");
-    expect(names.length).toBeGreaterThan(0);
-    expect(new Set(names).size).toBe(names.length);
-    expect(names.some((name) => name.startsWith("stewards-effort-"))).toBe(true);
-    expect(names.some((name) => name.startsWith("stewards-ended-"))).toBe(true);
-    expect(names.some((name) => name.startsWith("stewards-thread-"))).toBe(true);
+    expect(names).toEqual([]);
     slot.lifecycle.unmount();
   });
 
@@ -1172,7 +1170,7 @@ describe("the sidebar's row transitions (BB-91)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("wraps a data update in a view transition when the document supports one", async () => {
+  it("never starts a document view transition, even when the API exists (BB-95)", async () => {
     const startViewTransition = vi.fn((update: () => void) => {
       update();
       return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
@@ -1190,74 +1188,11 @@ describe("the sidebar's row transitions (BB-91)", () => {
     });
     await waitFor(() => expect(calls).toBe(1));
     startViewTransition.mockClear();
-    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
-    await waitFor(() => expect(calls).toBe(2));
-    await waitFor(() => expect(startViewTransition).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
-    slot.lifecycle.unmount();
-  });
-
-  it("commits a data update plainly while the list is inside an inert ancestor, as under a closed mobile drawer", async () => {
-    const startViewTransition = vi.fn((update: () => void) => {
-      update();
-      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
-    });
-    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
-    let calls = 0;
-    const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: {
-        stewardsSidebar: () => {
-          calls += 1;
-          return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
-        },
-      } as never,
-    });
-    await waitFor(() => expect(calls).toBe(1));
-    startViewTransition.mockClear();
-    // The host marks the closed drawer `inert` and keeps the list mounted under the page.
-    slot.container.setAttribute("inert", "");
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
     await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
     expect(startViewTransition).not.toHaveBeenCalled();
-    slot.container.removeAttribute("inert");
     slot.lifecycle.unmount();
-  });
-
-  it("commits a data update plainly while the list is hidden by visibility, as in a collapsed desktop sidebar", async () => {
-    const startViewTransition = vi.fn((update: () => void) => {
-      update();
-      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
-    });
-    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
-    const proto = Element.prototype as unknown as { checkVisibility?: unknown };
-    const had = proto.checkVisibility;
-    let visible = true;
-    proto.checkVisibility = () => visible;
-    try {
-      let calls = 0;
-      const slot = await renderSidebar({
-        sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-        rpc: {
-          stewardsSidebar: () => {
-            calls += 1;
-            return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
-          },
-        } as never,
-      });
-      await waitFor(() => expect(calls).toBe(1));
-      startViewTransition.mockClear();
-      visible = false;
-      await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
-      await waitFor(() => expect(calls).toBe(2));
-      await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
-      expect(startViewTransition).not.toHaveBeenCalled();
-      slot.lifecycle.unmount();
-    } finally {
-      if (had === undefined) delete proto.checkVisibility;
-      else proto.checkVisibility = had;
-    }
   });
 
   it("still commits a data update when the document has no view transition API", async () => {
@@ -1342,7 +1277,10 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
       rpc: {
         stewardsSidebar: () => {
           calls += 1;
-          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
+          // A changed payload each call, so the refetch commits and the row
+          // re-renders to read the mutated host thread (BB-95 diff-skips an
+          // identical payload).
+          return sidebarData({ bindings: [binding({ phase: `p${calls}`, workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
         },
       } as never,
     });
@@ -1370,7 +1308,7 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
       rpc: {
         stewardsSidebar: () => {
           calls += 1;
-          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_w1", title: "Unread worker", status: "finished" }, { threadId: "thr_w2", title: "Second worker", status: "finished" }] })] });
+          return sidebarData({ bindings: [binding({ phase: `p${calls}`, workers: [{ threadId: "thr_w1", title: "Unread worker", status: "finished" }, { threadId: "thr_w2", title: "Second worker", status: "finished" }] })] });
         },
       } as never,
     });
@@ -1394,7 +1332,7 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
       rpc: {
         stewardsSidebar: () => {
           calls += 1;
-          return sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
+          return sidebarData({ bindings: [binding({ phase: `p${calls}`, workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] });
         },
       } as never,
     });
@@ -1433,6 +1371,120 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
     // Navigation now targets the worker inside, so the effort re-expands.
     slot.lifecycle.rerender(<list.component {...props} activeThreadId="thr_worker" />);
     await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+});
+
+// BB-95: the client coalesces a burst of signals into one RPC, drops a
+// byte-identical answer, and re-renders only the row whose data changed.
+describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
+  it("makes one RPC for two signals inside the debounce window", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding()] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    // Two signals from one turn: the second lands while the first is still
+    // inside the debounce window, so the two make one call.
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls).toBe(2);
+    slot.lifecycle.unmount();
+  });
+
+  it("does not re-render rows when the refetched payload is identical", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding()] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    // Let the first-load renders settle, then take a baseline.
+    await new Promise((r) => setTimeout(r, 50));
+    const before = rowRenderCounts.get("effort:ENG-1") ?? 0;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBe(before);
+    slot.lifecycle.unmount();
+  });
+
+  it("re-renders only the row whose data changed", async () => {
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_a", displayTitle: "ENG-1: A" }), thread({ id: "thr_b", displayTitle: "ENG-2: B" })],
+      },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({
+            bindings: [binding({ key: "ENG-1", threadId: "thr_a", phase: calls === 1 ? "In Progress" : "In Review" }), binding({ key: "ENG-2", threadId: "thr_b" })],
+          });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("A")).toBeTruthy());
+    await waitFor(() => expect(calls).toBe(1));
+    await new Promise((r) => setTimeout(r, 50));
+    const beforeA = rowRenderCounts.get("effort:ENG-1") ?? 0;
+    const beforeB = rowRenderCounts.get("effort:ENG-2") ?? 0;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(lineTwo(slot, "A")).toContain("In Review"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBeGreaterThan(beforeA);
+    expect(rowRenderCounts.get("effort:ENG-2") ?? 0).toBe(beforeB);
+    slot.lifecycle.unmount();
+  });
+
+  // BB-80 regression: a host tick that only clears a thread's read state, with
+  // no RPC payload change, must still update the group it auto-expanded.
+  it("collapses an untouched group when a host thread read clears with no payload change", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker", isUnread: true });
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    // The user reads it; the host mutates the thread and re-renders, no RPC.
+    worker.isUnread = false;
+    slot.lifecycle.rerender(<list.component {...props} />);
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("updates a child row's unread glyph when the host clears it with no payload change", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker", isUnread: true });
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+    });
+    await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("you"));
+    worker.isUnread = false;
+    slot.lifecycle.rerender(<list.component {...props} />);
+    await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("quiet"));
     slot.lifecycle.unmount();
   });
 });

@@ -3471,6 +3471,45 @@ describe("the stewards sidebar call", () => {
     expect(result.projects[0]!.ended).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
     expect(result.projects[0]!.ended[0]!.endedAt).toBe(t.now());
   });
+
+  it("caches the per-worker reviewer lookup and lists projects once per call (BB-95)", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "Implement retry");
+    await t.created("thr_r1", "thr_w1", "Review the pull request");
+
+    let listCalls = 0;
+    let projectListCalls = 0;
+    const originalList = t.sdk.threads.list;
+    t.harness.sdk.stub("threads.list", async (args: { parentThreadId?: string }) => {
+      listCalls += 1;
+      return originalList(args);
+    });
+    const originalProjects = t.sdk.projects.list;
+    t.harness.sdk.stub("projects.list", async () => {
+      projectListCalls += 1;
+      return originalProjects();
+    });
+
+    const first = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
+    expect(first.projects[0]!.bindings[0]!.reviewers).toEqual([{ threadId: "thr_r1", workerThreadId: "thr_w1" }]);
+    expect(listCalls).toBe(1);
+    expect(projectListCalls).toBe(1);
+
+    // A second call inside the cache window shares the lookup and lists
+    // projects once more.
+    const second = (await t.harness.callRpc("stewardsSidebar", null)) as Sidebar;
+    expect(second.projects[0]!.bindings[0]!.reviewers).toEqual([{ threadId: "thr_r1", workerThreadId: "thr_w1" }]);
+    expect(listCalls).toBe(1);
+    expect(projectListCalls).toBe(2);
+
+    // Past the window the lookup runs again.
+    t.advance(6_000);
+    await t.harness.callRpc("stewardsSidebar", null);
+    expect(listCalls).toBe(2);
+  });
 });
 
 // BB-46: the sidebar's "needs you" count and items, and the realtime signal
@@ -3625,7 +3664,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
       ["url", () => ({ url: "https://linear.app/acme/issue/ENG-12?new" })],
       ["ending", () => ({ ending: "terminal" })],
       ["threadId", () => ({ threadId: "thr_new" })],
-      ["pending", (b) => ({ pending: [...b.pending, { at: 1, text: "a queued note" }] })],
+      ["pending", () => ({ pending: [{ at: 1, text: 'Worker "W" finished its turn.', quiet: true }] })],
     ];
     for (const [name, make] of cases) {
       const { t, b } = await bound();
@@ -3666,6 +3705,43 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
     const { t, b } = await bound();
     const before = t.harness.inspection.realtimeSignals.length;
     t.hooks.store.patch(b.id, { stage: b.stage, title: b.title, url: b.url });
+    expect(signalsSince(t, before)).toEqual([]);
+  });
+
+  it("publishes exactly one signal for a turn that writes status, stage and a worker", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    await t.hooks.store.coalescingTurn(async () => {
+      t.hooks.store.patch(b.id, {
+        stage: "build",
+        status: { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() },
+      });
+      t.hooks.store.addWorker("thr_turn_worker", b.id, "Implement");
+    });
+    expect(signalsSince(t, before)).toEqual([one]);
+  });
+
+  it("stays silent when a status rewrite leaves the derived phrase unchanged", async () => {
+    const { t, b } = await bound();
+    const status = { phase: "Build", summary: "Building.", nextAction: "Wait", actor: "steward" as const, blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: t.now() };
+    t.hooks.store.patch(b.id, { status, statusAt: t.now() });
+    const before = t.harness.inspection.realtimeSignals.length;
+    // Same actor and next action: the row's phrase does not change.
+    t.hooks.store.patch(b.id, { status: { ...status, summary: "Still building.", at: t.now() + 1 }, statusAt: t.now() + 1 });
+    expect(signalsSince(t, before)).toEqual([]);
+  });
+
+  it("stays silent when only advanced_at changes", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { advancedAt: t.now() });
+    expect(signalsSince(t, before)).toEqual([]);
+  });
+
+  it("stays silent when a non-phrase pending note is queued", async () => {
+    const { t, b } = await bound();
+    const before = t.harness.inspection.realtimeSignals.length;
+    t.hooks.store.patch(b.id, { pending: [...b.pending, { at: 1, text: "a queued note" }] });
     expect(signalsSince(t, before)).toEqual([]);
   });
 });
