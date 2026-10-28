@@ -1455,7 +1455,9 @@ export function createStore(db: Database.Database, now: () => number, options: S
       try {
         return await fn();
       } finally {
-        publish(dirty);
+        // A copy, like `flushProjectChanged`: a write from inside
+        // `onProjectChange` must not mutate the map being iterated.
+        publish(new Map(dirty));
       }
     });
   }

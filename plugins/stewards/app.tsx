@@ -1274,6 +1274,23 @@ function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
 }
 
 /**
+ * A signature of the read state of a child tree (BB-95): two rows with the
+ * same signature have the same unread glyphs and the same auto-expand state, so
+ * a memoised row can skip. A thread's read state feeds neither `SidebarLiveThread`
+ * nor `SidebarEffort`, and `byId` is a new Map on every host tick, so the state
+ * itself has to be part of the props for a memoised row to see it change.
+ */
+function unreadKey(children: readonly SidebarChild[], byId: ReadonlyMap<string, PluginSidebarThread>): string {
+  let out = "";
+  for (const c of children) {
+    const t = byId.get(c.threadId);
+    out += `${c.threadId}:${t === undefined ? "-" : `${t.isUnread ? 1 : 0}${t.indicator}`};`;
+    out += unreadKey(c.children, byId);
+  }
+  return out;
+}
+
+/**
  * Per-row render counters, for the sidebar tests to assert that a same-content
  * refetch or host tick re-renders only the row whose data changed (BB-95).
  * Exported for `sidebar-app.test.tsx`; the production cost is one map write per
@@ -1305,6 +1322,8 @@ type SidebarThreadRowProps = {
   activeThreadId: string | null;
   /** The rows that must be open so the active thread is revealed (BB-85). */
   openThreads: ReadonlySet<string>;
+  /** A signature of the descendants' read state, so a memoised row re-renders when any of them is read (BB-95). */
+  unreadKey: string;
   /** Whether the first load has painted, so a row that mounts later animates in (BB-91). */
   entered?: boolean;
 };
@@ -1312,9 +1331,9 @@ type SidebarThreadRowProps = {
 /**
  * Whether two `SidebarThreadRow` prop sets render the same output. `byId` is
  * ignored: it is a new Map whenever the host's thread list ticks, and the row
- * only reads it for threads whose own changes already arrive through `thread`
- * and `children`. `openThreads` is compared only for this row's own
- * membership, so a new Set with the same members is not a change (BB-95).
+ * only reads it for threads whose own changes already arrive through `thread`,
+ * `children` and `unreadKey`. `openThreads` is compared only for this row's
+ * own membership, so a new Set with the same members is not a change (BB-95).
  */
 function sameThreadRowProps(a: SidebarThreadRowProps, b: SidebarThreadRowProps): boolean {
   return (
@@ -1327,6 +1346,7 @@ function sameThreadRowProps(a: SidebarThreadRowProps, b: SidebarThreadRowProps):
     a.glyph === b.glyph &&
     a.activeThreadId === b.activeThreadId &&
     a.entered === b.entered &&
+    a.unreadKey === b.unreadKey &&
     a.openThreads.has(a.thread.id) === b.openThreads.has(b.thread.id)
   );
 }
@@ -1408,7 +1428,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
           {children.map((c) => {
             const child = byId.get(c.threadId);
             return child === undefined ? null : (
-              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
+              <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={depth + 1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} entered={entered} />
             );
           })}
         </ul>
@@ -1499,6 +1519,8 @@ type SidebarEffortRowProps = {
   activeThreadId: string | null;
   /** The rows that must be open so the active thread is revealed (BB-85). */
   openThreads: ReadonlySet<string>;
+  /** A signature of the descendants' read state, so a memoised row re-renders when any of them is read (BB-95). */
+  unreadKey: string;
   onNavigate: () => void;
   onChanged: () => void;
   /** A right-aligned stamp after the title, for a Recently ended row's `ended N ago` (BB-88). */
@@ -1510,9 +1532,9 @@ type SidebarEffortRowProps = {
 /**
  * Whether two `SidebarEffortRow` prop sets render the same output. `effort` is
  * structurally shared by `buildSidebar`, so an unchanged effort keeps its
- * identity. `byId` is ignored (a new Map on every host tick); the needs this
- * row shows are compared by content, since the RPC hands back fresh objects
- * (BB-95).
+ * identity. `byId` is ignored (a new Map on every host tick); the read state of
+ * the effort's threads arrives as `unreadKey`, and the needs this row shows are
+ * compared by content, since the RPC hands back fresh objects (BB-95).
  */
 function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps): boolean {
   if (
@@ -1524,6 +1546,7 @@ function sameEffortRowProps(a: SidebarEffortRowProps, b: SidebarEffortRowProps):
     a.onChanged !== b.onChanged ||
     a.trailing !== b.trailing ||
     a.entered !== b.entered ||
+    a.unreadKey !== b.unreadKey ||
     a.openThreads.has(a.effort.rootThreadId) !== b.openThreads.has(b.effort.rootThreadId)
   ) {
     return false;
@@ -1631,7 +1654,7 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
             {effort.children.map((c) => {
               const child = byId.get(c.threadId);
               return child === undefined ? null : (
-                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} entered={entered} />
+                <SidebarThreadRow key={c.threadId} thread={child} role={c.role} children={c.children} depth={1} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(child)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(c.children, byId)} entered={entered} />
               );
             })}
           </ul>
@@ -1874,6 +1897,7 @@ function StewardsSidebarCore({
         activeKey={activeKey}
         activeThreadId={activeThreadId}
         openThreads={openThreads}
+        unreadKey={unreadKey(e.children, byId)}
         onNavigate={onNavigate}
         onChanged={refetch}
         entered={loaded}
@@ -1912,7 +1936,7 @@ function StewardsSidebarCore({
                 {active.threads.map((e) => {
                   const t = byId.get(e.rootThreadId);
                   return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} entered={loaded} />
+                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(e.children, byId)} entered={loaded} />
                   );
                 })}
               </ul>
@@ -1936,6 +1960,7 @@ function StewardsSidebarCore({
                     activeKey={activeKey}
                     activeThreadId={activeThreadId}
                     openThreads={openThreads}
+                    unreadKey={unreadKey(e.children, byId)}
                     onNavigate={onNavigate}
                     onChanged={refetch}
                     trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
@@ -1957,6 +1982,7 @@ function StewardsSidebarCore({
                 glyph="quiet"
                 activeThreadId={activeThreadId}
                 openThreads={openThreads}
+                unreadKey=""
                 entered={loaded}
                 meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
               />

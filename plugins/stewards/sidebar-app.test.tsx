@@ -1413,13 +1413,13 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
     });
     await waitFor(() => expect(calls).toBe(1));
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
-    // Let the first-load `entered` render land before clearing the probe.
-    await waitFor(() => expect(slot.getByText("Fix login").closest("li")!.className).toContain("motion-safe:animate-in"));
-    rowRenderCounts.clear();
+    // Let the first-load renders settle, then take a baseline.
+    await new Promise((r) => setTimeout(r, 50));
+    const before = rowRenderCounts.get("effort:ENG-1") ?? 0;
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBe(0);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBe(before);
     slot.lifecycle.unmount();
   });
 
@@ -1441,14 +1441,50 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
     });
     await waitFor(() => expect(slot.getByText("A")).toBeTruthy());
     await waitFor(() => expect(calls).toBe(1));
-    await waitFor(() => expect(slot.getByText("A").closest("li")!.className).toContain("motion-safe:animate-in"));
-    rowRenderCounts.clear();
+    await new Promise((r) => setTimeout(r, 50));
+    const beforeA = rowRenderCounts.get("effort:ENG-1") ?? 0;
+    const beforeB = rowRenderCounts.get("effort:ENG-2") ?? 0;
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
     await waitFor(() => expect(calls).toBe(2));
     await waitFor(() => expect(lineTwo(slot, "A")).toContain("In Review"));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBeGreaterThan(0);
-    expect(rowRenderCounts.get("effort:ENG-2") ?? 0).toBe(0);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBeGreaterThan(beforeA);
+    expect(rowRenderCounts.get("effort:ENG-2") ?? 0).toBe(beforeB);
+    slot.lifecycle.unmount();
+  });
+
+  // BB-80 regression: a host tick that only clears a thread's read state, with
+  // no RPC payload change, must still update the group it auto-expanded.
+  it("collapses an untouched group when a host thread read clears with no payload change", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker", isUnread: true });
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+    });
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    // The user reads it; the host mutates the thread and re-renders, no RPC.
+    worker.isUnread = false;
+    slot.lifecycle.rerender(<list.component {...props} />);
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("updates a child row's unread glyph when the host clears it with no payload change", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const worker = thread({ id: "thr_worker", displayTitle: "Worker", isUnread: true });
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+    });
+    await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("you"));
+    worker.isUnread = false;
+    slot.lifecycle.rerender(<list.component {...props} />);
+    await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("quiet"));
     slot.lifecycle.unmount();
   });
 });
