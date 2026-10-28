@@ -168,7 +168,7 @@ export interface StewardsDeps {
   /** Runs kubectl for ops bindings: on the project's machine, through the host entry, by default. */
   kubectl?: (args: string[], where: { projectId: string; hostId: string | null }) => Promise<KubectlResult>;
   /** Reads the project's `.bb` from `origin/<default>` for the native source: the host entry by default. */
-  git?: (input: { projectId: string; hostId: string | null; path: string; files: string[] }) => Promise<NativeGitRead>;
+  git?: (input: { projectId: string; hostId: string | null; path: string; files: string[]; fetch: boolean }) => Promise<NativeGitRead>;
   /** The GitHub writer the page's Approve and Merge buttons use; the server's gh login by default. */
   github?: GithubWriter;
   /** What reads Sentry and subscribes to bb-gate-hooks for it; global fetch by default. */
@@ -234,6 +234,8 @@ const mergeGuidanceOutput = z.object({ ok: z.boolean(), sha: z.string().nullable
 
 /** A project checkout fetch can be slow; the git host call is allowed this long. */
 const GIT_TIMEOUT_MS = 60_000;
+/** One config load makes several native reads; only the first fetches within this window. */
+const NATIVE_FETCH_TTL_MS = 60_000;
 
 /** The checkout directory's own name, for a native project's single repo entry. */
 const checkoutDirName = (path: string): string => path.replace(/[\\/]+$/u, "").split(/[\\/]/u).filter((part) => part !== "").at(-1) ?? "project";
@@ -983,6 +985,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       });
     }
 
+    /** The last native fetch per project, so one config load's several reads fetch once. */
+    const nativeFetchedAt = new Map<string, number>();
+
     /**
      * The git-backed native source for one project. The host entry does the
      * fetch and the read (project-git.ts), on the checkout's own machine; the
@@ -992,16 +997,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const run = async (files: string[]): Promise<{ read: NativeGitRead; path: string | null }> => {
         const checkout = await projectCheckout(projectId);
         if (checkout === null) return { read: { head: null, files: [], remote: null, defaultBranch: null, layout: "primary", error: null }, path: null };
+        const last = nativeFetchedAt.get(projectId) ?? 0;
+        const fetch = now() - last >= NATIVE_FETCH_TTL_MS;
+        if (fetch) nativeFetchedAt.set(projectId, now());
         const read =
           deps.git !== undefined
-            ? await deps.git({ projectId, hostId: checkout.hostId, path: checkout.path, files })
-            : await (hostClient ??= bb.hosts.experimental_client({ contract: hostContract })).call("gitProjectFiles", { path: checkout.path, files }, { hostId: checkout.hostId, timeoutMs: GIT_TIMEOUT_MS });
+            ? await deps.git({ projectId, hostId: checkout.hostId, path: checkout.path, files, fetch })
+            : await (hostClient ??= bb.hosts.experimental_client({ contract: hostContract })).call("gitProjectFiles", { path: checkout.path, files, fetch }, { hostId: checkout.hostId, timeoutMs: GIT_TIMEOUT_MS });
         return { read, path: checkout.path };
       };
       return nativeSource({
         readFiles: async (paths) => {
           const { read } = await run(paths);
-          if (read.error !== null && read.files.length === 0) throw new Error(read.error);
+          // The host names a file it could not read (too large, a bad object);
+          // surface it even when other files came back, so the problem line
+          // names it instead of a silent missing file.
+          if (read.error !== null) throw new Error(read.error);
           return new Map(read.files.map((f) => [f.path, f.content]));
         },
         repoSet: async () => {

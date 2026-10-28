@@ -7,14 +7,13 @@
 // someone is halfway through there is not the project's. `git fetch` is the
 // only command that changes anything, and it changes only remote-tracking
 // refs; nothing here checks out, resets, stashes, commits or writes the
-// working tree or a local branch.
+// working tree or a local branch, and this handler leaves no state of its own
+// in the checkout (the caller throttles the fetch).
 //
 // Every path is a fixed argument from the plugin, passed after `--`, so a
 // file name can never become an option. Paths are validated again here even
 // though the host contract already checks them: this is the boundary.
 import { execFile } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { experimental_sanitizeInheritedChildProcessEnv } from "@get-bb/plugin-sdk/host";
 import type { NativeGitRead, ProjectGitFile } from "./project-source.js";
 
@@ -24,9 +23,6 @@ const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_CHARS = 200_000;
 const REGULAR_FILE_MODES = new Set(["100644", "100755"]);
 const SAFE_PATH = /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/u;
-/** One config load makes several reads; only the first fetches within this window. */
-const FETCH_TTL_MS = 60_000;
-const FETCH_MARKER = ".git/bb-stewards-fetched-at";
 
 type GitRun = { code: number; stdout: string; stderr: string; truncated: boolean };
 
@@ -60,20 +56,6 @@ async function gitLine(dir: string, args: string[]): Promise<string | null> {
 }
 
 const firstProblemLine = (r: GitRun): string => r.stderr.split(/\r?\n/u).map((l) => l.trim()).find((l) => l !== "") ?? `git exited ${r.code}`;
-
-/**
- * Fetch `origin`, at most once per {@link FETCH_TTL_MS}, and return the run
- * (null when the TTL skipped it). A failed fetch still reads the last fetched
- * commit, and does not mark the window, so the next call retries.
- */
-async function fetchOrigin(dir: string): Promise<GitRun | null> {
-  const marker = join(dir, FETCH_MARKER);
-  const last = await readFile(marker, "utf8").then((raw) => Number.parseInt(raw.trim(), 10), () => Number.NaN);
-  if (Number.isFinite(last) && Date.now() - last < FETCH_TTL_MS) return null;
-  const fetched = await runGit(dir, ["fetch", "--quiet", "origin"]);
-  if (fetched.code === 0) await writeFile(marker, String(Date.now()), "utf8").catch(() => undefined);
-  return fetched;
-}
 
 async function refExists(dir: string, ref: string): Promise<boolean> {
   const r = await runGit(dir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
@@ -117,18 +99,20 @@ export function projectGitPathProblem(path: string): string | null {
 
 /**
  * Read the named files out of the project checkout's `origin/<default>` at
- * its committed tip. A fetch is attempted first; a fetch that fails (no
- * network, no remote) still reads the last fetched commit rather than
- * failing the read. The working tree and every local branch are untouched.
+ * its committed tip. `fetch` (default true) asks for a `git fetch origin`
+ * first; the caller throttles it, so the checkout gets no plugin-owned state
+ * of its own. A fetch that fails (no network, no remote) still reads the last
+ * fetched commit rather than failing the read. The working tree and every
+ * local branch are untouched.
  */
-export async function readProjectGit(input: { path: string; files: readonly string[] }): Promise<NativeGitRead> {
+export async function readProjectGit(input: { path: string; files: readonly string[]; fetch?: boolean }): Promise<NativeGitRead> {
   const dir = input.path;
   for (const file of input.files) {
     const problem = projectGitPathProblem(file);
     if (problem !== null) return { head: null, files: [], remote: null, defaultBranch: null, layout: "primary", error: problem };
   }
   const remote = await gitLine(dir, ["config", "--get", "remote.origin.url"]);
-  const fetched = await fetchOrigin(dir);
+  const fetched = input.fetch === false ? null : await runGit(dir, ["fetch", "--quiet", "origin"]);
   const branch = await originDefaultBranch(dir);
   if (branch === null) {
     const why = fetched === null || fetched.code === 0 ? `${dir} has no origin default branch to read.` : `Could not fetch the project source: ${firstProblemLine(fetched)}`;

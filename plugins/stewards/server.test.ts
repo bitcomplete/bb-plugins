@@ -3771,11 +3771,12 @@ describe("the native project source (BB-107)", () => {
   /** A world whose multi-repo plugin is missing: native git serves `.bb`, and every multi-repo RPC is a 404. */
   const nativeWorld = async (missing = true) => {
     let files: Record<string, string | null> = defaultFiles();
-    const gitCalls: Array<{ path: string; hostId: string | null; files: string[] }> = [];
+    let hostError: string | null = null;
+    const gitCalls: Array<{ path: string; hostId: string | null; files: string[]; fetch: boolean }> = [];
     const t = await setup({
-      git: async ({ hostId, path, files: paths }) => {
-        gitCalls.push({ path, hostId, files: paths });
-        return { head: "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: "https://github.com/acme/web.git", defaultBranch: "main", layout: "primary" as const, error: null };
+      git: async ({ hostId, path, files: paths, fetch }) => {
+        gitCalls.push({ path, hostId, files: paths, fetch });
+        return { head: "abc", files: paths.map((p) => ({ path: p, content: files[p] ?? null })), remote: "https://github.com/acme/web.git", defaultBranch: "main", layout: "primary" as const, error: hostError };
       },
     });
     files = t.files;
@@ -3787,7 +3788,7 @@ describe("the native project source (BB-107)", () => {
         return original(args);
       });
     }
-    return { t, gitCalls };
+    return { t, gitCalls, setHostError: (message: string | null) => (hostError = message) };
   };
 
   it("loads from native git when the multi-repo RPC reports unknown plugin", async () => {
@@ -3847,6 +3848,28 @@ describe("the native project source (BB-107)", () => {
     expect(config!.source.kind).toBe("native");
     expect(t.hooks.store.find("ENG-12", "p1")).toMatchObject({ id: before!.id, entityKey: "ENG-12" });
     expect((await t.harness.behavior.runCli(["list", "--project", "p1"])).stdout).toContain("ENG-12");
+  });
+
+  it("fetches once per window and skips the next read's fetch", async () => {
+    const { t, gitCalls } = await nativeWorld();
+    t.advance(2 * 60_000);
+    gitCalls.length = 0;
+    await load(t);
+    expect(gitCalls.some((c) => c.fetch)).toBe(true);
+    const before = gitCalls.length;
+    await load(t);
+    const after = gitCalls.slice(before);
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.every((c) => c.fetch === false)).toBe(true);
+  });
+
+  it("surfaces a host read error as a problem line", async () => {
+    const { t, setHostError } = await nativeWorld();
+    expect(await load(t)).not.toBeNull();
+    setHostError("Larger than 200000 characters, so not read: stewards/big.md");
+    const after = await load(t);
+    expect(after).not.toBeNull();
+    expect(after!.problems.some((p) => p.includes("Larger than 200000 characters"))).toBe(true);
   });
 
   it("names the project source in check and the overview, for both sources", async () => {

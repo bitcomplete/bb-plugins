@@ -83,6 +83,15 @@ describe("the native git project source", () => {
     expect(await readFile(path.join(checkout, ".bb", "stewards", "project.json"), "utf8")).toContain("dirty");
   });
 
+  it("adds nothing at all to the checkout when it does not fetch", async () => {
+    const { checkout } = await world();
+    const listing = () => execFileSync("find", [checkout, "-type", "f"], { encoding: "utf8" }).trim().split("\n").filter(Boolean).sort();
+    const before = listing();
+    const read = await readProjectGit({ path: checkout, files: ["stewards/project.json"], fetch: false });
+    expect(read.error).toBeNull();
+    expect(listing()).toEqual(before);
+  });
+
   it("reads a standalone .bb checkout at its root, and reports its origin", async () => {
     const { origin, checkout } = await world();
     const standalone = path.join(path.dirname(checkout), "standalone");

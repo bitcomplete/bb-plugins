@@ -34,6 +34,6 @@ export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
     opsKubectl: ({ args, timeoutMs }) => runKubectlHere(args, timeoutMs),
-    gitProjectFiles: ({ path, files }) => readProjectGit({ path, files }),
+    gitProjectFiles: ({ path, files, fetch }) => readProjectGit({ path, files, fetch }),
   },
 });

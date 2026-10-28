@@ -14,7 +14,7 @@ export const hostContract = defineRpcContract({
     output: z.object({ exitCode: z.number().int(), stdout: z.string(), stderr: z.string(), missing: z.boolean() }).strict(),
   },
   gitProjectFiles: {
-    input: z.object({ path: z.string().min(1).max(2000), files: z.array(projectFilePath).max(64) }).strict(),
+    input: z.object({ path: z.string().min(1).max(2000), files: z.array(projectFilePath).max(64), fetch: z.boolean().default(true) }).strict(),
     output: z
       .object({
         head: z.string().max(64).nullable(),
