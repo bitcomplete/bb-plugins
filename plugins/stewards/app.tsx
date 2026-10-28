@@ -1254,10 +1254,10 @@ function phraseClass(state: SidebarEffortState): string {
 }
 
 /**
- * The four glyphs, in precedence order (BB-76): a solid yellow dot when it
- * waits on you, an empty red ring when blocked, a blue ring that pulses slowly
- * while a worker or agent runs, an empty grey ring when quiet. The pulse is
- * CSS only and stops under `prefers-reduced-motion`.
+ * The four glyphs, in precedence order (BB-76): a solid attention dot when it
+ * waits on you, an empty destructive ring when blocked, a timeline-accent ring
+ * that pulses slowly while a worker or agent runs, an empty muted ring when
+ * quiet. The pulse is CSS only and stops under `prefers-reduced-motion`.
  */
 function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
   const transition = "motion-safe:transition-colors duration-300";
@@ -1266,7 +1266,7 @@ function StewardGlyph({ kind }: { kind: SidebarEffortState }) {
   return <span data-steward-glyph={kind} aria-hidden="true" className={`size-2.5 shrink-0 rounded-full border-2 ${border} ${transition}${kind === "running" ? " motion-safe:animate-pulse" : ""}`} />;
 }
 
-/** A one-off thread's glyph: yellow when unread, blue animated while its agent runs, grey otherwise. */
+/** A one-off thread's glyph: attention when unread, timeline-accent animated while its agent runs, muted otherwise. */
 function oneOffGlyph(thread: PluginSidebarThread): SidebarEffortState {
   if (isUnread(thread)) return "you";
   if (isBusy(thread.status)) return "running";
