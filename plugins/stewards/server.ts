@@ -85,7 +85,7 @@ import {
 } from "./source-contract.js";
 import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
-import { hasLessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
+import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
 import { GUIDANCE_UNIT_PREFIX, GUIDANCE_UNCITED_DAYS, escalationWeeks, parseGuidanceUnits, uncitedGuidanceUnits, type GuidanceUnit } from "./guidance.js";
 import { createGhWriter, parsePullRef, type GithubWriter } from "./github.js";
@@ -219,10 +219,15 @@ export function githubRepoOf(url: string): string | null {
 const readFilesOutput = z
   .object({ projectSourcePath: z.string().nullable(), head: z.string().nullable(), files: z.array(z.object({ path: z.string(), content: z.string().nullable() }).loose()), error: z.string().nullable() })
   .loose();
-const repoSetOutput = z.object({ repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()), error: z.string().nullable() }).loose();
-
-/** multi-repo's answer to a lesson merge, loose like the reads above. */
-const mergeGuidanceOutput = z.object({ ok: z.boolean(), sha: z.string().nullable(), branch: z.string().nullable(), message: z.string() }).loose();
+const repoSetOutput = z
+  .object({
+    repos: z.array(z.object({ dir: z.string(), url: z.string() }).loose()),
+    /** The project source's own origin, for a lesson's pull request (BB-108). */
+    primary: z.object({ dir: z.string(), url: z.string() }).loose().nullable().default(null),
+    layout: z.enum(["primary", "standalone"]).default("standalone"),
+    error: z.string().nullable(),
+  })
+  .loose();
 
 /**
  * The `guidance-<thread>` ref a thread's `.bb` commits are published on.
@@ -277,6 +282,8 @@ const needViewSchema = z.object({
   choices: z.array(z.string()),
   /** The lesson a `decide` item is about, when it is a boundary lesson; null otherwise. */
   lessonId: z.string().nullable(),
+  /** A boundary lesson's pull request, for the page's "Review PR" link (BB-108); null otherwise. */
+  prUrl: z.string().nullable(),
   what: z.string(),
   how: z.string().nullable(),
   /** For a provide-secret item: where the value goes, in words. */
@@ -3652,89 +3659,267 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     //
     // A lesson is a general rule the project steward drew from an escalation
     // or its own judgement. It is pending until its text is found at `.bb`
-    // HEAD. A `procedure` lesson the project steward applies and publishes is
-    // self-merged through multi-repo; a `boundary` one changes its own
-    // escalation boundary and is filed for the user with Merge/Drop, never
-    // merged by the plugin.
+    // HEAD. Since BB-106 made `.bb` a directory on the primary repo's default
+    // branch, a promoted or retired lesson lands as a reviewed pull request
+    // (BB-108): the project steward publishes the `guidance-<thread>` branch,
+    // and this plugin opens the pull request. A `procedure` lesson's PR is
+    // merged by the project steward at once; a `boundary` one waits for the
+    // owner to merge it, and the lesson is marked merged when the PR merges.
 
-    /** Close the open Merge/Drop item for a boundary lesson, if one is filed. */
+    /** Close the open Review PR/Drop item for a boundary lesson, if one is filed. */
     function closeLessonNeed(lesson: Lesson, resolution: string): void {
       if (lesson.bindingId === null) return;
       store.closeNeedByKey(lesson.bindingId, "decide", lesson.id, resolution);
     }
 
-    /** Self-merge a procedure lesson, or file a boundary one for the user. */
+    /** The files a lesson may never target: the decide list, the roles split, and anything under them. */
+    function lessonFileAllowed(file: string): boolean {
+      return file !== PROJECT_FILE && file !== ROLES_FILE;
+    }
+
+    /**
+     * The primary repo a lesson's pull request opens on, from multi-repo's repo
+     * set.
+     *
+     * TODO(BB-107): when stewards has a native git project source, this must
+     * read the primary repo from that seam instead, and the publish in
+     * `workspace_publish_guidance` must be replaced by the native handler. Until
+     * BB-107 lands, a project with no multi-repo reports the lesson PR refused
+     * rather than opening one; the branch push is multi-repo's.
+     */
+    async function lessonRepo(projectId: string): Promise<{ repo: string } | { error: string }> {
+      let set: z.infer<typeof repoSetOutput>;
+      try {
+        set = await rpc(MULTI_REPO_PLUGIN_ID, "repoSet", { projectId }, repoSetOutput);
+      } catch (error) {
+        bb.log.warn(`stewards: could not read the repo set for a lesson pull request: ${errorMessage(error)}`);
+        return { error: "could not read the project's primary repo; is multi-repo installed?" };
+      }
+      if (set.primary === null) return { error: "the project source has no origin to open a lesson pull request on" };
+      const repo = githubRepoOf(set.primary.url);
+      if (repo === null) return { error: `the project source's origin ${set.primary.url} is not a GitHub repo` };
+      return { repo };
+    }
+
+    /** The signed body of a lesson's pull request: the id, the anchor, and the steward that proposed it. */
+    function lessonPrBody(lesson: Lesson, text: string, threadId: string, retire: boolean): string {
+      const binding = lesson.bindingId === null ? null : store.binding(lesson.bindingId);
+      const anchor = retire ? retiredLessonAnchor(lesson.id) : lessonAnchor(lesson.id);
+      return [
+        `${retire ? "Retires" : "Lands"} lesson \`${lesson.id}\` in \`${lesson.file}\` (proposed by the project steward${binding === null ? "" : ` for ${binding.entityKey}`}).`,
+        "",
+        `Anchor: \`${anchor}\``,
+        "",
+        text,
+        "",
+        `_— from bb thread ${threadId}_`,
+      ].join("\n");
+    }
+
+    type LessonPrResult = { ok: boolean; repo: string | null; url: string | null; number: number | null; branch: string | null; message: string };
+
+    /**
+     * Open the pull request that lands a lesson's anchored block on the primary
+     * repo. The branch has already been published by
+     * `workspace_publish_guidance`; this only turns it into a PR. The
+     * self-widening guard (BB-35 limit 1) is enforced here, before anything is
+     * opened, and the same branch is reused when a nightly pass lands several
+     * lessons in one publish. A retirement asks for `fresh` so the promotion's
+     * merged PR is never reused.
+     */
+    async function openLessonPr(lesson: Lesson, text: string, opts: { retire?: boolean } = {}): Promise<LessonPrResult> {
+      const retire = opts.retire === true;
+      const projectThreadId = store.project(lesson.projectId).threadId;
+      const branch = lesson.branch ?? (projectThreadId === null ? null : lessonBranchFor(projectThreadId));
+      if (!lessonFileAllowed(lesson.file)) return { ok: false, repo: null, url: null, number: null, branch, message: `a lesson may never target ${lesson.file}` };
+      if (projectThreadId === null) return { ok: false, repo: null, url: null, number: null, branch, message: "the project steward has no thread yet, so nothing has been published" };
+      if (branch === null) return { ok: false, repo: null, url: null, number: null, branch, message: "the lesson has no branch to open a pull request from" };
+      if (lesson.branch === null) store.setLessonBranch(lesson.id, branch);
+      const primary = await lessonRepo(lesson.projectId);
+      if ("error" in primary) return { ok: false, repo: null, url: null, number: null, branch, message: primary.error };
+      const already = retire ? lesson.retirePr : lesson.pr;
+      if (already !== null) {
+        const ref = parsePullRef(already);
+        return { ok: true, repo: primary.repo, url: already, number: ref?.number ?? null, branch, message: `already open at ${already}` };
+      }
+      if (!retire) {
+        // Several lessons landed in one nightly publish share a branch, so they
+        // share one pull request.
+        const sibling = store.allLessons(lesson.projectId).find((l) => l.id !== lesson.id && l.status === "pending" && l.branch === branch && l.pr !== null);
+        if (sibling !== undefined && sibling.pr !== null) {
+          store.setLessonPr(lesson.id, sibling.pr);
+          const ref = parsePullRef(sibling.pr);
+          return { ok: true, repo: primary.repo, url: sibling.pr, number: ref?.number ?? null, branch, message: `reuses ${sibling.pr}` };
+        }
+      }
+      const base = await github.defaultBranch(primary.repo).catch((error: unknown) => {
+        bb.log.warn(`stewards: could not read ${primary.repo}'s default branch: ${errorMessage(error)}`);
+        return null;
+      });
+      if (base === null) return { ok: false, repo: primary.repo, url: null, number: null, branch, message: `could not read ${primary.repo}'s default branch` };
+      const head = branch.replace(/^refs\/heads\//u, "");
+      try {
+        const created = await github.createPull(primary.repo, { head, base, title: `${retire ? "Retire" : "Lesson"} ${lesson.id}: ${lesson.file}`, body: lessonPrBody(lesson, text, projectThreadId, retire) });
+        if (retire) store.setLessonRetirePr(lesson.id, created.url);
+        else store.setLessonPr(lesson.id, created.url);
+        return { ok: true, repo: primary.repo, url: created.url, number: created.number, branch, message: `opened ${created.url}` };
+      } catch (error) {
+        return { ok: false, repo: primary.repo, url: null, number: null, branch, message: errorMessage(error) };
+      }
+    }
+
+    /**
+     * The `.bb` files the pull request may change: this lesson's own file and
+     * the files of the lessons that share its PR (several lessons in one
+     * publish). The project file and `roles.json` are never allowed, so a
+     * hand-edited pre-guard row cannot widen the set.
+     */
+    function lessonPrFiles(projectId: string, url: string, lessonId: string): string[] {
+      return [
+        ...new Set(
+          store
+            .allLessons(projectId)
+            .filter((l) => (l.id === lessonId || l.pr === url || l.retirePr === url) && lessonFileAllowed(l.file))
+            .map((l) => l.file),
+        ),
+      ];
+    }
+
+    /**
+     * The narrow guard the old fast-forward enforced, on the pull request
+     * (BB-35 limit 1, BB-108): the PR must change only the files of the lessons
+     * published on its branch, and this lesson's file must carry its anchor.
+     * Returns why it refuses, or null when the PR is safe to merge. Fails
+     * closed when the read is unavailable.
+     */
+    async function verifyLessonPr(lesson: Lesson, result: LessonPrResult, anchor: string): Promise<string | null> {
+      if (result.repo === null || result.number === null || result.branch === null) return "the pull request could not be read";
+      if (github.files === undefined) return "the pull request's changed files cannot be read";
+      let files: string[];
+      try {
+        files = await github.files(result.repo, result.number);
+      } catch (error) {
+        return `could not read the pull request's changed files: ${errorMessage(error)}`;
+      }
+      // `files` reads one page; a full page means there may be more to check.
+      if (files.length >= 100) return "the pull request changes too many files to verify";
+      const allowed = lessonPrFiles(lesson.projectId, result.url ?? "", lesson.id);
+      const bad = files.filter((path) => !allowed.some((file) => path === file || path === `.bb/${file}`));
+      if (bad.length > 0) return `the pull request changes files other than the lesson's own: ${bad.slice(0, 5).join(", ")}`;
+      const path = files.find((p) => p === lesson.file || p === `.bb/${lesson.file}`);
+      if (path === undefined) return `the pull request does not change ${lesson.file}`;
+      if (github.fileContent === undefined) return `${path} cannot be read from the pull request`;
+      let content: string | null;
+      try {
+        content = await github.fileContent(result.repo, path, result.branch.replace(/^refs\/heads\//u, ""));
+      } catch (error) {
+        return `could not read ${path} from the pull request: ${errorMessage(error)}`;
+      }
+      if (content === null || !content.includes(anchor)) return `${path} does not carry the lesson's anchor`;
+      return null;
+    }
+
+    /** Squash-merge a lesson's pull request as the project steward, and mark the lesson merged. The narrow guard is checked first, and a refusal is recorded as a note, like a refused open, so the nightly wake shows it. */
+    async function mergeLessonPr(lesson: Lesson, result: LessonPrResult, note: string, opts: { retire?: boolean; verb?: string } = {}): Promise<{ ok: boolean; message: string }> {
+      if (result.repo === null || result.number === null) return { ok: true, message: `pull request opened at ${result.url ?? "?"}` };
+      const retire = opts.retire === true;
+      const problem = await verifyLessonPr(lesson, result, retire ? retiredLessonAnchor(lesson.id) : lessonAnchor(lesson.id));
+      if (problem !== null) {
+        store.noteLesson(lesson.id, problem);
+        return { ok: false, message: `pull request refused: ${problem}` };
+      }
+      try {
+        const { sha } = await github.squashMerge(result.repo, result.number, `Lesson ${lesson.id}`, note);
+        store.markLessonMerged(lesson.id, sha, result.branch ?? lesson.branch, note);
+        return { ok: true, message: `${opts.verb ?? "merged"} at ${sha ?? result.url ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}` };
+      } catch (error) {
+        const message = errorMessage(error);
+        store.noteLesson(lesson.id, message);
+        return { ok: false, message: `pull request refused: ${message}` };
+      }
+    }
+
+    /**
+     * Close a lesson's open pull request (Drop). A promotion pull request can
+     * be shared by several pending lessons in one publish, so it is closed only
+     * when no other pending lesson still references it; the survivors keep it.
+     */
+    async function closeLessonPr(lesson: Lesson, url?: string | null): Promise<void> {
+      const pr = url === undefined ? (lesson.retirePr ?? lesson.pr) : url;
+      if (pr === null) return;
+      const shared = store.allLessons(lesson.projectId).some((l) => l.id !== lesson.id && l.status === "pending" && (l.pr === pr || l.retirePr === pr));
+      if (shared) return;
+      const ref = parsePullRef(pr);
+      if (ref === null) return;
+      await github.closePull(ref.repo, ref.number).catch((error: unknown) => bb.log.warn(`stewards: could not close ${pr}: ${errorMessage(error)}`));
+    }
+
+    /** Land a procedure lesson at once, or file a boundary one for the owner to review. */
     async function completeLesson(lesson: Lesson, action: "complete" | "drop"): Promise<string> {
       if (action === "drop") {
+        await closeLessonPr(lesson);
         store.markLessonDropped(lesson.id, "Dropped by the project steward.");
         closeLessonNeed(lesson, "Dropped by the project steward.");
         return "dropped";
       }
-      const threadId = store.project(lesson.projectId).threadId;
-      if (lesson.scope === "boundary") {
-        if (lesson.bindingId === null) return "a boundary lesson needs the binding it came from; record it with binding.";
-        const branch = lesson.branch ?? (threadId === null ? null : lessonBranchFor(threadId));
-        if (branch !== null) store.setLessonBranch(lesson.id, branch);
-        fileBoundaryLessonNeed(lesson, branch);
-        return `boundary lesson; Merge/Drop filed for the user${branch === null ? "" : ` on ${branch}`}`;
+      if (lesson.scope === "boundary" && lesson.bindingId === null) return "a boundary lesson needs the binding it came from; record it with binding.";
+      // A publish that landed several lessons in one branch may already have
+      // put this one's anchored text at HEAD when an earlier lesson merged;
+      // observe it rather than opening a pull request with no commits.
+      const atHead = (await readFiles(lesson.projectId, [lesson.file]).catch(() => new Map<string, string | null>())).get(lesson.file) ?? null;
+      if (atHead !== null && hasLessonAnchor(atHead, lesson.id)) {
+        store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch, "Already at .bb HEAD.");
+        closeLessonNeed(lesson, "Already at .bb HEAD.");
+        return "already landed at .bb HEAD";
       }
-      if (threadId === null) {
-        store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing has been published.");
-        return "no project steward thread";
-      }
-      // The file carries the lesson's anchor, so the merge's narrow guard can
-      // check the right block landed and the same lesson cannot land twice.
-      const result = await mergeLesson(lesson.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
+      const result = await openLessonPr(lesson, withLessonAnchor(lesson.text, lesson.id));
       if (!result.ok) {
         store.noteLesson(lesson.id, result.message);
-        return `merge refused: ${result.message}`;
+        return `pull request refused: ${result.message}`;
       }
-      store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch);
-      return `merged at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
+      if (lesson.scope === "boundary") {
+        fileBoundaryLessonNeed(lesson, result.branch, result.url);
+        return `boundary lesson; Review PR/Drop filed for the user at ${result.url ?? "?"}`;
+      }
+      return (await mergeLessonPr(lesson, result, "Landed by the project steward (procedure lesson).")).message;
     }
 
     /**
-     * Remove a retired lesson's text from `.bb` through the same narrow merge
-     * path, leaving the retired anchor behind. The project steward has already
-     * removed the text and published the branch; this fast-forwards it. A
-     * lesson that never reached the file is retired in the row alone.
+     * Remove a retired lesson's text from `.bb` as a pull request, leaving the
+     * retired anchor behind. The project steward has already removed the text
+     * and published the branch. A lesson that never reached the file is retired
+     * in the row alone.
      */
     async function retireLesson(lesson: Lesson): Promise<string> {
       if (lesson.status !== "merged") {
         store.markLessonDropped(lesson.id, "Retired before it reached the file.");
         return "retired (it was not in the file)";
       }
-      const threadId = store.project(lesson.projectId).threadId;
-      if (threadId === null) {
-        store.noteLesson(lesson.id, "The project steward has no thread yet, so nothing could be removed.");
-        return "no project steward thread";
+      // A publish that retired several lessons in one branch may already have
+      // put this one's retired anchor at HEAD when an earlier retire merged.
+      const atHead = (await readFiles(lesson.projectId, [lesson.file]).catch(() => new Map<string, string | null>())).get(lesson.file) ?? null;
+      if (atHead !== null && atHead.includes(retiredLessonAnchor(lesson.id))) {
+        store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
+        closeLessonNeed(lesson, "Already retired at .bb HEAD.");
+        return "already retired at .bb HEAD";
       }
-      const result = await mergeLesson(lesson.projectId, threadId, lesson, retiredLessonAnchor(lesson.id));
+      const result = await openLessonPr(lesson, retiredLessonAnchor(lesson.id), { retire: true });
       if (!result.ok) {
         store.noteLesson(lesson.id, result.message);
         return `retire refused: ${result.message}`;
       }
-      store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
-      return `retired at ${result.sha ?? "?"}${result.branch === null ? "" : ` on ${result.branch}`}`;
-    }
-
-    /** Fast-forward the canonical `.bb` to a lesson's published branch, through multi-repo. */
-    async function mergeLesson(projectId: string, threadId: string, lesson: Lesson, text: string): Promise<{ ok: boolean; sha: string | null; branch: string | null; message: string }> {
-      // Defence in depth for the self-widening guard (BB-35 limit 1): the tool
-      // refuses a project-file lesson, and every merge path refuses one too, so
-      // a row that predates the guard can never move the decide list.
-      if (lesson.file === PROJECT_FILE) return { ok: false, sha: null, branch: lesson.branch, message: "a lesson may never target the project file" };
-      try {
-        return await rpc(MULTI_REPO_PLUGIN_ID, "mergeGuidance", { projectId, threadId, file: lesson.file, text }, mergeGuidanceOutput);
-      } catch (error) {
-        return { ok: false, sha: null, branch: lesson.branch, message: errorMessage(error) };
+      if (lesson.scope === "boundary") {
+        fileBoundaryLessonNeed(lesson, result.branch, result.url, true);
+        return `boundary retire; Review PR/Drop filed for the user at ${result.url ?? "?"}`;
       }
+      const merged = await mergeLessonPr(lesson, result, `Retired; the anchored text was removed from ${lesson.file}.`, { retire: true, verb: "retired" });
+      if (merged.ok) store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
+      return merged.message;
     }
 
     /** Each pass, a lesson whose anchored text is already at `.bb` HEAD is merged, however it got there. */
     async function reconcileLessons(config: ProjectConfig): Promise<void> {
       const pending = store.lessons(config.projectId).filter((lesson) => lesson.tier !== "retired");
-      if (pending.length === 0) return;
       for (const lesson of pending) {
         // One lesson's file being unreadable — a bad path, a transient read
         // failure — must not stop every other lesson being checked.
@@ -3749,6 +3934,39 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // wording, so a plain-text match still counts.
         if (content !== null && (hasLessonAnchor(content, lesson.id) || normalizeLessonText(content).includes(normalizeLessonText(lesson.text)))) {
           store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch);
+          closeLessonNeed(lesson, "The anchored text is at .bb HEAD.");
+        }
+      }
+      await reconcileLessonPrs(config);
+    }
+
+    /**
+     * A pending lesson's pull request is the merge signal (BB-108): read it
+     * through the github source and mark the lesson merged when it merged,
+     * closing the owner's Review PR item. The read is best-effort, so one
+     * unreadable pull request does not stop the others.
+     */
+    async function reconcileLessonPrs(config: ProjectConfig): Promise<void> {
+      for (const lesson of store.allLessons(config.projectId)) {
+        // A pending lesson lands when its promotion PR merges; a retired lesson
+        // whose anchored text is still in the file (status merged) is dropped
+        // when its retire PR merges. The two PRs are kept apart so a promotion
+        // merge never retires a lesson and a retire merge never lands one.
+        const retire = lesson.status === "merged" && lesson.retirePr !== null;
+        if (!retire && lesson.status !== "pending") continue;
+        const pr = retire ? lesson.retirePr : lesson.pr;
+        if (pr === null) continue;
+        const ref = parsePullRef(pr);
+        if (ref === null) continue;
+        try {
+          const pull = await snapshot("github", `${ref.repo}#${ref.number}`);
+          if (pull?.pull?.merged === true) {
+            if (retire) store.markLessonDropped(lesson.id, `Retired; the anchored text was removed from ${lesson.file}.`);
+            else store.markLessonMerged(lesson.id, lesson.mergeSha, lesson.branch, "The pull request merged.");
+            closeLessonNeed(lesson, "The pull request merged.");
+          }
+        } catch (error) {
+          bb.log.warn(`stewards: could not read lesson ${lesson.id}'s pull request ${pr}: ${errorMessage(error)}`);
         }
       }
     }
@@ -3799,26 +4017,29 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * File the boundary lesson's Merge/Drop item (BB-35 steps 3/5). It is the
-     * existing validation escalation: only the user's Merge makes a boundary
-     * lesson permanent, and an unanswered item leaves the lesson in trial.
+     * File the boundary lesson's Review PR/Drop item (BB-35 steps 3/5, BB-108).
+     * It is the existing validation escalation: only the owner merging the pull
+     * request makes a boundary lesson permanent, and an unanswered item leaves
+     * the lesson in trial.
      */
-    function fileBoundaryLessonNeed(lesson: Lesson, branch: string | null): boolean {
+    function fileBoundaryLessonNeed(lesson: Lesson, branch: string | null, prUrl: string | null, retire = false): boolean {
       if (lesson.bindingId === null) return false;
       store.fileNeed({
         bindingId: lesson.bindingId,
         kind: "decide",
         url: lesson.id,
-        what: `Merge or drop the boundary lesson for ${lesson.file}`,
+        what: `Review or drop the ${retire ? "retirement of the " : ""}boundary lesson for ${lesson.file}`,
         how: [
-          "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
+          retire
+            ? "The nightly pass retired this boundary lesson, so removing its anchored text also changes the boundary and only you may make it permanent."
+            : "The project steward recorded a general rule that changes its own escalation boundary, so only you may make it permanent.",
           "",
           `> ${lesson.text}`,
           "",
           `File: \`${lesson.file}\`. Branch: \`${branch ?? "(not published yet)"}\`.`,
-          "Merge fast-forwards the canonical `.bb`; Drop discards it.",
+          prUrl === null ? "The pull request is not open yet." : `Review the pull request at ${prUrl}; the lesson is marked ${retire ? "dropped" : "merged"} when it merges. Drop closes it and discards the lesson.`,
         ].join("\n"),
-        data: { lessonId: lesson.id, branch, file: lesson.file, choices: ["Merge", "Drop"], validation: "boundary-promotion" },
+        data: { lessonId: lesson.id, branch, file: lesson.file, prUrl, retire, choices: ["Review PR", "Drop"], validation: "boundary-promotion" },
         filedBy: "project",
       });
       return true;
@@ -3877,7 +4098,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (remaining <= 0) continue;
         const branch = request.validation === "boundary-promotion" ? lessonBranch(lesson) : null;
         if (branch !== null) store.setLessonBranch(lesson.id, branch);
-        const filed = request.validation === "boundary-promotion" ? fileBoundaryLessonNeed(lesson, branch) : fileMixedEvidenceNeed(lesson);
+        const filed = request.validation === "boundary-promotion" ? fileBoundaryLessonNeed(lesson, branch, lesson.pr) : fileMixedEvidenceNeed(lesson);
         if (!filed) {
           // A lesson with no binding (a hand-edited or pre-guard row) has no
           // item to live on; say so once rather than skipping it in silence.
@@ -5532,15 +5753,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return { ok: true, message: `Opening the secure form for ${named} in a new thread.`, threadId: requesterId };
         }
 
-        // A lesson's validation item (BB-35 steps 3/5). A boundary one is
-        // Merge/Drop: Merge goes through the same multi-repo fast-forward the
-        // project steward's own self-merge uses; Drop discards it. A
+        // A lesson's validation item (BB-35 steps 3/5, BB-108). A boundary one
+        // is Review PR/Drop: the pull request lands it and Drop closes it. A
         // mixed-evidence one is Keep/Retire: Keep records that the user
         // confirmed it, Retire removes it. Neither is a free-text answer.
         if (need.kind === "decide" && action === "choose" && typeof need.data.lessonId === "string") {
           const lesson = store.lesson(need.data.lessonId);
           const label = choice === undefined || choice === null || choice === "" ? null : choice;
-          if (lesson === null || lesson.tier === "retired") {
+          // A retire item is about a retired lesson whose text is still in the
+          // file (status merged, a retire PR open); every other lesson item is
+          // about a pending lesson. Anything else is already resolved.
+          const isRetire = lesson !== null && lesson.retirePr !== null && lesson.status === "merged";
+          if (lesson === null || lesson.status === "dropped" || (lesson.tier === "retired" && !isRetire)) {
             store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
             return { ok: false, message: "That lesson is already resolved." };
           }
@@ -5560,28 +5784,20 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             after(`The user retired lesson ${lesson.id} (${lesson.file}) on the Stewards page: ${removed}.`);
             return { ok: true, message: `Retired; ${b.entityKey}'s steward has been told.` };
           }
-          if (lesson.status !== "pending") {
+          if (!isRetire && lesson.status !== "pending") {
             store.closeNeedByKey(b.id, "decide", need.url, "The lesson is already resolved.");
             return { ok: false, message: "That lesson is already resolved." };
           }
           if (label === "Drop") {
-            store.markLessonDropped(lesson.id, "Dropped by the user on the Stewards page.");
+            await closeLessonPr(lesson, isRetire ? lesson.retirePr : lesson.pr);
+            store.markLessonDropped(lesson.id, isRetire ? "Retire dropped by the user on the Stewards page." : "Dropped by the user on the Stewards page.");
             store.closeNeedByKey(b.id, "decide", need.url, "Dropped on the Stewards page.");
             after(`The user dropped lesson ${lesson.id} on the Stewards page.`);
             return { ok: true, message: `Dropped; ${b.entityKey}'s steward has been told.` };
           }
-          if (label !== "Merge") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Merge, Drop.` };
-          const threadId = store.project(b.projectId).threadId;
-          if (threadId === null) return { ok: false, message: "The project steward has no thread yet; nothing has been published." };
-          const result = await mergeLesson(b.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
-          if (!result.ok) {
-            store.noteLesson(lesson.id, result.message);
-            return { ok: false, message: result.message };
-          }
-          store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged by the user on the Stewards page.");
-          store.closeNeedByKey(b.id, "decide", need.url, "Merged on the Stewards page.");
-          after(`The user merged lesson ${lesson.id} (${lesson.file}) on the Stewards page at ${result.sha ?? "?"}.`);
-          return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
+          if (label !== "Review PR") return { ok: false, message: `"${label ?? ""}" is not one of the choices: Review PR, Drop.` };
+          const prUrl = typeof need.data.prUrl === "string" ? need.data.prUrl : (lesson.retirePr ?? lesson.pr);
+          return { ok: true, message: prUrl === null ? "The pull request is not open yet; the project steward has not landed it." : `Review ${prUrl}; the lesson is marked ${isRetire ? "dropped" : "merged"} when it merges.` };
         }
 
         if (need.kind === "decide" && action === "choose") {
@@ -6289,7 +6505,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 (f) => !f.startsWith("/") && !f.includes("\\") && !f.includes("\0") && f.split("/").every((s) => s !== ".." && s !== "." && s.length > 0),
                 "a .bb-relative path with no leading /, backslash, NUL, or empty/./.. segment",
               )
-              .refine((f) => f !== "stewards/project.json", "a guidance file (AGENTS.md or a playbook), never the project file: a lesson must not be able to move a big decision to the project, loosen the pull-request gate or relax an approval")
+              .refine((f) => f !== PROJECT_FILE && f !== ROLES_FILE, "a guidance file (AGENTS.md or a playbook), never the project file or roles.json: a lesson must not be able to move a big decision to the project, loosen the pull-request gate, relax an approval or change who is a steward")
               .describe("The .bb file it belongs in, repo-relative, such as AGENTS.md or stewards/linear-tickets.md."),
             scope: z.enum(["procedure", "boundary"]).describe("procedure: playbook wording, sequencing, conventions the steward may already decide, which it self-merges. boundary: credentials and reach, who may direct a server, irreversible production steps — the user decides."),
             supersedes: z.string().trim().min(1).max(100).optional().describe("An existing lesson id in the same file that this one replaces; the nightly pass retires the older one."),
@@ -6299,7 +6515,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         lessonAction: z
           .object({
             id: z.string().trim().min(1).max(100).describe("The lesson id (lsn_…) from the nightly prompt or `bb stewards lessons`."),
-            action: z.enum(["complete", "drop", "retire"]).describe("complete: self-merge a procedure lesson, or file the user's Merge/Drop item for a boundary one. retire: remove a retired lesson's anchored text from `.bb`. drop: discard it."),
+            action: z.enum(["complete", "drop", "retire"]).describe("complete: open the lesson's pull request and merge it for a procedure lesson, or file the owner's Review PR/Drop item for a boundary one. retire: open a pull request removing a retired lesson's anchored text. drop: close the pull request and discard it."),
           })
           .optional()
           .describe("Project steward only: finish a pending lesson after applying and publishing it, retire a retired one, or drop it."),
@@ -6435,7 +6651,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
             const written = questionWrites(closing, null);
             if (input.lesson !== undefined) {
-              if (input.lesson.scope === "boundary") return toolError(new Error("A boundary lesson must name the binding it came from: pass binding (and resolve) so the user's Merge/Drop item has somewhere to live."));
+              if (input.lesson.scope === "boundary") return toolError(new Error("A boundary lesson must name the binding it came from: pass binding (and resolve) so the owner's Review PR/Drop item has somewhere to live."));
               written.push(recordLesson(null, closing?.question.escalationId ?? null));
             }
             return `${written.join("; ")}.`;
@@ -6783,7 +6999,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -6804,7 +7020,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // appears in its first turn. Link the thread once one has been spawned.
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
     }
 
     /**
@@ -7504,7 +7720,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               // wakes the steward.
               if (n.kind === "decide" && typeof n.data.lessonId === "string") {
                 const lesson = store.lesson(n.data.lessonId);
-                if (lesson === null || lesson.tier === "retired") return { exitCode: 0, stdout: "That lesson is already resolved." };
+                const isRetire = lesson !== null && lesson.retirePr !== null && lesson.status === "merged";
+                if (lesson === null || lesson.status === "dropped" || (lesson.tier === "retired" && !isRetire)) return { exitCode: 0, stdout: "That lesson is already resolved." };
                 const label = choice ?? null;
                 if (n.data.validation === "mixed-evidence") {
                   if (label !== "Keep" && label !== "Retire") throw new PluginCliError(`Lesson ${lesson.id} is Keep or Retire; pass --choice Keep or --choice Retire.`, { code: "choice_required" });
@@ -7527,11 +7744,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   }
                   return { exitCode: 0, stdout: `Retired ${lesson.id}.` };
                 }
-                if (lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
-                if (label !== "Merge" && label !== "Drop") throw new PluginCliError(`Lesson ${lesson.id} is Merge or Drop; pass --choice Merge or --choice Drop.`, { code: "choice_required" });
+                if (!isRetire && lesson.status !== "pending") return { exitCode: 0, stdout: "That lesson is already resolved." };
+                if (label !== "Review PR" && label !== "Drop") throw new PluginCliError(`Lesson ${lesson.id} is Review PR or Drop; pass --choice Review PR or --choice Drop.`, { code: "choice_required" });
                 const b = store.binding(n.bindingId);
                 if (label === "Drop") {
-                  store.markLessonDropped(lesson.id, "Dropped from a thread.");
+                  await closeLessonPr(lesson, isRetire ? lesson.retirePr : lesson.pr);
+                  store.markLessonDropped(lesson.id, isRetire ? "Retire dropped from a thread." : "Dropped from a thread.");
                   store.closeNeedByKey(n.bindingId, "decide", n.url, "Dropped from a thread.");
                   if (b !== null) {
                     store.note(b.id, `The user dropped lesson ${lesson.id} from a thread.`);
@@ -7539,20 +7757,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                   }
                   return { exitCode: 0, stdout: `Dropped ${lesson.id}.` };
                 }
-                const threadId = b === null ? null : store.project(b.projectId).threadId;
-                if (threadId === null) throw new PluginCliError("The project steward has no thread yet; nothing has been published.", { code: "no_project_steward" });
-                const result = await mergeLesson(b!.projectId, threadId, lesson, withLessonAnchor(lesson.text, lesson.id));
-                if (!result.ok) {
-                  store.noteLesson(lesson.id, result.message);
-                  throw new PluginCliError(result.message, { code: "merge_refused" });
-                }
-                store.markLessonMerged(lesson.id, result.sha, result.branch ?? lesson.branch, "Merged from a thread.");
-                store.closeNeedByKey(n.bindingId, "decide", n.url, "Merged from a thread.");
-                if (b !== null) {
-                  store.note(b.id, `The user merged lesson ${lesson.id} from a thread at ${result.sha ?? "?"}.`);
-                  scheduleReconcile(b.id);
-                }
-                return { exitCode: 0, stdout: `Merged ${lesson.id}.` };
+                const prUrl = typeof n.data.prUrl === "string" ? n.data.prUrl : (lesson.retirePr ?? lesson.pr);
+                return { exitCode: 0, stdout: prUrl === null ? `The pull request for ${lesson.id} is not open yet.` : `Review ${prUrl}` };
               }
               if (choice !== undefined) {
                 if (n.kind !== "decide") throw new PluginCliError(`Choices are for a decide item; ${id} is ${n.kind}.`, { code: "not_decide" });

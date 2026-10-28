@@ -925,7 +925,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to land",
       "",
-      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, commit, and publish with workspace_publish_guidance; then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. A `boundary` one becomes a Merge/Drop item for the user instead. If a merge was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
+      'The nightly pass promoted these. Add the anchored block to the named file in your `.bb` checkout, publish with workspace_publish_guidance, then complete it with steward_update { lessonAction: { id: "<id>", action: "complete" } }. The plugin opens one pull request on the primary repo per lesson (or per publish when several touch the same file): a `procedure` one is squash-merged by the project steward, and a `boundary` one is filed for the owner as a Review PR/Drop item that waits for the owner to merge it. If the pull request was refused, the reason is on the lesson: fix the branch and complete it again, or drop it.',
     );
     for (const l of toLand) out.push(`- ${l.id} (${l.scope}, ${l.file}): ${oneLine(l.text)}\n  Anchor: \`<!-- lesson:${l.id} -->\`${l.note === null ? "" : `\n  Last attempt: ${oneLine(l.note)}`}`);
   }
@@ -935,7 +935,7 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
       "",
       "## Lessons to retire",
       "",
-      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, commit, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. The row is kept.',
+      'The nightly pass retired these. In your `.bb` checkout replace the lesson\'s anchored block (its `<!-- lesson:<id> -->` line and the wording under it) with the retired anchor `<!-- lesson:<id> retired -->`, publish with workspace_publish_guidance, then retire it with steward_update { lessonAction: { id: "<id>", action: "retire" } }. A retire is a pull request too: a `procedure` one is merged by the project steward, a `boundary` one waits for the owner. The row is kept.',
     );
     for (const l of toRetire) out.push(`- ${l.id} (${l.file}): ${oneLine(l.text)}`);
   }

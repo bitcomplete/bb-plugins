@@ -1099,7 +1099,7 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
   const freeText = choices.length === 0 || other;
   // The entity link opens the binding's ticket; for approve-pr and merge the
   // item's `url` is the pull request, so it gets its own link.
-  const prUrl = n.kind === "approve-pr" || n.kind === "merge" ? n.url : null;
+  const prUrl = n.kind === "approve-pr" || n.kind === "merge" ? n.url : (n.prUrl ?? null);
   return (
     <>
       {takesNote && !lesson ? (
@@ -1167,6 +1167,7 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
             Open the pull request
           </button>
         ) : null}
+        {lesson && n.prUrl === null && n.kind === "decide" && n.choices.includes("Review PR") ? <span className="text-muted-foreground">The pull request is not open yet.</span> : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
       </div>
     </>

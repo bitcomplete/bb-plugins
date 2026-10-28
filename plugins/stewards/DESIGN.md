@@ -981,7 +981,10 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 The cross-plugin RPC contract in §3, plus `mergeGuidance`: the narrow
 fast-forward of the canonical `.bb` to a thread's published guidance branch
-that a self-merged lesson uses (§20). Only the stewards plugin may call it.
+for a standalone `.bb` repo. Since BB-108 a lesson lands as a pull request on
+the primary repo and stewards no longer calls `mergeGuidance`; `pushGuidance`
+(`workspace_publish_guidance`) is still the branch push. Only the stewards
+plugin may call `mergeGuidance`.
 
 ### bb-gate
 
@@ -1498,52 +1501,59 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   cluster). A much-later forward of the same wording under the same playbook
   therefore gets no page box for a why the user already gave in the project
   steward's thread — the suggestion step 4 deferred.
-- **The promotion and retirement write only the lesson's own anchored text.**
-  A promotion the nightly pass queues is listed under `## Lessons to land`;
-  the project steward adds the block (`<!-- lesson:<id> -->` and the wording)
-  to the named file, commits, publishes with `workspace_publish_guidance`, and
-  completes it. A retirement is listed under `## Lessons to retire`; the
-  project steward replaces the block with `<!-- lesson:<id> retired -->` and
-  publishes, then `steward_update { lessonAction: { action: "retire" } }`
-  fast-forwards the canonical checkout. The same multi-repo guard applies both
-  ways: only the lesson's own file may change, and it must carry the anchor the
-  call names. A lesson's `file` may never be `stewards/project.json`, so a
-  lesson can never move a big decision to the project, loosen the
-  pull-request gate or relax an approval; the decide list, `bigDecisions` and
-  `prGate` are outside a lesson's reach by construction. A boundary-scope
-  lesson still becomes a Merge/Drop item for the user. `retireLessonAnchor`
-  in `lessons.ts` is the normative definition of the retirement edit; the
-  project steward makes it by hand and the helper is what the tests pin.
-- **Procedure lessons self-merge.** Playbook procedure, sequencing and
-  conventions are what the project steward may already decide. It applies
-  the text to the file in its `.bb` checkout, commits, and publishes with
-  `workspace_publish_guidance`; then
-  `steward_update { lessonAction: { id, action: "complete" } }` asks
-  multi-repo to fast-forward the canonical checkout to that branch. The
-  fast-forward is deliberately narrow: the canonical checkout must be clean
-  and not detached, the branch must be a fast-forward whose commits change
-  only the lesson's own file, and that file must carry the lesson's text
-  (whitespace-normalised). Anything else is refused and the
-  `guidance-<thread>` branch is left where it is. The merge commit's sha is
-  recorded on the lesson. This is the only way a self-merged lesson reaches
-  the HEAD that `readProjectFiles` — and so every steward — reads.
-- **Boundary lessons go to the user.** Anything that would change the
-  steward's own escalation boundary — credentials and reach, who may direct
-  a server, irreversible production steps — is never self-merged. The
-  project steward applies, commits and publishes it, then `complete` files a
-  BB-15 `decide` item on the binding with the fixed choices **Merge** and
-  **Drop**. Merge runs the same multi-repo fast-forward from the page, as
-  the connected user and unsigned; Drop marks the lesson dropped. Both close
-  the item and wake the steward.
-- **The guard.** multi-repo exposes the merge as an RPC that refuses any
-  caller but the stewards plugin, and stewards only calls it for a pending
-  lesson the project steward recorded. The fast-forward can therefore only
-  change the lesson's own file, and only to a version carrying the lesson
-  text; other edits already in that file ride along, which the recorded sha
-  and the revert below cover.
+- **The promotion and retirement write only the lesson's own anchored text,
+  as a pull request (BB-108).** A promotion the nightly pass queues is listed
+  under `## Lessons to land`; the project steward adds the block
+  (`<!-- lesson:<id> -->` and the wording) to the named file, publishes with
+  `workspace_publish_guidance`, and completes it. A retirement is listed under
+  `## Lessons to retire`; the project steward replaces the block with
+  `<!-- lesson:<id> retired -->`, publishes, then
+  `steward_update { lessonAction: { action: "retire" } }`. With `.bb` a
+  directory on the primary repo's default branch (BB-106) there is nothing to
+  fast-forward, so the plugin opens a pull request on the primary repo's
+  origin from the published `guidance-<thread>` branch: one per lesson, or one
+  per publish when several lessons touch the same file. The body names the
+  lesson id, the anchor and the proposing steward, and is signed. The PR path
+  refuses before anything is opened: a lesson's `file` may never be
+  `stewards/project.json`, `stewards/roles.json` or `bigDecisions`, so a
+  lesson can never move a big decision to the project, loosen the pull-request
+  gate, relax an approval or change who is a steward; the decide list,
+  `bigDecisions`, `roles.json` and `prGate` are outside a lesson's reach by
+  construction. `retireLessonAnchor` in `lessons.ts` is the normative
+  definition of the retirement edit; the project steward makes it by hand and
+  the helper is what the tests pin.
+- **Procedure lessons are merged by the project steward.** Playbook procedure,
+  sequencing and conventions are what the project steward may already decide.
+  It applies the text to the file in its `.bb` checkout, publishes with
+  `workspace_publish_guidance`, and `complete` opens the pull request; the
+  project steward squash-merges it at once through the server's gh login, with
+  no person asked, and the merge commit's sha is recorded on the lesson. This
+  is the only way a self-merged lesson reaches the HEAD that
+  `readProjectFiles` — and so every steward — reads.
+- **Boundary lessons wait for the owner's approval.** Anything that would
+  change the steward's own escalation boundary — credentials and reach, who
+  may direct a server, irreversible production steps — is never merged by the
+  plugin. The project steward publishes it, `complete` opens the pull request
+  and files a BB-15 `decide` item on the binding with the fixed choices
+  **Review PR** and **Drop**. Review PR points the owner at the pull request;
+  the owner approves and merges it on GitHub, and a project-steward approval
+  never counts for it. The lesson is marked merged when the pull request
+  merges. Drop closes the pull request, marks the lesson dropped and closes
+  the item.
+- **The guard.** The self-widening guard is enforced in the PR path before a
+  branch is pushed or a pull request is opened, so a lesson row that predates
+  the record-time guard can never move the decide list or the roles split.
+  Before a procedure merge the plugin re-checks the pull request: every changed
+  path must be a file of a lesson published on that branch, and this lesson's
+  file must carry the anchor the call names. Anything else is refused and noted
+  on the lesson, so a lesson can never smuggle a second change into an
+  auto-merged pull request. A reviewer still sees the diff like any other
+  change.
 - **Status is observed, not assumed.** Every sweep and nightly pass reads
   each pending lesson's file at `.bb` HEAD and marks it `merged` when the
-  anchored text is there, however it got there; a retired lesson is skipped so
+  anchored text is there, however it got there, and reads a pending lesson's
+  pull request through the github source and marks it `merged` when it
+  merged, closing the owner's Review PR item; a retired lesson is skipped so
   an observation never resurrects it. `dropped` is set by the user's Drop
   button, the project steward's `drop` action, a retirement, or
   `bb stewards drop-lesson <id>`.
@@ -1560,13 +1570,13 @@ A **lesson** makes the answer a record and, for most of them, lands it.
   `bb stewards lessons [--all]` lists them all with their counts, and
   `bb stewards lessons --efficacy` prints the escalation-to-user trend and the
   uncited guidance units; `bb stewards drop-lesson <id>` drops one.
-- **Undo.** A merged procedure lesson is an ordinary commit on `.bb` HEAD;
-  `bb stewards lessons --all` names its `mergeSha` and branch. To undo it,
-  revert that commit in the canonical checkout (`git revert <sha>` in the
-  project's `.bb`, then push), or let the nightly pass retire it once it is
-  uncited for `promoted.retireDays` and remove the anchored block through
-  `## Lessons to retire`. The row is kept with `tier: retired` either way. A
-  boundary lesson is undone the same way once the user has merged it. A
+- **Undo.** A merged lesson is an ordinary commit on the primary repo's
+  default branch; `bb stewards lessons --all` names its `mergeSha` and branch.
+  To undo it, open a revert pull request on the primary repo, or let the
+  nightly pass retire it once it is uncited for `promoted.retireDays` and
+  remove the anchored block through `## Lessons to retire` (itself a pull
+  request). The row is kept with `tier: retired` either way. A
+  boundary lesson is undone the same way once the owner has merged it. A
   lesson recorded by an image before this step gets the column default
   `candidate`, and the remap has already run at its own index, so after a
   roll-forward it is invisible to wakes; `bb stewards lessons --all` still
