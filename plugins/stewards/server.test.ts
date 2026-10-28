@@ -454,6 +454,77 @@ describe("a Linear ticket steward", () => {
     expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
+  // BB-111: `ensureProjectSteward` spawns the project steward with an
+  // environment that attaches asynchronously, so a read taken at once is null
+  // and the first stewards of a new project got their own environment. The
+  // first steward now waits for the project steward's environment.
+  describe("BB-111: waiting for the project steward's environment", () => {
+    const fastWait = { debounceMs: 1, nightlyStaggerMs: 0, environmentPollMs: 1, environmentWaitMs: 500 };
+    const projectThread = (t: Awaited<ReturnType<typeof setup>>) => t.spawns[0]!.id;
+    const stewardSpawn = (t: Awaited<ReturnType<typeof setup>>) => t.spawns.find((s) => s.parentThreadId === projectThread(t));
+
+    it("reuses the environment once the project steward's provider attaches it", async () => {
+      const t = await setup({ timing: fastWait });
+      const originalGet = t.sdk.threads.get;
+      let reads = 0;
+      t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => {
+        const base = await originalGet(args);
+        if (args.threadId !== "thr_1") return base;
+        reads += 1;
+        // The provider attaches the environment after the thread exists: the
+        // first read has no id, the next has it ready.
+        return (reads === 1 ? { ...base, environmentId: null, environment: null } : base) as unknown;
+      });
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      expect(reads).toBe(2);
+      expect(stewardSpawn(t)).toMatchObject({ environment: { type: "reuse", environmentId: "env1" } });
+    });
+
+    it("falls back to a fresh environment when the wait times out, and logs it", async () => {
+      const t = await setup({ timing: { ...fastWait, environmentWaitMs: 20 } });
+      const originalGet = t.sdk.threads.get;
+      t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => {
+        const base = await originalGet(args);
+        if (args.threadId !== "thr_1") return base;
+        return { ...base, environmentId: null, environment: null } as unknown;
+      });
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      expect(stewardSpawn(t)).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace" } });
+      expect(t.harness.logEntries.some((e) => e.level === "info" && e.message.includes("timed out"))).toBe(true);
+    });
+
+    it("falls back to a fresh environment when the project steward's environment is destroyed, and logs it", async () => {
+      const t = await setup({ timing: fastWait });
+      const originalGet = t.sdk.threads.get;
+      t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => {
+        const base = await originalGet(args);
+        if (args.threadId !== "thr_1") return base;
+        return { ...base, environment: { ...((base as { environment?: Record<string, unknown> }).environment ?? {}), status: "destroyed" } } as unknown;
+      });
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      expect(stewardSpawn(t)).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace" } });
+      expect(t.harness.logEntries.some((e) => e.level === "info" && e.message.includes("destroyed"))).toBe(true);
+    });
+
+    it("reuses an already-ready environment without waiting", async () => {
+      // A long bound: a bug that waits would hold the test open until it times out.
+      const t = await setup({ timing: { ...fastWait, environmentWaitMs: 60_000 } });
+      const originalGet = t.sdk.threads.get;
+      let reads = 0;
+      t.harness.sdk.stub("threads.get", async (args: { threadId: string }) => {
+        if (args.threadId === "thr_1") reads += 1;
+        return originalGet(args);
+      });
+      t.entities.set("uuid-12", issue());
+      await t.ring("linear", "uuid-12");
+      expect(reads).toBe(1);
+      expect(stewardSpawn(t)).toMatchObject({ environment: { type: "reuse", environmentId: "env1" } });
+    });
+  });
+
   it("retries a lost adoption wake: a binding left with no thread is woken as adopted on the next reconcile (BB-92)", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     // Let the startup sweep finish before counting config reads, so the only
