@@ -158,6 +158,24 @@ describe("the Stewards page's decide items and questions (BB-20)", () => {
 
 // BB-29: an approve-pr or merge card links the pull request separately, while
 // the entity key keeps opening the binding's ticket.
+describe("the Stewards page's data commits (BB-91)", () => {
+  it("never starts a view transition of its own, since only the sidebar's rows are named", async () => {
+    const startViewTransition = vi.fn((update: () => void) => {
+      update();
+      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
+    });
+    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
+    try {
+      const slot = await renderBoard([need({ choices: ["Merge"] })], []);
+      await waitFor(() => expect(slot.getByText("Merge")).toBeTruthy());
+      expect(startViewTransition).not.toHaveBeenCalled();
+      slot.lifecycle.unmount();
+    } finally {
+      delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
+    }
+  });
+});
+
 describe("the Stewards page's need links (BB-29)", () => {
   const pr = "https://github.com/bitcomplete/bb-gate/pull/17";
   const ticket = "https://linear.app/bit-complete/issue/BB-28";

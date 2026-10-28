@@ -68,8 +68,34 @@ function ago(at: number | null, now: number): string {
 /** `document.startViewTransition`, where the browser supports it (Chromium). */
 type ViewTransitionDocument = Document & { startViewTransition?: (update: () => void) => unknown };
 
-/** What `load` returns, refetched every half minute while the page is visible, and on demand. */
-function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
+/** `Element.checkVisibility`, where the browser supports it. */
+type CheckVisibilityElement = Element & { checkVisibility?: (options?: { visibilityProperty?: boolean }) => boolean };
+
+/**
+ * Whether `el` is on screen for the user, so a view transition around it is
+ * worth starting (BB-91). The host keeps the sidebar mounted but hidden when
+ * it is closed: on a phone the drawer sits under the page content and is
+ * `inert`, and on desktop the collapsed sidebar is `inert` (rail) or
+ * `visibility: hidden` (offcanvas). A view transition hoists every element
+ * with a `view-transition-name` into the top layer for the crossfade, so one
+ * started while the list is hidden paints its rows over whatever page is
+ * showing. Without `checkVisibility` the element is taken as visible.
+ */
+function onScreen(el: Element | null): boolean {
+  if (el === null || !el.isConnected) return false;
+  if (el.closest("[inert]") !== null) return false;
+  const check = (el as CheckVisibilityElement).checkVisibility;
+  return typeof check === "function" ? check.call(el, { visibilityProperty: true }) : true;
+}
+
+/**
+ * What `load` returns, refetched every half minute while the page is visible,
+ * and on demand. With `animate`, a commit that it approves is wrapped in a view
+ * transition so the browser animates rows moving between sections (BB-91); the
+ * caller passes a check that its animated surface is on screen, since a
+ * transition captures every named element in the document, hidden or not.
+ */
+function usePolled<T>(load: () => Promise<T>, animate?: () => boolean): { data: T | null; error: string | null; loaded: boolean; refetch: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   // True once a load has been on screen for a paint, so the first load's rows
@@ -88,9 +114,10 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
           setError(null);
         };
         // A view transition around the commit lets the browser animate a row
-        // moving between sections; without the API the commit is plain (BB-91).
+        // moving between sections; without the API, or when the caller's
+        // surface is off screen, the commit is plain (BB-91).
         const start = (document as ViewTransitionDocument).startViewTransition;
-        if (typeof start !== "function") return commit();
+        if (typeof start !== "function" || animate === undefined || !animate()) return commit();
         try {
           start.call(document, () => flushSync(commit));
         } catch {
@@ -101,7 +128,7 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
         if (mounted.current && call === latest.current) setError(message(e));
       },
     );
-  }, [load]);
+  }, [load, animate]);
   // A paint after the first successful load, so rows that mount later animate.
   useEffect(() => {
     if (data !== null) setLoaded(true);
@@ -1736,7 +1763,13 @@ function StewardsSidebarCore({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const { status, threads, projects } = experimental_useSidebarThreads();
-  const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", null), [rpc]));
+  // The list's root, so a poll animates only while the list is on screen and
+  // not from under a closed drawer (BB-91).
+  const root = useRef<HTMLDivElement>(null);
+  const { data, error, loaded, refetch } = usePolled(
+    useCallback(() => rpc.call("stewardsSidebar", null), [rpc]),
+    useCallback(() => onScreen(root.current), []),
+  );
   const tabs = useMemo(() => buildSidebar({ projects, threads, data: data?.projects ?? [], now: Date.now() }), [projects, threads, data]);
   const needsByProject = useMemo(() => new Map((data?.projects ?? []).map((p) => [p.projectId, p.needs] as const)), [data]);
   // The picker counts the yellow rows, so the pill and the sections cannot disagree (BB-76).
@@ -1794,7 +1827,7 @@ function StewardsSidebarCore({
       />
     ));
   return (
-    <div className="flex h-full flex-col text-sm">
+    <div ref={root} className="flex h-full flex-col text-sm">
       <ProjectTabs
         tabs={tabs}
         counts={counts}

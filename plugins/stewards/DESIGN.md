@@ -1608,6 +1608,19 @@ effort and follows that project, and clears both when the page unmounts. A
 project pick while the page is mounted moves it. A user who pinned bb's own
 list sees bb's list on the Stewards page rather than the stewards one.
 
+**Row transitions only while the list is on screen (BB-91).** Each effort,
+ended and thread row carries a `view-transition-name`, and the list's poll
+wraps a data commit in `document.startViewTransition` so a row moving between
+sections glides. A view transition hoists every named element in the document
+into the top layer for the crossfade, hidden or not, and the host keeps the
+sidebar mounted when it is closed: on a phone the drawer sits under the page
+content and is `inert`, on desktop the collapsed sidebar is `inert` (rail) or
+`visibility: hidden` (offcanvas). So the poll animates only when the list's
+root is on screen (no `[inert]` ancestor and `checkVisibility` true), and the
+page and overview polls, which have no named rows, never start one. Otherwise
+the sidebar's rows flashed over the Stewards page and thread pages on a phone
+for the length of the crossfade.
+
 **Grouping is the steward relationship, then the thread tree.** A worker
 belongs to its binding through the plugin's `workers` table and a reviewer
 through the worker the RPC names, so the grouping survives a worker spawned

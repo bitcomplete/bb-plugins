@@ -1197,6 +1197,69 @@ describe("the sidebar's row transitions (BB-91)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("commits a data update plainly while the list is inside an inert ancestor, as under a closed mobile drawer", async () => {
+    const startViewTransition = vi.fn((update: () => void) => {
+      update();
+      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
+    });
+    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
+    let calls = 0;
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
+        },
+      } as never,
+    });
+    await waitFor(() => expect(calls).toBe(1));
+    startViewTransition.mockClear();
+    // The host marks the closed drawer `inert` and keeps the list mounted under the page.
+    slot.container.setAttribute("inert", "");
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
+    expect(startViewTransition).not.toHaveBeenCalled();
+    slot.container.removeAttribute("inert");
+    slot.lifecycle.unmount();
+  });
+
+  it("commits a data update plainly while the list is hidden by visibility, as in a collapsed desktop sidebar", async () => {
+    const startViewTransition = vi.fn((update: () => void) => {
+      update();
+      return { finished: Promise.resolve(), ready: Promise.resolve(), updateCallbackDone: Promise.resolve(), skipTransition: () => {} } as unknown as ViewTransition;
+    });
+    (document as unknown as { startViewTransition: unknown }).startViewTransition = startViewTransition;
+    const proto = Element.prototype as unknown as { checkVisibility?: unknown };
+    const had = proto.checkVisibility;
+    let visible = true;
+    proto.checkVisibility = () => visible;
+    try {
+      let calls = 0;
+      const slot = await renderSidebar({
+        sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+        rpc: {
+          stewardsSidebar: () => {
+            calls += 1;
+            return sidebarData({ bindings: [binding({ phase: calls === 1 ? "In Progress" : "In Review" })] });
+          },
+        } as never,
+      });
+      await waitFor(() => expect(calls).toBe(1));
+      startViewTransition.mockClear();
+      visible = false;
+      await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+      await waitFor(() => expect(calls).toBe(2));
+      await waitFor(() => expect(lineTwo(slot, "Fix login")).toContain("In Review"));
+      expect(startViewTransition).not.toHaveBeenCalled();
+      slot.lifecycle.unmount();
+    } finally {
+      if (had === undefined) delete proto.checkVisibility;
+      else proto.checkVisibility = had;
+    }
+  });
+
   it("still commits a data update when the document has no view transition API", async () => {
     expect((document as unknown as { startViewTransition?: unknown }).startViewTransition).toBeUndefined();
     let calls = 0;
