@@ -1712,7 +1712,9 @@ question or need's text and its one-click actions, the same RPC calls the old
 block made. A fixed-choice question answers through
 `stewardsAnswerQuestion { choice }`, a `decide` need through
 `stewardsNeedAction { action: "choose", choice }`; an `approve-pr` row carries
-**Open PR** (`navigate.openUrl` on the item's `url`) and **Approve**
+**Open PR** (records the item's `url` in the plugin's one-shot handoff and
+navigates to the effort's detail view, whose `navigate.openUrl` opens it from
+inside the pane, BB-102) and **Approve**
 (`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
 refusal shown in the row); a `merge` row swaps **Merge** for **Approve** (the
 lane gate re-checked server-side). There is no **Details** button: the row
