@@ -893,7 +893,7 @@ describe("a Linear ticket steward", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id);
-    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "me", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward!);
+    const reported = await t.tool("steward_report", { phase: "Todo", summary: "Spec posted.", nextAction: "Ask the user", actor: "user", ready: { checklist: [1, 2, 3, 4].map((item) => ({ item, met: true })), substantial: true } }, steward!);
     expect(reported.text).toMatch(/requested from the user, on the Stewards page \(need_[\w-]+\): they press Approve or Decline there/u);
     expect(t.sends.filter((s) => s.threadId === project)).toHaveLength(0);
     t.userTurns.push({ threadId: steward!, text: "Approved, go ahead." });
@@ -2388,7 +2388,7 @@ describe("stewards waiting on others", () => {
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
 
-    await t.tool("steward_report", { ...waiting, actor: "me" }, steward);
+    await t.tool("steward_report", { ...waiting, actor: "user" }, steward);
     await t.idle(steward);
     expect(t.threads.get(steward)!.visibility).toBe("visible");
 
@@ -2567,6 +2567,57 @@ describe("stewards waiting on others", () => {
     expect(gone).toMatch(/Worker thr_w1 asked:\*\* Done\. Should I open the follow-up ticket\?/u);
     expect(gone).toMatch(/Its thread is gone/u);
     expect(gone).toMatch(/start a fresh worker/u);
+  });
+});
+
+describe("the status report actor (BB-97)", () => {
+  async function bound() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward };
+  }
+  const status = (t: Awaited<ReturnType<typeof bound>>) => t.hooks.store.find("ENG-12")!.status;
+  const needsUser = async (t: Awaited<ReturnType<typeof bound>>) => {
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", null)) as { projects: Array<{ bindings: Array<{ key: string; needsUser: boolean }> }> };
+    return sidebar.projects[0]!.bindings.find((b) => b.key === "ENG-12")!.needsUser;
+  };
+
+  it("records `user` as the server's owner, so the row needs you; `steward` and `other` do not", async () => {
+    const t = await bound();
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait for the worker", actor: "steward" }, t.steward);
+    expect(status(t)!.actor).toBe("steward");
+    expect(await needsUser(t)).toBe(false);
+
+    await t.tool("steward_report", { phase: "In Progress", summary: "Building.", nextAction: "Wait", actor: "other" }, t.steward);
+    expect(status(t)!.actor).toBe("other");
+    expect(await needsUser(t)).toBe(false);
+
+    await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", blockedOn: "a bb-gate deployment" }, t.steward);
+    expect(status(t)!.actor).toBe("user");
+    expect(await needsUser(t)).toBe(true);
+  });
+
+  it("accepts `me` for one release: stored as `user`, needs you, and one log line", async () => {
+    const t = await bound();
+    const before = t.harness.logEntries.length;
+    const report = await t.tool("steward_report", { phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me" }, t.steward);
+    expect(report.error).toBe(false);
+    expect(status(t)!.actor).toBe("user");
+    expect(await needsUser(t)).toBe(true);
+    expect(t.harness.logEntries.slice(before).filter((entry) => entry.message.includes('actor "me" is renamed to "user"'))).toHaveLength(1);
+  });
+
+  it("describes `user` as the server's owner and `steward` as the steward's own next step (BB-95)", async () => {
+    const t = await bound();
+    const config = await t.harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({ thread: { id: t.steward, title: null, parentThreadId: null, sourceThreadId: null } }));
+    const report = config.tools.find((x) => x.name === "steward_report")!;
+    const description = (report.inputSchema as { properties: { actor: { description: string } } }).properties.actor.description;
+    expect(description).toMatch(/`user` means the server's owner has to act/u);
+    expect(description).toMatch(/`steward` is you/u);
+    expect(description).toMatch(/next deployment wake/u);
+    expect(description).toMatch(/BB-95/u);
   });
 });
 
@@ -3264,7 +3315,7 @@ describe("questions to the user", () => {
       t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
       await t.ring("linear", "uuid-12");
       expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/Do not ask the user again; it is listed on the Stewards page/u);
-      const bad = await t.tool("steward_report", { ...base, nextAction: "Ask the user to approve the spec", actor: "me", ready: met }, t.steward);
+      const bad = await t.tool("steward_report", { ...base, nextAction: "Ask the user to approve the spec", actor: "user", ready: met }, t.steward);
       expect(bad.text).toMatch(/playbook violation/u);
       expect((await t.harness.behavior.runCli(["show", "ENG-12"])).stdout).toMatch(/asks for an approval that is already open/u);
     });
@@ -3815,7 +3866,7 @@ describe("needs you items", () => {
     const b = t.binding();
     const report = await t.tool(
       "steward_report",
-      { ...base, actor: "me", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub" }] },
+      { ...base, actor: "user", needs: [{ kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub" }] },
       t.steward,
     );
     expect(report.error).toBe(false);
@@ -3830,7 +3881,7 @@ describe("needs you items", () => {
     const b = t.binding();
     const report = await t.tool(
       "steward_report",
-      { ...base, actor: "me", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] },
+      { ...base, actor: "user", needs: [{ kind: "merge", url: "https://github.com/acme/web/pull/7", what: "Merge acme/web#7" }] },
       t.steward,
     );
     expect(report.error).toBe(false);
@@ -4017,7 +4068,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", escalate: { kind: "decision", question: "Provide API_TOKEN.", meanwhile: "Wait." } }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", escalate: { kind: "decision", question: "Provide API_TOKEN.", meanwhile: "Wait." } }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "decision")!;
     const out = await t.tool("steward_update", { binding: "ENG-12", forward: esc.id, resolution: "secret", variable: "API_TOKEN", purpose: "deploys" }, t.spawns[0]!.id);
@@ -4054,7 +4105,7 @@ describe("needs you items", () => {
     // A forward to the user without a resolution is refused too (the test shim
     // injects one elsewhere, so this calls the tool directly).
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
     const esc = t.hooks.store.openEscalations(t.hooks.store.find("ENG-12")!.id).find((x) => x.kind === "decision")!;
     const forward = (await t.harness.behavior.callAgentTool("steward_update", { binding: "ENG-12", forward: esc.id }, { threadId: project, projectId: "p1" })) as { isError?: boolean };
     expect(forward.isError).toBe(true);
@@ -4111,7 +4162,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "LINEAR_CLIENT_SECRET", variable: "LINEAR_CLIENT_SECRET", purpose: "Token exchange", worker: "thr_w1" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     const spawned = t.spawns.length;
@@ -4146,7 +4197,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "SOME_TOKEN", variable: "SOME_TOKEN", purpose: "Auth" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "SOME_TOKEN", variable: "SOME_TOKEN", purpose: "Auth" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
@@ -4160,13 +4211,13 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    const bad = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Bad", variable: "X", purpose: "Y", setting: "paused" }] }, steward);
+    const bad = await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "Bad", variable: "X", purpose: "Y", setting: "paused" }] }, steward);
     expect(bad.error).toBe(false);
     expect(bad.text).toMatch(/is not a secret setting/u);
-    const missing = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "No variable" }] }, steward);
+    const missing = await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "No variable" }] }, steward);
     expect(missing.error).toBe(false);
     expect(missing.text).toMatch(/name the env var with `variable`/u);
-    const good = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Good", variable: "SENTRY_TOKEN", purpose: "Y", setting: "sentryToken" }] }, steward);
+    const good = await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "Good", variable: "SENTRY_TOKEN", purpose: "Y", setting: "sentryToken" }] }, steward);
     expect(good.error).toBe(false);
     const b = t.hooks.store.find("ENG-12")!;
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.data.setting === "sentryToken")).toBe(true);
@@ -4178,7 +4229,7 @@ describe("needs you items", () => {
     await t.ring("linear", "uuid-12");
     t.harness.sdk.stub("threads.storageLocation", async ({ threadId }: { threadId: string }) => ({ hostId: "host_off", storageRootPath: `/storage/${threadId}` }));
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth", worker: "thr_w1" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth", worker: "thr_w1" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client);
@@ -4190,7 +4241,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "X", variable: "X", purpose: "Auth" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     const first = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { threadId: string };
@@ -4206,7 +4257,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
@@ -4235,7 +4286,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "provide-secret", what: "Enter the Sentry token", variable: "SENTRY_TOKEN", purpose: "Read Sentry", setting: "sentryToken" }] }, steward);
     const b = t.hooks.store.find("ENG-12")!;
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "provide-secret")!;
     const res = (await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "provide" }, client)) as { ok: boolean; threadId: string };
@@ -4278,10 +4329,10 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    const bad = await t.tool("steward_report", { ...base, actor: "me", blockedOn: "the user's answer" }, steward);
+    const bad = await t.tool("steward_report", { ...base, actor: "user", blockedOn: "the user's answer" }, steward);
     expect(bad.error).toBe(true);
     expect(bad.text).toMatch(/File it as a needs item/u);
-    const ok = await t.tool("steward_report", { ...base, actor: "me", blockedOn: "the user's answer", needs: [{ kind: "decide", what: "Answer the scope question", url: "https://linear.app/acme/issue/ENG-12" }] }, steward);
+    const ok = await t.tool("steward_report", { ...base, actor: "user", blockedOn: "the user's answer", needs: [{ kind: "decide", what: "Answer the scope question", url: "https://linear.app/acme/issue/ENG-12" }] }, steward);
     expect(ok.error).toBe(false);
   });
 
@@ -4307,7 +4358,7 @@ describe("needs you items", () => {
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret" }] }, steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret" }] }, steward);
     await t.hooks.nightlyPass("p1", "manual");
     await t.flush();
     const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
@@ -4328,7 +4379,7 @@ describe("needs you items", () => {
       "steward_report",
       {
         ...base,
-        actor: "me",
+        actor: "user",
         ready: met,
         needs: [
           { kind: "configure", url: "https://linear.app/settings/api", what: "Add the client secret", how: "Settings → API" },
@@ -4657,7 +4708,7 @@ describe("fixed choices on decide items and questions", () => {
     const t = await adopted();
     const reported = await t.tool(
       "steward_report",
-      { ...base, actor: "me", needs: [{ kind: "decide", what: "Merge, close, or verify the workflow first?", choices: ["Merge", "Close", "Verify first"] }] },
+      { ...base, actor: "user", needs: [{ kind: "decide", what: "Merge, close, or verify the workflow first?", choices: ["Merge", "Close", "Verify first"] }] },
       t.steward,
     );
     expect(reported.error).toBe(false);
@@ -4715,7 +4766,7 @@ describe("fixed choices on decide items and questions", () => {
 
   it("criterion 4: bb stewards done --choice records a choice for a need and a question, and refuses a label not among them", async () => {
     const t = await adopted();
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
     const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
     const refused = await t.harness.behavior.runCli(["done", need.id, "--choice", "Ship it", "--project", "p1"]);
     expect(refused).toMatchObject({ exitCode: 1, stderr: expect.stringMatching(/not one of .* choices: Merge, Close/u) });
@@ -4739,7 +4790,7 @@ describe("fixed choices on decide items and questions", () => {
 
   it("criterion 5: needs, show and the digest print the choices", async () => {
     const t = await adopted();
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", url: "https://linear.app/acme/issue/ENG-12", what: "Merge or close?", choices: ["Merge", "Close"] }] }, t.steward);
     expect((await t.harness.behavior.runCli(["needs", "--project", "p1"])).stdout).toMatch(/Merge or close\? \[choices: Merge, Close\]/u);
     expect((await t.harness.behavior.runCli(["show", "ENG-12", "--project", "p1"])).stdout).toMatch(/Escalation esc_\S+ decision \(open, me\): Merge or close\? \[choices: Merge, Close\]/u);
     await t.hooks.nightlyPass("p1", "manual");
@@ -4751,9 +4802,9 @@ describe("fixed choices on decide items and questions", () => {
 
   it("rejects choices outside two to six labels", async () => {
     const t = await adopted();
-    await expect(t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "One option?", choices: ["Only"] }] }, t.steward)).rejects.toThrow(/expected array to have >=2/u);
-    await expect(t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Too many?", choices: ["a", "b", "c", "d", "e", "f", "g"] }] }, t.steward)).rejects.toThrow(/expected array to have <=6/u);
-    const wrongKind = await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "configure", what: "Set it", choices: ["Yes", "No"] }] }, t.steward);
+    await expect(t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", what: "One option?", choices: ["Only"] }] }, t.steward)).rejects.toThrow(/expected array to have >=2/u);
+    await expect(t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", what: "Too many?", choices: ["a", "b", "c", "d", "e", "f", "g"] }] }, t.steward)).rejects.toThrow(/expected array to have <=6/u);
+    const wrongKind = await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "configure", what: "Set it", choices: ["Yes", "No"] }] }, t.steward);
     expect(wrongKind.error).toBe(false);
     expect(wrongKind.text).toMatch(/choices are for a decide item/u);
     expect(t.hooks.store.openNeeds(t.binding().id).some((n) => n.kind === "configure")).toBe(false);
@@ -4766,7 +4817,7 @@ describe("fixed choices on decide items and questions", () => {
 
   it("bb stewards done --note without --choice keeps the note as the answer and guidance", async () => {
     const t = await adopted();
-    await t.tool("steward_report", { ...base, actor: "me", needs: [{ kind: "decide", what: "Which way?" }] }, t.steward);
+    await t.tool("steward_report", { ...base, actor: "user", needs: [{ kind: "decide", what: "Which way?" }] }, t.steward);
     const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "decide")!;
     const out = await t.harness.behavior.runCli(["done", need.id, "--note", "The second way", "--project", "p1"]);
     expect(out).toMatchObject({ exitCode: 0, stdout: expect.stringMatching(/Closed/u) });
@@ -6955,7 +7006,7 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
 
     // The user is next: left unread.
     const before = marks().length;
-    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "me" }, steward);
+    await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "You decide", actor: "user" }, steward);
     expect(marks()).toHaveLength(before);
 
     // An escalation is open: left unread.

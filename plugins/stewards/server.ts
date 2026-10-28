@@ -1509,7 +1509,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     function needsUser(b: Binding): boolean {
       return (
-        b.status?.actor === "me" ||
+        b.status?.actor === "user" ||
         store.openEscalations(b.id).length > 0 ||
         store.openNeeds(b.id).length > 0 ||
         store.openQuestions(b.projectId).some((q) => q.bindingId === b.id)
@@ -5440,7 +5440,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         phase: z.string().trim().min(1).max(100).describe("The entity's phase as you understand it, usually its state."),
         summary: z.string().trim().min(1).max(600).describe("Where the entity is, in a sentence."),
         nextAction: z.string().trim().min(1).max(600).describe("What happens next."),
-        actor: z.enum(ACTORS).describe("Who does the next action: me (the user), steward (you or your workers), other (someone else)."),
+        actor: z.enum([...ACTORS, "me"]).describe("Who does the next action. `user` means the server's owner has to act — a decision, a credential, a step outside the repos — and leaves the row needing them (unread and ringing). `steward` is you: your own next step, including re-checking on the next deployment wake, is `steward`, not `user`. On BB-95 a steward filed \"On the next deployment wake, re-run the carries check and report deployed or not-yet\" as `me` and the row wrongly read \"needs you\"; that next step is `steward`. `other` is someone else."),
         blockedOn: z.string().trim().max(300).optional().describe("Who or what outside this thread it waits for."),
         requeueAfter: durationSchema.optional().describe('When to wake you if nothing else does, such as "4h" or "2d". The playbook\'s default when left out.'),
         conditions: z.array(z.string().trim().min(1).max(200)).max(10).optional().describe("Anything else a reader of the status should know at a glance."),
@@ -5535,6 +5535,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }),
       execute: store.coalescingTool(async (input, { threadId }) => {
         try {
+          // BB-97: `me` is the old name for `user`. Accept it for one release
+          // so a steward whose prompt predates the rename is not wedged: it is
+          // normalised here and the stored value is always `user`.
+          const actor: (typeof ACTORS)[number] = input.actor === "me" ? "user" : input.actor;
+          if (input.actor === "me") bb.log.info(`stewards: steward_report actor "me" is renamed to "user"; recording this report as user (thread ${threadId}).`);
           let b = ownBinding(threadId);
           // Validate the input that does not depend on which pull request the
           // binding is on before a replacement moves it: a wrap-up report that
@@ -5655,7 +5660,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             phase: input.phase,
             summary: input.summary,
             nextAction: input.nextAction,
-            actor: input.actor,
+            actor,
             blockedOn: input.blockedOn ?? null,
             requeueAfterMs: requeueMs,
             conditions: [...(input.conditions ?? []), ...open.map((x) => `${x.kind} escalation with ${x.route}`)],

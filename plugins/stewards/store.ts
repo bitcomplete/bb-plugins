@@ -455,7 +455,21 @@ export const APPROVAL_MARKER_MIGRATIONS = [
   `ALTER TABLE project_approvals ADD COLUMN verdict TEXT NOT NULL DEFAULT 'approved'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS];
+// BB-97: the status report's actor `me` is renamed `user`, so all three values
+// name a party rather than a pronoun. A stored row keeps its meaning: this
+// rewrites `status.actor` from `me` to `user` in place, leaving every other
+// field alone. It is idempotent (a second run matches nothing) and guarded with
+// `json_valid`/`CASE`, so a malformed status is left untouched rather than
+// making the whole migration throw. The previous build parsed `status` with
+// `z.enum(["me", "steward", "other"])`, so a migrated `user` row reads back as
+// no status there (null), never as an error.
+export const ACTOR_MIGRATIONS = [
+  `UPDATE bindings
+      SET status = json_set(status, '$.actor', 'user')
+    WHERE CASE WHEN json_valid(status) THEN json_extract(status, '$.actor') END = 'me'`,
+];
+
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -480,7 +494,7 @@ export const readyStateSchema = z.object({
 });
 export type ReadyState = z.infer<typeof readyStateSchema>;
 
-export const ACTORS = ["me", "steward", "other"] as const;
+export const ACTORS = ["user", "steward", "other"] as const;
 
 export const statusRecordSchema = z.object({
   phase: z.string(),
@@ -1350,7 +1364,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
    */
   function needsUserFor(b: Binding): boolean {
     return (
-      b.status?.actor === "me" ||
+      b.status?.actor === "user" ||
       openEscalations.all(b.id).length > 0 ||
       needsFor.all(b.id, 0).length > 0 ||
       openQuestions.all(b.projectId).some((q) => q.binding_id === b.id)

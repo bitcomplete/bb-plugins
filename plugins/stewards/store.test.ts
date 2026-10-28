@@ -1,6 +1,10 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope } from "./store.js";
+import { z } from "zod";
+import { ACTOR_MIGRATIONS, APPROVAL_MARKER_MIGRATIONS, BASE_MIGRATIONS, CHAIN_MIGRATIONS, GUIDANCE_MIGRATIONS, IDLE_MIGRATIONS, LESSON_COUNTER_MIGRATIONS, LESSON_TIER_MIGRATIONS, MIGRATIONS, RATIONALE_MIGRATIONS, VALIDATION_MIGRATIONS, WORKER_CHECK_MIGRATIONS, createStore, lessonScope, statusRecordSchema } from "./store.js";
+
+/** MIGRATIONS without the groups appended after the ones these order tests assert. */
+const beforeActorMigrations = MIGRATIONS.slice(0, MIGRATIONS.length - ACTOR_MIGRATIONS.length);
 
 function store() {
   const db = new Database(":memory:");
@@ -311,14 +315,88 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
     // `bb.storage.migrate` records each statement by index and refuses a changed
     // one; a group spliced in mid-array would fail every live database on load.
     // BB-35 step 4 appended the rationale group, step 5 the validation group,
-    // step 6 the guidance group, BB-83 the idle group, and BB-77 the approval
-    // marker group, after this one.
-    expect(MIGRATIONS.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
+    // step 6 the guidance group, BB-83 the idle group, BB-77 the approval
+    // marker group, and BB-97 the actor rename group, after this one. The
+    // slices stop at the actor group so this test still checks its own order.
+    expect(beforeActorMigrations.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
     const afterTier = APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length + RATIONALE_MIGRATIONS.length;
-    expect(MIGRATIONS.slice(-(afterTier + LESSON_TIER_MIGRATIONS.length), -afterTier)).toEqual([...LESSON_TIER_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(afterTier + LESSON_TIER_MIGRATIONS.length), -afterTier)).toEqual([...LESSON_TIER_MIGRATIONS]);
+  });
+});
+
+describe("the actor rename migration (BB-97)", () => {
+  // The pre-rename build parsed `status` with this schema through the same
+  // `json()` helper (a safeParse inside try/catch, falling back to null). A
+  // migrated `user` row must read back as no status there, never throw.
+  const preRenameStatusSchema = statusRecordSchema.extend({ actor: z.enum(["me", "steward", "other"]) });
+  const readAsOldBuild = (raw: string | null) => {
+    if (raw === null) return null;
+    try {
+      const parsed = preRenameStatusSchema.safeParse(JSON.parse(raw));
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** A database as the pre-rename build left it, with the actor migration not yet applied. */
+  const legacy = () => {
+    const db = new Database(":memory:");
+    for (const sql of MIGRATIONS.slice(0, MIGRATIONS.indexOf(ACTOR_MIGRATIONS[0]!))) db.exec(sql);
+    return db;
+  };
+  const insert = (db: ReturnType<typeof legacy>, id: string, key: string, status: string | null) =>
+    db.prepare(`INSERT INTO bindings (id, project_id, source, entity_id, entity_key, kind, playbook, playbook_version, status, created_at)
+                VALUES (?, 'p1', 'linear', ?, ?, 'ticket', 'linear-tickets', 'v1', ?, 1000)`).run(id, `uuid-${id}`, key, status);
+  const actor = (s: ReturnType<typeof createStore>, key: string) => s.find(key, "p1")!.status!.actor;
+
+  it("rewrites `me` to `user` in the stored status, leaving the rest of the record alone", () => {
+    const db = legacy();
+    insert(db, "bnd_1", "ENG-12", JSON.stringify({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "me", blockedOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 }));
+    for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 2_000);
+    expect(s.find("ENG-12", "p1")!.status).toEqual({ phase: "In Review", summary: "Waiting.", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", blockedOn: "a bb-gate deployment", requeueAfterMs: null, conditions: ["a condition"], resources: { workers: ["thr_w1"], pullRequests: [], children: [] }, at: 1_000 });
+  });
+
+  it("is idempotent, and leaves `steward` and `other` untouched", () => {
+    const db = legacy();
+    insert(db, "bnd_me", "ENG-12", JSON.stringify({ phase: "x", summary: "y", nextAction: "z", actor: "me", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 }));
+    insert(db, "bnd_steward", "ENG-13", JSON.stringify({ phase: "x", summary: "y", nextAction: "z", actor: "steward", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 2 }));
+    insert(db, "bnd_other", "ENG-14", JSON.stringify({ phase: "x", summary: "y", nextAction: "z", actor: "other", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 3 }));
+    for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
+    // A second run matches nothing and changes nothing.
+    for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
+    const s = createStore(db, () => 2_000);
+    expect(actor(s, "ENG-12")).toBe("user");
+    expect(actor(s, "ENG-13")).toBe("steward");
+    expect(actor(s, "ENG-14")).toBe("other");
+  });
+
+  it("a pre-rename build reads a migrated row as no status, never throwing (rollback)", () => {
+    const db = legacy();
+    insert(db, "bnd_1", "ENG-12", JSON.stringify({ phase: "x", summary: "y", nextAction: "z", actor: "me", blockedOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at: 1 }));
+    for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
+    const raw = (db.prepare("SELECT status FROM bindings WHERE id = 'bnd_1'").get() as { status: string }).status;
+    expect(JSON.parse(raw).actor).toBe("user");
+    expect(() => readAsOldBuild(raw)).not.toThrow();
+    expect(readAsOldBuild(raw)).toBeNull();
+  });
+
+  it("leaves a malformed status alone rather than making the migration throw", () => {
+    const db = legacy();
+    insert(db, "bnd_1", "ENG-12", "not json");
+    expect(() => {
+      for (const sql of ACTOR_MIGRATIONS) db.exec(sql);
+    }).not.toThrow();
+    expect((db.prepare("SELECT status FROM bindings WHERE id = 'bnd_1'").get() as { status: string }).status).toBe("not json");
+  });
+
+  it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
+    expect(MIGRATIONS.slice(-ACTOR_MIGRATIONS.length)).toEqual([...ACTOR_MIGRATIONS]);
+    expect(MIGRATIONS.slice(-(ACTOR_MIGRATIONS.length + APPROVAL_MARKER_MIGRATIONS.length), -ACTOR_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
   });
 });
 
@@ -504,10 +582,10 @@ describe("the guidance-citation migration (BB-35 step 6)", () => {
   });
 
   it("is appended at the end of MIGRATIONS, so a shipped statement index is never reused", () => {
-    expect(MIGRATIONS.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
-    expect(MIGRATIONS.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...APPROVAL_MARKER_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length), -APPROVAL_MARKER_MIGRATIONS.length)).toEqual([...IDLE_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length))).toEqual([...GUIDANCE_MIGRATIONS]);
+    expect(beforeActorMigrations.slice(-(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length + VALIDATION_MIGRATIONS.length), -(APPROVAL_MARKER_MIGRATIONS.length + IDLE_MIGRATIONS.length + GUIDANCE_MIGRATIONS.length))).toEqual([...VALIDATION_MIGRATIONS]);
   });
 });
 

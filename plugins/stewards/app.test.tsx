@@ -704,6 +704,16 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("labels the `user` actor as you in an effort's status (BB-97)", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, phase: "In Review", summary: "In review", nextAction: "On the next deployment wake, re-run the carries check", actor: "user", statusAt: 1_000, createdAt: 2_000, stage: "build" })],
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(slot.getByText(/Next: On the next deployment wake, re-run the carries check \(you\)/u)).toBeTruthy();
+    slot.lifecycle.unmount();
+  });
+
   it("keeps the page-only controls on the detail's needs-you items: the secret form and the approve-spec note", async () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",
