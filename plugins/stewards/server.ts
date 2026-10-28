@@ -6249,8 +6249,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // BB-109: `blockedOn` is the old name for `waitingOn`. Accept it for
           // one release so a steward whose prompt predates the rename still
           // reports cleanly; `waitingOn` wins when both are given, and only the
-          // new name is stored.
-          const waitingOn = input.waitingOn ?? input.blockedOn ?? null;
+          // new name is stored. An empty string is no wait, so it stores null
+          // rather than rendering a bare "Waiting on ".
+          const rawWaitingOn = input.waitingOn ?? input.blockedOn ?? null;
+          const waitingOn = rawWaitingOn === "" ? null : rawWaitingOn;
           if (input.blockedOn !== undefined && input.waitingOn === undefined) bb.log.info(`stewards: steward_report blockedOn is renamed to waitingOn; recording this report's wait (thread ${threadId}).`);
           // A status that waits on the user, the owner or a human has to say so
           // with an item, not only in prose: the item is what reaches the page.

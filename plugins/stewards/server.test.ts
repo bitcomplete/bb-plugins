@@ -4736,6 +4736,10 @@ describe("needs you items", () => {
     const both = await t.tool("steward_report", { ...base, actor: "other", blockedOn: "the old name", waitingOn: "the new name" }, steward);
     expect(both.error).toBe(false);
     expect(t.hooks.store.find("ENG-12", "p1")!.status!.waitingOn).toBe("the new name");
+    // An empty wait is no wait: it stores null, not a bare "Waiting on ".
+    const empty = await t.tool("steward_report", { ...base, actor: "other", waitingOn: "" }, steward);
+    expect(empty.error).toBe(false);
+    expect(t.hooks.store.find("ENG-12", "p1")!.status!.waitingOn).toBeNull();
   });
 
   it("shows the items on the board with their actionability", async () => {

@@ -381,8 +381,9 @@ describe("the lesson tier migration (BB-35 step 3)", () => {
 describe("the actor rename migration (BB-97)", () => {
   // The pre-rename build parsed `status` with this schema through the same
   // `json()` helper (a safeParse inside try/catch, falling back to null). A
-  // migrated `user` row must read back as no status there, never throw.
-  const preRenameStatusSchema = statusRecordSchema.extend({ actor: z.enum(["me", "steward", "other"]) });
+  // migrated `user` row must read back as no status there, never throw. It has
+  // the old `blockedOn` key and no `waitingOn`, as the pre-BB-109 build did.
+  const preRenameStatusSchema = statusRecordSchema.omit({ waitingOn: true }).extend({ actor: z.enum(["me", "steward", "other"]), blockedOn: z.string().nullable() });
   const readAsOldBuild = (raw: string | null) => {
     if (raw === null) return null;
     try {
