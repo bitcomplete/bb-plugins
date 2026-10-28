@@ -340,21 +340,30 @@ corrections, 14 days) or retires it (30 days uncited, or a correction); a
 promoted lesson is retired at 90 days uncited or 2 corrections. The
 thresholds, caps and decay half-life live under `lessons` in
 `stewards/project.json`. A `procedure` lesson is promoted mechanically; a
-`boundary` one is not — the pass files the user's Merge/Drop item and the
-lesson stays `trial` until they Merge. Two rare validation escalations exist,
-capped at `lessons.validations.perWeek` (default 1) per rolling week and
-ordered by score: the boundary Merge/Drop, and one Keep/Retire question for a
-promoted lesson with mixed evidence (citations and a correction short of the
-retire count). Silence has a default: an unanswered boundary item leaves the
-lesson in trial, while an unanswered Keep/Retire retires it on the next
-nightly pass; a Keep is remembered, so it is never asked again. When the pass queues a promotion or a retirement
+`boundary` one is not — the pass files the owner's Review PR/Drop item and the
+lesson stays `trial` until the pull request merges. Two rare validation
+escalations exist, capped at `lessons.validations.perWeek` (default 1) per
+rolling week and ordered by score: the boundary Review PR/Drop, and one
+Keep/Retire question for a promoted lesson with mixed evidence (citations and
+a correction short of the retire count). Silence has a default: an unanswered
+boundary item leaves the lesson in trial, while an unanswered Keep/Retire
+retires it on the next nightly pass; a Keep is remembered, so it is never
+asked again. When the pass queues a promotion or a retirement
 your wake lists it under `## Lessons to land` or `## Lessons to retire`:
 add or replace the anchored block (`<!-- lesson:<id> -->`) in the named
-file, commit, publish with `workspace_publish_guidance`, then
+file, publish with `workspace_publish_guidance`, then
 `steward_update { lessonAction: { id, action: "complete" } }` or `retire`.
-A lesson may never target `stewards/project.json`, so it cannot widen the
-decide list, loosen the pull-request gate or relax an approval; a boundary
-lesson still goes to the user as Merge/Drop. Every wake lists the questions still open: list them from
+Because `.bb` is a directory on the primary repo's default branch, a lesson
+lands as a pull request, never a fast-forward: the plugin opens one PR per
+lesson (or per publish when several lessons touch the same file) on the
+primary repo, naming the lesson id, the anchor and you as the proposing
+steward. A `procedure` lesson's PR is squash-merged by the project steward at
+once, with no person asked; a `boundary` lesson's PR waits for the owner to
+merge it, and a project-steward approval never counts for it. A lesson may
+never target `stewards/project.json` or `stewards/roles.json`, so it cannot
+widen the decide list, loosen the pull-request gate, relax an approval or
+change who is a steward; a boundary lesson still goes to the owner as
+Review PR/Drop. Every wake lists the questions still open: list them from
 there, never from
 memory, and do not ask one again. At the end of each nightly pass your reply is
 kept as the morning digest; the wake carries the record to write it from

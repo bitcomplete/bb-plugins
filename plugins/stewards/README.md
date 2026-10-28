@@ -308,20 +308,26 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   one at 90 days uncited or 2 corrections). The thresholds, caps and decay
   half-life are under `lessons` in `stewards/project.json`; the design's
   defaults apply when the key is absent. Only a `procedure` lesson is promoted
-  mechanically; a `boundary` one stays `trial` until you Merge it, and two
-  rare validation escalations are capped at `lessons.validations.perWeek`
-  (default 1) per week, ordered by score: the boundary Merge/Drop, and one
-  Keep/Retire question when a promoted lesson has citations and a correction
-  short of the retire count. Silence leaves a boundary lesson in trial and
-  retires a mixed-evidence one on the next nightly pass; a Keep is remembered.
+  mechanically; a `boundary` one stays `trial` until its pull request merges,
+  and two rare validation escalations are capped at
+  `lessons.validations.perWeek` (default 1) per week, ordered by score: the
+  boundary Review PR/Drop, and one Keep/Retire question when a promoted lesson
+  has citations and a correction short of the retire count. Silence leaves a
+  boundary lesson in trial and retires a mixed-evidence one on the next nightly
+  pass; a Keep is remembered.
   Trial lessons are injected into
-  wakes under `## Lessons (trial)`; only promoted ones reach `.bb`, with a
-  `<!-- lesson:<id> -->` anchor, and only that lesson's own file (multi-repo
-  fast-forwards the canonical `.bb`). A `boundary` lesson — credentials and
-  reach, who may direct a server, irreversible production steps — is filed on
-  the Stewards page with **Merge** and **Drop**, and only you merge it; a
-  lesson can never target `stewards/project.json`, so it cannot move a big
-  decision to the project, loosen the pull-request gate or relax an approval.
+  wakes under `## Lessons (trial)`; only promoted ones reach the primary
+  repo, with a `<!-- lesson:<id> -->` anchor, and only that lesson's own file.
+  Because `.bb` is a directory on the primary repo's default branch (BB-106),
+  a lesson lands as a pull request, never a fast-forward: the plugin opens one
+  PR per lesson (or per publish when several touch the same file). A
+  `procedure` lesson's PR is merged by the project steward at once; a
+  `boundary` lesson — credentials and reach, who may direct a server,
+  irreversible production steps — is filed on the Stewards page with
+  **Review PR** and **Drop**, and only you merge the PR (a project-steward
+  approval never counts). A lesson can never target `stewards/project.json` or
+  `stewards/roles.json`, so it cannot move a big decision to the project,
+  loosen the pull-request gate, relax an approval or change who is a steward.
   A user's answer to a forwarded escalation on the Stewards page (or from a
   thread) wakes the project steward with that answer as a lesson candidate: if
   it is a general judgement the playbook should carry, the project steward

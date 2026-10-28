@@ -53,14 +53,20 @@ export interface GithubWriter {
    * hand-typed lookalike never satisfies the lane gate.
    */
   comment(repo: string, number: number, body: string): Promise<string>;
-  /** Squash-merge the pull request, with the given commit title and message. */
-  squashMerge(repo: string, number: number, title: string, body: string): Promise<void>;
+  /** Squash-merge the pull request, with the given commit title and message; returns the merge commit sha when GitHub reports one. */
+  squashMerge(repo: string, number: number, title: string, body: string): Promise<{ sha: string | null }>;
   /**
    * The repo-relative paths a pull request changes, for the decide list. When
    * absent, or when the read fails, the plugin cannot classify the pull
    * request and treats it as the user's (fail closed).
    */
   files?(repo: string, number: number): Promise<string[]>;
+  /** A repository's default branch, for the base of a lesson's pull request (BB-108). */
+  defaultBranch(repo: string): Promise<string | null>;
+  /** Open a pull request and return its URL and number (BB-108). */
+  createPull(repo: string, args: { head: string; base: string; title: string; body: string }): Promise<{ url: string; number: number }>;
+  /** Close a pull request without merging it (BB-108 Drop). */
+  closePull(repo: string, number: number): Promise<void>;
 }
 
 /** "owner/repo#12" or "https://github.com/owner/repo/pull/12" → { repo, number }. */
@@ -100,13 +106,30 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       return String(nodeId);
     },
     async squashMerge(repo, number, title, body) {
-      await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });
+      const response = await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });
+      const merged = (await response.json().catch(() => null)) as { sha?: unknown } | null;
+      const sha = merged?.sha;
+      return { sha: typeof sha === "string" && sha !== "" ? sha : null };
     },
     async files(repo, number) {
       const response = await request("GET", `/repos/${repo}/pulls/${number}/files?per_page=100`, undefined);
       const body = (await response.json().catch(() => null)) as unknown;
       if (!Array.isArray(body)) return [];
       return body.map((f) => (f !== null && typeof f === "object" && "filename" in f ? String((f as { filename: unknown }).filename) : "")).filter((f) => f !== "");
+    },
+    async defaultBranch(repo) {
+      const response = await request("GET", `/repos/${repo}`, undefined);
+      const body = (await response.json().catch(() => null)) as { default_branch?: unknown } | null;
+      return typeof body?.default_branch === "string" && body.default_branch !== "" ? body.default_branch : null;
+    },
+    async createPull(repo, args) {
+      const response = await request("POST", `/repos/${repo}/pulls`, { head: args.head, base: args.base, title: args.title, body: args.body });
+      const body = (await response.json().catch(() => null)) as { html_url?: unknown; number?: unknown } | null;
+      if (typeof body?.html_url !== "string" || typeof body.number !== "number") throw new GithubApiError("GitHub created the pull request but returned no URL or number.");
+      return { url: body.html_url, number: body.number };
+    },
+    async closePull(repo, number) {
+      await request("PATCH", `/repos/${repo}/pulls/${number}`, { state: "closed" });
     },
   };
 }
