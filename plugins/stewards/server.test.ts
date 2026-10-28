@@ -2593,8 +2593,8 @@ describe("the status report actor (BB-97)", () => {
   }
   const status = (t: Awaited<ReturnType<typeof bound>>) => t.hooks.store.find("ENG-12")!.status;
   const needsUser = async (t: Awaited<ReturnType<typeof bound>>) => {
-    const sidebar = (await t.harness.callRpc("stewardsSidebar", null)) as { projects: Array<{ bindings: Array<{ key: string; needsUser: boolean }> }> };
-    return sidebar.projects[0]!.bindings.find((b) => b.key === "ENG-12")!.needsUser;
+    const sidebar = (await t.harness.callRpc("stewardsSidebar", { projectId: "p1" })) as { bindings: Array<{ key: string; needsUser: boolean }> };
+    return sidebar.bindings.find((b) => b.key === "ENG-12")!.needsUser;
   };
 
   it("records `user` as the server's owner, so the row needs you; `steward` and `other` do not", async () => {
