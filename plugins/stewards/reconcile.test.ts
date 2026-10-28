@@ -562,6 +562,27 @@ describe("the pull request gate (build-tickets)", () => {
     const signed = pull({ comments: [marker(head, "approved", "owner-reviewed"), comment({ author: "jane", body: "LGTM", signedBy: "thr_w" })] }, green);
     expect(ownerApproval(signed).approved).toBe(false);
   });
+
+  it("never reads an unsigned bb-review marker comment as the owner's approval (BB-110)", () => {
+    // The reviewer posts as the connected user; when it leaves its signature
+    // off, the marker still makes the comment a thread's, not the owner's.
+    const unsignedMarker = (body: string) => comment({ id: "rev", author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+    const marked = pull({ comments: [marker(head, "approved", "owner-reviewed"), unsignedMarker("<!-- bb-review round=2 sha=bbbbbbb2 verdict=approved lane=owner-reviewed -->\n\nLGTM, approved.")] }, green);
+    expect(ownerApproval(marked).approved).toBe(false);
+    // The same approving body without the marker is the owner's approval.
+    const unmarked = pull({ comments: [marker(head, "approved", "owner-reviewed"), unsignedMarker("LGTM, approved.")] }, green);
+    expect(ownerApproval(unmarked)).toMatchObject({ approved: true, at: "2026-10-14T17:00:00Z" });
+  });
+
+  it("never reads an unsigned bb-approval marker comment as the owner's approval (BB-110)", () => {
+    const typed = comment({ id: "typed", author: "jane", body: approvalMarkerLine({ sha: head, entry: null, verdict: "approved" }), signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+    expect(ownerApproval(pull({ comments: [marker(head, "approved", "owner-reviewed"), typed] }, green)).approved).toBe(false);
+    // It is still read by the project-approval path when the plugin recorded its id.
+    const ap = approval(head, "A cross-repo contract", "approved", "IC_recorded");
+    const recorded = pull({ comments: [marker(head, "approved", "owner-reviewed"), { ...ap, author: "jane", signedBy: null }] }, green);
+    expect(ownerApproval(recorded).approved).toBe(false);
+    expect(prGate(recorded, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: true, gateMet: true });
+  });
 });
 
 describe("a blockedOn naming the user", () => {
