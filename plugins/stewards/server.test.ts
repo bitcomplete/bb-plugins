@@ -1364,6 +1364,29 @@ describe("recovering a steward whose environment is gone (BB-103)", () => {
     expect(b.pending.some((n) => /respawned/u.test(n.text))).toBe(true);
   });
 
+  it("respawns the steward when its environment is destroyed at wake time", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id);
+    // The environment is already destroyed before the wake is even sent: no
+    // send error is needed for the recovery to fire.
+    t.threads.get(steward!)!.environmentStatus = "destroyed";
+    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
+    await t.ring("linear", "uuid-12");
+
+    expect(t.spawns).toHaveLength(3);
+    const respawned = t.spawns[2]!;
+    expect(respawned).toMatchObject({ environment: { type: "reuse", environmentId: "env1" }, parentThreadId: project, parentNotifications: "off" });
+    expect(String(respawned.prompt)).toMatch(/its environment is destroyed/u);
+    expect(t.deletes).toEqual([]);
+    expect(t.threads.get(steward!)!.archivedAt).not.toBeNull();
+    const b = t.hooks.store.find("ENG-12", "p1")!;
+    expect(b.threadId).toBe(respawned.id);
+    expect(b.awaitingReport).toBe(true);
+    expect(b.pending.some((n) => /respawned/u.test(n.text))).toBe(true);
+  });
+
   it("a review binding's rebind refuses a thread that is already another binding's steward", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());

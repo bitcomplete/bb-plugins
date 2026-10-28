@@ -4777,6 +4777,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             bb.log.info(`stewards: an @bb mention on ${w.issue.key} went to its steward${confirmed === null ? "" : ` (confirmed ${confirmed.id})`}`);
             return { routed: "ticket", threadId: bound.threadId, projectId: bound.projectId, requestId: confirmed?.id ?? null };
           }
+          // An "unavailable" environment is deliberately left to the
+          // binding's next wake: the mention is not lost (the project steward
+          // answers it), and the requeue or doorbell respawns the steward
+          // through deliverWake (BB-103). Respawning from here would need the
+          // binding's config and a fresh wake text anyway.
           bb.log.warn(`stewards: could not reach ${w.issue.key}'s steward with an @bb mention; trying the project steward`);
         }
 
@@ -7388,25 +7393,46 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const info = await threadInfo(threadId).catch(() => null);
               if (info === null || info.deletedAt !== null) throw new PluginCliError(`Thread ${threadId} does not exist.`, { code: "thread_not_found", hint: "bb thread list shows the threads." });
               if (info.projectId !== null && info.projectId !== b.projectId) throw new PluginCliError(`Thread ${threadId} is in project ${info.projectId}, not ${b.projectId}.`, { code: "thread_other_project" });
+              // An ended binding's old thread is nobody's steward any more, so it
+              // may be re-used; a live binding's thread may not.
               const other = store.byThread(threadId);
-              if (other !== null && other.id !== b.id) throw new PluginCliError(`Thread ${threadId} is already ${other.entityKey}'s steward.`, { code: "thread_taken", hint: `bb stewards show ${other.entityKey} shows it.` });
+              if (other !== null && other.id !== b.id && other.endedAt === null) throw new PluginCliError(`Thread ${threadId} is already ${other.entityKey}'s steward.`, { code: "thread_taken", hint: `bb stewards show ${other.entityKey} shows it.` });
               const worker = store.worker(threadId);
               if (worker !== null) throw new PluginCliError(`Thread ${threadId} is a worker of ${store.binding(worker.bindingId)?.entityKey ?? worker.bindingId}.`, { code: "thread_worker" });
-              const previous = b.threadId;
-              // Clear the wait before the wake: the new thread has not had the
-              // wake yet, and the old thread's report is not coming.
-              store.patch(b.id, { threadId, awaitingReport: false });
-              if (previous !== null && previous !== threadId) await quietly(`archive the previous steward thread ${previous}`, () => bb.sdk.threads.archive({ threadId: previous }));
-              // The action log: the wake carries it, so the new thread's first
-              // report knows where it came from.
-              store.note(b.id, `Rebound from ${previous ?? "(none)"} to ${threadId} with bb stewards rebind.`);
-              bb.log.info(`stewards: rebound ${b.entityKey} from ${previous ?? "(none)"} to ${threadId}`);
-              const config = await loadConfig(b.projectId);
-              const playbook = config === null ? null : bindingPlaybook(config, b);
-              if (config === null || playbook === null) return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}, but its playbook is missing so no wake was sent.` };
-              // Send the binding's wake now, not at the next requeue.
-              await serial(`b:${b.id}`, () => reconcileBinding(b.id, "requeue"));
-              return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}; its wake was sent.` };
+              const projectSteward = store.projectByThread(threadId);
+              if (projectSteward !== null) throw new PluginCliError(`Thread ${threadId} is the project steward of ${projectSteward.projectId}, not a binding's steward.`, { code: "thread_project_steward" });
+              const result = { outcome: "sent" as "sent" | "queued" | "missing" | "gone" };
+              // The whole mutation runs under the binding's lock, the same one
+              // every reconcile takes, so a doorbell-driven respawn cannot
+              // re-point the binding between the rebind and its wake.
+              await serial(`b:${b.id}`, async () => {
+                const fresh = store.binding(b.id);
+                if (fresh === null || fresh.endedAt !== null) {
+                  result.outcome = "gone";
+                  return;
+                }
+                const previous = fresh.threadId;
+                // Clear the wait before the wake: the new thread has not had the
+                // wake yet, and the old thread's report is not coming.
+                store.patch(b.id, { threadId, awaitingReport: false });
+                if (previous !== null && previous !== threadId) await quietly(`archive the previous steward thread ${previous}`, () => bb.sdk.threads.archive({ threadId: previous }));
+                // The action log: the wake carries it, so the new thread's first
+                // report knows where it came from.
+                store.note(b.id, `Rebound from ${previous ?? "(none)"} to ${threadId} with bb stewards rebind.`);
+                bb.log.info(`stewards: rebound ${b.entityKey} from ${previous ?? "(none)"} to ${threadId}`);
+                const config = await loadConfig(b.projectId);
+                const playbook = config === null ? null : bindingPlaybook(config, fresh);
+                if (config === null || playbook === null) {
+                  result.outcome = "missing";
+                  return;
+                }
+                // Send the binding's wake now, not at the next requeue.
+                await reconcileBinding(b.id, "requeue");
+                result.outcome = store.binding(b.id)?.awaitingReport === true ? "sent" : "queued";
+              });
+              if (result.outcome === "gone") return { exitCode: 0, stdout: `${b.entityKey} ended while rebinding; nothing was changed.` };
+              if (result.outcome === "missing") return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}, but its playbook is missing so no wake was sent.` };
+              return { exitCode: 0, stdout: `Rebound ${b.entityKey} to ${threadId}; ${result.outcome === "sent" ? "its wake was sent." : "its wake is queued for its next turn."}` };
             },
           }),
 
