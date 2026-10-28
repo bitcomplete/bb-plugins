@@ -3768,10 +3768,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
-    /** The `.bb` files the lessons published on one branch may change: a lesson only ever edits its own file, and several lessons in one publish share the branch. */
-    function lessonPrFiles(projectId: string, branch: string | null): string[] {
-      if (branch === null) return [];
-      return [...new Set(store.allLessons(projectId).filter((l) => l.branch === branch).map((l) => l.file))];
+    /**
+     * The `.bb` files the pull request may change: this lesson's own file and
+     * the files of the lessons that share its PR (several lessons in one
+     * publish). The project file and `roles.json` are never allowed, so a
+     * hand-edited pre-guard row cannot widen the set.
+     */
+    function lessonPrFiles(projectId: string, url: string, lessonId: string): string[] {
+      return [
+        ...new Set(
+          store
+            .allLessons(projectId)
+            .filter((l) => (l.id === lessonId || l.pr === url || l.retirePr === url) && lessonFileAllowed(l.file))
+            .map((l) => l.file),
+        ),
+      ];
     }
 
     /**
@@ -3792,7 +3803,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       // `files` reads one page; a full page means there may be more to check.
       if (files.length >= 100) return "the pull request changes too many files to verify";
-      const allowed = lessonPrFiles(lesson.projectId, result.branch);
+      const allowed = lessonPrFiles(lesson.projectId, result.url ?? "", lesson.id);
       const bad = files.filter((path) => !allowed.some((file) => path === file || path === `.bb/${file}`));
       if (bad.length > 0) return `the pull request changes files other than the lesson's own: ${bad.slice(0, 5).join(", ")}`;
       const path = files.find((p) => p === lesson.file || p === `.bb/${lesson.file}`);
