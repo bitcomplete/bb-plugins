@@ -455,12 +455,10 @@ above which a steward is compacted after its turn.
 - **A playbook edit has no effect.** It is not merged to `.bb`'s HEAD yet, or
   it fails validation and bindings run under the last good version; `check`
   says which.
-- **Stewards are not in their project's sidebar section.** The section,
-  named after the project, shows only when the sidebar is organized
-  chronologically (`bb thread-list prefs get organizationMode`). A steward
-  is placed there once and never moved back; one dragged out stays out. A
-  section deleted by hand is not recreated: `bb thread section create
-  "<project name>"` brings it back for new stewards. Workers are children of
+- **Stewards are not grouped by project in the sidebar.** The plugin makes
+  no sidebar sections: group by project with bb's project organization
+  (`bb thread-list prefs get organizationMode`) or switch to the stewards
+  thread list. Workers are children of
   their steward with parent notifications off, so they nest under its row
   without waking it on every turn. The plugin only archives a steward, worker
   or reviewer, never deletes one: deleting a parent thread deletes every

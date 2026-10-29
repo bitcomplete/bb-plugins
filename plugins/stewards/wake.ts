@@ -52,10 +52,9 @@ export const BRIEF_PREFIX =
   "Your context may have been compacted, and this turn may not be a wake (a plain message, a `bb thread tell`, a child notice). Run `bb stewards brief` before acting: it prints your thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules and the exact worker spawn command.";
 
 /** The worker spawn command, shared by the wake, `bb stewards spawn-flags` and the brief. */
-export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string; sectionId?: string | null }): string {
-  const section = input.sectionId === null || input.sectionId === undefined ? "" : ` --section ${input.sectionId}`;
+export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string }): string {
   return [
-    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${section}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
+    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
     "<the whole task>",
     "EOF",
   ].join("\n");
@@ -236,8 +235,6 @@ export type WakeInput = {
   children: ChildView[];
   /** The worker model, as `bb thread spawn` flags. */
   workerFlags: string;
-  /** The project's sidebar section id, so a worker is spawned into it; null when there is none. */
-  sectionId?: string | null;
   changes: string[];
   /** The binding's open "needs you" items, on the Stewards page. */
   needs?: Need[];
@@ -421,7 +418,7 @@ export function formatWake(input: WakeInput): string {
     "",
     "Start a worker for one bounded task with:",
     "",
-    ...spawnCommand({ projectId: binding.projectId, entityKey: e.key, workerFlags: input.workerFlags, sectionId: input.sectionId })
+    ...spawnCommand({ projectId: binding.projectId, entityKey: e.key, workerFlags: input.workerFlags })
       .split("\n")
       .map((line) => `    ${line}`),
     "",
@@ -508,8 +505,6 @@ export type BriefInput = {
   gate: GateState;
   /** The worker spawn flags, environment first, exactly as the wake and `bb stewards spawn-flags` build them; null when the project's machine is not known yet, so the brief points at the command instead of printing one it is unsure of. */
   workerFlags: string | null;
-  /** The project's sidebar section id, so a worker is spawned into it; null when there is none. */
-  sectionId?: string | null;
   /** Open escalations, so the gate line can say who is being asked for approval or scheduling. */
   escalations?: Escalation[];
   /** Open bindings at work on the same paths, for the scheduling line. */
@@ -552,7 +547,7 @@ export function formatBrief(input: BriefInput, maxChars?: number): string {
   if (!ops) head.push(briefGateLine(gate, escalations));
   if (!ops) {
     if (input.workerFlags === null) head.push("", "Run `bb stewards spawn-flags` for the exact worker spawn command: the project's machine has not been read on this server yet.");
-    else head.push("", "Start a worker with:", "", spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags, sectionId: input.sectionId }));
+    else head.push("", "Start a worker with:", "", spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags }));
   }
 
   const middle: string[] = [];

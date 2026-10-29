@@ -469,10 +469,10 @@ describe("a Linear ticket steward", () => {
     expect(project).toMatchObject({ pluginMetadata: { role: "project", threadBriefs: false } });
     // On the project's machine, never core's "project-default" (the server's own, which may have no daemon).
     expect(project).toMatchObject({ environment: { type: "provider", environmentProviderId: "multi-repo-workspace", machine: { type: "existing", hostId: "host_on" } } });
-    // Both in the project's own sidebar section, and nothing pinned.
-    expect(t.sections).toEqual([{ id: "sec_1", name: "Acme" }]);
-    expect(project).toMatchObject({ sectionId: "sec_1" });
-    expect(steward).toMatchObject({ sectionId: "sec_1" });
+    // No sidebar section of the plugin's own, and nothing pinned: grouping is bb's.
+    expect(t.sections).toEqual([]);
+    expect(project).not.toHaveProperty("sectionId");
+    expect(steward).not.toHaveProperty("sectionId");
     expect(project).not.toHaveProperty("pinned");
     // A child of the project steward, so the sidebar trees it there, with
     // notifications off so a finished steward turn does not wake the parent.
@@ -485,7 +485,7 @@ describe("a Linear ticket steward", () => {
     expect(prompt).toMatch(/given by the project steward/u);
     // The first wake is the spawn prompt, before the thread has an id.
     expect(prompt).toMatch(/Your thread id is in `\$BB_THREAD_ID`/u);
-    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
+    expect(prompt).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high --title "ENG-12: <task>" --prompt-file - <<'EOF'\n    <the whole task>\n    EOF`);
     expect(prompt).toContain("--parent-self --parent-notifications off");
     expect(prompt).not.toContain("--parent-thread");
     expect(prompt).toContain("A worker finishing starts no turn of yours");
@@ -2430,67 +2430,6 @@ describe("stewards and the sidebar", () => {
     expect(t.threads.get(steward!)!.parentThreadId).toBeNull();
     const parentWrites = t.harness.sdk.callsTo("threads.update").map(([args]) => args as { threadId: string; parentThreadId?: unknown }).filter((a) => a.threadId === steward && a.parentThreadId !== undefined);
     expect(parentWrites).toEqual([]);
-  });
-
-  it("puts stewards that predate it in their project's section once, and leaves them where you move them", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Fix logout" }));
-    await t.ring("linear", "uuid-12");
-    await t.ring("linear", "uuid-13");
-    const [project, steward, other] = t.spawns.map((x) => x.id);
-    // As an earlier version left them: no section anywhere, one filed by hand.
-    t.sections.splice(0);
-    t.sections.push({ id: "sec_later", name: "Later" });
-    t.hooks.store.patchProject("p1", { sectionId: null });
-    t.hooks.db.prepare("DELETE FROM placed_threads").run();
-    for (const id of [project!, steward!]) t.threads.get(id)!.sectionId = null;
-    t.threads.get(other!)!.sectionId = "sec_later";
-
-    t.hooks.forgetTags();
-    await t.hooks.sweep();
-    const acme = t.sections.find((s) => s.name === "Acme")!;
-    expect(t.threads.get(project!)!.sectionId).toBe(acme.id);
-    expect(t.threads.get(steward!)!.sectionId).toBe(acme.id);
-    expect(t.threads.get(other!)!.sectionId).toBe("sec_later");
-
-    // Dragged out, renamed: both stick.
-    t.threads.get(steward!)!.sectionId = null;
-    acme.name = "Acme stewards";
-    t.hooks.forgetTags();
-    await t.hooks.sweep();
-    expect(t.threads.get(steward!)!.sectionId).toBeNull();
-    expect(t.sections.map((s) => s.name)).toEqual(["Later", "Acme stewards"]);
-  });
-
-  it("does not bring back a section you deleted, and adopts one named after the project", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    await t.ring("linear", "uuid-12");
-    t.sections.splice(0);
-    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Fix logout" }));
-    await t.ring("linear", "uuid-13");
-    expect(t.sections).toEqual([]);
-    expect(t.spawns[2]).not.toHaveProperty("sectionId");
-
-    t.sections.push({ id: "sec_mine", name: "Acme" });
-    t.entities.set("uuid-14", issue({ id: "uuid-14", key: "ENG-14", title: "Fix signup" }));
-    await t.ring("linear", "uuid-14");
-    expect(t.spawns[3]).toMatchObject({ sectionId: "sec_mine" });
-  });
-
-  it("deletes the section of a project no longer stewarded once it is empty", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    await t.ring("linear", "uuid-12");
-    t.files[PROJECT_FILE] = null;
-    await t.hooks.sweep();
-    // Its stewards are still there, unarchived.
-    expect(t.sections).toHaveLength(1);
-    for (const thread of t.threads.values()) thread.archivedAt = 1;
-    await t.hooks.sweep();
-    expect(t.sections).toEqual([]);
-    expect(t.hooks.store.project("p1").sectionId).toBeNull();
   });
 
   it("cuts a long wake in its snapshot, never in what changed", async () => {
@@ -5836,7 +5775,7 @@ describe("ops stewards", () => {
     const ops = steward()!;
     // A binding of its own, reporting to the project steward, in the list and on the page.
     expect(await t.list()).toMatchObject([{ key: TARGET, kind: "ops", threadId: ops.id, ended: false }]);
-    expect(ops).toMatchObject({ title: "Ops watch: bb-gate-production", sectionId: "sec_1", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5" });
+    expect(ops).toMatchObject({ title: "Ops watch: bb-gate-production", parentThreadId: project!.id, parentNotifications: "off", environment: { type: "reuse", environmentId: "env1" }, model: "claude-sonnet-5-5" });
     const board = (await t.harness.callRpc("stewardsBoard", { projectId: "p1" })) as { board: { stewards: Array<{ key: string; kind: string; stage: string | null }> } };
     expect(board.board.stewards).toEqual([expect.objectContaining({ key: TARGET, kind: "ops", stage: "watch" })]);
 
@@ -7487,7 +7426,7 @@ describe("the dotenv a requester imports", () => {
 // context was compacted, and a worker spawned wrong must be caught here.
 describe("steward invariants on every turn (BB-24)", () => {
   const spawnLine = (over = "") =>
-    `bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
+    `bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high${over} --title "ENG-12: <task>" --prompt-file - <<'EOF'\n<the whole task>\nEOF`;
 
   it("prints the full runnable spawn command from the playbook's worker model and the project environment", async () => {
     const t = await setup();
@@ -7580,7 +7519,7 @@ describe("steward invariants on every turn (BB-24)", () => {
     expect(t.hooks.store.worker("thr_bad")!.status).toBe("stopped");
     const wake = t.sends.at(-1)!.text;
     expect(wake).toMatch(/Worker thr_bad was started with the wrong provider codex instead of claude-code/u);
-    expect(wake).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --section sec_1 --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
+    expect(wake).toContain(`bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --machine host_on --provider claude-code --model claude-opus-5-5 --reasoning-level high`);
   });
 
   it("stops a worker on the wrong model, reasoning level or environment provider, and leaves a matching one alone", async () => {
@@ -7681,32 +7620,21 @@ describe("steward invariants on every turn (BB-24)", () => {
   });
 });
 
-// BB-39: everything a steward spawns stays in the project's section, is left
-// alone by thread-briefs, and the sidebar's unread dot means "needs you".
+// BB-39: everything a steward spawns is left alone by thread-briefs, and the
+// sidebar's unread dot means "needs you". Sidebar grouping is bb's own
+// (project organization or the stewards list); the plugin makes no sections.
 describe("steward-spawned threads and the sidebar (BB-39)", () => {
-  it("files an unsectioned worker or reviewer into the owner's project section, and leaves a sectioned one alone", async () => {
+  it("leaves a worker or reviewer where it was spawned, and makes no section", async () => {
     const t = await setup();
     t.entities.set("uuid-12", issue());
     await t.ring("linear", "uuid-12");
     const steward = t.spawns[1]!.id;
-    expect(t.sections).toEqual([{ id: "sec_1", name: "Acme" }]);
-
-    // A worker with no section is filed into the project's section.
     await t.created("thr_w1", steward);
-    expect(t.threads.get("thr_w1")!.sectionId).toBe("sec_1");
-
-    // A worker already in a section of its own is left there.
-    t.sections.push({ id: "sec_mine", name: "Mine" });
-    await t.created("thr_w2", steward, "Implement", { sectionId: "sec_mine" });
-    expect(t.threads.get("thr_w2")!.sectionId).toBe("sec_mine");
-
-    // A reviewer (a child of the worker) with no section is filed too.
     await t.created("thr_r1", "thr_w1", "Review the pull request");
-    expect(t.threads.get("thr_r1")!.sectionId).toBe("sec_1");
-
-    // A top-level worker (no parent) is recognized by its lifecycle owner.
     await t.createdOwned("thr_w3", steward);
-    expect(t.threads.get("thr_w3")!.sectionId).toBe("sec_1");
+    expect(t.sections).toEqual([]);
+    for (const id of ["thr_w1", "thr_r1", "thr_w3"]) expect(t.threads.get(id)!.sectionId).toBeNull();
+    expect(t.harness.sdk.callsTo("threads.update").filter(([args]) => (args as { sectionId?: unknown }).sectionId !== undefined)).toEqual([]);
   });
 
   it("tags workers and reviewers for thread-briefs, so it never moves or archives them", async () => {
@@ -7739,24 +7667,6 @@ describe("steward-spawned threads and the sidebar (BB-39)", () => {
     // An escalation is open: left unread.
     await t.tool("steward_report", { phase: "open", summary: "Reviewed.", nextAction: "Decide", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward);
     expect(marks()).toHaveLength(before);
-  });
-
-  it("does not print a section id deleted by hand in the injected brief", async () => {
-    const t = await setup();
-    t.entities.set("uuid-12", issue());
-    await t.ring("linear", "uuid-12");
-    const steward = t.spawns[1]!.id;
-    const instructions = () => t.harness.inspection.registrations.instructionProvider!({ threadId: steward, projectId: "p1" })!;
-    expect(instructions()).toContain("--section sec_1");
-
-    // The user deletes the section by hand. A wake resolves it to null, and the
-    // synchronous brief must not fall back to the dead id in the store row.
-    t.sections.splice(0);
-    t.entities.set("uuid-12", issue({ comments: [comment({ createdAt: "2026-10-14T16:00:00Z" })] }));
-    await t.ring("linear", "uuid-12");
-    await t.flush();
-    expect(t.hooks.store.project("p1").sectionId).toBe("sec_1");
-    expect(instructions()).not.toContain("--section");
   });
 });
 
