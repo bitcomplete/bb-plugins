@@ -2077,6 +2077,10 @@ function StewardsSidebarCore({
     ),
   );
   const byId = useMemo(() => new Map(threads.map((t) => [t.id, t] as const)), [threads]);
+  // `byId` is a new Map on every host tick, so `pick` reads it through a ref:
+  // a new callback each tick would defeat `ProjectTabs`' memo (BB-95).
+  const byIdRef = useRef(byId);
+  byIdRef.current = byId;
   // The requested project's needs items, only while the data matches the tab on
   // screen; a stale answer for a previous project shows nothing (BB-100).
   const needItems = active !== null && data?.projectId === active.projectId ? data.needs.items : EMPTY_NEEDS;
@@ -2100,7 +2104,7 @@ function StewardsSidebarCore({
       if (boardRoute.projectId === null && activeThreadId === null) return;
       const place = readLastPlace(pluginId, projectId);
       if (place !== null && place.kind === "thread") {
-        const thread = byId.get(place.threadId);
+        const thread = byIdRef.current.get(place.threadId);
         if (thread !== undefined && !thread.isArchived && thread.projectId === projectId) {
           navigate.toThread(place.threadId);
           return;
@@ -2116,7 +2120,7 @@ function StewardsSidebarCore({
       }
       navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
     },
-    [active?.projectId, boardRoute.projectId, activeThreadId, byId, navigate, pluginId],
+    [active?.projectId, boardRoute.projectId, activeThreadId, navigate, pluginId],
   );
   const newThread = useCallback(() => {
     if (active !== null) onNewThread(active.projectId);
