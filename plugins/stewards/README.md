@@ -17,9 +17,9 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   child of the project steward with parent notifications off: the sidebar
   nests it under the project steward, and bb does not wake the parent on every
   child turn. (Before bb 0.47.0 parenting meant the project steward woke on 88
-  of its first 96 turns on bithub, so stewards were top-level.) A project's
-  stewards share one sidebar section, named after the project; see
-  DESIGN.md §15.
+  of its first 96 turns on bithub, so stewards were top-level.) Grouping in
+  the sidebar is bb's own: its project organization, or the stewards thread
+  list; the plugin makes no sidebar sections (DESIGN.md §15).
 - **Ops stewards.** Each namespace and Sentry project in a login's
   `roles.json` `ops` entry gets an `ops` steward, reporting to the project
   steward, for as long as it is listed. The plugin looks at the target with
@@ -195,15 +195,15 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   key, and between wakes it reads done while its entity is still open, so a
   brief would be wrong on every count — and one is a model call per idle.
   Workers and reviewers a steward spawns are tagged the same way, so
-  thread-briefs leaves them in the project's section too. The project steward
+  thread-briefs leaves them alone too. The project steward
   is titled "<project name> project steward". The sweep tags threads spawned
   before this, sets parent notifications off on a steward an earlier version
   parented to the project steward (keeping the parent), and renames an older
   project steward once. After that, a project steward renamed by hand keeps
   its name.
-- **The sidebar and the unread dot.** A steward is put in its project's
-  section when it is spawned, and a worker or reviewer the plugin did not
-  place is filed there by the `thread.created` handler. A finished worker
+- **The sidebar and the unread dot.** The plugin makes no sidebar sections
+  and never moves a thread; stewards nest under the project steward and
+  workers under their steward by parent. A finished worker
   leaves the sidebar once its report is consumed, and a consumed reviewer
   once its round is. The unread dot
   means "needs you": a report that waits on someone else, with no

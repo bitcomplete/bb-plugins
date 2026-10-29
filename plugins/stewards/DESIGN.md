@@ -890,45 +890,28 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 
 - Stewards are children of the project steward with parent notifications off
   (§4), so they nest under it in bb's thread tree. Who reports to whom is in
-  the bindings. They are grouped in the sidebar too: each stewarded project
-  gets one sidebar section, named after the project, holding its project
-  steward and every ticket and pull request steward. Sections are flat in bb,
-  and only shown when the sidebar is organized chronologically; in the
-  project organization the project's own group does the same job.
-- **Placed once, then the user's.** A steward is put in its project's
-  section when it is spawned, and one that predates the section is put there
-  by the sweep, but only when it is in no section. Either way the thread is
-  then recorded as placed (`placed_threads`) and never moved again, so a
-  steward dragged elsewhere stays where it was put. The plugin pins
-  nothing.
-- **The section is remembered by id** (`project_stewards.section_id`), so a
-  rename by hand sticks. One deleted by hand stays deleted: the id is kept
-  as a tombstone and new stewards land loose. Creating a section with the
-  project's exact name brings placement back; an existing section with that
-  name is adopted rather than duplicated. When a project stops being
-  stewarded, the sweep deletes its section once nothing unarchived is left
-  in it, since its stewards are archived as their bindings end; a thread
-  filed there by hand keeps it.
+  the bindings. Grouping in the sidebar is bb's: the project organization
+  groups a project's threads by itself, and the stewards thread list (§21)
+  groups by binding. The plugin makes no sidebar sections and pins nothing.
+  (Until BB-39's successor removed it, each stewarded project got a section
+  of its own, named after the project, that every steward, worker and
+  reviewer was filed into; `project_stewards.section_id` and
+  `placed_threads` are what that left in the store, unused.)
 - Stewards, the project steward included, are kept out of thread-briefs
   entirely (`threadBriefs: false`): no summary, no stored brief, no status
   section, no ring, no auto-archive. One idle between wakes would read done,
-  and a summary would be a model call per idle. thread-briefs only moves
-  threads in and out of its own sections, so it leaves the project section
-  alone. Workers and reviewers are tagged the same way when the
-  `thread.created` handler files them. The project steward is titled
+  and a summary would be a model call per idle. Workers and reviewers are
+  tagged the same way by the `thread.created` handler. The project steward is titled
   "<project name> project steward".
 - Workers are children of their steward, owned by it through
   `--lifecycle-owner-thread` and started with `bb thread spawn --project …
   --parent-self --parent-notifications off --lifecycle-owner-thread
-  "$BB_THREAD_ID" --section <section id> …`; the plugin recognizes them by
+  "$BB_THREAD_ID" …`; the plugin recognizes them by
   that owner or their parent, and a worker an older steward left with only the
   owner is still recognized. `parentNotifications: off` keeps a worker's
   finish from waking the steward: its final message arrives in the next wake,
-  which lists finished workers. The worker nests under its steward's row in
-  the project section, because bb's list trees by parent thread. The
-  `thread.created` handler files any unsectioned worker or reviewer into the
-  owner's project section, so a skill that builds its own spawn command lands
-  there too. A finished worker's thread is archived once the reconcile that
+  which lists finished workers. The worker nests under its steward's row,
+  because bb's list trees by parent thread. A finished worker's thread is archived once the reconcile that
   consumed its report has woken the steward, and a reviewer once its round is
   consumed, so a long-running binding does not leave its finished rows loose
   (§5). The plugin only ever archives a steward, worker or reviewer, never
@@ -951,8 +934,7 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
 - **Store:** bindings, status records, escalations, workers.
 - **Reconciler:** mechanical tier, debounce, nightly pass, `requeueAfter`
   timers, escalation routing.
-- **Threads:** spawning stewards, recognizing workers, building wake messages,
-  the project's sidebar section.
+- **Threads:** spawning stewards, recognizing workers, building wake messages.
 - **Agent tools:** `steward_report` and `steward_update` (which also
   records and completes lessons, §20).
 - **CLI:** `bb stewards init | check | list | show | needs | done | detach | pass | digest | lessons | drop-lesson`.

@@ -102,9 +102,8 @@ export const BASE_MIGRATIONS = [
   `ALTER TABLE bindings ADD COLUMN follow_through_until INTEGER`,
   // A wake turn reported that it waits on someone else: archive the steward when it goes idle.
   `ALTER TABLE bindings ADD COLUMN archive_when_idle INTEGER NOT NULL DEFAULT 0`,
-  // The sidebar section the project's stewards are put in. Kept after the section is deleted by hand, so it stays deleted.
+  // Unused since the plugin stopped filing threads into sidebar sections; the column and the table below stay because migrations are append-only.
   `ALTER TABLE project_stewards ADD COLUMN section_id TEXT`,
-  // Threads already put in their project's section once; where they sit after that is the user's.
   `CREATE TABLE IF NOT EXISTS placed_threads (
      thread_id TEXT PRIMARY KEY,
      placed_at INTEGER NOT NULL
@@ -1053,7 +1052,7 @@ export type Fingerprint = FingerprintRow & { projectId: string; bindingId: strin
 /** What a steward reports doing about a fingerprint: filing a ticket, commenting on one, or reopening one. */
 export type TicketAction = "filed" | "commented" | "reopened";
 
-export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; sectionId: string | null; pendingNotes: string[] };
+export type ProjectStewardRow = { projectId: string; threadId: string | null; digest: string | null; digestAt: number | null; nightlyDate: string | null; digestPending: boolean; title: string | null; pendingNotes: string[] };
 
 /** Guidance repeated within this window is a retry, not new guidance. */
 export const GUIDANCE_DEDUPE_MS = 5 * 60_000;
@@ -1100,8 +1099,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
      )`,
   );
   const children = db.prepare<[string], BindingRow>("SELECT * FROM bindings WHERE parent_binding_id = ? AND ended_at IS NULL ORDER BY created_at");
-  const isPlaced = db.prepare<[string], { thread_id: string }>("SELECT thread_id FROM placed_threads WHERE thread_id = ?");
-  const markPlaced = db.prepare<[string, number]>("INSERT OR IGNORE INTO placed_threads (thread_id, placed_at) VALUES (?, ?)");
   const dueRequeue = db.prepare<[number], BindingRow>("SELECT * FROM bindings WHERE ended_at IS NULL AND requeue_at IS NOT NULL AND requeue_at <= ? ORDER BY requeue_at");
   const insertBinding = db.prepare(
     `INSERT INTO bindings (id, project_id, source, entity_id, entity_key, url, title, kind, playbook, playbook_version, parent_binding_id, phase, stage, created_at)
@@ -1383,7 +1380,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
     nightlyDate: r.nightly_date === null ? null : String(r.nightly_date),
     digestPending: Number(r.digest_pending) === 1,
     title: r.title === null || r.title === undefined ? null : String(r.title),
-    sectionId: r.section_id === null || r.section_id === undefined ? null : String(r.section_id),
     pendingNotes: json(z.array(z.string()), r.pending_notes === null || r.pending_notes === undefined ? null : String(r.pending_notes), []),
   });
   const toLesson = (r: Record<string, unknown>): Lesson => ({
@@ -2352,7 +2348,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
     },
     patchProject(projectId: string, fields: Partial<Omit<ProjectStewardRow, "projectId">>): ProjectStewardRow {
       upsertProject.run(projectId);
-      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending", title: "title", sectionId: "section_id", pendingNotes: "pending_notes" };
+      const map: Record<string, string> = { threadId: "thread_id", digest: "digest", digestAt: "digest_at", nightlyDate: "nightly_date", digestPending: "digest_pending", title: "title", pendingNotes: "pending_notes" };
       const entries = Object.entries(fields).filter(([, v]) => v !== undefined);
       if (entries.length > 0) db.prepare(`UPDATE project_stewards SET ${entries.map(([k]) => `${map[k]} = ?`).join(", ")} WHERE project_id = ?`).run(...entries.map(([, v]) => toColumn(v)), projectId);
       return toProject(getProject.get(projectId)!);
@@ -2375,14 +2371,6 @@ export function createStore(db: Database.Database, now: () => number, options: S
     clearProjectNotes(projectId: string): void {
       upsertProject.run(projectId);
       db.prepare("UPDATE project_stewards SET pending_notes = ? WHERE project_id = ?").run("[]", projectId);
-    },
-
-    // threads put in their project's section
-    placed(threadId: string): boolean {
-      return isPlaced.get(threadId) !== undefined;
-    },
-    markPlaced(threadId: string): void {
-      markPlaced.run(threadId, now());
     },
   };
 }
