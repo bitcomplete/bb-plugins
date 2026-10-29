@@ -76,10 +76,15 @@ These were settled while designing; each changes what gets built.
   deliveries stop mattering, and the transcript stops being the source of
   truth, so compaction loses nothing important.
 - **Opt-in by label** for tickets and pull requests: `bb-managed`.
-- **Every pull request in the project's repos gets a review steward.** Not
-  only the ones your review is requested on — until a `roles.json` names a
-  project steward, when a review steward is made only where your review is
-  requested (BB-105).
+- **Each kind of work has one owner, set by a human.** A `bb-managed` Linear
+  ticket is adopted where this server's Linear login is an assignee; a
+  labelled pull request where its GitHub login is the author; a teammate's
+  pull request only where its GitHub login is a requested reviewer, checked
+  once at adoption, the binding lasting until merge or close. Reassigning or
+  unassigning an adopted ticket releases the old server with one stop turn and
+  stops its workers, and the new assignee's server adopts it. The rule is the
+  same with or without a `roles.json` project steward, and a login that cannot
+  be read adopts nothing (BB-115).
 - **Comments, not description edits.** A steward adds to a ticket with
   comments. It edits the description only when the scope changes.
 - **Approval before substantial implementation.** A ticket must be fully
@@ -180,7 +185,8 @@ GitHub login the github plugin reads. Every server runs only its own entry, so
 two developers never watch the same namespace, Sentry project or Dependabot
 repo, and a project has one project steward. Ticket stewards follow the Linear
 assignee and review stewards follow the GitHub requested reviewer; neither
-needs an entry.
+needs an entry. A labelled pull request follows its author; an unassigned
+labelled ticket is adopted nowhere and is listed read-only in the digest.
 
 ```jsonc
 {
@@ -205,7 +211,11 @@ needs an entry.
 - A login with no entry runs no watches and is not the project steward for
   the project; the home page says `No role for <login> in roles.json`. A file
   that is present but whose login cannot be read runs no roles — never every
-  role — and says so.
+  role — and says so. With no `roles.json` the legacy `ops` still runs, but
+  adoption is unchanged: a ticket is this server's only where its Linear login
+  is an assignee, a labelled pull request only where its GitHub login is the
+  author, and a review only where its GitHub login is a requested reviewer
+  (BB-115). An unassigned labelled ticket is adopted nowhere.
 - The project steward's server reports cross-server problems: a watch nobody
   runs, a watch two logins run, and no or two project stewards. A role whose
   machine lacks a credential (no kubectl, no Sentry token) is that server's

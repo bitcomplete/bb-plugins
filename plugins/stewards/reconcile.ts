@@ -850,10 +850,19 @@ export type Lifecycle =
   | { kind: "continue" }
   | { kind: "terminal" }
   | { kind: "detach" }
+  | { kind: "reassigned" }
   | { kind: "reopen"; why: string }
   | { kind: "stay-ended" };
 
 const hasLabel = (entity: EntitySnapshot, label: string) => entity.labels.some((l) => l.toLowerCase() === label.toLowerCase());
+
+/**
+ * Whether this server's login is one of the entity's assignees. `owner` null
+ * means the login could not be read, and nothing is claimed: a ticket that
+ * cannot be checked is never released (BB-115, limit a).
+ */
+const assignedTo = (entity: EntitySnapshot, owner: string | null): boolean =>
+  owner !== null && entity.assignees.some((a) => a.toLowerCase() === owner.toLowerCase());
 
 /**
  * What the entity's state means for the binding. A review binding is not
@@ -863,21 +872,37 @@ const hasLabel = (entity: EntitySnapshot, label: string) => entity.labels.some((
  * An entity that leaves its terminal state while the binding is still
  * ending reopens it too: a ticket an automation moved to Done and someone
  * moved straight back should not cost its steward its workers.
+ *
+ * A ticket whose assignee set no longer names this server's login is
+ * released: the new assignee's server owns it now (BB-115). `opts.owner` is
+ * this server's Linear login, and is passed only when the snapshot that
+ * carries `assignees` was read successfully; a read that failed never
+ * reaches here, so a partial or rate-limited read never ends a binding.
  */
-export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean } = {}): Lifecycle {
+export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason" | "manualDetach" | "ending">, playbook: Playbook, entity: EntitySnapshot, label: string, opts: { labelRequired?: boolean; owner?: string | null } = {}): Lifecycle {
   const terminal = isTerminal(playbook, entity.state);
   // A review binding is not labelled; a binding the plugin adopts itself (a
   // dependency bot's pull request) has no label to hold it, so its label is
   // not required either.
   const labelled = binding.kind === "review" || opts.labelRequired === false || hasLabel(entity, label);
+  const mine = assignedTo(entity, opts.owner ?? null);
   if (binding.endedAt !== null) {
     if (terminal || !labelled || binding.manualDetach) return { kind: "stay-ended" };
     if (binding.endReason === "terminal") return { kind: "reopen", why: `reopened: now ${entity.state}` };
     if (binding.endReason === "detach") return { kind: "reopen", why: `the ${label} label is back` };
+    // A ticket released on reassignment comes back when it is assigned here
+    // again; one still assigned elsewhere stays ended.
+    if (binding.endReason === "reassigned") return mine ? { kind: "reopen", why: "reassigned to this server" } : { kind: "stay-ended" };
     return { kind: "stay-ended" };
   }
-  if (binding.ending === "terminal" && !terminal && labelled) return { kind: "reopen", why: `reopened before the binding ended: now ${entity.state}` };
   if (terminal) return { kind: "terminal" };
+  // Only a ticket follows the assignee; a review binding is held by the
+  // requested-reviewer check at adoption, and a pr binding by its label.
+  // Checked before the follow-through reopen, so a ticket moved back to a
+  // non-terminal state and reassigned away in one change is released rather
+  // than taking a spurious reopen turn first.
+  if (binding.kind === "ticket" && opts.owner !== undefined && opts.owner !== null && !mine) return { kind: "reassigned" };
+  if (binding.ending === "terminal" && !terminal && labelled) return { kind: "reopen", why: `reopened before the binding ended: now ${entity.state}` };
   if (!labelled) return { kind: "detach" };
   return { kind: "continue" };
 }

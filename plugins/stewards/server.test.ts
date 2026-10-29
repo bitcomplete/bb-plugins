@@ -31,6 +31,8 @@ function world() {
   const entities = new Map<string, EntitySnapshot>();
   /** Dependabot alerts the fake github serves, by lowercased repo. */
   const dependabotAlerts = new Map<string, unknown[]>();
+  /** Entity ids whose snapshot read throws, for the failed-read test (BB-115). */
+  const snapshotErrors = new Set<string>();
   /** The login `sourceValidate` reports, per source; tests override one to make it unreadable (BB-105). */
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
@@ -121,7 +123,10 @@ function world() {
       out = { projectSourcePath: "/p/.bb", head: "abc", files: paths.map((path) => ({ path, content: files[path] ?? null })), error: null };
     }
     else if (args.method === "repoSet") out = { repos, primary, layout, error: null };
-    else if (args.method === "sourceSnapshot") out = { snapshot: entities.get(String(input.id)) ?? null };
+    else if (args.method === "sourceSnapshot") {
+      if (snapshotErrors.has(String(input.id))) throw new Error("Linear rate limited the read");
+      out = { snapshot: entities.get(String(input.id)) ?? null };
+    }
     else if (args.method === "sourceSetInterest") out = { ok: true };
     else if (args.method === "sourceAdoptable") {
       const units = input.units as string[];
@@ -322,7 +327,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -6124,6 +6129,11 @@ describe("ops stewards", () => {
     expect(back).toMatch(/escalate\s+a decision recommending it be reopened/u);
   });
 
+  it("criterion 7: the wake assigns every ticket it files to this server's owner", async () => {
+    const { wakes } = await watched();
+    expect(wakes()[0]).toMatch(/Assign every ticket you file to this server's owner, Jane, and to no one else/u);
+  });
+
   it("takes a short turn at every requeue when all is healthy, and none between", async () => {
     const { t, c, steward, wakes } = await watched();
     c.state.pods = [];
@@ -6331,6 +6341,11 @@ describe("dependency stewards", () => {
     expect(t.hooks.store.fingerprint("p1", "acme/web#4")).toMatchObject({ ticketKey: "ENG-50", severity: "high", ecosystem: "npm" });
   });
 
+  it("criterion 7: the wake assigns every ticket it files to this server's owner", async () => {
+    const { wakes } = await watching();
+    expect(wakes()[0]).toMatch(/Assign every ticket you file to this server's owner, Jane, and to no one else/u);
+  });
+
   it("joins a second low alert to the open ticket and tightens its due date for a medium one", async () => {
     const { t, steward, wakes } = await watching([alert({ number: 4, severity: "low", ghsaId: "GHSA-low-1" })]);
     const ops = steward()!.id;
@@ -6413,6 +6428,19 @@ describe("dependency stewards", () => {
     expect(prompt).toMatch(/playbook deps-prs@/u);
     expect(prompt).toMatch(/You steward one Dependabot version-update pull request/u);
     expect(prompt).toMatch(/never merge it: you adopt it, get it reviewed, and leave the\s+merge to a person/u);
+  });
+
+  it("keeps a labelled dependabot[bot] pull request under deps-prs, not the labelled-author rule (BB-115)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: ["bb-managed"] }));
+    await t.hooks.sweep();
+    await t.flush();
+    const pr = t.spawns.find((x) => x.title === "acme/web#9: Add login retry");
+    expect(pr).toBeDefined();
+    expect(String(pr!.prompt)).toMatch(/playbook deps-prs@/u);
+    expect(t.hooks.store.find("acme/web#9", "p1")!.playbook).toBe("deps-prs");
   });
 
   // A Dependabot bump that cannot merge as is comes back as a worker's own
@@ -8564,24 +8592,31 @@ describe("roles.json (BB-105)", () => {
     expect(await t.list()).toMatchObject([{ key: "ENG-13", kind: "ticket" }]);
   });
 
-  it("adopts an unassigned ticket on the project steward's server only", async () => {
+  it("adopts an unassigned labelled ticket nowhere, and lists it in the digest", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roles({ jane: { projectSteward: true } });
     t.entities.set("uuid-12", issue({ assignees: [] }));
     await t.ring("linear", "uuid-12");
-    expect(await t.list()).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
+    expect(await t.list()).toEqual([]);
 
     const other = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     other.files[ROLES_FILE] = roles({ jane: {}, boss: { projectSteward: true } });
     other.entities.set("uuid-12", issue({ assignees: [] }));
     await other.ring("linear", "uuid-12");
     expect(await other.list()).toEqual([]);
+
+    // The project steward's digest names it read-only.
+    await t.hooks.nightlyPass("p1", "manual");
+    await t.flush();
+    const project = t.hooks.store.project("p1").threadId!;
+    const wake = t.sends.filter((s) => s.threadId === project).at(-1)!.text;
+    expect(wake).toMatch(/labelled, no assignee: ENG-12/u);
   });
 
   it("makes a review steward only when the viewer is a requested reviewer", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[ROLES_FILE] = roles({ jane: {}, boss: { projectSteward: true } });
-    t.entities.set("acme/web#7", pull());
+    t.entities.set("acme/web#7", pull({}, { requestedReviewers: [] }));
     await t.ring("github", "acme/web#7");
     expect(await t.list()).toEqual([]);
     t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8" }, { requestedReviewers: ["jane"] }));
@@ -8589,7 +8624,7 @@ describe("roles.json (BB-105)", () => {
     expect(await t.list()).toMatchObject([{ key: "acme/web#8", kind: "review" }]);
   });
 
-  it("still adopts a legacy project's unassigned ticket and says ops belongs in roles.json", async () => {
+  it("still says ops belongs in roles.json on a legacy project, but adopts no unassigned ticket", async () => {
     const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: [{ kind: "k8s-namespace", name: "bb-gate-production" }] } });
     t.files[playbookPath("ops-watch")] = OPS_WATCH;
@@ -8597,7 +8632,7 @@ describe("roles.json (BB-105)", () => {
     await t.hooks.sweep();
     await t.flush();
     await t.ring("linear", "uuid-12");
-    expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "ENG-12", kind: "ticket" })]));
+    expect((await t.list()).filter((b) => b.kind === "ticket")).toEqual([]);
     expect(await problemsOf(t)).toContain("ops now belongs in stewards/roles.json");
   });
 
@@ -8696,5 +8731,167 @@ describe("roles.json (BB-105)", () => {
     await none.hooks.sweep();
     await none.flush();
     expect((await problemsOf(none)).some((p) => p.includes("no one is the project steward"))).toBe(true);
+  });
+});
+
+// BB-115: adoption follows one human-set owner per kind of work, with or
+// without a roles.json project steward. A ticket is this server's only when
+// its Linear login is an assignee, a labelled pull request only when its
+// GitHub login is the author, and a teammate's review only where its GitHub
+// login is a requested reviewer. Reassignment releases the old server.
+describe("strict owner dispatch (BB-115)", () => {
+  const problemsOf = async (t: Awaited<ReturnType<typeof setup>>): Promise<string[]> => {
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ problems: string[] }> };
+    return overview.projects[0]!.problems;
+  };
+
+  it("criterion 1: a ticket assigned to another login is not adopted", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"] }));
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual([]);
+  });
+
+  it("criterion 3: reassigning an adopted ticket ends its binding with one stop turn and stops its workers", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    await t.created("thr_w1", steward);
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("running");
+
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const released = t.hooks.store.find("ENG-12", "p1")!;
+    expect(released.ending).toBe("reassigned");
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
+    expect(t.sends.at(-1)!.text).toMatch(/assignee no longer includes this server's login/u);
+
+    await t.idle(steward);
+    const ended = t.hooks.store.find("ENG-12", "p1")!;
+    expect(ended.endedAt).not.toBeNull();
+    expect(ended.endReason).toBe("reassigned");
+  });
+
+  it("criterion 3: unassigning an adopted ticket releases it too", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+
+    t.entities.set("uuid-12", issue({ assignees: [] }));
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")!.ending).toBe("reassigned");
+    await t.idle(steward);
+    expect(t.hooks.store.find("ENG-12", "p1")!.endedAt).not.toBeNull();
+  });
+
+  it("criterion 3: the new assignee's server adopts the ticket on the next sweep", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"] }));
+    await t.ring("linear", "uuid-12");
+    await t.idle(steward);
+    expect(t.hooks.store.find("ENG-12", "p1")!.endedAt).not.toBeNull();
+
+    const other = await setup();
+    other.viewers.linear = "Sam";
+    other.entities.set("uuid-12", issue({ assignees: ["Sam"] }));
+    await other.hooks.sweep();
+    await other.flush();
+    expect(await other.list()).toMatchObject([{ key: "ENG-12", kind: "ticket" }]);
+  });
+
+  it("criterion 3 limit: a failed or rate-limited read never ends a binding", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-12");
+    const before = t.hooks.store.find("ENG-12", "p1")!;
+
+    // The ticket now names Sam, but the read fails: keep it and retry later.
+    t.entities.set("uuid-12", issue({ assignees: ["Sam"] }));
+    t.setSnapshotError("uuid-12", true);
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.find("ENG-12", "p1")!;
+    expect(after.ending).toBeNull();
+    expect(after.endedAt).toBeNull();
+    expect(after.threadId).toBe(before.threadId);
+
+    // The next successful read releases it.
+    t.setSnapshotError("uuid-12", false);
+    await t.ring("linear", "uuid-12");
+    expect(t.hooks.store.find("ENG-12", "p1")!.ending).toBe("reassigned");
+  });
+
+  it("criterion 4: adopts my own labelled pull request, not another author's, and ignores my own unlabelled one", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({ labels: ["bb-managed"], author: "sam" }));
+    await t.ring("github", "acme/web#7");
+    expect(await t.list()).toEqual([]);
+
+    t.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8", labels: ["bb-managed"], author: "jane" }));
+    await t.ring("github", "acme/web#8");
+    expect(await t.list()).toMatchObject([{ key: "acme/web#8", kind: "pr" }]);
+
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "jane" }, { requestedReviewers: ["jane"] }));
+    await t.ring("github", "acme/web#9");
+    expect((await t.list()).map((b) => b.key)).not.toContain("acme/web#9");
+  });
+
+  it("criterion 4: a ticket worker's own pull request stays under the ticket binding", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"], state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.hooks.store.find("ENG-12", "p1")!.threadId!;
+    await t.created("thr_w1", steward);
+    t.entities.set("acme/web#7", pull({ author: "jane" }, { headAuthor: "jane" }));
+    await t.ring("github", "acme/web#7");
+    expect((await t.list()).map((b) => b.key)).toEqual(["ENG-12"]);
+  });
+
+  it("criterion 5: a review binding survives GitHub dropping the reviewer until merge or close", async () => {
+    const t = await setup();
+    t.entities.set("acme/web#7", pull({}, { requestedReviewers: ["jane"] }));
+    await t.ring("github", "acme/web#7");
+    const binding = t.hooks.store.find("acme/web#7", "p1")!;
+    const steward = binding.threadId!;
+
+    t.entities.set("acme/web#7", pull({}, { requestedReviewers: [] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7", "p1")!.endedAt).toBeNull();
+    expect(t.hooks.store.find("acme/web#7", "p1")!.threadId).toBe(steward);
+
+    t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true, requestedReviewers: [] }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.find("acme/web#7", "p1")!.ending).toBe("terminal");
+  });
+
+  it("criterion 6: the same rule holds without roles.json", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ assignees: [] }));
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual([]);
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-13");
+    expect(await t.list()).toMatchObject([{ key: "ENG-13", kind: "ticket" }]);
+
+    const r = await setup();
+    r.entities.set("acme/web#7", pull({}, { requestedReviewers: [] }));
+    await r.ring("github", "acme/web#7");
+    expect(await r.list()).toEqual([]);
+    r.entities.set("acme/web#8", pull({ id: "acme/web#8", key: "acme/web#8" }, { requestedReviewers: ["jane"] }));
+    await r.ring("github", "acme/web#8");
+    expect(await r.list()).toMatchObject([{ key: "acme/web#8", kind: "review" }]);
+  });
+
+  it("criterion 6: an unreadable login adopts nothing and shows one problem line", async () => {
+    const t = await setup();
+    t.viewers.github = null;
+    t.entities.set("uuid-12", issue({ assignees: ["Jane"] }));
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual([]);
+    expect((await problemsOf(t)).some((p) => p.includes("GitHub login cannot be read"))).toBe(true);
   });
 });

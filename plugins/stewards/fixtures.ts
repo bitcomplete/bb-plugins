@@ -13,7 +13,10 @@ export const issue = (over: Partial<EntitySnapshot> = {}): EntitySnapshot => ({
   unit: "ENG",
   labels: ["bb-managed"],
   author: "Jane",
-  assignees: [],
+  // Assigned to the default viewer: a ticket is adopted only where this
+  // server's Linear login is an assignee (BB-115). Tests for an unassigned or
+  // reassigned ticket override this.
+  assignees: ["Jane"],
   priority: null,
   estimate: null,
   description: "Users cannot log in.",
@@ -43,7 +46,10 @@ export const pull = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNu
   author: "sam",
   description: "Retries login.",
   viewer: "jane",
-  pull: { draft: false, merged: false, base: "main", head: "retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: [], reviews: [], checks: { state: "pending", failing: [] }, ...pullOver },
+  // The viewer is a requested reviewer by default: a review binding is made
+  // only where this server's GitHub login is requested (BB-115). Tests for a
+  // pull request that should not be reviewed override this.
+  pull: { draft: false, merged: false, base: "main", head: "retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: ["jane"], reviews: [], checks: { state: "pending", failing: [] }, ...pullOver },
   ...over,
 });
 

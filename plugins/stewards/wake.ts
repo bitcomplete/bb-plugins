@@ -140,11 +140,13 @@ function fit(head: string[], middle: string[], tail: string[], maxChars = WAKE_M
 }
 
 /** Why this wake: an ordinary reconcile, or a lifecycle turn with its own instructions. */
-export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "disabled" | "reopen";
+export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "disabled" | "reassigned" | "reopen";
 
 const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
   detach:
     "The label was removed, so this binding is detached. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying the work is done here. Adding the label back brings this thread back.",
+  reassigned:
+    "The ticket's assignee no longer includes this server's login, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. The new assignee's server adopts the ticket on its next doorbell or sweep. End with steward_report, saying where the work stands. Assigning the ticket back to this server resumes this thread.",
   disabled:
     "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying where the work stands. Switching the project back on resumes this thread.",
   reopen: "The entity came back from a terminal or detached state and this binding has resumed. Re-read everything below as if new.",
@@ -589,11 +591,25 @@ export type OpsWakeInput = {
   /** The Linear team tickets are filed in. */
   team: string | null;
   label: string;
+  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  owner: string | null;
   /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
   autoAdopt: string[];
   escalations: Escalation[];
   changes: string[];
 };
+
+/**
+ * How a watcher assigns the tickets it files (BB-115). The owner is this
+ * server's connected Linear user, the person the watch belongs to; a login
+ * that could not be read files unassigned and never guesses. The problem line
+ * itself is already on `bb stewards check`.
+ */
+function assignInstruction(owner: string | null): string {
+  return owner === null
+    ? "This server's Linear login could not be read, so file every ticket unassigned; never guess an assignee. `bb stewards check` says why."
+    : `Assign every ticket you file to this server's owner, ${owner}, and to no one else: pass assignee: "me" to linear_create_issue (it resolves to ${owner}).`;
+}
 
 const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
   adopted: "You have just been made the ops steward for this target. Read everything below, then act on what the look found.",
@@ -634,6 +650,7 @@ export function formatOpsWake(input: OpsWakeInput): string {
   }
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
   out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
+  if (input.team !== null) out.push(assignInstruction(input.owner));
   if (input.autoAdopt.length > 0) {
     out.push(
       `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,
@@ -684,6 +701,8 @@ export type DepsWakeInput = {
   /** The Linear team tickets are filed in. */
   team: string | null;
   label: string;
+  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  owner: string | null;
   /** Severities whose tickets are labelled when filed (deps.autoAdopt). */
   autoAdopt: string[];
   /** The project's time zone, which due dates are given in. */
@@ -735,6 +754,7 @@ export function formatDepsWake(input: DepsWakeInput): string {
   }
   out.push("", `Allowed actions: ${playbook.may.join(", ") || "(none)"}.`);
   out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue, and set each ticket's due date to the deadline the alert names.`);
+  if (input.team !== null) out.push(assignInstruction(input.owner));
   if (input.autoAdopt.length > 0) {
     out.push(`deps.autoAdopt: a ticket you file for a ${input.autoAdopt.join(" or ")} alert is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`);
   }
@@ -780,6 +800,8 @@ export type SentryWakeInput = {
   /** The Linear team tickets are filed in. */
   team: string | null;
   label: string;
+  /** This server's connected Linear login, which owns every ticket it files; null when unreadable. */
+  owner: string | null;
   /** Priorities whose tickets are labelled when filed (ops.autoAdopt). */
   autoAdopt: string[];
   escalations: Escalation[];
@@ -838,6 +860,7 @@ export function formatSentryWake(input: SentryWakeInput): string {
     "This target is a Sentry project, not a Kubernetes namespace: the plugin reads it with its own Sentry token, which your thread does not hold, so you cannot query Sentry yourself. Diagnose from the evidence below (the stack trace names the code) and the code in your workspace, and link the issue's permalink in the ticket. The fingerprint is the Sentry issue id.",
   );
   out.push(input.team === null ? "No Linear team is configured to file in: escalate a blocked question instead of filing." : `File tickets in the Linear team ${input.team} with linear_create_issue.`);
+  if (input.team !== null) out.push(assignInstruction(input.owner));
   if (input.autoAdopt.length > 0) {
     out.push(
       `ops.autoAdopt: a ticket you file at ${input.autoAdopt.join(" or ")} priority is adopted at once: add the label \`${input.label}\` and move it to Todo when you file it, and raise no escalation for it. Say in your report that you did.`,

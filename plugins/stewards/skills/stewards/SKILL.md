@@ -12,10 +12,18 @@ steward** per project sits above all of them.
 
 | Binding | Made when | Playbook |
 |---|---|---|
-| `ticket` | the project's label (default `bb-managed`) is on a Linear issue in a listed team | `linear-tickets` |
-| `pr` | the label is on a pull request in one of the project's repos | `github-prs` |
-| `review` | a teammate opens, or marks ready, a pull request in one of the project's repos; once `roles.json` names a project steward, only where your review is requested | `github-reviews` |
+| `ticket` | the label (default `bb-managed`) is on a Linear issue in a listed team and this server's Linear login is an assignee | `linear-tickets` |
+| `pr` | the label is on a pull request in one of the project's repos and this server's GitHub login is its author | `github-prs` |
+| `review` | a teammate opens, or marks ready, a pull request in one of the project's repos and this server's GitHub login is a requested reviewer (checked once, at adoption) | `github-reviews` |
 | `ops` | this server's `roles.json` entry watches a namespace or Sentry project | `ops-watch` |
+
+Each kind of work has one owner, set by a human: a ticket follows the Linear
+assignee, a labelled pull request its author, a review the GitHub requested
+reviewer. An unassigned labelled ticket is adopted nowhere. Reassigning or
+unassigning an adopted ticket releases the old server with one stop turn and
+stops its workers; the new assignee's server adopts it. The rule is the same
+with or without a `roles.json` project steward, and a login that cannot be
+read adopts nothing and shows one problem line.
 
 ## If you are a steward
 
@@ -236,10 +244,12 @@ is the plugin's, so diagnose from the wake and the code in your workspace.
 - **New:** search the team for an open ticket about it, then file one ticket
   per problem with `linear_create_issue`: pod and container, since when, the
   evidence quoted, your diagnosis, a priority, and a line
-  ``Fingerprint: `<fingerprint>` ``. Raise one `decision` escalation for the
-  tickets of the turn: "Filed BB-N (high): …. Recommend adopting." A priority
-  the wake says `ops.autoAdopt` covers you label and move to Todo yourself,
-  with no escalation.
+  ``Fingerprint: `<fingerprint>` ``. Assign every ticket you file to this
+  server's owner (`assignee: "me"`) and to no one else; the wake names the
+  owner, and one that cannot be read files unassigned. Raise one `decision`
+  escalation for the tickets of the turn: "Filed BB-N (high): …. Recommend
+  adopting." A priority the wake says `ops.autoAdopt` covers you label and move
+  to Todo yourself, with no escalation.
 - **Recurring:** comment on its ticket when the evidence moved; file nothing.
 - **Returned:** as the playbook says: comment and escalate a reopen, or file
   anew linking the old ticket.
@@ -438,8 +448,11 @@ above which a steward is compacted after its turn.
 ## When something is wrong
 
 - **Nothing is adopted.** `bb stewards check`. The label must be on the
-  ticket, its team in `linear.teams`, and the linear plugin connected. Rings
-  need bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
+  ticket, its team in `linear.teams`, and the linear plugin connected; the
+  ticket must be assigned to this server's Linear login, a labelled pull
+  request authored by its GitHub login, and a teammate's review requested from
+  it. An unassigned labelled ticket is adopted nowhere. Rings need
+  bb-gate-hooks (`BB_HOOKS_URL`); without it, adoption waits for the
   half-hourly sweep.
 - **An ops steward never wakes.** `bb stewards list` shows `cannot read the
   target` and `bb stewards check` says why: kubectl on the project's
