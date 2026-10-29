@@ -140,11 +140,13 @@ function fit(head: string[], middle: string[], tail: string[], maxChars = WAKE_M
 }
 
 /** Why this wake: an ordinary reconcile, or a lifecycle turn with its own instructions. */
-export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "reopen";
+export type WakeReason = "adopted" | "changed" | "requeue" | "nightly" | "terminal" | "follow-through" | "detach" | "disabled" | "reopen";
 
 const LIFECYCLE_INSTRUCTIONS: Partial<Record<WakeReason, string>> = {
   detach:
     "The label was removed, so this binding is detached. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying the work is done here. Adding the label back brings this thread back.",
+  disabled:
+    "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the entity and start no workers; running workers have been stopped. End with steward_report, saying where the work stands. Switching the project back on resumes this thread.",
   reopen: "The entity came back from a terminal or detached state and this binding has resumed. Re-read everything below as if new.",
   adopted: "You have just been bound to this entity. Read everything below, then act on the phase's instructions.",
   nightly: "This is the nightly reconcile pass: nothing may have changed. Check for drift the event path missed, and report.",
@@ -597,6 +599,7 @@ const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
   adopted: "You have just been made the ops steward for this target. Read everything below, then act on what the look found.",
   reopen: "This target is configured again and its binding has resumed. Re-read everything below as if new.",
   nightly: "This is the nightly reconcile pass: check that every problem below is filed, and report.",
+  disabled: "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the target and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this thread.",
 };
 
 const CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
@@ -693,6 +696,7 @@ const DEPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
   adopted: "You have just been made the dependency steward for this repository. Read everything below, then act on the alerts.",
   reopen: "This repository is watched again and its binding has resumed. Re-read everything below as if new.",
   nightly: "This is the nightly reconcile pass: re-list the open alerts and check that every one is filed, batched or trimmed.",
+  disabled: "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the repository and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this thread.",
 };
 
 const DEPS_CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
@@ -786,6 +790,7 @@ const SENTRY_LIFECYCLE: Partial<Record<WakeReason, string>> = {
   adopted: "You have just been made the ops steward for this Sentry project. Read everything below, then act on what the look found.",
   reopen: "This project is watched again and its binding has resumed. Re-read everything below as if new.",
   nightly: "This is the nightly reconcile pass: check that every issue below is filed, and report.",
+  disabled: "Stewards for this project were switched off on this server, so this binding is ending. Take no new actions on the Sentry project and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this thread.",
 };
 
 const SENTRY_REASON_TEXT: Record<SentryReason, string> = {

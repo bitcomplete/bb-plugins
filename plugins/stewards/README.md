@@ -396,8 +396,11 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 - **The settings page** (Settings → Plugins → Stewards, [app.tsx](app.tsx))
   shows each stewarded project's configuration, problems, project steward
   and nightly pass, runs `bb stewards check` on a button, and lists every
-  open steward with its latest status record and open escalations. It is
-  read-only; steering stays with the project steward and `steward_update`.
+  open steward with its latest status record and open escalations. Each
+  project's row also has the per-project switch that turns stewards on or
+  off for that project on this server (BB-112); everything else is
+  read-only, and steering stays with the project steward and
+  `steward_update`.
 
 - **@bb mentions.** A Linear comment that mentions `@bb` reaches this
   server through linear (`stewardsSession`, see linear's README, "@bb
@@ -584,6 +587,21 @@ not the project steward therefore waits on its own binding; cross-server
 routing is a later change. A review binding adopted before `roles.json`
 landed keeps reviewing until its pull request closes — detach one by hand to
 stop it.
+
+A project is stewarded on a server only when both hold: its `.bb` has
+`stewards/project.json` (the project *can* be stewarded) and the server's
+local, per-project switch is on (this server *does* steward it). The switch is
+keyed by project id and off by default, so a recreated project starts off
+again and nothing in `.bb` changes. Switch it on each project's row of the
+settings page, or with `bb stewards enable|disable [--project <id>]`.
+Turning on sweeps the project at once and reopens the bindings the last
+switch-off ended; turning off gives each open binding one stop turn, stops its
+workers, archives the project steward, releases the leases and adopts nothing
+new, keeping the records so turning back on resumes rather than starts over.
+`bb stewards list` and `bb stewards check` say when a project is configured but
+off on this server. Deleting a project goes through the same path and purges
+the records instead of keeping them. `paused` is the global brake and is
+unchanged.
 
 The `deps` object is the dependency watch: `sla` (a duration or `asap` per
 severity; critical→urgent, high→high, medium→medium, low→low), `batch` (the
