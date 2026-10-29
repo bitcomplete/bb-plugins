@@ -1166,24 +1166,35 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
        * The role this server runs. With no roles.json, the legacy project.ops
        * is every server's role, as before. With one, the entry keyed by this
        * server's GitHub login; no entry runs no watches and no project
-       * steward, and the home page says so. A login that cannot be read runs
-       * no roles and never falls back to running every role.
+       * steward, and the home page says so. A login that cannot be read
+       * adopts nothing and shows one problem line (BB-115, addendum 2): with
+       * roles.json it runs no roles, and the legacy ops watch keeps running
+       * because it does not need a login.
        */
       let githubLogin: string | null = null;
       let linearLogin: string | null = null;
       let role: StewardRole | null;
       let rolesUnreadable = false;
-      if (rolesPresent) {
-        githubLogin = await readViewer("github", file.label);
-        linearLogin = await readViewer("linear", file.label);
-        if (githubLogin === null || linearLogin === null) {
-          rolesUnreadable = true;
+      // The logins are read whether or not roles.json is present: a ticket is
+      // adopted only where this server's Linear login is an assignee, and a
+      // review only where its GitHub login is a requested reviewer (BB-115).
+      githubLogin = await readViewer("github", file.label);
+      linearLogin = await readViewer("linear", file.label);
+      if (githubLogin === null || linearLogin === null) {
+        rolesUnreadable = true;
+        const which = githubLogin === null ? "GitHub" : "Linear";
+        if (rolesPresent) {
           role = null;
-          problems.push(`${ROLES_FILE} is present but this server's ${githubLogin === null ? "GitHub" : "Linear"} login cannot be read; running no roles`);
+          problems.push(`${ROLES_FILE} is present but this server's ${which} login cannot be read; running no roles`);
         } else {
-          role = roles?.roles[lc(githubLogin)] ?? null;
-          if (roles !== null && role === null) problems.push(`No role for ${githubLogin} in ${ROLES_FILE}`);
+          // The legacy ops watch does not need a login; only adoption does.
+          // Keep running it and adopt nothing (BB-115, addendum 2).
+          role = legacyRole(file);
+          problems.push(`this server's ${which} login cannot be read; adopting nothing`);
         }
+      } else if (rolesPresent) {
+        role = roles?.roles[lc(githubLogin)] ?? null;
+        if (roles !== null && role === null) problems.push(`No role for ${githubLogin} in ${ROLES_FILE}`);
       } else {
         role = legacyRole(file);
       }
@@ -2465,7 +2476,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
       const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
-      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file) });
+      const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file), owner: config.linearLogin });
       // A binding with no steward thread is still awaiting adoption: a first
       // wake lost to a transient read is retried on the next reconcile, as the
       // ops, deps and sentry paths already do (BB-92).
@@ -2483,7 +2494,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // only one that has not begun ending: one already following through (a
       // ticket Done with its pull request still open) must keep falling
       // through to the wake, so the deployment is not swallowed.
-      if ((life.kind === "terminal" || life.kind === "detach") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
+      if ((life.kind === "terminal" || life.kind === "detach" || life.kind === "reassigned") && !(life.kind === "terminal" && awaitingDeploy && b.ending === null)) {
         if (b.ending === null) {
           await beginEnding(b, config, playbook, life.kind, observed);
           return;
@@ -2927,6 +2938,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         look,
         team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
+        owner: config.linearLogin,
         autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
@@ -2984,6 +2996,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         look,
         team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
+        owner: config.linearLogin,
         autoAdopt: config.file.deps.autoAdopt,
         timeZone: config.file.nightly.timezone,
         escalations: store.openEscalations(b.id),
@@ -3179,6 +3192,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         look,
         team: roleOpsTeam(config.role, config.file),
         label: config.file.label,
+        owner: config.linearLogin,
         autoAdopt: config.role?.ops?.autoAdopt ?? [],
         escalations: store.openEscalations(b.id),
         changes: [...new Set(changes.map((c) => c.text))],
@@ -3322,13 +3336,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     const TERMINAL_WORKER_REPORT_MS = 15 * 60_000;
 
     /**
-     * The one wrap-up (terminal) or stop (detach) turn before the binding
-     * ends. A detach stops the workers now: someone took the label off. A
-     * terminal state leaves them running through the wrap-up turn, in which
-     * the steward may keep the binding open to follow through (a deploy to
-     * watch, production to verify); they are stopped when it ends.
+     * The one wrap-up (terminal) or stop (detach, disabled, reassigned) turn
+     * before the binding ends. A detach stops the workers now: someone took
+     * the label off; a reassignment or an unassignment releases the binding
+     * the same way. A terminal state leaves them running through the wrap-up
+     * turn, in which the steward may keep the binding open to follow through
+     * (a deploy to watch, production to verify); they are stopped when it
+     * ends.
      */
-    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach" | "disabled", observed: Observed): Promise<void> {
+    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach" | "disabled" | "reassigned", observed: Observed): Promise<void> {
       // BB-52 rule 4: the steward's own last report already named the terminal
       // state, or a worker's final message says it moved the entity there, so
       // the binding's own last turn set it and said the work is done. End from
@@ -3343,9 +3359,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ownDone = kind === "terminal" && (stewardDone || workerDone);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
-      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : "was detached");
+      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : "was detached");
       if (kind !== "terminal") await stopWorkers(b);
-      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "is ending because its project was switched off" : "was detached"}; one last turn`);
+      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "is ending because its project was switched off" : kind === "reassigned" ? "was reassigned away from this server" : "was detached"}; one last turn`);
       if (b.threadId === null) {
         await finishEnding(b, kind);
         return;
@@ -3360,7 +3376,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await finishEnding(b, "terminal");
         return;
       }
-      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : `The ${config.file.label} label was removed`], kind);
+      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : kind === "reassigned" ? `Reassigned: ${observed.entity.assignees.join(", ") || "no assignee"}` : `The ${config.file.label} label was removed`], kind);
     }
 
     /**
@@ -3401,13 +3417,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const team = roleOpsTeam(config.role, config.file);
       const escalations = store.openEscalations(b.id);
       if (target?.kind === "dependabot" && b.depsLook !== null) {
-        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, changes });
+        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, changes });
       }
       if (target?.kind === "sentry-project" && b.sentryLook !== null) {
-        return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, team, label: config.file.label, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+        return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
       }
       if (target?.kind === "k8s-namespace" && b.opsLook !== null) {
-        return formatOpsWake({ reason: "disabled", binding: b, playbook, look: b.opsLook, team, label: config.file.label, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+        return formatOpsWake({ reason: "disabled", binding: b, playbook, look: b.opsLook, team, label: config.file.label, owner: config.linearLogin, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
       }
       return `# ${b.entityKey}\n\nStewards for this project were switched off on this server. This is your stop turn: take no new actions on the target and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this binding.`;
     }
@@ -3493,17 +3509,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       configs.find((c) => (entity.source === "linear" ? c.file.linear.teams.includes(entity.unit.toUpperCase()) : c.repos.some((r) => lc(r) === lc(entity.unit)))) ?? null;
 
     /**
-     * Whether a roles.json names a project steward, so ticket and review
-     * adoption narrows to this server's owner (BB-105, addendum 1). Without a
-     * roles.json adoption is exactly as before: every managed ticket and
-     * teammate pull request is adopted.
-     */
-    const rolesNameProjectSteward = (config: ProjectConfig): boolean => config.roles !== null && Object.values(config.roles.roles).some((r) => r.projectSteward);
-
-    /**
      * Which kind of binding an entity wants in this project, or null for none.
      * `assignees` and `requestedReviewers` are absent on the nightly pass's
      * list, which is permissive: `maybeAdopt` re-checks with the full snapshot.
+     *
+     * Adoption follows one human-set owner per kind of work (BB-115): a ticket
+     * is this server's when its Linear login is an assignee, a labelled pull
+     * request when its GitHub login is the author, and a teammate's review only
+     * where its GitHub login is a requested reviewer. The rule is the same
+     * with or without a roles.json project steward; a login that cannot be read
+     * adopts nothing.
      */
     function adoptionKind(
       config: ProjectConfig,
@@ -3514,21 +3529,30 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (e.source === "linear") {
         const playbook = playbookFor(config, "ticket");
         if (!labelled || playbook === null || isTerminal(playbook, e.state)) return null;
-        // roles.json present but this server's login unreadable: run no roles.
+        // A login that cannot be read adopts nothing (BB-115, addendum 2).
         if (config.rolesUnreadable) return null;
-        if (rolesNameProjectSteward(config) && e.assignees !== undefined) {
-          // The Linear assignee decides; an unassigned ticket belongs to the
-          // project steward's server, so none is orphaned.
+        // The Linear assignee is the owner. A ticket assigned to another login,
+        // or to nobody, is adopted nowhere here; the new assignee's server
+        // picks it up on the doorbell or the next sweep. `assignees` is absent
+        // on the nightly list, so `maybeAdopt` re-checks the full snapshot.
+        if (e.assignees !== undefined) {
           const mine = config.linearLogin !== null && e.assignees.some((a) => lc(a) === lc(config.linearLogin));
-          if (!mine && !(e.assignees.length === 0 && config.role?.projectSteward === true)) return null;
+          if (!mine) return null;
         }
         return "ticket";
       }
       if (e.kind !== "pull") return null;
-      // A labelled pull request is the project's own work, whatever the login.
+      // A login that cannot be read adopts nothing (BB-115, addendum 2).
+      if (config.rolesUnreadable) return null;
+      // A labelled pull request is this server's own work only when its author
+      // is this server's GitHub login; another author's is handled on the
+      // author's server. An unlabelled pull request of my own falls through to
+      // the review path and is ignored there.
       if (labelled) {
         const playbook = playbookFor(config, "pr");
-        return playbook !== null && !isTerminal(playbook, e.state) ? "pr" : null;
+        if (playbook === null || isTerminal(playbook, e.state)) return null;
+        if (e.author === null || config.githubLogin === null || lc(e.author) !== lc(config.githubLogin)) return null;
+        return "pr";
       }
       // The dependency watch adopts the bot's version-update pull requests in
       // the repos it watches, whether or not they are labelled. deps-prs
@@ -3538,10 +3562,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;
       if (review.skipAuthors.some((a) => lc(a) === lc(e.author))) return null;
-      if (config.rolesUnreadable) return null;
-      // Once a project steward is named, a review steward is made only where
-      // the viewer is a requested reviewer.
-      if (rolesNameProjectSteward(config) && e.requestedReviewers !== undefined && !e.requestedReviewers.some((r) => lc(r) === lc(viewer))) return null;
+      // A review steward is made only where this server's GitHub login is a
+      // requested reviewer, checked once, at adoption; the binding survives
+      // GitHub dropping the reviewer until the pull request is merged or
+      // closed. `requestedReviewers` is absent on the nightly list, so
+      // `maybeAdopt` re-checks the full snapshot.
+      if (e.requestedReviewers !== undefined && (config.githubLogin === null || !e.requestedReviewers.some((r) => lc(r) === lc(config.githubLogin)))) return null;
       return "review";
     }
 
@@ -3692,12 +3718,17 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await maybeAdopt(entity, projects);
     }
 
+    /** A labelled ticket with no assignee, listed read-only in the digest (BB-115). */
+    type UnassignedTicket = { key: string; title: string | null; url: string | null };
+
     /**
      * The nightly backstop for adoption: everything adoptable that has no
      * binding, oldest first, at most `perPass` per project per pass so
-     * turning stewards on does not start every steward at once.
+     * turning stewards on does not start every steward at once. With
+     * `collectUnassigned` it also returns the labelled tickets nobody is
+     * assigned, which are adopted nowhere and belong in the digest.
      */
-    async function adoptionPass(config: ProjectConfig): Promise<number> {
+    async function adoptionPass(config: ProjectConfig, opts: { collectUnassigned?: boolean } = {}): Promise<{ adopted: number; unassigned: UnassignedTicket[] }> {
       const candidates: Array<{ source: Source; id: string; createdAt: string }> = [];
       const ask = async (source: Source, units: string[]) => {
         if (units.length === 0) return;
@@ -3716,13 +3747,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       await ask("linear", config.file.linear.teams);
       await ask("github", config.repos);
       candidates.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      // The digest's orphan list: every labelled ticket nobody is assigned.
+      // Only Linear candidates are read for it; the per-pass cap still bounds
+      // how many stewards a pass starts.
+      const unassigned: UnassignedTicket[] = [];
+      const orphanSnapshots = new Map<string, EntitySnapshot>();
+      if (opts.collectUnassigned) {
+        for (const c of candidates.filter((x) => x.source === "linear")) {
+          const entity = await snapshot("linear", c.id).catch(() => null);
+          if (entity === null) continue;
+          orphanSnapshots.set(c.id, entity);
+          if (entity.assignees.length === 0 && hasLabel(entity, config.file.label)) unassigned.push({ key: entity.key, title: entity.title, url: entity.url });
+        }
+      }
       let adopted = 0;
       for (const c of candidates) {
         if (adopted >= config.file.adoption.perPass) break;
-        const entity = await snapshot(c.source, c.id).catch(() => null);
+        const entity = orphanSnapshots.get(c.id) ?? (await snapshot(c.source, c.id).catch(() => null));
         if (entity !== null && (await maybeAdopt(entity, [config])) !== null) adopted++;
       }
-      return adopted;
+      return { adopted, unassigned };
     }
 
     // ---- escalations -----------------------------------------------------------------------------
@@ -7431,7 +7475,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       running.add(config.projectId);
       try {
         bb.log.info(`stewards: nightly pass for ${config.projectId} (${night})`);
-        if (!(await settings.get()).paused) await adoptionPass(config);
+        // The orphan list is read here so the digest can name the labelled
+        // tickets nobody is assigned, which are adopted nowhere (BB-115).
+        const adoption = (await settings.get()).paused ? { adopted: 0, unassigned: [] } : await adoptionPass(config, { collectUnassigned: true });
         await reconcileLessons(config);
         applyLessonTransitions(config);
         applyValidations(config);
@@ -7464,6 +7510,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             digestDue: true,
             notes: [
               `${woken.length} binding(s) had a turn tonight.`,
+              ...adoption.unassigned.map((t) => `labelled, no assignee: ${t.key}${t.title === null ? "" : ` ${t.title}`}${t.url === null ? "" : ` — ${t.url}`}. Assign it in Linear to the server that should own it; this one does not adopt it.`),
               ...followUps.map((x) => `The user's answer on ${x.id} went against your recommendation. Ask them once, in this thread, why — one follow-up — then record their reasoning as a lesson candidate with steward_update { lesson: { text, file, scope } }.`),
             ],
           });

@@ -44,8 +44,8 @@ describe("what changed", () => {
   });
 
   it("on a pull request: checks finishing, others' pushes and reviews, re-requests", () => {
-    const before = { entity: pull(), pulls: [] };
-    const ownPush = { entity: pull({}, { headSha: "bbbbbbb2", headAuthor: "jane" }), pulls: [] };
+    const before = { entity: pull({}, { requestedReviewers: [] }), pulls: [] };
+    const ownPush = { entity: pull({}, { headSha: "bbbbbbb2", headAuthor: "jane", requestedReviewers: [] }), pulls: [] };
     expect(actionable(diffObserved(before, ownPush, ctx))).toEqual([]);
     const theirs = { entity: pull({}, { headSha: "bbbbbbb2", headAuthor: "sam", checks: { state: "failure", failing: ["ci"] }, requestedReviewers: ["jane"], reviews: [{ author: "lee", state: "approved", submittedAt: "2026-10-02T00:00:00Z", commit: null }] }), pulls: [] };
     expect(actionable(diffObserved(before, theirs, ctx))).toEqual(["Pushed bbbbbbb by sam", "Checks finished: failure (failing: ci)", "Review: lee approved", "Your review was requested"]);
@@ -390,6 +390,22 @@ describe("lifecycle", () => {
   it("does not detach a review binding, which has no label", () => {
     expect(lifecycle({ ...open, kind: "review" }, reviews, pull(), "bb-managed").kind).toBe("continue");
     expect(lifecycle({ ...open, kind: "review" }, reviews, pull({ state: "merged" }), "bb-managed").kind).toBe("terminal");
+  });
+
+  it("releases a ticket whose assignee set no longer names this server, and reopens it when it returns", () => {
+    const owner = "jane";
+    expect(lifecycle(open, tickets, issue({ assignees: ["jane"] }), "bb-managed", { owner }).kind).toBe("continue");
+    expect(lifecycle(open, tickets, issue({ assignees: ["sam"] }), "bb-managed", { owner }).kind).toBe("reassigned");
+    expect(lifecycle(open, tickets, issue({ assignees: [] }), "bb-managed", { owner }).kind).toBe("reassigned");
+    // A login that could not be read never releases a binding (BB-115 limit a).
+    expect(lifecycle(open, tickets, issue({ assignees: ["sam"] }), "bb-managed", { owner: null }).kind).toBe("continue");
+    expect(lifecycle(open, tickets, issue({ assignees: ["sam"] }), "bb-managed", {}).kind).toBe("continue");
+    // A review or pr binding follows its label, not an assignee.
+    expect(lifecycle({ ...open, kind: "review" }, reviews, pull(), "bb-managed", { owner }).kind).toBe("continue");
+    // Assigned back to this server, an ended reassignment resumes; one still
+    // assigned elsewhere stays ended.
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "reassigned" }, tickets, issue({ assignees: ["jane"] }), "bb-managed", { owner }).kind).toBe("reopen");
+    expect(lifecycle({ ...open, endedAt: 1, endReason: "reassigned" }, tickets, issue({ assignees: ["sam"] }), "bb-managed", { owner }).kind).toBe("stay-ended");
   });
 });
 

@@ -9,9 +9,19 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
 ## What it does
 
 - **Adoption.** A Linear issue in a listed team carrying the project's label
-  (`bb-managed` by default) gets a `ticket` steward. A labelled pull request
-  in one of the project's repos gets a `pr` steward. Every non-draft pull
-  request a teammate opens in those repos gets a `review` steward. Each
+  (`bb-managed` by default) gets a `ticket` steward when this server's Linear
+  login is an assignee. A labelled pull request in one of the project's repos
+  gets a `pr` steward when this server's GitHub login is its author. A
+  non-draft pull request a teammate opens gets a `review` steward only where
+  this server's GitHub login is a requested reviewer, checked once at
+  adoption; the binding lasts until the pull request is merged or closed. An
+  unassigned labelled ticket is adopted nowhere, and the project steward's
+  digest lists it read-only as "labelled, no assignee". Reassigning or
+  unassigning an adopted ticket releases the old server with one stop turn and
+  stops its workers; the new assignee's server adopts it on the doorbell or the
+  next sweep. The rule is the same with or without a `roles.json` project
+  steward, and a login that cannot be read adopts nothing and shows one problem
+  line. Each
   steward reports to its nearest managed ancestor's steward, or to the
   project's **project steward**, through its binding, and is spawned as a
   child of the project steward with parent notifications off: the sidebar
@@ -34,7 +44,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   whatever the look found: a problem still failing under its open ticket is
   a comment there and nothing new filed, and a healthy look is a short
   "all healthy" report. The steward
-  files one ticket per problem and escalates a `decision` to the project
+  files one ticket per problem — assigned to this server's owner, never to
+  anyone else — and escalates a `decision` to the project
   steward ("Filed BB-N (high), recommend adopting"); the project steward
   adopts with the label and Todo, the ordinary path. Every kubectl call the
   plugin makes passes one gate that allows only `get`, `describe`, `logs`
@@ -43,7 +54,8 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   wall. Until kubectl can read a target, its binding waits and `bb stewards
   check` says "cannot read the target". DESIGN.md §18.
 - **Dependency stewards.** GitHub scans; the stewards turn Dependabot alerts
-  into tickets. A login whose role lists `dependabot` (or `dependabot: "all"`)
+  into tickets, each assigned to this server's owner and no one else. A login
+  whose role lists `dependabot` (or `dependabot: "all"`)
   gets an `ops` binding for each named repo, or every repo in `repos.json` not
   in `github.exclude` for `"all"`; each runs `deps-alerts` and is woken by the
   `dependabot_alert` doorbell; the github plugin reads the alerts with the
@@ -550,14 +562,20 @@ conventions only; the watches that need an owner live in `roles.json`.
 `roles.json` (BB-105) assigns what each person's server runs. It is keyed by
 the signed-in GitHub login the github plugin reads, and every server runs only
 its own entry: no entry means no watches and no project steward for that
-server, and its home page says `No role for <login> in roles.json`. An entry
+server, and its home page says `No role for <login> in roles.json`. Ticket,
+labelled-pull-request and review adoption need no entry: they follow the
+Linear assignee, the GitHub author and the GitHub requested reviewer, with or
+without a `roles.json`, and a login that cannot be read adopts nothing and
+shows one problem line. An entry
 is `{ projectSteward?: boolean, ops?: { k8sNamespaces, context?, team?,
 autoAdopt?, sentry?: { projects: [{ org, project }], resolveOnDone? },
 dependabot?: [repo, …] | "all" } }`. `k8sNamespaces` are watched with
 kubectl on that person's machine (their kubeconfig `context` when named);
 `team` is where their ops tickets are filed (the first of `linear.teams` by
 default, and it must be one of them); `autoAdopt` names the Linear priorities
-whose tickets the ops steward labels for a steward itself when it files them.
+whose tickets the ops steward labels for a steward itself when it files them;
+every ticket a watch files is assigned to this server's owner, the login the
+role belongs to, and never to anyone else.
 `sentry.projects` watches Sentry projects with the plugin's **Sentry token**
 setting (a user auth token with `project:read`, `event:read` and
 `event:write`; `Sentry API` for a self-hosted server), rung by bb-gate-hooks
