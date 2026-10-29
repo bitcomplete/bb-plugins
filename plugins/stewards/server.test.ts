@@ -44,6 +44,8 @@ function world() {
   const fileContents = new Map<string, string>();
   const fileKey = (hostId: string | undefined, path: string) => `${hostId ?? ""}:${path}`;
   const sections: Array<{ id: string; name: string }> = [];
+  /** What `projects.list` answers; a test empties it to delete the project. */
+  const projectList: Array<{ id: string; name: string }> = [{ id: "p1", name: "Acme" }];
   /** Each thread's latest context window reading, as bb reports it. */
   const usage = new Map<string, number>();
   const metadata = new Map<string, Record<string, unknown>>();
@@ -152,7 +154,7 @@ function world() {
   const sdk = {
     plugins: { callRpc },
     projects: {
-      list: async () => [{ id: "p1", name: "Acme" }],
+      list: async () => projectList.map((p) => ({ ...p })),
       // A checkout on a machine that is off (the default source) and one on a machine that is on.
       get: async () => ({
         id: "p1",
@@ -320,7 +322,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -2442,6 +2444,59 @@ describe("stewards and the sidebar", () => {
     expect(wake).toMatch(/more characters\)/u);
     expect(wake).toMatch(/## 5\. What changed since your last turn/u);
     expect(wake).toMatch(/End your turn with steward_report/u);
+  });
+});
+
+// A project deleted in bb (`bb project delete`) leaves the list the sweep
+// reads and loses its threads. Binding lookup is global, so the sweep purges
+// the project's rows rather than leaving ended bindings that would claim its
+// entities for ever.
+describe("a deleted project", () => {
+  it("ends and purges its bindings on the next sweep, drops its leases, and lets a successor project adopt the same ticket", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    t.entities.set("uuid-13", issue({ id: "uuid-13", key: "ENG-13", title: "Fix logout" }));
+    await t.ring("linear", "uuid-12");
+    await t.ring("linear", "uuid-13");
+    const [project, steward, other] = t.spawns.map((x) => x.id);
+    // A steward asked a question the user never answered, and one ticket's binding never got a thread.
+    await t.tool("steward_report", { phase: "open", summary: "Specified.", nextAction: "Decide", actor: "other", escalate: { kind: "decision", question: "Include SSO?", meanwhile: "Wait." } }, steward!);
+    t.hooks.store.patch(t.hooks.store.byThread(other!)!.id, { threadId: null });
+    expect((await t.list()).map((b) => [b.key, b.threadId])).toEqual([["ENG-12", steward], ["ENG-13", null]]);
+
+    // bb deletes the project: every thread goes, with a thread.deleted each, and the project leaves the list.
+    for (const id of [project!, steward!, other!]) {
+      t.threads.delete(id);
+      await t.harness.behavior.emitThreadEvent("thread.deleted", { thread: makeThreadResponse({ id, projectId: "p1" }) });
+    }
+    t.projectList.splice(0);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.harness.logEntries.some((e) => e.level === "info" && e.message.includes("project p1 is gone; ended 1 open binding(s), purged 2"))).toBe(true);
+
+    expect(t.hooks.store.all("p1")).toEqual([]);
+    expect(t.hooks.store.projectIds()).toEqual([]);
+    expect(t.hooks.store.byEntity("linear", "uuid-12")).toBeNull();
+    expect((t.hooks.db as unknown as { prepare(sql: string): { get(): unknown } }).prepare("SELECT COUNT(*) AS n FROM escalations").get()).toEqual({ n: 0 });
+    expect(t.deletes).toEqual([]);
+    const linear = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "linear").at(-1)?.input;
+    expect(linear).toEqual({ units: [], entities: [], dependabot: [], deployment: [] });
+
+    // A successor project watching the same team adopts the ticket afresh.
+    t.projectList.push({ id: "p2", name: "Acme again" });
+    await t.ring("linear", "uuid-12");
+    const again = (await t.harness.callRpc("stewardsList", { projectId: "p2", all: true })) as { bindings: Array<{ key: string; ended: boolean }> };
+    expect(again.bindings).toMatchObject([{ key: "ENG-12", ended: false }]);
+  });
+
+  it("purges nothing while the project list cannot be read", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    t.harness.sdk.stub("projects.list", async () => { throw new Error("bb is down"); });
+    await expect(t.hooks.sweep()).rejects.toThrow("bb is down");
+    t.harness.sdk.stub("projects.list", async () => t.projectList.map((p) => ({ ...p })));
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", ended: false }]);
   });
 });
 

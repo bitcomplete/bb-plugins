@@ -7153,10 +7153,47 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       }
     }
 
+    /**
+     * A project bb no longer lists was deleted. bb deleted its threads, and
+     * `thread.deleted` ended every binding that had a steward; this ends the
+     * rest (adopted but never woken, ops targets) and then purges the
+     * project's rows. Binding lookup is global, one steward per entity per
+     * server, so a dead project's bindings would otherwise keep a successor
+     * project watching the same teams and repos from ever adopting them. The
+     * cached configuration goes too, so the project's team, repo, Dependabot,
+     * deployment and Sentry leases lapse on the next push.
+     */
+    async function retireDeletedProject(projectId: string): Promise<void> {
+      const open = store.open(projectId);
+      for (const b of open) {
+        await serial(`b:${b.id}`, async () => {
+          const fresh = store.binding(b.id);
+          if (fresh === null || fresh.endedAt !== null) return;
+          await finishEnding(fresh, "project deleted");
+        });
+      }
+      const purged = store.purgeProject(projectId);
+      for (const id of purged) sentryRung.delete(id);
+      configs.delete(projectId);
+      guidanceIndexes.delete(projectId);
+      projectHostCache.delete(projectId);
+      nativeFetchedAt.delete(projectId);
+      for (const key of [`good/${projectId}/project`, `good/${projectId}/roles`]) await quietly(`forget ${key}`, () => bb.storage.kv.delete(key));
+      bb.log.info(`stewards: project ${projectId} is gone; ended ${open.length} open binding(s), purged ${purged.length}, and released its leases`);
+      pushInterest();
+    }
+
     async function sweep(): Promise<void> {
       lastSweepAt = now();
       await flushDeliveries();
-      const projects = await stewardedProjects(true);
+      // One list for the stewarded projects and for the deleted ones below; a
+      // failed read throws here, so a transient error never purges anything.
+      const listed = await bb.sdk.projects.list();
+      const projects = await stewardedProjects(true, listed);
+      const ids = new Set(listed.map((p) => p.id));
+      for (const projectId of store.projectIds()) {
+        if (!ids.has(projectId)) await quietly(`retire the deleted project ${projectId}`, () => retireDeletedProject(projectId));
+      }
       pushInterest();
       for (const config of projects) {
         if (!(await settings.get()).paused) await adoptionPass(config);

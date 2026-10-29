@@ -220,6 +220,14 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   deleting the project steward row by hand takes every steward, worker and
   reviewer under it. A runaway guard stops a steward's workers past a per-hour
   limit.
+- **Deleting a project** (`bb project delete`) deletes its threads, which
+  ends every binding that had a steward. The next sweep ends the rest,
+  purges the project's bindings and records from the store, forgets its
+  configuration so its Linear, GitHub and Sentry leases lapse, and the
+  project is gone from the Stewards page. Binding lookup is global, one
+  steward per entity on a server, so the purge is what lets a new project
+  watching the same teams and repos adopt those tickets and pull requests
+  again.
 - **Decisions stay with the agents.** Escalations are conditions on the
   status record, routed to the parent steward, then the project steward,
   which decides from the project's guidance (AGENTS.md, design docs). Only

@@ -2356,6 +2356,33 @@ export function createStore(db: Database.Database, now: () => number, options: S
     projects(): ProjectStewardRow[] {
       return db.prepare<[], Record<string, unknown>>("SELECT * FROM project_stewards").all().map(toProject);
     },
+    /** Every project the store holds anything for: a project-steward row or a binding. */
+    projectIds(): string[] {
+      return db
+        .prepare<[], { project_id: string }>("SELECT project_id FROM project_stewards UNION SELECT project_id FROM bindings")
+        .all()
+        .map((r) => r.project_id);
+    },
+    /**
+     * Forget a deleted project: its bindings and everything keyed by them
+     * (escalations, workers, needs, approvals, fingerprints, queued answers),
+     * its lessons, guidance citations and project-steward row.
+     * Binding lookup is global (one steward per entity per server), so a dead
+     * project's bindings would otherwise claim its entities for ever. Returns
+     * the ids of the bindings removed, for the caller's in-memory state.
+     */
+    purgeProject(projectId: string): string[] {
+      return db.transaction(() => {
+        const ids = db.prepare<[string], { id: string }>("SELECT id FROM bindings WHERE project_id = ?").all(projectId).map((r) => r.id);
+        const byBinding = "SELECT id FROM bindings WHERE project_id = ?";
+        db.prepare(`DELETE FROM secret_requesters WHERE thread_id IN (SELECT thread_id FROM workers WHERE binding_id IN (${byBinding}))`).run(projectId);
+        for (const table of ["escalations", "workers", "needs", "project_approvals"]) db.prepare(`DELETE FROM ${table} WHERE binding_id IN (${byBinding})`).run(projectId);
+        db.prepare(`DELETE FROM pending_deliveries WHERE origin_binding_id IN (${byBinding})`).run(projectId);
+        for (const table of ["ops_fingerprints", "lessons", "guidance_citations", "bindings", "project_stewards"]) db.prepare(`DELETE FROM ${table} WHERE project_id = ?`).run(projectId);
+        options.onProjectChange?.(projectId, ["purged"]);
+        return ids;
+      })();
+    },
     /** Queue a silent note for the project steward's next digest; it starts no turn. */
     noteProject(projectId: string, text: string): void {
       upsertProject.run(projectId);
