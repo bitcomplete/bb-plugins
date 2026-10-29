@@ -33,6 +33,7 @@ import {
 import type { rpcContract } from "./server";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute, useBoardRoute } from "./board-route.js";
+import { readLastPlace, writeLastPlace } from "./last-place.js";
 import { buildSidebar, compareBlocked, compareEfforts, compareInflight, countThreads, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, hasUnread, isBusy, isUnread, type EffortStatus, type SidebarChild, type SidebarChildRole, type SidebarEffort, type SidebarEffortState, type SidebarSection, type SidebarTab } from "./sidebar.js";
 import { AUTOMATIC_THREAD_LIST_PROVIDER, BUILTIN_THREAD_LIST_ID, THREAD_LIST_PROVIDER_KEY, stewardsThreadListId } from "./sidebar-provider.js";
 
@@ -606,6 +607,11 @@ function parseBoardPath(subPath: string): { projectId: string | null; key: strin
 /** The subPath for a project view, or with a key one effort's detail view. */
 function boardSubPath(projectId: string, key?: string): string {
   return key === undefined ? projectId : `${projectId}/${key}`;
+}
+
+/** Whether one project's sidebar data still lists an effort by that key (BB-113). */
+function effortListed(data: SidebarResult, key: string): boolean {
+  return data.bindings.some((b) => b.key === key) || data.ended.some((e) => e.key === key);
 }
 
 /** A real link to one effort's detail view, keeping a pull-request key's own `/` as path. */
@@ -1992,14 +1998,43 @@ function StewardsSidebarCore({
   // on a thread route, where the props above are the source.
   const boardRoute = useBoardRoute();
   const navigate = useBbNavigate();
+  const pluginId = experimental_usePluginId();
   const [picked, setPicked] = useState<string | null>(null);
+  // A board pick whose remembered effort key cannot be checked yet: it waits
+  // for the picked project's sidebar data, then navigates (BB-113).
+  const pendingBoardPick = useRef<{ projectId: string; key: string } | null>(null);
   // The active tab follows the panel route, then the thread route; a pick only
   // lasts until one of them moves.
-  useEffect(() => setPicked(null), [activeProjectId, boardRoute.projectId]);
+  useEffect(() => {
+    setPicked(null);
+    pendingBoardPick.current = null;
+  }, [activeProjectId, boardRoute.projectId]);
+  // Remember the last project-scoped place, per project, so a pick can return
+  // to it (BB-113). The board route wins while the Stewards page is mounted;
+  // otherwise the thread route's own props. Settings, the home page and other
+  // plugin panels have neither, so they record nothing.
+  useEffect(() => {
+    if (boardRoute.projectId !== null) {
+      writeLastPlace(pluginId, boardRoute.projectId, { kind: "board", key: boardRoute.key });
+      return;
+    }
+    if (activeThreadId !== null && activeProjectId !== null) {
+      writeLastPlace(pluginId, activeProjectId, { kind: "thread", threadId: activeThreadId });
+    }
+  }, [pluginId, boardRoute.projectId, boardRoute.key, activeThreadId, activeProjectId]);
   // The one project the RPC is asked for; null lets the server pick the first
   // by name. `load` depends on it, so a pick refetches like the board's `wanted`.
   const wanted = picked ?? boardRoute.projectId ?? activeProjectId;
   const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  // Finish a board pick whose remembered effort key still has to be checked:
+  // once the picked project's list has loaded, go to the effort if it is still
+  // there and to the project page otherwise (BB-113).
+  useEffect(() => {
+    const pending = pendingBoardPick.current;
+    if (pending === null || data === null || data.projectId !== pending.projectId) return;
+    pendingBoardPick.current = null;
+    navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(pending.projectId, effortListed(data, pending.key) ? pending.key : undefined) });
+  }, [data, navigate, picked]);
   // The previous tabs, so `buildSidebar` can hand back the same effort and
   // thread objects for unchanged rows and the memoised rows skip a render
   // (BB-95). The ref is written during render; the call is idempotent.
@@ -2049,15 +2084,39 @@ function StewardsSidebarCore({
   const activeKey = boardRoute.key;
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
   const openSections = useMemo(() => revealSections(tabs, activeThreadId, activeKey), [tabs, activeThreadId, activeKey]);
-  // The picker changes local state and, while the Stewards panel is mounted,
-  // moves the page so the two cannot disagree. Stable, so `ProjectTabs` can be
-  // memoised (BB-95).
+  // The picker switches the list and, on a project-scoped route, moves the main
+  // pane back to that project's last place (BB-113): its remembered thread when
+  // that still exists in the project, else its Stewards page (the remembered
+  // effort when it is still listed). It never calls `onNavigate`, so a phone's
+  // drawer stays open. Stable, so `ProjectTabs` can be memoised (BB-95).
   const pick = useCallback(
     (projectId: string) => {
+      // Picking the project already shown does nothing.
+      if (projectId === active?.projectId) return;
       setPicked(projectId);
-      if (boardRoute.projectId !== null) navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
+      pendingBoardPick.current = null;
+      // Settings, the home page and other plugin panels are not project-scoped:
+      // there a pick only switches the list, as before (BB-113).
+      if (boardRoute.projectId === null && activeThreadId === null) return;
+      const place = readLastPlace(pluginId, projectId);
+      if (place !== null && place.kind === "thread") {
+        const thread = byId.get(place.threadId);
+        if (thread !== undefined && !thread.isArchived && thread.projectId === projectId) {
+          navigate.toThread(place.threadId);
+          return;
+        }
+        navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
+        return;
+      }
+      if (place !== null && place.kind === "board" && place.key !== null) {
+        // The effort is only kept when the picked project's list still has it.
+        // That list is not loaded yet, so wait for it rather than guess.
+        pendingBoardPick.current = { projectId, key: place.key };
+        return;
+      }
+      navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId) });
     },
-    [boardRoute.projectId, navigate],
+    [active?.projectId, boardRoute.projectId, activeThreadId, byId, navigate, pluginId],
   );
   const newThread = useCallback(() => {
     if (active !== null) onNewThread(active.projectId);
