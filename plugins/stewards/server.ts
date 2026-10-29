@@ -7339,6 +7339,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The per-project body of the sweep: adoption, the project steward, ops bindings and a look at every binding. */
     async function sweepProject(config: ProjectConfig): Promise<void> {
+      // Only an enabled project is swept: `sweep()` filters to enabled configs
+      // and the enable path passes `{ ...config, enabled: true }`. Guard it here
+      // so the invariant is local rather than resting on the callers (BB-116).
+      if (!config.enabled) return;
       // BB-116: a binding the switch-off ended comes back whenever the project
       // is on, whatever the timing. The enable loop cancels an ending still in
       // flight and reopens one already ended; this backstop catches the paths
