@@ -496,7 +496,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     fireEvent.change(select, { target: { value: "personal" } });
     await waitFor(() => expect(select.value).toBe("personal"));
     fireEvent.click(slot.getByRole("button", { name: "New thread" }));
-    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "personal" } }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toCompose", options: { projectId: "personal", focusPrompt: true } }));
     expect(onNavigate).toHaveBeenCalledTimes(1);
     expect(composeSeenAtNavigate).toBe(true);
     slot.lifecycle.unmount();

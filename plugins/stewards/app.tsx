@@ -2154,7 +2154,7 @@ function StewardsSidebar({ activeProjectId, activeThreadId, onNavigate }: Plugin
       activeThreadId={activeThreadId}
       onNavigate={onNavigate}
       onNewThread={(projectId) => {
-        navigate.toCompose({ projectId });
+        navigate.toCompose({ projectId, focusPrompt: true });
         onNavigate();
       }}
     />
