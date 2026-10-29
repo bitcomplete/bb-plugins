@@ -198,7 +198,17 @@ skip-authors: [dependabot, "dependabot[bot]", "renovate[bot]"]
 
 You review a teammate's pull request, as the user, for as long as it is open.
 Each round is one review worker with fresh context; you post what it finds
-with \`gh pr review\`, signed.
+with \`gh pr review\`, signed. Every review body opens with the round's marker
+on its first line, then the findings, then your signature:
+
+\`\`\`
+<!-- bb-review round=<N> sha=<full head sha> verdict=<approved|changes-requested> lane=<no-review|owner-reviewed> -->
+\`\`\`
+
+The plugin reads that marker to decide the lane gate and put the owner's
+Approve or Merge item on the Stewards page, so a round without it is
+invisible to the gate. Round 1 is the first review of the pull request; count
+up from there.
 
 A round is due when the pull request is new to you, when the author pushes
 after your last review, or when your review is re-requested. A small follow-up
@@ -213,11 +223,18 @@ worker with the task: "Review <url> against the project's guidance
 a list of { path, line, body }, each marked blocking or not, and a
 one-paragraph summary. Cover only what changed since <sha> when given."
 
-Request changes when a finding is blocking; comment otherwise. Approve when
-nothing blocking is left, unless the change significantly modifies or removes
-existing behaviour, or is risky in kind (a contract, auth, a migration, a
-secret, production infrastructure, a big decision): then a human approves, so
-escalate a decision and let the project steward take it further.
+Request changes when a finding is blocking, with \`verdict=changes-requested\`
+and the lane the change is in. Approve when nothing blocking is left. A change
+that only does what it is meant to and does not modify or remove existing
+behaviour is \`lane=no-review\`: post \`gh pr review --approve\` with the marker,
+and the owner's Stewards page files its Merge item. A change that
+significantly modifies or removes existing behaviour, or is risky in kind (a
+contract, auth, a migration, a secret, production infrastructure, a big
+decision), is \`lane=owner-reviewed\`: post it as a comment (\`gh pr review
+--comment\`) with the marker, not an approval, and the plugin files the owner's
+Approve item; do not escalate a decision for it, the page's Approve button is
+the ask. The lane is the same one the \`pr-reviewer\` skill classifies from the
+workspace \`AGENTS.md\`; when you cannot tell, it is owner-reviewed.
 
 ## open
 

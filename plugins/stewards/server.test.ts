@@ -60,6 +60,7 @@ function world() {
   const userTurns: Array<{ threadId: string; text: string }> = [];
   /** What the page's GitHub actions did. */
   const githubComments: Array<{ repo: string; number: number; body: string }> = [];
+  const githubReviews: Array<{ repo: string; number: number; event: string; body: string }> = [];
   const githubMerges: Array<{ repo: string; number: number; title: string; body: string }> = [];
   /** Every lesson pull request the plugin opened, and every one it closed (BB-108). */
   const githubPulls: Array<{ repo: string; head: string; base: string; title: string; body: string; url: string; number: number }> = [];
@@ -76,6 +77,9 @@ function world() {
     comment: async (repo: string, number: number, body: string) => {
       githubComments.push({ repo, number, body });
       return `IC_${githubComments.length}`;
+    },
+    review: async (repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string) => {
+      githubReviews.push({ repo, number, event, body });
     },
     squashMerge: async (repo: string, number: number, title: string, body: string) => {
       if (mergePullError !== null) throw new Error(mergePullError);
@@ -327,7 +331,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -4546,10 +4550,10 @@ describe("needs you items", () => {
   const owner = comment({ id: "oa", author: "jane", body: "LGTM", signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
 
   /** A bound ticket with one linked pull request, observed. */
-  async function withPull(comments: ReturnType<typeof comment>[], pullOver: Record<string, unknown> = {}) {
+  async function withPull(comments: ReturnType<typeof comment>[], pullOver: Record<string, unknown> = {}, entityOver: Record<string, unknown> = {}) {
     const t = await setup();
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key: "acme/web#7", url: "https://github.com/acme/web/pull/7" }] }));
-    t.entities.set("acme/web#7", pull({ comments }, { checks: { state: "success", failing: [] }, ...pullOver }));
+    t.entities.set("acme/web#7", pull({ comments, ...entityOver }, { checks: { state: "success", failing: [] }, ...pullOver }));
     await t.ring("linear", "uuid-12");
     const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
     return { ...t, project, steward, binding: () => t.hooks.store.find("ENG-12")! };
@@ -4574,7 +4578,7 @@ describe("needs you items", () => {
     expect(t.sends.filter((s) => s.threadId === steward).at(-1)!.text).toMatch(/## 5\. What changed since your last turn[\s\S]*approved ENG-12's spec on the Stewards page: Looks good/u);
   });
 
-  it("files approve-pr in the owner lane; the page action posts the unsigned approval and the merge item follows", async () => {
+  it("files approve-pr in the owner lane; Approve posts a review on a teammate's pull request and the merge item follows", async () => {
     const t = await withPull([marker]);
     const b = t.binding();
     // The user's lane is filed on the page at once, with no project-steward
@@ -4583,6 +4587,7 @@ describe("needs you items", () => {
     expect(esc).toMatchObject({ route: "me" });
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need.data).toMatchObject({ foreign: true });
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     // BB-29: the board's `url` is the pull request and `entityUrl` the ticket,
     // so the page can link the PR separately from the entity key.
@@ -4590,8 +4595,10 @@ describe("needs you items", () => {
     expect((await board()).needs.find((n) => n.kind === "approve-pr")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
     expect(res).toMatchObject({ ok: true });
-    expect(t.githubComments).toEqual([{ repo: "acme/web", number: 7, body: "Approved aaaaaaa1 from the Stewards page" }]);
-    expect(t.githubComments[0]!.body).not.toMatch(/from bb thread/u);
+    // A teammate's pull request can carry a real APPROVED review, unsigned
+    // (BB-118); the comment convention is for the owner's own agent PR.
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "APPROVE", body: "" }]);
+    expect(t.githubComments).toEqual([]);
     expect(t.hooks.store.need(need.id)!.status).toBe("done");
     // The snapshot now shows the owner's approval, so the merge item is filed.
     t.entities.set("acme/web#7", pull({ comments: [marker, owner] }, { checks: { state: "success", failing: [] } }));
@@ -4599,6 +4606,62 @@ describe("needs you items", () => {
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeDefined();
     expect((await board()).needs.find((n) => n.kind === "merge")).toMatchObject({ url: "https://github.com/acme/web/pull/7", entityUrl: "https://linear.app/acme/issue/ENG-12" });
+  });
+
+  it("keeps the comment convention when the pull request is the signed-in account's own (BB-118)", async () => {
+    const t = await withPull([marker], {}, { author: "jane" });
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need.data).toMatchObject({ foreign: false });
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "approve" }, client);
+    expect(res).toMatchObject({ ok: true });
+    expect(t.githubComments).toEqual([{ repo: "acme/web", number: 7, body: "Approved aaaaaaa1 from the Stewards page" }]);
+    expect(t.githubComments[0]!.body).not.toMatch(/from bb thread/u);
+    expect(t.githubReviews).toEqual([]);
+  });
+
+  it("posts a CHANGES_REQUESTED review carrying the owner's note and does not ask the same round again (BB-118)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline", note: "Add a test first" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "REQUEST_CHANGES", body: "Add a test first" }]);
+    expect(t.githubComments).toEqual([]);
+    expect(t.hooks.store.need(need.id)!.status).toBe("done");
+    // The same head and reviewer marker are not asked again; the escalation
+    // closes with it.
+    await t.flush();
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
+    expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")).toBeUndefined();
+    // A new reviewer round on the same head is a new ask.
+    const later = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [marker, later] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeDefined();
+  });
+
+  it("posts a COMMENT review when the owner declines a teammate's pull request without a note (BB-118)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline" }, client);
+    expect(res).toMatchObject({ ok: true });
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "COMMENT", body: "Declined aaaaaaa from the Stewards page" }]);
+  });
+
+  it("files the owner's approve-pr item for a review steward's owner-reviewed round (BB-118)", async () => {
+    const t = await setup();
+    const signed = comment({ id: "rev", author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=owner-reviewed -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: "2026-10-14T16:00:00Z" });
+    t.entities.set("acme/web#7", pull({ comments: [signed] }, { checks: { state: "success", failing: [] } }));
+    await t.ring("github", "acme/web#7");
+    const b = t.hooks.store.find("acme/web#7")!;
+    expect(b.kind).toBe("review");
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    expect(need).toMatchObject({ what: "Approve acme/web#7 on GitHub", filedBy: "plugin" });
+    expect(need.data).toMatchObject({ foreign: true });
+    const esc = t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")!;
+    expect(esc).toMatchObject({ route: "me" });
   });
 
   it("files approve-pr and the user's approval escalation for an unsigned reviewer marker (BB-110)", async () => {

@@ -668,11 +668,14 @@ gets a review steward.
   what changed since your last review.
 - **Reviews post without asking, approvals included.** The review steward
   requests changes for blocking findings, comments otherwise, and approves
-  when nothing blocking is left — unless the change is one of the project's
-  big decisions, which it escalates. It posts with `gh pr review`, signed.
-  This makes an approval as you an agent's call; a project that wants branch
-  protection to mean a person looked removes `approve` from the review
-  playbook's `may` list and has the steward escalate instead.
+  when nothing blocking is left. Every round opens with a `bb-review` marker
+  naming the lane, so the plugin's gate files the owner's Merge item in the
+  no-review lane, and its Approve item when the change is owner-reviewed —
+  then the review steward comments rather than approves. It posts with
+  `gh pr review`, signed. This makes an approval as you an agent's call; a
+  project that wants branch protection to mean a person looked removes
+  `approve` from the review playbook's `may` list and has the steward
+  escalate instead.
 - **Authors to skip**, such as dependency bots, are a playbook field.
 - **Cost.** Review stewards default to a small model. The work is in the
   workers, one per round.
@@ -1248,7 +1251,7 @@ requester thread and bb's secure form) or `done`.
 | kind | filed by | link | done when | one-click action |
 | -- | -- | -- | -- | -- |
 | `approve-spec` | plugin, when the ready gate waits and the playbook's approver is `me`, or when the project steward forwards an `approval` escalation to the user | the ticket | gate approval recorded | **Approve** / **Decline** (with an optional note); Approve records the approval on the gate, as BB-13 does from any surface |
-| `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: posts the unsigned comment "Approved <sha> from the Stewards page" as the connected user |
+| `approve-pr` | plugin, when a `user`-marked owner-reviewed pull request is forwarded to the user, or the project steward's approval is not the gate's | the pull request | owner approval seen in the snapshot | **Approve**: on a teammate's pull request posts an unsigned APPROVED review; on the owner's own (an agent PR) posts the unsigned comment "Approved <sha> from the Stewards page". **Decline** posts a CHANGES_REQUESTED review on a teammate's pull request (a comment when there is no note) and does not ask the same round again |
 | `merge` | plugin, when the lane gate is met and no worker is running, or by a steward whose worker reported a refused merge | the pull request | the pull request merged | **Merge**: the server re-checks the gate itself, squash-merges through the server's `gh` login, posts the "Merged: …" comment, and wakes the steward |
 | `decide` | project steward (today's forwarded question) | the entity | answered | **Answer** (the text box), or one button per `choices` label and **Other…** |
 | `provide-secret` | steward, with the variable name and purpose, and either the `writeEnv` dotenv path (or `worker`) or the `setting` of one of the plugin's secret settings | the dotenv, or the stewards secret setting | the requester's `bb secret request` (and `bb stewards secret import` for a setting) completes | **Provide**: the server spawns a fixed-prompt requester thread, opens bb's secure form in its first turn, and navigates to it; **Done** is the manual escape hatch |
@@ -1275,10 +1278,10 @@ The rules that hold:
   it, so a steward is told whether a pull request's gate is met in the same
   words the button acts on.
 - **The buttons run on the server as the connected user, unsigned**, so they
-  count as human actions. Approve-PR is a comment, not a review, so GitHub is
-  the only thing that can refuse it (approving your own pull request); Merge
-  uses the server's `gh` token through the GitHub API. The server never signs
-  one with a thread id.
+  count as human actions. Approve-PR is a real APPROVED review on a
+  teammate's pull request and a comment on the owner's own (GitHub refuses a
+  self-review); Merge uses the server's `gh` token through the GitHub API.
+  The server never signs one with a thread id.
 - **A button is offered only while the server can verify its preconditions.**
   `syncNeeds` recomputes the plugin's items on every look and closes the ones
   whose condition no longer holds; the page marks one whose condition has moved
