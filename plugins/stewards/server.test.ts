@@ -6430,6 +6430,19 @@ describe("dependency stewards", () => {
     expect(prompt).toMatch(/never merge it: you adopt it, get it reviewed, and leave the\s+merge to a person/u);
   });
 
+  it("keeps a labelled dependabot[bot] pull request under deps-prs, not the labelled-author rule (BB-115)", async () => {
+    const t = await setup();
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] } });
+    t.files[playbookPath("deps-prs")] = DEPS_PRS;
+    t.entities.set("acme/web#9", pull({ id: "acme/web#9", key: "acme/web#9", author: "dependabot[bot]", labels: ["bb-managed"] }));
+    await t.hooks.sweep();
+    await t.flush();
+    const pr = t.spawns.find((x) => x.title === "acme/web#9: Add login retry");
+    expect(pr).toBeDefined();
+    expect(String(pr!.prompt)).toMatch(/playbook deps-prs@/u);
+    expect(t.hooks.store.find("acme/web#9", "p1")!.playbook).toBe("deps-prs");
+  });
+
   // A Dependabot bump that cannot merge as is comes back as a worker's own
   // pull request. The binding follows it: same thread, playbook and history,
   // and the ordinary gate files the replacement's Merge item.

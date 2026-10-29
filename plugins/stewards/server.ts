@@ -3544,6 +3544,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (e.kind !== "pull") return null;
       // A login that cannot be read adopts nothing (BB-115, addendum 2).
       if (config.rolesUnreadable) return null;
+      // The dependency watch adopts the bot's version-update pull requests in
+      // the repos it watches, whether or not they are labelled. deps-prs
+      // reviews them and escalates for a human merge; it never merges. This
+      // runs before the labelled-author check so a bot PR a human labelled
+      // `bb-managed` keeps its deps-prs steward rather than being adopted
+      // nowhere: the label does not change the dependency watch's ownership.
+      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && roleDepsTargets(config.role, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
       // A labelled pull request is this server's own work only when its author
       // is this server's GitHub login; another author's is handled on the
       // author's server. An unlabelled pull request of my own falls through to
@@ -3554,10 +3561,6 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (e.author === null || config.githubLogin === null || lc(e.author) !== lc(config.githubLogin)) return null;
         return "pr";
       }
-      // The dependency watch adopts the bot's version-update pull requests in
-      // the repos it watches, whether or not they are labelled. deps-prs
-      // reviews them and escalates for a human merge; it never merges.
-      if (config.depsPrs !== null && e.author !== null && DEPENDENCY_BOTS.has(lc(e.author)) && roleDepsTargets(config.role, config.repos).some((t) => lc(t.repo) === lc(e.unit))) return "pr";
       const review = playbookFor(config, "review");
       if (review === null || !config.file.reviews.enabled || e.draft || e.state !== "open") return null;
       if (e.author === null || viewer === null || lc(e.author) === lc(viewer)) return null;
@@ -7477,7 +7480,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.info(`stewards: nightly pass for ${config.projectId} (${night})`);
         // The orphan list is read here so the digest can name the labelled
         // tickets nobody is assigned, which are adopted nowhere (BB-115).
-        const adoption = (await settings.get()).paused ? { adopted: 0, unassigned: [] } : await adoptionPass(config, { collectUnassigned: true });
+        // Only the project steward's digest uses it, so a server without the
+        // role does not pay for the extra snapshots.
+        const adoption = (await settings.get()).paused ? { adopted: 0, unassigned: [] } : await adoptionPass(config, { collectUnassigned: config.role?.projectSteward === true });
         await reconcileLessons(config);
         applyLessonTransitions(config);
         applyValidations(config);

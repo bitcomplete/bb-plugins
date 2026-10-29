@@ -895,11 +895,14 @@ export function lifecycle(binding: Pick<Binding, "kind" | "endedAt" | "endReason
     if (binding.endReason === "reassigned") return mine ? { kind: "reopen", why: "reassigned to this server" } : { kind: "stay-ended" };
     return { kind: "stay-ended" };
   }
-  if (binding.ending === "terminal" && !terminal && labelled) return { kind: "reopen", why: `reopened before the binding ended: now ${entity.state}` };
   if (terminal) return { kind: "terminal" };
   // Only a ticket follows the assignee; a review binding is held by the
   // requested-reviewer check at adoption, and a pr binding by its label.
+  // Checked before the follow-through reopen, so a ticket moved back to a
+  // non-terminal state and reassigned away in one change is released rather
+  // than taking a spurious reopen turn first.
   if (binding.kind === "ticket" && opts.owner !== undefined && opts.owner !== null && !mine) return { kind: "reassigned" };
+  if (binding.ending === "terminal" && !terminal && labelled) return { kind: "reopen", why: `reopened before the binding ended: now ${entity.state}` };
   if (!labelled) return { kind: "detach" };
   return { kind: "continue" };
 }
