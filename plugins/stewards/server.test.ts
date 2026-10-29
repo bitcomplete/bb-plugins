@@ -338,6 +338,9 @@ async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string,
   const { bb, harness } = createFakePluginHost({ pluginId: "stewards", sdk: w.sdk as never, agentSkillIds: ["stewards"], settings });
   await createStewardsPlugin({ now: w.now, timing: { debounceMs: 1, nightlyStaggerMs: 0 }, github: w.github, ...extra })(bb);
   const hooks = testHooks.get("stewards")!;
+  // The local per-project switch is off by default; tests that are not about
+  // the switch itself run with p1 switched on, as a project whose owner did.
+  await hooks.setProjectEnabled("p1", true);
   /** Let debounced work run to completion. */
   const flush = async () => {
     for (let i = 0; i < 6; i++) {
@@ -2484,6 +2487,7 @@ describe("a deleted project", () => {
 
     // A successor project watching the same team adopts the ticket afresh.
     t.projectList.push({ id: "p2", name: "Acme again" });
+    await t.hooks.setProjectEnabled("p2", true);
     await t.ring("linear", "uuid-12");
     const again = (await t.harness.callRpc("stewardsList", { projectId: "p2", all: true })) as { bindings: Array<{ key: string; ended: boolean }> };
     expect(again.bindings).toMatchObject([{ key: "ENG-12", ended: false }]);
@@ -2497,6 +2501,113 @@ describe("a deleted project", () => {
     await expect(t.hooks.sweep()).rejects.toThrow("bb is down");
     t.harness.sdk.stub("projects.list", async () => t.projectList.map((p) => ({ ...p })));
     expect(await t.list()).toMatchObject([{ key: "ENG-12", ended: false }]);
+  });
+});
+
+describe("the per-project switch", () => {
+  /** An adopted ticket with a running worker, the shape most switch-off paths need. */
+  async function working() {
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ state: "In Progress", stateType: "started" }));
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    await t.created("thr_w1", steward, "ENG-12: Merge, watch the deploy, verify");
+    const archives = () => t.harness.sdk.callsTo("threads.archive").map(([args]) => (args as { threadId: string }).threadId);
+    return { ...t, project, steward, archives };
+  }
+
+  it("stewards nothing until it is switched on, and says so in overview, check and list", async () => {
+    const t = await setup();
+    await t.hooks.setProjectEnabled("p1", false);
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    expect(await t.list()).toEqual([]);
+    expect(t.spawns).toEqual([]);
+
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; configured: boolean; enabled: boolean }> };
+    expect(overview.projects).toMatchObject([{ projectId: "p1", configured: true, enabled: false }]);
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/Stewards are off for this project on this server/u);
+    const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
+    expect(list.stdout).toMatch(/Stewards are off for this project on this server/u);
+  });
+
+  it("switches on from the settings page and sweeps the project at once", async () => {
+    const t = await setup();
+    await t.hooks.setProjectEnabled("p1", false);
+    t.entities.set("uuid-12", issue());
+    const result = (await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: true })) as { ok: boolean; enabled: boolean };
+    expect(result).toMatchObject({ ok: true, enabled: true });
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", ended: false }]);
+    expect(t.spawns.length).toBeGreaterThanOrEqual(2);
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; enabled: boolean }> };
+    expect(overview.projects).toMatchObject([{ projectId: "p1", enabled: true }]);
+  });
+
+  it("switches off, gives each open binding a stop turn, archives the project steward and releases the leases, keeping the records", async () => {
+    const t = await working();
+    const before = t.sends.length;
+    const result = (await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: false })) as { ok: boolean };
+    expect(result.ok).toBe(true);
+    await t.flush();
+    // The stop turn went to the binding's steward, and its worker was stopped now.
+    const stop = t.sends.slice(before).find((s) => s.threadId === t.steward);
+    expect(stop?.text).toMatch(/switched off/u);
+    expect(stop?.text).toMatch(/Take no new actions/u);
+    expect(t.hooks.store.worker("thr_w1")!.status).toBe("stopped");
+    // The project steward was archived, and the source leases dropped.
+    expect(t.archives()).toContain(t.project);
+    const linear = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "linear").at(-1)?.input;
+    expect(linear).toEqual({ units: [], entities: [], dependabot: [], deployment: [] });
+    // The binding is ended, not purged: the record and its row survive.
+    await t.idle(t.steward);
+    expect((await t.list())[0]).toMatchObject({ ended: true });
+    expect(t.hooks.store.all("p1")).toHaveLength(1);
+    expect(t.hooks.store.binding(t.hooks.store.find("ENG-12", "p1")!.id)!.endReason).toBe("disabled");
+  });
+
+  it("switches back on and resumes the bindings it ended, on the same rows and threads", async () => {
+    const t = await working();
+    const bindingId = t.hooks.store.find("ENG-12", "p1")!.id;
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: false });
+    await t.flush();
+    await t.idle(t.steward);
+    expect(t.hooks.store.binding(bindingId)!.endedAt).not.toBeNull();
+
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: true });
+    await t.flush();
+    const resumed = t.hooks.store.binding(bindingId)!;
+    expect(resumed.endedAt).toBeNull();
+    expect(resumed.threadId).toBe(t.steward);
+    expect(t.hooks.store.all("p1").filter((b) => b.entityKey === "ENG-12")).toHaveLength(1);
+  });
+
+  it("ends what a disabled project left running on the first sweep, as the default-off upgrade does", async () => {
+    const t = await working();
+    // The switch is off but nothing ran the turn-off path, as on the upgrade
+    // that introduced the switch: the binding and the project steward are
+    // still live. The next sweep runs it once.
+    await t.hooks.setProjectEnabled("p1", false);
+    await t.hooks.sweep();
+    await t.flush();
+    const stop = t.sends.find((s) => s.threadId === t.steward && /switched off/u.test(s.text));
+    expect(stop).toBeTruthy();
+    expect(t.archives()).toContain(t.project);
+    expect(t.hooks.store.find("ENG-12", "p1")!.ending).toBe("disabled");
+  });
+
+  it("switches on and off from the CLI", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.hooks.setProjectEnabled("p1", false);
+    const on = await t.harness.behavior.runCli(["enable", "--project", "p1"]);
+    expect(on.exitCode).toBe(0);
+    await t.flush();
+    expect(await t.list()).toMatchObject([{ key: "ENG-12", ended: false }]);
+    const off = await t.harness.behavior.runCli(["disable", "--project", "p1"]);
+    expect(off.exitCode).toBe(0);
+    expect(off.stdout).toMatch(/are off/u);
   });
 });
 

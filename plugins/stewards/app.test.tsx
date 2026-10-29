@@ -561,6 +561,72 @@ describe("the stewards overview's refresh (BB-90)", () => {
   });
 });
 
+// BB-112: the per-project switch on each settings-page project row.
+describe("the stewards overview's per-project switch (BB-112)", () => {
+  const project = (enabled: boolean) => ({
+    projectId: "p1",
+    name: "Acme",
+    configured: true,
+    enabled,
+    source: "multi-repo",
+    label: "bb-managed",
+    linearTeams: ["ENG"],
+    repos: ["acme/web"],
+    excludedRepos: [],
+    playbooks: [],
+    problems: [],
+    nightly: null,
+    lastNight: null,
+    projectStewardThreadId: null,
+    digestAt: null,
+    endedCount: 0,
+    stewards: [],
+  });
+
+  it("turns a project's stewards on from its row", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[0]!;
+    const calls: Array<{ projectId: string; enabled: boolean }> = [];
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project(false)] }),
+        stewardsSetProjectEnabled: (args: { projectId: string; enabled: boolean }) => {
+          calls.push(args);
+          return { ok: true, message: "on", enabled: args.enabled };
+        },
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+      },
+    } as never);
+    const toggle = await waitFor(() => slot.getByRole("switch", { name: "Stewards for Acme" }));
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(slot.getByText(/Stewards are off for this project/u)).toBeTruthy();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(calls).toEqual([{ projectId: "p1", enabled: true }]));
+    slot.lifecycle.unmount();
+  });
+
+  it("turns a project's stewards off from its row", async () => {
+    const captured = await loadApp();
+    const section = captured.settingsSections[0]!;
+    const calls: Array<{ projectId: string; enabled: boolean }> = [];
+    const slot = renderSlot(section, {}, {
+      rpc: {
+        stewardsOverview: () => ({ paused: false, lastSweepAt: 0, stats: { rpc: {}, cli: {}, signals: {} }, projects: [project(true)] }),
+        stewardsSetProjectEnabled: (args: { projectId: string; enabled: boolean }) => {
+          calls.push(args);
+          return { ok: true, message: "off", enabled: args.enabled };
+        },
+        stewardsCheck: () => ({ ok: true, lines: [] }),
+      },
+    } as never);
+    const toggle = await waitFor(() => slot.getByRole("switch", { name: "Stewards for Acme" }));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(calls).toEqual([{ projectId: "p1", enabled: false }]));
+    slot.lifecycle.unmount();
+  });
+});
+
 // BB-78: the Stewards page adopts the sidebar's two-line row, glyph and phrase,
 // with the Blocked / In flight / Monitors / Recently ended sections.
 const boardSteward = (over: Record<string, unknown> = {}) => ({

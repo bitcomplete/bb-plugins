@@ -193,7 +193,7 @@ function usePolled<T>(load: () => Promise<T>): { data: T | null; error: string |
   return { data, error, loaded, refetch };
 }
 
-function useOverview(): { overview: Overview | null; error: string | null } {
+function useOverview(): { overview: Overview | null; error: string | null; refetch: () => void } {
   const rpc = useRpc<typeof rpcContract>();
   const { data, error, refetch } = usePolled(useCallback(() => rpc.call("stewardsOverview", null), [rpc]));
   // The overview covers every project, so any project's visible change
@@ -202,7 +202,7 @@ function useOverview(): { overview: Overview | null; error: string | null } {
     PROJECT_CHANGED,
     useCallback(() => refetch(), [refetch]),
   );
-  return { overview: data, error };
+  return { overview: data, error, refetch };
 }
 
 function Loading({ error }: { error: string | null }) {
@@ -277,7 +277,7 @@ function MethodStats({ title, rows }: { title: string; rows: Record<string, { co
 }
 
 function StatusSection() {
-  const { overview, error } = useOverview();
+  const { overview, error, refetch } = useOverview();
   if (overview === null) return <Loading error={error} />;
   const now = Date.now();
   return (
@@ -293,7 +293,7 @@ function StatusSection() {
           No project has a <code>stewards/project.json</code> in its <code>.bb</code>. Run <code>bb stewards init</code> from a thread in a multi-repo project, commit and publish it, and merge the guidance branch.
         </p>
       ) : (
-        overview.projects.map((p) => <ProjectStatus key={p.projectId} project={p} now={now} />)
+        overview.projects.map((p) => <ProjectStatus key={p.projectId} project={p} now={now} refetch={refetch} />)
       )}
       <p className="text-xs text-muted-foreground">Last sweep {ago(overview.lastSweepAt, now)}; the sweep runs every half hour. Configuration is reread from committed HEAD every few minutes.</p>
       <details className="rounded-lg border border-border p-3 text-xs">
@@ -324,10 +324,21 @@ function StatusSection() {
   );
 }
 
-function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
+function ProjectStatus({ project: p, now, refetch }: { project: Project; now: number; refetch: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [check, setCheck] = useState<CheckResult | "running" | { error: string } | null>(null);
+  const [toggle, setToggle] = useState<"idle" | "running" | { error: string }>("idle");
   const healthy = p.configured && p.problems.length === 0;
+  const setEnabled = (enabled: boolean) => {
+    setToggle("running");
+    rpc.call("stewardsSetProjectEnabled", { projectId: p.projectId, enabled }).then(
+      () => {
+        setToggle("idle");
+        refetch();
+      },
+      (e: unknown) => setToggle({ error: message(e) }),
+    );
+  };
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
       <div className="flex items-center justify-between gap-4">
@@ -338,21 +349,39 @@ function ProjectStatus({ project: p, now }: { project: Project; now: number }) {
             aria-label={healthy ? "healthy" : "needs attention"}
           />
           {p.name}
+          {p.configured ? <Badge tone={p.enabled ? "muted" : "warn"}>{p.enabled ? "on" : "off"}</Badge> : null}
         </p>
-        {p.configured ? (
-          <button
-            type="button"
-            disabled={check === "running"}
-            className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
-            onClick={() => {
-              setCheck("running");
-              rpc.call("stewardsCheck", { projectId: p.projectId }).then(setCheck, (e: unknown) => setCheck({ error: message(e) }));
-            }}
-          >
-            {check === "running" ? "Checking…" : "Check against Linear and GitHub"}
-          </button>
-        ) : null}
+        <div className="flex items-center gap-2">
+          {p.configured ? (
+            <button
+              type="button"
+              role="switch"
+              aria-checked={p.enabled}
+              aria-label={`Stewards for ${p.name}`}
+              disabled={toggle === "running"}
+              className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
+              onClick={() => setEnabled(!p.enabled)}
+            >
+              {toggle === "running" ? "Saving…" : p.enabled ? "Turn off" : "Turn on"}
+            </button>
+          ) : null}
+          {p.configured ? (
+            <button
+              type="button"
+              disabled={check === "running"}
+              className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
+              onClick={() => {
+                setCheck("running");
+                rpc.call("stewardsCheck", { projectId: p.projectId }).then(setCheck, (e: unknown) => setCheck({ error: message(e) }));
+              }}
+            >
+              {check === "running" ? "Checking…" : "Check against Linear and GitHub"}
+            </button>
+          ) : null}
+        </div>
       </div>
+      {!p.enabled && p.configured ? <p className="text-muted-foreground">Stewards are off for this project on this server: nothing is adopted and no steward is woken. Turn it on to resume.</p> : null}
+      {typeof toggle === "object" ? <p className="text-xs text-destructive">{toggle.error}</p> : null}
       {!p.configured ? (
         <p className="text-muted-foreground">This project has stewards but no readable stewards/project.json any more. They keep their bindings; nothing new is adopted.</p>
       ) : (

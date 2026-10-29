@@ -366,6 +366,8 @@ export const rpcContract = defineRpcContract({
           projectId: z.string(),
           name: z.string(),
           configured: z.boolean(),
+          /** Whether this server stewards the project: its local, per-project switch. */
+          enabled: z.boolean(),
           /** Which project source reads this project's `.bb`: multi-repo or native git (BB-107). */
           source: z.enum(["multi-repo", "native"]).nullable(),
           label: z.string().nullable(),
@@ -420,6 +422,11 @@ export const rpcContract = defineRpcContract({
   stewardsCheck: {
     input: z.object({ projectId: z.string().min(1).max(100) }),
     output: z.object({ ok: z.boolean(), lines: z.array(z.string()) }),
+  },
+  // The settings page's per-project toggle: this server's local switch for a project.
+  stewardsSetProjectEnabled: {
+    input: z.object({ projectId: z.string().min(1).max(100), enabled: z.boolean() }),
+    output: z.object({ ok: z.boolean(), message: z.string(), enabled: z.boolean() }),
   },
   // The stewards page: one project's board. A null projectId picks the first project.
   stewardsBoard: {
@@ -633,6 +640,8 @@ type ProjectConfig = {
   depsPrs: Playbook | null;
   /** GitHub repos from the project's repos.json, as owner/repo, less github.exclude. */
   repos: string[];
+  /** Whether this server stewards the project: a local, per-project setting, off until switched on. */
+  enabled: boolean;
   /** What is wrong with the configuration, in sentences; bindings keep running under the last good playbook. */
   problems: string[];
   loadedAt: number;
@@ -1106,6 +1115,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function readConfig(projectId: string): Promise<ProjectConfig | null> {
       const problems: string[] = [];
       const selected = await selectProjectSource(projectId);
+      const enabled = await projectEnabled(projectId);
       const source = selected.source;
       const configFiles = selected.files ?? (await source.readFiles([PROJECT_FILE, ROLES_FILE]));
       const projectText = configFiles.get(PROJECT_FILE) ?? null;
@@ -1272,7 +1282,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           problems.push(stewardProblem);
         }
       }
-      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, problems, loadedAt: now() };
+      return { projectId, source, file, roles, rolesPresent, rolesUnreadable, githubLogin, linearLogin, role, playbooks, depsAlerts, depsPrs, repos, enabled, problems, loadedAt: now() };
     }
 
     // ---- the hand-written guidance's meter (BB-35 step 6) ------------------------------
@@ -1312,8 +1322,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return value;
     }
 
-    /** Every project with a stewards configuration. `projects` reuses a list already fetched this call (BB-95). */
-    async function stewardedProjects(force = false, projects?: Awaited<ReturnType<typeof bb.sdk.projects.list>>): Promise<ProjectConfig[]> {
+    /**
+     * The local, per-project switch, keyed by project id: whether this server
+     * stewards the project. It lives in the plugin's kv, so a recreated project
+     * (a new id) starts off again, and it is off until switched on. `.bb`'s
+     * `stewards/project.json` still says the project *can* be stewarded; both
+     * hold for anything to run.
+     */
+    const projectEnabledKey = (projectId: string) => `projects/${projectId}/enabled`;
+    async function projectEnabled(projectId: string): Promise<boolean> {
+      return (await bb.storage.kv.get<boolean>(projectEnabledKey(projectId))) === true;
+    }
+    /** Set the switch and drop the cached configuration, so the next read sees it. */
+    async function setProjectEnabled(projectId: string, enabled: boolean): Promise<void> {
+      if (enabled) await bb.storage.kv.set(projectEnabledKey(projectId), true);
+      else await bb.storage.kv.delete(projectEnabledKey(projectId));
+      configs.delete(projectId);
+    }
+
+    /** Every project with a stewards configuration, whether or not this server has it switched on. */
+    async function configuredProjects(force = false, projects?: Awaited<ReturnType<typeof bb.sdk.projects.list>>): Promise<ProjectConfig[]> {
       const list = projects ?? (await bb.sdk.projects.list());
       const out: ProjectConfig[] = [];
       for (const p of list) {
@@ -1321,6 +1349,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (config !== null) out.push(config);
       }
       return out;
+    }
+
+    /** Every project this server stewards: configured in `.bb` and switched on here. `projects` reuses a list already fetched this call (BB-95). */
+    async function stewardedProjects(force = false, projects?: Awaited<ReturnType<typeof bb.sdk.projects.list>>): Promise<ProjectConfig[]> {
+      return (await configuredProjects(force, projects)).filter((c) => c.enabled);
     }
 
     const playbookFor = (config: ProjectConfig, kind: BindingKind) => config.playbooks[kind] ?? null;
@@ -1547,8 +1580,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       debounce("interest", () => serial("interest", sendInterest));
     }
     async function sendInterest(): Promise<void> {
-      const projects = [...configs.values()].map((c) => c.value).filter((c): c is ProjectConfig => c !== null);
-      const open = store.open();
+      const projects = [...configs.values()]
+        .map((c) => c.value)
+        .filter((c): c is ProjectConfig => c !== null && c.enabled);
+      // A binding whose project is switched off is not leased any more, even
+      // while its stop turn is still running: the doorbell has nothing to wake.
+      const off = new Set([...configs.values()].filter((c) => c.value !== null && !c.value.enabled).map((c) => c.value!.projectId));
+      const open = store.open().filter((b) => !off.has(b.projectId));
       const sets: Record<Source, { units: string[]; entities: string[]; dependabot: string[]; deployment: string[] }> = {
         linear: {
           units: [...new Set(projects.flatMap((p) => p.file.linear.teams))].sort(),
@@ -1994,6 +2032,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // Only the login roles.json names as project steward runs it. Without a
       // roles.json the legacy role is every server's, so this is unchanged.
       if (config.role?.projectSteward !== true) return null;
+      // A project switched off on this server adopts nothing and wakes nobody;
+      // re-read the switch so a wake already in flight cannot respawn it.
+      if (!(await projectEnabled(config.projectId))) return null;
       let threadId: string | null = null;
       await serial(`project:${config.projectId}`, async () => {
         const row = store.project(config.projectId);
@@ -2349,6 +2390,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         bb.log.debug(`stewards: could not read the configuration of project ${b.projectId} while reconciling ${b.entityKey}; leaving it for the next sweep`);
         return;
       }
+      // A project switched off on this server wakes nobody: a binding the
+      // upgrade left open, or one whose stop turn is still running, is not
+      // woken by a requeue, a doorbell or the Sentry sweep.
+      if (!config.enabled) return;
       const playbook = bindingPlaybook(config, b);
       if (playbook === null) {
         // A dependency bot's pull request runs under deps-prs only. With the
@@ -3166,7 +3211,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         out.push({ kind, id });
       };
       for (const c of configs.values()) {
-        if (c.value === null) continue;
+        if (c.value === null || !c.value.enabled) continue;
         for (const t of roleSentryTargets(c.value.role)) add("project", `${t.org}/${t.project}`);
       }
       const recent = now() - ISSUE_LEASE_WINDOW_MS;
@@ -3208,7 +3253,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         for (const { binding } of openSentryBindings()) scheduleReconcile(binding.id);
       },
     });
-    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && roleSentryTargets(c.value.role).length > 0);
+    const sentryWanted = () => [...configs.values()].some((c) => c.value !== null && c.value.enabled && roleSentryTargets(c.value.role).length > 0);
 
     /**
      * One ops binding per configured target. A target taken out of the
@@ -3283,7 +3328,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * the steward may keep the binding open to follow through (a deploy to
      * watch, production to verify); they are stopped when it ends.
      */
-    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach", observed: Observed): Promise<void> {
+    async function beginEnding(b: Binding, config: ProjectConfig, playbook: Playbook, kind: "terminal" | "detach" | "disabled", observed: Observed): Promise<void> {
       // BB-52 rule 4: the steward's own last report already named the terminal
       // state, or a worker's final message says it moved the entity there, so
       // the binding's own last turn set it and said the work is done. End from
@@ -3298,9 +3343,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const ownDone = kind === "terminal" && (stewardDone || workerDone);
       b = store.patch(b.id, { ending: kind, endingAt: now(), followThrough: null, followThroughUntil: null, lastSnapshot: observed, clearedToStart: false });
       // Whatever its work was holding back can go now: landed, canceled or no longer managed, it is not merging later.
-      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : "was detached");
-      if (kind === "detach") await stopWorkers(b);
-      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : "was detached"}; one last turn`);
+      await releaseBehind(b, kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "the project was switched off" : "was detached");
+      if (kind !== "terminal") await stopWorkers(b);
+      bb.log.info(`stewards: ${b.entityKey} ${kind === "terminal" ? `reached ${observed.entity.state}` : kind === "disabled" ? "is ending because its project was switched off" : "was detached"}; one last turn`);
       if (b.threadId === null) {
         await finishEnding(b, kind);
         return;
@@ -3315,7 +3360,56 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await finishEnding(b, "terminal");
         return;
       }
-      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : `The ${config.file.label} label was removed`], kind);
+      await wake(b, config, playbook, observed, [kind === "terminal" ? `Terminal: ${observed.entity.state}` : kind === "disabled" ? "Stewards for this project were switched off on this server" : `The ${config.file.label} label was removed`], kind);
+    }
+
+    /**
+     * The stop turn for a binding whose project was switched off on this
+     * server. An entity binding reuses its ordinary wake shape; an ops, deps
+     * or Sentry binding has no entity snapshot, so it gets its own wake built
+     * from the look it already holds. Either way the workers are stopped now
+     * and the binding ends when the turn goes idle.
+     */
+    async function beginDisabledEnding(b: Binding, config: ProjectConfig, playbook: Playbook): Promise<void> {
+      if (b.kind !== "ops" && b.lastSnapshot !== null) {
+        await beginEnding(b, config, playbook, "disabled", b.lastSnapshot);
+        return;
+      }
+      b = store.patch(b.id, { ending: "disabled", endingAt: now(), followThrough: null, followThroughUntil: null, clearedToStart: false });
+      await releaseBehind(b, "the project was switched off");
+      await stopWorkers(b);
+      bb.log.info(`stewards: ${b.entityKey} is ending because its project was switched off; one stop turn`);
+      if (b.threadId === null) {
+        await finishEnding(b, "disabled");
+        return;
+      }
+      const info = await threadInfo(b.threadId);
+      if (info === null || info.deletedAt !== null) {
+        await finishEnding(b, "disabled");
+        return;
+      }
+      const delivery = await deliverWake(b, config, playbook, disabledOpsWake(b, config, playbook));
+      if (delivery === false) return;
+      store.patch(b.id, { awaitingReport: true, wokeAt: now(), lastJudgmentAt: now(), pending: [], archiveWhenIdle: false });
+      noteRespawn(b, delivery.respawned);
+    }
+
+    /** The stop turn's text for an ops, deps or Sentry binding: its own wake with the look it last held. */
+    function disabledOpsWake(b: Binding, config: ProjectConfig, playbook: Playbook): string {
+      const changes = ["Stewards for this project were switched off on this server. This is your stop turn: take no new actions and start no workers."];
+      const target = parseOpsTargetKey(b.entityId);
+      const team = roleOpsTeam(config.role, config.file);
+      const escalations = store.openEscalations(b.id);
+      if (target?.kind === "dependabot" && b.depsLook !== null) {
+        return formatDepsWake({ reason: "disabled", binding: b, playbook, look: b.depsLook, team, label: config.file.label, autoAdopt: config.file.deps.autoAdopt, timeZone: config.file.nightly.timezone, escalations, changes });
+      }
+      if (target?.kind === "sentry-project" && b.sentryLook !== null) {
+        return formatSentryWake({ reason: "disabled", binding: b, playbook, look: b.sentryLook, team, label: config.file.label, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+      }
+      if (target?.kind === "k8s-namespace" && b.opsLook !== null) {
+        return formatOpsWake({ reason: "disabled", binding: b, playbook, look: b.opsLook, team, label: config.file.label, autoAdopt: config.role?.ops?.autoAdopt ?? [], escalations, changes });
+      }
+      return `# ${b.entityKey}\n\nStewards for this project were switched off on this server. This is your stop turn: take no new actions on the target and start no workers; running workers have been stopped. End with steward_report, saying where things stand. Switching the project back on resumes this binding.`;
     }
 
     /**
@@ -5240,8 +5334,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
       try {
         const bound = store.byEntity("linear", w.issue.id);
-        if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket") {
-          const config = await loadConfig(bound.projectId);
+        const boundConfig = bound === null ? null : await loadConfig(bound.projectId);
+        if (bound !== null && bound.endedAt === null && bound.threadId !== null && bound.kind === "ticket" && boundConfig !== null && boundConfig.enabled) {
+          const config = boundConfig;
           const sent = { outcome: "failed" as "sent" | "gone" | "failed" | "unavailable" };
           await serial(`b:${bound.id}`, async () => {
             const b = store.binding(bound.id);
@@ -5334,7 +5429,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsOverview() {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const configsById = new Map((await stewardedProjects()).map((c) => [c.projectId, c] as const));
+        const configsById = new Map((await configuredProjects()).map((c) => [c.projectId, c] as const));
         const ids = projectIds(configsById.keys());
         const projects = ids.map((projectId) => {
           const config = configsById.get(projectId) ?? null;
@@ -5345,6 +5440,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             projectId,
             name: named.get(projectId) ?? projectId,
             configured: config !== null,
+            enabled: config?.enabled ?? false,
             source: config?.source.kind ?? null,
             label: config?.file.label ?? null,
             linearTeams: config?.file.linear.teams ?? [],
@@ -5393,9 +5489,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       async stewardsCheck({ projectId }) {
         return check(projectId);
       },
+      async stewardsSetProjectEnabled({ projectId, enabled }) {
+        return setProjectEnabledForUser(projectId, enabled);
+      },
       async stewardsBoard({ projectId: wanted }) {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const projects = projectIds((await stewardedProjects()).map((c) => c.projectId))
+        const projects = projectIds((await configuredProjects()).map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
@@ -5475,7 +5574,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // instead of `bb.sdk.projects.list()` twice.
         const projectList = await bb.sdk.projects.list();
         const named = new Map(projectList.map((p) => [p.id, p.name] as const));
-        const configs = await stewardedProjects(false, projectList);
+        const configs = await configuredProjects(false, projectList);
         const projects = projectIds(configs.map((c) => c.projectId))
           .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
           .sort((a, b) => a.name.localeCompare(b.name));
@@ -7139,7 +7238,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const entity = await snapshot(origin.source, origin.entityId).catch(() => null);
                 if (entity !== null) observed = { entity, pulls: [] };
               }
-              if (config !== null && playbook !== null && observed !== null) {
+              if (config !== null && config.enabled && playbook !== null && observed !== null) {
                 await wake(origin, config, playbook, observed, [`Escalation ${d.escalationId} was answered by ${d.decidedBy}: ${d.text}`], "changed");
               }
             } else if (d.originThreadId !== null) {
@@ -7154,33 +7253,89 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * A project bb no longer lists was deleted. bb deleted its threads, and
-     * `thread.deleted` ended every binding that had a steward; this ends the
-     * rest (adopted but never woken, ops targets) and then purges the
-     * project's rows. Binding lookup is global, one steward per entity per
-     * server, so a dead project's bindings would otherwise keep a successor
-     * project watching the same teams and repos from ever adopting them. The
-     * cached configuration goes too, so the project's team, repo, Dependabot,
-     * deployment and Sentry leases lapse on the next push.
+     * End everything this server does for one project. It is the one path for
+     * both a project bb no longer lists (deletion, `purge` its records) and one
+     * switched off on this server (records kept, so switching back on resumes
+     * rather than starts over): each open binding with a live steward gets its
+     * one stop turn, one without ends at once, the project steward is archived,
+     * and the source leases lapse on the next push. Binding lookup is global,
+     * one steward per entity per server, so a deleted project's bindings would
+     * otherwise keep a successor project watching the same teams and repos from
+     * ever adopting them.
      */
-    async function retireDeletedProject(projectId: string): Promise<void> {
+    async function endProject(projectId: string, reason: string, opts: { purge: boolean }): Promise<void> {
       const open = store.open(projectId);
+      // A switched-off project keeps its records and can be switched back on,
+      // so its bindings get a stop turn; a deleted one is purged and cannot.
+      const config = opts.purge ? null : await loadConfig(projectId, true);
       for (const b of open) {
         await serial(`b:${b.id}`, async () => {
           const fresh = store.binding(b.id);
           if (fresh === null || fresh.endedAt !== null) return;
-          await finishEnding(fresh, "project deleted");
+          // Already ending (a terminal or detach, or an earlier pass of this
+          // switch-off): the stop turn is under way; do not send another.
+          if (fresh.ending !== null) return;
+          const playbook = config === null ? null : bindingPlaybook(config, fresh);
+          if (config === null || playbook === null) {
+            await finishEnding(fresh, reason);
+            return;
+          }
+          await beginDisabledEnding(fresh, config, playbook);
         });
       }
-      const purged = store.purgeProject(projectId);
+      // The project steward has no entity to report on and nothing left to
+      // wake it, so it is archived rather than given a turn.
+      const row = store.project(projectId);
+      if (row.threadId !== null) {
+        const threadId = row.threadId;
+        store.patchProject(projectId, { threadId: null, title: null });
+        await quietly(`archive the project steward ${threadId}`, () => bb.sdk.threads.archive({ threadId }));
+      }
+      const purged = opts.purge ? store.purgeProject(projectId) : [];
       for (const id of purged) sentryRung.delete(id);
-      configs.delete(projectId);
+      if (opts.purge) for (const key of [`good/${projectId}/project`, `good/${projectId}/roles`, projectEnabledKey(projectId)]) await quietly(`forget ${key}`, () => bb.storage.kv.delete(key));
+      // A deleted project's cached configuration goes; a switched-off one stays,
+      // disabled, so its leases are not re-sent and the switch shows without a re-read.
+      if (opts.purge) configs.delete(projectId);
       guidanceIndexes.delete(projectId);
       projectHostCache.delete(projectId);
       nativeFetchedAt.delete(projectId);
-      for (const key of [`good/${projectId}/project`, `good/${projectId}/roles`]) await quietly(`forget ${key}`, () => bb.storage.kv.delete(key));
-      bb.log.info(`stewards: project ${projectId} is gone; ended ${open.length} open binding(s), purged ${purged.length}, and released its leases`);
+      bb.log.info(
+        opts.purge
+          ? `stewards: project ${projectId} is gone; ended ${open.length} open binding(s), purged ${purged.length}, and released its leases`
+          : `stewards: project ${projectId} was switched off; ended ${open.length} open binding(s) and kept its records`,
+      );
       pushInterest();
+    }
+
+    /** The per-project body of the sweep: adoption, the project steward, ops bindings and a look at every binding. */
+    async function sweepProject(config: ProjectConfig): Promise<void> {
+      if (!(await settings.get()).paused) await adoptionPass(config);
+      await retireProjectSteward(config);
+      await keepProjectSteward(config.projectId);
+      await syncOpsBindings(config);
+      await reconcileLessons(config);
+      applyLessonTransitions(config);
+      applyRationaleClustering(config);
+      for (const b of store.open(config.projectId)) {
+        if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
+        const deadline = endingDeadline(b, timing.endingTimeoutMs);
+        if (deadline !== null && now() > deadline) {
+          await serial(`b:${b.id}`, async () => {
+            const fresh = store.binding(b.id);
+            if (fresh === null || fresh.ending === null || fresh.endedAt !== null) return;
+            if (followingThrough(fresh)) await followThroughRanOut(fresh);
+            else await finishEnding(fresh, fresh.ending!);
+          });
+          continue;
+        }
+        const playbook = bindingPlaybook(config, b);
+        if (playbook !== null) {
+          const limit = stuckDue(b, playbook, store.openEscalations(b.id), now());
+          if (limit !== null) await raise(b, "stuck", `${b.entityKey}'s status has not moved in ${formatDuration(limit)} (phase ${b.phase}). What should happen?`, "Carrying on as before.");
+        }
+        scheduleReconcile(b.id);
+      }
     }
 
     async function sweep(): Promise<void> {
@@ -7189,40 +7344,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // One list for the stewarded projects and for the deleted ones below; a
       // failed read throws here, so a transient error never purges anything.
       const listed = await bb.sdk.projects.list();
-      const projects = await stewardedProjects(true, listed);
+      const configured = await configuredProjects(true, listed);
+      const projects = configured.filter((c) => c.enabled);
       const ids = new Set(listed.map((p) => p.id));
       for (const projectId of store.projectIds()) {
-        if (!ids.has(projectId)) await quietly(`retire the deleted project ${projectId}`, () => retireDeletedProject(projectId));
+        if (!ids.has(projectId)) await quietly(`retire the deleted project ${projectId}`, () => endProject(projectId, "project deleted", { purge: true }));
+      }
+      // A project switched off on this server ends anything it still holds:
+      // the first sweep after the switch is a no-op, and the first sweep after
+      // the upgrade ends what the default-off change left running, once.
+      for (const config of configured) {
+        if (config.enabled) continue;
+        const row = store.project(config.projectId);
+        const pending = store.open(config.projectId).filter((b) => b.ending === null);
+        if (pending.length === 0 && row.threadId === null) continue;
+        await quietly(`switch off the disabled project ${config.projectId}`, () => endProject(config.projectId, "disabled", { purge: false }));
       }
       pushInterest();
-      for (const config of projects) {
-        if (!(await settings.get()).paused) await adoptionPass(config);
-        await retireProjectSteward(config);
-        await keepProjectSteward(config.projectId);
-        await syncOpsBindings(config);
-        await reconcileLessons(config);
-        applyLessonTransitions(config);
-        applyRationaleClustering(config);
-        for (const b of store.open(config.projectId)) {
-          if (b.threadId !== null) await keepSteward(config.projectId, b.threadId);
-          const deadline = endingDeadline(b, timing.endingTimeoutMs);
-          if (deadline !== null && now() > deadline) {
-            await serial(`b:${b.id}`, async () => {
-              const fresh = store.binding(b.id);
-              if (fresh === null || fresh.ending === null || fresh.endedAt !== null) return;
-              if (followingThrough(fresh)) await followThroughRanOut(fresh);
-              else await finishEnding(fresh, fresh.ending!);
-            });
-            continue;
-          }
-          const playbook = bindingPlaybook(config, b);
-          if (playbook !== null) {
-            const limit = stuckDue(b, playbook, store.openEscalations(b.id), now());
-            if (limit !== null) await raise(b, "stuck", `${b.entityKey}'s status has not moved in ${formatDuration(limit)} (phase ${b.phase}). What should happen?`, "Carrying on as before.");
-          }
-          scheduleReconcile(b.id);
-        }
-      }
+      for (const config of projects) await sweepProject(config);
     }
 
     const running = new Set<string>();
@@ -7232,6 +7371,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // `bb stewards pass --nightly` runs now, whatever the hour, for at most two hours.
       const deadline = now() + 2 * 60 * 60_000;
       const inNight = () => (anytime ? now() < deadline : stillNight(now(), config.file.nightly, night));
+      if (!config.enabled) return;
       if (running.has(config.projectId)) return;
       running.add(config.projectId);
       try {
@@ -7366,10 +7506,45 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return [environmentFlags(source, await projectHost(b.projectId)), workerFlags(workerModel(b, playbook))].filter((f) => f !== "").join(" ");
     }
 
+    /**
+     * Switch this server's stewards for one project on or off. Turning on
+     * sweeps the project at once, so its project steward and ops bindings start
+     * now, and reopens the bindings the switch-off ended. Turning off runs the
+     * shared end path: a stop turn for each open binding, the project steward
+     * archived, and the leases released, with the records kept.
+     */
+    async function setProjectEnabledForUser(projectId: string, enabled: boolean): Promise<{ ok: boolean; message: string; enabled: boolean }> {
+      const config = await loadConfig(projectId, true);
+      if (config === null) return { ok: false, message: `Project ${projectId} has no ${PROJECT_FILE}; run bb stewards init.`, enabled: false };
+      if (config.enabled === enabled) return { ok: true, message: enabled ? `Stewards are already on for ${config.file.label}.` : `Stewards are already off for ${config.file.label}.`, enabled };
+      await setProjectEnabled(projectId, enabled);
+      bb.realtime.publish(PROJECT_CHANGED, { projectId });
+      if (enabled) {
+        // Resume what the switch-off ended rather than start over.
+        for (const b of store.all(projectId)) {
+          if (b.endedAt === null || b.endReason !== "disabled") continue;
+          await serial(`b:${b.id}`, async () => {
+            const fresh = store.binding(b.id);
+            if (fresh === null || fresh.endedAt === null) return;
+            await reopen(fresh, "the project's stewards were switched back on");
+          });
+        }
+        const fresh = await loadConfig(projectId, true);
+        if (fresh !== null && fresh.enabled) {
+          await ensureProjectSteward(fresh);
+          await sweepProject(fresh);
+        }
+        return { ok: true, message: `Stewards are on for ${config.file.label}; swept now.`, enabled: true };
+      }
+      await endProject(projectId, "disabled", { purge: false });
+      return { ok: true, message: `Stewards are off for ${config.file.label}; open bindings are ending.`, enabled: false };
+    }
+
     async function check(projectId: string): Promise<{ ok: boolean; lines: string[] }> {
       const config = await loadConfig(projectId, true);
       if (config === null) return { ok: false, lines: [`No ${PROJECT_FILE} on the project's .bb (committed HEAD). Run bb stewards init.`] };
       const lines: string[] = [...config.problems.map((p) => `problem: ${p}`)];
+      if (!config.enabled) lines.push(`Stewards are off for this project on this server; nothing is adopted and no steward is woken. Switch on with bb stewards enable --project ${projectId}.`);
       lines.push(`Project source: ${projectSourceLabel(config.source.kind)}`);
       const ticket = config.playbooks.ticket;
       lines.push(`Linear teams: ${config.file.linear.teams.join(", ") || "(none)"}; repos: ${config.repos.join(", ") || "(none)"}${config.file.github.exclude.length > 0 ? ` (excluded: ${config.file.github.exclude.join(", ")})` : ""}; label ${config.file.label}`);
@@ -7488,7 +7663,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 const result = (await bb.sdk.files.write({ path, content, ...(input.options.force ? {} : { expectedSha256: null }), ...(hostId === undefined ? {} : { hostId }) } as never)) as { outcome: string };
                 lines.push(`${result.outcome === "written" ? "wrote" : "kept existing"} ${rel}`);
               }
-              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.");
+              lines.push("", `Teams: ${teams.join(", ") || "(none; add them to linear.teams)"}`, "Next: review the files, commit inside .bb, publish with workspace_publish_guidance (multi-repo) or open the guidance pull request yourself (native), merge the guidance branch, then run bb stewards check.", "Stewards are off until switched on for a server: run bb stewards enable --project <id> there, or use the toggle on each project's row of the settings page.");
               return { exitCode: 0, stdout: lines.join("\n") };
             },
           }),
@@ -7536,6 +7711,26 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             },
           }),
 
+          enable: cliCommand({
+            summary: "Switch this server's stewards on for a project, and sweep it now",
+            description: "Local to this server, keyed by project id, and off by default. `.bb`'s stewards/project.json still has to exist. Turning on reopens the bindings the last switch-off ended and sweeps the project at once.",
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const result = await setProjectEnabledForUser(projectOf(input.options.project, ctx), true);
+              return { exitCode: result.ok ? 0 : 1, stdout: result.message };
+            },
+          }),
+
+          disable: cliCommand({
+            summary: "Switch this server's stewards off for a project, ending its bindings",
+            description: "Local to this server only. Each open binding gets one stop turn and its workers are stopped, the project steward is archived, and the leases are released; the records are kept, so switching back on resumes rather than starts over.",
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const result = await setProjectEnabledForUser(projectOf(input.options.project, ctx), false);
+              return { exitCode: result.ok ? 0 : 1, stdout: result.message };
+            },
+          }),
+
           list: cliCommand({
             summary: "Bindings and their status records",
             options: { all: { type: "boolean", description: "Include ended bindings" }, project: PROJECT_OPTION, json: JSON_OPTION },
@@ -7543,9 +7738,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const projectId = input.options.project ?? ctx.projectId;
               const rows = input.options.all ? store.all(projectId) : store.open(projectId);
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
+              const config = projectId === undefined ? null : await loadConfig(projectId);
+              const offLine = config !== null && !config.enabled ? [`Stewards are off for this project on this server. Switch on with bb stewards enable${projectId === undefined ? "" : ` --project ${projectId}`}.`] : [];
               const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
-              return { exitCode: 0, stdout: [formatBindings(rows), ...lessonLines].join("\n") };
+              return { exitCode: 0, stdout: [...offLine, formatBindings(rows), ...lessonLines].join("\n") };
             },
           }),
 
@@ -8081,12 +8278,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       kept.clear();
     };
     await pinSidebarThreadListProvider(bb);
-    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
+    testHooks.set(bb.pluginId, { sweep, requeueTick, unhideOnce, store, db, settings, forgetTags, setProjectEnabled, nightlyPass: (projectId: string, night: string) => loadConfig(projectId, true).then((c) => (c === null ? undefined : nightlyPass(c, night, true))), loadConfig: (projectId: string, force = false) => loadConfig(projectId, force), forgetConfigs: () => configs.clear(), settle: () => Promise.all([...chains.values(), ...configReads.values()]).then(() => undefined), sentryDoorbell: onSentryDoorbell, sentryLeases });
   };
 }
 
 /** Test seams, keyed by plugin id. Not part of any contract. */
-export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
+export const testHooks = new Map<string, { sweep(): Promise<void>; requeueTick(): Promise<void>; unhideOnce(): Promise<void>; store: Store; db: { prepare(sql: string): { run(...args: unknown[]): unknown } }; settings: { get(): Promise<Record<string, unknown>> }; forgetTags(): void; setProjectEnabled(projectId: string, enabled: boolean): Promise<void>; nightlyPass(projectId: string, night: string): Promise<void>; loadConfig(projectId: string, force?: boolean): Promise<ProjectConfig | null>; forgetConfigs(): void; settle(): Promise<void>; sentryDoorbell(id: string, unit: string | null): void; sentryLeases(): Lease[] }>();
 
 export { DEFAULT_PLAYBOOKS, STEWARDS_PLUGIN_ID };
 
