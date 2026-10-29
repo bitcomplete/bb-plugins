@@ -918,6 +918,22 @@ deployment:                       # where a merge is confirmed live (BB-53); omi
   deletes one: deleting a parent thread deletes every descendant, archived
   ones included (get-bb/bb#6129), so deleting the project steward row by hand
   would take every steward, worker and reviewer under it.
+- **A deleted project is purged.** `bb project delete` tombstones every
+  thread in the project with a `thread.deleted` each, which the handler
+  turns into an ended binding, and the project leaves `projects.list` at
+  once (bb filters soft-deleted projects out). The sweep reads the list
+  once, and for every project the store knows that is not in it, ends the
+  open bindings that had no thread yet (adopted but never woken, ops
+  targets), then `purgeProject` deletes its bindings and everything keyed
+  by them, its lessons, citations and project-steward row, and the cached
+  configuration and kv "last good" copies go with it, so the next interest
+  push drops its leases. Purging rather than keeping ended rows is forced by
+  the lookup: `byEntity` is global and oldest-first and `maybeAdopt` treats
+  any binding as a claim, so a dead project's rows would keep a successor
+  project from ever adopting the same tickets. A failed list read throws
+  before the step, so a transient error purges nothing; and a project the
+  plugin was asleep for when it was deleted is caught the same way on the
+  next sweep.
 - Whether a steward is waiting on you, waiting on someone else, or done is
   thread-briefs' judgment from its transcript. A steward waiting on someone
   else is left in the sidebar, not archived and not hidden (BB-93): it stays
