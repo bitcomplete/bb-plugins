@@ -7263,18 +7263,24 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * otherwise keep a successor project watching the same teams and repos from
      * ever adopting them.
      */
-    async function endProject(projectId: string, reason: string, opts: { purge: boolean }): Promise<void> {
+    async function endProject(projectId: string, reason: string, opts: { purge: boolean; config?: ProjectConfig }): Promise<void> {
       const open = store.open(projectId);
       // A switched-off project keeps its records and can be switched back on,
       // so its bindings get a stop turn; a deleted one is purged and cannot.
-      const config = opts.purge ? null : await loadConfig(projectId, true);
+      // The caller's already-validated config is used when given, so one
+      // transient `.bb` read cannot turn the stop turns into hard endings.
+      const config = opts.purge ? null : (opts.config ?? (await loadConfig(projectId, true)));
       for (const b of open) {
         await serial(`b:${b.id}`, async () => {
           const fresh = store.binding(b.id);
           if (fresh === null || fresh.endedAt !== null) return;
-          // Already ending (a terminal or detach, or an earlier pass of this
-          // switch-off): the stop turn is under way; do not send another.
-          if (fresh.ending !== null) return;
+          if (fresh.ending !== null) {
+            // Already ending: send no second stop turn, but finish one whose
+            // turn never went idle, the same backstop every ending gets.
+            const deadline = endingDeadline(fresh, timing.endingTimeoutMs);
+            if (deadline !== null && now() > deadline) await finishEnding(fresh, fresh.ending);
+            return;
+          }
           const playbook = config === null ? null : bindingPlaybook(config, fresh);
           if (config === null || playbook === null) {
             await finishEnding(fresh, reason);
@@ -7356,9 +7362,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       for (const config of configured) {
         if (config.enabled) continue;
         const row = store.project(config.projectId);
-        const pending = store.open(config.projectId).filter((b) => b.ending === null);
+        // A binding with no ending is pending; so is one whose stop turn never
+        // went idle, so the ending backstop still reaches a switched-off project.
+        const pending = store.open(config.projectId).filter((b) => {
+          if (b.ending === null) return true;
+          const deadline = endingDeadline(b, timing.endingTimeoutMs);
+          return deadline !== null && now() > deadline;
+        });
         if (pending.length === 0 && row.threadId === null) continue;
-        await quietly(`switch off the disabled project ${config.projectId}`, () => endProject(config.projectId, "disabled", { purge: false }));
+        await quietly(`switch off the disabled project ${config.projectId}`, () => endProject(config.projectId, "disabled", { purge: false, config }));
       }
       pushInterest();
       for (const config of projects) await sweepProject(config);
@@ -7518,6 +7530,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (config === null) return { ok: false, message: `Project ${projectId} has no ${PROJECT_FILE}; run bb stewards init.`, enabled: false };
       if (config.enabled === enabled) return { ok: true, message: enabled ? `Stewards are already on for ${config.file.label}.` : `Stewards are already off for ${config.file.label}.`, enabled };
       await setProjectEnabled(projectId, enabled);
+      // The configuration was just read, so keep it cached with the new switch:
+      // the interest set and the stop turns see it without a second `.bb` read.
+      configs.set(projectId, { at: now(), value: { ...config, enabled } });
       bb.realtime.publish(PROJECT_CHANGED, { projectId });
       if (enabled) {
         // Resume what the switch-off ended rather than start over.
@@ -7529,14 +7544,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             await reopen(fresh, "the project's stewards were switched back on");
           });
         }
-        const fresh = await loadConfig(projectId, true);
-        if (fresh !== null && fresh.enabled) {
-          await ensureProjectSteward(fresh);
-          await sweepProject(fresh);
-        }
+        // The configuration was just read above, so a transient `.bb` failure
+        // here cannot silently skip the sweep the message promises.
+        await ensureProjectSteward(config);
+        await sweepProject({ ...config, enabled: true });
         return { ok: true, message: `Stewards are on for ${config.file.label}; swept now.`, enabled: true };
       }
-      await endProject(projectId, "disabled", { purge: false });
+      await endProject(projectId, "disabled", { purge: false, config });
       return { ok: true, message: `Stewards are off for ${config.file.label}; open bindings are ending.`, enabled: false };
     }
 
@@ -7738,8 +7752,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const projectId = input.options.project ?? ctx.projectId;
               const rows = input.options.all ? store.all(projectId) : store.open(projectId);
               if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(rows.map(({ lastSnapshot: _s, ...rest }) => rest)) };
-              const config = projectId === undefined ? null : await loadConfig(projectId);
-              const offLine = config !== null && !config.enabled ? [`Stewards are off for this project on this server. Switch on with bb stewards enable${projectId === undefined ? "" : ` --project ${projectId}`}.`] : [];
+              // With a project, its own line; without one, name every configured
+              // project this server has switched off, so a bare list still says.
+              const offProjects =
+                projectId === undefined
+                  ? (await configuredProjects()).filter((c) => !c.enabled).map((c) => c.projectId)
+                  : (await loadConfig(projectId))?.enabled === false
+                    ? [projectId]
+                    : [];
+              const offLine = offProjects.length === 0 ? [] : [`Stewards are off on this server for ${offProjects.join(", ")}. Switch on with bb stewards enable --project <id>.`];
               const lessons = projectId === undefined ? [] : store.lessons(projectId).filter((l) => l.tier !== "retired");
               const lessonLines = lessons.length === 0 ? [] : ["", `Lessons pending (${lessons.length}):`, ...lessons.map((l) => `  ${l.id} — ${l.scope}, ${l.file}${l.bindingId === null ? "" : `, from ${store.binding(l.bindingId)?.entityKey ?? l.bindingId}`}: ${l.text}`)];
               return { exitCode: 0, stdout: [...offLine, formatBindings(rows), ...lessonLines].join("\n") };

@@ -2529,7 +2529,9 @@ describe("the per-project switch", () => {
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.stdout).toMatch(/Stewards are off for this project on this server/u);
     const list = await t.harness.behavior.runCli(["list", "--project", "p1"]);
-    expect(list.stdout).toMatch(/Stewards are off for this project on this server/u);
+    expect(list.stdout).toMatch(/Stewards are off on this server for p1/u);
+    const bare = await t.harness.behavior.runCli(["list"]);
+    expect(bare.stdout).toMatch(/Stewards are off on this server for p1/u);
   });
 
   it("switches on from the settings page and sweeps the project at once", async () => {
@@ -2595,6 +2597,33 @@ describe("the per-project switch", () => {
     expect(stop).toBeTruthy();
     expect(t.archives()).toContain(t.project);
     expect(t.hooks.store.find("ENG-12", "p1")!.ending).toBe("disabled");
+  });
+
+  it("starts a project off after it is deleted and recreated", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+    // Deleting the project purges it, its switch included.
+    t.projectList.splice(0);
+    await t.hooks.sweep();
+    await t.flush();
+    // The same id comes back with the same .bb; it is off until switched on.
+    t.projectList.push({ id: "p1", name: "Acme again" });
+    const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ projectId: string; enabled: boolean }> };
+    expect(overview.projects).toEqual(expect.arrayContaining([expect.objectContaining({ projectId: "p1", enabled: false })]));
+  });
+
+  it("finishes a stop turn that never goes idle, so a hung turn cannot strand a binding", async () => {
+    const t = await working();
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: false });
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12", "p1")!.ending).toBe("disabled");
+    // The turn never ends; the ending backstop still reaches a project that is
+    // no longer swept.
+    t.advance(2 * 60 * 60_000);
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.find("ENG-12", "p1")!.endedAt).not.toBeNull();
   });
 
   it("switches on and off from the CLI", async () => {
