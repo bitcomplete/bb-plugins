@@ -77,9 +77,10 @@ There are two layouts, detected from the default branch's committed tree:
 - **primary** — the checkout is a clone of the primary repo and the definition
   sits at `P/.bb/`. `repos.json` lists only the other repos; P is derived from
   the checkout's `origin` and materialised into the workspace in addition to
-  them. `.bb/` is copied from the canonical checkout to `<workspace>/.bb`,
-  because core reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the
-  workspace root only.
+  them. `<workspace>/.bb` is a symlink to `<workspace>/P/.bb`, because core
+  reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the workspace
+  root only; a copy from the default branch's committed tip is the fallback
+  when the link cannot be made.
 - **standalone** — the checkout is a `.bb` git repo with the definition at its
   root. This is the original layout, still read and written as before so a
   machine that has not adopted keeps working.

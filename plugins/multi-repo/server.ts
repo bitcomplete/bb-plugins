@@ -1190,7 +1190,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     description:
       "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
     instructions:
-      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side and publishes a guidance-<thread> branch — there is no need (and, where .bb/ is a directory rather than a repo, no way) to commit inside .bb yourself.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side on a guidance-<thread> branch cut from the default branch, leaving the thread's own branch alone — there is no need to commit inside .bb yourself. In the primary layout .bb/ is a link into the primary clone, so the same edits can instead be committed and pushed with the thread's code.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {

@@ -136,7 +136,7 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
   lines.push("");
   lines.push(
     manifest.layout === "primary"
-      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. Changes to it are reviewed like code: edit them and publish the branch with `workspace_publish_guidance` (it commits for you), then land them with a pull request."
+      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. In this workspace `.bb/` is a link to the primary clone's `.bb/`, so an edit under it is a working-tree change in that clone on this thread's branch. Changes to it are reviewed like code: commit them with the thread's pull request, or publish them on their own with `workspace_publish_guidance` (it commits for you on a `guidance-<thread>` branch)."
       : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
   );
   lines.push("");
