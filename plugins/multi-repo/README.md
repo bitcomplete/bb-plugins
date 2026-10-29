@@ -137,9 +137,16 @@ workspace.
 `.bb/` is a directory on the primary repo's default branch, next to the code,
 reviewed like code. The project source is a clone of that primary repo, and
 core reads `<workspace>/.bb/AGENTS.md` and `<workspace>/.bb/skills` from the
-workspace root — so each thread materialises `.bb/` there from the primary's
-`.bb/`. Reads (`readProjectFiles`, `repoSet`) come from the default branch's
-committed tip, never the working tree or a feature branch.
+workspace root — so each thread gets `<workspace>/.bb` as a symlink to
+`<workspace>/<primary>/.bb`, and sees what its own checkout of the primary
+carries, exactly as a single-repo thread sees its checkout's `.bb/`. An edit
+under `.bb/` is a working-tree change in the primary clone: it can go with the
+thread's code, or on its own through `workspace_publish_guidance`. When the
+link cannot be made (the primary failed to clone, its branch has no `.bb/`, or
+the platform refuses a symlink) the thread gets a copy of `.bb/` from the
+default branch's committed tip instead. Reads (`readProjectFiles`, `repoSet`)
+come from the default branch's committed tip, never the working tree or a
+feature branch.
 
 The **standalone** layout — a small `.bb` git repo that is the project source —
 is still read and written exactly as before. `bb repos adopt <primary>` copies

@@ -589,8 +589,11 @@ async function pushGuidanceStandalone(
  *
  * The default branch is reviewed like code, so it is not fast-forwarded here.
  * A throwaway worktree at the default branch gets the workspace's `.bb`
- * content in place of the checkout's, one commit is made on it, and the ref is
- * written into the canonical checkout. A person (or BB-108) turns that branch
+ * content (the primary clone's working tree, through the workspace link) in
+ * place of the checkout's, one commit is made on it, and the ref is written
+ * into the canonical checkout. The thread's own branch is not touched: its
+ * `.bb/` edits may also travel with its code in a pull request, and this is
+ * the way to send them on their own. A person (or BB-108) turns that branch
  * into a pull request; the default branch only ever moves by merge.
  */
 async function pushGuidancePrimary(
@@ -624,7 +627,9 @@ async function pushGuidancePrimary(
     const added = await gitIn(projectSourcePath, ["worktree", "add", "--detach", "--force", worktree, base], options);
     if (added.code !== 0) return { ok: false, ref: null, message: firstProblemLine(added) };
     await rm(path.join(worktree, PROJECT_SOURCE_DIR), { recursive: true, force: true });
-    await cp(workspaceBbPath, path.join(worktree, PROJECT_SOURCE_DIR), { recursive: true });
+    // `dereference`: the workspace's `.bb` is a symlink into the primary clone,
+    // and it is the content behind it that is published, not the link.
+    await cp(workspaceBbPath, path.join(worktree, PROJECT_SOURCE_DIR), { recursive: true, dereference: true });
     await gitIn(worktree, ["add", "-A", "--", PROJECT_SOURCE_DIR], options);
     const staged = await gitIn(worktree, ["diff", "--cached", "--quiet"], options);
     let sha: string | null;

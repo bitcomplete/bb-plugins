@@ -8,7 +8,7 @@
  * at the workspace root, guidance publishing to a branch and not the default —
  * are git facts, not string shapes.
  */
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -26,6 +26,7 @@ import {
   readReposJson,
   resolveDefaultBranchRef,
 } from "./source.js";
+import { repoLiveStatus } from "./diff.js";
 import { provisionWorkspace } from "./workspace.js";
 
 let scratch: string;
@@ -160,13 +161,80 @@ describe("default-branch reads", () => {
 });
 
 describe("provisioning from a primary repo", () => {
-  it("clones the primary, copies .bb/ to the workspace root, and leaves the root non-git", async () => {
+  async function provisionPrimary(primaryDir = "primary"): Promise<{
+    primary: string;
+    canonical: string;
+    result: Awaited<ReturnType<typeof provisionWorkspace>>;
+  }> {
     const primary = await makeRepo("primary");
     await commitDefinition(primary, "cross-repo guidance\n");
     const canonical = path.join(scratch, "canonical");
     await git(["clone", "--quiet", primary, canonical]);
-
     const result = await provisionWorkspace({
+      dataDir,
+      pathKey: "thread1",
+      projectSourcePath: canonical,
+      layout: "primary",
+      primaryDir,
+      repos: [{ dir: "primary", url: primary, branch: null }],
+      branchName: "dylan/work",
+      fetchTtlMs: 0,
+      mirrors: [],
+    });
+    return { primary, canonical, result };
+  }
+
+  it("clones the primary, links .bb to the primary clone's .bb/, and leaves the root non-git", async () => {
+    const { result } = await provisionPrimary();
+
+    expect(await exists(path.join(result.root, ".git"))).toBe(false);
+    expect(await exists(path.join(result.root, "primary", ".git"))).toBe(true);
+    // Core reads `.bb/AGENTS.md` and `.bb/skills` from the workspace root, so
+    // the definition is reachable there — as a link into the primary clone,
+    // relative so the workspace resolves wherever it is mounted.
+    expect((await lstat(path.join(result.root, ".bb"))).isSymbolicLink()).toBe(true);
+    expect(await readlink(path.join(result.root, ".bb"))).toBe(path.join("primary", ".bb"));
+    expect(await readFile(path.join(result.root, ".bb", "AGENTS.md"), "utf8")).toBe("cross-repo guidance\n");
+    expect(await exists(path.join(result.root, ".bb", "repos.json"))).toBe(true);
+    expect(await exists(path.join(result.root, ".bb", ".git"))).toBe(false);
+    expect(result.definitionLinked).toBe(true);
+    const source = result.repos.find((repo) => repo.dir === ".bb");
+    expect(source?.status).toBe("ready");
+  });
+
+  it("shows the thread's own checkout: an edit under .bb/ is a change in the primary clone", async () => {
+    const { result } = await provisionPrimary();
+    await writeFile(path.join(result.root, ".bb", "AGENTS.md"), "edited in the thread\n", "utf8");
+    expect(await readFile(path.join(result.root, "primary", ".bb", "AGENTS.md"), "utf8")).toBe("edited in the thread\n");
+    const status = await gitIn(path.join(result.root, "primary"), ["status", "--porcelain"]);
+    expect(status.stdout.trimEnd()).toBe(" M .bb/AGENTS.md");
+  });
+
+  it("publishes the edits behind the link as guidance-<thread>, leaving the thread branch alone", async () => {
+    const { canonical, result } = await provisionPrimary();
+    await writeFile(path.join(result.root, ".bb", "AGENTS.md"), "learned through the link\n", "utf8");
+    const published = await pushGuidance(canonical, path.join(result.root, ".bb"), "thr_linked", undefined, result.definitionBase);
+    expect(published.ok).toBe(true);
+    expect(await gitLine(canonical, ["show", "guidance-thr_linked:.bb/AGENTS.md"])).toBe("learned through the link");
+    expect(await gitLine(canonical, ["show", "HEAD:.bb/AGENTS.md"])).toBe("cross-repo guidance");
+    // The guidance branch carries .bb/ only; the primary clone's branch has no new commit.
+    const clone = path.join(result.root, "primary");
+    expect(await gitLine(clone, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("dylan/work");
+    expect((await gitIn(clone, ["log", "--oneline", "main..HEAD"])).stdout.trim()).toBe("");
+  });
+
+  it("reports the linked .bb row by its target rather than the primary's status again", async () => {
+    const { result } = await provisionPrimary();
+    await writeFile(path.join(result.root, "primary", "README.md"), "changed\n", "utf8");
+    const status = await repoLiveStatus({ dir: ".bb", path: path.join(result.root, ".bb"), baseBranch: "default" });
+    expect(status.branch).toBeNull();
+    expect(status.dirty).toBe(0);
+    expect(status.error).toBe(`Linked to ${path.join("primary", ".bb")}.`);
+  });
+
+  it("leaves a link that still resolves alone when create() is re-entered", async () => {
+    const { primary, canonical } = await provisionPrimary();
+    const again = await provisionWorkspace({
       dataDir,
       pathKey: "thread1",
       projectSourcePath: canonical,
@@ -177,16 +245,19 @@ describe("provisioning from a primary repo", () => {
       fetchTtlMs: 0,
       mirrors: [],
     });
+    expect(again.definitionLinked).toBe(true);
+    expect((await lstat(path.join(again.root, ".bb"))).isSymbolicLink()).toBe(true);
+  });
 
-    expect(await exists(path.join(result.root, ".git"))).toBe(false);
-    expect(await exists(path.join(result.root, "primary", ".git"))).toBe(true);
-    // Core reads `.bb/AGENTS.md` and `.bb/skills` from the workspace root, so
-    // the definition is materialized there, not at `<primary>/.bb`.
+  it("falls back to a copy of the default branch's .bb/ when the primary clone has none to link", async () => {
+    // `primaryDir` names a directory that is not in the workspace: the primary
+    // failed to clone, or the thread branch predates `.bb/`.
+    const { result } = await provisionPrimary("elsewhere");
+    expect(result.definitionLinked).toBe(false);
+    expect((await lstat(path.join(result.root, ".bb"))).isSymbolicLink()).toBe(false);
     expect(await readFile(path.join(result.root, ".bb", "AGENTS.md"), "utf8")).toBe("cross-repo guidance\n");
-    expect(await exists(path.join(result.root, ".bb", "repos.json"))).toBe(true);
     expect(await exists(path.join(result.root, ".bb", ".git"))).toBe(false);
-    const source = result.repos.find((repo) => repo.dir === ".bb");
-    expect(source?.status).toBe("ready");
+    expect(result.repos.find((repo) => repo.dir === ".bb")?.status).toBe("ready");
   });
 
   it("fails the .bb row by name when the primary does not carry .bb/ on the branch", async () => {

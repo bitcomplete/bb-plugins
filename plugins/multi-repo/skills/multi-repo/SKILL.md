@@ -70,8 +70,16 @@ The canonical `.bb` checkout lives outside your sandbox, so `git push` from
 
 It commits them host-side and lands them on a `guidance-<thread>` branch in
 the canonical checkout, for a person to review and merge. There is no need to
-commit inside `.bb` yourself — and in the primary layout `.bb` is a plain
-directory with no git repo, so you cannot.
+commit inside `.bb` yourself.
+
+In the primary layout, `<workspace>/.bb` is a symlink to `<primary>/.bb`: the
+primary repo carries `.bb/` on its default branch, and the link shows you the
+copy on your own checkout of it, on this thread's branch. An edit under `.bb/`
+is therefore a working-tree change in the primary clone, and you have two ways
+to land it: commit it there and push it with the thread's code, or call
+`workspace_publish_guidance` to send only the `.bb/` changes on a
+`guidance-<thread>` branch cut from the default branch. `bb repos status` shows
+the `.bb` row as "Linked to"; the primary's row carries its change counts.
 
 ## A shared checkout
 

@@ -13,6 +13,7 @@
  * it has to work on anything; this caps the file count and the per-file patch
  * size instead and says so in the UI.
  */
+import { lstat, readlink } from "node:fs/promises";
 import path from "node:path";
 import type { ChangedFile, RepoChanges, RepoLiveStatus, RepoTarget } from "./contract.js";
 import { gitIn, gitLine } from "./git.js";
@@ -191,9 +192,26 @@ function nullDevice(): string {
   return process.platform === "win32" ? "nul" : path.posix.join("/dev", "null");
 }
 
+/** The link target of a symlinked path, as written, or null for anything else. */
+async function linkTarget(target: string): Promise<string | null> {
+  try {
+    if (!(await lstat(target)).isSymbolicLink()) return null;
+    return await readlink(target);
+  } catch {
+    return null;
+  }
+}
+
 /** Branch, divergence and working-tree counts, for the panel's repo headers. */
 export async function repoLiveStatus(target: RepoTarget, signal?: AbortSignal): Promise<RepoLiveStatus> {
   const options = { timeoutMs: 30_000, ...(signal === undefined ? {} : { signal }) };
+  // A linked `.bb` (the primary layout) sits inside the primary clone, so git
+  // run in it would report that whole clone again under this row. Say where
+  // it points instead; the primary's own row carries the counts.
+  const link = await linkTarget(target.path);
+  if (link !== null) {
+    return { dir: target.dir, branch: null, ahead: 0, behind: 0, dirty: 0, untracked: 0, error: `Linked to ${link}.` };
+  }
   const branch = await gitLine(target.path, ["rev-parse", "--abbrev-ref", "HEAD"], options);
   if (branch === null) {
     return {
