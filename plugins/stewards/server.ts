@@ -3459,6 +3459,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * BB-116: whether the per-project switch-off holds this binding and it is
+     * due back now that the project is on. A binding whose stop turn is still
+     * running (`ending === "disabled"`, not ended) is held; so is one the turn
+     * already ended (`endReason === "disabled"`), unless it was detached by
+     * hand. A binding that fully ended for any other reason is not.
+     */
+    const switchOffHeld = (b: Pick<Binding, "endedAt" | "ending" | "endReason" | "manualDetach">): boolean =>
+      (b.endedAt === null && b.ending === "disabled") || (b.endedAt !== null && b.endReason === "disabled" && !b.manualDetach);
+
+    /**
      * The playbook's cap on follow-through came before the steward said it
      * was done. The binding ends as any terminal one does, and the project
      * steward hears what was left, since nobody else will.
@@ -5055,6 +5065,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         if (followingThrough(b) && !b.awaitingReport) {
           await compactIfLarge(thread.id);
           if (store.binding(b.id)!.pending.some((n) => n.quiet !== true)) scheduleReconcile(b.id);
+          return;
+        }
+        // BB-116: the stop turn of a switched-off project may outlive the
+        // switch. If the project is on again by now, reopen the binding
+        // rather than end it, so a turn that goes idle after the switch
+        // cannot strand it.
+        if (b.ending === "disabled" && (await loadConfig(b.projectId))?.enabled === true) {
+          await serial(`b:${b.id}`, async () => {
+            const fresh = store.binding(b.id);
+            if (fresh === null || !switchOffHeld(fresh)) return;
+            await reopen(fresh, "the project's stewards were switched back on");
+          });
+          scheduleReconcile(b.id);
           return;
         }
         await serial(`b:${b.id}`, () => finishEnding(store.binding(b.id)!, b.ending!));
@@ -7316,6 +7339,22 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     /** The per-project body of the sweep: adoption, the project steward, ops bindings and a look at every binding. */
     async function sweepProject(config: ProjectConfig): Promise<void> {
+      // BB-116: a binding the switch-off ended comes back whenever the project
+      // is on, whatever the timing. The enable loop cancels an ending still in
+      // flight and reopens one already ended; this backstop catches the paths
+      // that interleave with it (a server restart partway through, an idle
+      // handler that ended the binding after the switch was already on), so a
+      // stranded `[ended: disabled]` cannot survive a sweep. A binding
+      // detached by hand stays ended; a reopened one is woken by the reconcile
+      // scheduled for it below.
+      for (const b of store.all(config.projectId)) {
+        if (!switchOffHeld(b)) continue;
+        await serial(`b:${b.id}`, async () => {
+          const fresh = store.binding(b.id);
+          if (fresh === null || !switchOffHeld(fresh)) return;
+          await reopen(fresh, "the project's stewards were switched back on");
+        });
+      }
       if (!(await settings.get()).paused) await adoptionPass(config);
       await retireProjectSteward(config);
       await keepProjectSteward(config.projectId);
@@ -7535,12 +7574,15 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       configs.set(projectId, { at: now(), value: { ...config, enabled } });
       bb.realtime.publish(PROJECT_CHANGED, { projectId });
       if (enabled) {
-        // Resume what the switch-off ended rather than start over.
+        // Resume what the switch-off ended rather than start over. A binding
+        // whose stop turn is still running (`ending === "disabled"`, not
+        // ended) is reopened too, so the turn going idle cannot end it after
+        // the project is already back on (BB-116).
         for (const b of store.all(projectId)) {
-          if (b.endedAt === null || b.endReason !== "disabled") continue;
+          if (!switchOffHeld(b)) continue;
           await serial(`b:${b.id}`, async () => {
             const fresh = store.binding(b.id);
-            if (fresh === null || fresh.endedAt === null) return;
+            if (fresh === null || !switchOffHeld(fresh)) return;
             await reopen(fresh, "the project's stewards were switched back on");
           });
         }

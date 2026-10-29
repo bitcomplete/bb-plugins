@@ -595,7 +595,9 @@ keyed by project id and off by default, so a recreated project starts off
 again and nothing in `.bb` changes. Switch it on each project's row of the
 settings page, or with `bb stewards enable|disable [--project <id>]`.
 Turning on sweeps the project at once and reopens the bindings the last
-switch-off ended; turning off gives each open binding one stop turn, stops its
+switch-off ended, including one whose stop turn is still running; a sweep
+reopens any the switch left stranded, so a binding cannot stay ended while the
+project is on. Turning off gives each open binding one stop turn, stops its
 workers, archives the project steward, releases the leases and adopts nothing
 new, keeping the records so turning back on resumes rather than starts over.
 `bb stewards list` and `bb stewards check` say when a project is configured but

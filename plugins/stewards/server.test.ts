@@ -2638,6 +2638,81 @@ describe("the per-project switch", () => {
     expect(off.exitCode).toBe(0);
     expect(off.stdout).toMatch(/are off/u);
   });
+
+  it("does not strand a binding whose stop turn is still running when the switch comes back on (BB-116)", async () => {
+    const t = await working();
+    const bindingId = t.hooks.store.find("ENG-12", "p1")!.id;
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: false });
+    await t.flush();
+    expect(t.hooks.store.binding(bindingId)!.ending).toBe("disabled");
+    expect(t.hooks.store.binding(bindingId)!.endedAt).toBeNull();
+
+    // The switch comes back on before the stop turn goes idle: the in-flight
+    // ending is cancelled, so the idle cannot end the binding.
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: true });
+    await t.flush();
+    await t.idle(t.steward);
+    const binding = t.hooks.store.binding(bindingId)!;
+    expect(binding.endedAt).toBeNull();
+    expect(binding.ending).toBeNull();
+    expect(binding.endReason).toBeNull();
+  });
+
+  it("reopens a stranded disabled binding on the next sweep and wakes it (BB-116)", async () => {
+    const t = await working();
+    const bindingId = t.hooks.store.find("ENG-12", "p1")!.id;
+    await t.harness.callRpc("stewardsSetProjectEnabled", { projectId: "p1", enabled: false });
+    await t.flush();
+    await t.idle(t.steward);
+    expect(t.hooks.store.binding(bindingId)!.endReason).toBe("disabled");
+    const before = t.sends.length;
+
+    // The project is on again, but the enable loop's reopen never reached this
+    // binding: the strand BB-115 hit. The sweep is the backstop.
+    await t.hooks.setProjectEnabled("p1", true);
+    await t.hooks.sweep();
+    await t.flush();
+    const binding = t.hooks.store.binding(bindingId)!;
+    expect(binding.endedAt).toBeNull();
+    expect(binding.endReason).toBeNull();
+    const wake = t.sends.slice(before).find((s) => s.threadId === t.steward);
+    expect(wake?.text).toMatch(/switched back on/u);
+  });
+
+  it("does not reopen a binding ended for any reason other than the switch-off (BB-116)", async () => {
+    const t = await setup();
+    const seed = (n: number, endReason: string, manualDetach = false) => {
+      t.entities.set(`uuid-${n}`, issue({ id: `uuid-${n}`, key: `ENG-${n}` }));
+      const b = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: `uuid-${n}`, entityKey: `ENG-${n}`, url: null, title: `Issue ${n}`, kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+      t.hooks.store.patch(b.id, { endedAt: t.now(), endReason, manualDetach });
+      return b.id;
+    };
+    const kept = { terminal: seed(1, "terminal"), detach: seed(2, "detach"), unconfigured: seed(3, "unconfigured"), deleted: seed(4, "deleted"), detachedDisabled: seed(5, "disabled", true) };
+    // The control: a stranded disabled binding the sweep is meant to reopen.
+    const stranded = seed(6, "disabled");
+
+    await t.hooks.sweep();
+    await t.flush();
+    for (const id of Object.values(kept)) expect(t.hooks.store.binding(id)!.endedAt).not.toBeNull();
+    expect(t.hooks.store.binding(stranded)!.endedAt).toBeNull();
+  });
+
+  it("a disabled project's sweep still ends what it holds and reopens nothing (BB-116)", async () => {
+    const t = await working();
+    const liveId = t.hooks.store.find("ENG-12", "p1")!.id;
+    // A binding stranded by an earlier switch-off, sitting in a project that is
+    // off again. The sweep must leave it ended.
+    const stranded = t.hooks.store.create({ projectId: "p1", source: "linear", entityId: "uuid-stranded", entityKey: "ENG-99", url: null, title: "Stranded", kind: "ticket", playbook: "linear-tickets", playbookVersion: "v1", parentBindingId: null, phase: "Todo", stage: "spec" });
+    t.hooks.store.patch(stranded.id, { endedAt: t.now(), endReason: "disabled" });
+    // The switch is off but the turn-off path has not run: the live binding is
+    // still open, as after the default-off upgrade.
+    await t.hooks.setProjectEnabled("p1", false);
+
+    await t.hooks.sweep();
+    await t.flush();
+    expect(t.hooks.store.binding(liveId)!.ending).toBe("disabled");
+    expect(t.hooks.store.binding(stranded.id)!.endedAt).not.toBeNull();
+  });
 });
 
 describe("pull requests", () => {
