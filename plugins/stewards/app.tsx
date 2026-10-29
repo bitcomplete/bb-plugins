@@ -2000,11 +2000,22 @@ function StewardsSidebarCore({
   const navigate = useBbNavigate();
   const pluginId = experimental_usePluginId();
   const [picked, setPicked] = useState<string | null>(null);
+  // The project the route names: the Stewards page's path, else the thread
+  // route's own prop. Null on Settings, the home page and other plugin panels.
+  const routeProject = boardRoute.projectId ?? activeProjectId;
+  // The last project the sidebar showed, so a route that names none — archiving
+  // a thread, Settings, the home page — leaves the list on it instead of
+  // letting the server fall back to the first project (BB-117). Written during
+  // render like `previousTabs`; a pick sets it too, so a home-page pick outlives
+  // the route change that clears `picked`.
+  const lastProject = useRef<string | null>(null);
+  if (routeProject !== null) lastProject.current = routeProject;
   // A board pick whose remembered effort key cannot be checked yet: it waits
   // for the picked project's sidebar data, then navigates (BB-113).
   const pendingBoardPick = useRef<{ projectId: string; key: string } | null>(null);
   // The active tab follows the panel route, then the thread route; a pick only
-  // lasts until one of them moves.
+  // lasts until one of them moves. `lastProject` above is what survives the
+  // move, so a pick on a route that names no project does not vanish.
   useEffect(() => {
     setPicked(null);
     pendingBoardPick.current = null;
@@ -2024,7 +2035,9 @@ function StewardsSidebarCore({
   }, [pluginId, boardRoute.projectId, boardRoute.key, activeThreadId, activeProjectId]);
   // The one project the RPC is asked for; null lets the server pick the first
   // by name. `load` depends on it, so a pick refetches like the board's `wanted`.
-  const wanted = picked ?? boardRoute.projectId ?? activeProjectId;
+  // A route that names a project wins over the remembered one, and a pick wins
+  // until the next route change (BB-117).
+  const wanted = picked ?? routeProject ?? lastProject.current;
   const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
   // Finish a board pick whose remembered effort key still has to be checked:
   // once the picked project's list has loaded, go to the effort if it is still
@@ -2098,6 +2111,9 @@ function StewardsSidebarCore({
       // Picking the project already shown does nothing.
       if (projectId === active?.projectId) return;
       setPicked(projectId);
+      // Remember it past the route change that clears `picked`, so a pick on
+      // the home page or Settings lasts (BB-117).
+      lastProject.current = projectId;
       pendingBoardPick.current = null;
       // Settings, the home page and other plugin panels are not project-scoped:
       // there a pick only switches the list, as before (BB-113).

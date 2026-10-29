@@ -1330,6 +1330,79 @@ describe("the sidebar project picker's last place (BB-113)", () => {
     slot.lifecycle.unmount();
   });
 });
+
+// BB-117: a route that names no project (archiving a thread, Settings, the home
+// page) must not drop the sidebar back to the server's first project. The
+// sidebar remembers the last project it showed, and a dropdown pick sets it too
+// so a home-page pick outlives the route change that clears `picked`.
+describe("the sidebar keeps its project when the route names none (BB-117)", () => {
+  const projectAwareData = (input: { projectId: string | null }, over: Record<string, unknown> = {}) => sidebarData({ projectId: input.projectId ?? "p1", ...over });
+
+  it("keeps the project a thread route named when the route goes to none", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const calls: (string | null)[] = [];
+    const props = { activeThreadId: "thr_b", activeProjectId: "personal", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_b", projectId: "personal" })] },
+      rpc: {
+        stewardsSidebar: (input: { projectId: string | null }) => {
+          calls.push(input.projectId);
+          return projectAwareData(input);
+        },
+      } as never,
+    });
+    expect((await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement)).value).toBe("personal");
+    // Archiving the thread (or opening Settings) leaves the route with no
+    // project; the sidebar stays on personal rather than falling to the first.
+    slot.lifecycle.rerender(<list.component {...props} activeThreadId={null} activeProjectId={null} />);
+    // A route that names no project must not refetch the server's fallback.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls).not.toContain(null);
+    expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal");
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps a home-page pick when the route leaves for a project-less page", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [thread({ id: "thr_b", projectId: "personal" })] },
+      rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.value).toBe("p1");
+    // Pick B on the home page, then open a B thread: the route change clears
+    // `picked`, but the remembered project survives. Archiving it then leaves
+    // the sidebar on B, not the server's first project.
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    slot.lifecycle.rerender(<list.component {...props} activeProjectId="personal" activeThreadId="thr_b" />);
+    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    slot.lifecycle.rerender(<list.component {...props} />);
+    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    slot.lifecycle.unmount();
+  });
+
+  it("still follows the route when it names a project", async () => {
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: null, isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const slot = renderSlot(list, props, {
+      sidebarThreads: { projects, threads: [] },
+      rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+    });
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    // Pick B on the home page, then open a thread in project A: the route wins.
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("personal"));
+    slot.lifecycle.rerender(<list.component {...props} activeProjectId="p1" activeThreadId="thr_a" />);
+    await waitFor(() => expect((slot.getByLabelText("Project") as HTMLSelectElement).value).toBe("p1"));
+    slot.lifecycle.unmount();
+  });
+});
+
 describe("the sidebar's Open PR handoff to the detail page (BB-102)", () => {
   const prUrl = "https://github.com/acme/web/pull/1";
   const detailBoard = () => ({
