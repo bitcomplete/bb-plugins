@@ -188,6 +188,7 @@ afterEach(() => {
   app = null;
   resetOpenPrHandoff();
   setBoardRoute({ projectId: null, key: null });
+  window.localStorage.clear();
   delete (document as unknown as { startViewTransition?: unknown }).startViewTransition;
 });
 
@@ -1182,8 +1183,153 @@ describe("the board route store (BB-94)", () => {
   });
 });
 
-// BB-102: the sidebar's Open PR button hands the PR URL to the effort detail
-// page, which sits inside a pane and can open it in bb's in-app browser.
+// BB-113: the project picker returns the main pane to the last project-scoped
+// place open in the picked project, instead of leaving another project's thread
+// showing.
+describe("the sidebar project picker's last place (BB-113)", () => {
+  const projectAwareData = (input: { projectId: string | null }, over: Record<string, unknown> = {}) => sidebarData({ projectId: input.projectId ?? "p1", ...over });
+
+  it("returns to a project's remembered thread when the project is picked again", async () => {
+    const onNavigate = vi.fn();
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "p1", displayTitle: "A thread" })] },
+        rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+      },
+      { activeThreadId: "thr_a", activeProjectId: "p1", onNavigate },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.value).toBe("p1");
+    // Pick B: no history there, so its Stewards page.
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    // Pick A again: the thread remembered in A.
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thr_a" }));
+    // A pick never closes the mobile drawer.
+    expect(onNavigate).not.toHaveBeenCalled();
+    slot.lifecycle.unmount();
+  });
+
+  it("goes to a project's Stewards page when it has no history", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "p1", displayTitle: "A thread" })] },
+        rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+      },
+      { activeThreadId: "thr_a", activeProjectId: "p1" },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("falls back to the Stewards page when the remembered thread is archived", async () => {
+    // Seed the memory with a live thread in p1.
+    const seed = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "p1", displayTitle: "A thread" })] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeThreadId: "thr_a", activeProjectId: "p1" },
+    );
+    await waitFor(() => expect(seed.getByLabelText("Project")).toBeTruthy());
+    seed.lifecycle.unmount();
+    // The thread is archived now, so picking p1 cannot return to it.
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: {
+          projects,
+          threads: [thread({ id: "thr_a", projectId: "p1", displayTitle: "A thread", isArchived: true }), thread({ id: "thr_personal", projectId: "personal" })],
+        },
+        rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+      },
+      { activeThreadId: "thr_personal", activeProjectId: "personal" },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    expect(select.value).toBe("personal");
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toThread", threadId: "thr_a" });
+    slot.lifecycle.unmount();
+  });
+
+  it("only switches the list when the route is not project-scoped", async () => {
+    const onNavigate = vi.fn();
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: { stewardsSidebar: () => sidebarData() } as never,
+      },
+      { activeThreadId: null, activeProjectId: "p1", onNavigate },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(select.value).toBe("personal"));
+    expect(slot.inspection.navigateCalls).toHaveLength(0);
+    expect(onNavigate).not.toHaveBeenCalled();
+    slot.lifecycle.unmount();
+  });
+
+  it("does nothing when the project already shown is picked", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "p1", displayTitle: "A thread" })] },
+        rpc: { stewardsSidebar: (input: { projectId: string | null }) => projectAwareData(input) } as never,
+      },
+      { activeThreadId: "thr_a", activeProjectId: "p1" },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(select.value).toBe("p1"));
+    expect(slot.inspection.navigateCalls).toHaveLength(0);
+    slot.lifecycle.unmount();
+  });
+
+  it("returns to a remembered effort while it is still listed", async () => {
+    setBoardRoute({ projectId: "p1", key: "ENG-1" });
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: {
+          stewardsSidebar: (input: { projectId: string | null }) =>
+            input.projectId === "personal" ? sidebarData({ projectId: "personal" }) : sidebarData({ projectId: "p1", bindings: [binding({ key: "ENG-1" })] }),
+        } as never,
+      },
+      { activeThreadId: null, activeProjectId: "p1" },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    await waitFor(() => expect(select.value).toBe("p1"));
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("drops a remembered effort the project no longer lists", async () => {
+    setBoardRoute({ projectId: "p1", key: "ENG-1" });
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [] },
+        rpc: {
+          stewardsSidebar: (input: { projectId: string | null }) =>
+            input.projectId === "personal" ? sidebarData({ projectId: "personal" }) : sidebarData({ projectId: "p1" }),
+        } as never,
+      },
+      { activeThreadId: null, activeProjectId: "p1" },
+    );
+    const select = await waitFor(() => slot.getByLabelText("Project") as HTMLSelectElement);
+    await waitFor(() => expect(select.value).toBe("p1"));
+    fireEvent.change(select, { target: { value: "personal" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "personal" } }));
+    fireEvent.change(select, { target: { value: "p1" } });
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1" } }));
+    expect(slot.inspection.navigateCalls).not.toContainEqual({ method: "toPluginPanel", path: "board", options: { subPath: "p1/ENG-1" } });
+    slot.lifecycle.unmount();
+  });
+});
 describe("the sidebar's Open PR handoff to the detail page (BB-102)", () => {
   const prUrl = "https://github.com/acme/web/pull/1";
   const detailBoard = () => ({
