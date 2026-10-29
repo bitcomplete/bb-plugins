@@ -8,7 +8,7 @@ import { kubectlRefusal, type KubectlResult } from "./kubectl.js";
 import { retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { guidanceUnitId } from "./guidance.js";
 import { createStewardsPlugin, parseDotenvValue, SECRET_SETTING_NAMES, secretVariable, testHooks, type StewardsDeps } from "./server.js";
-import { SOURCE_PLUGIN_IDS, type EntitySnapshot } from "./source-contract.js";
+import { SOURCE_PLUGIN_IDS, sourceContract, type EntitySnapshot } from "./source-contract.js";
 import { MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, STEWARD_NEED_KINDS, type Binding } from "./store.js";
 import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS, DEPS_PRS, projectFileTemplate } from "./templates.js";
 import { STANDING_RULES } from "./wake.js";
@@ -131,6 +131,8 @@ function world() {
         errors: [],
       };
     } else if (args.method === "sourceValidate") {
+      // The real plugins validate the input; an empty label was once accepted here and rejected there.
+      sourceContract.sourceValidate.input.parse(input);
       const source = args.pluginId === SOURCE_PLUGIN_IDS.github ? "github" : "linear";
       const viewer = source in viewers ? viewers[source]! : "Jane";
       out = { viewer, units: (input.units as string[]).map((unit) => ({ unit, found: true, labelFound: true, missingStates: [] })), mine: [{ unit: "ENG", name: "Engineering" }], error: null };
@@ -491,7 +493,7 @@ describe("a Linear ticket steward", () => {
 
     const interest = t.rpcCalls.filter((c) => c.method === "sourceSetInterest");
     expect(interest.find((c) => c.pluginId === "linear")?.input).toEqual({ units: ["ENG"], entities: ["uuid-12"], dependabot: [], deployment: [] });
-    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
+    expect(interest.find((c) => c.pluginId === "github-watcher")?.input).toEqual({ units: ["acme/bb", "acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
   // BB-111: `ensureProjectSteward` spawns the project steward with an
@@ -1329,7 +1331,7 @@ describe("a Linear ticket steward", () => {
     // acme/web#10 has no snapshot: it cannot be read yet.
     await t.ring("linear", "uuid-12");
     const github = t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input;
-    expect(github).toEqual({ units: ["acme/web"], entities: ["acme/web#10", "acme/web#7"], dependabot: [], deployment: [] });
+    expect(github).toEqual({ units: ["acme/bb", "acme/web"], entities: ["acme/web#10", "acme/web#7"], dependabot: [], deployment: [] });
   });
 
   it("stops leasing a linked pull request once it merges", async () => {
@@ -1339,13 +1341,13 @@ describe("a Linear ticket steward", () => {
     t.entities.set("acme/web#7", pull());
     await t.ring("linear", "uuid-12");
     const github = () => t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher");
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: ["acme/web#7"], dependabot: [], deployment: [] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/bb", "acme/web"], entities: ["acme/web#7"], dependabot: [], deployment: [] });
     const sent = github().length;
 
     t.entities.set("acme/web#7", pull({ state: "merged" }, { merged: true }));
     await t.ring("github", "acme/web#7");
     expect(github()).toHaveLength(sent + 1);
-    expect(github().at(-1)?.input).toEqual({ units: ["acme/web"], entities: [], dependabot: [], deployment: [] });
+    expect(github().at(-1)?.input).toEqual({ units: ["acme/bb", "acme/web"], entities: [], dependabot: [], deployment: [] });
   });
 
   it("counts a worker woken again (by a watch, a reviewer) as running", async () => {
@@ -2533,12 +2535,29 @@ describe("pull requests", () => {
     await t.ring("github", "acme/docs#3");
     await t.ring("github", "acme/web#7");
     expect(await t.list()).toMatchObject([{ key: "acme/web#7", kind: "review" }]);
-    expect(t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input).toMatchObject({ units: ["acme/web"] });
+    expect(t.rpcCalls.filter((c) => c.method === "sourceSetInterest" && c.pluginId === "github-watcher").at(-1)?.input).toMatchObject({ units: ["acme/bb", "acme/web"] });
     const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
     expect(check.exitCode).toBe(0);
-    expect(check.stdout).toMatch(/repos: acme\/web \(excluded: Acme\/Docs\)/u);
+    expect(check.stdout).toMatch(/repos: acme\/web, acme\/bb \(excluded: Acme\/Docs\)/u);
     const overview = (await t.harness.callRpc("stewardsOverview", null)) as { projects: Array<{ repos: string[]; excludedRepos: string[] }> };
-    expect(overview.projects).toMatchObject([{ repos: ["acme/web"], excludedRepos: ["Acme/Docs"] }]);
+    expect(overview.projects).toMatchObject([{ repos: ["acme/web", "acme/bb"], excludedRepos: ["Acme/Docs"] }]);
+  });
+
+  it("stewards the primary repo, which carries .bb/ and is not repeated in repos.json", async () => {
+    const t = await setup();
+    t.entities.set("acme/bb#4", pull({ id: "acme/bb#4", key: "acme/bb#4", unit: "acme/bb" }));
+    await t.ring("github", "acme/bb#4");
+    expect(await t.list()).toMatchObject([{ key: "acme/bb#4", kind: "review" }]);
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.exitCode).toBe(0);
+    expect(check.stdout).toMatch(/repos: acme\/web, acme\/bb/u);
+  });
+
+  it("does not count the primary twice when repos.json still lists it", async () => {
+    const t = await setup();
+    t.repos.push({ dir: "bb", url: "git@github.com:Acme/BB.git" });
+    const check = await t.harness.behavior.runCli(["check", "--project", "p1"]);
+    expect(check.stdout).toMatch(/repos: acme\/web, acme\/bb;/iu);
   });
 
   it("reports an exclusion that names no repo in repos.json", async () => {
@@ -5501,7 +5520,7 @@ describe("the settings page", () => {
   it("shows each stewarded project's configuration and its open stewards with their status", async () => {
     const t = await setup();
     const empty = (await t.harness.callRpc("stewardsOverview", null)) as Overview;
-    expect(empty.projects).toMatchObject([{ name: "Acme", configured: true, repos: ["acme/web"], problems: [], projectStewardThreadId: null, stewards: [] }]);
+    expect(empty.projects).toMatchObject([{ name: "Acme", configured: true, repos: ["acme/web", "acme/bb"], problems: [], projectStewardThreadId: null, stewards: [] }]);
     expect(empty.projects[0]!.playbooks.map((p) => p.kind)).toEqual(["ticket", "pr", "review"]);
 
     t.entities.set("uuid-12", issue());
@@ -6061,7 +6080,8 @@ describe("dependency stewards", () => {
 
   async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}) {
     const t = await setup();
-    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ...project });
+    // The fixture's primary (acme/bb) is a stewarded repo too; these tests watch one repo.
+    t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
@@ -8399,6 +8419,16 @@ describe("roles.json (BB-105)", () => {
     await t.ring("linear", "uuid-12");
     expect(await t.list()).toEqual(expect.arrayContaining([expect.objectContaining({ key: "ENG-12", kind: "ticket" })]));
     expect(await problemsOf(t)).toContain("ops now belongs in stewards/roles.json");
+  });
+
+  it("reads the login with the project's label, which the contract requires", async () => {
+    const t = await setup({ timing: { debounceMs: 1, nightlyStaggerMs: 0, configTtlMs: 0 } });
+    t.files[ROLES_FILE] = roles({ jane: { projectSteward: true } });
+    await t.hooks.sweep();
+    await t.flush();
+    const read = t.rpcCalls.find((c) => c.method === "sourceValidate" && c.pluginId === "github-watcher");
+    expect(read?.input).toMatchObject({ units: [], label: "bb-managed" });
+    expect((await problemsOf(t)).some((p) => p.includes("login cannot be read"))).toBe(false);
   });
 
   it("runs no roles and says so when roles.json is present but the login cannot be read", async () => {

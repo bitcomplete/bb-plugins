@@ -894,9 +894,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * be asked, answers null; roles.json then runs no roles rather than every
      * role (BB-105).
      */
-    async function readViewer(source: Source): Promise<string | null> {
+    async function readViewer(source: Source, label: string): Promise<string | null> {
       try {
-        const out = await sourceRpc(source, "sourceValidate", { units: [], label: "", states: [] }, sourceContract.sourceValidate.output);
+        // The contract wants a label even with no units to check; the project's own is the honest one.
+        const out = await sourceRpc(source, "sourceValidate", { units: [], label, states: [] }, sourceContract.sourceValidate.output);
         return out.viewer;
       } catch (error) {
         bb.log.warn(`stewards: could not read the ${source} login: ${errorMessage(error)}`);
@@ -1163,8 +1164,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       let role: StewardRole | null;
       let rolesUnreadable = false;
       if (rolesPresent) {
-        githubLogin = await readViewer("github");
-        linearLogin = await readViewer("linear");
+        githubLogin = await readViewer("github", file.label);
+        linearLogin = await readViewer("linear", file.label);
         if (githubLogin === null || linearLogin === null) {
           rolesUnreadable = true;
           role = null;
@@ -1237,7 +1238,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const set = await source.repoSet();
         if (set.error !== null) problems.push(`repos.json: ${set.error}`);
-        const all = set.repos.map((r) => githubRepoOf(r.url)).filter((r): r is string => r !== null);
+        // In the primary layout the project source's own repo carries `.bb/` and
+        // is not repeated in repos.json, but it is a work repo like the others.
+        const listed = set.layout === "primary" && set.primary !== null ? [...set.repos, set.primary] : set.repos;
+        const all = listed
+          .map((r) => githubRepoOf(r.url))
+          .filter((r): r is string => r !== null)
+          .filter((r, i, arr) => arr.findIndex((x) => lc(x) === lc(r)) === i);
         repos = all.filter((r) => !file.github.exclude.some((x) => lc(x) === lc(r)));
         if (set.error === null) {
           const stray = file.github.exclude.filter((x) => !all.some((r) => lc(r) === lc(x)));
