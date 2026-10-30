@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSidebar, compareBlocked, compareEfforts, compareInflight, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
+import { buildSidebar, compareBlocked, compareEfforts, compareInflight, compareMonitors, deploymentPhrase, effortPhrase, effortSection, effortState, effortTitle, endReasonPhrase, endedEffort, hasUnread, isBusy, isUnread, type SidebarChild, type SidebarEffort, type SidebarLiveProject, type SidebarLiveThread, type SidebarProjectData } from "./sidebar.js";
 
 const thread = (over: Partial<SidebarLiveThread> & { id: string }): SidebarLiveThread => ({
   projectId: "p1",
@@ -201,7 +201,7 @@ describe("stewards sidebar grouping", () => {
   it("moves a held or needs-you ops binding into blocked, out of monitors", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
-      threads: [thread({ id: "thr_ops_blocked" }), thread({ id: "thr_ops_you" }), thread({ id: "thr_ops_quiet" })],
+      threads: [thread({ id: "thr_ops_blocked", displayTitle: "Ops: sentry" }), thread({ id: "thr_ops_you", displayTitle: "Ops: deps" }), thread({ id: "thr_ops_quiet", displayTitle: "Ops: ns" })],
       data: [
         data({
           projectId: "p1",
@@ -214,6 +214,7 @@ describe("stewards sidebar grouping", () => {
       ],
     });
     expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/ns"]);
+    // BB-128: blocked no longer tiers by state, so the two sort by display title.
     expect(tabs[0]!.blocked.map((e) => e.key)).toEqual(["acme/deps", "acme/sentry"]);
   });
 
@@ -275,7 +276,7 @@ describe("stewards sidebar grouping", () => {
 });
 
 describe("stewards sidebar ordering", () => {
-  it("orders pinned, then needsUser, then busy, then most recent activity", () => {
+  it("orders Threads (compareEfforts) pinned, then needsUser, then busy, then most recent activity", () => {
     const pinned = effort({ key: "pinned", pinned: true, recency: 1 });
     const needs = effort({ key: "needs", needsUser: true, recency: 2 });
     const busy = effort({ key: "busy", busy: true, recency: 3 });
@@ -290,7 +291,7 @@ describe("stewards sidebar ordering", () => {
     expect(["idle", "finished", "failed"].some(isBusy)).toBe(false);
   });
 
-  it("orders a tab's threads and monitors with the same comparator", () => {
+  it("orders a tab's one-off threads by busy, then recency (compareEfforts)", () => {
     const tabs = buildSidebar({
       projects: [project({ id: "p1" })],
       threads: [thread({ id: "thr_quiet", updatedAt: 5 }), thread({ id: "thr_busy", status: "active", updatedAt: 1 })],
@@ -299,21 +300,48 @@ describe("stewards sidebar ordering", () => {
     expect(tabs[0]!.threads.map((e) => e.rootThreadId)).toEqual(["thr_busy", "thr_quiet"]);
   });
 
-  it("orders blocked: pinned, then needs-you (yellow) before red, then recency", () => {
-    const you = effort({ key: "you", needsUser: true, state: "you", recency: 1 });
-    const blockedOld = effort({ key: "blocked-old", waitingOn: "x", state: "blocked", recency: 5 });
-    const blockedNew = effort({ key: "blocked-new", waitingOn: "y", state: "blocked", recency: 50 });
-    const pinned = effort({ key: "pinned", pinned: true, waitingOn: "z", state: "blocked", recency: 0 });
-    const ordered = [blockedOld, you, pinned, blockedNew].sort(compareBlocked).map((e) => e.key);
-    expect(ordered).toEqual(["pinned", "you", "blocked-new", "blocked-old"]);
+  // BB-128: Blocked, In flight and Monitors hold a fixed pinned › display
+  // title › binding-key position. State, busy and recency are ignored, so a
+  // recency tick moves nothing and replays no enter animation.
+  it("orders blocked by pinned, then display title, then key, ignoring state and recency", () => {
+    const pinned = effort({ key: "ENG-9", title: "Zeta", pinned: true, state: "blocked", recency: 0 });
+    const you = effort({ key: "ENG-1", title: "Alpha", needsUser: true, state: "you", recency: 999 });
+    const blocked = effort({ key: "ENG-2", title: "Alpha", waitingOn: "x", state: "blocked", recency: 1 });
+    const beta = effort({ key: "ENG-3", title: "Beta", waitingOn: "y", state: "blocked", recency: 500 });
+    const ordered = [beta, you, pinned, blocked].sort(compareBlocked).map((e) => e.key);
+    expect(ordered).toEqual(["ENG-9", "ENG-1", "ENG-2", "ENG-3"]);
   });
 
-  it("orders in flight: pinned, then running before quiet, then recency", () => {
-    const runningOld = effort({ key: "running-old", runningWorkers: 1, state: "running", recency: 1 });
-    const quietNew = effort({ key: "quiet-new", recency: 99 });
-    const pinned = effort({ key: "pinned", pinned: true, recency: 0 });
-    const ordered = [quietNew, runningOld, pinned].sort(compareInflight).map((e) => e.key);
-    expect(ordered).toEqual(["pinned", "running-old", "quiet-new"]);
+  it("orders in flight by pinned, then display title, then key, ignoring state, busy and recency", () => {
+    const pinned = effort({ key: "ENG-9", title: "Zeta", pinned: true, recency: 0 });
+    const quiet = effort({ key: "ENG-1", title: "Alpha", state: "quiet", recency: 999 });
+    const running = effort({ key: "ENG-2", title: "Alpha", state: "running", busy: true, runningWorkers: 1, recency: 1 });
+    const beta = effort({ key: "ENG-3", title: "Beta", state: "running", runningWorkers: 2, recency: 500 });
+    const ordered = [beta, running, pinned, quiet].sort(compareInflight).map((e) => e.key);
+    expect(ordered).toEqual(["ENG-9", "ENG-1", "ENG-2", "ENG-3"]);
+  });
+
+  it("orders monitors by pinned, then display title, then key, ignoring state and recency", () => {
+    const pinned = effort({ key: "acme/z", title: "Zeta", pinned: true, recency: 0 });
+    const quiet = effort({ key: "acme/a", title: "Alpha", state: "quiet", recency: 999 });
+    const running = effort({ key: "acme/b", title: "Alpha", state: "running", runningWorkers: 1, recency: 1 });
+    const beta = effort({ key: "acme/c", title: "Beta", state: "quiet", recency: 500 });
+    const ordered = [beta, running, pinned, quiet].sort(compareMonitors).map((e) => e.key);
+    expect(ordered).toEqual(["acme/z", "acme/a", "acme/b", "acme/c"]);
+  });
+
+  it("orders a tab's monitors by display title, not recency (BB-128)", () => {
+    const tabs = buildSidebar({
+      projects: [project({ id: "p1" })],
+      threads: [thread({ id: "thr_z", displayTitle: "Alpha", updatedAt: 1 }), thread({ id: "thr_a", displayTitle: "Zeta", updatedAt: 99 })],
+      data: [
+        data({
+          projectId: "p1",
+          bindings: [binding({ key: "acme/z", threadId: "thr_z", kind: "ops", stage: null }), binding({ key: "acme/a", threadId: "thr_a", kind: "ops", stage: null })],
+        }),
+      ],
+    });
+    expect(tabs[0]!.monitors.map((e) => e.key)).toEqual(["acme/z", "acme/a"]);
   });
 });
 

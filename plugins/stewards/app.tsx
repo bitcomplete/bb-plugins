@@ -768,6 +768,7 @@ function boardOrder(e: BoardEffort) {
     runningWorkers: e.steward.workers.length,
     recency: boardRecency(e),
     title: e.steward.title ?? e.steward.key,
+    key: e.steward.key,
   };
 }
 
@@ -1393,6 +1394,11 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
 // (the page publishes it through `board-route.ts`, BB-94). Every
 // effort and thread row carries bb's own thread actions context menu, so
 // nothing bb's rows can do is lost.
+//
+// Blocked, In flight and Monitors rows hold a fixed pinned › display title ›
+// binding-key position (BB-128), so a host tick that only bumps recency does
+// not move them and replay their enter animation. The one-off Threads keep
+// bb's own needsUser › busy › recency order, and Recently ended is unchanged.
 
 /** The live fields bb's thread actions read, from a sidebar row. */
 function actionTarget(t: PluginSidebarThread): PluginThreadActionTarget {
