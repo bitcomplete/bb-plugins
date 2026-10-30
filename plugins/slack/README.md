@@ -54,8 +54,11 @@ on the pod.
   the log line is the reliable half.
 - **No reply.** If a turn that handled a tagged wake ends without calling
   `slack_reply`, the plugin posts one error reply itself, so every tagged
-  message gets an answer. An untagged reply in a followed thread does not owe
-  a reply, so a silent turn there posts nothing.
+  message gets an answer. A message that needs no answer (a thanks, or one bb
+  should not act on) is acknowledged with `slack_ack` instead, which counts the
+  wake as answered and posts nothing, so no error reply fires. An untagged
+  reply in a followed thread does not owe a reply, so a silent turn there posts
+  nothing.
 
 ## Settings
 
@@ -173,6 +176,7 @@ signing secret, bot token or OAuth client secret; they are sealed with
 | Tool | What it does |
 |---|---|
 | `slack_reply` | Post the one reply on the Slack conversation that woke this thread. The service holds the bot token; the request carries only the connection id and the text. The text may be Markdown (`**bold**`, `# Heading`, `- item`, `[label](url)`, fenced code): the plugin converts it to Slack mrkdwn before posting. |
+| `slack_ack` | Count the wake as answered without posting anything, for a message that needs no answer (a thanks, or one bb should not act on), so no error reply fires. It is not for skipping work that was asked for; answer a request with `slack_reply`. |
 
 ## Other people's text
 
