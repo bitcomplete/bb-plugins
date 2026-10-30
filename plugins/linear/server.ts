@@ -622,6 +622,19 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       async sourceDeployments() {
         return { deployments: [], error: "deployments are read from github, not linear" };
       },
+      // Files, commits, workflow runs and compares are a GitHub thing too.
+      async sourceFileAtRef() {
+        return { content: null, error: "files are read from github, not linear" };
+      },
+      async sourceLatestCommit() {
+        return { sha: null, committedAt: null, error: "commits are read from github, not linear" };
+      },
+      async sourceWorkflowRun() {
+        return { run: null, error: "workflow runs are read from github, not linear" };
+      },
+      async sourceCompare() {
+        return { status: null, error: "commits are compared on github, not linear" };
+      },
       async sourceSetInterest({ units, entities }, { experimental_caller: caller }) {
         // The interest decides what this server leases and whom it rings, so
         // only stewards itself may set it; the app and the CLI are clients.

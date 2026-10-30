@@ -22,20 +22,26 @@ import { z } from "zod";
 import { WATCHES_CHANGED } from "./channels.js";
 import { createGhTokenReader, type TokenReader } from "./gh.js";
 import {
+  FILE_AT_REF_QUERY,
   GITHUB_API_URL,
   GitHubRequestError,
+  LATEST_COMMIT_QUERY,
   OPEN_PULLS_QUERY,
   REPO_CHECK_QUERY,
   TARGET_QUERY,
   VIEWER_QUERY,
+  comparePath,
   dependabotAlertsPath,
   deploymentStatusesPath,
   deploymentsPath,
   graphql,
   kindName,
+  parseCompare,
   parseDependabotAlerts,
   parseDeploymentStatus,
   parseDeployments,
+  parseFileAtRef,
+  parseLatestCommit,
   parseOpenPulls,
   parseRef,
   parseRefKey,
@@ -44,7 +50,12 @@ import {
   parseSnapshot,
   parseTarget,
   parseViewer,
+  parseWorkflowJobs,
+  parseWorkflowRuns,
   refKey,
+  workflowRunJobsPath,
+  workflowRunPath,
+  workflowRunsPath,
   type Target,
 } from "./github.js";
 import { createHooksLoop, HOOKS_URL_ENV, type Lease, type Rejection } from "./hooks-client.js";
@@ -655,6 +666,85 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
           return { deployments, error: null };
         } catch (error) {
           return { deployments: [], error: `${repo}: ${errorMessage(error)}` };
+        }
+      },
+
+      // One file's text at a ref, for a deployment rule's `image-tag`
+      // strategy: the manifest a newTag is read from and the Dockerfile a
+      // consumer's pin is read from. A path not there at that ref is a null
+      // content, not an error; a failed read is the error.
+      async sourceFileAtRef({ repo, path, ref }) {
+        const parsed = parseRepo(repo);
+        if (parsed === null) return { content: null, error: `${repo}: not owner/repo` };
+        try {
+          const expression = `${ref}:${path}`;
+          return { content: parseFileAtRef(await query(FILE_AT_REF_QUERY, { ...parsed, expression }, checkSignal())), error: null };
+        } catch (error) {
+          return { content: null, error: `${repo}: ${errorMessage(error)}` };
+        }
+      },
+
+      // The newest commit on a branch touching a path at or before a time:
+      // the build commit a deployment rule compares a merge against. An empty
+      // path is the branch's tip as of that time ("HEAD" or empty is the
+      // default branch).
+      async sourceLatestCommit({ repo, branch, path, until }) {
+        const parsed = parseRepo(repo);
+        if (parsed === null) return { sha: null, committedAt: null, error: `${repo}: not owner/repo` };
+        try {
+          const qualified = branch === "" || branch.toUpperCase() === "HEAD" ? "refs/heads/HEAD" : `refs/heads/${branch}`;
+          const commit = parseLatestCommit(await query(LATEST_COMMIT_QUERY, { ...parsed, qualified, path: path === "" ? null : path, until }, checkSignal()));
+          return { sha: commit?.sha ?? null, committedAt: commit?.committedAt ?? null, error: null };
+        } catch (error) {
+          return { sha: null, committedAt: null, error: `${repo}: ${errorMessage(error)}` };
+        }
+      },
+
+      // One workflow run by the workflow file and the run number an image tag
+      // names, with its head sha, its start and its jobs. The REST API has no
+      // lookup by run number, so the runs are paged newest first until the
+      // number is reached or passed. A run that is not there is a null run.
+      async sourceWorkflowRun({ repo, workflow, runNumber, runId }) {
+        const parsed = parseRepo(repo);
+        if (parsed === null) return { run: null, error: `${repo}: not owner/repo` };
+        if (runId === undefined && (workflow === undefined || runNumber === undefined)) return { run: null, error: "name a run by runId, or by workflow and runNumber" };
+        const name = `${parsed.owner}/${parsed.name}`;
+        try {
+          let found: ReturnType<typeof parseWorkflowRuns>[number] | null = null;
+          if (runId !== undefined) {
+            const body = (await restPage(workflowRunPath(name, runId), checkSignal())).body;
+            found = parseWorkflowRuns({ workflow_runs: [body] })[0] ?? null;
+          } else {
+            for (let page = 1; page <= 20; page++) {
+              const runs = parseWorkflowRuns((await restPage(workflowRunsPath(name, workflow!, page), checkSignal())).body);
+              const match = runs.find((r) => r.runNumber === runNumber);
+              if (match !== undefined) {
+                found = match;
+                break;
+              }
+              // Newest first: all below the wanted number means it is not here,
+              // and a short page means there are no more.
+              if (runs.length < 100 || runs.every((r) => r.runNumber < runNumber!)) break;
+            }
+          }
+          if (found === null) return { run: null, error: null };
+          const jobs = parseWorkflowJobs((await restPage(workflowRunJobsPath(name, found.id), checkSignal())).body);
+          return { run: { id: found.id, runNumber: found.runNumber, headSha: found.headSha, startedAt: found.startedAt, jobs }, error: null };
+        } catch (error) {
+          return { run: null, error: `${repo}: ${errorMessage(error)}` };
+        }
+      },
+
+      // GitHub's compare status of head against base, for a rule that asks
+      // whether one ref contains another.
+      async sourceCompare({ repo, base, head }) {
+        const parsed = parseRepo(repo);
+        if (parsed === null) return { status: null, error: `${repo}: not owner/repo` };
+        try {
+          const status = parseCompare((await restPage(comparePath(`${parsed.owner}/${parsed.name}`, base, head), checkSignal())).body);
+          return { status, error: null };
+        } catch (error) {
+          return { status: null, error: `${repo}: ${errorMessage(error)}` };
         }
       },
 

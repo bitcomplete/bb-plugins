@@ -8,7 +8,7 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { SENTRY_SLUG, opsTargetKey, type DependabotTarget, type K8sTarget, type OpsTarget, type SentryTarget } from "./ops.js";
-import { DEPENDABOT_SEVERITIES } from "./source-contract.js";
+import { DEPENDABOT_SEVERITIES, REPO_NAME } from "./source-contract.js";
 
 export const STEWARDS_DIR = "stewards";
 export const PROJECT_FILE = `${STEWARDS_DIR}/project.json`;
@@ -657,6 +657,65 @@ export type ReadyConfig = z.infer<typeof readySchema>;
 export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
 
 /**
+ * One deployment rule's match: the merged pull request's repo, and optionally
+ * the changed paths it must touch. A rule whose `when` matches the merge is
+ * the one whose strategy decides whether a deployment carries it.
+ */
+export const carriesWhenSchema = z
+  .object({
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
+    paths: z.array(z.string().trim().min(1).max(300)).max(200).optional(),
+  })
+  .strict();
+export type CarriesWhen = z.infer<typeof carriesWhenSchema>;
+
+/**
+ * How a deployment is judged to carry a merge. `ref-contains-merge` asks
+ * whether the deployment's ref has the merge as an ancestor. `image-tag`
+ * reads the image tag the manifest applies, finds the workflow run it names,
+ * and compares the merge against what that run built: the run's head sha, or
+ * the commit whose Dockerfile pinned a consumer (BB-132).
+ */
+export const carriesStrategySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("ref-contains-merge") }).strict(),
+  z
+    .object({
+      kind: z.literal("image-tag"),
+      /** The kustomization file, read at the deployment's ref, e.g. kploy/production/kustomization.yaml. */
+      manifest: z.string().trim().min(1).max(500),
+      /** The image whose `newTag` names the run, e.g. bb-server. */
+      image: z.string().trim().min(1).max(200),
+      /** The workflow file whose run number the tag is, e.g. bb-server.yaml. */
+      workflow: z.string().trim().min(1).max(300),
+      /** The build job whose `started_at` the pin is read as of, when the image is built from a pin. */
+      job: z.string().trim().min(1).max(200).optional(),
+      /** Where the pin lives and points: the Dockerfile, its ARG and the repo the pin names. */
+      consumer: z
+        .object({
+          dockerfile: z.string().trim().min(1).max(500),
+          pinArg: z.string().trim().min(1).max(200),
+          repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-plugins"),
+        })
+        .strict()
+        .optional(),
+    })
+    .strict(),
+]);
+export type CarriesStrategy = z.infer<typeof carriesStrategySchema>;
+
+/** One ordered rule: a `when` match and the strategy to apply. */
+export const carriesRuleSchema = z.object({ when: carriesWhenSchema, strategy: carriesStrategySchema }).strict();
+export type CarriesRule = z.infer<typeof carriesRuleSchema>;
+
+/**
+ * A deployment target's `carries`: free text the steward applies (the older
+ * behaviour, byte for byte), or an ordered list of rules the plugin evaluates
+ * itself, first match wins. All additive: a string still parses.
+ */
+export const carriesSchema = z.union([z.string().trim().min(1).max(2000), z.array(carriesRuleSchema).min(1).max(20)]);
+export type Carries = z.infer<typeof carriesSchema>;
+
+/**
  * Where a merge is confirmed live: the deployment source, the target repo and
  * environment, the rule the steward applies to decide whether a deployment
  * carries its merge, and how long to wait for one. A playbook with no
@@ -665,17 +724,19 @@ export const DEFAULT_FOLLOW_THROUGH_MS = 6 * 3_600_000;
  */
 export const deploymentTargetSchema = z
   .object({
+    /** An optional name, so a playbook with more than one target can name it in reports and wakes. */
+    name: z.string().trim().min(1).max(100).optional(),
     source: z.literal("github"),
     /** The repo the deployment is created on, as GitHub spells it, e.g. bitcomplete/bb-gate. */
-    repo: z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u, "a repo such as bitcomplete/bb-gate"),
+    repo: z.string().trim().regex(REPO_NAME, "a repo such as bitcomplete/bb-gate"),
     /** The deployment environment that confirms it, matched ignoring case. */
     environment: z.string().trim().min(1).max(100),
     /**
-     * The rule the steward applies to decide whether a deployment carries a
-     * merge. Free text, shown in the wake beside the deployment; the plugin
-     * does not evaluate it.
+     * The rule for whether a deployment carries a merge: free text the steward
+     * applies, or an ordered list of rules the plugin evaluates itself, first
+     * match wins. A string keeps the older behaviour exactly.
      */
-    carries: z.string().trim().min(1).max(2000),
+    carries: carriesSchema,
     /** No matching deployment within this long wakes the steward. */
     timeout: durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /**
@@ -691,6 +752,23 @@ export const deploymentTargetSchema = z
   })
   .strict();
 export type DeploymentTarget = z.infer<typeof deploymentTargetSchema>;
+
+/**
+ * One deployment target, or an ordered list of them, as a playbook's
+ * `deployment` field writes it. A single target is today's shape; a list lets
+ * one merge be awaited on more than one deployment (BB-132).
+ */
+export const deploymentsFieldSchema = z
+  .union([deploymentTargetSchema, z.array(deploymentTargetSchema).min(1).max(10)])
+  .superRefine((value, ctx) => {
+    const list = Array.isArray(value) ? value : [value];
+    const seen = new Set<string>();
+    for (const target of list) {
+      const key = (target.name ?? `${target.repo}@${target.environment}`).toLowerCase();
+      if (seen.has(key)) ctx.addIssue({ code: "custom", message: `${key} is listed twice; each deployment target needs its own name` });
+      seen.add(key);
+    }
+  });
 
 export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
 const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };
@@ -720,8 +798,8 @@ export const frontMatterSchema = z
     "follow-through": durationSchema.default(DEFAULT_FOLLOW_THROUGH_MS),
     /** Reviews: pull request authors no review steward is made for (bots). */
     "skip-authors": z.array(z.string().trim().min(1).max(100)).default([]),
-    /** Where a merge is confirmed live, when the project has a deployment source (BB-53). */
-    deployment: deploymentTargetSchema.optional(),
+    /** Where a merge is confirmed live, when the project has a deployment source (BB-53): one target or a list. */
+    deployment: deploymentsFieldSchema.optional(),
   })
   .strict();
 
@@ -740,8 +818,8 @@ export type Playbook = {
   idleGraceMs: number;
   followThroughMs: number;
   skipAuthors: string[];
-  /** Where a merge is confirmed live, or null when the playbook names no deployment target. */
-  deployment: DeploymentTarget | null;
+  /** Where a merge is confirmed live, or empty when the playbook names no deployment target. */
+  deployments: DeploymentTarget[];
   /** The text before the first `## ` heading: instructions for every phase. */
   general: string;
   /** Each `## Phase` section's text, keyed by heading as written. */
@@ -811,7 +889,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
       skipAuthors: fm["skip-authors"],
-      deployment: fm.deployment ?? null,
+      deployments: fm.deployment === undefined ? [] : Array.isArray(fm.deployment) ? fm.deployment : [fm.deployment],
       general,
       sections,
       version: createHash("sha256").update(text).digest("hex").slice(0, 12),

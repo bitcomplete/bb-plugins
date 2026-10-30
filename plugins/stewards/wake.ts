@@ -203,29 +203,32 @@ function lifecycleInstructions(input: WakeInput): string | undefined {
 
 /**
  * What to do about a deployment, when the playbook names a target and a merge
- * is waiting on one. The plugin does not decide whether a deployment carries a
- * merge: it hands the steward the deployment and the playbook's rule, and the
- * steward reports the verdict (BB-53).
+ * is waiting on one. A free-text rule is the steward's to apply; a structured
+ * one the plugin evaluates itself (BB-132), so the steward is woken only when
+ * it could not decide.
  */
 function deploymentInstructions(input: WakeInput): string | undefined {
-  const target = input.playbook.deployment;
+  const targets = input.playbook.deployments;
   const watches = Object.values(input.deployments ?? {});
-  if (target === null || watches.length === 0) return undefined;
+  if (targets.length === 0 || watches.length === 0) return undefined;
+  const where = targets.map((t) => `${t.repo} ${t.environment}`).join(", ");
   const settled = watches.every((w) => w.state === "deployed");
   if (settled) {
     return (
-      `Every pull request is merged and deployed (${target.repo} ${target.environment}). This is the last turn of the work: post one closing comment saying it is live and move the ticket to its terminal state, then end with steward_report without followThrough. ` +
+      `Every pull request is merged and deployed (${where}). This is the last turn of the work: post one closing comment saying it is live and move the ticket to its terminal state, then end with steward_report without followThrough. ` +
       `If a playbook says otherwise, keep it open with followThrough as usual.`
     );
   }
   const pending = watches.filter((w) => w.state === "merged" || w.state === "deploying");
   if (pending.length === 0) return undefined;
-  const names = pending.map((w) => w.key).join(", ");
-  return (
-    `A merge is awaiting deployment (${names}) through ${target.repo} ${target.environment}. Decide from the playbook's rule whether the deployment carries the merge — ${JSON.stringify(target.carries)} — and report it with ` +
-    `steward_report { deployment: { state: "deployed" } } when it does, "not-yet" when it does not, or "failed" when it failed. ` +
-    `Do not start a worker to watch the deploy, and do not move the ticket on until every pull request is deployed.`
-  );
+  const names = pending.map((w) => `${w.key}${w.target === "" ? "" : ` (${w.target})`}`).join(", ");
+  const structured = targets.every((t) => typeof t.carries !== "string");
+  const rules = targets.map((t) => `${t.repo} ${t.environment}${t.name === undefined ? "" : ` (${t.name})`}: ${typeof t.carries === "string" ? JSON.stringify(t.carries) : "the plugin evaluates its carries rules"}`).join("; ");
+  const verdict = `report it with steward_report { deployment: { state: "deployed" } } when it carries the merge, "not-yet" when it does not, or "failed" when it failed.`;
+  const what = structured
+    ? `The plugin evaluates the playbook's carries rules itself and wakes you only when a read fails or no rule matches. When a verdict is yours, ${verdict} `
+    : `Decide from the playbook's rule whether the deployment carries the merge — ${rules} — and ${verdict} `;
+  return `A merge is awaiting deployment (${names}) through ${where}. ${what}` + `Do not start a worker to watch the deploy, and do not move the ticket on until every pull request is deployed.`;
 }
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
@@ -312,14 +315,16 @@ function entityLines(e: EntitySnapshot, cursor: string, own: ReadonlySet<string>
 
 const DEPLOY_STATE_LABEL: Record<DeploymentWatch["state"], string> = { merged: "merged, awaiting deployment", deploying: "deploying", deployed: "deployed", failed: "failed" };
 
-/** The deployment block of a wake: the playbook's target and rule, then each watched pull request. */
+/** The deployment block of a wake: the playbook's targets and rules, then each watched pull request. */
 function deploymentLines(input: WakeInput): string[] {
-  const target = input.playbook.deployment;
+  const targets = input.playbook.deployments;
   const watches = Object.values(input.deployments ?? {}).sort((a, b) => a.key.localeCompare(b.key));
-  if (target === null || watches.length === 0) return [];
-  const out = ["", `### Deployment (${target.repo} ${target.environment})`, ""];
-  out.push(`- Rule (from the playbook): ${target.carries}`);
-  out.push(`- No matching deployment within ${formatDuration(target.timeout)} wakes you with the run URL.`);
+  if (targets.length === 0 || watches.length === 0) return [];
+  const where = targets.map((t) => `${t.repo} ${t.environment}${t.name === undefined ? "" : ` (${t.name})`}`).join("; ");
+  const out = ["", `### Deployment (${where})`, ""];
+  for (const t of targets) out.push(`- Rule for ${t.repo} ${t.environment}${t.name === undefined ? "" : ` (${t.name})`}: ${typeof t.carries === "string" ? t.carries : "evaluated by the plugin"}`);
+  const timeouts = [...new Set(targets.map((t) => t.timeout))];
+  out.push(timeouts.length === 1 ? `- No matching deployment within ${formatDuration(timeouts[0]!)} wakes you with the run URL.` : "- No matching deployment within each target's timeout wakes you with the run URL.");
   for (const w of watches) {
     const facts = [
       w.mergeSha === null ? null : `merge ${w.mergeSha.slice(0, 7)}`,
@@ -328,7 +333,8 @@ function deploymentLines(input: WakeInput): string[] {
       w.sha === null ? null : `sha ${w.sha.slice(0, 7)}`,
       w.url === null ? null : w.url,
     ].filter((x): x is string => x !== null);
-    out.push(`- ${w.key}: ${DEPLOY_STATE_LABEL[w.state]}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`);
+    const named = w.target === "" ? "" : ` [${w.target}]`;
+    out.push(`- ${w.key}${named}: ${DEPLOY_STATE_LABEL[w.state]}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`);
   }
   return out;
 }

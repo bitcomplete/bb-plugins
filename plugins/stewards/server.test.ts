@@ -37,6 +37,14 @@ function world() {
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
   const sourceDeployments = new Map<string, unknown[]>();
+  /** Files the fake github serves, by `lowercased repo path ref` (BB-132). */
+  const sourceFiles = new Map<string, string>();
+  /** Commits the fake github serves, by `lowercased repo path until` (BB-132). */
+  const sourceCommits = new Map<string, string>();
+  /** Workflow runs the fake github serves, by `lowercased repo run id` (BB-132). */
+  const sourceRuns = new Map<string, unknown>();
+  /** Compare statuses the fake github serves, by `lowercased repo base head` (BB-132). */
+  const sourceCompares = new Map<string, string>();
   const rpcCalls: Call[] = [];
   const threads = new Map<string, { status: string; archivedAt: number | null; visibility?: string; title?: string | null; parentThreadId?: string | null; parentNotifications?: string; sectionId?: string | null; projectId?: string; hostId?: string; providerId?: string; model?: string | null; reasoningLevel?: string | null; environmentProviderId?: string | null; branchName?: string | null; environmentStatus?: string | null; environmentPhase?: string | null; sendError?: { code: string; status: number; message: string } }>();
   /** Every `threads.delete` the plugin asked for; the plugin must only ever archive. */
@@ -155,6 +163,19 @@ function world() {
     else if (args.method === "sourceDeployments") {
       const key = `${String(input.repo).toLowerCase()} ${String(input.environment).toLowerCase()}`;
       out = { deployments: sourceDeployments.get(key) ?? [], error: null };
+    }
+    else if (args.method === "sourceFileAtRef") {
+      out = { content: sourceFiles.get(`${String(input.repo).toLowerCase()} ${String(input.path)} ${String(input.ref)}`) ?? null, error: null };
+    }
+    else if (args.method === "sourceLatestCommit") {
+      out = { sha: sourceCommits.get(`${String(input.repo).toLowerCase()} ${String(input.path)} ${String(input.until)}`) ?? null, committedAt: null, error: null };
+    }
+    else if (args.method === "sourceWorkflowRun") {
+      const key = input.runId === undefined ? `${String(input.repo).toLowerCase()} ${String(input.workflow)} ${String(input.runNumber)}` : `${String(input.repo).toLowerCase()} ${String(input.runId)}`;
+      out = { run: sourceRuns.get(key) ?? null, error: null };
+    }
+    else if (args.method === "sourceCompare") {
+      out = { status: sourceCompares.get(`${String(input.repo).toLowerCase()} ${String(input.base)} ${String(input.head)}`) ?? null, error: null };
     }
     else throw Object.assign(new Error(`unknown ${args.pluginId}.${args.method}`), { status: 404 });
     return args.outputSchema.parse(out);
@@ -331,7 +352,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -3843,7 +3864,7 @@ describe("questions to the user", () => {
       holdBehind: ["ENG-9"],
       status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
       deployments: {
-        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
       wokeAt: at,
     });
@@ -4252,7 +4273,7 @@ describe("the stewards sidebar call", () => {
       holdBehind: ["ENG-9"],
       status: { phase: "review", summary: "Waiting on the vendor", nextAction: "the vendor", actor: "other", waitingOn: null, requeueAfterMs: null, conditions: [], resources: { workers: [], pullRequests: [], children: [] }, at },
       deployments: {
-        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
     });
     // An open `stuck` escalation is a block (BB-76).
@@ -4460,7 +4481,7 @@ describe("the realtime signal on every sidebar-visible change (BB-90)", () => {
   it("publishes one signal when a deployment watch changes state", async () => {
     const { t, b } = await bound();
     const before = t.harness.inspection.realtimeSignals.length;
-    t.hooks.store.patch(b.id, { deployments: { "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t.now(), deadlineAt: null, note: null, workflowRuns: [] } } });
+    t.hooks.store.patch(b.id, { deployments: { "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at: t.now(), deadlineAt: null, note: null, workflowRuns: [] } } });
     expect(signalsSince(t, before)).toEqual([one]);
   });
 
@@ -5849,7 +5870,7 @@ describe("the settings page", () => {
       hold: "a freeze",
       holdBehind: ["ENG-9"],
       deployments: {
-        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
+        "acme/web#7": { key: "acme/web#7", state: "deployed", mergeSha: null, target: "", mergedAt: null, prRepo: "acme/web", files: [], repo: "acme/web", environment: "production", deploymentId: null, deploymentState: null, ref: null, sha: null, url: null, at, deadlineAt: null, note: null, workflowRuns: [] },
       },
     });
     t.hooks.store.escalate({ bindingId: b.id, kind: "stuck", question: "Stuck", meanwhile: "Waiting", route: "project", recommendation: null, projectId: "p1" });
@@ -8101,10 +8122,32 @@ describe("deployment watching (BB-53)", () => {
       "requeue-default: 2d",
       'requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries: "The pinned BB_PLUGINS_REF contains the merge commit."\n  timeout: 1h',
     );
+  const twoTargetPlaybook = () =>
+    LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      [
+        "requeue-default: 2d",
+        "deployment:",
+        "  - name: bb-gate",
+        "    source: github",
+        "    repo: acme/bb-gate",
+        "    environment: production",
+        '    carries: "the pin contains the merge"',
+        "    timeout: 1h",
+        "  - name: devbox",
+        "    source: github",
+        "    repo: bitcomplete/devbox",
+        "    environment: production",
+        '    carries: "the ref contains the merge"',
+        "    timeout: 1h",
+      ].join("\n"),
+    );
+  const structuredPlaybook = (carries: string) =>
+    LINEAR_TICKETS.replace("requeue-default: 2d", `requeue-default: 2d\ndeployment:\n  source: github\n  repo: acme/bb-gate\n  environment: production\n  carries:\n${carries}\n  timeout: 1h`);
   const merged = (t: Awaited<ReturnType<typeof setup>>, id = "uuid-12", key = "ENG-12", pullKey = "acme/web#7") => {
     t.files[playbookPath("linear-tickets")] = deploymentPlaybook();
     t.entities.set(id, issue({ id, key, state: "In Progress", linkedPulls: [{ url: `https://github.com/acme/web/pull/${pullKey.split("#")[1]}`, key: pullKey }] }));
-    t.entities.set(pullKey, pull({ key: pullKey }, { merged: true }));
+    t.entities.set(pullKey, pull({ key: pullKey }, { merged: true, mergeCommit: "aaaaaaa1" }));
   };
   const doorbell = async (t: Awaited<ReturnType<typeof setup>>, id: string, deployment: Record<string, unknown>) => {
     await t.harness.callRpc("stewardsRing", { source: "github", id, deployment }, { experimental_caller: { kind: "plugin", pluginId: "github-watcher" } });
@@ -8142,6 +8185,53 @@ describe("deployment watching (BB-53)", () => {
     expect(wake).toMatch(/merge aaaaaaa/u);
     expect(wake).toMatch(/ref main/u);
     expect(wake).toMatch(/sha bbbbbbb/u);
+  });
+
+  it("tracks two deployment targets on one merge independently (BB-132)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = twoTargetPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const recorded = t.hooks.store.find("ENG-12")!.deployments;
+    expect(Object.keys(recorded).sort()).toEqual(["acme/web#7::bb-gate", "acme/web#7::devbox"]);
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    const after = t.hooks.store.find("ENG-12")!.deployments;
+    expect(after["acme/web#7::bb-gate"]).toMatchObject({ state: "deploying", deploymentId: 7 });
+    // The devbox target is a different watch, untouched by the bb-gate doorbell.
+    expect(after["acme/web#7::devbox"]).toMatchObject({ state: "merged", deploymentId: null });
+    expect(t.rpcCalls.filter((c) => c.method === "sourceSetInterest").at(-1)!.input).toMatchObject({ deployment: ["acme/bb-gate", "bitcomplete/devbox"] });
+  });
+
+  it("evaluates a structured carries rule itself and settles the watch (BB-132)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    t.sourceCompares.set("acme/bb-gate aaaaaaa1 main", "identical");
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    // The plugin decided, so the watch is settled deployed without the steward reporting.
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]).toMatchObject({ state: "deployed", note: expect.stringMatching(/ref-contains-merge: main contains merge aaaaaaa/u) });
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+    const wake = t.sends.filter((s) => s.threadId === steward).at(-1)!.text;
+    expect(wake).toMatch(/deployed/);
+    expect(wake).toMatch(/evaluated by the plugin/);
+  });
+
+  it("leaves a structured carries it cannot decide to the steward, with a note (BB-132)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = structuredPlaybook('    - when: { repo: acme/web }\n      strategy: { kind: ref-contains-merge }');
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    // No compare is registered: the read fails, so the plugin wakes the steward.
+    await doorbell(t, "acme/bb-gate#7", deployment());
+    const watch = t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!;
+    expect(watch.state).toBe("deploying");
+    expect(watch.note).toMatch(/ref-contains-merge: could not compare/u);
   });
 
   it("marks the pull request deployed when the steward reports the rule carried, and wakes for the closing comment", async () => {
@@ -8365,12 +8455,34 @@ describe("deployment watching (BB-53)", () => {
     // it, so it must not wake, but the event must persist on it so a repeat
     // delivery of the same run and attempt cannot wake it later.
     const watch = binding.deployments["acme/web#7"]!;
-    t.hooks.store.patch(binding.id, { deployments: { "acme/web#7": { ...watch, at: t.now() + 100_000 } } });
+    t.hooks.store.patch(binding.id, { deployments: { "acme/web#7": { ...watch, at: t.now() + 100_000, mergedAt: t.now() + 100_000 } } });
     await runDoorbell(t, "acme/bb-gate#42", workflowRun());
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
     expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
     await runDoorbell(t, "acme/bb-gate#42", workflowRun());
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+  });
+
+  it("skips a run that started before the watch's merge, read back by run id, and wakes one after (BB-132)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const binding = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const mergedAt = binding.deployments["acme/web#7"]!.mergedAt!;
+    // The doorbell carries no run start, so the plugin reads it back by run id.
+    // A run that started before the merge is recorded but does not wake.
+    t.sourceRuns.set("acme/bb-gate 42", { id: 42, runNumber: 7, headSha: "ccccccc3", startedAt: new Date(mergedAt - 60_000).toISOString(), jobs: [] });
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    // A run that started after the merge wakes.
+    t.sourceRuns.set("acme/bb-gate 43", { id: 43, runNumber: 8, headSha: "ddddddd4", startedAt: new Date(mergedAt + 60_000).toISOString(), jobs: [] });
+    await runDoorbell(t, "acme/bb-gate#43", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
   });
 
   it("ignores a workflow the playbook does not name (BB-61)", async () => {

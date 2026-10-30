@@ -676,20 +676,32 @@ part is the level only when it names one), `requeue-default`,
 `follow-through` (how long a terminal binding may be kept open, 6h by
 default), `skip-authors`, `deployment`.
 
-`deployment` names where a merge is confirmed live (BB-53): `source`
-(`github`), `repo` (the repo the deployment is created on, e.g.
-`bitcomplete/bb-gate`), `environment`, `carries` (the rule the steward applies
-to decide whether a deployment carries a merge; free text, shown in the wake
-alongside the deployment) and `timeout` (how long to wait for one, 6h by
-default). With it, a merged pull request is recorded as awaiting deployment,
-the github plugin leases the repo as a `deployment_repo` and a `deployment`
-doorbell for the repo and environment wakes the binding, and the steward
-reports the verdict with `steward_report { deployment: { state } }`; a
-failure/error deployment or a timeout wakes it with the run URL. The wake's
-`merge <sha>` is the pull request's head, and a squash or rebase merge
-rewrites it, so decide ancestry from the deployment's own `ref`/`sha` and the
-repository rather than the head sha alone. With no
-`deployment`, the playbook behaves exactly as before.
+`deployment` names where a merge is confirmed live (BB-53, BB-132): one
+target or a list of them. A target has `name` (optional; reports and wakes
+name it when there is more than one), `source` (`github`), `repo` (the repo
+the deployment is created on, e.g. `bitcomplete/bb-gate`), `environment`,
+`carries`, `timeout` (how long to wait for one, 6h by default) and the
+optional `workflows` whose failure matters while it waits (BB-61). With it, a
+merged pull request is recorded as awaiting deployment for each target, the
+github plugin leases each repo as a `deployment_repo`, and a `deployment`
+doorbell for the repo and environment wakes the binding. `carries` is either
+free text the steward applies (the older behaviour, shown in the wake) or an
+ordered list of rules the plugin evaluates itself, first match wins. A rule
+is `{ when: { repo, paths? }, strategy }`, matched against the merged pull
+request's repo and changed files. `strategy: { kind: ref-contains-merge }`
+asks whether the deployment's ref has the merge as an ancestor.
+`strategy: { kind: image-tag, manifest, image, workflow, job?, consumer? }`
+reads the image's `newTag` from the manifest at the deployment's ref, finds
+the workflow run it numbers, and compares the merge against what that run
+built: the run's head sha without `job`; with `job`, the default branch as of
+the job's `started_at`, or, with `consumer` (`dockerfile`, `pinArg`, `repo`),
+the pin in the Dockerfile at that time, compared in the consumer's repo. The
+plugin reports `deployed`/`not-yet` itself and wakes the steward only when a
+read fails or no rule matches; the watch's `merge <sha>` is now the merge
+commit (`mergeCommit.oid`), not the head. The steward reports a verdict with
+`steward_report { deployment: { state, key?, target? } }`; a failure/error
+deployment or a timeout wakes it with the run URL. With no `deployment`, the
+playbook behaves exactly as before.
 
 The wake numbers the ready checklist, and `steward_report` takes each item by
 its number (or the playbook's exact words). It stores the playbook's wording,
