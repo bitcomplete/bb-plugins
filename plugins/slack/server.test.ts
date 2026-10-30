@@ -1241,10 +1241,31 @@ describe("Slack plugin", () => {
     expect(s.hooks.messages).toEqual([{ session: "D0123:1712345678.901234", body: { connection: "c_1", text: ASSISTANT_GREETING } }]);
     // No thinking indicator is set for the pane open, and none is cleared.
     expect(s.hooks.statuses).toEqual([]);
-    // The greeting already answered the wake, so a turn's idle cannot trip the backstop.
+    // The greeting already answered the wake; a turn's idle cannot trip the
+    // backstop. (The pre-mapped re-open test below pins the answered count,
+    // which this unmapped session cannot.)
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("answers a pane-open wake on a conversation that already has a thread, so a turn's idle cannot trip the backstop", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    // The first message maps the session to thr-1, and its turn replies.
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_reply", { text: "hi" }, { threadId: "thr-1" });
+    const before = s.hooks.messages.length;
+    // Reopening the pane greets and starts nothing, but still answers the wake.
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(s.hooks.messages).toHaveLength(before + 1);
+    // The mapped thread's turn idle must not fire the backstop for the pane open.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(before + 1);
     await s.stop();
   });
 
