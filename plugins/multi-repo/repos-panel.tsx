@@ -387,11 +387,12 @@ export function ReposPanel() {
     prUrl: string | null;
     message: string | null;
   }): string | null => {
+    if (result.message !== null) return result.message;
     if (result.mode === "pull-request") {
       return result.prUrl === null ? "Opened a pull request for the change." : `Opened ${result.prUrl} for the change.`;
     }
-    if (result.mode === "push") return result.message ?? "Pushed the change to origin.";
-    return result.message;
+    if (result.mode === "push") return "Pushed the change to origin.";
+    return null;
   };
 
   const addRepo = useCallback(

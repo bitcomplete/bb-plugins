@@ -325,8 +325,6 @@ export const hostContract = defineRpcContract({
          * layout defaults.
          */
         publish: publishPolicySchema.optional(),
-        /** The thread a `guidance-` branch is named after, when there is one. */
-        threadId: z.string().min(1).max(100).nullable().optional(),
       })
       .strict(),
     output: z

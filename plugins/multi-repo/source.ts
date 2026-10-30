@@ -595,7 +595,6 @@ export async function writeReposJson(
   signal?: AbortSignal,
   layout: ProjectLayout = "standalone",
   policy?: PublishPolicy,
-  threadId?: string | null,
 ): Promise<{
   ok: boolean;
   committed: boolean;
@@ -612,7 +611,6 @@ export async function writeReposJson(
     path: REPOS_FILE,
     content: text,
     message,
-    threadId: threadId ?? null,
     ...(signal === undefined ? {} : { signal }),
   });
   return {
@@ -640,8 +638,6 @@ export interface PublishContentRequest {
   content: string;
   /** The commit message, and the pull request title. */
   message: string;
-  /** The thread a guidance branch is named after, when there is one. */
-  threadId?: string | null;
   signal?: AbortSignal;
 }
 
@@ -655,7 +651,6 @@ export interface PublishBranchRequest {
   /** A local branch (short name) that already holds the commit. */
   branch: string;
   message: string;
-  threadId?: string | null;
   signal?: AbortSignal;
 }
 
@@ -792,7 +787,15 @@ async function publishByPush(
   }
   if (outcome.message !== null) return failure(outcome.message, outcome.head, outcome.committed);
   if (!outcome.committed) {
-    return { ok: true, mode, committed: false, head: outcome.head, branch: null, prUrl: null, message: null };
+    return {
+      ok: true,
+      mode,
+      committed: false,
+      head: outcome.head,
+      branch: null,
+      prUrl: null,
+      message: "Nothing to commit; the change was already in place.",
+    };
   }
   if (!hasRemote) {
     return {
@@ -834,9 +837,20 @@ async function publishByPullRequest(
   if (request.kind === "content") {
     branchName = guidanceBranchName(request.path);
     const relative = `${projectDefinitionPrefix(request.layout)}${request.path}`;
+    // Stack on the branch's own tip when it already exists. A second write
+    // while the first pull request is still open must fast-forward the same
+    // branch, not replace its earlier commit: basing on the default branch
+    // would move the ref off that commit and then fail the push as
+    // non-fast-forward. When the branch does not exist yet, the default
+    // branch is the base.
+    const existing = await gitLine(
+      request.dir,
+      ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}^{commit}`],
+      options,
+    );
     const outcome = await commitContentOnBranch({
       dir: request.dir,
-      base,
+      base: existing ?? base,
       branchRef: `refs/heads/${branchName}`,
       relative,
       content: request.content,
@@ -846,7 +860,15 @@ async function publishByPullRequest(
     });
     if (outcome.message !== null) return failure(outcome.message, outcome.head, branchName);
     if (!outcome.committed) {
-      return { ok: true, mode, committed: false, head: outcome.head, branch: null, prUrl: null, message: null };
+      return {
+        ok: true,
+        mode,
+        committed: false,
+        head: outcome.head,
+        branch: null,
+        prUrl: null,
+        message: "Nothing to commit; the change was already in place.",
+      };
     }
     head = outcome.head;
   } else {
@@ -978,10 +1000,13 @@ async function openOrFindPullRequest(args: {
       ["pr", "list", "--head", args.branch, "--state", "open", "--json", "url", "--limit", "1"],
       common,
     );
-    if (listed.code === 0) {
-      const url = firstPullRequestUrl(listed.stdout);
-      if (url !== null) return { ok: true, url, message: null };
+    // A failed list is reported as itself. Falling through to `pr create`
+    // would replace it with "a pull request already exists" when one does.
+    if (listed.code !== 0) {
+      return { ok: false, url: null, message: `Could not check for an existing pull request: ${firstProblemLine(listed)}` };
     }
+    const existing = firstPullRequestUrl(listed.stdout);
+    if (existing !== null) return { ok: true, url: existing, message: null };
     const bodyDir = await mkdtemp(path.join(tmpdir(), "bb-pr-"));
     const bodyPath = path.join(bodyDir, "body.md");
     await writeFile(bodyPath, args.body, "utf8");
@@ -1235,7 +1260,6 @@ export async function mergeGuidance(
     path: file,
     branch: guidanceBranchName(threadId),
     message: `Guidance from ${threadId}`,
-    threadId,
     ...(signal === undefined ? {} : { signal }),
   });
   if (!published.ok) return refuse(published.message ?? "The lesson could not be published.");

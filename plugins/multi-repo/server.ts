@@ -611,7 +611,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     message: string,
     signal?: AbortSignal,
     layout: ProjectLayout = "standalone",
-    threadId?: string | null,
   ): Promise<{ mode: PublishMode; prUrl: string | null; message: string | null }> {
     const result = await host.call(
       "writeProjectSourceRepos",
@@ -621,7 +620,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         message,
         layout,
         ...(file.publish === undefined ? {} : { publish: file.publish }),
-        threadId: threadId ?? null,
       },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
@@ -646,10 +644,11 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
    * remote. The write itself already succeeded by the time this is called.
    */
   function publishNote(published: { mode: PublishMode; prUrl: string | null; message: string | null }): string {
+    if (published.message !== null) return published.message;
     if (published.mode === "pull-request") {
       return published.prUrl === null ? "Opened a pull request for the change." : `Opened ${published.prUrl} for the change.`;
     }
-    return published.message ?? "Pushed the change to origin.";
+    return "Pushed the change to origin.";
   }
 
   type EditOutcome =
@@ -660,7 +659,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     location: SourceLocation,
     seed: RepoSeed,
     signal?: AbortSignal,
-    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: true }, signal);
     if (current.file === null) {
@@ -680,7 +678,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = addRepo(current.file, entry);
     if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
-    const published = await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout, threadId);
+    const published = await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout);
     return { ok: true, dir: entry.dir, ...published };
   }
 
@@ -688,7 +686,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     location: SourceLocation,
     dir: string,
     signal?: AbortSignal,
-    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
@@ -696,7 +693,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = removeRepo(current.file, dir);
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
-    const published = await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout, threadId);
+    const published = await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout);
     return { ok: true, dir, ...published };
   }
 
@@ -705,7 +702,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     dir: string,
     branch: string | null,
     signal?: AbortSignal,
-    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
@@ -715,7 +711,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
     const next = edited.value.repos.find((repo) => repo.dir === dir)?.branch;
     const message = next === undefined ? `Use the default branch for ${dir}` : `Base ${dir} on ${next}`;
-    const published = await writeRepoSet(location, edited.value, message, signal, current.layout, threadId);
+    const published = await writeRepoSet(location, edited.value, message, signal, current.layout);
     return { ok: true, dir, ...published };
   }
 
@@ -872,7 +868,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               .map((repo) => repo.dir)
               .join(", ")}`,
           );
-          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout, context.thread.id);
+          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
           repoSet = seeded;
         }
 
@@ -1178,7 +1174,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       // All three writes run host-side: the commit in the canonical checkout,
       // the cache population, and the clone into the live workspace. That is
       // what makes this work while the agent is sandboxed.
-      const outcome = await addRepoToProject(location, seed, signal, threadId);
+      const outcome = await addRepoToProject(location, seed, signal);
       if (!outcome.ok) throw new Error(outcome.error);
       const dir = outcome.dir;
       const entry = resolveRepoEntry(seed);
@@ -1228,7 +1224,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async execute(input, { threadId, signal }) {
       const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const outcome = await removeRepoFromProject(location, input.dir, signal, threadId);
+      const outcome = await removeRepoFromProject(location, input.dir, signal);
       if (!outcome.ok) throw new Error(outcome.error);
       // Deliberately leaves the checkout alone. A workspace should not mutate
       // under a running thread, and deleting a directory the agent may have
@@ -1424,7 +1420,6 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                 ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
               },
               ctx.signal,
-              ctx.threadId,
             );
             if (!outcome.ok) {
               throw new PluginCliError(outcome.error, {
@@ -1445,7 +1440,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           options: { project: PROJECT_OPTION },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal, ctx.threadId);
+            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal);
             if (!outcome.ok) throw new PluginCliError(outcome.error, { code: outcome.code });
             return { exitCode: 0, stdout: `Removed ${outcome.dir}. Existing workspaces are unchanged. ${publishNote(outcome)}` };
           },

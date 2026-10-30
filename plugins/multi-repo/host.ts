@@ -137,7 +137,6 @@ export function createMultiRepoHostEntry() {
           context.signal,
           input.layout ?? "standalone",
           input.publish,
-          input.threadId ?? null,
         );
         return {
           ok: result.ok,

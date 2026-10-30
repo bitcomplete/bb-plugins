@@ -230,7 +230,8 @@ discovery seed and `mergeGuidance` all call it.
   temporary detached worktree at the default branch, so the checkout's own
   branch and working tree are untouched), pushes it, and opens a pull request
   with `gh`. The default branch never moves; the change lands when the pull
-  request merges. A second write to the same path reuses the open pull request.
+  request merges. A second write to the same path stacks on the open branch
+  (so the push stays a fast-forward) and reuses the open pull request.
 
 A failed push or a failed `gh pr create` is a hard error on every surface
 (panel, CLI, agent tool): the local commit is kept exactly where it is, nothing

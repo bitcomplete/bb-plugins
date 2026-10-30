@@ -231,7 +231,7 @@ exit 1`);
     expect(await gitLine(dir, ["show", "guidance-repos-json:repos.json"])).toContain('"added"');
   });
 
-  it("reuses an open pull request instead of failing on a second edit", async () => {
+  it("returns the open pull request when the branch already has one", async () => {
     await installFakeGh(`if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo '[{"url":"https://github.com/you/bb/pull/9"}]'; exit 0; fi
 echo "should not create" >&2
 exit 1`);
@@ -240,6 +240,47 @@ exit 1`);
     const result = await writeByPolicy(dir, reposText("pull-request"), "standalone");
     expect(result.ok).toBe(true);
     expect(result.prUrl).toBe("https://github.com/you/bb/pull/9");
+  });
+
+  it("stacks a second write on the open branch and fast-forwards it", async () => {
+    // `gh` is stateful: after the first create, `pr list` reports the open PR.
+    const marker = path.join(scratch, "gh-created");
+    await installFakeGh(`if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  if [ -f "${marker}" ]; then echo '[{"url":"https://github.com/you/bb/pull/7"}]'; else echo "[]"; fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  touch "${marker}"
+  echo "https://github.com/you/bb/pull/7"
+  exit 0
+fi
+exit 1`);
+    const remote = await makeBareRemote("stack-remote");
+    const dir = await makeStandalone(remote, "stack-canonical", "pull-request");
+    const first = `${JSON.stringify({ version: 1, repos: [{ dir: "one", url: "https://example.com/one" }], publish: "pull-request" })}\n`;
+    const second = `${JSON.stringify({
+      version: 1,
+      repos: [
+        { dir: "one", url: "https://example.com/one" },
+        { dir: "two", url: "https://example.com/two" },
+      ],
+      publish: "pull-request",
+    })}\n`;
+    const r1 = await writeByPolicy(dir, first, "standalone");
+    expect(r1.ok).toBe(true);
+    expect(r1.prUrl).toBe("https://github.com/you/bb/pull/7");
+    const r2 = await writeByPolicy(dir, second, "standalone");
+    expect(r2.ok).toBe(true);
+    expect(r2.prUrl).toBe("https://github.com/you/bb/pull/7");
+    // The second commit descends from the first, so the push is a
+    // fast-forward and origin's branch carries both changes.
+    expect(r1.head).not.toBeNull();
+    expect(r2.head).not.toBeNull();
+    const ancestor = await gitIn(remote, ["merge-base", "--is-ancestor", r1.head as string, r2.head as string]);
+    expect(ancestor.code).toBe(0);
+    expect(await gitLine(remote, ["show", "guidance-repos-json:repos.json"])).toContain('"two"');
+    // The default branch is still untouched.
+    expect(await gitLine(remote, ["show", "main:repos.json"])).not.toContain('"one"');
   });
 });
 
