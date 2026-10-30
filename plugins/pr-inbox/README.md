@@ -9,7 +9,7 @@ review of other people's PRs. My PRs does not require Workstreams.
 Install the plugin from the collection:
 
 ```sh
-bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@bb/pr-inbox-from-workstreams --plugin pr-inbox --yes
+bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin pr-inbox --yes
 bb plugin config pr-inbox set project <project-id>
 bb plugin reload pr-inbox
 bb pr-inbox poll --json
@@ -20,9 +20,12 @@ PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
-The page groups PRs alphabetically by GitHub organization, then by area, using the same compact layout as Reviews. Its
-branch icon distinguishes My PRs in the sidebar. Groups come from PR title
-scopes, falling back to the repository name.
+The page uses Workstreams' PR layout: a blue **Your turn** section followed by
+an always-visible **Other open PRs** section, each with its own count and empty
+state. Within each section, it groups PRs alphabetically by GitHub organization,
+then by area. Its branch icon distinguishes My PRs in the sidebar.
+Groups come from PR title scopes, falling back to the repository name. Compact rows wrap titles in narrow
+panes and show feedback age and the linked thread's current status.
 
 The header and navigation badge show the number of PRs on Your turn. The
 navigation badge clears when nothing needs your response. This requires a BB
@@ -46,7 +49,8 @@ out of Your turn counts and batch selection. Holds survive new feedback and
 restarts, expire automatically, and can be ended early with **Resume**.
 
 **Dismiss** hides feedback until a new commit or new human feedback changes
-that PR. Open the dismissed list and choose **Restore** to bring it back.
+that PR. Open the dismissed list under **Your turn** and choose **Restore** to
+bring it back.
 Started PRs keep a link to their thread, including after the feedback clears.
 When an attempt finishes, **Clear attempt** lets you start another. If a start
 fails without returning a thread, check your threads before clearing it.

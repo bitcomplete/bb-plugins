@@ -111,6 +111,63 @@ it("keeps thread, clear-attempt, dismissal, and restore actions available in com
   await waitFor(() => expect(JSON.stringify(slot.inspection.rpcCalls)).toContain('"dismissed":false'));
 });
 
+it("shows separate open PR sections and keeps dismissed and held rows out of their counts", async () => {
+  const slot = await renderFeedback([
+    row(1), { ...row(2), turn: null }, { ...row(3), dismissed: true },
+    { ...row(4), holdUntil: "2099-01-01T12:00:00Z" },
+  ]);
+  const turn = within(slot.getByRole("region", { name: "Your turn" }));
+  const other = within(slot.getByRole("region", { name: "Other open PRs" }));
+  const held = within(slot.getByRole("region", { name: "On hold" }));
+  expect(turn.getByText("Improve the editor 1")).toBeTruthy();
+  expect(turn.getByRole("heading", { name: "Your turn" }).parentElement?.textContent).toBe("Your turn1");
+  expect(turn.queryByText("Improve the editor 2")).toBeNull();
+  expect(turn.queryByText("Improve the editor 4")).toBeNull();
+  expect(other.getByText("Improve the editor 2")).toBeTruthy();
+  expect(other.getByText("Improve the editor 2").closest("details")).toBeNull();
+  expect(other.queryByRole("checkbox")).toBeNull();
+  expect(held.getByText("Improve the editor 4")).toBeTruthy();
+  fireEvent.click(turn.getByText("1 dismissed · show"));
+  expect(turn.getByText("Improve the editor 3")).toBeTruthy();
+  expect(slot.getAllByRole("listitem")).toHaveLength(4);
+});
+
+it("shows both empty sections when no PRs are open", async () => {
+  const slot = await renderFeedback([]);
+  expect(within(slot.getByRole("region", { name: "Your turn" })).getByText("Nothing waiting on you.")).toBeTruthy();
+  expect(within(slot.getByRole("region", { name: "Other open PRs" })).getByText("No other open PRs.")).toBeTruthy();
+});
+
+it("keeps the linked thread visible when feedback clears and moves a row to Other open PRs", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing inbox");
+  let rows: View["rows"] = [row(1), { ...row(2), dispatch: { kind: "linked", threadId: "thread-existing" }, threadStatus: "active" }];
+  const slot = renderSlot(panel, { subPath: "" }, { rpc: {
+    inbox_get: () => ({ rows, project: "project-test", poll: null }),
+  } });
+  cleanups.push(() => slot.lifecycle.unmount());
+  fireEvent.click(await slot.findByLabelText("Select example/editor#1"));
+  expect(await slot.findByRole("button", { name: "Open feedback thread for example/editor#2" })).toHaveProperty("textContent", "Working↗");
+  rows = rows.map((item) => ({ ...item, turn: null }));
+  await slot.behavior.emitRealtime("inbox-changed", {});
+  await waitFor(() => expect(slot.queryByLabelText("Selection")).toBeNull());
+  const other = within(slot.getByRole("region", { name: "Other open PRs" }));
+  expect(other.getByText("Improve the editor 1")).toBeTruthy();
+  fireEvent.click(other.getByRole("button", { name: "Open feedback thread for example/editor#2" }));
+  expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-existing" });
+});
+
+it("dates waiting feedback from when it arrived and labels the linked thread's current status", async () => {
+  const slot = await renderFeedback([
+    { ...row(1), updatedAt: new Date().toISOString(), turn: { why: "Comment from @reviewer", since: Date.now() - 7_200_000, latest: Date.now() - 7_200_000 },
+      dispatch: { kind: "linked", threadId: "thread-existing" }, threadStatus: "error" },
+  ]);
+  expect(slot.getByText("Comment from @reviewer · 2h ago")).toBeTruthy();
+  fireEvent.click(slot.getByRole("button", { name: "Open feedback thread for example/editor#1" }));
+  expect(slot.inspection.navigateCalls).toContainEqual({ method: "toThread", threadId: "thread-existing" });
+  expect(slot.getByText("Failed")).toBeTruthy();
+});
+
 it("registers a sidebar badge that counts actionable feedback and follows realtime updates", async () => {
   const app = await loadPluginApp(() => import("./app.js"));
   const useBadge = app.navPanels[0]?.experimental_useBadge;
