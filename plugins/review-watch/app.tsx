@@ -19,6 +19,8 @@ import { ReviewProjectDialog } from "./review-project-dialog";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { createSnapshotCache, useSnapshot } from "./lib/snapshot-cache";
+import type { z } from "zod";
 
 /** The panel's route segment. Shared so every jump to it names one string. */
 const REVIEWS_PATH = "reviews";
@@ -207,28 +209,21 @@ function QueueCountChips({
 }
 
 /** The queue, kept current by the server's "queue-changed" signal. */
+export const queueCache = createSnapshotCache<z.infer<(typeof rpcContract)["queue_list"]["output"]>>();
+
 function useQueue() {
   const rpc = useRpc<typeof rpcContract>();
-  const [items, setItems] = useState<QueueItem[] | null>(null);
-  const [lastPoll, setLastPoll] = useState<LastPoll>(null);
   const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => rpc.call("queue_list"), [rpc]);
+  const snapshot = useSnapshot(queueCache, load);
   const report = useCallback((cause: unknown) => {
     setError(cause instanceof Error ? cause.message : String(cause));
   }, []);
-  const refetch = useCallback(() => {
-    rpc.call("queue_list").then((result) => {
-      setItems(result.items);
-      setLastPoll(result.lastPoll);
-      setError(null);
-    }, report);
-  }, [rpc, report]);
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
+  const refetch = useCallback(() => { setError(null); queueCache.refresh(load); }, [load]);
   // The poller publishes after every change it writes, so a pass that runs
   // while this page is open shows up without a reload.
   useRealtime("queue-changed", refetch);
-  return { rpc, items, lastPoll, error, report, refetch };
+  return { rpc, items: snapshot.data?.items ?? null, lastPoll: snapshot.data?.lastPoll ?? null, error: error ?? snapshot.error, report, refetch };
 }
 
 export function ReviewRow({
@@ -599,30 +594,10 @@ function ReviewsPage() {
   );
 }
 
-/**
- * How many items still want a human. Each caller keeps its own copy: the
- * header action mounts once per visible pane in a split layout, so the count
- * cannot live in a module-level singleton.
- */
+/** The page, badges, and split-pane headers read one shared queue snapshot. */
 function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
-  const rpc = useRpc<typeof rpcContract>();
-  const [activeReviews, setActiveReviews] = useState<QueueItem[]>([]);
-  const [lastPoll, setLastPoll] = useState<LastPoll>(null);
-  const refetch = useCallback(() => {
-    rpc.call("queue_list").then(
-      (result) => {
-        setActiveReviews(result.items.filter(isActiveItem));
-        setLastPoll(result.lastPoll);
-      },
-      // Keep the last queue response visible while a transient fetch fails.
-      () => {},
-    );
-  }, [rpc]);
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
-  useRealtime("queue-changed", refetch);
-  return { items: activeReviews, lastPoll };
+  const { items, lastPoll } = useQueue();
+  return { items: items?.filter(isActiveItem) ?? [], lastPoll };
 }
 
 function useQueuedBadge(): ExperimentalBadge | null {

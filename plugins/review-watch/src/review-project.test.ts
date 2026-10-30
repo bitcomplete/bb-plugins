@@ -3,11 +3,12 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { QueueItem } from "./types.js";
+import { queueCache } from "../app.js";
 
 beforeEach(() => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
 });
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(() => { queueCache.clear(); vi.unstubAllGlobals(); });
 
 const first: QueueItem = {
   key: "review-requested:one:sha", rule: "review-requested", state: "queued", repo: "parsleyhealth/sage",

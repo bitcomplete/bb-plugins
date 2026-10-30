@@ -58,6 +58,11 @@ zero counts. Hover over the header badge to see labeled counts,
 preview up to five review requests, and open the full **Reviews** page. The
 realtime signal keeps these surfaces current.
 
+The page and badges share an in-memory snapshot and in-flight reads. Returning
+to Reviews shows the last snapshot immediately, while data older than 15 seconds
+refreshes in the background. Realtime changes invalidate it immediately. Refresh
+errors keep the last successful view; hidden windows skip periodic reads.
+
 On the **Reviews** page, queued and started `review-requested` and
 `review-followup` items stay in their action sections and remain counted.
 Started rows link to their open threads. They stay pending until a GitHub poll
