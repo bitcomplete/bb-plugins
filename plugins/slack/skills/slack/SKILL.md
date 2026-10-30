@@ -11,7 +11,9 @@ the team's `bb` app reaches the server of the Slack user who sent it as an
 Slack conversation and posts the reply back through bb-gate-hooks, which holds
 the app's bot token. The pod never holds a Slack bot credential. Opening the
 assistant pane only posts a canned one-line greeting and starts no bb thread;
-the first real message starts it.
+the first real message starts it. A message sent while bb is working **steers
+the current work** instead of queueing behind it, so it is read as a correction
+or addition to the running turn.
 
 A DM and a channel mention of the app both wake the server of the Slack user
 who sent them. A reply inside a channel thread bb is already part of also
@@ -47,8 +49,10 @@ the turn silently.
   connection id and the text, so never put a token or secret in it.
 - Each tagged Slack message gets one reply. A second `slack_reply` for the
   same message is refused; a new Slack message is a new wake and can be
-  answered. An untagged reply is not counted: reply only when it is for bb,
-  and a silent turn posts no error reply.
+  answered. A message that arrives while bb is working is sent as a steer: it
+  joins the running turn, the wake text says so, and the turn's one reply
+  covers both messages. An untagged reply is not counted: reply only when it is
+  for bb, and a silent turn posts no error reply.
 - The session is leased to this server: the wake carries an opaque capability
   that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
   half its life. Reply rights therefore survive a restart of bb-gate-hooks and

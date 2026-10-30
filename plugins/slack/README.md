@@ -13,6 +13,12 @@ is a continuation rather than a request: it is delivered to the bb thread and
 does not owe a reply. Posting as "Alice's bb" per message is a separate later
 step.
 
+A message sent while bb is working **steers the current work**: it is
+injected into the running turn instead of queueing behind it, so a correction
+typed mid-turn is read as a correction or addition, and the turn's one reply
+covers both Slack messages. A message to an idle thread starts a turn as
+usual.
+
 ## How it fits together
 
 bb-gate-hooks (`bb-gate/docs/hooks.md`, "Slack agent") holds the app's
@@ -35,9 +41,11 @@ on the pod.
 - **The wake.** A DM from that user arrives as `event: session`,
   `source: "slack"` on the same SSE stream the Linear plugin uses. The plugin
   maps the conversation (`channel:thread`) to one bb thread: the first message
-  spawns it, a follow-up is sent to it. Opening the assistant pane sends
-  `assistant_thread_started`, which posts a canned one-line greeting and
-  starts no bb thread; the first real message then spawns the thread as usual.
+  spawns it, a follow-up is sent to it as a steer (`mode: "steer"`) — it joins
+  the turn already running, or starts one when the thread is idle. Opening the
+  assistant pane sends `assistant_thread_started`, which posts a canned
+  one-line greeting and starts no bb thread; the first real message then spawns
+  the thread as usual.
 - **Replies.** The plugin never holds the bot token. `slack_reply` posts
   through bb-gate-hooks with the connection id and the text; the service posts
   as the app. `assistant.threads.setStatus` shows a thinking indicator while
@@ -53,8 +61,10 @@ on the pod.
   the log line is the reliable half.
 - **No reply.** If a turn that handled a tagged wake ends without calling
   `slack_reply`, the plugin posts one error reply itself, so every tagged
-  message gets an answer. An untagged reply in a followed thread does not owe
-  a reply, so a silent turn there posts nothing.
+  message gets an answer. A follow-up delivered as a steer joins the running
+  turn, so its reply is the turn's one reply and a silent turn still gets a
+  single backstop, not one per message. An untagged reply in a followed thread
+  does not owe a reply, so a silent turn there posts nothing.
 
 ## Settings
 

@@ -113,6 +113,15 @@ describe("wakeText", () => {
     expect(text.length).toBeLessThan(SESSION_TEXT_CHARS + 400);
     expect(text).toContain("(cut; the rest is in Slack)");
   });
+
+  it("tells a steered follow-up it arrived while the previous message was being handled", () => {
+    const text = wakeText(event(), { steered: true });
+    expect(text).toContain("while the previous one was being handled");
+    expect(text).toContain("correction or addition");
+    expect(text).toContain("not a new question");
+    // The plain text is unchanged, so a first message never carries it.
+    expect(wakeText(event())).not.toContain("correction or addition");
+  });
 });
 
 describe("sessionsSchema", () => {

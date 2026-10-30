@@ -1,4 +1,4 @@
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makeMessageDispatchHookContext } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors } from "./server.js";
 
@@ -200,7 +200,9 @@ async function setup(
     sources?: Array<{ type: string; hostId: string; isDefault: boolean }>;
     environments?: Array<{ environmentProviderId: string | null; hostId: string; createdAt: number; lifecycle: { phase: string }; environmentProviderSelection: { inputs: unknown } | null }>;
     spawn?: () => unknown;
-    send?: () => unknown;
+    send?: (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => unknown;
+    /** What the dispatch hook reports for a `threads.send`: joined or started. */
+    sendAttempt?: "join-turn" | "start-turn";
     get?: () => unknown;
     turns?: Array<{ createdAt: number; data: unknown }>;
   } = {},
@@ -213,6 +215,9 @@ async function setup(
     String(url).startsWith("https://slack.com/") ? slack.fetchImpl(url, init) : hooks.fetchImpl(url, init),
   ) as unknown as typeof fetch;
   const settings = options.settings ?? { token: options.token ?? "", project: "", channels: "[]" };
+  // Assigned once the host is built: the fake `send` runs the registered
+  // dispatch hook, the way the server runs it inside `threads.send`.
+  let dispatchHook: ((context: ReturnType<typeof makeMessageDispatchHookContext>) => unknown) | null = null;
   const { bb, harness } = createFakePluginHost({
     pluginId: "slack",
     appUrl: APP_URL,
@@ -226,7 +231,19 @@ async function setup(
       environments: { list: async () => options.environments ?? ENVIRONMENTS },
       threads: {
         spawn: async () => options.spawn?.() ?? { id: "thr-1" },
-        send: async () => options.send?.() ?? { outcome: "sent" },
+        send: async (args: { threadId: string; input: Array<{ type: string; text?: string }>; pluginSubmission?: unknown }) => {
+          if (dispatchHook !== null) {
+            await dispatchHook(
+              makeMessageDispatchHookContext({
+                thread: { id: args.threadId },
+                input: { blocks: args.input as never, text: args.input.map((b) => b.text ?? "").join("\n") },
+                attempt: options.sendAttempt ?? "start-turn",
+                experimental_submission: (args.pluginSubmission ?? null) as never,
+              }),
+            );
+          }
+          return options.send?.(args) ?? { delivery: "sent" };
+        },
         get: async () => options.get?.() ?? { title: "Build BB-38", titleFallback: null },
         events: { list: async () => options.turns ?? [] },
       },
@@ -235,6 +252,7 @@ async function setup(
   let now = 1_000_000_000_000;
   const factory = createSlackPlugin({ fetch: fetchImpl, now: () => now, env: { BB_HOOKS_URL: HOOKS_URL } });
   await factory(bb);
+  dispatchHook = harness.registrations.hooks["message.dispatch"] as typeof dispatchHook;
   if (options.map !== undefined) await harness.callRpc("setMap", options.map);
   const tool = (name: string, args: Record<string, unknown>, ctx?: { threadId?: string; projectId?: string }) =>
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
@@ -351,7 +369,7 @@ describe("Slack plugin", () => {
     await tick();
     const sends = s.harness.sdk.callsTo("threads.send");
     expect(sends).toHaveLength(1);
-    expect(sends[0]![0]).toMatchObject({ threadId: "thr-1", mode: "auto" });
+    expect(sends[0]![0]).toMatchObject({ threadId: "thr-1", mode: "steer" });
     expect(JSON.stringify(sends[0]![0])).toContain("also the SSO page");
     await s.stop();
   });
@@ -985,6 +1003,94 @@ describe("Slack plugin", () => {
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    await s.stop();
+  });
+
+  it("steers a follow-up into the running turn and does not backstop when the turn replies once", async () => {
+    // The first wake spawns and starts a turn. The second arrives while it
+    // runs, so the server joins it: `mode: "steer"` with a `join-turn`
+    // dispatch. The turn's one reply covers both Slack messages.
+    const s = await live({
+      sendAttempt: "join-turn",
+      turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }],
+    });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ comment: { text: "wait, use the other branch", untrusted: false } }));
+    await tick();
+    const sends = s.harness.sdk.callsTo("threads.send");
+    expect(sends).toHaveLength(1);
+    expect(sends[0]![0]).toMatchObject({ threadId: "thr-1", mode: "steer" });
+    expect(JSON.stringify(sends[0]![0])).toContain("wait, use the other branch");
+    // The wake says the words arrived while the previous message was handled.
+    expect(JSON.stringify(sends[0]![0])).toContain("while the previous one was being handled");
+    expect(JSON.stringify(sends[0]![0])).toContain("correction or addition");
+    // One reply covers both wakes, and the backstop stays quiet.
+    const reply = await s.tool("slack_reply", { text: "Switched to the other branch." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("starts a turn for a follow-up on an idle thread and needs its own reply", async () => {
+    // The first wake's turn replied and the thread is idle, so the second wake
+    // is a `start-turn` dispatch: it owes a reply of its own, as before.
+    const s = await live({ sendAttempt: "start-turn" });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_reply", { text: "Done." }, { threadId: "thr-1" });
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ comment: { text: "and the docs", untrusted: false } }));
+    await tick();
+    const sends = s.harness.sdk.callsTo("threads.send");
+    expect(sends).toHaveLength(1);
+    expect(sends[0]![0]).toMatchObject({ mode: "steer" });
+    // The new turn owes its own reply, so slack_reply is allowed again.
+    const reply = await s.tool("slack_reply", { text: "Docs too." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(2);
+    await s.stop();
+  });
+
+  it("posts exactly one backstop when a turn ends silent after a steer", async () => {
+    const s = await live({
+      sendAttempt: "join-turn",
+      turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }],
+    });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "wait", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    await s.stop();
+  });
+
+  it("keeps a tagged steer's own reply when the running turn has already replied", async () => {
+    // An untagged first wake starts the thread with no tagged obligation. Its
+    // turn replies, then a tagged wake steers in before the turn ends: nothing
+    // is outstanding for the steer to share, so it keeps its own reply.
+    const s = await live({ sendAttempt: "join-turn" });
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    await s.tool("slack_reply", { text: "Yes, that one." }, { threadId: "thr-1" });
+    expect(s.hooks.messages).toHaveLength(1);
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: true, tagged: true, comment: { text: "and the docs", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    // The steer owes a reply of its own: slack_reply is allowed again.
+    const reply = await s.tool("slack_reply", { text: "Docs too." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(2);
     await s.stop();
   });
 
