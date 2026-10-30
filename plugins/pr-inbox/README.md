@@ -9,7 +9,7 @@ review of other people's PRs. My PRs does not require Workstreams.
 Install the plugin from the collection:
 
 ```sh
-bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@bb/pr-inbox-from-workstreams --plugin pr-inbox --yes
+bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin pr-inbox --yes
 bb plugin config pr-inbox set project <project-id>
 bb plugin reload pr-inbox
 bb pr-inbox poll --json
