@@ -115,6 +115,15 @@ describe("wakeText", () => {
     expect(text.length).toBeLessThan(SESSION_TEXT_CHARS + 400);
     expect(text).toContain("(cut; the rest is in Slack)");
   });
+
+  it("tells a steered follow-up it arrived while the previous message was being handled", () => {
+    const text = wakeText(event(), { steered: true });
+    expect(text).toContain("while the previous one was being handled");
+    expect(text).toContain("correction or addition");
+    expect(text).toContain("not a new question");
+    // The plain text is unchanged, so a first message never carries it.
+    expect(wakeText(event())).not.toContain("correction or addition");
+  });
 });
 
 describe("sessionsSchema", () => {
@@ -123,6 +132,8 @@ describe("sessionsSchema", () => {
     expect(parsed.a?.title).toBeNull();
     // An older stored record without the field is read as no untagged wake waiting.
     expect(parsed.a?.untagged).toBe(0);
+    // An older record has no steer mark either.
+    expect(parsed.a?.steeredAt).toBeNull();
     expect(sessionsSchema.parse("nonsense")).toEqual({});
   });
 });
