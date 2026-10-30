@@ -1953,6 +1953,60 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
   });
 });
 
+// BB-128: the In flight, Blocked and Monitors rows hold a fixed
+// pinned › display title › binding-key position. A host tick that only bumps a
+// running worker's `updatedAt` re-renders the row but leaves it in place, so no
+// row replays its enter animation.
+describe("the sidebar's fixed effort-row order (BB-128)", () => {
+  it("keeps In flight rows in place when a host tick only bumps a running worker's updatedAt", async () => {
+    let calls = 0;
+    const captured = await loadApp();
+    const list = captured.threadLists[0]!;
+    const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
+    const worker = thread({ id: "thr_w", displayTitle: "Implement", status: "active", updatedAt: 10 });
+    const slot = renderSlot(list, props, {
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_a", displayTitle: "ENG-1: Beta", updatedAt: 10 }), thread({ id: "thr_b", displayTitle: "ENG-2: Alpha", updatedAt: 20 }), worker],
+      },
+      rpc: {
+        stewardsSidebar: () => {
+          calls += 1;
+          return sidebarData({
+            // An unrelated field moves between calls so the refetched payload
+            // is not byte-identical and the tab recomputes.
+            bindings: [
+              binding({ key: "ENG-1", threadId: "thr_a", phase: calls === 1 ? "In Progress" : "In Review", workers: [{ threadId: "thr_w", title: "Implement", status: "running" }] }),
+              binding({ key: "ENG-2", threadId: "thr_b" }),
+            ],
+          });
+        },
+      } as never,
+    });
+    const inflightKeys = (): string[] => {
+      const section = slot.getByRole("heading", { name: /In flight/u }).closest("section")!;
+      const ul = section.querySelector(":scope > ul")!;
+      return Array.from(ul.children).map((li) => li.querySelector("a[href]")!.getAttribute("href")!.split("/").pop()!);
+    };
+    await waitFor(() => expect(slot.getByText("Alpha")).toBeTruthy());
+    // By display title: Alpha (ENG-2) before Beta (ENG-1).
+    expect(inflightKeys()).toEqual(["ENG-2", "ENG-1"]);
+    const before = rowRenderCounts.get("effort:ENG-1") ?? 0;
+    // The host ticks the running worker's recency. The tab recomputes (the
+    // phase moved for an unrelated reason); under the old recency fallback
+    // ENG-1 would leapfrog ENG-2, but the row holds its place and just
+    // re-renders.
+    worker.updatedAt = 100;
+    await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
+    await waitFor(() => expect(calls).toBe(2));
+    await waitFor(() => expect(lineTwo(slot, "Beta")).toContain("In Review"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(inflightKeys()).toEqual(["ENG-2", "ENG-1"]);
+    expect(rowRenderCounts.get("effort:ENG-1") ?? 0).toBeGreaterThan(before);
+    slot.lifecycle.unmount();
+  });
+});
+
 // BB-100: the sidebar asks for one project, the picker's count comes from the
 // server, and a signal for another project does not refetch.
 describe("the sidebar's one-project RPC (BB-100)", () => {

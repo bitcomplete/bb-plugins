@@ -147,13 +147,13 @@ export interface SidebarTab {
   projectId: string;
   name: string;
   isPersonal: boolean;
-  /** Needs-you (yellow) then blocked (red) efforts: stewarded and ops. */
+  /** Blocked efforts (stewarded and ops), pinned › title › key (BB-128). */
   blocked: SidebarEffort[];
-  /** In-flight stewarded efforts, running before quiet. `ops` bindings are in `monitors`, one-off threads in `threads`. */
+  /** In-flight stewarded efforts, pinned › title › key (BB-128). `ops` bindings are in `monitors`, one-off threads in `threads`. */
   efforts: SidebarEffort[];
-  /** One-off threads (no steward binding), ordered. */
+  /** One-off threads (no steward binding), bb's own needsUser › busy › recency order. */
   threads: SidebarEffort[];
-  /** `ops`, Dependabot and Sentry bindings that are neither waiting on you nor blocked. */
+  /** `ops`, Dependabot and Sentry bindings that are neither waiting on you nor blocked, pinned › title › key (BB-128). */
   monitors: SidebarEffort[];
   projectStewardThreadId: string | null;
   ended: SidebarEndedEffort[];
@@ -379,9 +379,11 @@ export function effortTitle(displayTitle: string, key: string | null): string {
  */
 export interface EffortOrder {
   pinned: boolean;
-  state: SidebarEffortState;
-  recency: number;
+  /** The row's raw display title; compared through `effortTitle` with `key`. */
   title: string;
+  /** The binding key: the title's key prefix, and the final tie-break. */
+  key: string;
+  recency: number;
 }
 
 /** An effort's ordering plus the two flags bb's own precedence reads. */
@@ -391,9 +393,10 @@ export interface EffortPriority extends EffortOrder {
 }
 
 /**
- * bb's precedence for its own list: pinned first, then threads that need the
- * user, then busy threads (`starting` / `active` / `stopping`), then most
- * recent activity. The tie-break by title keeps the order stable.
+ * bb's precedence for its own list (the one-off Threads): pinned first, then
+ * threads that need the user, then busy threads (`starting` / `active` /
+ * `stopping`), then most recent activity. The tie-break by title keeps the
+ * order stable.
  */
 export function compareEfforts(a: EffortPriority, b: EffortPriority): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -403,24 +406,34 @@ export function compareEfforts(a: EffortPriority, b: EffortPriority): number {
   return a.title.localeCompare(b.title);
 }
 
-/** Blocked: pinned first, then needs-you (yellow) before red, then by recency. */
-export function compareBlocked(a: EffortOrder, b: EffortOrder): number {
+/**
+ * The fixed position shared by In flight, Blocked and Monitors (BB-128):
+ * pinned first, then the row's display title (`effortTitle`, the title the row
+ * shows), then the binding key. `recency`, `busy` and `state` are deliberately
+ * ignored: the glyph and the line-two phrase carry the state, and a fixed
+ * position stops a host tick that only bumps `updatedAt` from moving a row and
+ * replaying its enter animation.
+ */
+function compareFixed(a: EffortOrder, b: EffortOrder): number {
   if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  const aYou = a.state === "you" ? 0 : 1;
-  const bYou = b.state === "you" ? 0 : 1;
-  if (aYou !== bYou) return aYou - bYou;
-  if (b.recency !== a.recency) return b.recency - a.recency;
-  return a.title.localeCompare(b.title);
+  const byTitle = effortTitle(a.title, a.key).localeCompare(effortTitle(b.title, b.key));
+  if (byTitle !== 0) return byTitle;
+  return a.key.localeCompare(b.key);
 }
 
-/** In flight: pinned first, then running (blue) before quiet (grey), then by recency. */
+/** Blocked: the fixed pinned › title › key order (BB-128). */
+export function compareBlocked(a: EffortOrder, b: EffortOrder): number {
+  return compareFixed(a, b);
+}
+
+/** In flight: the fixed pinned › title › key order (BB-128). */
 export function compareInflight(a: EffortOrder, b: EffortOrder): number {
-  if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-  const aRun = a.state === "running" ? 0 : 1;
-  const bRun = b.state === "running" ? 0 : 1;
-  if (aRun !== bRun) return aRun - bRun;
-  if (b.recency !== a.recency) return b.recency - a.recency;
-  return a.title.localeCompare(b.title);
+  return compareFixed(a, b);
+}
+
+/** Monitors: the fixed pinned › title › key order (BB-128), not `compareEfforts`' recency. */
+export function compareMonitors(a: EffortOrder, b: EffortOrder): number {
+  return compareFixed(a, b);
 }
 
 /** Every live project gets a tab; a project with no stewards still gets its one-off threads. */
@@ -662,7 +675,7 @@ function buildTab(project: SidebarLiveProject, data: SidebarProjectData | undefi
     blocked: [...nonOps, ...ops].filter((e) => e.section === "blocked").sort(compareBlocked),
     efforts: nonOps.filter((e) => e.section === "inflight").sort(compareInflight),
     threads: efforts.filter((e) => e.bindingKey === null).sort(compareEfforts),
-    monitors: ops.filter((e) => e.section === "monitors").sort(compareEfforts),
+    monitors: ops.filter((e) => e.section === "monitors").sort(compareMonitors),
     projectStewardThreadId: stewardThreadId,
     ended: (data?.ended ?? []).map(endedEffort),
   };
