@@ -4872,7 +4872,7 @@ describe("needs you items", () => {
     const wakes = t.sends.filter((s) => s.threadId === t.steward);
     expect(wakes.length).toBeGreaterThan(before);
     expect(wakes.at(-1)!.text).toMatch(/The project steward approved acme\/web#7/u);
-    expect(wakes.at(-1)!.text).toMatch(/build-tickets, The merge gate/u);
+    expect(wakes.at(-1)!.text).toMatch(/build-tickets merge gate/u);
   });
 
   it("posts a declined marker and tells the worker to treat it as a change request (BB-77)", async () => {

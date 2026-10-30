@@ -5,7 +5,7 @@ import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { ESCALATED_NEED_KINDS } from "./store.js";
-import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
+import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 import { STANDING_RULES, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
@@ -89,6 +89,12 @@ describe("a steward's wake", () => {
     const review = s.create({ projectId: "p1", source: "github", entityId: "acme/web#8", entityKey: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Review", kind: "review", playbook: "github-reviews", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
     const reviewPlaybook = playbook("github-reviews", GITHUB_REVIEWS);
     expect(formatWake(wakeInput({ binding: review, playbook: reviewPlaybook, gate: gateState(reviewPlaybook, review.ready, "") }))).not.toContain("follows the `build-tickets` skill");
+
+    // A deps-prs worker runs the review loop but never merges, so it must not
+    // be told to follow build-tickets (BB-134 review round 1).
+    const depsPrs = s.create({ projectId: "p1", source: "github", entityId: "acme/web#9", entityKey: "acme/web#9", url: "https://github.com/acme/web/pull/9", title: "Bump", kind: "pr", playbook: "deps-prs", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    const depsPrsPlaybook = playbook("deps-prs", DEPS_PRS);
+    expect(formatWake(wakeInput({ binding: depsPrs, playbook: depsPrsPlaybook, gate: gateState(depsPrsPlaybook, depsPrs.ready, "") }))).not.toContain("follows the `build-tickets` skill");
   });
 
   // BB-55: the Todo wake must say that an unjudged substantiality is settled

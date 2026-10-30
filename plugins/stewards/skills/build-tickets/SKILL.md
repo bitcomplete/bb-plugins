@@ -258,8 +258,8 @@ again.
 
 ## Merge and end
 
-You merge; no person does (the `stewards` skill and the project's
-guidance, "Who merges"). An empty or `REVIEW_REQUIRED` `reviewDecision` is
+You merge; no person does (the project's guidance, "Who merges", and the
+`stewards` skill). An empty or `REVIEW_REQUIRED` `reviewDecision` is
 normal on every agent PR and is not part of the gate; the base branch is
 not protected and the `gh` login is an admin, so there is no merge
 permission to wait for. Run:

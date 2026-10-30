@@ -4840,7 +4840,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return "worker";
         }
       }
-      store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning} Start a worker at build-tickets, The merge gate, ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
+      store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning} Start a worker at the build-tickets merge gate ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
       scheduleReconcile(b.id);
       return "steward";
     }
