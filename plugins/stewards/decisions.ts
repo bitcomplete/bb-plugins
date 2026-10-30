@@ -102,20 +102,105 @@ export function decideForPull(files: readonly string[] | null | undefined, decis
 }
 
 /**
+ * The one-line rule every listing states, so the wake, the page, the refusal
+ * and `bb stewards gate` all read the same (BB-135).
+ */
+export const DECISION_RULE = "a `user` entry wins; self-widening is always the user's; no match is the user's";
+
+/** One decide-list entry a change matched, and the changed files that matched it. */
+export type DecisionMatch = { text: string; decide: DecideMark; files: string[] };
+
+/**
+ * What the decide list did with a change: every entry its paths matched, the
+ * entry that decides it, the final mark, and the rule (BB-135). Entry-
+ * independent, so the wake, the gate and the approval refusal cannot disagree
+ * about which entries matched; the named-entry question is `decideFor`'s.
+ */
+export type DecisionExplanation = {
+  /** Every entry whose paths at least one changed file matched, in decide-list order. */
+  matched: DecisionMatch[];
+  /** The entry that decides the change, or null when none matched (the user's) or the change is self-widening. */
+  winner: DecisionMatch | null;
+  /** The final mark. */
+  mark: DecideMark;
+  /** True when the change touches the decide list or the code that enforces it. */
+  selfWidening: boolean;
+  /** True when the changed files could not be read (a missing or empty list). */
+  unreadable: boolean;
+  /** The one-line rule. */
+  rule: string;
+  /** One line saying why the mark came out as it did. */
+  reason: string;
+};
+
+/**
+ * Explain how the decide list places a change: every entry the changed files
+ * matched (text, mark, matching files), the entry that wins by the rule, the
+ * final mark, and why. `files` null or empty is a failed read and can only be
+ * the user's, as everywhere else (fail closed, BB-51/BB-135).
+ */
+export function explainDecision(files: readonly string[] | null | undefined, decisions: readonly BigDecision[]): DecisionExplanation {
+  const rule = DECISION_RULE;
+  if (files === null || files === undefined) {
+    return { matched: [], winner: null, mark: "user", selfWidening: false, unreadable: true, rule, reason: "the changed files could not be read" };
+  }
+  if (files.length === 0) {
+    return { matched: [], winner: null, mark: "user", selfWidening: false, unreadable: true, rule, reason: "the pull request changes no files" };
+  }
+  const matched: DecisionMatch[] = decisions
+    .filter((d) => d.paths.length > 0 && touchesAny(files, d.paths))
+    .map((d) => ({ text: d.text, decide: d.decide === "project" ? "project" : "user", files: files.filter((f) => touchesAny([f], d.paths)) }));
+  if (isSelfWidening(files)) {
+    return { matched, winner: null, mark: "user", selfWidening: true, unreadable: false, rule, reason: "the change touches the decide list or the code that enforces it" };
+  }
+  const user = matched.find((m) => m.decide === "user");
+  if (user !== undefined) return { matched, winner: user, mark: "user", selfWidening: false, unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(user.text)}, which is the user's decision` };
+  const project = matched.find((m) => m.decide === "project");
+  if (project !== undefined) return { matched, winner: project, mark: "project", selfWidening: false, unreadable: false, rule, reason: `the changed files touch ${JSON.stringify(project.text)}, which is the project steward's decision` };
+  return { matched, winner: null, mark: "user", selfWidening: false, unreadable: false, rule, reason: "no decide-list entry's paths matched" };
+}
+
+/**
+ * The listing a wake, the page and `bb stewards gate` print: every entry the
+ * changed files matched with the files that matched it, the deciding entry,
+ * and the rule in one line (BB-135).
+ */
+export function formatDecisionListing(explanation: DecisionExplanation): string {
+  const entries = explanation.unreadable
+    ? "Decide list: the changed files were not read, so no entry was matched."
+    : explanation.matched.length === 0
+      ? "Decide list: no entry's paths matched the changed files."
+      : [
+          `Decide list: ${explanation.matched.length} entr${explanation.matched.length === 1 ? "y" : "ies"} matched:`,
+          ...explanation.matched.map((m) => `- ${JSON.stringify(m.text)} [${m.decide}] — ${m.files.join(", ") || "(no file listed)"}`),
+        ].join("\n");
+  const winner = explanation.selfWidening
+    ? "Deciding entry: none — self-widening is always the user's."
+    : explanation.winner === null
+      ? "Deciding entry: none (the user's)."
+      : `Deciding entry: ${JSON.stringify(explanation.winner.text)} [${explanation.winner.decide}].`;
+  return `${entries}\n${winner}\nRule: ${explanation.rule}`;
+}
+
+/**
  * Why a pull request is the user's to approve, in words, or null when a
  * project-steward approval may be recorded. The null/empty file list gets its
  * own text: it is not the self-widening refusal, it is a failed read (BB-51).
+ * Every refusal carries the decide-list listing, so the approval route names
+ * the entries that matched and the one that decides (BB-135).
  */
 export function decideForRefusal(files: readonly string[] | null | undefined, entry: string | null | undefined, decisions: readonly BigDecision[]): string | null {
-  if (files === null || files === undefined) return "the changed files could not be read";
-  if (files.length === 0) return "the pull request changes no files";
-  if (isSelfWidening(files)) return "the change touches the decide list or the code that enforces it";
+  const listing = formatDecisionListing(explainDecision(files, decisions));
+  const refused = (reason: string): string => `${reason}\n${listing}`;
+  if (files === null || files === undefined) return refused("the changed files could not be read");
+  if (files.length === 0) return refused("the pull request changes no files");
+  if (isSelfWidening(files)) return refused("the change touches the decide list or the code that enforces it");
   const userEntry = matchingUserEntry(files, decisions);
-  if (userEntry !== undefined) return `the changed files touch ${JSON.stringify(userEntry.text)}, which is the user's decision`;
+  if (userEntry !== undefined) return refused(`the changed files touch ${JSON.stringify(userEntry.text)}, which is the user's decision`);
   const wanted = (entry ?? "").trim();
-  if (wanted === "") return "no decide-list entry was given";
+  if (wanted === "") return refused("no decide-list entry was given");
   const found = decisions.find((d) => d.text === wanted || d.text.toLowerCase() === wanted.toLowerCase());
-  if (found === undefined) return `the entry ${JSON.stringify(entry)} is not in the decide list`;
-  if (found.paths.length > 0 && !touchesAny(files, found.paths)) return `the changed files do not touch ${JSON.stringify(found.text)}'s paths`;
-  return found.decide === "project" ? null : `the entry ${JSON.stringify(found.text)} is not marked project`;
+  if (found === undefined) return refused(`the entry ${JSON.stringify(entry)} is not in the decide list`);
+  if (found.paths.length > 0 && !touchesAny(files, found.paths)) return refused(`the changed files do not touch ${JSON.stringify(found.text)}'s paths`);
+  return found.decide === "project" ? null : refused(`the entry ${JSON.stringify(found.text)} is not marked project`);
 }

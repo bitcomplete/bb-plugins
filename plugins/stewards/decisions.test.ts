@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultDecideList, parseProjectFile, type BigDecision } from "./config.js";
-import { decideFor, decideForEntry, decideForPull, decideForRefusal, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
+import { decideFor, decideForEntry, decideForPull, decideForRefusal, explainDecision, formatDecisionListing, isSelfWidening, SELF_WIDENING_PATHS, touchesAny } from "./decisions.js";
 
 const decisions: BigDecision[] = [
   { text: "Changing what a ticket's requester asked for", decide: "user", paths: [] },
@@ -71,16 +71,119 @@ describe("the decide list fails closed", () => {
   });
 
   it("gives the failed files fetch its own refusal text, not the self-widening one (BB-51)", () => {
-    expect(decideForRefusal(null, "A store migration", decisions)).toBe("the changed files could not be read");
-    expect(decideForRefusal([], "A store migration", decisions)).toBe("the pull request changes no files");
-    expect(decideForRefusal(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("the change touches the decide list or the code that enforces it");
+    expect(decideForRefusal(null, "A store migration", decisions)).toMatch(/^the changed files could not be read/u);
+    expect(decideForRefusal([], "A store migration", decisions)).toMatch(/^the pull request changes no files/u);
+    expect(decideForRefusal(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toMatch(/^the change touches the decide list or the code that enforces it/u);
     expect(decideForRefusal(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBeNull();
     expect(decideForRefusal(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toMatch(/do not touch/u);
+    // Every refusal carries the decide-list listing (BB-135).
+    expect(decideForRefusal(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toContain("Rule: a `user` entry wins");
     // A file that touches no entry still gets the no-entry text; a file that
     // touches a user entry gets the user-entry text even with no entry named
     // (BB-125, the user entry is checked before the entry-named checks).
-    expect(decideForRefusal(["bb-plugins/plugins/linear/foo.ts"], null, decisions)).toBe("no decide-list entry was given");
+    expect(decideForRefusal(["bb-plugins/plugins/linear/foo.ts"], null, decisions)).toMatch(/^no decide-list entry was given/u);
     expect(decideForRefusal(["bb-plugins/plugins/linear/source-contract.ts"], null, decisions)).toContain("A public API change other teams depend on");
+  });
+});
+
+describe("explainDecision names the entries that matched and the one that decides (BB-135)", () => {
+  const overlap: BigDecision[] = [
+    { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+    { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+  ];
+
+  it("lists every matched entry with its mark and files, and the deciding entry", () => {
+    const files = ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"];
+    const e = explainDecision(files, overlap);
+    expect(e.matched).toEqual([
+      { text: "Identity and access", decide: "user", files: ["bb-gate/hooks/slack.go"] },
+      { text: "A cross-repo contract", decide: "project", files: ["bb-gate/docs/hooks.md"] },
+    ]);
+    expect(e.winner).toEqual({ text: "Identity and access", decide: "user", files: ["bb-gate/hooks/slack.go"] });
+    expect(e.mark).toBe("user");
+    expect(e.selfWidening).toBe(false);
+    expect(e.unreadable).toBe(false);
+    expect(e.rule).toBe("a `user` entry wins; self-widening is always the user's; no match is the user's");
+    const listing = formatDecisionListing(e);
+    expect(listing).toContain('"Identity and access" [user] — bb-gate/hooks/slack.go');
+    expect(listing).toContain('"A cross-repo contract" [project] — bb-gate/docs/hooks.md');
+    expect(listing).toContain('Deciding entry: "Identity and access" [user].');
+    expect(listing).toContain("Rule: a `user` entry wins; self-widening is always the user's; no match is the user's");
+  });
+
+  it("names the project entry when only it matched", () => {
+    const e = explainDecision(["bb-gate/docs/hooks.md"], overlap);
+    expect(e.matched.map((m) => m.text)).toEqual(["A cross-repo contract"]);
+    expect(e.winner?.text).toBe("A cross-repo contract");
+    expect(e.mark).toBe("project");
+    expect(formatDecisionListing(e)).toContain('Deciding entry: "A cross-repo contract" [project].');
+  });
+
+  it("reports no match as the user's", () => {
+    const e = explainDecision(["bb-gate/README.md"], overlap);
+    expect(e.matched).toEqual([]);
+    expect(e.winner).toBeNull();
+    expect(e.mark).toBe("user");
+    const listing = formatDecisionListing(e);
+    expect(listing).toContain("Decide list: no entry's paths matched the changed files.");
+    expect(listing).toContain("Deciding entry: none (the user's).");
+  });
+
+  it("reports self-widening as the user's, with no deciding entry", () => {
+    const e = explainDecision(["bb-plugins/plugins/stewards/decisions.ts", "bb-gate/docs/hooks.md"], overlap);
+    expect(e.selfWidening).toBe(true);
+    expect(e.winner).toBeNull();
+    expect(e.mark).toBe("user");
+    const listing = formatDecisionListing(e);
+    expect(listing).toContain("Deciding entry: none — self-widening is always the user's.");
+    expect(listing).toContain('"A cross-repo contract" [project]');
+  });
+
+  it("reports an unreadable or empty file list as the user's, and matches nothing", () => {
+    for (const files of [null, undefined, [] as string[]]) {
+      const e = explainDecision(files, overlap);
+      expect(e.unreadable).toBe(true);
+      expect(e.matched).toEqual([]);
+      expect(e.mark).toBe("user");
+      expect(e.reason).toMatch(/could not be read|changes no files/u);
+      expect(formatDecisionListing(e)).toContain("the changed files were not read");
+    }
+  });
+});
+
+describe("nothing the old decide-list code left to the user moves to the project steward (BB-135)", () => {
+  // The pre-BB-125 code, kept here as the frozen behaviour the listing must not
+  // regress: a matching `project` entry won outright, with no user-entry check.
+  const oldDecideForPull = (files: readonly string[] | null | undefined, list: readonly BigDecision[]): "user" | "project" => {
+    if (files === null || files === undefined || files.length === 0) return "user";
+    if (isSelfWidening(files)) return "user";
+    const match = list.find((d) => d.decide === "project" && d.paths.length > 0 && touchesAny(files, d.paths));
+    return match === undefined ? "user" : "project";
+  };
+  const oldDecideFor = (files: readonly string[] | null | undefined, entry: string | null, list: readonly BigDecision[]): "user" | "project" => {
+    if (files === null || files === undefined || files.length === 0) return "user";
+    if (isSelfWidening(files)) return "user";
+    const wanted = (entry ?? "").trim();
+    const found = list.find((d) => d.text.toLowerCase() === wanted.toLowerCase());
+    if (found === undefined) return "user";
+    if (found.paths.length > 0 && !touchesAny(files, found.paths)) return "user";
+    return found.decide === "project" ? "project" : "user";
+  };
+
+  const cases: Array<{ name: string; files: string[] | null; entry: string | null }> = [
+    { name: "the changed files could not be read", files: null, entry: "A store migration" },
+    { name: "the pull request changes no files", files: [], entry: "A store migration" },
+    { name: "the change is self-widening", files: ["bb-plugins/plugins/stewards/store.ts"], entry: "A cross-repo contract other repos implement" },
+    { name: "only a user entry's paths matched", files: ["bb-plugins/plugins/linear/source-contract.ts"], entry: "A store migration" },
+    { name: "no entry's paths matched", files: ["bb-plugins/plugins/linear/wake.ts"], entry: "A store migration" },
+    { name: "the named entry is not marked project", files: ["bb-plugins/plugins/linear/wake.ts"], entry: "An unmarked entry" },
+  ];
+
+  it.each(cases)("$name stays the user's", ({ files, entry }) => {
+    expect(oldDecideForPull(files, decisions)).toBe("user");
+    expect(decideForPull(files, decisions)).toBe("user");
+    expect(oldDecideFor(files, entry, decisions)).toBe("user");
+    expect(decideFor(files, entry, decisions)).toBe("user");
   });
 });
 

@@ -60,7 +60,7 @@ import {
   type Role as StewardRole,
   type RolesFile,
 } from "./config.js";
-import { decideFor, decideForPull, decideForRefusal, matchingUserEntry, touchesAny } from "./decisions.js";
+import { decideFor, decideForPull, decideForRefusal, explainDecision, formatDecisionListing } from "./decisions.js";
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -3994,7 +3994,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       // lists it as still open rather than new. The text is built before the
       // mark, so a throw while building it leaves nothing marked.
       const open = store.open(projectId);
-      const routed = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
+      // An approval escalation to the project steward carries the decide-list
+      // listing, fetched once here from the pull request's changed files, so
+      // the wake names every entry that matched and the one that decides
+      // (BB-135).
+      const routedRaw = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "project").map((escalation) => ({ escalation, from: b })));
+      const routed = await Promise.all(
+        routedRaw.map(async (r) => {
+          if (r.escalation.kind !== "approval") return r;
+          const pull = r.from.lastSnapshot === null ? undefined : observedPulls(r.from, r.from.lastSnapshot).find((p) => (p.url ?? p.key) === r.escalation.url);
+          if (pull === undefined) return r;
+          return { ...r, listing: formatDecisionListing(explainDecision(await pullChangedFiles(pull), config.file.bigDecisions)) };
+        }),
+      );
       const coveredWithUser = new Set(store.openQuestionEscalationIds(projectId));
       const withUser = open.flatMap((b) => store.openEscalations(b.id).filter((x) => x.route === "me" && !x.isQuestion && x.kind !== "approval" && x.resolutionKind === null && !coveredWithUser.has(x.id)).map((escalation) => ({ escalation, from: b })));
       const bindings = open.map((binding) => ({ binding, openEscalations: store.openEscalations(binding.id) }));
@@ -4923,17 +4935,23 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * review, so the item says that rather than the agent-PR comment
      * convention (BB-118).
      */
-    function fileApprovePrNeed(b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null): void {
+    function fileApprovePrNeed(b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null, listing: string | null = null): void {
       const foreign = isForeignPull(pull);
+      const how = foreign
+        ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
+        : `Post the unsigned comment "Approved ${shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`;
+      // A later refresh (checks went red) may not have the files at hand; keep
+      // the listing an earlier wake stored rather than dropping it (BB-135).
+      const url = pull.url ?? pull.key;
+      const existing = store.openNeeds(b.id).find((n) => n.kind === "approve-pr" && n.url === url);
+      const carried = listing ?? (typeof existing?.data.decideListing === "string" ? existing.data.decideListing : null);
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-pr",
-        url: pull.url ?? pull.key,
+        url,
         what: `Approve ${pull.key} on GitHub`,
-        how: foreign
-          ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
-          : `Post the unsigned comment "Approved ${shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`,
-        data: { sha: headSha, escalationId, foreign },
+        how: carried === null ? how : `${how}\n\n${carried}`,
+        data: { sha: headSha, escalationId, foreign, ...(carried === null ? {} : { decideListing: carried }) },
         filedBy: "plugin",
       });
     }
@@ -5025,9 +5043,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // when the lane actually waits on an approval.
         const preliminary = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
         let g = preliminary;
+        // The decide-list listing is fetched once, with the changed files, and
+        // passed to whichever surface asks for the approval (BB-135).
+        let listing: string | null = null;
         if (preliminary.lane !== "no-review" && preliminary.marker?.verdict === "approved" && preliminary.checksGreen && !preliminary.ownerApproved && !preliminary.projectApproved) {
           const files = await pullChangedFiles(pull);
-          g = prGate(pull, { decision: decideForPull(files, decisions), projectApprovals: projectApprovalsFor(b) });
+          const explanation = explainDecision(files, decisions);
+          listing = formatDecisionListing(explanation);
+          g = prGate(pull, { decision: explanation.mark, projectApprovals: projectApprovalsFor(b) });
         }
         const closed = pull.pull?.merged === true || pull.state === "merged" || pull.state === "closed";
         const approvalEsc = store.openEscalations(b.id).find((x) => x.kind === "approval" && x.url === url && x.resolutionKind === "approve-decline") ?? null;
@@ -5050,11 +5073,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (approvalEsc !== null) store.resolve(approvalEsc.id, "Declined on the Stewards page.");
           } else if (approvalEsc === null) {
             const x = store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "me", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
-            fileApprovePrNeed(b, pull, x.id, g.headSha);
+            fileApprovePrNeed(b, pull, x.id, g.headSha, listing);
           } else {
             if (approvalEsc.headSha !== g.headSha) store.setEscalationHead(approvalEsc.id, g.headSha);
             if (approvalEsc.route !== "me") store.reroute(approvalEsc.id, "me", approvalEsc.recommendation);
-            fileApprovePrNeed(b, pull, approvalEsc.id, g.headSha);
+            fileApprovePrNeed(b, pull, approvalEsc.id, g.headSha, listing);
           }
         } else if (g.needsProjectApproval) {
           // The project steward's lane: one escalation, no page item.
@@ -5080,7 +5103,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             // Checks went pending or failing: never resolve the request as
             // approved. Keep it and the page item open, re-pointed at the head.
             if (approvalEsc.headSha !== g.headSha) store.setEscalationHead(approvalEsc.id, g.headSha);
-            if (approvalEsc.route === "me") fileApprovePrNeed(b, pull, approvalEsc.id, g.headSha);
+            if (approvalEsc.route === "me") fileApprovePrNeed(b, pull, approvalEsc.id, g.headSha, listing);
             store.note(b.id, `${pull.key}'s checks are ${g.checksState ?? "not run"}; its approval request stays open.`, true);
           } else if (g.ownerApproved || g.projectApproved) {
             store.closeNeedByKey(b.id, "approve-pr", url, "Approval is present.");
@@ -5682,7 +5705,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       headSha: string | null;
       lane: string | null;
       marker: { round: number; sha: string; verdict: string } | null;
-      decision: { entry: string | null; decide: "project" | "user"; why: string | null };
+      decision: { entry: string | null; decide: "project" | "user"; why: string | null; listing: string };
       approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
       checks: { state: string | null; green: boolean };
       openItems: string[];
@@ -5690,12 +5713,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       gateMet: boolean;
     };
 
-    /** The decide-list entry a pull request's changed files match, and who decides (fail closed to the user). */
+    /** The decide-list entry a pull request's changed files match, who decides, and the full listing (BB-133, BB-135). */
     function matchedDecision(files: readonly string[] | null, decisions: readonly BigDecision[]): GateReport["decision"] {
-      const decide = decideForPull(files, decisions);
-      const entry = files === null || files.length === 0 ? undefined : matchingUserEntry(files, decisions) ?? decisions.find((d) => d.decide === "project" && d.paths.length > 0 && touchesAny(files, d.paths));
-      const text = entry?.text ?? null;
-      return { entry: text, decide, why: decideForRefusal(files, text, decisions) };
+      const explanation = explainDecision(files, decisions);
+      return { entry: explanation.winner?.text ?? null, decide: explanation.mark, why: explanation.reason, listing: formatDecisionListing(explanation) };
     }
 
     /**
@@ -5763,12 +5784,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     function formatGateReport(r: GateReport): string {
       const marker = r.marker === null ? "none" : `round ${r.marker.round} at ${shortSha(r.marker.sha)} (${r.marker.verdict})`;
       const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}${r.decision.why === null ? "" : `: ${r.decision.why}`})` : `"${r.decision.entry}" (${r.decision.decide})`;
+      const listing = r.decision.listing.split("\n").map((l) => `  ${l}`).join("\n");
       const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
       return [
         `${r.ref}${r.binding === "" ? "" : ` — ${r.binding}`}`,
         `head ${shortSha(r.headSha)}; lane ${r.lane ?? "(none)"}`,
         `reviewer: ${marker}`,
         `decide list: ${decision}`,
+        listing,
         `approval: ${approval}`,
         `checks: ${r.checks.state ?? "none"}${r.checks.green ? " (green)" : ""}`,
         `open items: ${r.openItems.length === 0 ? "none" : r.openItems.join("; ")}`,
@@ -7505,13 +7528,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             if (approvalToUser && target.lastSnapshot !== null) fileApproveSpecNeed(target, target.lastSnapshot.entity, forwarding.id);
             if (prToUser) {
               const key = forwarding.question.replace(/^Approve\s+/u, "");
+              // The user's page item carries the same decide-list listing the
+              // project steward was shown, so the approval route is legible
+              // (BB-135).
+              const pull = target.lastSnapshot === null ? undefined : observedPulls(target, target.lastSnapshot).find((p) => (p.url ?? p.key) === forwarding.url);
+              const listing = pull === undefined ? null : formatDecisionListing(explainDecision(await pullChangedFiles(pull), (await loadConfig(target.projectId))?.file.bigDecisions ?? []));
+              const how = `Post the unsigned comment "Approved ${shortSha(forwarding.headSha)} from the Stewards page" as you; that is what counts as your approval.`;
               store.fileNeed({
                 bindingId: target.id,
                 kind: "approve-pr",
                 url: forwarding.url ?? target.url ?? "",
                 what: `Approve ${key} on GitHub`,
-                how: `Post the unsigned comment "Approved ${shortSha(forwarding.headSha)} from the Stewards page" as you; that is what counts as your approval.`,
-                data: { sha: forwarding.headSha, escalationId: forwarding.id },
+                how: listing === null ? how : `${how}\n\n${listing}`,
+                data: { sha: forwarding.headSha, escalationId: forwarding.id, ...(listing === null ? {} : { decideListing: listing }) },
                 filedBy: "plugin",
               });
             }
