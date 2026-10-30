@@ -910,6 +910,62 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("acknowledges a wake without posting a reply, and refuses a later reply", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const ack = await s.tool("slack_ack", {}, { threadId: "thr-1" });
+    expect(s.text(ack)).toContain("Acknowledged");
+    expect(s.hooks.messages).toEqual([]);
+    const reply = await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    expect(s.text(reply)).toContain("already has its reply");
+    expect(s.hooks.messages).toEqual([]);
+    await s.stop();
+  });
+
+  it("takes an explicit session for an ack, and refuses one with no session", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const ack = await s.tool("slack_ack", { session: "D0123:1712345678.901234" }, { threadId: "thr-other" });
+    expect(s.text(ack)).toContain("Acknowledged");
+    expect(s.hooks.messages).toEqual([]);
+    const noSession = await s.tool("slack_ack", {}, { threadId: "thr-other" });
+    expect(s.text(noSession)).toContain("not answering a Slack conversation");
+    await s.stop();
+  });
+
+  it("clears the thinking status on an ack", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_ack", {}, { threadId: "thr-1" });
+    expect(s.hooks.statuses.at(-1)).toMatchObject({ session: "D0123:1712345678.901234", body: { connection: "c_1", status: "" } });
+    await s.stop();
+  });
+
+  it("posts no backstop after an ack", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_ack", {}, { threadId: "thr-1" });
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toEqual([]);
+    await s.stop();
+  });
+
+  it("refuses an ack after a reply", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_reply", { text: "On it." }, { threadId: "thr-1" });
+    const ack = await s.tool("slack_ack", {}, { threadId: "thr-1" });
+    expect(s.text(ack)).toContain("already has its reply");
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
   it("converts Markdown in a slack_reply to Slack mrkdwn before posting", async () => {
     const s = await live();
     s.hooks.last().send(s.hooks.session());

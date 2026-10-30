@@ -1211,7 +1211,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       description:
         "Reply in Slack on the conversation that woke this thread. Markdown is fine; it is converted to Slack mrkdwn before posting. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
       instructions:
-        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Markdown or Slack's mrkdwn — Markdown is fine; it is converted — and say in one line who did it. Do not paste secrets or tokens.",
+        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Markdown or Slack's mrkdwn — Markdown is fine; it is converted — and say in one line who did it. A message that needs no answer (a thanks, or something bb should not act on) is acknowledged with slack_ack instead, which posts nothing; never use slack_ack to skip work that was asked for. Do not paste secrets or tokens.",
       presentation: { label: { pending: "Replying in Slack", completed: "Replied in Slack" } },
       parameters: z.object({
         text: z.string().trim().min(1).max(30_000).describe("The reply, in Markdown or Slack's mrkdwn; Markdown is converted."),
@@ -1235,6 +1235,27 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         } catch (error) {
           return toolError(error);
         }
+      },
+    });
+
+    bb.agents.registerTool({
+      name: "slack_ack",
+      description:
+        "Acknowledge the Slack message that woke this thread without posting anything to Slack. Use it for a message that needs no answer (a thanks, a note) or one bb should not act on, so the turn can end quietly with no error reply. It is not a way to skip work that was asked for: answer a request with slack_reply. The session id is in the message that woke the thread.",
+      instructions:
+        "A Slack message that needs no answer (a thanks, or something bb should not act on) is acknowledged with slack_ack, which counts the wake as answered and posts nothing to Slack. Never use slack_ack to skip work that was asked for; answer a request with slack_reply. The session id is in the message that woke the thread; leave it out to use this thread's Slack conversation.",
+      presentation: { label: { pending: "Acknowledging in Slack", completed: "Acknowledged in Slack" } },
+      parameters: z.object({
+        session: z.string().trim().min(1).max(200).optional().describe("The Slack session id from the wake. Leave it out: this thread's Slack conversation is used."),
+      }),
+      async execute({ session }, { threadId }) {
+        const id = session ?? sessionForThread(threadId);
+        const r = id === null ? undefined : sessions.get(id);
+        if (id === null || r === undefined) return toolError(new Error("This thread is not answering a Slack conversation, so there is nothing to acknowledge."));
+        if (answered(r)) return toolError(new Error("Every message in this Slack conversation already has its reply; each gets exactly one. Send a new Slack message to continue."));
+        markAnswered(id);
+        void hooks.status(id, "", checkSignal()).catch(() => undefined);
+        return `Acknowledged the Slack message (session ${id}) without replying.`;
       },
     });
 

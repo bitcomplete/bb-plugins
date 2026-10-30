@@ -87,6 +87,8 @@ describe("wakeText", () => {
     expect(text).toContain("session D0123:1712345678.901234");
     expect(text).toContain("build this");
     expect(text).toContain("slack_reply");
+    expect(text).toContain("slack_ack");
+    expect(text).toContain("never for skipping work");
     expect(text).not.toContain("untrusted");
   });
 
