@@ -1,0 +1,38 @@
+{
+  "name": "bb-plugin-voice-transcription",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Voice input through any OpenAI-compatible speech-to-text endpoint, run in the server process",
+  "engines": {
+    "bb": ">=0.46",
+    "bbPluginSdk": ">=0.6.37"
+  },
+  "bb": {
+    "name": "Voice transcription",
+    "description": "Adds a voice-input service that transcribes through any OpenAI-compatible /audio/transcriptions endpoint: OpenAI, Groq, Mistral, or a self-hosted Whisper server. No primary machine and no bb account.",
+    "branding": {
+      "icon": "Mic"
+    },
+    "server": "./server.ts"
+  },
+  "keywords": [
+    "bb-plugin"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "bb plugin build"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.6.5",
+    "better-sqlite3": "^13.0.3",
+    "cron-parser": "^5.10.2",
+    "hono": "^4.13.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  },
+  "license": "MIT"
+}
