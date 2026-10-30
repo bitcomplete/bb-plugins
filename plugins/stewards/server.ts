@@ -4708,18 +4708,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     }
 
     /**
+     * Whether a pull request's author is someone other than the server's gh
+     * login: a teammate's, where the owner can give a real GitHub review
+     * rather than the self-approval comment an agent PR needs (BB-118).
+     */
+    function isForeignPull(pull: EntitySnapshot): boolean {
+      return pull.author !== null && pull.viewer !== null && pull.author.toLowerCase() !== pull.viewer.toLowerCase();
+    }
+
+    /**
      * File or refresh the user's `approve-pr` item: the owner approves on
      * GitHub from the Stewards page. Deduped by (binding, kind, url), so a push
      * updates the same item's sha rather than closing and refiling it (BB-51).
+     * On a teammate's pull request the owner can approve with a real GitHub
+     * review, so the item says that rather than the agent-PR comment
+     * convention (BB-118).
      */
     function fileApprovePrNeed(b: Binding, pull: EntitySnapshot, escalationId: string, headSha: string | null): void {
+      const foreign = isForeignPull(pull);
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-pr",
         url: pull.url ?? pull.key,
         what: `Approve ${pull.key} on GitHub`,
-        how: `Post the unsigned comment "Approved ${shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`,
-        data: { sha: headSha, escalationId },
+        how: foreign
+          ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
+          : `Post the unsigned comment "Approved ${shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`,
+        data: { sha: headSha, escalationId, foreign },
         filedBy: "plugin",
       });
     }
@@ -4828,8 +4843,13 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           // The user's lane: the page item is filed as soon as the reviewer's
           // marker is approved and checks are green, with no project-steward
           // turn (BB-51). Deduped by (binding, kind, url), so a push updates the
-          // same item rather than closing and refiling it.
-          if (approvalEsc === null) {
+          // same item rather than closing and refiling it. A head and marker
+          // the owner already declined from the page are not asked again; a
+          // new round or a new push files the item afresh (BB-118).
+          if (b.declinedPrHeadSha === g.headSha && b.declinedPrMarker === markerSha) {
+            store.closeNeedByKey(b.id, "approve-pr", url, "Declined on the Stewards page; waiting for a new review round.");
+            if (approvalEsc !== null) store.resolve(approvalEsc.id, "Declined on the Stewards page.");
+          } else if (approvalEsc === null) {
             const x = store.escalate({ bindingId: b.id, kind: "approval", question: `Approve ${pull.key}`, meanwhile: "Waiting: the owner approves on GitHub from the Stewards page.", route: "me", recommendation: null, resolutionKind: "approve-decline", url, headSha: g.headSha, projectId: b.projectId });
             fileApprovePrNeed(b, pull, x.id, g.headSha);
           } else {
@@ -5871,11 +5891,40 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         }
 
         if (need.kind === "approve-pr") {
+          if (action !== "approve" && action !== "decline") return { ok: false, message: "Approve or decline the pull request." };
           const ref = parsePullRef(need.url);
           if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
           const pull = await freshPull();
           const gate = pull === null ? null : prGate(pull);
           if (pull === null || gate === null || !gate.needsOwnerApproval) return { ok: false, message: `Not now: ${gate?.missing ?? "the pull request has not been observed yet"}.` };
+          // A teammate's pull request can carry a real review; the owner's own
+          // (an agent PR) cannot, so it keeps today's comment convention
+          // (BB-118).
+          const foreign = isForeignPull(pull);
+          if (action === "decline") {
+            try {
+              if (foreign) await github.review(ref.repo, ref.number, text === null ? "COMMENT" : "REQUEST_CHANGES", `Declined ${shortSha(gate.headSha)} from the Stewards page${text === null ? "" : `: ${text}`}`);
+              else await github.comment(ref.repo, ref.number, `Declined ${shortSha(gate.headSha)} from the Stewards page${text === null ? "" : `: ${text}`}`);
+            } catch (error) {
+              return { ok: false, message: `GitHub refused the ${foreign ? "review" : "comment"}: ${errorMessage(error)}` };
+            }
+            // The same head and reviewer marker are not asked again until a
+            // new round or a new push (BB-118).
+            store.patch(b.id, { declinedPrHeadSha: gate.headSha, declinedPrMarker: markerKey(gate.marker) });
+            store.closeNeedByKey(b.id, "approve-pr", need.url, "Declined on the Stewards page.");
+            after(`The user declined ${pull.key} from the Stewards page${text === null ? "" : `: "${text}"`}.`);
+            return { ok: true, message: `Declined; ${b.entityKey}'s steward has been told.` };
+          }
+          if (foreign) {
+            try {
+              await github.review(ref.repo, ref.number, "APPROVE", "");
+            } catch (error) {
+              return { ok: false, message: `GitHub refused the review: ${errorMessage(error)}` };
+            }
+            store.closeNeedByKey(b.id, "approve-pr", need.url, "Approved on the Stewards page.");
+            after(`The user approved ${pull.key} from the Stewards page.`);
+            return { ok: true, message: `Approved; ${b.entityKey}'s steward has been told.` };
+          }
           const body = `Approved ${gate.headSha ?? "?"} from the Stewards page`;
           try {
             await github.comment(ref.repo, ref.number, body);

@@ -53,6 +53,12 @@ export interface GithubWriter {
    * hand-typed lookalike never satisfies the lane gate.
    */
   comment(repo: string, number: number, body: string): Promise<string>;
+  /**
+   * Submit a pull request review as the connected user (BB-118). The body is
+   * unsigned: a teammate's pull request can carry a real APPROVED or
+   * changes-requested review, where the owner's own pull request cannot.
+   */
+  review(repo: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string): Promise<void>;
   /** Squash-merge the pull request, with the given commit title and message; returns the merge commit sha when GitHub reports one. */
   squashMerge(repo: string, number: number, title: string, body: string): Promise<{ sha: string | null }>;
   /**
@@ -110,6 +116,9 @@ export function createGhWriter(token: TokenReader = createGhTokenReader(), doFet
       const nodeId = created?.node_id ?? created?.id;
       if (nodeId === undefined || nodeId === null || String(nodeId) === "") throw new GithubApiError("GitHub created the comment but returned no id, so the approval marker cannot be recorded.");
       return String(nodeId);
+    },
+    async review(repo, number, event, body) {
+      await request("POST", `/repos/${repo}/pulls/${number}/reviews`, { event, body });
     },
     async squashMerge(repo, number, title, body) {
       const response = await request("PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: "squash", commit_title: title, commit_message: body });

@@ -1189,7 +1189,7 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
   };
   const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
-  const takesNote = n.kind === "approve-spec" || n.kind === "configure" || n.kind === "decide";
+  const takesNote = n.kind === "approve-spec" || n.kind === "approve-pr" || n.kind === "configure" || n.kind === "decide";
   const choices = n.kind === "decide" ? n.choices : [];
   // A lesson's Merge/Drop are its only choices: no free-text "Other…".
   const lesson = n.lessonId !== null;
@@ -1204,7 +1204,7 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
           value={note}
           onChange={(e) => setNote(e.target.value)}
           rows={1}
-          placeholder={n.kind === "approve-spec" ? "Note (optional)" : freeText ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "approve-pr" ? "Note (optional; used when you decline)" : freeText ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
           aria-label={`Note for: ${n.what}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
@@ -1220,9 +1220,14 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
             </button>
           </>
         ) : n.kind === "approve-pr" ? (
-          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
-            Approve
-          </button>
+          <>
+            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
+              Approve
+            </button>
+            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => act("decline")}>
+              Decline
+            </button>
+          </>
         ) : n.kind === "merge" ? (
           <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("merge")}>
             Merge
@@ -1620,6 +1625,7 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
   const answer = (choice: string) => run(rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice }));
   const choose = (choice: string) => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice }));
   const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
+  const decline = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "decline", note: null, choice: null }));
   const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
   // BB-102: hand the URL to the detail page, which is inside a pane and can
   // open it in bb's in-app browser, then go there as the row does. If nothing
@@ -1657,6 +1663,11 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
             <button type="button" disabled={state === "running"} className={button} onClick={isApprovePr ? approve : merge}>
               {isApprovePr ? "Approve" : "Merge"}
             </button>
+            {isApprovePr ? (
+              <button type="button" disabled={state === "running"} className={button} onClick={decline}>
+                Decline
+              </button>
+            ) : null}
           </>
         ) : null}
         {typeof state === "object" ? <span className="text-[11px] text-destructive">{state.error}</span> : null}

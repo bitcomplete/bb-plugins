@@ -418,7 +418,27 @@ export function isMarkerComment(body: string): boolean {
  * unsigned comment that carries a `bb-review` or `bb-approval` marker: the
  * reviewer posts as the connected user, and its marker is a thread's whatever
  * the signature line says (BB-110).
+ *
+ * A review steward posts a real, signed review as the connected user too, so
+ * an APPROVED review that a thread's review comment stands behind is that
+ * thread's, not the owner's (BB-118). The snapshot's `pull.reviews` carries no
+ * body, so the review is matched to its flattened comment by author and time.
  */
+const REVIEW_DIDS = new Set(["approved", "requested changes", "reviewed", "had a review dismissed"]);
+
+/** The (author, time) pairs of the reviews a thread posted, signed or marked. github-watcher builds a review's flattened comment and its `pull.reviews` entry from the same `submittedAt ?? createdAt`, so the pair identifies the review. */
+function threadReviewKeys(entity: EntitySnapshot): Set<string> {
+  const keys = new Set<string>();
+  for (const c of entity.comments) {
+    const marker = isMarkerComment(c.body);
+    const review = REVIEW_DIDS.has(c.did.toLowerCase());
+    if (!review && !marker) continue;
+    if (c.signedBy === null && !marker) continue;
+    keys.add(`${c.author.toLowerCase()}\u0000${c.createdAt}`);
+  }
+  return keys;
+}
+
 export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: string | null } {
   const viewer = entity.viewer === null ? null : entity.viewer.toLowerCase();
   if (viewer === null) return { approved: false, at: null };
@@ -429,9 +449,13 @@ export function ownerApproval(entity: EntitySnapshot): { approved: boolean; at: 
     if (classifyApproval(c.body) !== "approve") continue;
     if (at === null || c.createdAt > at) at = c.createdAt;
   }
+  const threads = threadReviewKeys(entity);
   for (const r of entity.pull?.reviews ?? []) {
     if (r.author.toLowerCase() !== viewer || r.state.toLowerCase() !== "approved") continue;
     const when = r.submittedAt ?? "";
+    // A review a thread posted as the connected user (a review steward's
+    // APPROVED review) is not the owner's approval (BB-118).
+    if (threads.has(`${r.author.toLowerCase()}\u0000${when}`)) continue;
     if (at === null || when > at) at = when;
   }
   return { approved: at !== null, at };

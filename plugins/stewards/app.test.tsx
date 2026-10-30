@@ -807,6 +807,20 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("offers Approve and Decline on an approve-pr item, and sends the decline note (BB-118)", async () => {
+    const slot = await renderBoardWith({
+      subPath: "p1/ENG-1",
+      stewards: [boardSteward({ key: "ENG-1", title: "Fix login", needsUser: true, summary: "Waiting on you" })],
+      needs: [need({ id: "need_pr", key: "ENG-1", kind: "approve-pr", what: "Approve acme/web#7 on GitHub", how: "Submit an APPROVED review" })],
+    });
+    await waitFor(() => expect(slot.getByText("Approve acme/web#7 on GitHub")).toBeTruthy());
+    const note = slot.getByLabelText("Note for: Approve acme/web#7 on GitHub") as HTMLTextAreaElement;
+    fireEvent.change(note, { target: { value: "Add a test first" } });
+    fireEvent.click(slot.getByRole("button", { name: "Decline" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_pr", action: "decline", note: "Add a test first" } }));
+    slot.lifecycle.unmount();
+  });
+
   it("shows the waiting, hold and stuck lines in the status", async () => {
     const slot = await renderBoardWith({
       subPath: "p1/ENG-1",

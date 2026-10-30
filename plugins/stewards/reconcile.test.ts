@@ -424,6 +424,9 @@ describe("the pull request gate (build-tickets)", () => {
   const marker = (sha: string, verdict: string, lane: string) =>
     comment({ id: `m-${sha}-${verdict}-${lane}`, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
   const owner = (body: string) => comment({ id: `oa-${body}`, author: "jane", body, signedBy: null, createdAt: "2026-10-14T17:00:00Z" });
+  /** A review steward's signed review: the marker on the first line, the thread's signature at the end (BB-118). */
+  const reviewWithMarker = (sha: string, verdict: string, lane: string, at: string) =>
+    comment({ id: `rev-${verdict}-${lane}`, author: "jane", did: "reviewed", body: `<!-- bb-review round=1 sha=${sha} verdict=${verdict} lane=${lane} -->\n\nFindings.\n\n_— from bb thread thr_review_`, signedBy: "thr_review", createdAt: at });
   const approval = (sha: string, entry: string | null, verdict: "approved" | "declined" = "approved", id = `ap-${sha}-${verdict}`, createdAt = "2026-10-14T16:10:00Z") =>
     comment({ id, author: "trotterdylan", body: approvalMarkerLine({ sha, entry, verdict }), signedBy: "thr_project", createdAt });
   const record = (commentId: string, verdict: "approved" | "declined" = "approved"): ProjectApprovalRecord => ({ commentId, verdict });
@@ -598,6 +601,66 @@ describe("the pull request gate (build-tickets)", () => {
     const recorded = pull({ comments: [marker(head, "approved", "owner-reviewed"), { ...ap, author: "jane", signedBy: null }] }, green);
     expect(ownerApproval(recorded).approved).toBe(false);
     expect(prGate(recorded, { decision: "project", projectApprovals: [record(ap.id)] })).toMatchObject({ projectApproved: true, gateMet: true });
+  });
+
+  // BB-118: a review steward posts a real, signed review as the connected
+  // user. Its marker is the reviewer's round, and its APPROVED review is the
+  // thread's, not the owner's approval.
+  it("reads a review steward's signed marker from its review and waits on the owner (BB-118)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const review = reviewWithMarker(head, "approved", "owner-reviewed", at);
+    const entity = pull({ comments: [review] }, { ...green, reviews: [{ author: "jane", state: "COMMENTED", submittedAt: at, commit: head }] });
+    expect(prGate(entity)).toMatchObject({ lane: "owner-reviewed", checksGreen: true, ownerApproved: false, needsOwnerApproval: true, missing: "owner approval needed" });
+  });
+
+  it("never reads a review steward's signed APPROVED review as the owner's approval (BB-118)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const review = reviewWithMarker(head, "approved", "no-review", at);
+    const entity = pull({ comments: [review] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] });
+    expect(ownerApproval(entity).approved).toBe(false);
+    // An unsigned marker review is a thread's too, so it is not the owner's.
+    const unsigned = { ...review, signedBy: null };
+    expect(ownerApproval(pull({ comments: [unsigned] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] })).approved).toBe(false);
+  });
+
+  it("closes the owner lane once the owner gives a real APPROVED review (BB-118)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const ownerAt = "2026-10-14T17:00:00Z";
+    const review = reviewWithMarker(head, "approved", "owner-reviewed", at);
+    const entity = pull(
+      { comments: [review] },
+      { ...green, reviews: [{ author: "jane", state: "COMMENTED", submittedAt: at, commit: head }, { author: "jane", state: "APPROVED", submittedAt: ownerAt, commit: head }] },
+    );
+    expect(ownerApproval(entity)).toMatchObject({ approved: true, at: ownerAt });
+    expect(prGate(entity)).toMatchObject({ gateMet: true, needsOwnerApproval: false });
+  });
+
+  it("treats a signed review with no marker as no reviewer round, and a no-review round as needing no owner (BB-118)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const bare = comment({ id: "rev", author: "jane", did: "reviewed", body: "Findings.\n\n_— from bb thread thr_review_", signedBy: "thr_review", createdAt: at });
+    expect(prGate(pull({ comments: [bare] }, { ...green, reviews: [{ author: "jane", state: "COMMENTED", submittedAt: at, commit: head }] })).missing).toBe("no reviewer round yet");
+    const noReview = reviewWithMarker(head, "approved", "no-review", at);
+    const entity = pull({ comments: [noReview] }, { ...green, reviews: [{ author: "jane", state: "APPROVED", submittedAt: at, commit: head }] });
+    expect(prGate(entity)).toMatchObject({ lane: "no-review", gateMet: true, needsOwnerApproval: false });
+  });
+
+  it("still waits when the review steward's round is on red checks (BB-118)", () => {
+    const at = "2026-10-14T16:00:00Z";
+    const review = reviewWithMarker(head, "approved", "owner-reviewed", at);
+    const entity = pull({ comments: [review] }, { checks: { state: "failure", failing: ["ci"] }, reviews: [{ author: "jane", state: "COMMENTED", submittedAt: at, commit: head }] });
+    const gate = prGate(entity);
+    expect(gate).toMatchObject({ needsOwnerApproval: false, gateMet: false });
+    expect(gate.missing).toMatch(/checks failure/u);
+  });
+
+  it("never reads a decline whose note approves as the owner's approval (BB-118)", () => {
+    // The page frames a decline's review body, so an approving-sounding note
+    // is still a decline to `classifyApproval`.
+    const decline = comment({ id: "d1", author: "jane", did: "requested changes", body: "Declined aaaaaaa from the Stewards page: Looks good, but add a test first", signedBy: null, createdAt: "2026-10-14T18:00:00Z" });
+    expect(classifyApproval(decline.body)).toBe("decline");
+    expect(ownerApproval(pull({ comments: [decline] })).approved).toBe(false);
+    // An unframed approving note by the owner still approves, as before.
+    expect(ownerApproval(pull({ comments: [comment({ id: "a1", author: "jane", body: "Looks good, but add a test first", signedBy: null, createdAt: "2026-10-14T18:00:00Z" })] })).approved).toBe(true);
   });
 });
 

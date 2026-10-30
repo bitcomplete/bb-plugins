@@ -206,7 +206,8 @@ describe("playbooks", () => {
     const reviews = parsePlaybook(GITHUB_REVIEWS, "github-reviews");
     if (!reviews.ok) throw new Error(reviews.error);
     expect(reviews.value.general).toMatch(/short check of the new commits/u);
-    expect(reviews.value.general).toMatch(/then a human approves/u);
+    expect(reviews.value.general).toMatch(/owner-reviewed/u);
+    expect(reviews.value.general).toMatch(/the plugin files the owner's\s+Approve item/u);
   });
 
   it("maps states to phases and stages, ignoring case, and splits sections", () => {
