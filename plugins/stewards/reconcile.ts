@@ -426,7 +426,7 @@ export function isMarkerComment(body: string): boolean {
  */
 const REVIEW_DIDS = new Set(["approved", "requested changes", "reviewed", "had a review dismissed"]);
 
-/** The (author, time) pairs of the reviews a thread posted, signed or marked. */
+/** The (author, time) pairs of the reviews a thread posted, signed or marked. github-watcher builds a review's flattened comment and its `pull.reviews` entry from the same `submittedAt ?? createdAt`, so the pair identifies the review. */
 function threadReviewKeys(entity: EntitySnapshot): Set<string> {
   const keys = new Set<string>();
   for (const c of entity.comments) {

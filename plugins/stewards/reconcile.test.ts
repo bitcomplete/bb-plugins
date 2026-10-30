@@ -652,6 +652,16 @@ describe("the pull request gate (build-tickets)", () => {
     expect(gate).toMatchObject({ needsOwnerApproval: false, gateMet: false });
     expect(gate.missing).toMatch(/checks failure/u);
   });
+
+  it("never reads a decline whose note approves as the owner's approval (BB-118)", () => {
+    // The page frames a decline's review body, so an approving-sounding note
+    // is still a decline to `classifyApproval`.
+    const decline = comment({ id: "d1", author: "jane", did: "requested changes", body: "Declined aaaaaaa from the Stewards page: Looks good, but add a test first", signedBy: null, createdAt: "2026-10-14T18:00:00Z" });
+    expect(classifyApproval(decline.body)).toBe("decline");
+    expect(ownerApproval(pull({ comments: [decline] })).approved).toBe(false);
+    // An unframed approving note by the owner still approves, as before.
+    expect(ownerApproval(pull({ comments: [comment({ id: "a1", author: "jane", body: "Looks good, but add a test first", signedBy: null, createdAt: "2026-10-14T18:00:00Z" })] })).approved).toBe(true);
+  });
 });
 
 describe("a waitingOn naming the user", () => {

@@ -4626,13 +4626,14 @@ describe("needs you items", () => {
     const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline", note: "Add a test first" }, client);
     expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
-    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "REQUEST_CHANGES", body: "Add a test first" }]);
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "REQUEST_CHANGES", body: "Declined aaaaaaa from the Stewards page: Add a test first" }]);
     expect(t.githubComments).toEqual([]);
     expect(t.hooks.store.need(need.id)!.status).toBe("done");
     // The same head and reviewer marker are not asked again; the escalation
     // closes with it.
     await t.flush();
     expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")).toBeUndefined();
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeUndefined();
     expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")).toBeUndefined();
     // A new reviewer round on the same head is a new ask.
     const later = comment({ id: "m2", author: "trotterdylan", body: `<!-- bb-review round=2 sha=${head} verdict=approved lane=owner-reviewed -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T18:00:00Z" });
@@ -4648,6 +4649,20 @@ describe("needs you items", () => {
     const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline" }, client);
     expect(res).toMatchObject({ ok: true });
     expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "COMMENT", body: "Declined aaaaaaa from the Stewards page" }]);
+  });
+
+  it("frames a decline so an approving-sounding note is never read as the owner's approval (BB-118)", async () => {
+    const t = await withPull([marker]);
+    const b = t.binding();
+    const need = t.hooks.store.openNeeds(b.id).find((n) => n.kind === "approve-pr")!;
+    const res = await t.harness.callRpc("stewardsNeedAction", { needId: need.id, action: "decline", note: "Looks good, but add a test first" }, client);
+    expect(res).toMatchObject({ ok: true, message: expect.stringMatching(/Declined/u) });
+    // The body is framed as a decline, so `classifyApproval` reads the
+    // "Declined" before the note's approval words.
+    expect(t.githubReviews).toEqual([{ repo: "acme/web", number: 7, event: "REQUEST_CHANGES", body: "Declined aaaaaaa from the Stewards page: Looks good, but add a test first" }]);
+    await t.flush();
+    expect(t.hooks.store.openNeeds(b.id).find((n) => n.kind === "merge")).toBeUndefined();
+    expect(t.hooks.store.openEscalations(b.id).find((x) => x.kind === "approval" && x.resolutionKind === "approve-decline")).toBeUndefined();
   });
 
   it("files the owner's approve-pr item for a review steward's owner-reviewed round (BB-118)", async () => {

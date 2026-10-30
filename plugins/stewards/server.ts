@@ -5903,7 +5903,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const foreign = isForeignPull(pull);
           if (action === "decline") {
             try {
-              if (foreign) await github.review(ref.repo, ref.number, text === null ? "COMMENT" : "REQUEST_CHANGES", text ?? `Declined ${shortSha(gate.headSha)} from the Stewards page`);
+              if (foreign) await github.review(ref.repo, ref.number, text === null ? "COMMENT" : "REQUEST_CHANGES", `Declined ${shortSha(gate.headSha)} from the Stewards page${text === null ? "" : `: ${text}`}`);
               else await github.comment(ref.repo, ref.number, `Declined ${shortSha(gate.headSha)} from the Stewards page${text === null ? "" : `: ${text}`}`);
             } catch (error) {
               return { ok: false, message: `GitHub refused the ${foreign ? "review" : "comment"}: ${errorMessage(error)}` };
