@@ -702,19 +702,31 @@ describe("Slack plugin", () => {
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
     s.hooks.state.join = () => Response.json({ error: "not-identified" }, { status: 403 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
+    // The service forgot the connection: its own message, not the generic one.
+    s.hooks.state.join = () => Response.json({ error: "unknown-connection" }, { status: 404 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("no longer knows this connection") });
     // An older bb-gate-hooks without the endpoint answers a bare 404.
     s.hooks.state.join = () => new Response("not found", { status: 404 });
     expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
     // A name is never sent: the map stores ids.
     expect(await s.harness.callRpc("joinChannel", { channel: "general" })).toMatchObject({ state: "not-found", message: fallback });
-    expect(s.hooks.joins.map((j) => j.channel)).toEqual(["G0456", "C0000", "C0001", "C0789", "C0789", "C0789"]);
+    expect(s.hooks.joins.map((j) => j.channel)).toEqual(["G0456", "C0000", "C0001", "C0789", "C0789", "C0789", "C0789"]);
     await s.stop();
   });
 
-  it("says when the service is unreachable rather than joining", async () => {
+  it("says when the service is not connected rather than joining", async () => {
     const s = await setup({ token: "xoxp-user-1" });
-    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("/invite @bb") });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("not connected to bb-gate-hooks") });
     expect(s.hooks.joins).toEqual([]);
+  });
+
+  it("says so when the join request itself fails", async () => {
+    const s = await live({ token: "xoxp-user-1" });
+    s.hooks.state.join = () => {
+      throw new Error("network down");
+    };
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("/invite @bb") });
+    await s.stop();
   });
 
   it("asks for sign-in when the stored token is an OpenID one, never logging it", async () => {

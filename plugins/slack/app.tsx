@@ -51,8 +51,8 @@ interface Status {
   hooks: { configured: boolean; connected: boolean; state: string };
 }
 
-/** A Slack channel id: `C…` or `G…`, never a name. */
-const CHANNEL_ID = /^[CG][A-Z0-9]+$/i;
+/** A Slack channel id: `C…` or `G…`, never a name. Case-sensitive, like the RPC. */
+const CHANNEL_ID = /^[CG][A-Z0-9]+$/;
 
 const isChannelId = (channel: string): boolean => CHANNEL_ID.test(channel.trim());
 

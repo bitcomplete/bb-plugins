@@ -975,6 +975,8 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
               return { state: "unavailable", message: `The team's Slack app was installed without the channels:join scope, so bb cannot add itself yet. ${byHand}` };
             case "not-identified":
               return { state: "unavailable", message: `Sign in with Slack first, then try again. ${byHand}` };
+            case "unknown-connection":
+              return { state: "unavailable", message: `bb-gate-hooks no longer knows this connection; it reconnects on its own. Try again in a minute. ${byHand}` };
             default:
               break;
           }
