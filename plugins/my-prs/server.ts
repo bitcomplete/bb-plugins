@@ -114,7 +114,8 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         let result: z.infer<typeof pollSchema>;
         try {
           const client = githubClient();
-          const snapshot = await client.fetchMyPrs(current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean), AbortSignal.any([signal, lifecycle.signal]));
+          const snapshot = await client.fetchMyPrs(current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean),
+            AbortSignal.any([signal, lifecycle.signal]), readPrs().map((pr) => pr.id));
           if (revision !== startedRevision) throw new Error("GitHub settings changed during refresh. Refresh again.");
           db.transaction(() => {
             db.prepare("DELETE FROM prs").run();

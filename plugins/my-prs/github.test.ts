@@ -53,6 +53,21 @@ it("reads a normal PR's feedback in two calls, including the final head check", 
   expect(transport.mock.calls.every(([query]) => !query.includes("search("))).toBe(true);
 });
 
+it("deduplicates moving search pages and rechecks previously open PRs missing from search", async () => {
+  const data = [fixture(1), fixture(2), fixture(3)];
+  const base = transportFor(() => data);
+  const reads: string[] = [];
+  const transport: Transport = async (query, variables, signal) => {
+    if (query.includes("search(")) return { search: { ...page([data[0]?.pr, data[0]?.pr]), issueCount: 2 } };
+    if (variables.id && query.includes("viewer { login }")) reads.push(variables.id);
+    if (variables.id === "PR_3") return { viewer: { login: "me" }, node: null };
+    return base(query, variables, signal);
+  };
+  const result = await createGithubClient(transport).fetchMyPrs([], undefined, ["PR_1", "PR_2", "PR_3"]);
+  expect(result.prs.map((pr) => pr.id)).toEqual(["PR_1", "PR_2"]);
+  expect(reads).toEqual(["PR_1", "PR_2", "PR_3"]);
+});
+
 it("reads four PRs concurrently, preserves search order, and keeps every final head check", async () => {
   const data = Array.from({ length: 9 }, (_, index) => fixture(index + 1));
   const base = transportFor(() => data);

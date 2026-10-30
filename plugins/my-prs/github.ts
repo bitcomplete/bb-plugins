@@ -178,7 +178,7 @@ export function createGithubClient(transport: Transport) {
 
   return {
     fetchPullRequest,
-    async fetchMyPrs(allowlist: string[], signal?: AbortSignal): Promise<{ login: string; prs: PullRequest[] }> {
+    async fetchMyPrs(allowlist: string[], signal?: AbortSignal, knownIds: readonly string[] = []): Promise<{ login: string; prs: PullRequest[] }> {
       const { viewer } = z.object({ viewer: z.object({ login: z.string() }) }).parse(
         await transport("query { viewer { login } }", {}, signal));
       const searchSchema = z.object({ search: z.object({ nodes: z.array(metadataSchema), pageInfo, issueCount: z.number() }) });
@@ -195,15 +195,16 @@ export function createGithubClient(transport: Transport) {
       const allowed = new Set(allowlist.map((repo) => repo.toLowerCase()));
       const eligible = metadata.filter((pr) => pr.author?.login.toLowerCase() === viewer.login.toLowerCase() &&
         (!allowed.size || allowed.has(pr.repository.nameWithOwner.toLowerCase())));
-      const snapshots: (PullRequest | null)[] = eligible.map(() => null);
-      const queue = eligible.entries();
+      const ids = [...new Set([...eligible.map((pr) => pr.id), ...knownIds])];
+      const snapshots: (PullRequest | null)[] = ids.map(() => null);
+      const queue = ids.entries();
       const cancel = new AbortController();
       const abort = signal ? AbortSignal.any([signal, cancel.signal]) : cancel.signal;
       const failures: unknown[] = [];
       await Promise.all(Array.from({ length: Math.min(4, eligible.length) }, async () => {
-        for (const [index, pr] of queue) {
+        for (const [index, id] of queue) {
           if (abort.aborted) return;
-          try { snapshots[index] = await fetchPullRequest(pr.id, allowlist, abort); }
+          try { snapshots[index] = await fetchPullRequest(id, allowlist, abort); }
           catch (cause) { failures.push(cause); cancel.abort(); return; }
         }
       }));

@@ -44,6 +44,8 @@ Realtime changes invalidate the snapshot immediately. A failed refresh keeps the
 last successful view, and hidden windows skip periodic reads. GitHub refreshes
 read up to four PRs concurrently, retain the final head checks, and cancel the
 remaining reads on failure. Each shared batch thread is read once per snapshot.
+Repeated search results are read once. Previously open PRs omitted from GitHub
+search are checked directly before they can leave the queue.
 
 For an existing installation under the previous plugin identity, keep it enabled
 while running `bb my-prs import --json`. This copies settings, saved PRs, holds,

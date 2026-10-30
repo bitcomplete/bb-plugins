@@ -72,6 +72,24 @@ describe("My PRs behavior", () => {
     expect((await env.view()).rows.map((row) => row.threadStatus)).toEqual(["idle", "idle"]);
     expect(env.harness.inspection.sdk.callsTo("threads.get").length - before).toBe(1);
   });
+  it("retains a known open PR when GitHub search temporarily omits it", async () => {
+    const data = [fixture(1), fixture(2)];
+    const base = transportFor(() => data);
+    let omit = false;
+    const host = createFakePluginHost({ pluginId: "my-prs" });
+    cleanup.push(() => host.harness.lifecycle.dispose());
+    await createPlugin({ transport: (query, variables, signal) => {
+      if (omit && query.includes("search(")) return Promise.resolve({ search: { nodes: [data[0]?.pr], issueCount: 1,
+        pageInfo: { hasNextPage: false, endCursor: null } } });
+      return base(query, variables, signal);
+    } })(host.bb);
+    await host.harness.behavior.callRpc("poll_now", null);
+    omit = true;
+    await host.harness.behavior.callRpc("poll_now", null);
+    const view = viewSchema.parse(await host.harness.behavior.callRpc("prs_get", null));
+    expect(view.rows.map((row) => row.id)).toEqual(["PR_1", "PR_2"]);
+    expect(view.poll?.error).toBeNull();
+  });
   it("revalidates selected heads and keeps cached rows on GitHub failure without dispatching", async () => {
     const env = await setup(); const item = await firstSelection(env);
     if (env.data[0]) env.data[0].pr.headRefOid = "b".repeat(40);
