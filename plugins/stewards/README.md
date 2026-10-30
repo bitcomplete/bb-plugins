@@ -480,10 +480,16 @@ ended** for their rows.
 **The needs-you items and the picker count (BB-46, BB-85).** The project
 dropdown shows each project's count in its option label, counting the yellow
 effort rows. A needs-you effort shows the question or need's text and its
-one-click actions inline under line two: a fixed-choice question answers through
-`stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
-{ action: "choose" }`, an `approve-pr` row carries **Open PR** / **Approve**,
-and a `merge` row **Open PR** / **Merge**. There is no **Details** button: the
+one-click actions inline under line two. The server describes each item's
+`actions` once (`needActions`, `questionActions` and `withUserActions` in
+`server.ts`) and both the sidebar and the page render that list, so the two
+cannot drift: a fixed-choice question or a `decide` need carries one button per
+choice, an `approve-spec` row **Open ticket** / **Approve** / **Decline**, an
+`approve-pr` row **Open PR** / **Approve** / **Decline**, a `merge` row
+**Open PR** / **Merge**, a `configure` row **Done**, a `provide-secret` row
+**Provide** / **Done**, and a free-text question or need **Answer**. A link
+action goes through the Open PR one-shot handoff (BB-102), which works for any
+URL. There is no **Details** button: the
 row itself opens the effort's detail view, where the free-text answer and the
 secret form live. The actions make the same RPC calls the board does, the
 server's refusal is shown in the row, and the row refetches on success. The items come from `stewardsSidebar` and each

@@ -1223,6 +1223,7 @@ function ActionButtons({
   onOpenLink,
   button,
   primary,
+  busyLabel,
 }: {
   actions: readonly BoardAction[];
   freeText: boolean;
@@ -1234,6 +1235,8 @@ function ActionButtons({
   onOpenLink: (url: string) => void;
   button: string;
   primary: string;
+  /** A disabled free-text action's label while a write is in flight, e.g. "Closing…". */
+  busyLabel?: string;
 }) {
   const rpc = actions.filter((a): a is BoardActionButton => !isLinkAction(a));
   const choices = rpc.filter((a) => a.choice !== null);
@@ -1245,13 +1248,13 @@ function ActionButtons({
   return (
     <>
       {actions.filter(isLinkAction).map((a) => (
-        <button key={`link:${a.url}`} type="button" className={button} onClick={() => onOpenLink(a.url)}>
+        <button key={`link:${a.label}:${a.url}`} type="button" className={button} onClick={() => onOpenLink(a.url)}>
           {a.label}
         </button>
       ))}
       {shown.map((a) => (
         <button key={`${a.action}:${a.choice ?? ""}`} type="button" disabled={disabled} className={a.primary ? primary : button} onClick={() => onAction(a)}>
-          {a.label}
+          {disabled && busyLabel !== undefined && a.choice === null ? busyLabel : a.label}
         </button>
       ))}
       {mode === "page" && gated && !other ? (
@@ -1369,7 +1372,7 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
           aria-label={`Answer to: ${q.question}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
-        <ActionButtons actions={q.actions} freeText={q.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={state === "closing"} onAction={close} onOpenLink={() => {}} button={button} primary={button} />
+        <ActionButtons actions={q.actions} freeText={q.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={state === "closing"} onAction={close} onOpenLink={() => {}} button={button} primary={button} busyLabel={state === "closing" ? "Closing…" : undefined} />
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
     </>
