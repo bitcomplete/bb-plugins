@@ -71,7 +71,7 @@ function optionMeta(option: ChannelOption, botChannels: string[] | null): string
   const parts: string[] = [];
   if (option.private) parts.push("private");
   if (option.extShared) parts.push("Slack Connect");
-  if (needsInvite(option.id, botChannels)) parts.push("bb is not in this channel yet; invite it");
+  if (needsInvite(option.id, botChannels)) parts.push("invite bb");
   return parts.join(" · ");
 }
 
@@ -87,8 +87,8 @@ function PickerRow({ label, meta, selected, onClick }: { label: string; meta: st
         onClick();
       }}
     >
-      <span className="truncate">{label}</span>
-      {meta !== "" ? <span className="shrink-0 text-xs text-muted-foreground">{meta}</span> : null}
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {meta !== "" ? <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{meta}</span> : null}
     </button>
   );
 }
@@ -194,7 +194,7 @@ function ChannelPicker({
         }}
       />
       {open ? (
-        <div className="absolute z-10 mt-1 w-72 rounded-md border border-input bg-popover p-1 text-sm shadow-md">
+        <div className="absolute z-10 mt-1 w-80 rounded-md border border-input bg-popover p-1 text-sm shadow-md">
           <div className="max-h-56 overflow-auto">
             {matches.map((option) => (
               <PickerRow
