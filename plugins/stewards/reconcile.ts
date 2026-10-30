@@ -540,8 +540,8 @@ export function latestProjectApprovalMarker(comments: readonly SnapshotComment[]
 
 /**
  * The worker thread that posted build-tickets' "Independent review running"
- * comment, or null. The worker is told the approval landed so it merges
- * without a `github_watch` on the owner.
+ * comment (its Spawn the reviewer step), or null. The worker is told the
+ * approval landed so it merges without a `github_watch` on the owner.
  */
 export function reviewWorkerThread(comments: readonly SnapshotComment[]): string | null {
   let found: string | null = null;
@@ -550,7 +550,7 @@ export function reviewWorkerThread(comments: readonly SnapshotComment[]): string
 }
 
 /**
- * The lane gate from the build-tickets skill, in one place: the reviewer's
+ * The merge gate from the build-tickets skill, in one place: the reviewer's
  * latest marker has verdict `approved`, every check has passed, and, in the
  * owner-reviewed lane, the owner has approved. The marker need not name the
  * current head: an approval is of the pull request, not of a commit, so it

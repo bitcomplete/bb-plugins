@@ -319,11 +319,24 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   yes|no`, exiting 0 when met and 1 when not. `bb stewards merge
   <owner/repo#N>` runs the page's Merge action through one shared function: it
   re-reads the pull request, re-checks the gate, refuses with the gate's
-  reason when it is unmet or a worker is in flight, and otherwise
+  reason when it is unmet or another worker is in flight, and otherwise
   squash-merges, posts the "Merged:" comment (lane, approved sha, a "since
   then" line when the head moved past it, the merge commit, and a restart
   note when the project's guidance says a merge there restarts servers), and
   closes the Merge item.
+- **The worker and reviewer skills (BB-134).** The plugin ships `build-tickets`
+  (the worker's end-to-end loop: build, test, open the PR, spawn one reviewer,
+  address its findings, merge by the lane gate, end at merge) and `pr-reviewer`
+  (the reviewer's one-comment-per-round protocol, the `bb-review` marker and
+  the lane classification) as plugin skills under `skills/`, so a worker or
+  reviewer is spawned with just the skill name. The project-specific parts —
+  its repos and their test commands, the restart note, the decide list
+  (`bigDecisions`) and the standing rules — are read from the project's `.bb`
+  (`AGENTS.md`, `stewards/project.json`, `bb stewards brief`) rather than
+  written into the skills. A `.bb/skills/build-tickets` or
+  `.bb/skills/pr-reviewer` copy with the same name overrides the plugin's, so
+  a project can still pin its own: bb resolves project skills over plugin
+  skills.
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
   worker's `bb stewards escalate` goes to its steward, a steward's
   `steward_report { escalate }` to the project steward, and only the
