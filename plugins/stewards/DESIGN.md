@@ -1729,16 +1729,19 @@ component joins them to `experimental_useSidebarThreads` and polls
 sidebar is where the user already looks, so what waits on them is shown there,
 not only on the Stewards page. An effort that needs you appears once, at the
 top of **Blocked**, with a yellow dot; under its line two it shows the
-question or need's text and its one-click actions, the same RPC calls the old
-block made. A fixed-choice question answers through
-`stewardsAnswerQuestion { choice }`, a `decide` need through
-`stewardsNeedAction { action: "choose", choice }`; an `approve-pr` row carries
-**Open PR** (records the item's `url` in the plugin's one-shot handoff and
-navigates to the effort's detail view, whose `navigate.openUrl` opens it from
-inside the pane, BB-102) and **Approve**
-(`stewardsNeedAction { action: "approve" }`, no confirmation, the server's
-refusal shown in the row); a `merge` row swaps **Merge** for **Approve** (the
-lane gate re-checked server-side). There is no **Details** button: the row
+question or need's text and its one-click actions. The server describes each
+item's `actions` once (`needActions`, `questionActions` and `withUserActions`
+in `server.ts`) and both the sidebar and the page render that list, so the two
+cannot drift: a fixed-choice question or a `decide` need carries one button per
+choice, an `approve-spec` row **Open ticket** / **Approve** / **Decline**, an
+`approve-pr` row **Open PR** / **Approve** / **Decline**, a `merge` row
+**Open PR** / **Merge**, a `configure` row **Done**, a `provide-secret` row
+**Provide** / **Done**, and a free-text question or need **Answer**. A link
+action records its URL in the plugin's one-shot handoff and navigates to the
+effort's detail view, whose `navigate.openUrl` opens it from inside the pane
+(BB-102); the RPC actions make the same `stewardsAnswerQuestion` /
+`stewardsNeedAction` calls the page makes, with the server's refusal shown in
+the row. There is no **Details** button: the row
 itself opens the effort's detail view (BB-85), where the free-text answer and
 the secret form live. The inline block adds no write path the page does not
 already make. The

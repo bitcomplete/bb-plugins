@@ -1199,10 +1199,78 @@ function WithUserControls({ withUser: x, projectStewardThreadId }: { withUser: B
   );
 }
 
+/** One action a needs-you item offers, from the server's shared list (BB-122). */
+type BoardAction = BoardNeed["actions"][number];
+/** The RPC half of an action; the other half is a link with a URL. */
+type BoardActionButton = Extract<BoardAction, { action: string }>;
+/** Whether an action is a link to open rather than an RPC write. */
+const isLinkAction = (a: BoardAction): a is Extract<BoardAction, { url: string }> => "url" in a;
+
 /**
- * A need's buttons. A button is offered only when the server can verify the
- * item's preconditions now; otherwise the item says why it is not actionable
- * yet. Every action runs on the server, as the user.
+ * Renders a needs-you item's server-described actions in one loop (BB-122).
+ * The page keeps the free-text action behind Other… when the server flags
+ * `freeText`; the sidebar drops it (it has no text box) and shows the fixed
+ * choices, or the free-text action when that is the only one.
+ */
+function ActionButtons({
+  actions,
+  freeText,
+  mode,
+  other,
+  onOther,
+  disabled,
+  onAction,
+  onOpenLink,
+  button,
+  primary,
+  busyLabel,
+}: {
+  actions: readonly BoardAction[];
+  freeText: boolean;
+  mode: "page" | "sidebar";
+  other: boolean;
+  onOther: () => void;
+  disabled: boolean;
+  onAction: (a: BoardActionButton) => void;
+  onOpenLink: (url: string) => void;
+  button: string;
+  primary: string;
+  /** A disabled free-text action's label while a write is in flight, e.g. "Closing…". */
+  busyLabel?: string;
+}) {
+  const rpc = actions.filter((a): a is BoardActionButton => !isLinkAction(a));
+  const choices = rpc.filter((a) => a.choice !== null);
+  const free = rpc.filter((a) => a.choice === null);
+  // Free text exists only alongside fixed choices; it is the action with no
+  // `choice`. The page hides it behind Other…, the sidebar never shows it.
+  const gated = freeText && choices.length > 0;
+  const shown = mode === "sidebar" ? (gated ? choices : rpc) : gated ? (other ? free : choices) : rpc;
+  return (
+    <>
+      {actions.filter(isLinkAction).map((a) => (
+        <button key={`link:${a.label}:${a.url}`} type="button" className={button} onClick={() => onOpenLink(a.url)}>
+          {a.label}
+        </button>
+      ))}
+      {shown.map((a) => (
+        <button key={`${a.action}:${a.choice ?? ""}`} type="button" disabled={disabled} className={a.primary ? primary : button} onClick={() => onAction(a)}>
+          {disabled && busyLabel !== undefined && a.choice === null ? busyLabel : a.label}
+        </button>
+      ))}
+      {mode === "page" && gated && !other ? (
+        <button type="button" disabled={disabled} className={button} onClick={onOther}>
+          Other…
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * A need's buttons, rendered from the server's `actions` list (BB-122). A
+ * button is offered only when the server can verify the item's preconditions
+ * now; otherwise the item says why it is not actionable yet. Every action runs
+ * on the server, as the user.
  */
 function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -1212,10 +1280,10 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
   // into the free-text answer.
   const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  const act = (action: "approve" | "decline" | "done" | "merge" | "provide" | "choose", choice?: string) => {
+  const act = (a: BoardActionButton) => {
     setState("running");
     rpc
-      .call("stewardsNeedAction", { needId: n.id, action, note: note.trim() === "" ? null : note.trim(), ...(choice === undefined ? {} : { choice }) })
+      .call("stewardsNeedAction", { needId: n.id, action: a.action as "approve" | "decline" | "done" | "merge" | "provide" | "choose", note: note.trim() === "" ? null : note.trim(), ...(a.choice === null ? {} : { choice: a.choice }) })
       .then(
         (r) => {
           if (!r.ok) return setState({ error: r.message });
@@ -1227,94 +1295,33 @@ function NeedControls({ need: n, onDone }: { need: BoardNeed; onDone: () => void
   };
   const primary = "rounded-md border border-input bg-state-hover px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
   const secondary = "rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50";
-  const takesNote = n.kind === "approve-spec" || n.kind === "approve-pr" || n.kind === "configure" || n.kind === "decide";
-  const choices = n.kind === "decide" ? n.choices : [];
-  // A lesson's Merge/Drop are its only choices: no free-text "Other…".
-  const lesson = n.lessonId !== null;
-  const freeText = choices.length === 0 || other;
-  // The entity link opens the binding's ticket; for approve-pr and merge the
-  // item's `url` is the pull request, so it gets its own link.
-  const prUrl = n.kind === "approve-pr" || n.kind === "merge" ? n.url : (n.prUrl ?? null);
+  const takesNote = n.actions.some((a) => !isLinkAction(a) && a.note);
+  // The text box is the free-text answer when there are no choices, or after
+  // Other… turned it into one; otherwise it is a note on the chosen button.
+  const freeMode = !n.actions.some((a) => !isLinkAction(a) && a.choice !== null) || other;
   return (
     <>
-      {takesNote && !lesson ? (
+      {takesNote ? (
         <textarea
           value={note}
           onChange={(e) => setNote(e.target.value)}
           rows={1}
-          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "approve-pr" ? "Note (optional; used when you decline)" : freeText ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
+          placeholder={n.kind === "approve-spec" ? "Note (optional)" : n.kind === "approve-pr" ? "Note (optional; used when you decline)" : freeMode ? "Your answer (optional, saved as guidance)" : "Note (optional, saved as guidance)"}
           aria-label={`Note for: ${n.what}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
       ) : null}
       <div className="flex flex-wrap items-center gap-2">
-        {n.kind === "approve-spec" ? (
-          <>
-            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
-              Approve
-            </button>
-            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => act("decline")}>
-              Decline
-            </button>
-          </>
-        ) : n.kind === "approve-pr" ? (
-          <>
-            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("approve")}>
-              Approve
-            </button>
-            <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => act("decline")}>
-              Decline
-            </button>
-          </>
-        ) : n.kind === "merge" ? (
-          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("merge")}>
-            Merge
-          </button>
-        ) : n.kind === "provide-secret" ? (
-          <>
-            <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("provide")}>
-              Provide
-            </button>
-            <button type="button" disabled={state === "running"} className={secondary} onClick={() => act("done")}>
-              Done
-            </button>
-          </>
-        ) : n.kind === "configure" ? (
-          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
-            Done
-          </button>
-        ) : choices.length > 0 && !other ? (
-          <>
-            {choices.map((choice) => (
-              <button key={choice} type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("choose", choice)}>
-                {choice}
-              </button>
-            ))}
-            {lesson ? null : (
-              <button type="button" disabled={!n.actionable || state === "running"} className={secondary} onClick={() => setOther(true)}>
-                Other…
-              </button>
-            )}
-          </>
-        ) : (
-          <button type="button" disabled={!n.actionable || state === "running"} className={primary} onClick={() => act("done")}>
-            Answer
-          </button>
-        )}
+        <ActionButtons actions={n.actions} freeText={n.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={!n.actionable || state === "running"} onAction={act} onOpenLink={(url) => navigate.openUrl(url)} button={secondary} primary={primary} />
         {n.threadId !== null ? <ThreadLink threadId={n.threadId}>{n.kind === "provide-secret" ? "Open the requester" : "Open the worker"}</ThreadLink> : null}
-        {prUrl !== null ? (
-          <button type="button" className="underline underline-offset-2 hover:text-foreground" onClick={() => navigate.openUrl(prUrl)}>
-            Open the pull request
-          </button>
-        ) : null}
-        {lesson && n.prUrl === null && n.kind === "decide" && n.choices.includes("Review PR") ? <span className="text-muted-foreground">The pull request is not open yet.</span> : null}
+        {n.kind === "decide" && n.lessonId !== null && n.prUrl === null && n.choices.includes("Review PR") ? <span className="text-muted-foreground">The pull request is not open yet.</span> : null}
         {typeof state === "object" ? <span className="text-destructive">{state.error}</span> : null}
       </div>
     </>
   );
 }
 
-/** A question's page controls (BB-78): the optional rationale box, the free-text answer, fixed choices and Other…. */
+/** A question's page controls (BB-78): the optional rationale box, the answer box and the server's actions. */
 function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; onClosed: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const [answer, setAnswer] = useState("");
@@ -1326,13 +1333,13 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
   // into the free-text answer.
   const [other, setOther] = useState(false);
   const [state, setState] = useState<"idle" | "closing" | { error: string }>("idle");
-  const close = (choice?: string) => {
+  const close = (a: BoardActionButton) => {
     setState("closing");
     rpc
       .call("stewardsAnswerQuestion", {
         questionId: q.id,
         answer: answer.trim() === "" ? null : answer.trim(),
-        ...(choice === undefined ? {} : { choice }),
+        ...(a.choice === null ? {} : { choice: a.choice }),
         ...(q.rationaleWanted === null || rationale.trim() === "" ? {} : { rationale: rationale.trim() }),
       })
       .then(
@@ -1361,26 +1368,11 @@ function QuestionControls({ question: q, onClosed }: { question: BoardQuestion; 
           value={answer}
           onChange={(e) => setAnswer(e.target.value)}
           rows={1}
-          placeholder={q.choices.length > 0 && !other ? "Note (optional)" : "Your answer (optional)"}
+          placeholder={q.freeText && !other ? "Note (optional)" : "Your answer (optional)"}
           aria-label={`Answer to: ${q.question}`}
           className="min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 py-1"
         />
-        {q.choices.length > 0 && !other ? (
-          <>
-            {q.choices.map((choice) => (
-              <button key={choice} type="button" disabled={state === "closing"} className={button} onClick={() => close(choice)}>
-                {choice}
-              </button>
-            ))}
-            <button type="button" disabled={state === "closing"} className={button} onClick={() => setOther(true)}>
-              Other…
-            </button>
-          </>
-        ) : (
-          <button type="button" disabled={state === "closing"} className={button} onClick={() => close()}>
-            {state === "closing" ? "Closing…" : "Answer"}
-          </button>
-        )}
+        <ActionButtons actions={q.actions} freeText={q.freeText} mode="page" other={other} onOther={() => setOther(true)} disabled={state === "closing"} onAction={close} onOpenLink={() => {}} button={button} primary={button} busyLabel={state === "closing" ? "Closing…" : undefined} />
       </div>
       {typeof state === "object" ? <p className="text-destructive">{state.error}</p> : null}
     </>
@@ -1625,31 +1617,27 @@ const SidebarThreadRow = memo(function SidebarThreadRow({
 
 /**
  * The inline "needs you" block under an effort row's line two (BB-76): the
- * question or need's text, then its one-click actions, exactly the RPC calls
- * the old Needs you block made. A fixed-choice question answers through
- * `stewardsAnswerQuestion`, a `decide` need through `stewardsNeedAction
- * choose`; an approve-pr or merge keeps its Open PR / Approve|Merge buttons.
- * The row itself opens the detail view (BB-85), so there is no Details button.
+ * question or need's text, then the server-described actions in one loop
+ * (BB-122). A link action goes through the Open PR handoff (BB-102); an RPC
+ * action makes the call the server names. The row itself opens the detail view
+ * (BB-85), so there is no Details button.
  */
 function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: SidebarNeedItem; projectId: string; effortKey: string; onChanged: () => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const [state, setState] = useState<"idle" | "running" | { error: string }>("idle");
-  // The fallback timer that opens the PR externally when the page never takes
+  // The fallback timer that opens the URL externally when the page never takes
   // the handoff (a hidden panel, a chunk that failed to load) (BB-102).
-  const openPrFallback = useRef<number | null>(null);
+  const openLinkFallback = useRef<number | null>(null);
   useEffect(() => () => {
-    if (openPrFallback.current !== null) window.clearTimeout(openPrFallback.current);
+    if (openLinkFallback.current !== null) window.clearTimeout(openLinkFallback.current);
   }, []);
   const text = item.type === "need" ? item.what : item.question;
-  const isApprovePr = item.type === "need" && item.kind === "approve-pr";
-  const isMerge = item.type === "need" && item.kind === "merge";
-  const choices = item.type === "question" ? item.choices : item.type === "need" && item.kind === "decide" ? item.choices : [];
-  // A free-text prompt (no choices, not an approve-pr or merge need) cannot be
-  // answered from the sidebar, so it gets one line; the rest get three. The
-  // full text stays on the element's title and on the page; context is never
-  // shown here (BB-79).
-  const clamped = choices.length === 0 && !isApprovePr && !isMerge;
+  // One line when there is nothing to press; three when the actions give the
+  // row something to do (BB-122). The full text stays on the element's title
+  // and on the page; context is never shown here (BB-79).
+  const clamped = item.actions.length === 0;
+  const disabled = state === "running" || (item.type === "need" && !item.actionable);
   const run = (call: Promise<{ ok: boolean; message: string }>) => {
     setState("running");
     call.then(
@@ -1660,22 +1648,19 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
       (e: unknown) => setState({ error: message(e) }),
     );
   };
-  const answer = (choice: string) => run(rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice }));
-  const choose = (choice: string) => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "choose", note: null, choice }));
-  const approve = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "approve", note: null, choice: null }));
-  const decline = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "decline", note: null, choice: null }));
-  const merge = () => run(rpc.call("stewardsNeedAction", { needId: item.id, action: "merge", note: null, choice: null }));
+  const act = (a: BoardActionButton) => {
+    if (item.type === "question") return run(rpc.call("stewardsAnswerQuestion", { questionId: item.id, answer: null, choice: a.choice }));
+    return run(rpc.call("stewardsNeedAction", { needId: item.id, action: a.action as "approve" | "decline" | "done" | "merge" | "provide" | "choose", note: null, choice: a.choice }));
+  };
   // BB-102: hand the URL to the detail page, which is inside a pane and can
   // open it in bb's in-app browser, then go there as the row does. If nothing
   // takes the slot in time, fall back to the sidebar's own (external) openUrl.
-  const openPr = () => {
-    const url = item.url;
-    if (url === null) return;
-    if (openPrFallback.current !== null) window.clearTimeout(openPrFallback.current);
+  const openLink = (url: string) => {
+    if (openLinkFallback.current !== null) window.clearTimeout(openLinkFallback.current);
     const seq = setOpenPrHandoff(url);
     navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(projectId, effortKey) });
-    openPrFallback.current = window.setTimeout(() => {
-      openPrFallback.current = null;
+    openLinkFallback.current = window.setTimeout(() => {
+      openLinkFallback.current = null;
       const pending = takeOpenPrHandoff(seq);
       if (pending !== null) navigate.openUrl(pending);
     }, OPEN_PR_HANDOFF_MS);
@@ -1685,29 +1670,7 @@ function SidebarInlineNeed({ item, projectId, effortKey, onChanged }: { item: Si
     <div className="flex flex-col gap-1">
       <p className={`min-w-0 break-words text-[11px] text-muted-foreground ${clamped ? "line-clamp-1" : "line-clamp-3"}`} title={text}>{text}</p>
       <div className="flex flex-wrap items-center gap-1">
-        {choices.length > 0 ? (
-          choices.map((choice) => (
-            <button key={choice} type="button" disabled={state === "running"} className={button} onClick={() => (item.type === "question" ? answer(choice) : choose(choice))}>
-              {choice}
-            </button>
-          ))
-        ) : isApprovePr || isMerge ? (
-          <>
-            {item.url !== null ? (
-              <button type="button" className={button} onClick={openPr}>
-                Open PR
-              </button>
-            ) : null}
-            <button type="button" disabled={state === "running"} className={button} onClick={isApprovePr ? approve : merge}>
-              {isApprovePr ? "Approve" : "Merge"}
-            </button>
-            {isApprovePr ? (
-              <button type="button" disabled={state === "running"} className={button} onClick={decline}>
-                Decline
-              </button>
-            ) : null}
-          </>
-        ) : null}
+        <ActionButtons actions={item.actions} freeText={item.freeText} mode="sidebar" other={false} onOther={() => {}} disabled={disabled} onAction={act} onOpenLink={openLink} button={button} primary={`${button} bg-state-hover`} />
         {typeof state === "object" ? <span className="text-[11px] text-destructive">{state.error}</span> : null}
       </div>
     </div>

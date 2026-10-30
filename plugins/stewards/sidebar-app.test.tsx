@@ -9,6 +9,7 @@ import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
 import { setBoardRoute } from "./board-route.js";
 import { resetOpenPrHandoff, rowRenderCounts } from "./app.js";
+import { needActions, questionActions } from "./server.js";
 
 const thread = (over: Partial<PluginSidebarThread> & { id: string }): PluginSidebarThread => ({
   projectId: "p1",
@@ -81,42 +82,51 @@ const binding = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-const questionItem = (over: Record<string, unknown> = {}) => ({
-  type: "question",
-  id: "qst_1",
-  question: "Stack or hold?",
-  context: null,
-  choices: [],
-  key: "ENG-1",
-  bindingKey: "ENG-1",
-  url: null,
-  escalationId: null,
-  createdAt: 0,
-  rationaleWanted: null,
-  ...over,
-});
+const questionItem = (over: Record<string, unknown> = {}) => {
+  const base = {
+    type: "question",
+    id: "qst_1",
+    question: "Stack or hold?",
+    context: null,
+    choices: [],
+    key: "ENG-1",
+    bindingKey: "ENG-1",
+    url: null,
+    escalationId: null,
+    createdAt: 0,
+    rationaleWanted: null,
+    ...over,
+  };
+  const { actions, freeText } = questionActions({ choices: base.choices as string[] });
+  return { ...base, actions: (over.actions as unknown[]) ?? actions, freeText: (over.freeText as boolean) ?? freeText };
+};
 
-const needItem = (over: Record<string, unknown> = {}) => ({
-  type: "need",
-  id: "need_1",
-  bindingId: "b1",
-  key: "ENG-1",
-  bindingKey: "ENG-1",
-  kind: "approve-pr",
-  url: "https://github.com/acme/web/pull/1",
-  entityUrl: "https://github.com/acme/web/pull/1",
-  escalationId: null,
-  choices: [],
-  lessonId: null,
-  what: "Approve the pull request",
-  how: null,
-  destination: null,
-  threadId: null,
-  createdAt: 0,
-  actionable: true,
-  why: null,
-  ...over,
-});
+const needItem = (over: Record<string, unknown> = {}) => {
+  const base = {
+    type: "need",
+    id: "need_1",
+    bindingId: "b1",
+    key: "ENG-1",
+    bindingKey: "ENG-1",
+    kind: "approve-pr",
+    url: "https://github.com/acme/web/pull/1",
+    entityUrl: "https://github.com/acme/web/pull/1",
+    escalationId: null,
+    choices: [],
+    lessonId: null,
+    prUrl: null,
+    what: "Approve the pull request",
+    how: null,
+    destination: null,
+    threadId: null,
+    createdAt: 0,
+    actionable: true,
+    why: null,
+    ...over,
+  };
+  const { actions, freeText } = needActions({ kind: base.kind as string, url: (base.url as string | null) ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl } }, { url: (base.entityUrl as string | null) ?? null });
+  return { ...base, actions: (over.actions as unknown[]) ?? actions, freeText: (over.freeText as boolean) ?? freeText };
+};
 
 const boardSteward = (over: Record<string, unknown> = {}) => ({
   key: "ENG-1",
@@ -160,6 +170,8 @@ const withUserItem = (over: Record<string, unknown> = {}) => ({
   threadId: null,
   createdAt: 0,
   rationaleWanted: null,
+  actions: [],
+  freeText: false,
   ...over,
 });
 
@@ -876,6 +888,82 @@ describe("the inline needs-you actions (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
+  it("renders an approve-spec need's Open ticket / Approve / Decline and records the approval", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "approve-spec", entityUrl: "https://linear.app/acme/issue/ENG-1", what: "Approve the spec" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "approved" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Approve the spec")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Open ticket" })).toBeTruthy();
+    expect(slot.getByRole("button", { name: "Decline" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "approve", note: null, choice: null } }));
+    fireEvent.click(slot.getByRole("button", { name: "Open ticket" }));
+    await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: "https://linear.app/acme/issue/ENG-1" }));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a merge need's Open PR and Merge", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "merge", what: "Merge the pull request" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "merged" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Merge the pull request")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Open PR" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Merge" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "merge", note: null, choice: null } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a configure need's Done", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "configure", url: null, what: "Enable the event" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Enable the event")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("renders a provide-secret need's Provide and Done", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "provide-secret", url: null, what: "Add the token" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Add the token")).toBeTruthy());
+    expect(slot.getByRole("button", { name: "Provide" })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } }));
+    slot.lifecycle.unmount();
+  });
+
+  it("gives a need of a kind the sidebar has no branch for its buttons", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
+      rpc: {
+        stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [needItem({ kind: "brand-new-kind", url: null, what: "Do the new thing" })] } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Do the new thing")).toBeTruthy());
+    fireEvent.click(slot.getByRole("button", { name: "Answer" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsNeedAction", input: { needId: "need_1", action: "done", note: null, choice: null } }));
+    slot.lifecycle.unmount();
+  });
+
   it("renders a with-user escalation's prompt with no one-click buttons", async () => {
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
@@ -884,8 +972,8 @@ describe("the inline needs-you actions (BB-76)", () => {
       } as never,
     });
     await waitFor(() => expect(slot.getByText("Need cluster access")).toBeTruthy());
-    // A with-user escalation has no choices and is not an approve-pr or merge,
-    // so its prompt is one line (BB-79) and the row itself is the detail (BB-85).
+    // A with-user escalation offers no actions, so its prompt is one line (BB-79)
+    // and the row itself is the detail (BB-85).
     expect(slot.getByText("Need cluster access").className).toContain("line-clamp-1");
     expect(slot.queryByRole("button", { name: "Details" })).toBeNull();
     expect(slot.queryByRole("button", { name: "Approve" })).toBeNull();
@@ -907,19 +995,22 @@ describe("the inline needs-you actions (BB-76)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("clamps a free-text question's prompt to one line and never shows its context", async () => {
-    const long = "A free-text question the sidebar cannot answer, so one line only. ".repeat(6).trim();
+  it("shows an Answer control for a free-text question, keeps its prompt at three lines and never shows its context", async () => {
+    const long = "A free-text question the sidebar answers with one click. ".repeat(6).trim();
     const slot = await renderSidebar({
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
       rpc: {
         stewardsSidebar: () => sidebarData({ bindings: [binding({ needsUser: true })], needs: { count: 1, items: [questionItem({ question: long, context: "The evidence and reasoning the sidebar must never show." })] } }),
+        stewardsAnswerQuestion: () => ({ ok: true, message: "closed" }),
       } as never,
     });
     await waitFor(() => expect(slot.getByText(long)).toBeTruthy());
     const prompt = slot.getByText(long);
-    expect(prompt.className).toContain("line-clamp-1");
+    expect(prompt.className).toContain("line-clamp-3");
     expect(prompt.getAttribute("title")).toBe(long);
     expect(slot.queryByText(/The evidence and reasoning the sidebar must never show/u)).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Answer" }));
+    await waitFor(() => expect(slot.inspection.rpcCalls).toContainEqual({ method: "stewardsAnswerQuestion", input: { questionId: "qst_1", answer: null, choice: null } }));
     slot.lifecycle.unmount();
   });
 
