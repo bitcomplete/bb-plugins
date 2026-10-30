@@ -4,8 +4,11 @@ Talk to your own bb from Slack. One team Slack app named `bb` is installed
 once; a DM to it reaches the server of the Slack user who sent it, which runs
 a bb thread and replies in the same Slack thread.
 
-A DM and a channel mention of the app both reach the server of the Slack user
-who sent them. Per-message "Alice's bb" naming is a later step.
+A DM and the first channel mention in a conversation reach the server of the
+Slack user who sent them. The first routed mention in a conversation sets its
+owner, and a later mention by someone else goes to that same server, held for
+the owner to confirm (see "Other people's text"). Posting as "Alice's bb" per
+message is a separate later step.
 
 ## How it fits together
 
@@ -134,8 +137,9 @@ signing secret, bot token or OAuth client secret; they are sealed with
 ## Other people's text
 
 The map decides where a thread starts, not whose words it trusts. A channel
-mention by someone other than the server's owner is parked (no turn runs) and
-the plugin posts one reply asking the owner to mention it with `confirm <id>`; a
-mention by the owner that names the id releases exactly one held message into
-the thread. A vague owner reply while requests wait re-asks for the id instead
-of running a turn.
+mention by someone other than the server's owner — a later mention in a
+conversation the owner's first mention routed — is delivered to the owner's
+server marked untrusted and parked (no turn runs); the plugin posts one reply
+asking the owner to mention it with `confirm <id>`, and a mention by the owner
+that names the id releases exactly one held message into the thread. A vague
+owner reply while requests wait re-asks for the id instead of running a turn.
