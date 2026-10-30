@@ -119,6 +119,21 @@ export type IdentifyResponse = z.infer<typeof identifyResponseSchema>;
 
 const personWire = z.object({ id: z.string().max(200), name: z.string().max(200) }).loose();
 
+/**
+ * One attachment's metadata on a Slack wake: the file's id, its display name
+ * (the gate falls back to the title), its mime type and its size in bytes.
+ * Metadata only — Step 1 fetches nothing.
+ */
+export const sessionFileSchema = z
+  .object({
+    id: z.string().max(200).default(""),
+    name: z.string().max(1000).default(""),
+    mimeType: z.string().max(200).default(""),
+    size: z.number().int().nonnegative().default(0),
+  })
+  .loose();
+export type SessionFile = z.infer<typeof sessionFileSchema>;
+
 /** `event: session` as the service sends it (bb-gate/docs/hooks.md). */
 export const sessionEventSchema = z
   .object({
@@ -166,6 +181,11 @@ export const sessionEventSchema = z
      */
     responseUrl: z.string().max(2000).default(""),
     comment: z.object({ text: z.string(), untrusted: z.boolean() }).loose(),
+    /**
+     * The message's attachments, metadata only. An older service sends no
+     * field, which is read as none; nothing is fetched either way.
+     */
+    files: z.array(sessionFileSchema).max(1000).default([]),
     at: z.string().max(100).default(""),
   })
   .loose();

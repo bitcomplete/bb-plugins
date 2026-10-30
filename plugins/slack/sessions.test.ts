@@ -4,19 +4,24 @@ import {
   channelProject,
   chooseConversationProject,
   conversationOf,
+  FILES_NAMED,
+  filesLine,
+  formatFileSize,
   isFromOwner,
   isUntrusted,
   parseChannelMap,
   parseConfirm,
   parseLegacyChannelEntries,
+  sanitizeFileField,
   SESSION_TEXT_CHARS,
   sessionsSchema,
+  STEER_NOTE,
   wakeText,
   type ChannelMap,
   type ChannelEntry,
   type Project,
 } from "./sessions.js";
-import type { SessionEvent } from "./hooks-client.js";
+import type { SessionEvent, SessionFile } from "./hooks-client.js";
 
 const PROJECTS: Project[] = [
   { id: "prj-1", name: "Project One", kind: "standard" },
@@ -43,6 +48,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
     value: "",
     responseUrl: "",
     comment: { text: "build this", untrusted: false },
+    files: [],
     at: "2026-10-22T12:00:00Z",
     ...over,
   };
@@ -123,6 +129,68 @@ describe("wakeText", () => {
     expect(text).toContain("not a new question");
     // The plain text is unchanged, so a first message never carries it.
     expect(wakeText(event())).not.toContain("correction or addition");
+  });
+
+  it("appends the not-forwarded line for a new thread and a steered follow-up", () => {
+    const files: SessionFile[] = [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }];
+    const spawned = wakeText(event({ files }));
+    expect(spawned.endsWith("1 file was attached and not forwarded: shot.png (image/png, 1.2 KB)")).toBe(true);
+    const steered = wakeText(event({ files }), { steered: true });
+    expect(steered).toContain(STEER_NOTE);
+    // The files line is the wake's last line, after the steer note.
+    expect(steered.endsWith("1 file was attached and not forwarded: shot.png (image/png, 1.2 KB)")).toBe(true);
+  });
+
+  it("leaves a wake without files unchanged", () => {
+    const text = wakeText(event());
+    expect(text).not.toContain("not forwarded");
+    expect(text).toBe(wakeText(event({ files: [] })));
+  });
+});
+
+describe("filesLine", () => {
+  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, ...over });
+
+  it("names every file with its type and size", () => {
+    const line = filesLine([file(), file({ id: "F2", name: "notes.txt", mimeType: "text/plain", size: 2048 })]);
+    expect(line).toBe("2 files were attached and not forwarded: shot.png (image/png, 1.2 KB), notes.txt (text/plain, 2 KB)");
+  });
+
+  it("uses the singular for one file, and says nothing for none", () => {
+    expect(filesLine([file({ size: 512 })])).toBe("1 file was attached and not forwarded: shot.png (image/png, 512 B)");
+    expect(filesLine([])).toBe("");
+  });
+
+  it("clips a long list with 'and M more'", () => {
+    const many = Array.from({ length: FILES_NAMED + 3 }, (_, i) => file({ id: `F${i}`, name: `f${i}.png` }));
+    const line = filesLine(many);
+    expect(line).toContain("and 3 more");
+    expect(line).toContain(`f${FILES_NAMED - 1}.png`);
+    expect(line).not.toContain(`f${FILES_NAMED}.png`);
+  });
+
+  it("sanitizes an untrusted name so it cannot inject a line, mention or markup", () => {
+    const name = "shot\n<@U123> <!channel> [x](https://evil) `code`";
+    const line = filesLine([file({ name })]);
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("<");
+    expect(line).not.toContain(">");
+    expect(line).not.toContain("`");
+    expect(line).not.toContain("https://evil)");
+    expect(line).toContain("@U123");
+    expect(sanitizeFileField(name)).toBe("shot @U123 !channel xhttps://evil code");
+  });
+
+  it("falls back to placeholders for an empty name or type", () => {
+    expect(filesLine([file({ name: "", mimeType: "" })])).toContain("(unnamed) (unknown, 1.2 KB)");
+  });
+
+  it("formats sizes", () => {
+    expect(formatFileSize(0)).toBe("0 B");
+    expect(formatFileSize(999)).toBe("999 B");
+    expect(formatFileSize(1024)).toBe("1 KB");
+    expect(formatFileSize(1536)).toBe("1.5 KB");
+    expect(formatFileSize(10 * 1024 * 1024)).toBe("10 MB");
   });
 });
 
