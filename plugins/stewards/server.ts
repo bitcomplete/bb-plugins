@@ -432,11 +432,14 @@ export const rpcContract = defineRpcContract({
   stewardsBoard: {
     input: z.object({ projectId: z.string().min(1).max(100).nullable() }),
     output: z.object({
-      projects: z.array(z.object({ projectId: z.string(), name: z.string() })),
+      /** Every configured project, for the picker, with this server's local switch. */
+      projects: z.array(z.object({ projectId: z.string(), name: z.string(), enabled: z.boolean() })),
       board: z
         .object({
           projectId: z.string(),
           name: z.string(),
+          /** Whether this server stewards the project: its local, per-project switch (BB-119). */
+          enabled: z.boolean(),
           paused: z.boolean(),
           projectStewardThreadId: z.string().nullable(),
           /** The playbook schema's stages, in order: the page groups in-flight stewards by them. */
@@ -5584,8 +5587,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       },
       async stewardsBoard({ projectId: wanted }) {
         const named = new Map((await bb.sdk.projects.list()).map((p) => [p.id, p.name] as const));
-        const projects = projectIds((await configuredProjects()).map((c) => c.projectId))
-          .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId }))
+        const configs = await configuredProjects();
+        const enabledByProject = new Map(configs.map((c) => [c.projectId, c.enabled] as const));
+        const projects = projectIds(configs.map((c) => c.projectId))
+          .map((projectId) => ({ projectId, name: named.get(projectId) ?? projectId, enabled: enabledByProject.get(projectId) ?? false }))
           .sort((a, b) => a.name.localeCompare(b.name));
         const picked = projects.find((p) => p.projectId === wanted) ?? (wanted === null ? projects[0] : undefined);
         if (picked === undefined) return { projects, board: null };
@@ -5604,6 +5609,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           board: {
             projectId,
             name: picked.name,
+            enabled: picked.enabled,
             paused: (await settings.get()).paused,
             projectStewardThreadId: row.threadId,
             stages: [...STAGES],

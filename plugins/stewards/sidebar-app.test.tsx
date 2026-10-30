@@ -1071,10 +1071,11 @@ describe("the sidebar's highlighting and auto-expand (BB-85)", () => {
 // effort the Stewards page shows even with no active thread.
 describe("the board route store (BB-94)", () => {
   const boardData = () => ({
-    projects: [{ projectId: "p1", name: "Acme" }],
+    projects: [{ projectId: "p1", name: "Acme", enabled: true }],
     board: {
       projectId: "p1",
       name: "Acme",
+      enabled: true,
       paused: false,
       projectStewardThreadId: null,
       stages: [],
@@ -1406,10 +1407,11 @@ describe("the sidebar keeps its project when the route names none (BB-117)", () 
 describe("the sidebar's Open PR handoff to the detail page (BB-102)", () => {
   const prUrl = "https://github.com/acme/web/pull/1";
   const detailBoard = () => ({
-    projects: [{ projectId: "p1", name: "Acme" }],
+    projects: [{ projectId: "p1", name: "Acme", enabled: true }],
     board: {
       projectId: "p1",
       name: "Acme",
+      enabled: true,
       paused: false,
       projectStewardThreadId: null,
       stages: [],
