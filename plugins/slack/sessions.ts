@@ -252,6 +252,8 @@ export const pendingRequestSchema = z.object({
   asker: z.string(),
   text: z.string(),
   at: z.string(),
+  /** Whether the held message addressed bb; the confirm wording follows it. */
+  tagged: z.boolean().default(true),
 });
 export type PendingRequest = z.infer<typeof pendingRequestSchema>;
 

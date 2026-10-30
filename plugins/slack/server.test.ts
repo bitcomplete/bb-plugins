@@ -453,6 +453,30 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("does not log an untagged session's channel when its lease is rejected", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.state.subscribe = (body) => Response.json({ leases: [], rejected: body.watches.map((w) => ({ kind: w.kind, id: w.id, reason: "owned" })) });
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        capability: "cap-secret",
+        comment: { text: "what about the second one?", untrusted: false },
+      }),
+    );
+    await tick();
+    s.hooks.last().send(s.hooks.hello("c_2"));
+    await tick();
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).toContain("another bb server holds");
+    expect(logs).not.toContain("C0123");
+    expect(logs).not.toContain("what about the second one?");
+    expect(logs).not.toContain("cap-secret");
+    await s.stop();
+  });
+
   it("holds a non-owner's channel mention for the owner's confirmation, running no turn", async () => {
     const s = await live();
     s.hooks.last().send(
@@ -964,6 +988,36 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("does not let an untagged hold prompt consume a tagged wake's reply slot", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
+    // A tagged owner wake, unanswered.
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1712345678.901234", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    // A non-owner untagged reply arrives; the confirm prompt answers the
+    // untagged message, not the tagged one.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
+    await tick();
+    expect(String(s.hooks.messages.at(-1)?.body.text)).toContain("Carol wrote");
+    const before = s.hooks.messages.length;
+    // The turn that handled the tagged wake ended silently: it still gets its
+    // guaranteed backstop.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.length).toBe(before + 1);
+    expect(String(s.hooks.messages.at(-1)?.body.text)).toContain("finished its turn without sending a reply");
+    await s.stop();
+  });
+
   it("holds an untagged reply from someone other than the owner, wording it as written not asked", async () => {
     const s = await live();
     s.hooks.last().send(
@@ -988,6 +1042,43 @@ describe("Slack plugin", () => {
     const logs = s.harness.logEntries.map((l) => l.message).join("\n");
     expect(logs).not.toContain("C0123");
     expect(logs).not.toContain("Carol");
+    await s.stop();
+  });
+
+  it("words a confirmed untagged reply as written even when the owner confirms with a mention", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1.2",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
+    await tick();
+    const id = /confirm (r-[a-z0-9]+)/u.exec(String(s.hooks.messages.at(-1)?.body.text ?? ""))?.[1];
+    expect(id).toBeTruthy();
+    // The owner confirms with a tagged mention; the held message's own tagged
+    // flag decides the wording that reaches the thread.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1.2",
+        channel: "C0123",
+        mention: true,
+        tagged: true,
+        fromOwner: true,
+        comment: { text: `<@U-bb> confirm ${id}`, untrusted: false },
+      }),
+    );
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    const released = String((spawns[0]![0] as { prompt: string }).prompt);
+    expect(released).toContain("Carol wrote");
+    expect(released).not.toContain("Carol asked");
     await s.stop();
   });
 
