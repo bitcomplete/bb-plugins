@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { parsePlaybook } from "./config.js";
+import { explainDecision, formatDecisionListing } from "./decisions.js";
 import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
@@ -308,6 +309,45 @@ describe("the nightly prompt", () => {
     const none = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
     expect(none).toMatch(/no standing-rules list configured/u);
     expect(none).toMatch(/Add only the limits this change needs, in at most three points/u);
+  });
+});
+
+describe("the decide-list listing in the wakes (BB-135)", () => {
+  const entries = [
+    { text: "Identity and access", decide: "user" as const, paths: ["bb-gate/hooks/**"] },
+    { text: "A cross-repo contract", decide: "project" as const, paths: ["bb-gate/docs/hooks.md"] },
+  ];
+  const listing = () => formatDecisionListing(explainDecision(["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"], entries));
+
+  it("prints the listing on an approval escalation routed to the project steward", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve acme/web#7", meanwhile: "Wait for the project steward's decision.", route: "project", recommendation: null, resolutionKind: "approve-decline", url: "https://github.com/acme/web/pull/7" });
+    const wake = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b, listing: listing() }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
+    expect(wake).toContain('"Identity and access" [user] — bb-gate/hooks/slack.go');
+    expect(wake).toContain('"A cross-repo contract" [project] — bb-gate/docs/hooks.md');
+    expect(wake).toContain('Deciding entry: "Identity and access" [user].');
+    expect(wake).toContain("Rule: a `user` entry wins");
+  });
+
+  it("prints the listing on a plugin-filed approve-pr need in the project wake", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const need = s.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub", how: `Post the unsigned comment as you.\n\n${listing()}`, data: { decideListing: listing() }, filedBy: "plugin" });
+    const wake = formatProjectWake({ reason: "nightly", bindings: [], routed: [], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], needs: [{ need, binding: b }] });
+    expect(wake).toContain("## Needs you");
+    expect(wake).toContain('Deciding entry: "Identity and access" [user].');
+    expect(wake).toContain("Rule: a `user` entry wins");
+  });
+
+  it("prints the listing on the owner's approve-pr item in the steward wake", () => {
+    const { s, bind } = world();
+    const b = bind("ENG-12");
+    const need = s.fileNeed({ bindingId: b.id, kind: "approve-pr", url: "https://github.com/acme/web/pull/7", what: "Approve acme/web#7 on GitHub", how: `Post the unsigned comment as you.\n\n${listing()}`, data: { decideListing: listing() }, filedBy: "plugin" });
+    const wake = formatWake(wakeInput({ binding: b, needs: [need] }));
+    expect(wake).toContain("## Waiting on you");
+    expect(wake).toContain('Deciding entry: "Identity and access" [user].');
+    expect(wake).toContain("Rule: a `user` entry wins");
   });
 });
 

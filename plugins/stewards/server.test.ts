@@ -9105,11 +9105,12 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
   const reviewMarker = (lane: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
 
   /** A bound ticket with one linked pull request, observed. */
-  async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[] } = {}) {
+  async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[]; project?: Record<string, unknown> } = {}) {
     const repo = over.repo ?? "acme/web";
     const number = over.number ?? 7;
     const key = `${repo}#${number}`;
     const t = await setup();
+    if (over.project !== undefined) t.files[PROJECT_FILE] = JSON.stringify(over.project);
     t.entities.set("uuid-12", issue({ linkedPulls: [{ key, url: `https://github.com/${repo}/pull/${number}` }] }));
     t.entities.set(key, pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments, ...over.entityOver }, { checks: { state: "success", failing: [] }, ...over.pullOver }));
     if (over.files !== undefined) t.githubFiles.set(key, over.files);
@@ -9197,10 +9198,71 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
 
   it("names the matched decide-list entry and who decides", async () => {
     const t = await withPull([reviewMarker("owner-reviewed")], { files: ["bb-gate/docs/hooks.md"] });
-    const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { decision: { entry: string | null; decide: string }; gateMet: boolean };
-    expect(json.decision).toEqual({ entry: "A cross-repo contract other repos implement", decide: "project", why: null });
+    const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { decision: { entry: string | null; decide: string; why: string | null; listing: string }; gateMet: boolean };
+    expect(json.decision).toMatchObject({ entry: "A cross-repo contract other repos implement", decide: "project" });
+    expect(json.decision.why).toMatch(/project steward's decision/u);
+    expect(json.decision.listing).toContain('"A cross-repo contract other repos implement" [project] — bb-gate/docs/hooks.md');
+    expect(json.decision.listing).toContain('Deciding entry: "A cross-repo contract other repos implement" [project].');
+    expect(json.decision.listing).toContain("Rule: a `user` entry wins");
     // The project steward's approval is still needed, so the gate is not met.
     expect(json.gateMet).toBe(false);
+  });
+
+  it("refuses a project-steward approve, with the listing, when a user entry also matched (BB-135)", async () => {
+    const entries = [
+      { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    const t = await withPull([reviewMarker("owner-reviewed")], {
+      files: ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"],
+      project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
+    });
+    // The user's lane: the files touch both entries, so the project steward
+    // cannot approve under the project entry.
+    const update = await t.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t.project);
+    expect(update.error, update.text).toBe(true);
+    expect(update.text).toContain("the user's to approve");
+    expect(update.text).toContain('"Identity and access" [user]');
+    expect(update.text).toContain('"A cross-repo contract other repos implement" [project]');
+    expect(update.text).toContain('Deciding entry: "Identity and access" [user].');
+    expect(update.text).toContain("Rule: a `user` entry wins");
+    // No bb-approval marker was posted.
+    expect(t.githubComments.filter((c) => c.body.startsWith("<!-- bb-approval"))).toHaveLength(0);
+  });
+
+  it("carries the decide-list listing on the owner's approve-pr item (BB-135)", async () => {
+    const entries = [
+      { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    const t = await withPull([reviewMarker("owner-reviewed")], {
+      files: ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"],
+      project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
+    });
+    const need = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    expect(need.how).toContain('"Identity and access" [user]');
+    expect(need.how).toContain('"A cross-repo contract other repos implement" [project]');
+    expect(need.how).toContain("Rule: a `user` entry wins");
+    expect(need.data.decideListing).toContain("Deciding entry: \"Identity and access\" [user].");
+  });
+
+  it("drops a stale decide-list listing when the head moves while checks are red (BB-135 review round 1)", async () => {
+    const entries = [
+      { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    const t = await withPull([reviewMarker("owner-reviewed")], {
+      files: ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"],
+      project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
+    });
+    const before = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    expect(before.data.decideListing).toContain("Decide list:");
+    // Checks go red at a new head: the old head's listing is not shown.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", comments: [reviewMarker("owner-reviewed")] }, { checks: { state: "failure", failing: ["ci"] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    expect(after.data.decideListing).toBeUndefined();
+    expect(after.how).not.toContain("Decide list:");
   });
 
   it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {

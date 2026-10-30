@@ -1001,11 +1001,16 @@ function projectLessonsLines(lessons: Lesson[], rules: LessonRules | undefined):
   return out;
 }
 
+/** The decide-list listing a plugin-filed `approve-pr` need carries, or null (BB-135). */
+function needListing(n: Need): string | null {
+  return typeof n.data.decideListing === "string" && n.data.decideListing !== "" ? n.data.decideListing : null;
+}
+
 /** What the project steward is woken with, at the end of a nightly pass or when an escalation reaches it. */
 export function formatProjectWake(input: {
   reason: string;
   bindings: Array<{ binding: Binding; openEscalations: Escalation[] }>;
-  routed: Array<{ escalation: Escalation; from: Binding }>;
+  routed: Array<{ escalation: Escalation; from: Binding; /** The decide-list listing when the escalation is an approval (BB-135). */ listing?: string }>;
   /** Escalations forwarded to the user and not yet answered. */
   withUser?: Array<{ escalation: Escalation; from: Binding }>;
   problems: string[];
@@ -1037,8 +1042,10 @@ export function formatProjectWake(input: {
     // New: not in an earlier prompt. Still open: sent before and not yet decided.
     const fresh = input.routed.filter((r) => r.escalation.deliveredAt === null);
     const before = input.routed.filter((r) => r.escalation.deliveredAt !== null);
-    const line = ({ escalation: x, from }: { escalation: Escalation; from: Binding }) =>
-      `- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`;
+    const line = ({ escalation: x, from, listing }: { escalation: Escalation; from: Binding; listing?: string }): string => {
+      const base = `- ${x.id} from ${from.entityKey} (${x.kind}): ${x.question}${choicesNote(x.choices)} Meanwhile: ${x.meanwhile}${x.recommendation === null ? "" : ` Recommendation: ${x.recommendation}`}`;
+      return listing === undefined ? base : `${base}\n  ${listing.split("\n").join("\n  ")}`;
+    };
     if (fresh.length > 0) out.push("## New escalations routed to you", "", ...fresh.map(line), "");
     if (before.length > 0) out.push("## Escalations still open with you", "", "Sent in an earlier prompt and not decided when this one was sent. One you have answered since needs nothing more.", "", ...before.map(line), "");
     out.push(
@@ -1101,7 +1108,9 @@ export function formatProjectWake(input: {
   const needs = input.needs ?? [];
   if (needs.length > 0) {
     out.push("## Needs you", "");
-    for (const { need: n, binding } of needs) out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}`);
+    for (const { need: n, binding } of needs) {
+      out.push(`- ${n.id} (${n.kind}, ${binding.entityKey}): ${oneLine(n.what)}${choicesNote(needChoices(n))}${n.url === "" ? "" : ` — ${n.url}`}${needListing(n) === null ? "" : `\n  ${needListing(n)!.split("\n").join("\n  ")}`}`);
+    }
     out.push("", "The Stewards page has a button for each. Do not ask the user about one in prose.", "");
   }
   const lessons = input.lessons ?? [];
