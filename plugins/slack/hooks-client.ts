@@ -238,6 +238,18 @@ export function fetchBotChannels(fetchImpl: FetchLike, baseUrl: string, signal: 
   return getJson(fetchImpl, baseUrl, "/v1/slack/bot/channels", botChannelsResponseSchema, "the bot channel list", signal);
 }
 
+/**
+ * POST /v1/slack/bot/join: have the app's bot join a public channel, so the
+ * developer need not /invite it from Slack. The service joins with the bot
+ * token it holds; the pod sends only its connection id and the channel id.
+ * Throws HooksRequestError with `code` "private-channel", "channel-not-found",
+ * "archived" or "missing-scope" when Slack refused for a reason the settings
+ * page can explain.
+ */
+export function joinChannel(fetchImpl: FetchLike, baseUrl: string, connection: string, channel: string, signal: AbortSignal): Promise<{ ok?: boolean }> {
+  return postJson(fetchImpl, baseUrl, "/v1/slack/bot/join", { connection, channel }, okSchema, "the Slack channel join", signal);
+}
+
 export type SessionReply = { session: string; connection: string; text: string };
 export type SessionStatus = { session: string; connection: string; status: string };
 export type SessionTitle = { session: string; connection: string; title: string };
@@ -342,6 +354,8 @@ export interface HooksLoop {
   title(session: string, title: string, signal: AbortSignal): Promise<void>;
   /** Post an ephemeral message, visible only to the connection's own bound user. */
   ephemeral(ephemeral: Omit<SessionEphemeral, "connection">, signal: AbortSignal): Promise<void>;
+  /** Have the bot join a public channel. Throws HooksRequestError, or an Error when there is no connection. */
+  joinChannel(channel: string, signal: AbortSignal): Promise<void>;
   /** Mint a sign-in URL for this connection. Throws when there is no connection. */
   signinStart(signal: AbortSignal): Promise<SigninStartResponse>;
   /** Complete a sign-in flow on the connection that started it. */
@@ -503,6 +517,10 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async ephemeral(ephemeral, signal) {
       await postEphemeral(deps.fetch, deps.baseUrl, { connection: requireConnection(), ...ephemeral }, signal);
+    },
+
+    async joinChannel(channel, signal) {
+      await joinChannel(deps.fetch, deps.baseUrl, requireConnection(), channel, signal);
     },
 
     async signinStart(signal) {

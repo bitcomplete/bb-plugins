@@ -56,7 +56,14 @@ stored user token, paginated and cached in memory for a few minutes per
 server; filtering by name is local. A still-valid OpenID token from a sign-in
 before this change cannot list channels, so the picker says "Sign in again to
 search channels" and falls back to the id box. A channel the app's bot is not a
-member of is flagged "bb is not in this channel yet; invite it".
+member of gets a prompt under its row, "bb is not in #name yet. Add bb to this
+channel?", with an **Add bb** button: the plugin asks bb-gate-hooks
+(`POST /v1/slack/bot/join`), which joins with the bot token it holds, so the
+pod never needs one. Slack lets a bot join only public channels by itself, so
+for a private channel the prompt says to type `/invite @bb` in Slack instead,
+and so does every refusal (an app installed without the `channels:join` bot
+scope, an older service without the endpoint). The bot's own join raises no
+"which project?" prompt in Slack: that asks only when a person invites it.
 
 Words from anyone but the owner never run a turn. A channel mention by someone
 else is held under a short id and the owner releases it by mentioning the app

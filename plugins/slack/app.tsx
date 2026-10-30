@@ -36,6 +36,12 @@ interface ChannelSearch {
   message?: string;
 }
 
+/** The joinChannel RPC's answer. */
+interface JoinResult {
+  state: "joined" | "private" | "not-found" | "unavailable";
+  message?: string;
+}
+
 interface Status {
   signedIn: boolean;
   user: { id: string; name: string } | null;
@@ -55,15 +61,62 @@ function needsInvite(channel: string, botChannels: string[] | null): boolean {
   return botChannels !== null && isChannelId(channel) && !botChannels.includes(channel.trim());
 }
 
-/** The one-line note under a row: private, Slack Connect, or not invited yet. */
-function channelNote(channel: string, options: ChannelOption[], botChannels: string[] | null): string | null {
+/** The one-line note under a row: private or Slack Connect. */
+function channelNote(channel: string, options: ChannelOption[]): string | null {
   if (channel.trim() === "") return null;
-  if (needsInvite(channel, botChannels)) return "bb is not in this channel yet; invite it";
   const known = options.find((c) => c.id === channel.trim());
   if (known === null || known === undefined) return null;
   if (known.extShared) return "Slack Connect channel";
   if (known.private) return "Private channel";
   return null;
+}
+
+/** `#name` for a channel in the list, else its id. */
+function channelLabel(channel: string, options: ChannelOption[]): string {
+  const known = options.find((c) => c.id === channel.trim());
+  return known === undefined ? channel.trim() : `#${known.name}`;
+}
+
+/**
+ * The prompt under a row whose channel bb's bot is not in: "Add bb to this
+ * channel?" with a button that has the bot join, or, for a private channel,
+ * where only a member can invite it, the /invite to type in Slack.
+ */
+function InvitePrompt({
+  channel,
+  options,
+  result,
+  pending,
+  disabled,
+  join,
+}: {
+  channel: string;
+  options: ChannelOption[];
+  result: JoinResult | null;
+  pending: boolean;
+  disabled: boolean;
+  join: () => void;
+}) {
+  const label = channelLabel(channel, options);
+  const known = options.find((c) => c.id === channel.trim());
+  if (known?.private === true || result?.state === "private") {
+    return (
+      <span className="text-xs text-muted-foreground">
+        bb is not in {label} yet, and cannot join a private channel by itself. In Slack, open {label} and type <code>/invite @bb</code>.
+      </span>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">bb is not in {label} yet. Add bb to this channel?</span>
+        <Button variant="outline" size="sm" disabled={disabled || pending} onClick={join}>
+          {pending ? "Adding…" : "Add bb"}
+        </Button>
+      </div>
+      {result !== null && result.state !== "joined" && result.message !== undefined ? <span className="text-xs text-destructive">{result.message}</span> : null}
+    </div>
+  );
 }
 
 /** The meta text beside an option in the dropdown. */
@@ -226,14 +279,27 @@ function ChannelMapEditor({
   search,
   busy,
   save,
+  join,
 }: {
   status: Status;
   search: ChannelSearch | null;
   busy: boolean;
   save: (map: { fallback: string; channels: ChannelEntry[] }) => void;
+  join: (channel: string) => Promise<JoinResult>;
 }) {
   const [fallback, setFallback] = useState(status.fallback);
   const [rows, setRows] = useState<ChannelEntry[]>(status.channels);
+  // What "Add bb" answered per channel id, and which joins are in flight.
+  const [joins, setJoins] = useState<Record<string, JoinResult>>({});
+  const [joining, setJoining] = useState<Record<string, boolean>>({});
+  const addBot = (channel: string) => {
+    const id = channel.trim();
+    setJoining((all) => ({ ...all, [id]: true }));
+    join(id)
+      .then((result) => setJoins((all) => ({ ...all, [id]: result })))
+      .catch((e: unknown) => setJoins((all) => ({ ...all, [id]: { state: "unavailable", message: e instanceof Error ? e.message : String(e) } })))
+      .finally(() => setJoining((all) => ({ ...all, [id]: false })));
+  };
   useEffect(() => {
     setFallback(status.fallback);
     setRows(status.channels);
@@ -292,7 +358,9 @@ function ChannelMapEditor({
       </div>
       {rows.length === 0 ? <p className="text-muted-foreground">No channel entries yet.</p> : null}
       {rows.map((row, index) => {
-        const note = channelNote(row.channel, options, botChannels);
+        const note = channelNote(row.channel, options);
+        const id = row.channel.trim();
+        const joined = joins[id]?.state === "joined";
         return (
           <div key={index} className="flex flex-col gap-0.5">
             <div className="flex items-center gap-2">
@@ -322,6 +390,17 @@ function ChannelMapEditor({
               </Button>
             </div>
             {note !== null ? <span className="text-xs text-muted-foreground">{note}</span> : null}
+            {needsInvite(row.channel, botChannels) && !joined ? (
+              <InvitePrompt
+                channel={row.channel}
+                options={options}
+                result={joins[id] ?? null}
+                pending={joining[id] === true}
+                disabled={busy}
+                join={() => addBot(row.channel)}
+              />
+            ) : null}
+            {joined ? <span className="text-xs text-muted-foreground">Added bb to {channelLabel(row.channel, options)}.</span> : null}
           </div>
         );
       })}
@@ -427,7 +506,18 @@ function SlackSection() {
         )}
       </div>
       {status.projects.length > 0 ? (
-        <ChannelMapEditor status={status} search={search} busy={busy} save={(map) => void act(() => rpc.call("setMap", map))} />
+        <ChannelMapEditor
+          status={status}
+          search={search}
+          busy={busy}
+          save={(map) => void act(() => rpc.call("setMap", map))}
+          join={async (channel) => {
+            const result = (await rpc.call("joinChannel", { channel })) as JoinResult;
+            // The bot's membership list changed; reload it so the flag clears.
+            if (result.state === "joined") loadChannels();
+            return result;
+          }}
+        />
       ) : null}
       {!status.hooks.connected && status.hooks.configured ? <p className="text-muted-foreground">Connecting to bb-gate-hooks…</p> : null}
       {error !== null ? <p className="text-destructive">{error}</p> : null}
