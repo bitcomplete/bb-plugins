@@ -9036,6 +9036,17 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(t.hooks.store.find("ENG-12")!.modelReviewer).toBe("pi/fireworks/accounts/fireworks/models/other-reviewer");
     const overridden = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer", "ENG-12", "--project", "p1"]);
     expect(overridden.stdout).toContain("--model fireworks/accounts/fireworks/models/other-reviewer");
+
+    // A reviewerModel with no binding names the binding, like the other models.
+    const noBinding = await t.tool("steward_update", { reviewerModel: "pi/fireworks/accounts/fireworks/models/other-reviewer" }, t.spawns[0]!.id);
+    expect(noBinding.error).toBe(true);
+    expect(noBinding.text).toMatch(/Name the binding/u);
+
+    // `--role reviewer` only makes sense from the worker it reviews for: run
+    // from the steward it would parent the reviewer to the steward.
+    const fromSteward = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer", "ENG-12", "--project", "p1"], { threadId: t.spawns[1]!.id, projectId: "p1" });
+    expect(fromSteward.exitCode).toBe(1);
+    expect(fromSteward.stderr).toMatch(/run from the worker thread/u);
   });
 
   it("resolves spawn-flags --role reviewer from the invoking worker thread", async () => {
@@ -9128,11 +9139,42 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/merged with bb stewards merge/u);
   });
 
-  it("carries the restart note when the project's guidance says a merge to that repo restarts servers", async () => {
-    const t = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins" });
-    t.files["AGENTS.md"] = "## Shipping a plugin change\n\nLanding on `bb-plugins` main is not instant: a new image is built, and every developer's server will restart when they press Restart now.\n";
-    const merged = await t.harness.behavior.runCli(["merge", "bitcomplete/bb-plugins#7", "--project", "p1"]);
+  it("names the approved sha and the since-then line when the head moved past it", async () => {
+    const approved = "bbbbbbb2";
+    const moved = comment({ id: "m-moved", author: "trotterdylan", body: `<!-- bb-review round=1 sha=${approved} verdict=approved lane=no-review -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+    const t = await withPull([moved], { pullOver: { headSha: "ccccccc3" } });
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
     expect(merged.exitCode).toBe(0);
-    expect(t.githubComments.at(-1)!.body).toMatch(/moves the pin and stages a restart/u);
+    // The summary names the reviewer's approved sha, not the head...
+    expect(merged.stdout).toMatch(/reviewer approved bbbbbbb/u);
+    const body = t.githubComments.at(-1)!.body;
+    expect(body).toMatch(/Merged: no-review lane, reviewer approved bbbbbbb, checks green/u);
+    // ...and the comment carries the since-then line for the moved head.
+    expect(body).toMatch(/since then: the head moved to ccccccc/u);
+  });
+
+  it("carries the restart note only when one guidance paragraph names the repo, says restart and makes an every-merge claim", async () => {
+    const withNote = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins" });
+    // The real `.bb/AGENTS.md` shape ("Who merges"): all three in one paragraph.
+    withNote.files["AGENTS.md"] = "The lane decides who approves, not what ships. **Any merge to `bb-plugins` `main`, docs included, moves the pin**, builds a new `bb-server` image and stages a restart for every developer.\n";
+    const merged = await withNote.harness.behavior.runCli(["merge", "bitcomplete/bb-plugins#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(withNote.githubComments.at(-1)!.body).toMatch(/moves the pin and stages a restart/u);
+
+    // A devbox-shaped paragraph names the repo and says "restart" but makes no
+    // every-merge claim, so no note: the false positive the reviewer found.
+    const devbox = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/devbox" });
+    devbox.files["AGENTS.md"] = "## Change classification\n\nA change to `devbox/host/**` is production infrastructure. A merge rebuilds the `bb-server` image and restarts every developer's server.\n";
+    const devboxMerged = await devbox.harness.behavior.runCli(["merge", "bitcomplete/devbox#7", "--project", "p1"]);
+    expect(devboxMerged.exitCode).toBe(0);
+    expect(devbox.githubComments.at(-1)!.body).not.toMatch(/moves the pin/u);
+
+    // The repo named in one paragraph and "restart" in another, in the same
+    // section, is not the project saying a merge to that repo restarts servers.
+    const split = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-gate" });
+    split.files["AGENTS.md"] = "## Shipping a plugin change\n\nLanding on `bb-gate` main is not instant; the pin is rewritten.\n\nEvery developer's server will restart when a staged image lands.\n";
+    const splitMerged = await split.harness.behavior.runCli(["merge", "bitcomplete/bb-gate#7", "--project", "p1"]);
+    expect(splitMerged.exitCode).toBe(0);
+    expect(split.githubComments.at(-1)!.body).not.toMatch(/moves the pin/u);
   });
 });
