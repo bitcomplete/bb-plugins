@@ -33,6 +33,9 @@ function world() {
   const dependabotAlerts = new Map<string, unknown[]>();
   /** Entity ids whose snapshot read throws, for the failed-read test (BB-115). */
   const snapshotErrors = new Set<string>();
+  /** The fake linear dedup search: unsupported (github-style decline) or an error, for BB-136. */
+  let searchUnsupported = false;
+  let searchError: string | null = null;
   /** The login `sourceValidate` reports, per source; tests override one to make it unreadable (BB-105). */
   const viewers: Partial<Record<"linear" | "github", string | null>> = {};
   /** Deployments the fake github serves, by `lowercased repo lowercased environment`. */
@@ -149,6 +152,21 @@ function world() {
           .map((e) => ({ id: e.id, key: e.key, unit: e.unit, kind: e.kind, state: e.state, labels: e.labels, author: e.author, draft: e.pull?.draft ?? false, createdAt: e.createdAt })),
         errors: [],
       };
+    } else if (args.method === "sourceSearchIssues") {
+      const units = input.units as string[];
+      const query = String(input.query);
+      out = searchUnsupported
+        ? { issues: [], unsupported: true, errors: [] }
+        : searchError !== null
+          ? { issues: [], unsupported: false, errors: [searchError] }
+          : {
+              issues: [...entities.values()]
+                .filter((e) => SOURCE_PLUGIN_IDS[e.source] === args.pluginId && units.some((u) => u.toLowerCase() === e.unit.toLowerCase()))
+                .filter((e) => (e.description ?? "").includes(query) || (e.title ?? "").includes(query))
+                .map((e) => ({ id: e.id, key: e.key, title: e.title, description: e.description, state: e.state, stateType: e.stateType, unit: e.unit, assignee: e.assignees[0] ?? null })),
+              unsupported: false,
+              errors: [],
+            };
     } else if (args.method === "sourceValidate") {
       // The real plugins validate the input; an empty label was once accepted here and rejected there.
       sourceContract.sourceValidate.input.parse(input);
@@ -352,7 +370,7 @@ function world() {
     },
   };
   let now = Date.parse("2026-10-14T15:00:00Z");
-  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
+  return { files, writes, fileContents, repos, primary, entities, projectList, dependabotAlerts, sourceDeployments, sourceFiles, sourceCommits, sourceRuns, sourceCompares, viewers, rpcCalls, setSnapshotError: (id: string, fail: boolean) => { if (fail) snapshotErrors.add(id); else snapshotErrors.delete(id); }, setSearchUnsupported: (value: boolean) => { searchUnsupported = value; }, setSearchError: (value: string | null) => { searchError = value; }, setCreatePullError: (value: string | null) => { createPullError = value; }, setMergePullError: (value: string | null) => { mergePullError = value; }, threads, deletes, sections, usage, metadata, spawns, sends, userTurns, githubComments, githubReviews, githubMerges, githubPulls, githubClosedPulls, githubDefaultBranches, githubFiles, githubFileContents, github, sdk, uiPreferences, uiPreferencesWrites, now: () => now, advance: (ms: number) => (now += ms) };
 }
 
 async function setup(extra: Partial<StewardsDeps> = {}, settings: Record<string, string> = {}, seedProvider?: string | null | "fail-list" | "fail-set") {
@@ -6139,7 +6157,7 @@ describe("ops stewards", () => {
   const opsProject = (targets: string[] = ["bb-gate-production"], extra: Record<string, unknown> = {}) =>
     JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, ops: { targets: targets.map((name) => ({ kind: "k8s-namespace", name })), ...extra } });
 
-  async function watched(over: { unreachable?: boolean } = {}) {
+  async function watched(over: { unreachable?: boolean; entities?: Array<[string, EntitySnapshot]>; linearLogin?: string | null; searchError?: string; searchUnsupported?: boolean } = {}) {
     const c = cluster();
     const t = await setup({ kubectl: c.kubectl });
     t.files[PROJECT_FILE] = opsProject();
@@ -6147,6 +6165,10 @@ describe("ops stewards", () => {
     c.state.pods = [crashingPod()];
     c.state.events = [warningEvent("bb-gate-router-6d4f9c7b8-x2k4q")];
     if (over.unreachable === true) c.state.unreachable = true;
+    if (over.linearLogin !== undefined) t.viewers.linear = over.linearLogin;
+    if (over.searchError !== undefined) t.setSearchError(over.searchError);
+    if (over.searchUnsupported === true) t.setSearchUnsupported(true);
+    for (const [id, entity] of over.entities ?? []) t.entities.set(id, entity);
     await t.hooks.sweep();
     await t.flush();
     const steward = () => t.spawns.find((x) => String(x.title).startsWith("Ops watch"));
@@ -6245,6 +6267,76 @@ describe("ops stewards", () => {
   it("criterion 7: the wake assigns every ticket it files to this server's owner", async () => {
     const { wakes } = await watched();
     expect(wakes()[0]).toMatch(/Assign every ticket you file to this server's owner, Jane, and to no one else/u);
+  });
+
+  it("adopts an unmapped fingerprint from an exact Fingerprint line in the team, and never reassigns", async () => {
+    const found = issue({ id: "ENG-77", key: "ENG-77", title: "Router crash-loop", state: "In Progress", stateType: "started", assignees: ["Sam"], description: `Seen in prod.\nFingerprint: \`${FP}\`\nReopened.` });
+    const { t, wakes } = await watched({ entities: [["ENG-77", found]] });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on ENG-77 \(open\)/u);
+    expect(first).toMatch(/ticket ENG-77 \(In Progress\)/u);
+    expect(first).toMatch(/Assignee: Jane/u);
+    expect(first).not.toMatch(/### New: no ticket yet/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "ENG-77" });
+    // The plugin only classifies and reports: the ticket's own assignee is untouched.
+    expect(t.entities.get("ENG-77")!.assignees).toEqual(["Sam"]);
+  });
+
+  it("does not adopt a title-only or inexact fingerprint match", async () => {
+    const titleOnly = issue({ id: "ENG-78", key: "ENG-78", title: `Fingerprint: \`${FP}\``, description: "No fingerprint line here.", state: "In Progress", stateType: "started" });
+    const inexact = issue({ id: "ENG-79", key: "ENG-79", title: "Other", description: `The fingerprint is Fingerprint: \`${FP}\` in a sentence.`, state: "In Progress", stateType: "started" });
+    const { t, wakes } = await watched({ entities: [["ENG-78", titleOnly], ["ENG-79", inexact]] });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### New: no ticket yet/u);
+    expect(first).toMatch(/New \(no ticket found\)/u);
+    expect(first).not.toMatch(/Dedup unavailable/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: null });
+  });
+
+  it("prefers an open ticket when two carry the same exact fingerprint line", async () => {
+    const closed = issue({ id: "ENG-80", key: "ENG-80", title: "Old", state: "Done", stateType: "completed", description: `Fingerprint: \`${FP}\`` });
+    const open = issue({ id: "ENG-81", key: "ENG-81", title: "Current", state: "In Progress", stateType: "started", description: `Fingerprint: \`${FP}\`` });
+    const { t, wakes } = await watched({ entities: [["ENG-80", closed], ["ENG-81", open]] });
+    expect(wakes()[0]).toMatch(/Recurring on ENG-81 \(open\)/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "ENG-81" });
+  });
+
+  it("marks the finding dedup unavailable and tells the steward to search itself when the search fails", async () => {
+    const { t, wakes } = await watched({ searchError: "Linear rate limited the read" });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### New: no ticket yet/u);
+    expect(first).toMatch(/New \(no ticket found\)/u);
+    expect(first).toMatch(/Dedup unavailable/u);
+    expect(first).toMatch(/linear_search/u);
+    expect(first).toMatch(/Assignee: Jane/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: null });
+  });
+
+  it("treats a source that declines the search as dedup unavailable", async () => {
+    const { wakes } = await watched({ searchUnsupported: true });
+    expect(wakes()[0]).toMatch(/Dedup unavailable/u);
+  });
+
+  it("reports the assignee as unassigned when the Linear login cannot be read", async () => {
+    const { wakes } = await watched({ linearLogin: null });
+    const first = wakes()[0]!;
+    expect(first).toMatch(/Assignee: unassigned \(login unreadable\)/u);
+    expect(first).toMatch(/file every ticket unassigned/u);
+  });
+
+  it("dates a returned ticket's close and whether it is inside the two-week window", async () => {
+    const returned = async (days: number) => {
+      const { t, steward, wakes } = await watched();
+      const ops = steward()!;
+      await t.tool("steward_report", { phase: "watching", summary: "Filed.", nextAction: "Watch", actor: "steward", opsTickets: [{ fingerprint: FP, ticket: "ENG-50", did: "filed" }] }, ops.id);
+      t.entities.set("ENG-50", issue({ id: "ENG-50", key: "ENG-50", labels: ["bb-managed"], state: "Done", stateType: "completed", completedAt: new Date(t.now() - days * 86_400_000).toISOString() }));
+      await t.hooks.sweep();
+      await t.flush();
+      return wakes().at(-1)!;
+    };
+    expect(await returned(13)).toMatch(/Returned: ENG-50 closed .*, within two weeks/u);
+    expect(await returned(15)).toMatch(/Returned: ENG-50 closed .*, outside two weeks/u);
   });
 
   it("takes a short turn at every requeue when all is healthy, and none between", async () => {
@@ -6410,13 +6502,14 @@ describe("dependency stewards", () => {
     ...over,
   });
 
-  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}) {
+  async function watching(alerts: unknown[] = [alert()], project: Record<string, unknown> = {}, entities: Array<[string, EntitySnapshot]> = []) {
     const t = await setup();
     // The fixture's primary (acme/bb) is a stewarded repo too; these tests watch one repo.
     t.files[PROJECT_FILE] = JSON.stringify({ version: 1, linear: { teams: ["ENG"] }, github: { exclude: ["acme/bb"] }, ...project });
     t.files[playbookPath("deps-alerts")] = DEPS_ALERTS;
     t.files[playbookPath("deps-prs")] = DEPS_PRS;
     t.dependabotAlerts.set("acme/web", alerts);
+    for (const [id, entity] of entities) t.entities.set(id, entity);
     await t.hooks.sweep();
     await t.flush();
     const steward = () => t.spawns.find((x) => String(x.title).startsWith("Deps watch"));
@@ -6457,6 +6550,18 @@ describe("dependency stewards", () => {
   it("criterion 7: the wake assigns every ticket it files to this server's owner", async () => {
     const { wakes } = await watching();
     expect(wakes()[0]).toMatch(/Assign every ticket you file to this server's owner, Jane, and to no one else/u);
+  });
+
+  it("adopts an unmapped alert fingerprint from an exact Fingerprint line, without reassigning", async () => {
+    const found = issue({ id: "ENG-77", key: "ENG-77", title: "lodash alert", state: "In Progress", stateType: "started", assignees: ["Sam"], description: "Fingerprint: `acme/web#4`" });
+    const { t, wakes } = await watching([alert()], {}, [["ENG-77", found]]);
+    const first = wakes()[0]!;
+    expect(first).toMatch(/### Recurring: its ticket is open/u);
+    expect(first).toMatch(/Recurring on ENG-77 \(open\)/u);
+    expect(first).toMatch(/ticket ENG-77 \(In Progress\)/u);
+    expect(first).toMatch(/Assignee: Jane/u);
+    expect(t.hooks.store.fingerprint("p1", "acme/web#4")).toMatchObject({ ticketKey: "ENG-77" });
+    expect(t.entities.get("ENG-77")!.assignees).toEqual(["Sam"]);
   });
 
   it("joins a second low alert to the open ticket and tightens its due date for a medium one", async () => {

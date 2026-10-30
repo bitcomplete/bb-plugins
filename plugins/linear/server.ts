@@ -116,7 +116,7 @@ import {
   type Account,
 } from "./accounts.js";
 import { createHooksLoop, HooksRequestError, HOOKS_URL_ENV, REPLY_BODY_MAX_BYTES, REPLY_KINDS, type IdentifyResponse, type Lease, type Rejection, type ReplyKind, type SessionEvent } from "./hooks-client.js";
-import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type SessionWake } from "./source-contract.js";
+import { isMissingPlugin, ringStewards, SESSION_TEXT_CHARS, sourceContract, STEWARDS_PLUGIN_ID, stewardsContract, type AdoptableEntity, type SearchIssue, type SessionWake } from "./source-contract.js";
 import { CONNECTION_CHANGED, WATCHES_CHANGED } from "./channels.js";
 import { buildUsage, createRefusals, formatUsage, usageViewSchema, type InterestView } from "./usage.js";
 import { compare, createCheckQueue, createWatchStore, initialCursors, signed, snapshotOf, WATCH_MIGRATIONS, type WatchRow } from "./watch.js";
@@ -612,6 +612,7 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       sourceSnapshot: ({ id }) => sourceSnapshot(id),
       sourceValidate: (input) => sourceValidate(input),
       sourceAdoptable: (input) => sourceAdoptable(input),
+      sourceSearchIssues: (input) => sourceSearchIssues(input),
       // Dependabot alerts are a GitHub thing; linear has none. Stewards only
       // asks github, so this is a plain answer rather than a throw.
       async sourceDependabotAlerts() {
@@ -1450,6 +1451,38 @@ export function createLinearPlugin(deps: LinearPluginDeps): (bb: BbPluginApi) =>
       }
       entities.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
       return { viewer, entities: entities.slice(0, input.limit), errors };
+    }
+
+    /** An issue as the search contract wants it: the description the caller matches the fingerprint line in. */
+    const searchIssueOf = (issue: Issue): SearchIssue => ({
+      id: issue.id,
+      key: issue.identifier,
+      title: issue.title ?? null,
+      description: issue.description ?? null,
+      state: issue.state?.name ?? "",
+      stateType: issue.state?.type ?? null,
+      unit: issue.team?.key ?? "",
+      assignee: issue.assignee?.displayName ?? issue.assignee?.name ?? issue.assignee?.email ?? null,
+    });
+
+    // For stewards' dedup: a fingerprint the map lost but a ticket still
+    // carries. Searches each team with the connected user's credential,
+    // closed issues included, and returns the descriptions so the caller can
+    // verify the exact `Fingerprint:` line itself. A team that cannot be read
+    // is an error rather than a failure of the whole call.
+    async function sourceSearchIssues(input: { units: string[]; query: string; limit: number }) {
+      if (!(await isConnected())) return { issues: [], unsupported: false, errors: [NOT_CONNECTED] };
+      const issues: SearchIssue[] = [];
+      const errors: string[] = [];
+      for (const key of [...new Set(input.units.map((u) => u.trim().toUpperCase()))]) {
+        try {
+          const { issues: found } = await searchIssues({ team: key, query: input.query, openOnly: false, limit: input.limit }, checkSignal());
+          issues.push(...found.map(searchIssueOf));
+        } catch (error) {
+          errors.push(`${key}: ${errorMessage(error)}`);
+        }
+      }
+      return { issues, unsupported: false, errors };
     }
 
     // ---- the doorbell stream ---------------------------------------------

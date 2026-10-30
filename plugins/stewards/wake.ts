@@ -636,15 +636,19 @@ export type OpsWakeInput = {
 };
 
 /**
- * How a watcher assigns the tickets it files (BB-115). The owner is this
- * server's connected Linear user, the person the watch belongs to; a login
- * that could not be read files unassigned and never guesses. The problem line
- * itself is already on `bb stewards check`.
+ * The defaults a watcher files by (BB-115, BB-136): the fingerprint line
+ * every ticket carries, who it is assigned to, and that a recurrence is a
+ * comment rather than a second ticket. The owner is this server's connected
+ * Linear user, the person the watch belongs to; a login that could not be
+ * read files unassigned and never guesses. The problem line itself is
+ * already on `bb stewards check`.
  */
 function assignInstruction(owner: string | null): string {
+  const fingerprint = "Put the problem's fingerprint in the ticket description on a line of its own, ``Fingerprint: `<fingerprint>` ``.";
+  const recurrence = "A recurrence is a comment on its ticket, never a second ticket.";
   return owner === null
-    ? "This server's Linear login could not be read, so file every ticket unassigned; never guess an assignee. `bb stewards check` says why."
-    : `Assign every ticket you file to this server's owner, ${owner}, and to no one else: pass assignee: "me" to linear_create_issue (it resolves to ${owner}).`;
+    ? `Defaults: ${fingerprint} This server's Linear login could not be read, so file every ticket unassigned; never guess an assignee. \`bb stewards check\` says why. ${recurrence}`
+    : `Defaults: ${fingerprint} Assign every ticket you file to this server's owner, ${owner}, and to no one else: pass assignee: "me" to linear_create_issue (it resolves to ${owner}). ${recurrence}`;
 }
 
 const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
@@ -656,11 +660,31 @@ const OPS_LIFECYCLE: Partial<Record<WakeReason, string>> = {
 
 const CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket yet", recurring: "Recurring: its ticket is open", returned: "Returned: its ticket was resolved" };
 
+/** The fields a finding's classification line needs; ops and deps both have them. */
+type Classified = { class: FindingClass; ticket: string | null; closedAt: string | null; window: "within" | "outside" | null };
+
+/** One line naming a finding's phase, its ticket and, for a returned problem, when it was closed. */
+function classLine(f: Classified): string {
+  if (f.class === "new") return "New (no ticket found)";
+  if (f.class === "recurring") return `Recurring on ${f.ticket} (open)`;
+  const closed = f.closedAt === null ? "closed date unknown" : `closed ${f.closedAt}, ${f.window ?? "outside"} two weeks`;
+  return `Returned: ${f.ticket} ${closed}`;
+}
+
+/** The assignee line: the owner login, or "unassigned" and why. */
+const assigneeLine = (assignee: string): string => (assignee === "unassigned" ? "unassigned (login unreadable)" : assignee);
+
+/** The dedup note a new finding carries when the plugin could not search Linear itself. */
+const DEDUP_UNAVAILABLE = "Dedup unavailable: the plugin could not search Linear for an existing ticket. Run `linear_search` for this fingerprint yourself before filing; if a ticket exists, comment on it rather than filing a second one.";
+
 function findingLines(f: OpsFinding, look: OpsLook): string[] {
   const lines = [`#### ${f.fingerprint}`, ""];
-  const ticket = f.ticket === null ? "" : ` · ticket ${f.ticket}${f.ticketState === null ? "" : ` (${f.ticketState})`}${f.lastCommentedAt === null ? "" : `, your last word on it ${iso(f.lastCommentedAt)}`}`;
+  lines.push(`- ${classLine(f)}`);
+  if (f.ticket !== null) lines.push(`- ticket ${f.ticket}${f.ticketState === null ? "" : ` (${f.ticketState})`}${f.lastCommentedAt === null ? "" : `, your last word on it ${iso(f.lastCommentedAt)}`}`);
+  lines.push(`- Assignee: ${assigneeLine(f.assignee)}`);
+  if (f.dedupUnavailable) lines.push(`- ${DEDUP_UNAVAILABLE}`);
   lines.push(`- ${f.summary}`);
-  lines.push(`- Workload ${f.workload}; pod${f.pods.length === 1 ? "" : "s"} ${f.pods.join(", ")}${f.container === null ? "" : `; container ${f.container}`}; first seen ${iso(f.firstSeenAt)}${ticket}`);
+  lines.push(`- Workload ${f.workload}; pod${f.pods.length === 1 ? "" : "s"} ${f.pods.join(", ")}${f.container === null ? "" : `; container ${f.container}`}; first seen ${iso(f.firstSeenAt)}`);
   if (f.events.length > 0) lines.push("- Warning events, newest first:", ...f.events.map((e) => `  - ${e}`));
   if (f.logs !== null) lines.push(`- Last log lines${f.previous ? " of the run that ended" : ""}:`, "", "```", ...(f.logs.length === 0 ? ["(empty)"] : f.logs), "```");
   else if (f.container !== null) lines.push(look.logs === "not granted" ? "- Logs: kubectl may not read them here. Diagnose from status and events, and say so in the ticket." : "- Logs: not read.");
@@ -760,8 +784,11 @@ const DEPS_CLASS_TITLES: Record<FindingClass, string> = { new: "New: no ticket y
 
 function depsAlertLines(a: DepsFinding, timeZone: string): string[] {
   const lines: string[] = [`#### ${a.fingerprint}`, ""];
-  const ticket = a.ticket === null ? "" : ` · ticket ${a.ticket}${a.ticketState === null ? "" : ` (${a.ticketState})`}${a.lastCommentedAt === null ? "" : `, your last word on it ${iso(a.lastCommentedAt)}`}`;
-  lines.push(`- **${a.severity}** priority ${a.priority}, due ${dueDate(a.dueAt, timeZone)}${ticket}`);
+  lines.push(`- ${classLine(a)}`);
+  if (a.ticket !== null) lines.push(`- ticket ${a.ticket}${a.ticketState === null ? "" : ` (${a.ticketState})`}${a.lastCommentedAt === null ? "" : `, your last word on it ${iso(a.lastCommentedAt)}`}`);
+  lines.push(`- Assignee: ${assigneeLine(a.assignee)}`);
+  if (a.dedupUnavailable) lines.push(`- ${DEDUP_UNAVAILABLE}`);
+  lines.push(`- **${a.severity}** priority ${a.priority}, due ${dueDate(a.dueAt, timeZone)}`);
   lines.push(`- \`${a.package}\` (${a.ecosystem})${a.manifestPath === null ? "" : ` — ${a.manifestPath}`}${a.ghsaId === null ? "" : ` — ${a.ghsaId}`}`);
   lines.push(`- ${a.fixedVersion === null ? "No fixed version yet" : `Fixed in ${a.fixedVersion}`}; first seen ${iso(a.firstSeenAt)}${a.url === null ? "" : ` — ${a.url}`}`);
   if (a.batch.kind === "join") lines.push(`- Batch: join the open ticket ${a.batch.ticketKey} (its due date is already inside this alert's).`);

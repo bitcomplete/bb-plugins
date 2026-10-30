@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_BATCH, DEFAULT_SLA, alertFingerprint, alertLine, batchAlert, deadlineAt, dueDate, isBatchable, priorityFor, sightingOf } from "./deps.js";
+import { DEFAULT_BATCH, DEFAULT_SLA, alertFingerprint, alertLine, batchAlert, deadlineAt, depsFindingSchema, dueDate, isBatchable, priorityFor, sightingOf } from "./deps.js";
 import type { DependabotAlert } from "./source-contract.js";
 
 const alert = (over: Partial<DependabotAlert> = {}): DependabotAlert => ({
@@ -97,6 +97,37 @@ describe("alert rendering", () => {
     expect(line).toMatch(/lodash/u);
     expect(line).toMatch(/fixed in 4\.17\.21/u);
     expect(alertLine(alert({ fixedVersion: null, ghsaId: null }))).toMatch(/no fixed version yet/u);
+  });
+});
+
+describe("a finding's classification fields", () => {
+  it("carries the close date, the window and the assignee, defaulting dedupUnavailable", () => {
+    const finding = {
+      fingerprint: "acme/web#4",
+      alertNumber: 4,
+      severity: "high" as const,
+      package: "lodash",
+      ecosystem: "npm",
+      manifestPath: null,
+      ghsaId: null,
+      fixedVersion: null,
+      summary: "high lodash",
+      state: "open",
+      url: null,
+      dueAt: now,
+      priority: "high",
+      class: "returned" as const,
+      ticket: "ENG-50",
+      ticketState: "Done",
+      closedAt: "2026-10-05T00:00:00Z",
+      window: "within" as const,
+      assignee: "Jane",
+      firstSeenAt: now,
+      lastCommentedAt: null,
+      batch: { kind: "new" as const },
+    };
+    expect(depsFindingSchema.parse(finding)).toMatchObject({ closedAt: "2026-10-05T00:00:00Z", window: "within", assignee: "Jane", dedupUnavailable: false });
+    expect(depsFindingSchema.parse({ ...finding, closedAt: null, window: null, dedupUnavailable: true })).toMatchObject({ closedAt: null, window: null, dedupUnavailable: true });
   });
 });
 

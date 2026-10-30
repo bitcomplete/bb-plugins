@@ -288,6 +288,8 @@ describe("what stewards reads", () => {
     estimate: 3,
     createdAt: "2026-10-01T00:00:00.000Z",
     updatedAt: "2026-10-02T00:00:00.000Z",
+    completedAt: null,
+    canceledAt: null,
     state: { name: "In Progress", type: "started" },
     team: { id: "team-uuid", key: "ENG" },
     assignee: { name: "Jane Doe", displayName: "jane" },
@@ -332,6 +334,8 @@ describe("what stewards reads", () => {
       description: "Users cannot log in.",
       createdAt: "2026-10-01T00:00:00.000Z",
       updatedAt: "2026-10-02T00:00:00.000Z",
+      completedAt: null,
+      canceledAt: null,
       comments: [
         { id: "c-1", author: "someone", did: "commented", body: "Repro?", createdAt: "2026-10-01T01:00:00Z", url: null, signedBy: null },
         { id: "c-2", author: "jane", did: "commented", body: "On it.\n\n_— from bb thread thr_abc_", createdAt: "2026-10-01T02:00:00Z", url: "https://linear.app/c/2", signedBy: "thr_abc" },
@@ -343,6 +347,13 @@ describe("what stewards reads", () => {
       viewer: "jane",
     });
     expect(parseSnapshotIssue({ data: { issue: null } })).toBeNull();
+  });
+
+  it("maps completedAt and canceledAt for a resolved issue (BB-136)", () => {
+    const done = { ...raw, state: { name: "Done", type: "completed" }, completedAt: "2026-10-03T00:00:00.000Z", canceledAt: null };
+    expect(snapshotOfIssue(parseSnapshotIssue({ data: { issue: done } })!, null)).toMatchObject({ state: "Done", stateType: "completed", completedAt: "2026-10-03T00:00:00.000Z", canceledAt: null });
+    const canceled = { ...raw, state: { name: "Canceled", type: "canceled" }, completedAt: null, canceledAt: "2026-10-04T00:00:00.000Z" };
+    expect(snapshotOfIssue(parseSnapshotIssue({ data: { issue: canceled } })!, null)).toMatchObject({ stateType: "canceled", completedAt: null, canceledAt: "2026-10-04T00:00:00.000Z" });
   });
 
   it("clips long bodies after reading their signature, and keeps the newest comments", () => {

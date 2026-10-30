@@ -67,7 +67,7 @@ import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvi
 import { KUBECTL_VERBS, createKubectlReader, kubectlRefusal, type KubectlResult, type OpsAccess, type OpsReader } from "./kubectl.js";
 import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./hooks-client.js";
 import { nightlyDue, stillNight } from "./nightly.js";
-import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
+import { classify, hasFingerprintLine, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type FingerprintRow, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
 import { advanced, answerDiffers, anyWorkerInFlight, approvalMarkerLine, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestProjectApprovalMarker, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, reviewWorkerThread, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import {
@@ -2940,9 +2940,58 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const out = new Map<string, TicketState>();
       for (const key of [...new Set(keys)].slice(0, 20)) {
         const e = await snapshot("linear", key).catch(() => null);
-        out.set(key, e === null ? null : { state: e.state, stateType: e.stateType });
+        const resolved = e !== null && (e.stateType === "completed" || e.stateType === "canceled");
+        out.set(key, e === null ? null : { state: e.state, stateType: e.stateType, closedAt: e.completedAt ?? e.canceledAt ?? (resolved ? (e.updatedAt ?? null) : null) });
       }
       return out;
+    }
+
+    /** At most this many issues a dedup search returns, and how many a look searches for. */
+    const DEDUP_LIMIT = 10;
+
+    /**
+     * The tickets a fingerprint map has lost, found by searching the team for
+     * the exact `Fingerprint:` line the steward put in the ticket. Returns the
+     * fingerprints adopted, or null when the search could not run or was
+     * partial (an older source, github, a read error), so the caller marks the
+     * new findings "dedup unavailable" and the wake tells the steward to
+     * `linear_search` itself rather than risk a duplicate. It only reads; it
+     * never files, comments or reassigns.
+     */
+    async function dedupFingerprints(team: string | null, fingerprints: string[]): Promise<Map<string, string> | null> {
+      const adopted = new Map<string, string>();
+      if (fingerprints.length === 0) return adopted;
+      // No team to search is not "nothing found": dedup did not run, so the
+      // caller marks the new findings unavailable rather than risk a duplicate.
+      if (team === null) return null;
+      for (const fingerprint of fingerprints) {
+        let out: z.infer<typeof sourceContract.sourceSearchIssues.output>;
+        try {
+          out = await sourceRpc("linear", "sourceSearchIssues", { units: [team], query: fingerprint, limit: DEDUP_LIMIT }, sourceContract.sourceSearchIssues.output);
+        } catch (error) {
+          if (!sourceRpcMissing(error)) bb.log.warn(`stewards: the dedup search for ${fingerprint} failed: ${errorMessage(error)}`);
+          return null;
+        }
+        if (out.unsupported || out.errors.length > 0) return null;
+        const matches = out.issues.filter((issue) => hasFingerprintLine(issue.description, fingerprint));
+        // A duplicate line is meant to be impossible, but if two tickets carry
+        // it, prefer one that can still be commented on over one already resolved.
+        const open = matches.find((issue) => issue.stateType !== "completed" && issue.stateType !== "canceled");
+        if (matches.length > 0) adopted.set(fingerprint, (open ?? matches[0]!).key);
+      }
+      return adopted;
+    }
+
+    /** The fingerprints of a look's sightings with no mapped ticket, for the dedup search. */
+    const unmappedFingerprints = (rows: ReadonlyMap<string, FingerprintRow>): string[] => [...rows.values()].filter((r) => r.ticketKey === null).map((r) => r.fingerprint);
+
+    /** Adopt the tickets the dedup search found into the map, so classification sees them like any mapped one. */
+    function adoptTickets(b: Binding, rows: Map<string, Fingerprint>, adopted: ReadonlyMap<string, string>): void {
+      for (const [fingerprint, ticketKey] of adopted) {
+        store.adoptTicket(b.projectId, fingerprint, ticketKey);
+        const row = rows.get(fingerprint);
+        if (row !== undefined) rows.set(fingerprint, { ...row, ticketKey });
+      }
     }
 
     /** Every ops target a project watches: the k8s namespaces, the Sentry projects and the Dependabot repositories. */
@@ -2955,8 +3004,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       try {
         const { sightings, ...rest } = await opsReaderFor(config).look(target, { now: at, since });
         const rows = store.sight(b.projectId, b.id, sightings.map((s) => ({ fingerprint: s.fingerprint, summary: s.summary })));
+        const adopted = await dedupFingerprints(roleOpsTeam(config.role, config.file), unmappedFingerprints(rows));
+        if (adopted !== null) adoptTickets(b, rows, adopted);
         const tickets = await ticketStates([...rows.values()].map((r) => r.ticketKey).filter((k): k is string => k !== null));
-        return { ...rest, at, target: opsTargetKey(target), error: null, findings: classify(sightings, rows, tickets, at) };
+        const findings = classify(sightings, rows, tickets, at, config.linearLogin).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
+        return { ...rest, at, target: opsTargetKey(target), error: null, findings };
       } catch (error) {
         return { at, target: opsTargetKey(target), error: errorMessage(error), pods: 0, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [] };
       }
@@ -3003,13 +3055,19 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             return { fingerprint: s.fingerprint, summary: s.summary, severity: s.severity, ecosystem: s.ecosystem };
           }),
         );
+        // A fingerprint the map has lost but Linear still has a ticket for is
+        // adopted here, exactly as in the ops look, before the batch plan reads
+        // the map: an adopted medium or low alert then joins its ticket like
+        // any mapped one.
+        const adopted = await dedupFingerprints(roleOpsTeam(config.role, config.file), unmappedFingerprints(rows));
+        if (adopted !== null) adoptTickets(b, rows, adopted);
         // Every fingerprint row, not just this look's: a batched ticket that
         // is no longer in the open alerts still has rows, and whether it is
         // open decides if a new medium or low alert may join it.
         const allRows = store.fingerprints(b.id);
         const sightings: Sighting[] = alerts.map((a) => ({ fingerprint: alertFingerprint(a), workload: a.package, pods: [], container: null, signature: a.severity, summary: `${a.severity} ${a.package}`, restarts: 0, events: [], logs: null, previous: false }));
         const tickets = await ticketStates([...allRows].map((r) => r.ticketKey).filter((k): k is string => k !== null));
-        const findings = classify(sightings, rows, tickets, at);
+        const findings = classify(sightings, rows, tickets, at, config.linearLogin).map((f) => (adopted === null && f.class === "new" ? { ...f, dedupUnavailable: true } : f));
         const open = openBatchedTickets(allRows, config.file.deps.sla, tickets);
         const byFingerprint = new Map(alerts.map((a) => [alertFingerprint(a), a]));
         const depsFindings: DepsFinding[] = [];
@@ -3035,6 +3093,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
             class: f.class,
             ticket: f.ticket,
             ticketState: f.ticketState,
+            closedAt: f.closedAt,
+            window: f.window,
+            assignee: f.assignee,
+            dedupUnavailable: f.dedupUnavailable,
             firstSeenAt,
             lastCommentedAt: f.lastCommentedAt,
             batch: batchAlert(a, dueAt, open),

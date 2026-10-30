@@ -130,6 +130,14 @@ export const depsFindingSchema = z.object({
   class: z.enum(["new", "recurring", "returned"]),
   ticket: z.string().nullable(),
   ticketState: z.string().nullable(),
+  /** When the ticket was resolved, when the source reports it; null otherwise. */
+  closedAt: z.string().nullable(),
+  /** Whether the ticket was resolved inside the two-week window; null when it was not resolved or has no date. */
+  window: z.enum(["within", "outside"]).nullable(),
+  /** The login the steward files under, or "unassigned" when it cannot be read. */
+  assignee: z.string(),
+  /** Set on a new finding when the dedup search could not run or was partial. */
+  dedupUnavailable: z.boolean().default(false),
   firstSeenAt: z.number(),
   lastCommentedAt: z.number().nullable(),
   /** For a medium or low alert, what to do with the open ticket for its repo and ecosystem. */
