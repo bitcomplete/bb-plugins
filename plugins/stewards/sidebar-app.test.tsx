@@ -2017,28 +2017,32 @@ describe("the sidebar's loading state (BB-127)", () => {
 
   it("replaces the skeleton with the grouped sections once the RPC lands", async () => {
     const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" })] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()] }) } as never,
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_p", displayTitle: "Project steward" })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()], projectStewardThreadId: "thr_p" }) } as never,
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(slot.container.querySelector("[data-sidebar-skeleton]")).toBeNull();
     expect(slot.getByRole("heading", { name: /In flight/u })).toBeTruthy();
+    // The project-steward footer is part of the grouped rendering.
+    expect(slot.getByText("project steward")).toBeTruthy();
     // The stewarded effort is grouped, so there is no one-off Threads section.
     expect(slot.queryByRole("button", { name: /Threads/u })).toBeNull();
     slot.lifecycle.unmount();
   });
 
-  it("treats a null project answer as loading, not as ungrouped threads", async () => {
+  it("renders the wanted project's one-offs when the answer names no project", async () => {
     const slot = await renderSidebar(
       {
-        sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "A one-off" })] },
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "personal", displayTitle: "A one-off" })] },
         rpc: { stewardsSidebar: () => ({ ...sidebarData(), projectId: null }) } as never,
       },
-      { activeProjectId: null },
+      { activeProjectId: "personal" },
     );
-    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
-    expect(slot.container.querySelector("[data-sidebar-skeleton]")).not.toBeNull();
-    expect(slot.queryByText("A one-off")).toBeNull();
+    await waitFor(() => expect(slot.getByText("A one-off")).toBeTruthy());
+    expect(slot.container.querySelector("[data-sidebar-skeleton]")).toBeNull();
     slot.lifecycle.unmount();
   });
 

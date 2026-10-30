@@ -1992,20 +1992,25 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
  * The list body while the RPC has no data for the project on screen (BB-127):
  * a section header line and a few row placeholders in the shape of the real
  * sections, in muted `bg-state-hover` tones with a gentle pulse. No spinner and
- * no "Loading…" text; `motion-safe:` respects `prefers-reduced-motion`.
+ * no visible "Loading…" text; `motion-safe:` respects `prefers-reduced-motion`,
+ * and the `sr-only` status keeps the pending state perceivable to a screen
+ * reader.
  */
 function SidebarSkeleton() {
   return (
-    <div data-sidebar-skeleton="" aria-hidden="true" className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
-      <section className="flex flex-col">
-        <div className="mx-2 my-1 h-3 w-24 rounded bg-state-hover motion-safe:animate-pulse" />
-        <ul className="flex flex-col gap-1 px-1">
-          {[0, 1, 2].map((i) => (
-            <li key={i} className="h-9 rounded-md bg-state-hover motion-safe:animate-pulse" />
-          ))}
-        </ul>
-      </section>
-    </div>
+    <>
+      <span role="status" className="sr-only">Loading the stewards list</span>
+      <div data-sidebar-skeleton="" aria-hidden="true" className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
+        <section className="flex flex-col">
+          <div className="mx-2 my-1 h-3 w-24 rounded bg-state-hover motion-safe:animate-pulse" />
+          <ul className="flex flex-col gap-1 px-1">
+            {[0, 1, 2].map((i) => (
+              <li key={i} className="h-9 rounded-md bg-state-hover motion-safe:animate-pulse" />
+            ))}
+          </ul>
+        </section>
+      </div>
+    </>
   );
 }
 
@@ -2075,11 +2080,14 @@ function StewardsSidebarCore({
   const wanted = picked ?? routeProject ?? lastProject.current;
   const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
   // BB-127: the body is pending until the RPC has data for the project on
-  // screen. `wanted === null` accepts any non-null answer (the server's first
-  // project); a stale or absent answer is not ready. A stale answer keeps the
-  // previous list visible dimmed for `STALE_LIST_MS`, then the skeleton takes
-  // over if the answer has still not arrived.
-  const rpcReady = data !== null && (wanted === null ? data.projectId !== null : data.projectId === wanted);
+  // screen. A null `data.projectId` is a landed answer for a project with no
+  // stewards config (`server.ts` returns it for an unconfigured or absent
+  // project): the wanted tab's one-off threads render as before, and no
+  // bindings can arrive to reshuffle them. A non-null answer for another
+  // project is not ready, so the previous list stays visible dimmed for
+  // `STALE_LIST_MS`, then the skeleton takes over if the answer has still not
+  // arrived.
+  const rpcReady = data !== null && (data.projectId === null || wanted === null || data.projectId === wanted);
   const [skeleton, setSkeleton] = useState(false);
   useEffect(() => {
     if (rpcReady) {
@@ -2306,7 +2314,7 @@ function StewardsSidebarCore({
         !skeleton && staleTab !== null ? body(staleTab, true) : <SidebarSkeleton />
       ) : active === null ? (
         <p className="p-3 text-muted-foreground">No projects yet.</p>
-      ) : data?.projectId === active.projectId ? (
+      ) : data?.projectId === null || data?.projectId === active.projectId ? (
         body(active, false)
       ) : (
         <SidebarSkeleton />
