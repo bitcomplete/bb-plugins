@@ -884,12 +884,14 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /**
      * Forget the steer marks on a thread's sessions. Called when the thread
      * goes idle: the turn a steer joined has ended, so the mark has done its
-     * job and must not make a later idle look handled.
+     * job and must not make a later idle look handled. A mark newer than the
+     * idle is left alone: it belongs to a steer that joined a turn starting
+     * while this idle was being processed, whose own idle will clear it.
      */
-    async function clearSteered(threadId: string): Promise<void> {
+    async function clearSteered(threadId: string, before: number): Promise<void> {
       let changed = false;
       for (const [session, r] of sessions) {
-        if (r.threadId !== threadId || r.steeredAt === null) continue;
+        if (r.threadId !== threadId || r.steeredAt === null || r.steeredAt > before) continue;
         sessions.set(session, { ...r, steeredAt: null });
         changed = true;
       }
@@ -1077,7 +1079,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       let changed = false;
       for (const [session, r] of sessions) {
         if (r.threadId !== threadId) continue;
-        sessions.set(session, { ...r, threadId: null, projectId: null });
+        sessions.set(session, { ...r, threadId: null, projectId: null, steeredAt: null });
         changed = true;
       }
       if (changed) void saveSessions();
@@ -1092,6 +1094,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * (`steeredAt`). The title is pushed from the bb thread's own title here.
      */
     async function onThreadIdle(threadId: string): Promise<void> {
+      const idleAt = deps.now();
       await pushTitle(threadId);
       const mine = [...sessions].filter(([, r]) => r.threadId === threadId);
       const waiting = mine.filter(([, r]) => !taggedAnswered(r));
@@ -1101,7 +1104,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       // older turn's idle does not clear the indicator of a queued wake.
       const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
       if (waiting.length === 0 && untaggedWaiting.length === 0) {
-        await clearSteered(threadId);
+        await clearSteered(threadId, idleAt);
         return;
       }
       let starts: Array<{ createdAt: number; data: unknown }>;
@@ -1124,7 +1127,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         bb.log.warn(`thread ${threadId} ended the turn that handled Slack session ${sessionLogId(session)} without replying; answering for it`);
         await backstop(session, "The bb thread finished its turn without sending a reply here. Send another message to try again.", "tagged");
       }
-      await clearSteered(threadId);
+      await clearSteered(threadId, idleAt);
     }
     bb.events.on("thread.idle", ({ thread }) => {
       void onThreadIdle(thread.id).catch((error: unknown) => bb.log.warn(`checking thread ${thread.id}'s Slack replies failed: ${errorMessage(error)}`));
