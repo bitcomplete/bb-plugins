@@ -10,6 +10,7 @@ import type { Row, View } from "./types.js";
 const RING = "outline-none focus-visible:ring-2 focus-visible:ring-sky-500";
 const CHIP = "inline-flex h-5 min-w-0 max-w-72 shrink-0 items-center gap-1 rounded px-1.5 text-[11px]";
 const AMBER = "bg-amber-500/10 text-[light-dark(var(--color-amber-800),var(--color-amber-200))]";
+const BLUE = "bg-sky-500/10 text-[light-dark(var(--color-sky-800),var(--color-sky-200))]";
 const GRAY = "bg-foreground/[0.05] text-muted-foreground";
 const BUTTON = cn("inline-flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2 text-[12px] disabled:opacity-45", RING);
 const GHOST = cn("inline-flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2 text-[12px] text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground", RING);
@@ -17,6 +18,8 @@ const COLUMN = "mx-auto w-full max-w-3xl";
 const GROUP_CARD = "min-w-0 rounded-[10px] border border-border/50 bg-foreground/[0.015] px-2 py-1";
 const CHECKBOX = "size-3.5 shrink-0 accent-sky-600 disabled:opacity-20";
 const EMPTY = "py-8 text-center text-[12px] text-muted-foreground";
+const SECTION_HEAD = "flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 bg-background py-1 pl-2 pr-1";
+const COUNT = "min-w-[18px] rounded-full px-1.5 text-center text-[11px] tabular-nums";
 const POINTER_CURSORS = "[&_button:not(:disabled)]:cursor-pointer [&_summary]:cursor-pointer [&_a[href]]:cursor-pointer [&_input[type=checkbox]:not(:disabled)]:cursor-pointer";
 type SectionKind = "turn" | "dismissed" | "other" | "held";
 
@@ -53,8 +56,13 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
   const threadId = row.dispatch.kind === "linked" ? row.dispatch.threadId : null;
   const clearable = row.dispatch.kind === "uncertain" || (row.dispatch.kind === "linked" && ["idle", "error"].includes(row.threadStatus ?? ""));
   const holdLabel = row.holdUntil ? `On hold until ${new Date(row.holdUntil).toLocaleString()}` : null;
-  const why = row.turn?.why ?? "Waiting on reviewers or checks";
-  const updated = `${age(Date.parse(row.updatedAt), now)} ago`;
+  const why = row.turn?.why ?? (row.draft ? "Draft" : "Waiting on reviewers or checks");
+  const since = row.turn ? row.turn.since : Date.parse(row.updatedAt);
+  const info = holdLabel ?? `${why}${since === null ? "" : ` · ${age(since, now)} ago`}`;
+  const threadLabel = row.threadStatus === "idle" ? "Idle" : row.threadStatus === "error" ? "Failed"
+    : ["starting", "pending", "active", "running", "stopping"].includes(row.threadStatus ?? "") ? "Working" : "Open thread";
+  const threadTone = kind !== "turn" || threadLabel === "Idle" ? GRAY : row.threadStatus === "error"
+    ? "bg-rose-500/10 text-[light-dark(var(--color-rose-800),var(--color-rose-200))]" : BLUE;
   return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
     <div className="flex items-start gap-2 py-1 pl-2 pr-1.5 text-[12.5px] leading-5">
       {kind === "turn" && row.dispatch.kind === "none" ? <input type="checkbox" checked={selected} disabled={pending}
@@ -66,15 +74,15 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
         <b className={cn("shrink-0 font-medium", kind === "turn" ? "text-foreground" : "text-foreground/80")}>#{row.number}</b>
       </UrlLink>
       <div className="min-w-0 flex-1">
-        <p className={cn("truncate", kind !== "turn" && "text-foreground/80")} title={row.title}>{row.title}</p>
+        <p className={cn("whitespace-normal break-words @min-[720px]:truncate", kind !== "turn" && "text-foreground/80")} title={row.title}>{row.title}</p>
         <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
-          <span className="min-w-0" title={holdLabel ?? `${why} · ${updated}`}>{holdLabel ?? `${why} · ${updated}`}</span>
-          <span className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
-            <span className={cn(CHIP, kind === "turn" ? AMBER : GRAY)}>{kind === "turn" ? "Your turn" : kind === "dismissed" ? "Dismissed" : kind === "held" ? "On hold" : "Waiting"}</span>
-            {row.draft ? <span className={cn(CHIP, GRAY)}>Draft</span> : null}
+          <span className="min-w-0" title={info}>{info}</span>
+          <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-1.5">
+            {row.draft && (row.turn || row.holdUntil) ? <span className={cn(CHIP, GRAY)}>Draft</span> : null}
             {threadId !== null ? <button type="button" onClick={() => navigate.toThread(threadId)}
-              title={`Open its feedback thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, GRAY, "hover:underline", RING)}>Open<span aria-hidden>↗</span></button> :
-              row.dispatch.kind === "starting" ? <span className={cn(CHIP, GRAY)}><Spin />Starting…</span> :
+              aria-label={`Open feedback thread for ${row.repo}#${row.number}`}
+              title={`Open its feedback thread · ${row.threadStatus ?? "unknown status"}`} className={cn(CHIP, threadTone, "hover:underline", RING)}>{threadLabel}<span aria-hidden>↗</span></button> :
+              row.dispatch.kind === "starting" ? <span className={cn(CHIP, kind === "turn" ? BLUE : GRAY)}><Spin />Starting…</span> :
                 kind === "turn" && row.dispatch.kind === "none" ? <button type="button" disabled={pending}
                   aria-label={`Address comments on ${row.repo}#${row.number}`} title="Start a thread to address these comments" onClick={onAddress}
                   className={cn(BUTTON, "h-5 border-border px-1.5 text-[11px] hover:bg-foreground/[0.06]")}>Address</button> : null}
@@ -233,24 +241,32 @@ export function InboxPage() {
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
           <section aria-label="Your turn">
-            <div className="flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 bg-background py-1 pl-2 pr-1">
-              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-amber-500/70" />
+            <div className={SECTION_HEAD}>
+              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-sky-500/70" />
               <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} />
               <h2 className="truncate text-[12.5px] font-semibold">Your turn</h2>
-              <span className={cn("min-w-[18px] rounded-full px-1.5 text-center text-[11px] tabular-nums", yours.length ? cn("font-semibold", AMBER) : "text-muted-foreground")}>{yours.length}</span>
+              <span className={cn(COUNT, yours.length ? cn("font-semibold", BLUE) : "text-muted-foreground")}>{yours.length}</span>
             </div>
             {yours.length === 0 ? <p className={EMPTY}>Nothing waiting on you.</p> : renderGroups(yours, "turn")}
+            {dismissed.length > 0 ? <details className="pb-1.5">
+              <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>{dismissed.length} dismissed · show</summary>
+              {renderGroups(dismissed, "dismissed")}
+            </details> : null}
           </section>
-          {dismissed.length > 0 ? <details className="mt-7 pb-1.5">
-            <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>{dismissed.length} dismissed · show</summary>
-            {renderGroups(dismissed, "dismissed")}
-          </details> : null}
-          {other.length > 0 ? <details className="mt-7 pb-1.5">
-            <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>Other open PRs · {other.length}</summary>
-            {renderGroups(other, "other")}
-          </details> : null}
+          <section aria-label="Other open PRs" className="mt-6">
+            <div className={SECTION_HEAD}>
+              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-muted-foreground/50" />
+              <h2 className="truncate text-[12.5px] font-semibold">Other open PRs</h2>
+              <span className={cn(COUNT, "text-muted-foreground")}>{other.length}</span>
+            </div>
+            {other.length ? renderGroups(other, "other") : <p className={EMPTY}>No other open PRs.</p>}
+          </section>
           {held.length > 0 ? <section aria-label="On hold" className="mt-7 opacity-60 hover:opacity-100 focus-within:opacity-100">
-            <h2 className="ml-9 text-[12px] font-medium">On hold <span className="font-normal tabular-nums">{held.length}</span></h2>
+            <div className={SECTION_HEAD}>
+              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-muted-foreground/50" />
+              <h2 className="truncate text-[12.5px] font-semibold">On hold</h2>
+              <span className={cn(COUNT, "text-muted-foreground")}>{held.length}</span>
+            </div>
             {renderGroups(held, "held")}
           </section> : null}
         </>}
