@@ -6,6 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import { PROJECT_CHANGED } from "./channels.js";
+import { needActions, questionActions } from "./server.js";
+
+/** One action in a needs-you view, as the server builds it (BB-122). */
+type NeedAction = ReturnType<typeof needActions>["actions"][number];
 
 type Need = {
   id: string;
@@ -17,6 +21,7 @@ type Need = {
   escalationId: string | null;
   choices: string[];
   lessonId: string | null;
+  prUrl: string | null;
   what: string;
   how: string | null;
   destination: string | null;
@@ -24,6 +29,8 @@ type Need = {
   createdAt: number;
   actionable: boolean;
   why: string | null;
+  actions: NeedAction[];
+  freeText: boolean;
 };
 
 type Question = {
@@ -36,40 +43,53 @@ type Question = {
   escalationId: string | null;
   createdAt: number;
   rationaleWanted: string | null;
+  actions: NeedAction[];
+  freeText: boolean;
 };
 
-const need = (over: Partial<Need> = {}): Need => ({
-  id: "need_1",
-  bindingId: "bnd_1",
-  key: "ENG-12",
-  kind: "decide",
-  url: null,
-  entityUrl: null,
-  escalationId: null,
-  choices: [],
-  lessonId: null,
-  what: "Merge or close?",
-  how: null,
-  destination: null,
-  threadId: null,
-  createdAt: 1_000,
-  actionable: true,
-  why: null,
-  ...over,
-});
+/** The page's need fixture, with the server's actions for its kind (BB-122). */
+const need = (over: Partial<Need> = {}): Need => {
+  const base = {
+    id: "need_1",
+    bindingId: "bnd_1",
+    key: "ENG-12",
+    kind: "decide",
+    url: null,
+    entityUrl: null,
+    escalationId: null,
+    choices: [],
+    lessonId: null,
+    prUrl: null,
+    what: "Merge or close?",
+    how: null,
+    destination: null,
+    threadId: null,
+    createdAt: 1_000,
+    actionable: true,
+    why: null,
+    ...over,
+  };
+  const { actions, freeText } = needActions({ kind: base.kind, url: base.url ?? "", data: { choices: base.choices, lessonId: base.lessonId, prUrl: base.prUrl } }, { url: base.entityUrl });
+  return { ...base, actions: over.actions ?? actions, freeText: over.freeText ?? freeText };
+};
 
-const question = (over: Partial<Question> = {}): Question => ({
-  id: "qst_1",
-  question: "Merge or close?",
-  context: null,
-  choices: [],
-  key: "ENG-12",
-  url: null,
-  escalationId: null,
-  createdAt: 1_000,
-  rationaleWanted: null,
-  ...over,
-});
+/** The page's question fixture, with the server's actions for its choices (BB-122). */
+const question = (over: Partial<Question> = {}): Question => {
+  const base = {
+    id: "qst_1",
+    question: "Merge or close?",
+    context: null,
+    choices: [],
+    key: "ENG-12",
+    url: null,
+    escalationId: null,
+    createdAt: 1_000,
+    rationaleWanted: null,
+    ...over,
+  };
+  const { actions, freeText } = questionActions({ choices: base.choices });
+  return { ...base, actions: over.actions ?? actions, freeText: over.freeText ?? freeText };
+};
 
 let app: CapturedPluginApp | null = null;
 const loadApp = async () => {
@@ -181,7 +201,7 @@ describe("the Stewards page's need links (BB-29)", () => {
   const pr = "https://github.com/bitcomplete/bb-gate/pull/17";
   const ticket = "https://linear.app/bit-complete/issue/BB-28";
 
-  it("links the key to the ticket and offers Open the pull request for approve-pr and merge", async () => {
+  it("links the key to the ticket and offers Open PR for approve-pr and merge", async () => {
     const slot = await renderBoard(
       [
         need({ kind: "approve-pr", key: "BB-28", url: pr, entityUrl: ticket, what: "Approve bitcomplete/bb-gate#17 on GitHub" }),
@@ -189,18 +209,18 @@ describe("the Stewards page's need links (BB-29)", () => {
       ],
       [],
     );
-    await waitFor(() => expect(slot.getAllByRole("button", { name: "Open the pull request" })).toHaveLength(2));
+    await waitFor(() => expect(slot.getAllByRole("button", { name: "Open PR" })).toHaveLength(2));
     fireEvent.click(slot.getByRole("button", { name: "BB-28" }));
-    fireEvent.click(slot.getAllByRole("button", { name: "Open the pull request" })[0]!);
+    fireEvent.click(slot.getAllByRole("button", { name: "Open PR" })[0]!);
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: ticket }));
     await waitFor(() => expect(slot.inspection.navigateCalls).toContainEqual({ method: "openUrl", url: pr }));
     slot.lifecycle.unmount();
   });
 
-  it("shows no Open the pull request link for other kinds", async () => {
+  it("shows no Open PR link for other kinds", async () => {
     const slot = await renderBoard([need({ kind: "decide", url: ticket, entityUrl: ticket })], []);
     await waitFor(() => expect(slot.getByRole("button", { name: "Answer" })).toBeTruthy());
-    expect(slot.queryByRole("button", { name: "Open the pull request" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Open PR" })).toBeNull();
     slot.lifecycle.unmount();
   });
 });
@@ -495,6 +515,31 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
     expect(button.className).toContain("size-8");
     expect(button.className).toContain("shrink-0");
     slot.lifecycle.unmount();
+  });
+
+  it("offers the same action labels on the page and in the sidebar for one item (BB-122)", async () => {
+    const item = need({ id: "need_spec", kind: "approve-spec", key: "ENG-1", what: "Approve the spec", entityUrl: "https://linear.app/acme/issue/ENG-1" });
+    const page = await renderBoard([item], []);
+    await waitFor(() => expect(page.getByText("Approve the spec")).toBeTruthy());
+    const pageLabels = page.getAllByRole("button").map((b) => b.textContent);
+    page.lifecycle.unmount();
+
+    const sidebar = await renderSidebar(
+      {
+        stewardsSidebar: () => sidebarData({ p1: { bindings: [sidebarBinding({ key: "ENG-1", threadId: "thr_a", needsUser: true })], needs: { count: 1, items: [{ ...item, type: "need", bindingKey: "ENG-1" }] } } }),
+        stewardsNeedAction: () => ({ ok: true, message: "done" }),
+      },
+      {},
+      [{ ...sidebarThread("thr_a"), displayTitle: "ENG-1: Fix login" }],
+    );
+    await waitFor(() => expect(sidebar.getByText("Approve the spec")).toBeTruthy());
+    const sidebarLabels = sidebar.getAllByRole("button").map((b) => b.textContent);
+    sidebar.lifecycle.unmount();
+
+    for (const label of ["Open ticket", "Approve", "Decline"]) {
+      expect(pageLabels, label).toContain(label);
+      expect(sidebarLabels, label).toContain(label);
+    }
   });
 
   it("refetches on a realtime event for a shown project and ignores an unknown one", async () => {

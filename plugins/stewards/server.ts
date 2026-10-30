@@ -251,9 +251,42 @@ export const lessonBranchFor = (threadId: string): string => `refs/heads/guidanc
 /** Whitespace-normalised text, so a lesson matches however the playbook wraps it. */
 const normalizeLessonText = (text: string) => text.replace(/\s+/gu, " ").trim();
 
+/**
+ * One action a needs-you item offers: an RPC write, or a link to open. The
+ * server builds the list once (BB-122) so the page and the sidebar cannot
+ * disagree about an item's buttons.
+ */
+const needActionSchema = z.union([
+  z.object({
+    label: z.string(),
+    /** The write this action makes; `answer` goes to `stewardsAnswerQuestion`, the rest to `stewardsNeedAction`. */
+    action: z.enum(["approve", "decline", "done", "merge", "provide", "choose", "answer"]),
+    /** With `choose` (or a question's fixed choice): the label passed as `choice`; null for a free-text action. */
+    choice: z.string().nullable(),
+    /** Whether this is the item's primary button. */
+    primary: z.boolean(),
+    /** Whether a note box makes sense with this action. */
+    note: z.boolean(),
+  }),
+  z.object({
+    label: z.string(),
+    /** A link to open in the browser: Open PR, Open ticket. */
+    url: z.string(),
+  }),
+]);
+/** One entry in a needs-you view's `actions` list. */
+export type NeedAction = z.infer<typeof needActionSchema>;
+
+/** An http(s) URL, or null for anything else (a Linear key, a lesson id). */
+const httpUrl = (url: string | null): string | null => (url !== null && /^https?:\/\//iu.test(url) ? url : null);
+
 // One row each in the board's "waiting on you" section. The sidebar reuses
 // these shapes, tagged, for its "Needs you" list, so the two surfaces cannot
 // disagree about what an item is.
+//
+// Each view also carries the `actions` the item offers, built once by the
+// server functions below, so the page and the sidebar render the same buttons
+// and cannot drift (BB-122).
 const questionViewSchema = z.object({
   id: z.string(),
   question: z.string(),
@@ -265,6 +298,10 @@ const questionViewSchema = z.object({
   createdAt: z.number(),
   /** Why the page shows a rationale box, or null when it must not (BB-35 step 4). */
   rationaleWanted: z.string().nullable(),
+  /** The buttons this question offers, built once on the server (BB-122). */
+  actions: z.array(needActionSchema),
+  /** Whether the page offers Other… for a free-text answer (BB-122). */
+  freeText: z.boolean(),
 });
 const withUserViewSchema = z.object({
   id: z.string(),
@@ -278,6 +315,10 @@ const withUserViewSchema = z.object({
   threadId: z.string().nullable(),
   createdAt: z.number(),
   rationaleWanted: z.string().nullable(),
+  /** The buttons this escalation offers; empty today, since it is answered in its steward's thread (BB-122). */
+  actions: z.array(needActionSchema),
+  /** Whether the page offers Other… for a free-text answer (BB-122). */
+  freeText: z.boolean(),
 });
 const needViewSchema = z.object({
   id: z.string(),
@@ -304,6 +345,10 @@ const needViewSchema = z.object({
   /** Whether the server can verify the preconditions now; when false, `why` says what is missing. */
   actionable: z.boolean(),
   why: z.string().nullable(),
+  /** The buttons this need offers, built once on the server (BB-122). */
+  actions: z.array(needActionSchema),
+  /** Whether the page offers Other… for a free-text answer (BB-122). */
+  freeText: z.boolean(),
 });
 /** One "needs you" item in the sidebar, tagged so the app knows which write it makes. */
 const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
@@ -311,6 +356,79 @@ const sidebarNeedsItemSchema = z.discriminatedUnion("type", [
   withUserViewSchema.extend({ type: z.literal("withUser"), bindingKey: z.string() }),
   needViewSchema.extend({ type: z.literal("need"), bindingKey: z.string() }),
 ]);
+
+/**
+ * The actions a need offers, per kind. This is the page's old per-kind switch,
+ * moved to the server so the sidebar and the page render the same buttons
+ * (BB-122). `freeText` is true when the item has fixed choices and can also
+ * take a free-text answer, which the page hides behind Other…; the sidebar
+ * drops that action because it has no text box.
+ */
+export function needActions(n: { kind: string; data: Record<string, unknown>; url: string }, b: Pick<Binding, "url">): { actions: NeedAction[]; freeText: boolean } {
+  const actions: NeedAction[] = [];
+  const url = httpUrl(n.url);
+  const prUrl = httpUrl(typeof n.data.prUrl === "string" ? n.data.prUrl : null);
+  const ticket = httpUrl(b.url);
+  switch (n.kind) {
+    case "approve-spec":
+      if (ticket !== null) actions.push({ label: "Open ticket", url: ticket });
+      actions.push({ label: "Approve", action: "approve", choice: null, primary: true, note: true });
+      actions.push({ label: "Decline", action: "decline", choice: null, primary: false, note: true });
+      return { actions, freeText: false };
+    case "approve-pr":
+      if (url !== null) actions.push({ label: "Open PR", url });
+      actions.push({ label: "Approve", action: "approve", choice: null, primary: true, note: true });
+      actions.push({ label: "Decline", action: "decline", choice: null, primary: false, note: true });
+      return { actions, freeText: false };
+    case "merge":
+      if (url !== null) actions.push({ label: "Open PR", url });
+      actions.push({ label: "Merge", action: "merge", choice: null, primary: true, note: false });
+      return { actions, freeText: false };
+    case "configure":
+      actions.push({ label: "Done", action: "done", choice: null, primary: true, note: true });
+      return { actions, freeText: false };
+    case "provide-secret":
+      actions.push({ label: "Provide", action: "provide", choice: null, primary: true, note: false });
+      actions.push({ label: "Done", action: "done", choice: null, primary: false, note: false });
+      return { actions, freeText: false };
+    case "decide": {
+      const choices = needChoices(n);
+      // A boundary lesson's Review PR/Drop are its only choices: no free-text
+      // "Other…", and no note box (BB-35 step 5, BB-108).
+      const lesson = typeof n.data.lessonId === "string";
+      for (const choice of choices) actions.push({ label: choice, action: "choose", choice, primary: true, note: false });
+      if (prUrl !== null) actions.push({ label: "Open PR", url: prUrl });
+      if (lesson) return { actions, freeText: false };
+      actions.push({ label: "Answer", action: "done", choice: null, primary: true, note: true });
+      return { actions, freeText: choices.length > 0 };
+    }
+    default:
+      // A kind with no branch still gets its buttons, so a new kind does not
+      // need a client change (BB-122).
+      actions.push({ label: "Answer", action: "done", choice: null, primary: true, note: true });
+      return { actions, freeText: false };
+  }
+}
+
+/**
+ * The actions a question offers: one button per fixed choice, then a free-text
+ * Answer the page hides behind Other… when there are choices (BB-122).
+ */
+export function questionActions(q: Pick<Question, "choices">): { actions: NeedAction[]; freeText: boolean } {
+  const actions: NeedAction[] = [];
+  for (const choice of q.choices) actions.push({ label: choice, action: "answer", choice, primary: true, note: false });
+  actions.push({ label: "Answer", action: "answer", choice: null, primary: true, note: true });
+  return { actions, freeText: q.choices.length > 0 };
+}
+
+/**
+ * The actions a with-user escalation offers. A forwarded approval is answered
+ * in its steward's thread and one the project steward has not forwarded waits
+ * on it; neither has an RPC action of its own (BB-122).
+ */
+export function withUserActions(): { actions: NeedAction[]; freeText: boolean } {
+  return { actions: [], freeText: false };
+}
 
 /** One RPC method's or CLI command's in-memory stat (BB-100). */
 const methodStatSchema = z.object({
@@ -7255,7 +7373,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     });
 
     /** One open "needs you" item, with whether its button can act now and why not when it cannot. */
-    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null } {
+    function needView(n: Need, b: Binding): { id: string; bindingId: string; key: string; kind: string; url: string | null; entityUrl: string | null; escalationId: string | null; choices: string[]; lessonId: string | null; prUrl: string | null; what: string; how: string | null; destination: string | null; threadId: string | null; createdAt: number; actionable: boolean; why: string | null; actions: NeedAction[]; freeText: boolean } {
       let actionable = true;
       let why: string | null = null;
       let threadId: string | null = null;
@@ -7276,7 +7394,8 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         // appears in its first turn. Link the thread once one has been spawned.
         threadId = store.secretRequesterForNeed(n.id)?.threadId ?? null;
       }
-      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: /^https?:\/\//iu.test(n.url) ? n.url : null, entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why };
+      const { actions, freeText } = needActions(n, b);
+      return { id: n.id, bindingId: b.id, key: b.entityKey, kind: n.kind, url: httpUrl(n.url), entityUrl: b.url, escalationId: typeof n.data.escalationId === "string" ? n.data.escalationId : null, choices: needChoices(n), lessonId: typeof n.data.lessonId === "string" ? n.data.lessonId : null, prUrl: typeof n.data.prUrl === "string" ? n.data.prUrl : null, what: n.what, how: n.how, destination: n.kind === "provide-secret" ? secretDestination(n) : null, threadId, createdAt: n.createdAt, actionable, why, actions, freeText };
     }
 
     /**
@@ -7300,12 +7419,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The board's question row; the sidebar reuses it, tagged. */
     function questionView(q: Question) {
       const b = q.bindingId === null ? null : store.binding(q.bindingId);
-      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted };
+      const { actions, freeText } = questionActions(q);
+      return { id: q.id, question: q.question, context: q.context, choices: q.choices, key: b?.entityKey ?? null, url: b?.url ?? null, escalationId: q.escalationId, createdAt: q.createdAt, rationaleWanted: q.rationaleWanted, actions, freeText };
     }
 
     /** The board's with-user row; the sidebar reuses it, tagged. */
     function withUserView(x: Escalation, b: Binding) {
-      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted };
+      const { actions, freeText } = withUserActions();
+      return { id: x.id, kind: x.kind, question: x.question, context: x.context, recommendation: x.recommendation, key: b.entityKey, url: b.url, threadId: b.threadId, createdAt: x.createdAt, rationaleWanted: x.rationaleWanted, actions, freeText };
     }
 
     function formatBindings(rows: Binding[]): string {
