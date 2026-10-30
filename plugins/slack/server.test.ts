@@ -453,6 +453,30 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("does not log an untagged session's channel when its lease is rejected", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.state.subscribe = (body) => Response.json({ leases: [], rejected: body.watches.map((w) => ({ kind: w.kind, id: w.id, reason: "owned" })) });
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        capability: "cap-secret",
+        comment: { text: "what about the second one?", untrusted: false },
+      }),
+    );
+    await tick();
+    s.hooks.last().send(s.hooks.hello("c_2"));
+    await tick();
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).toContain("another bb server holds");
+    expect(logs).not.toContain("C0123");
+    expect(logs).not.toContain("what about the second one?");
+    expect(logs).not.toContain("cap-secret");
+    await s.stop();
+  });
+
   it("holds a non-owner's channel mention for the owner's confirmation, running no turn", async () => {
     const s = await live();
     s.hooks.last().send(
@@ -897,6 +921,167 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("does not post a backstop for an untagged wake whose turn ends without a reply", async () => {
+    // A turn that names the session would be caught by the backstop for a
+    // tagged wake; an untagged one is not counted, so it must not be.
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        thread: "1712345678.901234",
+        mention: false,
+        tagged: false,
+        comment: { text: "what about the second one?", untrusted: false },
+      }),
+    );
+    await tick();
+    // The wake is still handed to a bb thread.
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toEqual([]);
+    // Neither the channel nor the untagged text reaches a log line.
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).not.toContain("C0123");
+    expect(logs).not.toContain("what about the second one?");
+    await s.stop();
+  });
+
+  it("lets a turn reply once to an untagged wake even though it does not owe one", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        thread: "1712345678.901234",
+        mention: false,
+        tagged: false,
+        comment: { text: "what about the second one?", untrusted: false },
+      }),
+    );
+    await tick();
+    const first = await s.tool("slack_reply", { text: "Yes, that one." }, { threadId: "thr-1" });
+    expect(s.text(first)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(1);
+    // One reply per message still holds: the untagged wake does not open the
+    // door to a second reply.
+    const second = await s.tool("slack_reply", { text: "More." }, { threadId: "thr-1" });
+    expect(s.text(second)).toContain("already has its reply");
+    expect(s.hooks.messages).toHaveLength(1);
+    // And a turn that did reply never trips the backstop.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("still posts a backstop for a tagged wake, and a missing tagged field counts as tagged", async () => {
+    // `session()` sends no `tagged` field at all: the schema defaults it to
+    // true, exactly as it does for an older service.
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    await s.stop();
+  });
+
+  it("does not let an untagged hold prompt consume a tagged wake's reply slot", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1712345678.901234" }] } } } }] });
+    // A tagged owner wake, unanswered.
+    s.hooks.last().send(s.hooks.session({ session: "C0123:1712345678.901234", channel: "C0123", mention: true, comment: { text: "build this", untrusted: false } }));
+    await tick();
+    // A non-owner untagged reply arrives; the confirm prompt answers the
+    // untagged message, not the tagged one.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
+    await tick();
+    expect(String(s.hooks.messages.at(-1)?.body.text)).toContain("Carol wrote");
+    const before = s.hooks.messages.length;
+    // The turn that handled the tagged wake ended silently: it still gets its
+    // guaranteed backstop.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.length).toBe(before + 1);
+    expect(String(s.hooks.messages.at(-1)?.body.text)).toContain("finished its turn without sending a reply");
+    await s.stop();
+  });
+
+  it("holds an untagged reply from someone other than the owner, wording it as written not asked", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1712345678.901234",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
+    await tick();
+    // The words never reached a thread, and the owner is asked to confirm.
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    const prompt = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    expect(prompt).toContain("Carol wrote");
+    expect(prompt).toContain("halt work");
+    expect(prompt).not.toContain("Carol asked");
+    // The held untagged reply's channel and user are not logged.
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).not.toContain("C0123");
+    expect(logs).not.toContain("Carol");
+    await s.stop();
+  });
+
+  it("words a confirmed untagged reply as written even when the owner confirms with a mention", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1.2",
+        channel: "C0123",
+        mention: false,
+        tagged: false,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "halt work", untrusted: true },
+      }),
+    );
+    await tick();
+    const id = /confirm (r-[a-z0-9]+)/u.exec(String(s.hooks.messages.at(-1)?.body.text ?? ""))?.[1];
+    expect(id).toBeTruthy();
+    // The owner confirms with a tagged mention; the held message's own tagged
+    // flag decides the wording that reaches the thread.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1.2",
+        channel: "C0123",
+        mention: true,
+        tagged: true,
+        fromOwner: true,
+        comment: { text: `<@U-bb> confirm ${id}`, untrusted: false },
+      }),
+    );
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    const released = String((spawns[0]![0] as { prompt: string }).prompt);
+    expect(released).toContain("Carol wrote");
+    expect(released).not.toContain("Carol asked");
+    await s.stop();
+  });
+
   it("does not answer a turn that did not handle the wake", async () => {
     const s = await live({ turns: [{ createdAt: 1_000_000_000_000, data: { initiator: "client" } }] });
     s.hooks.last().send(s.hooks.session());
@@ -905,6 +1090,27 @@ describe("Slack plugin", () => {
     await tick();
     expect(s.hooks.messages).toEqual([]);
     await s.stop();
+  });
+
+  it("clears an untagged wake's thinking status only after the turn that handled it has run", async () => {
+    // The wake's own turn has not started: an older turn's idle must not clear
+    // the indicator just set for the queued wake.
+    const queued = await live({ turns: [{ createdAt: 999_999_999_999, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
+    queued.hooks.last().send(queued.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    await queued.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(queued.hooks.statuses.map((s) => s.body.status)).not.toContain("");
+    await queued.stop();
+
+    // The silent untagged turn ran and ended: the indicator is cleared.
+    const done = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
+    done.hooks.last().send(done.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    await done.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(done.hooks.statuses.map((s) => s.body.status)).toContain("");
+    await done.stop();
   });
 
   it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {

@@ -7,8 +7,11 @@ a bb thread and replies in the same Slack thread.
 A DM and the first channel mention in a conversation reach the server of the
 Slack user who sent them. The first routed mention in a conversation sets its
 owner, and a later mention by someone else goes to that same server, held for
-the owner to confirm (see "Other people's text"). Posting as "Alice's bb" per
-message is a separate later step.
+the owner to confirm (see "Other people's text"). A reply in a channel thread
+bb is already part of is routed the same way even without an `@bb` tag, but it
+is a continuation rather than a request: it is delivered to the bb thread and
+does not owe a reply. Posting as "Alice's bb" per message is a separate later
+step.
 
 ## How it fits together
 
@@ -46,9 +49,10 @@ on the pod.
   service says another server owns is logged and gets a best-effort backstop
   reply; the other server's live lease makes the service refuse that reply, so
   the log line is the reliable half.
-- **No reply.** If a turn that handled a wake ends without calling
-  `slack_reply`, the plugin posts one error reply itself, so every message
-  gets an answer.
+- **No reply.** If a turn that handled a tagged wake ends without calling
+  `slack_reply`, the plugin posts one error reply itself, so every tagged
+  message gets an answer. An untagged reply in a followed thread does not owe
+  a reply, so a silent turn there posts nothing.
 
 ## Settings
 
@@ -128,6 +132,31 @@ is in `bb-gate/README.md`:
    the same signing secret as the events URL.
 
 Until both are done, no `invited` wake arrives and the plugin does nothing.
+
+## Continuing a thread without tagging bb
+
+Once the app is subscribed to `message.channels` and `message.groups`, a reply
+inside a channel thread bb is already part of is routed to the conversation's
+owner's server even when it does not tag `@bb`. The wake says the message was
+posted without addressing bb and tells the turn to reply only when the message
+is for bb. Such a reply is delivered to the bb thread but does not owe a reply:
+it is not counted for the one-reply-per-message rule, and a turn that ends
+silently posts no error reply. An untagged reply from someone other than the
+owner is held for the owner's confirmation exactly like an untrusted mention.
+
+A thread only becomes followed once bb has been tagged or mentioned in it; a
+thread bb is not part of is dropped by bb-gate-hooks, in memory, with no text,
+user or channel logged or stored. The feature is **inert until a Slack admin
+does two by-hand steps** on the team app:
+
+1. **OAuth & Permissions → Bot Token Scopes**: add `channels:history` and
+   `groups:history`, then **Reinstall to Workspace**.
+2. **Event Subscriptions → Subscribe to bot events**: add `message.channels`
+   and `message.groups`.
+
+Until both are done, no untagged reply reaches bb. After the reinstall, the
+service receives every message in every channel the bot is in; it acks and
+drops everything that is not in a followed thread.
 
 ## By hand (a Slack admin)
 
