@@ -30,6 +30,7 @@ import {
   preparePrimaryProjectSource,
   projectSourceBranch,
   projectSourceRemote,
+  projectSourceUnpushed,
   pushGuidance,
   readCommittedFiles,
   readReposJson,
@@ -104,6 +105,7 @@ export function createMultiRepoHostEntry() {
           reposJson: await readReposJson(input.path, layout, context.signal),
           remote: await projectSourceRemote(input.path, context.signal),
           defaultBranch: await projectSourceBranch(input.path, context.signal),
+          unpushed: await projectSourceUnpushed(input.path, context.signal),
           layout,
           warnings: warnings.slice(0, 20),
         };

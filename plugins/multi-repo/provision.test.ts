@@ -19,6 +19,7 @@ import {
   cloneProjectSource,
   defaultProjectSourcePath,
   mergeGuidance,
+  projectSourceUnpushed,
   pushGuidance,
   readCommittedFiles,
   readReposJson,
@@ -442,6 +443,27 @@ describe("the project source", () => {
     );
     expect(written.committed).toBe(true);
     expect(await gitLine(dir, ["rev-parse", "HEAD"])).not.toBe(before);
+  });
+
+  it("reports the commits a project checkout's default branch has not pushed", async () => {
+    const remote = await makeRemote("unpushed-remote");
+    const dir = path.join(scratch, "unpushed-clone");
+    await git(["clone", "--quiet", remote, dir]);
+    await gitIn(dir, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(dir, ["config", "user.name", "Test"]);
+    // Level with origin: nothing to report.
+    expect(await projectSourceUnpushed(dir)).toBeNull();
+    await writeFile(path.join(dir, "AGENTS.md"), "local\n", "utf8");
+    await gitIn(dir, ["add", "-A"]);
+    await gitIn(dir, ["commit", "--quiet", "-m", "Add a repo"]);
+    await writeFile(path.join(dir, "AGENTS.md"), "local again\n", "utf8");
+    await gitIn(dir, ["add", "-A"]);
+    await gitIn(dir, ["commit", "--quiet", "-m", "Rewrite guidance"]);
+    const unpushed = await projectSourceUnpushed(dir);
+    expect(unpushed).not.toBeNull();
+    expect(unpushed?.branch).toBe("main");
+    expect(unpushed?.count).toBe(2);
+    expect(unpushed?.subjects).toEqual(["Rewrite guidance", "Add a repo"]);
   });
 
   it("publishes workspace .bb commits back to the canonical checkout as a branch", async () => {

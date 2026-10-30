@@ -78,6 +78,7 @@ function hostResponder(call: HostRpcCall): unknown {
         }),
         remote: null,
         defaultBranch: "main",
+        unpushed: null,
         layout: "standalone",
         warnings: [],
       };

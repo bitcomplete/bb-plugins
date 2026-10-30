@@ -20,6 +20,7 @@ function manifest(overrides: Partial<WorkspaceManifest> = {}): WorkspaceManifest
     layout: "standalone",
     projectSourcePath: "/home/me/projects/acme",
     definitionBase: null,
+    unpushed: null,
     createdAt: 0,
     repos: [
       {
@@ -108,6 +109,56 @@ describe("formatInstructions", () => {
     expect(formatInstructions(manifest())).toContain("workspace_add_repo");
   });
 
+  it("prints nothing extra when the project checkout is level with its origin", () => {
+    const clean = formatInstructions(manifest({ unpushed: null }));
+    expect(clean).toBe(formatInstructions(manifest()));
+    expect(clean).not.toContain("Unpushed");
+    expect(clean).not.toContain("Push with");
+  });
+
+  it("says the .bb write commits on the project checkout and does not push", () => {
+    const text = formatInstructions(manifest());
+    expect(text).toContain("do not push it");
+    expect(text).toContain("live on this server only");
+    expect(text).toContain("`origin/main`");
+    // The old sentence promised review-by-pull-request for a local commit.
+    expect(text).not.toContain("reviewed like code");
+  });
+
+  it("prints count, subjects, the server-only warning and the push command when ahead", () => {
+    const text = formatInstructions(
+      manifest({
+        projectSourcePath: "/home/me/projects/acme",
+        unpushed: { branch: "main", count: 2, subjects: ["Add a repo to the repo set", "Rewrite cross-repo guidance"] },
+      }),
+    );
+    expect(text).toContain("Unpushed `.bb`");
+    expect(text).toContain("2 commits on main are live on this server only");
+    expect(text).toContain("Add a repo to the repo set; Rewrite cross-repo guidance");
+    expect(text).toContain('git -C "/home/me/projects/acme" push origin main');
+  });
+
+  it("uses the singular for one commit", () => {
+    const text = formatInstructions(
+      manifest({ unpushed: { branch: "main", count: 1, subjects: ["Only change"] } }),
+    );
+    expect(text).toContain("1 commit on main is live on this server only");
+  });
+
+  it("caps the subjects it lists and counts the rest", () => {
+    const text = formatInstructions(
+      manifest({
+        unpushed: {
+          branch: "release",
+          count: 12,
+          subjects: Array.from({ length: 10 }, (_, index) => `subject-${index}`),
+        },
+      }),
+    );
+    expect(text).toContain("12 commits on release are live on this server only");
+    expect(text).toContain("and 2 more");
+  });
+
   it("stays under the 4096-character contribution ceiling for a large repo set", () => {
     const many = Array.from({ length: 32 }, (_, index) => ({
       dir: `repository-number-${index}`,
@@ -119,6 +170,29 @@ describe("formatInstructions", () => {
     }));
     const text = formatInstructions(manifest({ repos: many }));
     expect(text.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
+  });
+
+  it("keeps the unpushed line and the .bb paragraph at the repo-set ceiling", () => {
+    const many = Array.from({ length: 32 }, (_, index) => ({
+      dir: `repository-number-${index}`,
+      path: `/data/workspaces/thr_1/repository-number-${index}`,
+      branch: "dylan/a-fairly-long-branch-name-here",
+      baseBranch: "main",
+      remote: `git@github.com:an-organization/repository-number-${index}.git`,
+      status: "ready" as const,
+    }));
+    const text = formatInstructions(
+      manifest({
+        repos: many,
+        unpushed: { branch: "main", count: 2, subjects: ["Add a repo", "Rewrite guidance"] },
+      }),
+    );
+    expect(text.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
+    // The table gives up rows; the prose after it and the unpushed line do not.
+    expect(text).toContain("Unpushed `.bb`");
+    expect(text).toContain("do not push it");
+    expect(text).toContain("workspace_add_repo");
+    expect(text).toContain("truncated");
   });
 
   it("cuts whole lines and says so rather than truncating mid-table", () => {

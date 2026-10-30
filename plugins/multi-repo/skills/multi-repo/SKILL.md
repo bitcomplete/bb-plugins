@@ -62,15 +62,29 @@ It is the **wrong** place for anything specific to one thread.
 
 ### Publishing changes to `.bb`
 
-The canonical `.bb` checkout lives outside your sandbox, so `git push` from
-`.bb` will not reach it. Instead:
+**How a `.bb` change lands.** A committed `.bb` write is not published on its
+own yet. The Repos panel,
+`bb repos add`/`remove` and `workspace_add_repo` commit on the project
+checkout's default branch and do not push it; the plugin reads that local
+branch while it is ahead of `origin`, so the change is live on this server
+only. Pushing is the operator's job until the publish policy ships.
 
-1. Edit the files under `<workspace>/.bb`.
-2. Call `workspace_publish_guidance`.
+- **In a primary-repo project** (`.bb/` on a code repo's default branch), a
+  `.bb` change is a pull request. Publish a branch with
+  `workspace_publish_guidance` and merge it; do not push the default branch.
+- **In a standalone `.bb` repo**, `repos.json` edits go straight to the
+  default branch, while `AGENTS.md`, `skills/` and `stewards/` are reviewed
+  like code and land by pull request.
 
-It commits them host-side and lands them on a `guidance-<thread>` branch in
-the canonical checkout, for a person to review and merge. There is no need to
-commit inside `.bb` yourself.
+To publish from a thread: edit the files under `<workspace>/.bb`, then call
+`workspace_publish_guidance`. It commits them host-side and lands them on a
+`guidance-<thread>` branch in the canonical checkout, for a person to review
+and merge. There is no need to commit inside `.bb` yourself.
+
+The push to `origin` is **best-effort**: a protected or unreachable remote
+leaves the branch only in the local canonical checkout. Read the tool's result
+message, which says which happened, and push the branch yourself when it did
+not reach `origin`.
 
 In the primary layout, `<workspace>/.bb` is a symlink to `<primary>/.bb`: the
 primary repo carries `.bb/` on its default branch, and the link shows you the
