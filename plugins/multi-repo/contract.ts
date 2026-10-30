@@ -20,6 +20,24 @@ export const projectLayoutSchema = z.enum(["standalone", "primary"]);
 export type ProjectLayoutValue = z.infer<typeof projectLayoutSchema>;
 
 /**
+ * Commits on the project checkout's default branch that its origin lacks.
+ *
+ * Computed host-side at `create()` and carried in the workspace manifest so
+ * the synchronous instruction block can print the "unpushed .bb" line. `count`
+ * is the true ahead count; `subjects` may be shorter when the log was capped.
+ */
+export const unpushedSummarySchema = z
+  .object({
+    /** The default branch the commits sit on, e.g. `main`. */
+    branch: z.string().min(1).max(300),
+    count: z.number().int().positive(),
+    subjects: z.array(z.string().max(2000)).max(50),
+  })
+  .strict();
+
+export type UnpushedSummary = z.infer<typeof unpushedSummarySchema>;
+
+/**
  * The most text one file in `readProjectFiles` may carry.
  *
  * A file over it is not truncated: half a playbook reads as a whole one. It
@@ -242,6 +260,11 @@ export const hostContract = defineRpcContract({
         reposJson: z.string().max(200_000).nullable(),
         remote: z.string().max(2000).nullable(),
         defaultBranch: z.string().max(300).nullable(),
+        /**
+         * Commits on the default branch the origin lacks, or null when level.
+         * The provider computes this; `readRepoSet` and `create()` carry it.
+         */
+        unpushed: unpushedSummarySchema.nullable(),
         /** `standalone` (definition at the root) or `primary` (`.bb/`). */
         layout: projectLayoutSchema,
         warnings: z.array(z.string().max(600)).max(20),

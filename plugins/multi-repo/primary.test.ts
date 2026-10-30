@@ -547,6 +547,7 @@ describe("seeding an empty repo set", () => {
             reposJson: '{"version":1,"repos":[]}',
             remote,
             defaultBranch: "main",
+            unpushed: null,
             layout,
             warnings: [],
           };

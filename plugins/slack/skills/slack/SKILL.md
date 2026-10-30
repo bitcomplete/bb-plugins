@@ -37,29 +37,40 @@ until then bb never sees it.
 A Slack wake reaches a thread as a message naming the session
 (`channel:thread`) and telling you whether it expects a reply. A tagged wake
 (a DM or an `@bb` mention) does: post exactly one reply per Slack message with
-`slack_reply`. An untagged wake is a reply in a thread bb is already part of;
-it does not owe a reply, so answer it only when it is for bb and otherwise end
-the turn silently.
+`slack_reply`. A message that needs no answer (a thanks, or one bb should not
+act on) is instead acknowledged with `slack_ack`, which counts the wake as
+answered and posts nothing, so no error reply fires. It is not for skipping
+work that was asked for; answer a request with `slack_reply`. An untagged wake
+is a reply in a thread bb is already part of; it does not owe a reply, so
+answer it only when it is for bb and otherwise end the turn silently.
 
 | Tool | Use it to |
 |---|---|
-| `slack_reply` | Post the reply on the Slack conversation that woke this thread. Pass `text` (Slack's mrkdwn) and, only when a thread has more than one conversation, the `session` from the wake. |
+| `slack_reply` | Post the reply on the Slack conversation that woke this thread. Pass `text` (Markdown is fine; it is converted to Slack mrkdwn) and, only when a thread has more than one conversation, the `session` from the wake. |
+| `slack_ack` | Acknowledge a message that needs no answer without posting anything, so no error reply fires for the quiet turn. Pass `session` only when a thread has more than one conversation. |
 
 - The reply is posted by bb-gate-hooks as the app; the tool sends only the
   connection id and the text, so never put a token or secret in it.
+- Write the reply in Markdown if that is what comes naturally: `**bold**`,
+  `*italic*`, `~~strike~~`, `# Heading`, `- item`, `[label](url)` and fenced
+  code are converted to Slack mrkdwn before posting. Existing Slack tokens
+  (`<@U…>`, `<#C…>`, `<!here>`, `<url|label>`), inline code and fenced code
+  pass through untouched. A single `*x*` is read as Markdown italic and becomes
+  `_x_`, so Slack-style `*bold*` is not preserved.
 - Each tagged Slack message gets one reply. A second `slack_reply` for the
   same message is refused; a new Slack message is a new wake and can be
-  answered. A message that arrives while bb is working is sent as a steer: it
-  joins the running turn, the wake text says so, and the turn's one reply
-  covers both messages. An untagged reply is not counted: reply only when it is
-  for bb, and a silent turn posts no error reply.
+  answered. A `slack_ack` counts the message answered too, so a `slack_reply`
+  after an ack is refused the same way. A message that arrives while bb is
+  working is sent as a steer: it joins the running turn, the wake text says so,
+  and the turn's one reply covers both messages. An untagged reply is not
+  counted: reply only when it is for bb, and a silent turn posts no error reply.
 - The session is leased to this server: the wake carries an opaque capability
   that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
   half its life. Reply rights therefore survive a restart of bb-gate-hooks and
   are not limited to a day.
-- If the turn that handled a tagged wake ends without calling `slack_reply`,
-  the plugin posts one error reply itself, so the developer is not left
-  waiting. An untagged reply posts nothing when the turn stays silent.
+- If the turn that handled a tagged wake ends without calling `slack_reply`
+  or `slack_ack`, the plugin posts one error reply itself, so the developer is
+  not left waiting. An untagged reply posts nothing when the turn stays silent.
 - While the turn runs the plugin sets the Slack assistant status to
   "is thinking…", and it pushes the bb thread's title to the Slack
   conversation, so the title comes from bb, not from Slack.

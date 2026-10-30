@@ -21,6 +21,7 @@ import path from "node:path";
 import { projectFilePathProblem, slugify } from "./names.js";
 import { git, gitIn, gitInOrThrow, gitLine, firstProblemLine, run, splitNul } from "./git.js";
 import { REPOS_FILE, serializeReposFile, type ReposFile } from "./repos.js";
+import type { UnpushedSummary } from "./contract.js";
 import {
   PROJECT_SOURCE_DIR,
   projectDefinitionPrefix,
@@ -135,8 +136,7 @@ export const SEEDED_AGENTS_MD = `# Cross-repo guidance
 This file lives in \`.bb/\`, a directory on the primary repo's default branch.
 It is **shared by every thread in this project and versioned**, so it is the
 right place to record durable cross-repo knowledge — and the wrong place for
-anything specific to one thread. Changes to it are reviewed like code: commit
-them, publish the branch, and land them with a pull request.
+anything specific to one thread.
 
 \`.bb/\` holds three things:
 
@@ -148,6 +148,23 @@ The plugin generates a separate block listing each repo's directory, branch and
 path. Do not duplicate those facts here: paths written into this file go stale
 the first time a repo is renamed, and the generated block is always current as
 of thread start.
+
+## How a \`.bb\` change lands
+
+A committed \`.bb\` write is not published on its own yet. The Repos panel,
+\`bb repos add\`/\`remove\` and \`workspace_add_repo\` commit on the project
+checkout's default branch and do not push it; the plugin reads that local
+branch while it is ahead of \`origin\`, so the change is live on this server
+only. Pushing is the operator's job until the publish policy ships.
+
+- **In a primary-repo project** (\`.bb/\` on a code repo's default branch, as
+  on bb-gate), a \`.bb\` change is a pull request. Publish a branch with
+  \`workspace_publish_guidance\` and merge it; do not push the default branch.
+- **In a standalone \`.bb\` repo**, \`repos.json\` edits go straight to the
+  default branch, while \`AGENTS.md\`, \`skills/\` and \`stewards/\` are
+  reviewed like code and land by pull request.
+
+Either way the change reaches other machines only once it is on \`origin\`.
 
 ## What belongs here
 
@@ -353,6 +370,46 @@ export async function projectSourceBranch(dir: string, signal?: AbortSignal): Pr
     timeoutMs: GIT_TIMEOUT_MS,
     ...(signal === undefined ? {} : { signal }),
   });
+}
+
+/** How many commit subjects to carry when the default branch is ahead. */
+const UNPUSHED_SUBJECT_LIMIT = 50;
+
+/**
+ * Commits on the project checkout's default branch that `origin` does not have.
+ *
+ * The same ref {@link resolveDefaultBranchRef} picks for a read is compared to
+ * `origin/<branch>`, so the count is exactly the local-ahead state the plugin's
+ * own committed `.bb` edits create. A level or diverged branch, or a checkout
+ * with no such remote ref, is reported as null rather than as zero commits:
+ * the instruction block prints nothing for it.
+ */
+export async function projectSourceUnpushed(
+  dir: string,
+  signal?: AbortSignal,
+): Promise<UnpushedSummary | null> {
+  const ref = await resolveDefaultBranchRef(dir, signal);
+  if (ref === null) return null;
+  const branch = ref.replace(/^refs\/(heads|remotes\/origin)\//u, "");
+  const options = { timeoutMs: GIT_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) };
+  const range = `refs/remotes/origin/${branch}..${ref}`;
+  const countText = await gitLine(dir, ["rev-list", "--count", range], options);
+  if (countText === null) return null;
+  const count = Number.parseInt(countText.trim(), 10);
+  if (!Number.isFinite(count) || count <= 0) return null;
+  const log = await gitIn(
+    dir,
+    ["log", `--max-count=${UNPUSHED_SUBJECT_LIMIT}`, "--format=%s", range],
+    options,
+  );
+  const subjects =
+    log.code === 0
+      ? log.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+      : [];
+  return { branch, count, subjects };
 }
 
 /**

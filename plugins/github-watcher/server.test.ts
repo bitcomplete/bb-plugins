@@ -38,11 +38,33 @@ const comment = (body: string, createdAt: string, who = "bob") => ({ author: { l
 // A GitHub whose GraphQL endpoint a test scripts: one repository with one
 // pull request, whose bb-managed label validates.
 function fakeGitHub() {
-  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]> };
+  const state = { node: pullNode() as Record<string, unknown> | null, fail: false, valid: (token: string) => token.startsWith("gho_"), openPulls: [] as Array<Record<string, unknown>>, dependabotAlerts: [] as unknown[], dependabotPage2: [] as unknown[], dependabotStatus: 200, dependabotMessage: "Forbidden", deployments: [] as unknown[], deploymentStatuses: {} as Record<number, unknown[]>, files: {} as Record<string, string>, commits: {} as Record<string, string>, workflowRuns: [] as unknown[], workflowRun: null as unknown, jobs: [] as unknown[], compares: {} as Record<string, string> };
   const calls: Array<{ token: string; variables: Record<string, unknown> }> = [];
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const token = ((init?.headers as Record<string, string>).authorization ?? "").replace(/^Bearer /u, "");
     const u = String(url);
+    const jobs = /\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/jobs(?:\?|$)/u.exec(u);
+    if (jobs !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      return Response.json({ jobs: state.jobs });
+    }
+    const runById = /\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\?|$)/u.exec(u);
+    if (runById !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      return Response.json(state.workflowRun);
+    }
+    const workflowRuns = /\/repos\/([^/]+)\/([^/]+)\/actions\/workflows\/([^/]+)\/runs(?:\?|$)/u.exec(u);
+    if (workflowRuns !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      return Response.json({ workflow_runs: state.workflowRuns });
+    }
+    const compare = /\/repos\/([^/]+)\/([^/]+)\/compare\/([^/?]+)(?:\?|$)/u.exec(u);
+    if (compare !== null) {
+      if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
+      const status = state.compares[decodeURIComponent(compare[3]!)];
+      if (status === undefined) return Response.json({ message: "Not Found" }, { status: 404 });
+      return Response.json({ status });
+    }
     const deployments = /\/repos\/([^/]+)\/([^/]+)\/deployments(?:\?|$)/u.exec(u);
     if (deployments !== null) {
       if (!state.valid(token)) return Response.json({ message: "Bad credentials" }, { status: 401 });
@@ -74,6 +96,19 @@ function fakeGitHub() {
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { viewer: { login: "dev" }, repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
     if (body.query.includes("label(name:")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", label: v.label === "bb-managed" ? { name: "bb-managed" } : null } } });
     if (body.query.includes("pullRequests(")) return Response.json({ data: { viewer: { login: "dev" }, repository: { nameWithOwner: "Acme/Widgets", pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: state.openPulls } } } });
+    if (body.query.includes("object(expression:")) {
+      const expression = String((body.variables as { expression?: unknown }).expression ?? "");
+      const content = state.files[expression] ?? null;
+      return Response.json({ data: { repository: { object: content === null ? null : { text: content } } } });
+    }
+    if (body.query.includes("history(")) {
+      const vv = body.variables as { qualified?: unknown; path?: unknown; until?: unknown };
+      const key = `${String(vv.qualified)} ${vv.path === null || vv.path === undefined ? "" : String(vv.path)} ${String(vv.until)}`;
+      const sha = state.commits[key] ?? null;
+      const history = sha === null ? null : { nodes: [{ oid: sha, committedDate: null }] };
+      const qualified = String(vv.qualified);
+      return Response.json({ data: { repository: { ref: qualified.endsWith("HEAD") || history === null ? null : { target: { history } }, defaultBranchRef: history === null ? null : { target: { history } } } } });
+    }
     if (`${v.owner}/${v.name}`.toLowerCase() !== "acme/widgets") return Response.json({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }] });
     const number = typeof state.node?.number === "number" ? state.node.number : 12;
     if (v.number !== number || state.node === null) return Response.json({ data: { repository: { nameWithOwner: "Acme/Widgets", issueOrPullRequest: null } }, errors: [{ type: "NOT_FOUND", message: "Could not resolve" }] });
@@ -604,6 +639,31 @@ describe("stewards' source contract", () => {
     expect(await w.harness.callRpc("sourceDeployments", { repo: "widgets", environment: "production", limit: 10 }, STEWARDS)).toMatchObject({ deployments: [], error: "widgets: not owner/repo" });
   });
 
+  it("reads a file at a ref, the newest commit for a path as of a time, a workflow run by number or id, and a compare (BB-132)", async () => {
+    const w = await setup();
+    w.github.state.files["refs/heads/main:kploy/production/kustomization.yaml"] = 'images:\n  - name: bb-server\n    newTag: "7"\n';
+    w.github.state.commits["refs/heads/main docker/bb-server/Dockerfile 2026-10-30T18:05:00Z"] = "asofsha1";
+    expect(await w.harness.callRpc("sourceFileAtRef", { repo: "Acme/Widgets", path: "kploy/production/kustomization.yaml", ref: "refs/heads/main" }, STEWARDS)).toEqual({ content: 'images:\n  - name: bb-server\n    newTag: "7"\n', error: null });
+    expect(await w.harness.callRpc("sourceFileAtRef", { repo: "Acme/Widgets", path: "missing", ref: "main" }, STEWARDS)).toEqual({ content: null, error: null });
+    expect(await w.harness.callRpc("sourceFileAtRef", { repo: "widgets", path: "x", ref: "main" }, STEWARDS)).toMatchObject({ content: null, error: "widgets: not owner/repo" });
+    expect(await w.harness.callRpc("sourceLatestCommit", { repo: "Acme/Widgets", branch: "main", path: "docker/bb-server/Dockerfile", until: "2026-10-30T18:05:00Z" }, STEWARDS)).toEqual({ sha: "asofsha1", committedAt: null, error: null });
+    // An empty path asks for the branch tip: the fake answers defaultBranchRef when the qualified name is HEAD.
+    w.github.state.commits["refs/heads/HEAD  2026-10-30T18:05:00Z"] = "tipsha00";
+    expect(await w.harness.callRpc("sourceLatestCommit", { repo: "Acme/Widgets", branch: "HEAD", path: "", until: "2026-10-30T18:05:00Z" }, STEWARDS)).toEqual({ sha: "tipsha00", committedAt: null, error: null });
+    // A run by workflow and number, and the same run by id.
+    w.github.state.workflowRuns = [{ id: 11, run_number: 7, head_sha: "runhead1", run_started_at: "2026-10-30T18:00:00Z" }];
+    w.github.state.jobs = [{ name: "build_and_push_image", started_at: "2026-10-30T18:05:00Z", conclusion: "success" }];
+    const expectedRun = { id: 11, runNumber: 7, headSha: "runhead1", startedAt: "2026-10-30T18:00:00Z", jobs: [{ name: "build_and_push_image", startedAt: "2026-10-30T18:05:00Z", conclusion: "success" }] };
+    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "bb-server.yaml", runNumber: 7 }, STEWARDS)).toEqual({ run: expectedRun, error: null });
+    w.github.state.workflowRun = { id: 11, run_number: 7, head_sha: "runhead1", run_started_at: "2026-10-30T18:00:00Z" };
+    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", runId: 11 }, STEWARDS)).toEqual({ run: expectedRun, error: null });
+    expect(await w.harness.callRpc("sourceWorkflowRun", { repo: "Acme/Widgets", workflow: "bb-server.yaml", runNumber: 999 }, STEWARDS)).toEqual({ run: null, error: null });
+    // A compare, and a compare GitHub has no answer for.
+    w.github.state.compares["mergesha1...main"] = "identical";
+    expect(await w.harness.callRpc("sourceCompare", { repo: "Acme/Widgets", base: "mergesha1", head: "main" }, STEWARDS)).toEqual({ status: "identical", error: null });
+    expect(await w.harness.callRpc("sourceCompare", { repo: "Acme/Widgets", base: "a", head: "b" }, STEWARDS)).toMatchObject({ status: null, error: expect.stringMatching(/404/u) });
+  });
+
   describe("interest", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
@@ -717,7 +777,7 @@ describe("stewards' source contract", () => {
       w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/bb-gate#42", unit: "Acme/bb-gate", workflow_run })}\n\n`);
       w.hooks.last().send(`event: doorbell\ndata: ${JSON.stringify({ source: "github", kind: "workflow_run", id: "Acme/Other#42", unit: "Acme/Other", workflow_run })}\n\n`);
       await tick(3000);
-      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#42", workflow_run } }]);
+      expect(w.rpcs()).toEqual([{ pluginId: "stewards", method: "stewardsRing", input: { source: "github", id: "Acme/bb-gate#42", workflow_run: { ...workflow_run, startedAt: null } } }]);
       service.controller.abort();
       await service.done;
     });

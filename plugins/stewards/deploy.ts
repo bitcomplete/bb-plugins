@@ -1,8 +1,9 @@
 // Deployment watching: the per-pull-request state a binding keeps between a
 // merge and the deployment that confirms it is live (BB-53). Pure: the store
 // holds the state, and server.ts feeds in the snapshots and the deployment
-// doorbells. Nothing here decides whether a deployment carries a merge; that
-// is the steward's, from the playbook's rule, and it reports the verdict.
+// doorbells. A free-text `carries` is the steward's to apply; a structured one
+// is evaluated by `carries.ts` (BB-132), and either way the steward reports a
+// verdict it disagrees with.
 import { z } from "zod";
 import type { DeploymentTarget } from "./config.js";
 import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
@@ -23,6 +24,22 @@ export const deploymentWatchSchema = z.object({
   state: z.enum(DEPLOY_STATES),
   /** The merged commit the deployment must carry. */
   mergeSha: z.string().nullable().default(null),
+  /**
+   * The target this watch belongs to, keyed name-or-`repo@environment`
+   * (BB-132). Empty on a watch stored before targets could be many; a
+   * playbook with one unnamed target still keys its watches by the pull
+   * request alone, so old watches and new ones share a key.
+   */
+  target: z.string().default(""),
+  /**
+   * When the pull request merged, the clock a workflow run is compared
+   * against. Null on a watch stored before BB-132, when `at` is used.
+   */
+  mergedAt: z.number().nullable().default(null),
+  /** The merged pull request's own repo, for matching a carries rule's `when.repo`. */
+  prRepo: z.string().default(""),
+  /** The merged pull request's changed paths, for matching a carries rule's `when.paths`. */
+  files: z.array(z.string()).default([]),
   /** The playbook's target, recorded with the watch so a later playbook edit does not move it. */
   repo: z.string(),
   environment: z.string(),
@@ -55,35 +72,81 @@ export function mergedPulls(observed: Observed): EntitySnapshot[] {
   return [observed.entity, ...observed.pulls].filter((e) => e.pull !== null && (e.pull.merged || e.state.toLowerCase() === "merged"));
 }
 
+/** The target's stable key: its name when it has one, else `repo@environment`. */
+export const targetKeyOf = (target: Pick<DeploymentTarget, "name" | "repo" | "environment">): string => target.name ?? `${target.repo}@${target.environment}`;
+
+/**
+ * The map key a watch for one merged pull request and one target uses. A
+ * single unnamed target keeps today's key (the pull request's own), so a
+ * project with one target reads and writes exactly as before (BB-132).
+ */
+export const watchId = (pullKey: string, target: Pick<DeploymentTarget, "name" | "repo" | "environment">, multiple: boolean): string => (!multiple && target.name === undefined ? pullKey : `${pullKey}::${targetKeyOf(target)}`);
+
 /**
  * Add a `merged` watch for every merged pull request the binding does not
- * already watch. The target's timeout is the deadline; a watch that already
- * exists is left alone, so a re-read does not reset it.
+ * already watch, for each of the playbook's deployment targets (BB-132). The
+ * target's timeout is the deadline; a watch that already exists is left
+ * alone, except that its `mergeSha` is re-resolved to the merge commit when
+ * the source now knows one and the stored one differs (a watch recorded
+ * before BB-132 holds the pull request head, which a squash merge rewrites).
  */
-export function recordMerged(deployments: Deployments, observed: Observed, target: DeploymentTarget, now: number): Deployments {
+export function recordMerged(deployments: Deployments, observed: Observed, targets: readonly DeploymentTarget[], now: number): Deployments {
   const pulls = mergedPulls(observed);
-  if (pulls.length === 0) return deployments;
+  if (pulls.length === 0 || targets.length === 0) return deployments;
+  const multiple = targets.length > 1;
   const next = { ...deployments };
   let changed = false;
   for (const p of pulls) {
-    if (next[p.key] !== undefined) continue;
-    next[p.key] = {
-      key: p.key,
-      state: "merged",
-      mergeSha: p.pull?.headSha ?? null,
-      repo: target.repo,
-      environment: target.environment,
-      deploymentId: null,
-      deploymentState: null,
-      ref: null,
-      sha: null,
-      url: null,
-      at: now,
-      deadlineAt: now + target.timeout,
-      note: null,
-      workflowRuns: [],
-    };
-    changed = true;
+    const merge = p.pull?.mergeCommit ?? null;
+    for (const target of targets) {
+      const id = watchId(p.key, target, multiple);
+      let existing = next[id];
+      // A playbook that grew a target, or named its single one, leaves a
+      // watch stored before BB-132 keyed by the pull request alone. When its
+      // recorded target is this one, move it to the keyed form rather than
+      // orphaning it.
+      if (existing === undefined && id !== p.key) {
+        const legacy = next[p.key];
+        if (legacy !== undefined && legacy.target === "" && matchesTarget(target, legacy.repo, legacy.environment)) {
+          delete next[p.key];
+          existing = { ...legacy, target: targetKeyOf(target) };
+          next[id] = existing;
+          changed = true;
+        }
+      }
+      if (existing !== undefined) {
+        // Re-resolve a stored PR-head merge sha to the merge commit (BB-132).
+        // An unknown oid leaves the watch on the steward-decided path. The
+        // old note is kept: a settled watch's failure text must not vanish.
+        if (merge !== null && existing.mergeSha !== merge) {
+          const resolved = `Merge commit re-resolved to ${merge.slice(0, 7)}`;
+          next[id] = { ...existing, mergeSha: merge, note: existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})` };
+          changed = true;
+        }
+        continue;
+      }
+      next[id] = {
+        key: p.key,
+        state: "merged",
+        mergeSha: merge,
+        target: multiple || target.name !== undefined ? targetKeyOf(target) : "",
+        mergedAt: now,
+        prRepo: p.unit,
+        files: p.pull?.files ?? [],
+        repo: target.repo,
+        environment: target.environment,
+        deploymentId: null,
+        deploymentState: null,
+        ref: null,
+        sha: null,
+        url: null,
+        at: now,
+        deadlineAt: now + target.timeout,
+        note: merge === null ? "The merge commit is not known yet; the next read re-resolves it" : null,
+        workflowRuns: [],
+      };
+      changed = true;
+    }
   }
   return changed ? next : deployments;
 }
@@ -101,14 +164,14 @@ export function applyDeployment(deployments: Deployments, target: Pick<Deploymen
   const next = { ...deployments };
   const changed: string[] = [];
   const failed = deployment.state === "failure" || deployment.state === "error";
-  for (const watch of Object.values(next)) {
+  for (const [id, watch] of Object.entries(next)) {
     if (watch.state === "deployed" || watch.state === "failed") continue;
     if (!matchesTarget(target, watch.repo, watch.environment)) continue;
     // The doorbell's own environment has to be the target's too; the caller
     // matched the repo already, and a doorbell for another environment is not
     // this target's.
     if (deployment.environment.toLowerCase() !== watch.environment.toLowerCase()) continue;
-    next[watch.key] = {
+    next[id] = {
       ...watch,
       state: failed ? "failed" : "deploying",
       deploymentId: deployment.id,
@@ -169,18 +232,22 @@ export const awaitingOnRepo = (deployments: Deployments, repo: string): Deployme
  * caller must persist even when nothing is woken, or a repeat delivery would
  * wake an arrival-skipped watch later.
  */
-export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number): { deployments: Deployments; woken: string[]; recorded: string[] } {
+export function applyWorkflowRun(deployments: Deployments, id: string, repo: string, run: WorkflowRun, receivedAt: number, runStartedAt: number | null = null): { deployments: Deployments; woken: string[]; recorded: string[] } {
   const key = workflowRunKey(id, run.run_attempt);
+  // The run's own start is the clock when it is known (BB-132); the doorbell's
+  // arrival is the fallback. A run that started before a watch's merge cannot
+  // concern it, so that watch is recorded but not woken.
+  const startedAt = runStartedAt ?? receivedAt;
   const next = { ...deployments };
   const woken: string[] = [];
   const recorded: string[] = [];
-  for (const watch of Object.values(next)) {
+  for (const [id, watch] of Object.entries(next)) {
     if (watch.state !== "merged" && watch.state !== "deploying") continue;
     if (watch.repo.toLowerCase() !== repo.toLowerCase()) continue;
     if (watch.workflowRuns.includes(key)) continue;
-    next[watch.key] = { ...watch, workflowRuns: [...watch.workflowRuns, key] };
+    next[id] = { ...watch, workflowRuns: [...watch.workflowRuns, key] };
     recorded.push(watch.key);
-    if (watch.at <= receivedAt) woken.push(watch.key);
+    if ((watch.mergedAt ?? watch.at) <= startedAt) woken.push(watch.key);
   }
   return { deployments: next, woken, recorded };
 }
@@ -205,7 +272,7 @@ export function applyDeploymentRead(
   const failed = latest.state === "failure" || latest.state === "error";
   const next = { ...deployments };
   const changed: string[] = [];
-  for (const watch of Object.values(next)) {
+  for (const [id, watch] of Object.entries(next)) {
     if (watch.state === "deployed" || watch.state === "failed") continue;
     if (!matchesTarget(target, watch.repo, watch.environment)) continue;
     if (latest.environment.toLowerCase() !== watch.environment.toLowerCase()) continue;
@@ -213,7 +280,7 @@ export function applyDeploymentRead(
     if (watch.deploymentId === latest.id && watch.deploymentState === latest.state) continue;
     // A read can only move a watch forward; an older deployment is stale.
     if (watch.deploymentId !== null && latest.id < watch.deploymentId) continue;
-    next[watch.key] = {
+    next[id] = {
       ...watch,
       state: failed ? "failed" : "deploying",
       deploymentId: latest.id,
@@ -230,19 +297,19 @@ export function applyDeploymentRead(
   return changed.length === 0 ? { deployments, changed, deployment: null } : { deployments: next, changed, deployment: latest };
 }
 
-/** The watches still awaiting a deployment whose deadline has passed. */
+/** The watches still awaiting a deployment whose deadline has passed, by map id. */
 export const timeoutsDue = (deployments: Deployments, now: number): string[] =>
-  Object.values(deployments)
-    .filter((w) => (w.state === "merged" || w.state === "deploying") && w.deadlineAt !== null && now >= w.deadlineAt)
-    .map((w) => w.key);
+  Object.entries(deployments)
+    .filter(([, w]) => (w.state === "merged" || w.state === "deploying") && w.deadlineAt !== null && now >= w.deadlineAt)
+    .map(([id]) => id);
 
 /** Mark timed-out watches failed, so the steward is woken once and the state does not flap. */
-export function timeOut(deployments: Deployments, keys: readonly string[], now: number): Deployments {
+export function timeOut(deployments: Deployments, ids: readonly string[], now: number): Deployments {
   const next = { ...deployments };
-  for (const key of keys) {
-    const watch = next[key];
-    if (watch === undefined) continue;
-    next[key] = { ...watch, state: "failed", at: now, deadlineAt: null, note: watch.note ?? "No matching deployment within the playbook's timeout" };
+  const wanted = new Set(ids);
+  for (const [id, watch] of Object.entries(next)) {
+    if (!wanted.has(id)) continue;
+    next[id] = { ...watch, state: "failed", at: now, deadlineAt: null, note: watch.note ?? "No matching deployment within the playbook's timeout" };
   }
   return next;
 }
@@ -252,16 +319,22 @@ export const deploymentReportSchema = z.object({
   state: z.enum(["deployed", "failed", "not-yet"]),
   /** The pull request key, when the binding watches more than one. */
   key: z.string().trim().min(1).max(300).optional(),
+  /** The deployment target's name, when the binding watches more than one (BB-132). */
+  target: z.string().trim().min(1).max(200).optional(),
   /** The deployment id, when the steward is answering a specific doorbell. */
   deploymentId: z.number().int().nonnegative().optional(),
   note: z.string().trim().max(2000).optional(),
 });
 export type DeploymentReport = z.infer<typeof deploymentReportSchema>;
 
-/** The watch a report names: by key, by deployment id, or the only unsettled one. */
+/** The watch a report names: by key (and target, when named), by deployment id, or the only unsettled one. */
 export function pickWatch(deployments: Deployments, report: DeploymentReport): DeploymentWatch | null {
   const all = Object.values(deployments);
-  if (report.key !== undefined) return all.find((w) => w.key.toLowerCase() === report.key!.toLowerCase()) ?? null;
+  if (report.key !== undefined) {
+    const matches = all.filter((w) => w.key.toLowerCase() === report.key!.toLowerCase());
+    if (report.target !== undefined) return matches.find((w) => w.target.toLowerCase() === report.target!.toLowerCase()) ?? null;
+    return matches[0] ?? null;
+  }
   if (report.deploymentId !== undefined) return all.find((w) => w.deploymentId === report.deploymentId) ?? null;
   const unsettled = all.filter((w) => w.state === "merged" || w.state === "deploying");
   return unsettled.length === 1 ? unsettled[0]! : null;
@@ -275,15 +348,18 @@ export function pickWatch(deployments: Deployments, report: DeploymentReport): D
 export function reportDeployment(deployments: Deployments, report: DeploymentReport, now: number, timeoutMs: number): { deployments: Deployments; changed: DeploymentWatch | null } {
   const watch = pickWatch(deployments, report);
   if (watch === null) return { deployments, changed: null };
+  const entry = Object.entries(deployments).find(([, w]) => w === watch);
+  if (entry === undefined) return { deployments, changed: null };
+  const [id] = entry;
   const next = { ...deployments };
   const note = report.note ?? null;
-  if (report.state === "deployed") next[watch.key] = { ...watch, state: "deployed", at: now, deadlineAt: null, note };
-  else if (report.state === "failed") next[watch.key] = { ...watch, state: "failed", at: now, deadlineAt: null, note: note ?? watch.note };
+  if (report.state === "deployed") next[id] = { ...watch, state: "deployed", at: now, deadlineAt: null, note };
+  else if (report.state === "failed") next[id] = { ...watch, state: "failed", at: now, deadlineAt: null, note: note ?? watch.note };
   // A deployment that does not carry the merge is not settled: it keeps a
   // fresh deadline, so another deployment, or the timeout, still wakes the
   // steward within the playbook's time.
-  else next[watch.key] = { ...watch, state: "merged", at: now, deadlineAt: now + timeoutMs, note: note ?? "The deployment does not carry this merge yet" };
-  return { deployments: next, changed: next[watch.key]! };
+  else next[id] = { ...watch, state: "merged", at: now, deadlineAt: now + timeoutMs, note: note ?? "The deployment does not carry this merge yet" };
+  return { deployments: next, changed: next[id]! };
 }
 
 /** Whether every watched pull request is deployed and there is at least one. */
@@ -304,12 +380,13 @@ export function deploymentLines(deployments: Deployments): string[] {
     .sort((a, b) => a.key.localeCompare(b.key))
     .map((w) => {
       const where = `→ ${w.repo} ${w.environment}`;
+      const named = w.target !== "" && w.target !== `${w.repo}@${w.environment}` ? ` [${w.target}]` : "";
       const facts = [
         w.deploymentId === null ? null : `deployment ${w.deploymentId}`,
         w.ref === null ? null : `ref ${w.ref}`,
         w.sha === null ? null : `sha ${w.sha.slice(0, 7)}`,
         w.url === null ? null : w.url,
       ].filter((x): x is string => x !== null);
-      return `${w.key}: ${w.state} ${where}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`;
+      return `${w.key}${named}: ${w.state} ${where}${facts.length === 0 ? "" : ` (${facts.join(", ")})`}${w.note === null ? "" : ` — ${w.note}`}`;
     });
 }

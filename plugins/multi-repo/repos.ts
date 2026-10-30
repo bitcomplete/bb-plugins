@@ -16,7 +16,7 @@
  */
 import { z } from "zod";
 import { PROJECT_SOURCE_DIR } from "./paths.js";
-import { dirFromUrl, isSafeSegment, normalizeRemoteUrl } from "./names.js";
+import { PROJECT_FILE_PATH_MAX, dirFromUrl, isSafeSegment, normalizeRemoteUrl, projectFilePathProblem } from "./names.js";
 
 export { dirFromUrl };
 
@@ -67,10 +67,76 @@ export const repoEntrySchema = repoEntryInputSchema
 
 export type RepoEntry = z.infer<typeof repoEntrySchema>;
 
+/**
+ * How a committed `.bb` write is published, per project or per path.
+ *
+ * Accepted and preserved by this parser now so that a `repos.json` written
+ * once deliverable 2 ships does not make an older server reject the whole
+ * repo set. This module attaches no behaviour to the value: it only validates
+ * and round-trips it.
+ */
+export const publishModeSchema = z.enum(["push", "pull-request"]);
+export type PublishMode = z.infer<typeof publishModeSchema>;
+
+/**
+ * A `.bb`-relative path that a publish policy may be keyed by.
+ *
+ * A trailing slash is allowed so a directory — `skills/`, `stewards/` — can
+ * name a subtree; the segment rules are the same as for any file path.
+ */
+const publishPathSchema = z
+  .string()
+  .min(1)
+  .max(PROJECT_FILE_PATH_MAX)
+  .superRefine((value, context) => {
+    const problem = projectFilePathProblem(value.endsWith("/") ? value.slice(0, -1) : value);
+    if (problem !== null) context.addIssue({ code: "custom", message: problem });
+  });
+
+/**
+ * One mode for the whole project, or one per path.
+ *
+ * The split form lets a project push mechanical `repos.json` edits while
+ * keeping `AGENTS.md` and `skills/` reviewed like code; the value is validated
+ * strictly so an unknown word is a parse error, not a silently ignored key.
+ */
+export const publishPolicySchema = z.union([
+  publishModeSchema,
+  z.record(publishPathSchema, publishModeSchema),
+]);
+
+export type PublishPolicy = z.infer<typeof publishPolicySchema>;
+
+/**
+ * Why a publish policy is invalid, or null when it is one of the accepted
+ * shapes. Kept separate from the schema so `parseReposFile` can name the
+ * offending path and mode in a sentence rather than a union of zod issues.
+ */
+export function publishPolicyProblem(value: unknown): string | null {
+  if (typeof value === "string") {
+    return publishModeSchema.safeParse(value).success
+      ? null
+      : `publish is ${JSON.stringify(value)}; expected "push" or "pull-request".`;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return `publish must be "push", "pull-request", or an object of path → mode.`;
+  }
+  for (const [key, mode] of Object.entries(value)) {
+    const problem = projectFilePathProblem(key.endsWith("/") ? key.slice(0, -1) : key);
+    if (problem !== null) return `publish[${JSON.stringify(key)}]: ${problem}`;
+    if (typeof mode !== "string" || !publishModeSchema.safeParse(mode).success) {
+      return `publish[${JSON.stringify(key)}] is ${JSON.stringify(mode)}; expected "push" or "pull-request".`;
+    }
+  }
+  return null;
+}
+
 export const reposFileInputSchema = z
   .object({
     version: z.literal(REPOS_VERSION),
     repos: z.array(repoEntryInputSchema).max(MAX_REPOS),
+    /** Optional; absent means the deliverable-2 defaults, which this PR does not implement. */
+    publish: publishPolicySchema.optional(),
   })
   .strict();
 
@@ -78,6 +144,7 @@ export const reposFileSchema = z
   .object({
     version: z.literal(REPOS_VERSION),
     repos: z.array(repoEntrySchema).max(MAX_REPOS),
+    publish: publishPolicySchema.optional(),
   })
   .strict();
 
@@ -121,11 +188,21 @@ export function parseReposFile(text: string): ParseResult {
   const parsed = reposFileInputSchema.safeParse(json);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
+    // A bad `publish` is the one failure worth a sentence of its own: the
+    // union that accepts it produces a list of zod issues, and the operator
+    // needs to be told which value is wrong, not which shapes were tried.
+    if (issue.path.length > 0 && issue.path[0] === "publish") {
+      const problem = publishPolicyProblem((json as { publish?: unknown }).publish);
+      if (problem !== null) return { ok: false, error: `${REPOS_FILE} ${problem}` };
+    }
     return {
       ok: false,
       error: `${REPOS_FILE} is invalid at ${issueLocation(issue.path)}: ${issue.message}`,
     };
   }
+  // The schema itself validates both the modes and the split-path keys, so a
+  // bad `publish` fails `safeParse` above and the clearer sentence is built
+  // there; nothing further is needed here.
   const repos: RepoEntry[] = [];
   for (const [index, entry] of parsed.data.repos.entries()) {
     const resolved = resolveRepoEntry(entry);
@@ -139,7 +216,23 @@ export function parseReposFile(text: string): ParseResult {
   }
   const semantic = validateRepoSet(repos);
   if (semantic !== null) return { ok: false, error: semantic };
-  return { ok: true, value: { version: parsed.data.version, repos } };
+  return {
+    ok: true,
+    value: {
+      version: parsed.data.version,
+      repos,
+      ...(parsed.data.publish === undefined ? {} : { publish: parsed.data.publish }),
+    },
+  };
+}
+
+/** Carry `repos.json`'s non-repo keys across an edit unchanged. */
+function withRepos(file: ReposFile, repos: RepoEntry[]): ReposFile {
+  return {
+    version: REPOS_VERSION,
+    repos,
+    ...(file.publish === undefined ? {} : { publish: file.publish }),
+  };
 }
 
 /**
@@ -208,7 +301,15 @@ export function serializeReposFile(file: ReposFile): string {
     url: repo.url,
     ...(repo.branch === undefined ? {} : { branch: repo.branch }),
   }));
-  return `${JSON.stringify({ version: REPOS_VERSION, repos }, null, 2)}\n`;
+  return `${JSON.stringify(
+    {
+      version: REPOS_VERSION,
+      repos,
+      ...(file.publish === undefined ? {} : { publish: file.publish }),
+    },
+    null,
+    2,
+  )}\n`;
 }
 
 export type EditResult =
@@ -223,7 +324,7 @@ export function addRepo(file: ReposFile, entry: RepoEntryInput): EditResult {
   if (resolved === null) {
     return { ok: false, error: `Could not derive a directory name from ${JSON.stringify(entry.url)}.` };
   }
-  const next: ReposFile = { version: REPOS_VERSION, repos: [...file.repos, resolved] };
+  const next = withRepos(file, [...file.repos, resolved]);
   const problem = validateRepoSet(next.repos);
   return problem === null ? { ok: true, value: next } : { ok: false, error: problem };
 }
@@ -233,7 +334,7 @@ export function removeRepo(file: ReposFile, dir: string): EditResult {
   if (repos.length === file.repos.length) {
     return { ok: false, error: `No repo named ${JSON.stringify(dir)} is in ${REPOS_FILE}.` };
   }
-  return { ok: true, value: { version: REPOS_VERSION, repos } };
+  return { ok: true, value: withRepos(file, repos) };
 }
 
 /**
@@ -255,7 +356,7 @@ export function setRepoBranch(file: ReposFile, dir: string, branch: string | nul
   const next = trimmed.length === 0 ? rest : { ...rest, branch: trimmed };
   const repos = [...file.repos];
   repos[index] = next;
-  return { ok: true, value: { version: REPOS_VERSION, repos } };
+  return { ok: true, value: withRepos(file, repos) };
 }
 
 /** Whether a repo with this directory name — or this remote — is already in the set. */

@@ -257,6 +257,93 @@ describe("edits", () => {
   });
 });
 
+describe("publish policy", () => {
+  it("parses a whole-project mode and round-trips it", () => {
+    const text = JSON.stringify({ version: 1, repos: [], publish: "push" });
+    const parsed = parseReposFile(text);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.publish).toBe("push");
+    const again = parseReposFile(serializeReposFile(parsed.value));
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(again.value).toEqual(parsed.value);
+  });
+
+  it("parses a policy split by path and round-trips it", () => {
+    const text = JSON.stringify({
+      version: 1,
+      repos: [{ dir: "a", url: "https://example.com/a" }],
+      publish: { "repos.json": "push", "AGENTS.md": "pull-request", "skills/": "pull-request" },
+    });
+    const parsed = parseReposFile(text);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.publish).toEqual({ "repos.json": "push", "AGENTS.md": "pull-request", "skills/": "pull-request" });
+    const again = parseReposFile(serializeReposFile(parsed.value));
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(again.value).toEqual(parsed.value);
+  });
+
+  it("rejects an unknown whole-project value with a clear message", () => {
+    const parsed = parseReposFile(JSON.stringify({ version: 1, repos: [], publish: "maybe" }));
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("publish");
+    expect(parsed.error).toContain("push");
+    expect(parsed.error).toContain("pull-request");
+  });
+
+  it("rejects an unknown split value and names the path", () => {
+    const parsed = parseReposFile(
+      JSON.stringify({ version: 1, repos: [], publish: { "AGENTS.md": "maybe" } }),
+    );
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("AGENTS.md");
+    expect(parsed.error).toContain("pull-request");
+  });
+
+  it("rejects a path that escapes the definition", () => {
+    const parsed = parseReposFile(
+      JSON.stringify({ version: 1, repos: [], publish: { "../repos.json": "push" } }),
+    );
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("publish");
+  });
+
+  it("still parses an old repos.json with no publish key", () => {
+    const parsed = parseReposFile(valid);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.publish).toBeUndefined();
+    expect(serializeReposFile(parsed.value)).not.toContain("publish");
+  });
+
+  it("preserves the policy across a structured edit", () => {
+    const parsed = parseReposFile(
+      JSON.stringify({ version: 1, repos: [{ dir: "a", url: "https://example.com/a" }], publish: "pull-request" }),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const added = addRepo(parsed.value, { dir: "b", url: "https://example.com/b" });
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    expect(added.value.publish).toBe("pull-request");
+    const removed = removeRepo(added.value, "a");
+    expect(removed.ok).toBe(true);
+    if (!removed.ok) return;
+    expect(removed.value.publish).toBe("pull-request");
+    const branch = setRepoBranch(removed.value, "b", "release");
+    expect(branch.ok).toBe(true);
+    if (!branch.ok) return;
+    expect(branch.value.publish).toBe("pull-request");
+    expect(parseReposFile(serializeReposFile(branch.value))).toMatchObject({ ok: true });
+  });
+});
+
 describe("dirFromUrl", () => {
   it("takes the last component without .git", () => {
     expect(dirFromUrl("git@github.com:you/bb-dylan.git")).toBe("bb-dylan");

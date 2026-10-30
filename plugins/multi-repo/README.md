@@ -83,6 +83,12 @@ bb repos list --project proj_abc123
 - `url` — anything git can clone, **including a local path**, which makes
   "base this on my local checkout" a first-class option.
 - `branch` — optional base branch; defaults to that repo's default branch.
+- `publish` — optional. `"push"` or `"pull-request"`, or an object mapping a
+  `.bb`-relative path (`repos.json`, `AGENTS.md`, `skills/`, `stewards/`) to
+  one of those modes. The parser accepts and preserves it, and an unknown
+  value is a clear error, but the behaviour it names (BB-148 deliverable 2) is
+  not implemented yet: for now an absent key and any valid value behave
+  identically. Nothing writes the key yet.
 
 **Branches float; SHAs are never pinned.** This is a dev workspace, not a
 release manifest.
@@ -208,6 +214,17 @@ the generated block cannot be edited.
 
 The canonical `.bb` checkout is outside the agent's sandbox, so the write is
 inverted: the plugin's host entry does it.
+
+**A write lands on the canonical checkout's default branch and does not push
+it.** The Repos panel, `bb repos add`/`remove`, `workspace_add_repo` and the
+raw `repos.json` editor all commit on that local branch. The plugin reads that
+local branch while it is strictly ahead of `origin` (see
+`resolveDefaultBranchRef`), so the edit is live on this server immediately —
+and on no other machine until it is pushed. The generated instruction block
+says so with an **unpushed `.bb`** line: the commit count, the subjects, the
+fact that they are live on this server only, and the exact
+`git -C <project-source> push origin <branch>` command. `bb repos list` prints
+the same line under its `layout` row. A clean checkout prints nothing extra.
 
 On the **standalone** layout, the canonical repo *fetches* from the workspace
 clone:

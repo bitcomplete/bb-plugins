@@ -16,6 +16,7 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type Rejection, type SessionEvent } from "./hooks-client.js";
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
+import { toMrkdwn } from "./mrkdwn.js";
 import {
   channelEntrySchema,
   channelMapFromLegacy,
@@ -615,13 +616,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Post a reply on a session and count it answered. Throws what replyError
-     * makes. `clearStatus` clears the thinking indicator after the reply; a
-     * caller that never set one (the assistant-pane greeting) passes false.
+     * Post a reply on a session and count it answered. The text is Markdown or
+     * mrkdwn; it is converted to mrkdwn here, the one path both `slack_reply`
+     * and the plugin's own backstop use. Throws what replyError makes.
+     * `clearStatus` clears the thinking indicator after the reply; a caller
+     * that never set one (the assistant-pane greeting) passes false.
      */
     async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any", clearStatus = true): Promise<void> {
       try {
-        await hooks.reply(session, text, signal);
+        await hooks.reply(session, toMrkdwn(text), signal);
       } catch (error) {
         throw replyError(error);
       }
@@ -1306,12 +1309,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "slack_reply",
       description:
-        "Reply in Slack on the conversation that woke this thread. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
+        "Reply in Slack on the conversation that woke this thread. Markdown is fine; it is converted to Slack mrkdwn before posting. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
       instructions:
-        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Slack's mrkdwn, and say in one line who did it. Do not paste secrets or tokens.",
+        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Markdown or Slack's mrkdwn — Markdown is fine; it is converted — and say in one line who did it. A message that needs no answer (a thanks, or something bb should not act on) is acknowledged with slack_ack instead, which posts nothing; never use slack_ack to skip work that was asked for. Do not paste secrets or tokens.",
       presentation: { label: { pending: "Replying in Slack", completed: "Replied in Slack" } },
       parameters: z.object({
-        text: z.string().trim().min(1).max(30_000).describe("The reply, in Slack's mrkdwn."),
+        text: z.string().trim().min(1).max(30_000).describe("The reply, in Markdown or Slack's mrkdwn; Markdown is converted."),
         session: z.string().trim().min(1).max(200).optional().describe("The Slack session id from the wake. Leave it out: this thread's Slack conversation is used."),
       }),
       async execute({ text, session }, { threadId, signal }) {
@@ -1322,7 +1325,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (r !== undefined && answered(r)) {
           return toolError(new Error("Every message in this Slack conversation already has its reply; each gets exactly one. Send a new Slack message to continue."));
         }
-        if (new TextEncoder().encode(text).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
+        // The size cap is on what is posted, so it is checked on the converted
+        // text: a conversion that grows the reply past the cap is refused here.
+        if (new TextEncoder().encode(toMrkdwn(text)).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
         try {
           await postReply(id, text, signal);
           void pushTitle(threadId);
@@ -1330,6 +1335,27 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         } catch (error) {
           return toolError(error);
         }
+      },
+    });
+
+    bb.agents.registerTool({
+      name: "slack_ack",
+      description:
+        "Acknowledge the Slack message that woke this thread without posting anything to Slack. Use it for a message that needs no answer (a thanks, a note) or one bb should not act on, so the turn can end quietly with no error reply. It is not a way to skip work that was asked for: answer a request with slack_reply. The session id is in the message that woke the thread.",
+      instructions:
+        "A Slack message that needs no answer (a thanks, or something bb should not act on) is acknowledged with slack_ack, which counts the wake as answered and posts nothing to Slack. Never use slack_ack to skip work that was asked for; answer a request with slack_reply. The session id is in the message that woke the thread; leave it out to use this thread's Slack conversation.",
+      presentation: { label: { pending: "Acknowledging in Slack", completed: "Acknowledged in Slack" } },
+      parameters: z.object({
+        session: z.string().trim().min(1).max(200).optional().describe("The Slack session id from the wake. Leave it out: this thread's Slack conversation is used."),
+      }),
+      async execute({ session }, { threadId }) {
+        const id = session ?? sessionForThread(threadId);
+        const r = id === null ? undefined : sessions.get(id);
+        if (id === null || r === undefined) return toolError(new Error("This thread is not answering a Slack conversation, so there is nothing to acknowledge."));
+        if (answered(r)) return toolError(new Error("Every message in this Slack conversation already has its reply; each gets exactly one. Send a new Slack message to continue."));
+        markAnswered(id);
+        void hooks.status(id, "", checkSignal()).catch(() => undefined);
+        return `Acknowledged the Slack message (session ${id}) without replying.`;
       },
     });
 
