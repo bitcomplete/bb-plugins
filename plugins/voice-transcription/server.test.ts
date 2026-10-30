@@ -234,6 +234,24 @@ describe("transcribe", () => {
     expect(serverError).toHaveBeenCalledTimes(2);
   });
 
+  it("stops after the one retry when the second answer is still 429", async () => {
+    const { service } = await load({ apiKey: "sk-test" });
+    const fetchMock = vi.fn(async () => new Response("busy", { status: 429 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(service.transcribe!(audio(), { signal: signal(), hint: null })).rejects.toThrow(/HTTP 429/u);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a 200 reply that has no text field", async () => {
+    const { service } = await load({ apiKey: "sk-test" });
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ transcript: "oops" })));
+
+    await expect(service.transcribe!(audio(), { signal: signal(), hint: null })).rejects.toThrow(
+      /without a text field/u,
+    );
+  });
+
   it("does not retry a 400", async () => {
     const { service } = await load({ apiKey: "sk-test" });
     const fetchMock = vi.fn(async () => new Response("bad request", { status: 400 }));

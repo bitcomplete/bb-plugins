@@ -202,6 +202,8 @@ export function createVoiceTranscriptionPlugin() {
         signal,
       });
       if (retryable(response.status) && !signal.aborted) {
+        // Release the first body's socket before opening the retry.
+        await response.body?.cancel();
         response = await fetch(url, {
           method: "POST",
           headers,
@@ -229,14 +231,17 @@ export function createVoiceTranscriptionPlugin() {
           `Voice transcription failed: ${url} returned a reply that is not JSON`,
         );
       }
-      const text =
-        typeof payload === "object" &&
-        payload !== null &&
-        "text" in payload &&
-        typeof (payload as { text: unknown }).text === "string"
-          ? (payload as { text: string }).text.trim()
-          : "";
-      return text;
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("text" in payload) ||
+        typeof (payload as { text: unknown }).text !== "string"
+      ) {
+        throw new Error(
+          `Voice transcription failed: ${url} returned a reply without a text field`,
+        );
+      }
+      return (payload as { text: string }).text.trim();
     }
 
     bb.experimental_aiServices.register({

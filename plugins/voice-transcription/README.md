@@ -34,8 +34,9 @@ that would send audio to OpenAI unauthenticated. An empty key is ready only
 when `baseUrl` points somewhere else.
 
 Recordings over 25 MB (OpenAI's limit) are refused before anything is sent.
-One retry is made on HTTP 429 or 5xx if the caller is still waiting; a
-timeout, an abort and every 4xx are final. A failed call reports the status,
+One retry is made on HTTP 429 or 5xx if the caller is still waiting. bb
+bounds a transcribe call through the signal it passes (10 seconds), so a
+signal timeout, an abort and every 4xx are final. A failed call reports the status,
 the endpoint and the first 200 characters of the response body with the key
 removed. The server log gets one line per call — duration, bytes, status —
 and never the audio or the transcript.

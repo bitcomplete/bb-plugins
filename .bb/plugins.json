@@ -18,6 +18,7 @@
     { "name": "github-watcher", "source": "./plugins/github-watcher" },
     { "name": "stewards", "source": "./plugins/stewards" },
     { "name": "slack", "source": "./plugins/slack" },
-    { "name": "review-watch", "source": "./plugins/review-watch" }
+    { "name": "review-watch", "source": "./plugins/review-watch" },
+    { "name": "voice-transcription", "source": "./plugins/voice-transcription" }
   ]
 }

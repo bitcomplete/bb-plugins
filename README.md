@@ -19,6 +19,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [My PRs](plugins/my-prs) | Human feedback waiting on your authored PRs, with dismiss and Address comments |
 | [repo-dashboard](plugins/repo-dashboard) | Shows weekly pull request activity by contributor for Parsley Health, Bit Complete, and Cscc |
 | [review-watch](plugins/review-watch) | Queues the GitHub pull requests that need your review and opens a thread for one when you press Start |
+| [voice-transcription](plugins/voice-transcription) | Adds a voice-input service that transcribes through any OpenAI-compatible `/audio/transcriptions` endpoint from the server process |
 
 Install one:
 
