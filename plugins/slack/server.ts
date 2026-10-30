@@ -982,21 +982,24 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      */
     async function onThreadIdle(threadId: string): Promise<void> {
       await pushTitle(threadId);
+      const waiting = [...sessions].filter(([, r]) => r.threadId === threadId && !taggedAnswered(r));
       // An untagged wake does not owe a reply, so a silent turn is the expected
       // outcome and never clears the thinking status; clear it for those
-      // sessions here.
-      for (const [session, r] of sessions) {
-        if (r.threadId !== threadId || r.untagged === 0) continue;
-        void hooks.status(session, "", checkSignal()).catch(() => undefined);
-      }
-      const waiting = [...sessions].filter(([, r]) => r.threadId === threadId && !taggedAnswered(r));
-      if (waiting.length === 0) return;
+      // sessions, but only once the turn that handled the wake has run, so an
+      // older turn's idle does not clear the indicator of a queued wake.
+      const untaggedWaiting = [...sessions].filter(([, r]) => r.threadId === threadId && r.untagged > 0);
+      if (waiting.length === 0 && untaggedWaiting.length === 0) return;
       let starts: Array<{ createdAt: number; data: unknown }>;
       try {
         starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
       } catch (error) {
         bb.log.warn(`could not read thread ${threadId}'s turns to check its Slack replies: ${errorMessage(error)}`);
         return;
+      }
+      for (const [session, r] of untaggedWaiting) {
+        const handled = starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));
+        if (!handled) continue;
+        void hooks.status(session, "", checkSignal()).catch(() => undefined);
       }
       for (const [session, r] of waiting) {
         const handled = starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));

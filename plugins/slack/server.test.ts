@@ -1092,6 +1092,27 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("clears an untagged wake's thinking status only after the turn that handled it has run", async () => {
+    // The wake's own turn has not started: an older turn's idle must not clear
+    // the indicator just set for the queued wake.
+    const queued = await live({ turns: [{ createdAt: 999_999_999_999, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
+    queued.hooks.last().send(queued.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    await queued.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(queued.hooks.statuses.map((s) => s.body.status)).not.toContain("");
+    await queued.stop();
+
+    // The silent untagged turn ran and ended: the indicator is cleared.
+    const done = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session C0123:1.2" }] } } } }] });
+    done.hooks.last().send(done.hooks.session({ session: "C0123:1.2", channel: "C0123", mention: false, tagged: false, comment: { text: "what about the second one?", untrusted: false } }));
+    await tick();
+    await done.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(done.hooks.statuses.map((s) => s.body.status)).toContain("");
+    await done.stop();
+  });
+
   it("runs the thread in the project's checkout on its connected machine when it has no environment there", async () => {
     const s = await live({ map: { fallback: "prj-1", channels: [] }, environments: [] });
     s.hooks.last().send(s.hooks.session());
