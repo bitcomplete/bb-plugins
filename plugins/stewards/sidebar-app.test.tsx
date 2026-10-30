@@ -358,10 +358,11 @@ describe("the stewards sidebar list (BB-44)", () => {
       } as never,
     });
     // An unread worker is the yellow dot even with no running worker; its busy
-    // reviewer is the pulsing blue ring. BB-80: the unread worker opens the
-    // effort by default, so there is no Expand click here.
+    // reviewer is the pulsing blue ring. BB-131: the unread worker does not open
+    // the effort, so open it by hand.
     await waitFor(() => expect(slot.getByText("Unread worker")).toBeTruthy());
-    expect(slot.getByRole("button", { name: /Collapse ENG-1: Fix login/u })).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: /Expand ENG-1: Fix login/u }));
+    await waitFor(() => expect(slot.getByRole("button", { name: /Collapse ENG-1: Fix login/u })).toBeTruthy());
     expect(glyphOf(slot, "Unread worker")).toBe("you");
     fireEvent.click(slot.getByRole("button", { name: /Expand Unread worker/u }));
     await waitFor(() => expect(slot.getByText("Busy reviewer")).toBeTruthy());
@@ -1712,8 +1713,9 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
       } as never,
     });
     await waitFor(() => expect(sectionBody(slot, /Monitors/u).className).toContain("grid-rows-[1fr]"));
-    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse Ops watch: acme/web" })).toBeTruthy());
-    expect(workersBody(slot, "Ops watch: acme/web").className).toContain("grid-rows-[1fr]");
+    // BB-131: an unread worker does not open the effort row; the section still opens.
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand Ops watch: acme/web" })).toBeTruthy());
+    expect(workersBody(slot, "Ops watch: acme/web").className).toContain("grid-rows-[0fr]");
     slot.lifecycle.unmount();
   });
 
@@ -1733,7 +1735,7 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
     slot.lifecycle.unmount();
   });
 
-  it("flips an untouched group with unread state: expands when unread arrives, collapses when it clears", async () => {
+  it("keeps an untouched effort collapsed when a worker becomes unread and when it is read again", async () => {
     const worker = thread({ id: "thr_worker", displayTitle: "Worker" });
     let calls = 0;
     const slot = await renderSidebar({
@@ -1750,41 +1752,25 @@ describe("the sidebar's unread auto-expand (BB-80)", () => {
     });
     await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
     expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy();
-    const before = calls;
+    // An unread worker does not open the effort (BB-131).
+    const beforeUnread = calls;
     worker.isUnread = true;
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
-    await waitFor(() => expect(calls).toBeGreaterThan(before));
-    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
-    const afterExpand = calls;
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeUnread));
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    // Reading it again does not open it either: the default stays collapsed.
+    const beforeRead = calls;
     worker.isUnread = false;
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
-    await waitFor(() => expect(calls).toBeGreaterThan(afterExpand));
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeRead));
     await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
-    slot.lifecycle.unmount();
-  });
-
-  it("keeps a manually collapsed group collapsed when new unread arrives", async () => {
-    const first = thread({ id: "thr_w1", displayTitle: "Unread worker", isUnread: true });
-    const second = thread({ id: "thr_w2", displayTitle: "Second worker" });
-    let calls = 0;
-    const slot = await renderSidebar({
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), first, second] },
-      rpc: {
-        stewardsSidebar: () => {
-          calls += 1;
-          return sidebarData({ bindings: [binding({ phase: `p${calls}`, workers: [{ threadId: "thr_w1", title: "Unread worker", status: "finished" }, { threadId: "thr_w2", title: "Second worker", status: "finished" }] })] });
-        },
-      } as never,
-    });
-    // Auto-expanded by the first worker's unread, then collapsed by hand.
-    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })));
-    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
-    // New unread arrives on the second worker; the manual collapse stands.
-    const before = calls;
-    second.isUnread = true;
+    // The yellow unread glyph is kept once the row is opened by hand.
+    const beforeOpen = calls;
+    worker.isUnread = true;
     await slot.emitRealtime(PROJECT_CHANGED, { projectId: "p1" });
-    await waitFor(() => expect(calls).toBeGreaterThan(before));
-    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    await waitFor(() => expect(calls).toBeGreaterThan(beforeOpen));
+    fireEvent.click(slot.getByRole("button", { name: "Expand ENG-1: Fix login" }));
+    await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("you"));
     slot.lifecycle.unmount();
   });
 
@@ -1919,20 +1905,21 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
 
   // BB-80 regression: a host tick that only clears a thread's read state, with
   // no RPC payload change, must still update the group it auto-expanded.
-  it("collapses an untouched group when a host thread read clears with no payload change", async () => {
+  it("collapses an untouched one-off thread when a host thread read clears with no payload change", async () => {
     const captured = await loadApp();
     const list = captured.threadLists[0]!;
     const props = { activeThreadId: null, activeProjectId: "p1", isCompactViewport: false, onNavigate: () => {}, searchQuery: "" };
-    const worker = thread({ id: "thr_worker", displayTitle: "Worker", isUnread: true });
+    const child = thread({ id: "thr_child", displayTitle: "Unread child", parentThreadId: "thr_parent", isUnread: true });
     const slot = renderSlot(list, props, {
-      sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
-      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
+      sidebarThreads: { projects, threads: [thread({ id: "thr_parent", displayTitle: "One-off parent" }), child] },
+      rpc: { stewardsSidebar: () => sidebarData() } as never,
     });
-    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse ENG-1: Fix login" })).toBeTruthy());
+    // The one-off parent's row still follows its child's unread state (BB-80).
+    await waitFor(() => expect(slot.getByRole("button", { name: "Collapse One-off parent" })).toBeTruthy());
     // The user reads it; the host mutates the thread and re-renders, no RPC.
-    worker.isUnread = false;
+    child.isUnread = false;
     slot.lifecycle.rerender(<list.component {...props} />);
-    await waitFor(() => expect(slot.getByRole("button", { name: "Expand ENG-1: Fix login" })).toBeTruthy());
+    await waitFor(() => expect(slot.getByRole("button", { name: "Expand One-off parent" })).toBeTruthy());
     slot.lifecycle.unmount();
   });
 
@@ -1945,6 +1932,8 @@ describe("the sidebar's refetch coalescing and row memoisation (BB-95)", () => {
       sidebarThreads: { projects, threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), worker] },
       rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding({ workers: [{ threadId: "thr_worker", title: "Worker", status: "finished" }] })] }) } as never,
     });
+    // The effort starts collapsed (BB-131); open it by hand to see the child.
+    fireEvent.click(await waitFor(() => slot.getByRole("button", { name: "Expand ENG-1: Fix login" })));
     await waitFor(() => expect(glyphOf(slot, "Worker")).toBe("you"));
     worker.isUnread = false;
     slot.lifecycle.rerender(<list.component {...props} />);

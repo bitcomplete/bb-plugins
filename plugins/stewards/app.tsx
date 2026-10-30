@@ -1775,9 +1775,10 @@ const SidebarEffortRow = memo(function SidebarEffortRow({
   useEffect(() => {
     if (revealed) setUserOpen(true);
   }, [revealed]);
-  // An untouched effort follows the unread state of its workers and reviewers
-  // (BB-80); a manual toggle always wins.
-  const open = userOpen ?? hasUnread(effort.children, byId);
+  // An effort row starts collapsed whatever its children's read state (BB-131);
+  // it opens only by the chevron or the BB-85 navigation reveal. A manual
+  // toggle always wins.
+  const open = userOpen ?? false;
   const href = boardHref(pluginId, projectId, key);
   const body = (
     <div className={`flex flex-col rounded-md py-0.5 pr-1 hover:bg-state-hover ${selected ? "bg-state-active" : ""}`} style={{ paddingLeft: "4px" }} title={key ?? undefined}>
