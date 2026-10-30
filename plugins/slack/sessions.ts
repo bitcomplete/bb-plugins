@@ -15,9 +15,15 @@ export const sessionRecordSchema = z.object({
   thread: z.string(),
   /** The bb thread, or null until the first wake has been placed. */
   threadId: z.string().nullable(),
+  /**
+   * The opaque capability the wake carried, echoed to `POST /v1/subscribe`
+   * to lease this session. Empty when the service sent none. Secret-like: it
+   * is never logged and never put in a wake's text.
+   */
+  capability: z.string().default(""),
   /** The bb project the thread was placed in, for its link. */
   projectId: z.string().nullable(),
-  /** When the latest wake arrived, for expiry. */
+  /** When the latest wake arrived; the newest wake of a thread answers a bare `slack_reply`. */
   eventAt: z.number(),
   /** How many wakes this conversation has had; each needs its own reply. */
   events: z.number(),

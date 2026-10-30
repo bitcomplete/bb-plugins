@@ -14,7 +14,7 @@ import { randomBytes } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Context } from "hono";
 import { z } from "zod";
-import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type SessionEvent } from "./hooks-client.js";
+import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type Rejection, type SessionEvent } from "./hooks-client.js";
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
 import {
   channelEntrySchema,
@@ -45,7 +45,11 @@ export { CONNECTION_CHANGED, chooseProject };
 /** The plugin's sign-in callback on the developer's own server. */
 export const CALLBACK_PATH = "/signin/callback";
 
-/** Sessions are remembered for a day: the service accepts replies that long. */
+/**
+ * A session whose bb thread is gone is kept this long, so a later message can
+ * start a new thread from the same conversation. A session whose thread still
+ * exists is kept for the thread's life, not this long.
+ */
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** A sign-in state the plugin started is good for as long as the service's own. */
 export const PENDING_TTL_MS = 10 * 60 * 1000;
@@ -285,7 +289,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     const sessions = new Map<string, SessionRecord>(Object.entries(sessionsSchema.parse(await bb.storage.kv.get(SESSIONS_KEY))));
     async function saveSessions(): Promise<void> {
       const cutoff = deps.now() - SESSION_TTL_MS;
-      for (const [id, r] of sessions) if (r.eventAt < cutoff) sessions.delete(id);
+      for (const [id, r] of sessions) {
+        // A live thread keeps its session for the thread's life; only a
+        // session whose thread is gone falls back to the short grace.
+        if (r.threadId === null && r.eventAt < cutoff) sessions.delete(id);
+      }
       await bb.storage.kv.set(SESSIONS_KEY, Object.fromEntries(sessions));
     }
     const answered = (r: SessionRecord) => r.answered >= r.events;
@@ -470,6 +478,36 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     // sign-out, a refused token).
     let cachedToken = ((await bb.storage.kv.get<string>(TOKEN_KEY)) ?? "").trim();
 
+    /**
+     * The sessions whose `owned` rejection this server has already told the
+     * owner about. In memory: one notice per session per server run.
+     */
+    const ownedNotified = new Set<string>();
+
+    /**
+     * A lease the service refused. `owned` means another server's connection
+     * holds the session; the owner gets one best-effort backstop reply (the
+     * other server's live lease makes the service refuse it, so the log line
+     * is the reliable half). Any other reason (a capability that did not
+     * verify) is logged and retried. The capability itself is never named.
+     */
+    function onLeaseRejected(rejections: Rejection[]): void {
+      for (const rejection of rejections) {
+        if (rejection.kind !== "session") continue;
+        if (rejection.reason === "owned") {
+          if (!ownedNotified.has(rejection.id)) {
+            ownedNotified.add(rejection.id);
+            bb.log.warn(`bb-gate-hooks says another bb server holds Slack session ${rejection.id}; this server will not renew it`);
+            // Best effort: the other server's live lease makes the service
+            // refuse this reply, so the log line above is the reliable half.
+            void backstop(rejection.id, "Another bb server holds this Slack conversation now, so this one cannot answer in it.");
+          }
+          continue;
+        }
+        bb.log.warn(`bb-gate-hooks refused the Slack session lease for ${rejection.id} (${rejection.reason})`);
+      }
+    }
+
     const hooks = createHooksLoop({
       fetch: deps.fetch,
       baseUrl: hooksUrl,
@@ -483,6 +521,13 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       },
       onSession: (event) => onSession(event),
       onIdentified: (who) => rememberIdentity(who),
+      // A live session is leased for its bb thread's life; archiving the thread
+      // drops it from this set, and the next renewal stops claiming it.
+      leases: () =>
+        [...sessions]
+          .filter(([, r]) => r.threadId !== null && r.capability !== "")
+          .map(([id, r]) => ({ kind: "session" as const, id, capability: r.capability })),
+      onRejected: (rejections) => onLeaseRejected(rejections),
       onHello: () => void prunePending(),
       onTokenRefused: (token) => void forgetSignin("bb-gate-hooks refused the sign-in token", token),
     });
@@ -493,7 +538,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     function replyError(error: unknown): Error {
       if (!(error instanceof HooksRequestError)) return error instanceof Error ? error : new Error(String(error));
       if (error.status === 403 && error.code === "not-identified") return new Error("bb-gate-hooks does not know which Slack user this server is yet (it proves that on connecting, every half hour, and after sign-in). Try again in a minute.");
-      if (error.status === 403) return new Error("bb-gate-hooks refused: this Slack conversation was not routed to this server's Slack user, or its last message was more than a day ago, or the service restarted since. Nothing was posted.");
+      if (error.status === 403) return new Error("bb-gate-hooks refused: this Slack conversation is not routed to this server's Slack user. Nothing was posted.");
       if (error.unknownConnection) return new Error("This bb server is reconnecting to bb-gate-hooks. Try again in a minute.");
       if (error.status === 400) return new Error("bb-gate-hooks refused the reply as malformed.");
       if (error.status === 413) return new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`);
@@ -764,6 +809,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const record: SessionRecord = {
         channel: event.channel,
         thread: event.thread,
+        capability: event.capability === "" ? (previous?.capability ?? "") : event.capability,
         threadId: previous?.threadId ?? null,
         projectId: previous?.projectId ?? null,
         eventAt: deps.now(),
@@ -773,6 +819,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         title: previous?.title ?? null,
       };
       sessions.set(event.session, record);
+      // A wake for the session means the service routed it here again: a
+      // later `owned` rejection is a new episode and gets its own notice.
+      ownedNotified.delete(event.session);
       await saveSessions();
       if (!needsReply) {
         bb.log.info(`Slack session ${event.session} context changed; nothing to answer`);
@@ -865,7 +914,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       chain(`session ${event.session}`, () => handleSession(event));
     }
 
-    /** A bb thread that went away stops answering its Slack conversation; the next message starts a new one. */
+    /**
+     * A bb thread that went away stops answering its Slack conversation and
+     * drops out of the lease renewal set; the next message starts a new one.
+     */
     function forgetThread(threadId: string): void {
       let changed = false;
       for (const [session, r] of sessions) {
