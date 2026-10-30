@@ -12,9 +12,16 @@ import { access, lstat, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type {
+  PluginEnvironmentProviderCreateContext,
+  PluginEnvironmentProviderProgress,
+} from "@get-bb/plugin-sdk/environment-provider";
+import { createFakePluginHost, makeHostResponse, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { git, gitIn, gitLine } from "./git.js";
-import { EMPTY_REPOS, dirFromUrl } from "./repos.js";
+import { EMPTY_REPOS, dirFromUrl, parseReposFile } from "./repos.js";
 import { repoSetViewSchema } from "./contract.js";
+import plugin from "./server.js";
+import { ENVIRONMENT_PROVIDER_ID } from "./shared.js";
 import {
   adoptProjectSource,
   bootstrapProjectSource,
@@ -498,5 +505,142 @@ describe("the default-branch ref", () => {
     await gitIn(checkout, ["checkout", "--quiet", "-b", "feature"]);
 
     expect(await resolveDefaultBranchRef(checkout)).toBe("refs/heads/main");
+  });
+});
+
+/**
+ * `create()`'s seeding fallback (BB-137): a primary-layout project with an
+ * empty `repos.json` is a complete definition, not a project with nothing
+ * configured, so `create()` must not invent repos from the checkouts next to
+ * it. Only a standalone `.bb` project is seeded, and the project source's own
+ * origin is never proposed into the file either.
+ *
+ * Driven through the provider with a fake host so the assertion is about the
+ * calls `create()` makes — no seed write, and only the primary handed to
+ * `provisionWorkspace` — not about a stubbed host's filesystem.
+ */
+describe("seeding an empty repo set", () => {
+  const HOST_ID = "host-seed";
+  const PROJECT_ID = "proj_seed";
+  const THREAD_ID = "thr_seed";
+  const SOURCE_PATH = "/checkouts/primary";
+  const ROOT = "/data/workspaces/thr_seed";
+  const PRIMARY_URL = "git@github.com:you/primary.git";
+  const SIBLING_URL = "git@github.com:you/sibling.git";
+
+  const PROJECT: PluginEnvironmentProviderCreateContext["project"] = {
+    id: PROJECT_ID,
+    kind: "standard",
+    name: "primary",
+    gitRemoteUrl: null,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const THREAD = makeThreadResponse({ id: THREAD_ID, projectId: PROJECT_ID, environmentId: null });
+
+  function hostResponder(layout: "primary" | "standalone", remote: string | null) {
+    return (call: { method: string; input: unknown }): unknown => {
+      switch (call.method) {
+        case "prepareProjectSource":
+          return {
+            bootstrapped: false,
+            reposJson: '{"version":1,"repos":[]}',
+            remote,
+            defaultBranch: "main",
+            layout,
+            warnings: [],
+          };
+        case "discoverCheckouts":
+          return {
+            checkouts: [
+              { path: "/home/dev/projects/sibling", url: SIBLING_URL },
+              { path: "/home/dev/projects/primary", url: PRIMARY_URL },
+            ],
+          };
+        case "writeProjectSourceRepos":
+          return { committed: true, head: "seed", message: null };
+        case "provisionWorkspace":
+          return {
+            root: ROOT,
+            repos: [
+              {
+                dir: "primary",
+                path: `${ROOT}/primary`,
+                branch: "bb/work",
+                baseBranch: "main",
+                remote: PRIMARY_URL,
+                status: "ready" as const,
+              },
+              {
+                dir: ".bb",
+                path: `${ROOT}/.bb`,
+                branch: "main",
+                baseBranch: "main",
+                remote: PRIMARY_URL,
+                status: "ready" as const,
+              },
+            ],
+            definitionBase: null,
+          };
+        default:
+          throw new Error(`unexpected host method ${call.method}`);
+      }
+    };
+  }
+
+  async function runCreate(layout: "primary" | "standalone", remote: string | null) {
+    const { bb, harness } = createFakePluginHost({ experimental_callHostRpc: hostResponder(layout, remote) });
+    harness.sdk.stub("projects.list", () => []);
+    harness.sdk.stub("projects.get", () => PROJECT);
+    harness.sdk.stub("system.config", () => ({ primaryHostId: HOST_ID }));
+    await plugin(bb);
+
+    const provider = harness.registrations.environmentProviders.get(ENVIRONMENT_PROVIDER_ID);
+    if (provider === undefined) throw new Error("Provider not registered");
+    const report: PluginEnvironmentProviderProgress = { step: () => undefined, log: () => undefined };
+    const result = await provider.create({
+      thread: THREAD,
+      project: PROJECT,
+      host: makeHostResponse({ id: HOST_ID, name: "Fake machine" }),
+      projectCheckout: { path: SOURCE_PATH, experimental_ownsPath: false },
+      gitRemote: null,
+      inputs: null,
+      suggestedBranchName: "bb/work",
+      attempt: 1,
+      pathKey: THREAD_ID,
+      experimental_claimPath: async () => true,
+      report,
+      signal: new AbortController().signal,
+    });
+    return { result, harness };
+  }
+
+  it("primary layout with an empty repos.json seeds nothing and holds only the primary", async () => {
+    const { result, harness } = await runCreate("primary", PRIMARY_URL);
+
+    expect(result).toMatchObject({ status: "created", path: ROOT });
+    // No seed commit: the definition is left exactly as the owner wrote it.
+    expect(harness.experimental_hostRpcCalls.some((call) => call.method === "writeProjectSourceRepos")).toBe(false);
+
+    const provision = harness.experimental_hostRpcCalls.find((call) => call.method === "provisionWorkspace");
+    const repos = (provision?.input as { repos: { dir: string; url: string }[] }).repos;
+    expect(repos.map((repo) => repo.dir)).toEqual(["primary"]);
+    expect(repos.some((repo) => repo.url === SIBLING_URL)).toBe(false);
+  });
+
+  it("standalone layout still seeds, and skips the project source's own origin", async () => {
+    const { result, harness } = await runCreate("standalone", PRIMARY_URL);
+
+    expect(result).toMatchObject({ status: "created", path: ROOT });
+    const write = harness.experimental_hostRpcCalls.find((call) => call.method === "writeProjectSourceRepos");
+    expect(write).toBeDefined();
+    const reposJson = (write?.input as { reposJson: string }).reposJson;
+    // The sibling checkout is the whole proposed set...
+    const parsed = parseReposFile(reposJson);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.repos).toEqual([{ dir: "sibling", url: SIBLING_URL, inferredDir: true }]);
+    // ...and the project source's own origin is not repeated in the file.
+    expect(reposJson).not.toContain(PRIMARY_URL);
   });
 });

@@ -816,23 +816,26 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           };
         }
 
-        if (repoSet.repos.length === 0) {
-          const seeded = proposeRepoSet(mirrors);
-          if (seeded.repos.length === 0 && layout !== "primary") {
+        // An empty `repos.json` in a primary project is a complete definition:
+        // the workspace is the primary and nothing else, so seeding from
+        // whatever happens to be checked out on this machine would invent repos
+        // the owner never configured. Only a standalone `.bb` project, where an
+        // empty file is a project with nothing set up yet, is seeded.
+        if (repoSet.repos.length === 0 && layout !== "primary") {
+          const seeded = proposeRepoSet(mirrors, prepared.remote);
+          if (seeded.repos.length === 0) {
             return {
               status: "failed",
               message: `No repos are configured. Add some to ${REPOS_FILE} in ${location.path}, or run \`bb repos add <url>\`.`,
             };
           }
-          if (seeded.repos.length > 0) {
-            context.report.log(
-              `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
-                .map((repo) => repo.dir)
-                .join(", ")}`,
-            );
-            await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
-            repoSet = seeded;
-          }
+          context.report.log(
+            `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
+              .map((repo) => repo.dir)
+              .join(", ")}`,
+          );
+          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
+          repoSet = seeded;
         }
 
         const repoRequests = repoSet.repos.map(toRepoRequest);
@@ -1005,14 +1008,23 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
    * Only ever used when `repos.json` holds nothing: the alternative is handing
    * someone an empty directory and no explanation. Deduplicated by remote and
    * capped, because a machine with forty checkouts should not produce a forty
-   * repo workspace by accident.
+   * repo workspace by accident. `projectRemote` is the project source's own
+   * `origin`; it is skipped, because `repos.json` never repeats it.
    */
-  function proposeRepoSet(mirrors: readonly { path: string; url: string }[]): ReposFile {
+  function proposeRepoSet(
+    mirrors: readonly { path: string; url: string }[],
+    projectRemote: string | null = null,
+  ): ReposFile {
     const seen = new Set<string>();
     const repos: ReposFile["repos"] = [];
+    // The project source's own origin is the primary in a primary layout and
+    // the definition repo in a standalone one. `repos.json` never repeats it,
+    // so it must not be proposed into the file either.
+    const projectKey = projectRemote === null ? null : normalizeRemoteUrl(projectRemote);
     for (const mirror of mirrors) {
       if (repos.length >= 8) break;
       const key = normalizeRemoteUrl(mirror.url);
+      if (projectKey !== null && key === projectKey) continue;
       if (seen.has(key)) continue;
       const dir = dirFromUrl(mirror.url);
       if (dir === null || dir === PROJECT_SOURCE_DIR) continue;
