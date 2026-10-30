@@ -108,12 +108,6 @@ describe("wakeText", () => {
     expect(text).not.toContain("Reply in Slack with the slack_reply tool");
   });
 
-  it("introduces an assistant-thread start without words", () => {
-    const text = wakeText(event({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
-    expect(text).toContain("opened the assistant pane");
-    expect(text).toContain("session D0123:1712345678.901234");
-  });
-
   it("clips a very long message", () => {
     const text = wakeText(event({ comment: { text: "x".repeat(SESSION_TEXT_CHARS + 500), untrusted: false } }));
     expect(text.length).toBeLessThan(SESSION_TEXT_CHARS + 400);

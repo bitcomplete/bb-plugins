@@ -1,6 +1,6 @@
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import serverEntry, { CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors } from "./server.js";
+import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -1231,6 +1231,62 @@ describe("Slack plugin", () => {
     await tick();
     expect(gone.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
     await gone.stop();
+  });
+
+  it("greets on an assistant pane open without spawning a thread, a status, or a backstop", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    expect(s.hooks.messages).toEqual([{ session: "D0123:1712345678.901234", body: { connection: "c_1", text: ASSISTANT_GREETING } }]);
+    // No thinking indicator is set for the pane open, and none is cleared.
+    expect(s.hooks.statuses).toEqual([]);
+    // The greeting already answered the wake; a turn's idle cannot trip the
+    // backstop. (The pre-mapped re-open test below pins the answered count,
+    // which this unmapped session cannot.)
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("answers a pane-open wake on a conversation that already has a thread, so a turn's idle cannot trip the backstop", async () => {
+    const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
+    // The first message maps the session to thr-1, and its turn replies.
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    await s.tool("slack_reply", { text: "hi" }, { threadId: "thr-1" });
+    const before = s.hooks.messages.length;
+    // Reopening the pane greets and starts nothing, but still answers the wake.
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(s.hooks.messages).toHaveLength(before + 1);
+    // The mapped thread's turn idle must not fire the backstop for the pane open.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(before + 1);
+    await s.stop();
+  });
+
+  it("spawns the thread on the first real message after the pane opened, in the same session", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toEqual([]);
+    s.hooks.last().send(s.hooks.session({ comment: { text: "build this", untrusted: false } }));
+    await tick();
+    const spawns = s.harness.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(1);
+    const prompt = String((spawns[0]![0] as { prompt: string }).prompt);
+    expect(prompt).toContain("session D0123:1712345678.901234");
+    expect(prompt).toContain("build this");
+    // The session record survived the pane open, so a follow-up continues the same bb thread.
+    s.hooks.last().send(s.hooks.session({ comment: { text: "also the SSO page", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    await s.stop();
   });
 
   it("records a context change without running a turn or expecting a reply", async () => {
