@@ -27,17 +27,20 @@ function fakeHooks() {
   const titles: Array<{ session: string; body: Record<string, unknown> }> = [];
   const ephemerals: Array<Record<string, unknown>> = [];
   const responses: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const joins: Array<{ connection: string; channel: string }> = [];
   let botChannelRequests = 0;
   const state: {
     start: () => Response | Promise<Response>;
     exchange: () => Response | Promise<Response>;
     identify: () => Response | Promise<Response>;
     botChannels: () => Response | Promise<Response>;
+    join: () => Response | Promise<Response>;
   } = {
     start: () => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
     exchange: () => Response.json({ token: "xoxp-user-token" }),
     identify: () => Response.json({ user: { id: "U0123", name: "Alice" }, teams: [], rejected: [] }),
     botChannels: () => Response.json({ channels: ["C0123", "G0456"] }),
+    join: () => Response.json({ ok: true }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
@@ -72,6 +75,10 @@ function fakeHooks() {
       botChannelRequests += 1;
       return state.botChannels();
     }
+    if (u === `${HOOKS_URL}/v1/slack/bot/join`) {
+      joins.push(JSON.parse(String(init?.body)) as (typeof joins)[number]);
+      return state.join();
+    }
     if (u === `${HOOKS_URL}/v1/slack/ephemeral`) {
       ephemerals.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ ok: true });
@@ -104,6 +111,7 @@ function fakeHooks() {
     titles,
     ephemerals,
     responses,
+    joins,
     state,
     botChannelRequests: () => botChannelRequests,
     last: () => streams.at(-1)!,
@@ -668,6 +676,56 @@ describe("Slack plugin", () => {
     const result = (await s.harness.callRpc("searchChannels", { query: "rand" })) as ChannelSearchResult;
     expect(result.channels.map((c) => c.name)).toEqual(["random"]);
     expect(slack.requests).toHaveLength(1);
+    await s.stop();
+  });
+
+  it("adds the bot to a channel through the service, with the connection and the channel id only", async () => {
+    const s = await live({ token: "xoxp-user-1" });
+    expect(await s.harness.callRpc("joinChannel", { channel: " C0789 " })).toEqual({ state: "joined" });
+    expect(s.hooks.joins).toEqual([{ connection: "c_1", channel: "C0789" }]);
+    expect(JSON.stringify(s.hooks.joins)).not.toContain("xoxp-user-1");
+    await s.stop();
+  });
+
+  it("explains a private channel, a missing channel and a missing scope instead of failing", async () => {
+    const s = await live({ token: "xoxp-user-1" });
+    // Every refusal is a message, never a thrown error, and every one points
+    // at the /invite @bb fallback.
+    const fallback = expect.stringContaining("/invite @bb");
+    s.hooks.state.join = () => Response.json({ error: "private-channel" }, { status: 409 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "G0456" })).toMatchObject({ state: "private", message: fallback });
+    s.hooks.state.join = () => Response.json({ error: "channel-not-found" }, { status: 404 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0000" })).toMatchObject({ state: "not-found", message: fallback });
+    s.hooks.state.join = () => Response.json({ error: "archived" }, { status: 409 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0001" })).toMatchObject({ state: "not-found", message: fallback });
+    s.hooks.state.join = () => Response.json({ error: "missing-scope" }, { status: 503 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
+    s.hooks.state.join = () => Response.json({ error: "not-identified" }, { status: 403 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
+    // The service forgot the connection: its own message, not the generic one.
+    s.hooks.state.join = () => Response.json({ error: "unknown-connection" }, { status: 404 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("no longer knows this connection") });
+    // An older bb-gate-hooks without the endpoint answers a bare 404.
+    s.hooks.state.join = () => new Response("not found", { status: 404 });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: fallback });
+    // A name is never sent: the map stores ids.
+    expect(await s.harness.callRpc("joinChannel", { channel: "general" })).toMatchObject({ state: "not-found", message: fallback });
+    expect(s.hooks.joins.map((j) => j.channel)).toEqual(["G0456", "C0000", "C0001", "C0789", "C0789", "C0789", "C0789"]);
+    await s.stop();
+  });
+
+  it("says when the service is not connected rather than joining", async () => {
+    const s = await setup({ token: "xoxp-user-1" });
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("not connected to bb-gate-hooks") });
+    expect(s.hooks.joins).toEqual([]);
+  });
+
+  it("says so when the join request itself fails", async () => {
+    const s = await live({ token: "xoxp-user-1" });
+    s.hooks.state.join = () => {
+      throw new Error("network down");
+    };
+    expect(await s.harness.callRpc("joinChannel", { channel: "C0789" })).toMatchObject({ state: "unavailable", message: expect.stringContaining("/invite @bb") });
     await s.stop();
   });
 

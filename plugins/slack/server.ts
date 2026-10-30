@@ -208,7 +208,23 @@ export const rpcContract = defineRpcContract({
       message: z.string().optional(),
     }),
   },
+  /**
+   * Add the app's bot to a channel the developer is mapping, through
+   * bb-gate-hooks, which holds the bot token. "joined" also covers a channel
+   * the bot was already in. "private" means Slack lets only a member invite
+   * the bot there; the message says how. "unavailable" carries why.
+   */
+  joinChannel: {
+    input: z.object({ channel: z.string().trim().min(1).max(40) }),
+    output: z.object({
+      state: z.enum(["joined", "private", "not-found", "unavailable"]),
+      message: z.string().optional(),
+    }),
+  },
 });
+
+/** A Slack channel id: `C…` or `G…` in upper case, never a name. */
+const CHANNEL_ID = /^[CG][A-Z0-9]+$/u;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -929,7 +945,50 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         await withMapLock(() => saveChannelMap({ fallback, channels }));
         return { ok: true };
       },
+      async joinChannel({ channel }) {
+        return addBotToChannel(channel);
+      },
     });
+
+    /**
+     * Ask bb-gate-hooks to have the bot join `channel`. Every refusal is an
+     * answer the settings page can show, not an error: the developer can
+     * always fall back to /invite in Slack, and the page says so.
+     */
+    async function addBotToChannel(channel: string): Promise<{ state: "joined" | "private" | "not-found" | "unavailable"; message?: string }> {
+      const id = channel.trim();
+      const byHand = "Invite bb from Slack instead: open the channel and type /invite @bb.";
+      if (!CHANNEL_ID.test(id)) return { state: "not-found", message: `That is not a Slack channel id; pick a channel from the list or paste its id. ${byHand}` };
+      if (hooksUrl === "") return { state: "unavailable", message: `This bb server has no bb-gate-hooks service, so it cannot add bb to channels. ${byHand}` };
+      if (!hooks.connected || hooks.connectionId === null) return { state: "unavailable", message: `This bb server is not connected to bb-gate-hooks yet. Wait a moment and try again. ${byHand}` };
+      try {
+        await hooks.joinChannel(id, checkSignal());
+      } catch (error) {
+        if (error instanceof HooksRequestError) {
+          switch (error.code) {
+            case "private-channel":
+              return { state: "private", message: `bb cannot join a private channel by itself. ${byHand}` };
+            case "channel-not-found":
+            case "archived":
+              return { state: "not-found", message: `Slack has no open channel with this id that bb can join. ${byHand}` };
+            case "missing-scope":
+              return { state: "unavailable", message: `The team's Slack app was installed without the channels:join scope, so bb cannot add itself yet. ${byHand}` };
+            case "not-identified":
+              return { state: "unavailable", message: `Sign in with Slack first, then try again. ${byHand}` };
+            case "unknown-connection":
+              return { state: "unavailable", message: `bb-gate-hooks no longer knows this connection; it reconnects on its own. Try again in a minute. ${byHand}` };
+            default:
+              break;
+          }
+          // A 404 with no code is an older bb-gate-hooks without the endpoint.
+          if (error.status === 404 && error.code === null) return { state: "unavailable", message: `This bb-gate-hooks cannot add bb to channels yet. ${byHand}` };
+        }
+        bb.log.warn(`could not add the Slack bot to ${id}: ${errorMessage(error)}`);
+        return { state: "unavailable", message: `Slack did not answer; try again. ${byHand}` };
+      }
+      bb.log.info(`added the Slack bot to channel ${id}`);
+      return { state: "joined" };
+    }
 
     /**
      * The channels the developer can see, for the picker. Calls Slack with the
