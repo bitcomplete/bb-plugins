@@ -54,10 +54,14 @@ describe("recording merged pull requests", () => {
     expect(noted["acme/web#10"]).toMatchObject({ mergeSha: null, note: expect.stringMatching(/merge commit is not known/u) });
   });
 
-  it("re-resolves a stored PR-head merge sha to the merge commit", () => {
+  it("re-resolves a stored PR-head merge sha to the merge commit, keeping a settled watch's note", () => {
     const before = recordMerged({}, { entity: pull({ key: "acme/web#11" }, { merged: true, headSha: "headsha3", mergeCommit: null }), pulls: [] }, [target], NOW);
     const after = recordMerged(before, { entity: pull({ key: "acme/web#11" }, { merged: true, headSha: "headsha3", mergeCommit: "mergesha3" }), pulls: [] }, [target], NOW + 1000);
     expect(after["acme/web#11"]).toMatchObject({ mergeSha: "mergesha3", note: expect.stringMatching(/re-resolved/u) });
+    // A settled watch's own note is kept, not overwritten.
+    const failed = { ...before, "acme/web#11": { ...before["acme/web#11"]!, state: "failed" as const, note: "Deployment 7 reported failure" } };
+    const resolved = recordMerged(failed, { entity: pull({ key: "acme/web#11" }, { merged: true, headSha: "headsha3", mergeCommit: "mergesha3" }), pulls: [] }, [target], NOW + 2000);
+    expect(resolved["acme/web#11"]!.note).toBe("Deployment 7 reported failure (Merge commit re-resolved to mergesh)");
   });
 
   it("keys two targets on one pull request independently, and a single unnamed target as before", () => {
@@ -256,6 +260,19 @@ describe("a failed workflow run (BB-61)", () => {
     expect(late.recorded).toEqual(["acme/web#7"]);
     expect(late.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
     expect(applyWorkflowRun(late.deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW).woken).toEqual([]);
+  });
+
+  it("skips a run that started before the watch's merge and wakes one that started after (BB-132)", () => {
+    const deployments = mergedWatch();
+    // The watch merged at NOW. A run that started before it cannot concern it,
+    // so it is recorded but not woken, even though the doorbell arrived after.
+    const before = applyWorkflowRun(deployments, "acme/bb-gate#42", "acme/bb-gate", run(), NOW + 1000, NOW - 60_000);
+    expect(before.woken).toEqual([]);
+    expect(before.recorded).toEqual(["acme/web#7"]);
+    expect(before.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    // A run that started after the merge wakes, and a run at the merge time too.
+    expect(applyWorkflowRun(deployments, "acme/bb-gate#43", "acme/bb-gate", run(), NOW + 1000, NOW + 60_000).woken).toEqual(["acme/web#7"]);
+    expect(applyWorkflowRun(deployments, "acme/bb-gate#44", "acme/bb-gate", run(), NOW + 1000, NOW).woken).toEqual(["acme/web#7"]);
   });
 
   it("lists the watches still awaiting a deployment on a repo, and keys an event by run and attempt", () => {

@@ -1,8 +1,9 @@
 // Deployment watching: the per-pull-request state a binding keeps between a
 // merge and the deployment that confirms it is live (BB-53). Pure: the store
 // holds the state, and server.ts feeds in the snapshots and the deployment
-// doorbells. Nothing here decides whether a deployment carries a merge; that
-// is the steward's, from the playbook's rule, and it reports the verdict.
+// doorbells. A free-text `carries` is the steward's to apply; a structured one
+// is evaluated by `carries.ts` (BB-132), and either way the steward reports a
+// verdict it disagrees with.
 import { z } from "zod";
 import type { DeploymentTarget } from "./config.js";
 import type { Deployment, EntitySnapshot, WorkflowRun } from "./source-contract.js";
@@ -115,9 +116,11 @@ export function recordMerged(deployments: Deployments, observed: Observed, targe
       }
       if (existing !== undefined) {
         // Re-resolve a stored PR-head merge sha to the merge commit (BB-132).
-        // An unknown oid leaves the watch on the steward-decided path.
+        // An unknown oid leaves the watch on the steward-decided path. The
+        // old note is kept: a settled watch's failure text must not vanish.
         if (merge !== null && existing.mergeSha !== merge) {
-          next[id] = { ...existing, mergeSha: merge, note: `Merge commit re-resolved to ${merge.slice(0, 7)}` };
+          const resolved = `Merge commit re-resolved to ${merge.slice(0, 7)}`;
+          next[id] = { ...existing, mergeSha: merge, note: existing.note === null || existing.note === undefined || existing.note === "" ? resolved : `${existing.note} (${resolved})` };
           changed = true;
         }
         continue;

@@ -179,7 +179,11 @@ export const snapshotPullSchema = z.object({
    * has no merge to carry and stays on the steward-decided path.
    */
   mergeCommit: z.string().nullable().default(null),
-  /** The paths the pull request changed, for matching a deployment rule's `when.paths`. */
+  /**
+   * The paths the pull request changed (up to GitHub's first 100), for
+   * matching a deployment rule's `when.paths`. A pull request changing more
+   * than 100 files can miss a rule whose path falls outside the first page.
+   */
   files: z.array(z.string()).default([]),
 });
 export type SnapshotPull = z.infer<typeof snapshotPullSchema>;

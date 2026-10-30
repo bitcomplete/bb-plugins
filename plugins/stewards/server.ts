@@ -3864,16 +3864,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const runId = hash === -1 ? "" : id.slice(hash + 1);
       if (repo === "") return;
       const projects = await stewardedProjects();
+      // The run's start is the same for every binding; read it back by run id
+      // once (BB-132), only when a binding actually has an awaiting watch.
+      let runStartedAt: number | null | undefined;
+      const startedAt = async (): Promise<number | null> => {
+        if (runStartedAt === undefined) runStartedAt = await readRunStartedAt(repo, run, runId);
+        return runStartedAt;
+      };
       for (const config of projects) {
         for (const b of store.open(config.projectId)) {
           const playbook = bindingPlaybook(config, b);
           if (playbook === null || playbook === undefined) continue;
           const targets = playbook.deployments.filter((t) => lc(t.repo) === lc(repo) && matchesWorkflow(t, run));
           if (targets.length === 0) continue;
-          // BB-132: the run's own start decides whether it can concern a
-          // watch, read back by run id when the doorbell does not carry it.
-          const runStartedAt = await readRunStartedAt(repo, run, runId);
-          const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt, runStartedAt);
+          if (!Object.values(b.deployments).some((w) => (w.state === "merged" || w.state === "deploying") && lc(w.repo) === lc(repo))) continue;
+          const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt, await startedAt());
           if (applied.recorded.length === 0) continue;
           // Persist the event even when it wakes nobody (a run that started
           // before every open watch's merge): a repeat delivery of the same

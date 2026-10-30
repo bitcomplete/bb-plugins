@@ -305,6 +305,10 @@ describe("playbooks", () => {
     // An unknown strategy is refused, and so is an empty rule list.
     expect(parsePlaybook(structured.replace("kind: ref-contains-merge", "kind: magic"), "linear-tickets")).toMatchObject({ ok: false });
     expect(parsePlaybook(structured.replace("carries: [{ when: { repo: bitcomplete/devbox }, strategy: { kind: ref-contains-merge } }]", "carries: []"), "linear-tickets")).toMatchObject({ ok: false });
+    // Two targets cannot share a name: their watches would share a key.
+    const duplicate = parsePlaybook(structured.replace("name: devbox", "name: bb-gate"), "linear-tickets");
+    expect(duplicate).toMatchObject({ ok: false });
+    if (!duplicate.ok) expect(duplicate.error).toMatch(/bb-gate is listed twice/u);
   });
 
   it("refuses what would misbehave", () => {

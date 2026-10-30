@@ -758,7 +758,17 @@ export type DeploymentTarget = z.infer<typeof deploymentTargetSchema>;
  * `deployment` field writes it. A single target is today's shape; a list lets
  * one merge be awaited on more than one deployment (BB-132).
  */
-export const deploymentsFieldSchema = z.union([deploymentTargetSchema, z.array(deploymentTargetSchema).min(1).max(10)]);
+export const deploymentsFieldSchema = z
+  .union([deploymentTargetSchema, z.array(deploymentTargetSchema).min(1).max(10)])
+  .superRefine((value, ctx) => {
+    const list = Array.isArray(value) ? value : [value];
+    const seen = new Set<string>();
+    for (const target of list) {
+      const key = (target.name ?? `${target.repo}@${target.environment}`).toLowerCase();
+      if (seen.has(key)) ctx.addIssue({ code: "custom", message: `${key} is listed twice; each deployment target needs its own name` });
+      seen.add(key);
+    }
+  });
 
 export const PLAYBOOK_SOURCES = ["linear", "github", "k8s", "sentry"] as const;
 const SOURCE_OF: Record<BindingKind, (typeof PLAYBOOK_SOURCES)[number]> = { ticket: "linear", pr: "github", review: "github", ops: "k8s" };

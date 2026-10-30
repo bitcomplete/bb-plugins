@@ -8463,6 +8463,28 @@ describe("deployment watching (BB-53)", () => {
     expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
   });
 
+  it("skips a run that started before the watch's merge, read back by run id, and wakes one after (BB-132)", async () => {
+    const t = await setup();
+    t.files[playbookPath("linear-tickets")] = workflowPlaybook();
+    t.entities.set("uuid-12", issue({ id: "uuid-12", key: "ENG-12", state: "In Progress", linkedPulls: [{ url: "https://github.com/acme/web/pull/7", key: "acme/web#7" }] }));
+    t.entities.set("acme/web#7", pull({ key: "acme/web#7" }, { merged: true, mergeCommit: "aaaaaaa1" }));
+    await t.ring("linear", "uuid-12");
+    const binding = t.hooks.store.find("ENG-12")!;
+    const steward = t.spawns[1]!.id;
+    const before = t.sends.filter((s) => s.threadId === steward).length;
+    const mergedAt = binding.deployments["acme/web#7"]!.mergedAt!;
+    // The doorbell carries no run start, so the plugin reads it back by run id.
+    // A run that started before the merge is recorded but does not wake.
+    t.sourceRuns.set("acme/bb-gate 42", { id: 42, runNumber: 7, headSha: "ccccccc3", startedAt: new Date(mergedAt - 60_000).toISOString(), jobs: [] });
+    await runDoorbell(t, "acme/bb-gate#42", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before);
+    expect(t.hooks.store.find("ENG-12")!.deployments["acme/web#7"]!.workflowRuns).toEqual(["acme/bb-gate#42#1"]);
+    // A run that started after the merge wakes.
+    t.sourceRuns.set("acme/bb-gate 43", { id: 43, runNumber: 8, headSha: "ddddddd4", startedAt: new Date(mergedAt + 60_000).toISOString(), jobs: [] });
+    await runDoorbell(t, "acme/bb-gate#43", workflowRun());
+    expect(t.sends.filter((s) => s.threadId === steward)).toHaveLength(before + 1);
+  });
+
   it("ignores a workflow the playbook does not name (BB-61)", async () => {
     const t = await setup();
     t.files[playbookPath("linear-tickets")] = workflowPlaybook();

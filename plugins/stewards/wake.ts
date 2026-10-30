@@ -224,14 +224,11 @@ function deploymentInstructions(input: WakeInput): string | undefined {
   const names = pending.map((w) => `${w.key}${w.target === "" ? "" : ` (${w.target})`}`).join(", ");
   const structured = targets.every((t) => typeof t.carries !== "string");
   const rules = targets.map((t) => `${t.repo} ${t.environment}${t.name === undefined ? "" : ` (${t.name})`}: ${typeof t.carries === "string" ? JSON.stringify(t.carries) : "the plugin evaluates its carries rules"}`).join("; ");
-  return (
-    `A merge is awaiting deployment (${names}) through ${where}. ` +
-    (structured
-      ? `The plugin evaluates the playbook's carries rules itself and wakes you only when a read fails or no rule matches. `
-      : `Decide from the playbook's rule whether the deployment carries the merge — ${rules} — and report it with `) +
-    `When a verdict is yours, report it with steward_report { deployment: { state: "deployed" } } when it carries the merge, "not-yet" when it does not, or "failed" when it failed. ` +
-    `Do not start a worker to watch the deploy, and do not move the ticket on until every pull request is deployed.`
-  );
+  const verdict = `report it with steward_report { deployment: { state: "deployed" } } when it carries the merge, "not-yet" when it does not, or "failed" when it failed.`;
+  const what = structured
+    ? `The plugin evaluates the playbook's carries rules itself and wakes you only when a read fails or no rule matches. When a verdict is yours, ${verdict} `
+    : `Decide from the playbook's rule whether the deployment carries the merge — ${rules} — and ${verdict} `;
+  return `A merge is awaiting deployment (${names}) through ${where}. ${what}` + `Do not start a worker to watch the deploy, and do not move the ticket on until every pull request is deployed.`;
 }
 
 export type ChildView = { binding: Binding; openEscalations: Escalation[] };
