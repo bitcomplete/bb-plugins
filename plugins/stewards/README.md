@@ -112,9 +112,10 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   spawn command, the standing rules and "end with `steward_report`". It is
   system context, not transcript, so compaction cannot lose it. Every wake
   also names the durable commands: `bb stewards brief [<binding>]` prints
-  the whole brief, and `bb stewards spawn-flags [<binding>]` prints the
-  runnable `bb thread spawn …` command from `models.worker` and the project
-  environment. A worker whose provider, model, reasoning level or
+  the whole brief, and `bb stewards spawn-flags [--role worker|reviewer]
+  [<binding>]` prints the runnable `bb thread spawn …` command from the
+  role's model and the project environment (`--role reviewer` is run from the
+  worker thread that owns the pull request). A worker whose provider, model, reasoning level or
   environment provider differs from the playbook's is stopped in the
   `thread.created` handler, and the steward's next wake says why and gives
   the right command. DESIGN.md §6.
@@ -300,6 +301,29 @@ bb. [DESIGN.md](DESIGN.md) is the design; this is how it is built and run.
   unless an open item says so; it never marks the effort blocked (BB-109). The sidebar's **Needs you** block and count
   badge show the same items, so a question reaches you where you already look
   (BB-46).
+- **The reviewer role, and the worker's gate and merge commands (BB-133).**
+  A playbook may name `models.reviewer` beside `models.steward` and
+  `models.worker` (the same `provider/model/level` syntax), and a binding may
+  override it with `steward_update { reviewerModel }`; the binding's override
+  wins, then the playbook, then nothing. `bb stewards spawn-flags --role
+  reviewer [<binding>]` prints the full `bb thread spawn` command for a
+  reviewer — hidden, full permissions, the reviewer model, started from the
+  worker thread that owns the pull request so `--parent-self` makes it that
+  worker's child — and fails clearly when no reviewer model is configured.
+  The default role is `worker`, whose output is unchanged. `bb stewards gate
+  <owner/repo#N> [--json]` reads the pull request fresh and prints the same
+  verdict the page and the wake use (`prGate`): the lane, the latest
+  `bb-review` marker and its sha, the matched decide-list entry and who
+  decides, the approval found (owner comment, owner review or `bb-approval`
+  marker) and its sha, the checks, the binding's open items, and `gate met:
+  yes|no`, exiting 0 when met and 1 when not. `bb stewards merge
+  <owner/repo#N>` runs the page's Merge action through one shared function: it
+  re-reads the pull request, re-checks the gate, refuses with the gate's
+  reason when it is unmet or a worker is in flight, and otherwise
+  squash-merges, posts the "Merged:" comment (lane, approved sha, a "since
+  then" line when the head moved past it, the merge commit, and a restart
+  note when the project's guidance says a merge there restarts servers), and
+  closes the Merge item.
 - **One escalation chain (BB-30).** Every hop is one `escalations` row: a
   worker's `bb stewards escalate` goes to its steward, a steward's
   `steward_report { escalate }` to the project steward, and only the
@@ -645,8 +669,8 @@ Playbook front matter: `name`, `kind` (`ticket`, `pr`, `review`, `ops`),
 `source` (`linear`, `github`, or `k8s` or `sentry` for `ops`), `phases` (state → `{ stage,
 stuck }`; none for `ops`), `terminal` (at least one; none for `ops`), `ready` (`checklist`,
 `substantial`, `approval: project` (default), `me` or `{ linear-state: … }`),
-`promote`, `may` (policy stated in every wake), `models` (`steward`, `worker` as
-`provider/model/level`; `claude` means `claude-code`; the model may hold
+`promote`, `may` (policy stated in every wake), `models` (`steward`, `worker`,
+`reviewer` as `provider/model/level`; `claude` means `claude-code`; the model may hold
 slashes, as Pi's `pi/fireworks/accounts/fireworks/models/…` do, and the last
 part is the level only when it names one), `requeue-default`,
 `follow-through` (how long a terminal binding may be kept open, 6h by

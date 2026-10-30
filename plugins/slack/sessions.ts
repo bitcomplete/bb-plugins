@@ -79,9 +79,6 @@ export function wakeText(event: SessionEvent): string {
   const clipped = clipSessionText(event.comment.text);
   const text = clipped.trim() === "" ? "(no text)" : clipped;
 
-  if (event.action === "assistant_thread_started") {
-    return `[Slack — session ${event.session}]\n${owner} opened the assistant pane in their DM with you. Greet them briefly and ask what they need. Reply in Slack with the slack_reply tool (session ${event.session}).`;
-  }
   if (event.action === "assistant_thread_context_changed") {
     return `[Slack — session ${event.session}]\nThe assistant context changed in ${owner}'s DM. Nothing was said. If a reply is needed, use the slack_reply tool (session ${event.session}); otherwise end the turn.`;
   }

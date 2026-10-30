@@ -9,7 +9,9 @@ The `slack` plugin lets a developer talk to their own bb from Slack. A DM to
 the team's `bb` app reaches the server of the Slack user who sent it as an
 `event: session` wake; the plugin starts (or continues) one bb thread per
 Slack conversation and posts the reply back through bb-gate-hooks, which holds
-the app's bot token. The pod never holds a Slack bot credential.
+the app's bot token. The pod never holds a Slack bot credential. Opening the
+assistant pane only posts a canned one-line greeting and starts no bb thread;
+the first real message starts it.
 
 A DM and a channel mention of the app both wake the server of the Slack user
 who sent them. A reply inside a channel thread bb is already part of also

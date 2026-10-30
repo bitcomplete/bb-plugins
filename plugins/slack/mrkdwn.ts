@@ -119,7 +119,10 @@ function convertLine(line: string): string {
 export function toMrkdwn(input: string): string {
   const out: string[] = [];
   let fence: string | null = null;
-  for (const line of input.split("\n")) {
+  for (const raw of input.split("\n")) {
+    // Strip a CRLF line ending once, before the fence and block-marker checks;
+    // otherwise the trailing `\r` hides a fence, heading or list marker.
+    const line = raw.replace(/\r$/u, "");
     const trimmed = line.trimStart();
     const indent = line.slice(0, line.length - trimmed.length);
     const marks = /^(`{3,})(.*)$/u.exec(trimmed);
@@ -129,8 +132,7 @@ export function toMrkdwn(input: string): string {
         out.push(`${indent}${fence}`);
         continue;
       }
-      // A CRLF line ending would otherwise hide the heading or list marker.
-      out.push(convertLine(line.replace(/\r$/u, "")));
+      out.push(convertLine(line));
       continue;
     }
     if (marks !== null && marks[2]!.trim() === "" && marks[1]!.length >= fence.length) fence = null;

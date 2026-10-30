@@ -52,6 +52,7 @@ import {
   watchProblems,
   type BindingKind,
   type EscalationKind,
+  type BigDecision,
   type LessonRules,
   type ModelSpec,
   type Playbook,
@@ -59,7 +60,7 @@ import {
   type Role as StewardRole,
   type RolesFile,
 } from "./config.js";
-import { decideFor, decideForPull, decideForRefusal } from "./decisions.js";
+import { decideFor, decideForPull, decideForRefusal, matchingUserEntry, touchesAny } from "./decisions.js";
 import { alertFingerprint, batchAlert, deadlineAt, depsLookSchema, isBatchable, priorityFor, repoOfFingerprint, sightingOf, type DepsFinding, type DepsLook, type DepsTicket } from "./deps.js";
 import { hostContract } from "./host-contract.js";
 import { MULTI_REPO_ENVIRONMENT_PROVIDER_ID, MULTI_REPO_PLUGIN_ID, multiRepoEnvironmentFlags, multiRepoFreshEnvironment, multiRepoSource, nativeSource, projectSourceLabel, sourceRpcMissing, type FreshEnvironment, type NativeGitRead, type ProjectSource } from "./project-source.js";
@@ -68,7 +69,7 @@ import { HOOKS_URL_ENV, createHooksLoop, type Lease, type Rejection } from "./ho
 import { nightlyDue, stillNight } from "./nightly.js";
 import { classify, lookChanges, opsTargetKey, parseOpsTargetKey, type DependabotTarget, type K8sTarget, type OpsLook, type OpsTarget, type SentryTarget, type Sighting, type TicketState } from "./ops.js";
 import { EVENTS_PER_LOOK, NO_TOKEN, RECENT_PER_LOOK, SENTRY_API_URL, TOKEN_SCOPES, createSentryReader, emptySentryLook, issueInOrg, recentLine, sentryChanges, sentryResolveTargets, sentrySightings, sentrySummary, type SentryFinding, type SentryLook, type SentryReader } from "./sentry.js";
-import { advanced, answerDiffers, anyWorkerInFlight, approvalMarkerLine, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, reviewWorkerThread, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
+import { advanced, answerDiffers, anyWorkerInFlight, approvalMarkerLine, approvalWanted, asksForOpenApproval, classifyApproval, commentDiffersFromRecommendation, compactDue, diffObserved, endingDeadline, followingThrough, gateKnownUnmet, gateState, hasLabel, IDLE_WAKE_TEXT, idleInActiveStage, isCommentNews, isSpecComment, latestProjectApprovalMarker, latestReviewMarker, lifecycle, namesUserAsBlocker, newHumanComments, newestCommentAt, ownPullClosed, phaseAndStage, prGate, resolveChecklistItem, reviewWorkerThread, specHash, stuckDue, unheardWait, workerInFlight, workerReportedTerminal, type Change } from "./reconcile.js";
 import {
   SOURCE_PLUGIN_IDS,
   STEWARDS_PLUGIN_ID,
@@ -1849,6 +1850,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     const stewardModel = (b: Binding, playbook: Playbook) => parseModel(b.modelSteward) ?? playbook.models.steward;
     const workerModel = (b: Binding, playbook: Playbook) => parseModel(b.modelWorker) ?? playbook.models.worker;
+    const reviewerModel = (b: Binding, playbook: Playbook) => parseModel(b.modelReviewer) ?? playbook.models.reviewer;
 
     /**
      * The machine a project's threads run on: the host of its checkout.
@@ -5595,6 +5597,177 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
     // ---- the RPC -------------------------------------------------------------------------------------
 
+    // ---- the lane gate, shared by the page, `bb stewards gate` and `bb stewards merge` (BB-133) ----
+
+    /** One pull request's gate verdict, as `bb stewards gate` prints it. */
+    type GateReport = {
+      ref: string;
+      binding: string;
+      headSha: string | null;
+      lane: string | null;
+      marker: { round: number; sha: string; verdict: string } | null;
+      decision: { entry: string | null; decide: "project" | "user"; why: string | null };
+      approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
+      checks: { state: string | null; green: boolean };
+      openItems: string[];
+      missing: string | null;
+      gateMet: boolean;
+    };
+
+    /** The decide-list entry a pull request's changed files match, and who decides (fail closed to the user). */
+    function matchedDecision(files: readonly string[] | null, decisions: readonly BigDecision[]): GateReport["decision"] {
+      const decide = decideForPull(files, decisions);
+      const entry = files === null || files.length === 0 ? undefined : matchingUserEntry(files, decisions) ?? decisions.find((d) => d.decide === "project" && d.paths.length > 0 && touchesAny(files, d.paths));
+      const text = entry?.text ?? null;
+      return { entry: text, decide, why: decideForRefusal(files, text, decisions) };
+    }
+
+    /**
+     * The approval the lane gate found, with the sha it names: the project
+     * steward's `bb-approval` marker (only when its comment id is in the
+     * plugin's own records), or the owner's newest unsigned approving review
+     * or comment. A comment carries no sha of its own, so it names none.
+     */
+    function approvalDetail(b: Binding, pull: EntitySnapshot, gate: ReturnType<typeof prGate>): GateReport["approval"] {
+      if (gate.projectApproved) {
+        const recorded = new Set(projectApprovalsFor(b).filter((r) => r.commentId !== null).map((r) => r.commentId!));
+        const marker = latestProjectApprovalMarker(pull.comments, recorded);
+        if (marker !== null) return { kind: "project-marker", sha: marker.marker.sha === "" ? null : marker.marker.sha, at: marker.comment.createdAt };
+      }
+      if (gate.ownerApproved) {
+        const at = gate.ownerApprovalAt;
+        const review = at === null ? undefined : (pull.pull?.reviews ?? []).find((r) => (r.submittedAt ?? "") === at && r.state.toLowerCase() === "approved");
+        if (review !== undefined) return { kind: "owner-review", sha: review.commit, at };
+        return { kind: "owner-comment", sha: null, at };
+      }
+      return null;
+    }
+
+    /** The plugin's open items for one pull request: its needs, and the approval escalations on it. */
+    function openPullItems(b: Binding, url: string): string[] {
+      const items: string[] = [];
+      for (const n of store.openNeeds(b.id)) {
+        if ((n.kind === "approve-pr" || n.kind === "merge") && (n.url === "" || n.url === url)) items.push(`${n.kind}: ${n.what}`);
+      }
+      for (const x of store.openEscalations(b.id)) {
+        if (x.kind === "approval" && (x.url === null || x.url === url)) items.push(`approval (${x.route}): ${x.question}`);
+      }
+      return items;
+    }
+
+    /**
+     * The lane gate's verdict for a pull request, the same computation the
+     * page and the wake use, with the pieces the CLI prints: lane, reviewer
+     * marker, matched decide-list entry and who decides, the approval found
+     * and its sha, checks, and the binding's open items.
+     */
+    async function gateReport(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot): Promise<GateReport> {
+      const decisions = (await loadConfig(b.projectId))?.file.bigDecisions ?? [];
+      const decision = matchedDecision(await pullChangedFiles(pull), decisions);
+      // The verdict is `prGate` with the project's approvals, exactly as the
+      // page's Merge item and the wake compute it; the decide-list entry above
+      // is what the plugin asks the owner or project steward for (BB-133).
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
+      return {
+        ref: `${ref.repo}#${ref.number}`,
+        binding: b.entityKey,
+        headSha: gate.headSha,
+        lane: gate.lane,
+        marker: gate.marker === null ? null : { round: gate.marker.round, sha: gate.marker.sha, verdict: gate.marker.verdict },
+        decision,
+        approval: approvalDetail(b, pull, gate),
+        checks: { state: gate.checksState, green: gate.checksGreen },
+        openItems: openPullItems(b, pull.url ?? pull.key),
+        missing: gate.missing,
+        gateMet: gate.gateMet,
+      };
+    }
+
+    /** The human-readable `bb stewards gate` output; `--json` emits the same fields. */
+    function formatGateReport(r: GateReport): string {
+      const marker = r.marker === null ? "none" : `round ${r.marker.round} at ${shortSha(r.marker.sha)} (${r.marker.verdict})`;
+      const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}${r.decision.why === null ? "" : `: ${r.decision.why}`})` : `"${r.decision.entry}" (${r.decision.decide})`;
+      const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
+      return [
+        `${r.ref}${r.binding === "" ? "" : ` — ${r.binding}`}`,
+        `head ${shortSha(r.headSha)}; lane ${r.lane ?? "(none)"}`,
+        `reviewer: ${marker}`,
+        `decide list: ${decision}`,
+        `approval: ${approval}`,
+        `checks: ${r.checks.state ?? "none"}${r.checks.green ? " (green)" : ""}`,
+        `open items: ${r.openItems.length === 0 ? "none" : r.openItems.join("; ")}`,
+        `gate met: ${r.gateMet ? "yes" : `no — ${r.missing ?? "unknown"}`}`,
+      ].join("\n");
+    }
+
+    /** The reviewer's approved sha against the lane gate, and the "since then" line when the head moved past it. */
+    function mergeSummary(gate: ReturnType<typeof prGate>): string {
+      const lane = gate.lane ?? "no-review";
+      const approved = gate.marker?.sha ?? gate.headSha;
+      const by = gate.projectApproved ? ", approved by the project steward" : gate.ownerApproved ? ", approved by the owner" : "";
+      return `Merged: ${lane} lane, reviewer approved ${shortSha(approved)}, checks green${by}.`;
+    }
+
+    function sinceApproval(gate: ReturnType<typeof prGate>): string | null {
+      const approved = gate.marker?.sha ?? null;
+      if (approved === null || gate.headSha === null || approved === gate.headSha) return null;
+      return `since then: the head moved to ${shortSha(gate.headSha)}`;
+    }
+
+    const RESTART_NOTE = "Note: merging this moves the pin and stages a restart for every developer's server (Restart now, or in the 03:00–05:00 ET quiet window).";
+    /**
+     * The restart note for a merge, when the project's guidance says so: one
+     * guidance paragraph that names the merged repository, says "restart", and
+     * makes an every-merge claim ("any merge … moves the pin"). Requiring all
+     * three in one paragraph is what distinguishes `.bb/AGENTS.md`'s "Any merge
+     * to `bb-plugins` main … moves the pin … stages a restart" from the
+     * paragraphs that merely name the repo (or a sibling repo) and the word
+     * "restart" elsewhere in the same section. The note is a fixed sentence the
+     * merge comment carries so the worker no longer has to read the guidance
+     * itself.
+     */
+    async function restartNoteFor(projectId: string, repo: string): Promise<string | null> {
+      const short = (repo.split("/").at(-1) ?? repo).toLowerCase();
+      if (short === "") return null;
+      const named = new RegExp(`\\b${short.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\b`, "u");
+      for (const u of await guidanceUnits(projectId)) {
+        const text = u.text.toLowerCase();
+        if (named.test(text) && /restart/u.test(text) && /\b(?:any|every) merge\b/u.test(text)) return RESTART_NOTE;
+      }
+      return null;
+    }
+
+    /**
+     * The one merge path the Stewards page's Merge button and `bb stewards
+     * merge` share: recompute the gate with the project's approval records
+     * and the pull request's changed files, refuse with the gate's words when
+     * it is unmet or a worker is in flight, squash-merge, post the "Merged:"
+     * comment, and close the binding's Merge need. The caller reads the pull
+     * request fresh and passes it in; `where` names the surface in the need's
+     * closure.
+     */
+    async function mergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, where: string): Promise<{ ok: true; summary: string; mergeSha: string | null } | { ok: false; message: string }> {
+      // The same `prGate` with the project's approvals the page's Merge item
+      // and the wake use, so the page, `bb stewards gate` and `bb stewards
+      // merge` cannot disagree.
+      const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
+      if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
+      if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
+      const summary = mergeSummary(gate);
+      const since = sinceApproval(gate);
+      const restart = await restartNoteFor(b.projectId, ref.repo);
+      let mergeSha: string | null = null;
+      try {
+        ({ sha: mergeSha } = await github.squashMerge(ref.repo, ref.number, `Merge ${pull.key}`, summary));
+        const body = [summary, ...(since === null ? [] : [since]), `merge commit ${mergeSha ?? "?"}`, ...(restart === null ? [] : [restart])].join("\n");
+        await github.comment(ref.repo, ref.number, body).catch(() => undefined);
+      } catch (error) {
+        return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
+      }
+      store.closeNeedByKey(b.id, "merge", pull.url ?? pull.key, `Merged ${where}.`);
+      return { ok: true, summary, mergeSha };
+    }
+
     const rawRpcHandlers: ExperimentalPluginRpcHandlersWithContext<typeof rpcContract> = {
       async stewardsRing({ source, id, deployment, workflow_run }, { experimental_caller: caller }) {
         if (caller.kind !== "plugin" || caller.pluginId !== SOURCE_PLUGIN_IDS[source]) throw new Error("only the linear and github-watcher plugins ring stewards, each for its own source");
@@ -5973,6 +6146,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         await wakePlainRationale();
         return { ok: true, message: "Closed." };
       },
+
       // The page's buttons. Each action runs on the server as the connected user
       // and unsigned, so it counts as a human action; each closes its item and
       // wakes the binding's steward with the closure under "What changed".
@@ -6064,19 +6238,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const ref = parsePullRef(need.url);
           if (ref === null) return { ok: false, message: `I cannot tell which pull request ${need.url} is.` };
           const pull = await freshPull();
-          const gate = pull === null ? null : prGate(pull, { projectApprovals: projectApprovalsFor(b) });
-          if (pull === null || gate === null || !gate.gateMet) return { ok: false, message: `The gate is not met: ${gate?.missing ?? "the pull request could not be read"}.` };
-          if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
-          const lane = gate.lane ?? "no-review";
-          const summary = `Merged: ${lane} lane, reviewer approved ${shortSha(gate.headSha)}, checks green${gate.ownerApproved ? ", approved by the owner" : ""}.`;
-          try {
-            await github.squashMerge(ref.repo, ref.number, `Merge ${pull.key}`, summary);
-            await github.comment(ref.repo, ref.number, summary).catch(() => undefined);
-          } catch (error) {
-            return { ok: false, message: `GitHub refused the merge: ${errorMessage(error)}` };
-          }
-          store.closeNeedByKey(b.id, "merge", need.url, "Merged from the Stewards page.");
-          after(`${pull.key} was merged from the Stewards page. ${summary}`);
+          if (pull === null) return { ok: false, message: "The pull request could not be read; try again." };
+          // The same shared path `bb stewards merge` takes (BB-133): one gate
+          // check, one squash merge, one "Merged:" comment.
+          const result = await mergePullRequest(b, ref, pull, "from the Stewards page");
+          if (!result.ok) return { ok: false, message: result.message };
+          after(`${pull.key} was merged from the Stewards page. ${result.summary}`);
           return { ok: true, message: `Merged; ${b.entityKey}'s steward has been told.` };
         }
 
@@ -6865,6 +7032,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           .describe("With hold: the open bindings (entity keys) this hold waits behind. The hold lifts itself, and the steward is woken, once every one has merged its pull requests or ended. Use it to schedule a ticket after the work it overlaps."),
         stewardModel: modelSpecSchema.optional().describe("The steward thread's model, provider/model/level."),
         workerModel: modelSpecSchema.optional().describe("The model for workers it starts from now."),
+        reviewerModel: modelSpecSchema.optional().describe("The model for reviewers its workers start from now."),
         approve: z.boolean().optional().describe("Approve the ticket's current spec for the ready gate, or, with `entry`, an owner-reviewed pull request the project steward may decide."),
         quote: z.string().trim().min(2).max(500).optional().describe("When approving for the user: their words of approval, quoted exactly from a message they sent in this thread."),
         lesson: z
@@ -7020,7 +7188,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           const target = bindingRef === undefined ? (projectOf !== null ? null : ownBinding(threadId)) : store.find(bindingRef);
           if (bindingRef !== undefined && target === null) return toolError(new Error(`No binding for ${bindingRef}.`));
           if (target === null) {
-            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve, input.quote];
+            const forBinding = [guidance, resolve, input.forward, input.recommendation, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.reviewerModel, input.approve, input.quote];
             if (forBinding.some((v) => v !== undefined)) return toolError(new Error("Name the binding (binding: ENG-12 or owner/repo#3) for that."));
             if (closing === null && input.ask === undefined && input.lesson === undefined) return toolError(new Error("Nothing to update: name a binding, ask a question, record a lesson, or close one."));
             const written = questionWrites(closing, null);
@@ -7126,7 +7294,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               const info = await threadInfo(target.threadId);
               if (info !== null && info.providerId !== "" && info.providerId !== input.stewardModel.providerId) return toolError(new Error(`${target.entityKey}'s steward runs on ${info.providerId}; a model can be changed, the provider cannot.`));
             }
-            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
+            const asked = [guidance, resolve, input.forward, input.priority, input.hold, input.behind, input.stewardModel, input.workerModel, input.reviewerModel, input.approve === true ? true : undefined, input.ask, input.lesson, closing ?? undefined];
             if (asked.every((v) => v === undefined)) return toolError(new Error("Nothing to update: give guidance, resolve, forward, priority, hold, a model, approve, ask, or record a lesson."));
           }
           const behind: Binding[] = [];
@@ -7360,9 +7528,9 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           if (input.stewardModel !== undefined && target.threadId !== null) {
             await bb.sdk.threads.update({ threadId: target.threadId, ...(input.stewardModel.model === null ? {} : { model: input.stewardModel.model }), ...(input.stewardModel.reasoningLevel === null ? {} : { reasoningLevel: input.stewardModel.reasoningLevel }) });
           }
-          if (input.stewardModel !== undefined || input.workerModel !== undefined) {
-            store.patch(target.id, { ...(input.stewardModel === undefined ? {} : { modelSteward: input.stewardModel.text }), ...(input.workerModel === undefined ? {} : { modelWorker: input.workerModel.text }) });
-            done.push(`models: steward ${input.stewardModel?.text ?? "unchanged"}, workers ${input.workerModel?.text ?? "unchanged"}`);
+          if (input.stewardModel !== undefined || input.workerModel !== undefined || input.reviewerModel !== undefined) {
+            store.patch(target.id, { ...(input.stewardModel === undefined ? {} : { modelSteward: input.stewardModel.text }), ...(input.workerModel === undefined ? {} : { modelWorker: input.workerModel.text }), ...(input.reviewerModel === undefined ? {} : { modelReviewer: input.reviewerModel.text }) });
+            done.push(`models: steward ${input.stewardModel?.text ?? "unchanged"}, workers ${input.workerModel?.text ?? "unchanged"}, reviewers ${input.reviewerModel?.text ?? "unchanged"}`);
           }
           for (const n of notes) tell(threadId, target, n);
           return `${target.entityKey}: ${done.join("; ")}.`;
@@ -7770,10 +7938,16 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       return b;
     }
 
-    /** The binding `brief`/`spawn-flags` acts on: the positional, or the invoking thread's own. */
-    function bindingFromCli(positional: string | undefined, option: string | undefined, ctx: { threadId?: string; projectId?: string }): Binding {
+    /**
+     * The binding `brief`/`spawn-flags`/`gate`/`merge` acts on: the positional,
+     * or the invoking thread's own. A worker thread resolves to its binding when
+     * `worker` is set, so a worker can ask for its reviewer's spawn command and
+     * its pull request's gate without naming the ticket (BB-133).
+     */
+    function bindingFromCli(positional: string | undefined, option: string | undefined, ctx: { threadId?: string; projectId?: string }, opts: { worker?: boolean } = {}): Binding {
       if (positional !== undefined && positional !== "") return bindingOrThrow(positional, option ?? ctx.projectId);
-      const own = ctx.threadId === undefined ? null : store.byThread(ctx.threadId);
+      const worker = opts.worker === true && ctx.threadId !== undefined ? store.worker(ctx.threadId) : null;
+      const own = ctx.threadId === undefined ? null : store.byThread(ctx.threadId) ?? (worker === null ? null : store.binding(worker.bindingId));
       if (own === null) {
         const project = ctx.threadId === undefined ? null : store.projectByThread(ctx.threadId);
         throw new PluginCliError("This thread is not the steward of a binding; pass one (an entity key or binding id).", {
@@ -7782,6 +7956,33 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         });
       }
       return own;
+    }
+
+    /**
+     * The binding that watches a pull request: the invoking thread's own when
+     * there is one, a binding whose own entity is the pull request, or any open
+     * binding in the project whose last snapshot links it. Null when none does.
+     */
+    function bindingForPullRef(ref: { repo: string; number: number }, ctx: { threadId?: string; projectId?: string }): Binding | null {
+      const key = `${ref.repo}#${ref.number}`;
+      // A binding whose own entity is the pull request (a review or pr
+      // binding) wins, so a worker asking about another binding's pull request
+      // does not read its own binding's approvals.
+      const direct = store.find(key, ctx.projectId);
+      if (direct !== null && direct.endedAt === null) return direct;
+      if (ctx.threadId !== undefined) {
+        const worker = store.worker(ctx.threadId);
+        const own = store.byThread(ctx.threadId) ?? (worker === null ? null : store.binding(worker.bindingId));
+        if (own !== null && own.endedAt === null) return own;
+      }
+      const matches = (b: Binding) => b.lastSnapshot !== null && observedPulls(b, b.lastSnapshot).some((p) => (p.url ?? p.key) === key || p.key === key);
+      const candidates = ctx.projectId === undefined ? store.open() : store.open(ctx.projectId);
+      return candidates.find(matches) ?? null;
+    }
+
+    /** The pull request a CLI ref names, read fresh from GitHub; null when it cannot be read. */
+    async function readPullRef(ref: { repo: string; number: number }): Promise<EntitySnapshot | null> {
+      return snapshot("github", `${ref.repo}#${ref.number}`).catch(() => null);
     }
 
     /** The worker spawn flags for a binding: the project source's environment first, then the playbook's worker model. */
@@ -7977,16 +8178,67 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           }),
 
           "spawn-flags": cliCommand({
-            summary: "The full runnable `bb thread spawn` command for a steward's workers, from the playbook's worker model and the project environment",
-            description: "Use these flags as they are: they are the playbook's, not the steward's to choose. Defaults to the binding of the invoking thread.",
+            summary: "The full runnable `bb thread spawn` command for a steward's workers or a worker's reviewer, from the playbook's model and the project environment",
+            description: "Use these flags as they are: they are the playbook's, not the steward's to choose. Defaults to the binding of the invoking thread. `--role reviewer` is run from the worker thread that owns the pull request, so `--parent-self` makes the reviewer that worker's child; it needs `models.reviewer` in the playbook or a binding override.",
             positionals: [{ name: "binding", description: "The entity key (ENG-12, owner/repo#3) or binding id; the invoking thread's binding when left out", required: false }],
-            options: { project: PROJECT_OPTION },
+            options: { project: PROJECT_OPTION, role: { type: "string", description: "worker (the default) or reviewer" } },
             async run(input, ctx) {
-              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx);
+              const role = input.options.role ?? "worker";
+              if (role !== "worker" && role !== "reviewer") throw new PluginCliError(`Unknown role ${JSON.stringify(role)}: worker or reviewer.`, { code: "bad_role" });
+              // A reviewer is spawned with `--parent-self` from the worker it
+              // reviews for, so the command only makes sense from that worker's
+              // thread; from a steward it would parent the reviewer to the
+              // steward and the plugin would stop it as a mis-spawned worker.
+              if (role === "reviewer" && ctx.threadId !== undefined && store.worker(ctx.threadId) === null) throw new PluginCliError("`--role reviewer` is run from the worker thread that owns the pull request, so the reviewer is that worker's child; run it there.", { code: "reviewer_not_from_worker" });
+              const b = bindingFromCli(input.positionals.binding, input.options.project, ctx, { worker: true });
               const config = await loadConfig(b.projectId);
               const playbook = config === null ? null : bindingPlaybook(config, b);
               if (config === null || playbook === null) throw new PluginCliError(`No playbook for ${b.entityKey}: run bb stewards check.`, { code: "playbook_missing" });
-              return { exitCode: 0, stdout: spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: await workerFlagsFor(b, playbook, config.source) }) };
+              const spec = role === "reviewer" ? reviewerModel(b, playbook) : workerModel(b, playbook);
+              if (role === "reviewer" && spec === null) throw new PluginCliError(`No reviewer model for ${b.entityKey}: add models.reviewer to ${playbook.name}, or set one with steward_update { binding, reviewerModel }.`, { code: "no_reviewer_model" });
+              const flags = [environmentFlags(config.source, await projectHost(b.projectId)), workerFlags(spec)].filter((f) => f !== "").join(" ");
+              return { exitCode: 0, stdout: spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: flags, role }) };
+            },
+          }),
+
+          gate: cliCommand({
+            summary: "The lane gate's verdict for a pull request, from the plugin's own rules",
+            description: "Reads the pull request fresh from GitHub and prints the lane, the latest bb-review marker and its sha, the decide-list entry matched and who decides, the approval found and its sha, the check status, the binding's open items and whether the gate is met. Exit 0 when met, 1 when not. --json emits the same fields.",
+            positionals: [{ name: "ref", description: "The pull request, owner/repo#N", required: true }],
+            options: { project: PROJECT_OPTION, json: JSON_OPTION },
+            async run(input, ctx) {
+              const ref = parsePullRef(input.positionals.ref);
+              if (ref === null) throw new PluginCliError(`${JSON.stringify(input.positionals.ref)} is not a pull request (owner/repo#N).`, { code: "bad_ref" });
+              const b = bindingForPullRef(ref, ctx);
+              if (b === null) throw new PluginCliError(`No binding watches ${ref.repo}#${ref.number}; pass --project or run from the thread that owns it.`, { code: "binding_not_found" });
+              const pull = await readPullRef(ref);
+              if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
+              const report = await gateReport(b, ref, pull);
+              return { exitCode: report.gateMet ? 0 : 1, stdout: input.options.json === true ? JSON.stringify(report) : formatGateReport(report) };
+            },
+          }),
+
+          merge: cliCommand({
+            summary: "Merge a pull request whose lane gate is met, through the same path as the Stewards page",
+            description: "Re-reads the pull request, re-checks the gate with the project's approvals, and refuses with the gate's reason when it is unmet or a worker is in flight. Otherwise squash-merges, posts the \"Merged:\" comment, and closes the binding's Merge item. Exit 1 on a refusal.",
+            positionals: [{ name: "ref", description: "The pull request, owner/repo#N", required: true }],
+            options: { project: PROJECT_OPTION },
+            async run(input, ctx) {
+              const ref = parsePullRef(input.positionals.ref);
+              if (ref === null) throw new PluginCliError(`${JSON.stringify(input.positionals.ref)} is not a pull request (owner/repo#N).`, { code: "bad_ref" });
+              const b = bindingForPullRef(ref, ctx);
+              if (b === null) throw new PluginCliError(`No binding watches ${ref.repo}#${ref.number}; pass --project or run from the thread that owns it.`, { code: "binding_not_found" });
+              const pull = await readPullRef(ref);
+              if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
+              const result = await mergePullRequest(b, ref, pull, "with bb stewards merge");
+              if (!result.ok) return { exitCode: 1, stdout: result.message };
+              // The same record the page leaves, so the binding's steward is woken.
+              const fresh = store.binding(b.id);
+              if (fresh !== null) {
+                store.note(fresh.id, `${pull.key} was merged with bb stewards merge. ${result.summary}`);
+                scheduleReconcile(fresh.id);
+              }
+              return { exitCode: 0, stdout: `${result.summary}\nmerge commit ${result.mergeSha ?? "?"}` };
             },
           }),
 

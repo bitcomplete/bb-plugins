@@ -87,7 +87,8 @@ describe("toMrkdwn", () => {
     expect(toMrkdwn("plain text, no Markdown")).toBe("plain text, no Markdown");
   });
 
-  it("still reads headings and lists when the lines end with CRLF", () => {
+  it("still reads headings, lists and fences when the lines end with CRLF", () => {
     expect(toMrkdwn("# Head\r\n- item\r\n**bold**")).toBe("*Head*\n• item\n*bold*");
+    expect(toMrkdwn("```js\r\n**not bold**\r\n```")).toBe("```\n**not bold**\n```");
   });
 });

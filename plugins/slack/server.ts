@@ -55,6 +55,13 @@ export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** A sign-in state the plugin started is good for as long as the service's own. */
 export const PENDING_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * The canned one-line greeting posted when a developer opens the assistant
+ * pane. It answers the wake, so the backstop stays quiet, and no bb thread is
+ * started until the first real message.
+ */
+export const ASSISTANT_GREETING = "Hi, I'm your bb. Tell me what you need and I'll start a thread for it.";
+
 /** The Block Kit action id the ephemeral "which project?" prompt uses. */
 export const SET_PROJECT_ACTION = "bb_set_project";
 /** Slack's response_url host; the plugin posts to no other host. */
@@ -576,15 +583,17 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
      * Post a reply on a session and count it answered. The text is Markdown or
      * mrkdwn; it is converted to mrkdwn here, the one path both `slack_reply`
      * and the plugin's own backstop use. Throws what replyError makes.
+     * `clearStatus` clears the thinking indicator after the reply; a caller
+     * that never set one (the assistant-pane greeting) passes false.
      */
-    async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any"): Promise<void> {
+    async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any", clearStatus = true): Promise<void> {
       try {
         await hooks.reply(session, toMrkdwn(text), signal);
       } catch (error) {
         throw replyError(error);
       }
       markAnswered(session, slot);
-      void hooks.status(session, "", checkSignal()).catch(() => undefined);
+      if (clearStatus) void hooks.status(session, "", checkSignal()).catch(() => undefined);
     }
 
     /** The plugin's own reply when a turn ends without one. Logged, never thrown. */
@@ -760,7 +769,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /** A short, deterministic bb thread title for the first wake of a conversation. */
     function threadTitle(event: SessionEvent): string {
       const first = event.comment.text.replace(/\s+/gu, " ").trim();
-      if (first === "") return event.action === "assistant_thread_started" ? "Slack assistant pane" : "Slack message";
+      if (first === "") return "Slack message";
       return first.length <= 80 ? first : `${first.slice(0, 77)}…`;
     }
 
@@ -866,6 +875,16 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       await saveSessions();
       if (contextChange) {
         bb.log.info(`Slack session ${event.session} context changed; nothing to answer`);
+        return;
+      }
+      // Opening the assistant pane is not a request. Greet once through the
+      // normal reply path, keep the session mapped with no bb thread, and let
+      // the first real message spawn one. The greeting is the wake's one reply
+      // (so the backstop stays quiet) and no thinking indicator was set, so
+      // none is cleared.
+      if (event.action === "assistant_thread_started") {
+        bb.log.info(`Slack session ${event.session} opened the assistant pane; posting the greeting and starting no thread`);
+        await postReply(event.session, ASSISTANT_GREETING, checkSignal(), "tagged", false);
         return;
       }
       // An untagged reply's channel is never logged; the hash still groups the
