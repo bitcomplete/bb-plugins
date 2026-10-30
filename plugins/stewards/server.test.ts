@@ -9246,6 +9246,25 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(need.data.decideListing).toContain("Deciding entry: \"Identity and access\" [user].");
   });
 
+  it("drops a stale decide-list listing when the head moves while checks are red (BB-135 review round 1)", async () => {
+    const entries = [
+      { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+      { text: "A cross-repo contract other repos implement", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+    ];
+    const t = await withPull([reviewMarker("owner-reviewed")], {
+      files: ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"],
+      project: { version: 1, linear: { teams: ["ENG"] }, bigDecisions: entries },
+    });
+    const before = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    expect(before.data.decideListing).toContain("Decide list:");
+    // Checks go red at a new head: the old head's listing is not shown.
+    t.entities.set("acme/web#7", pull({ id: "acme/web#7", key: "acme/web#7", url: "https://github.com/acme/web/pull/7", unit: "acme/web", comments: [reviewMarker("owner-reviewed")] }, { checks: { state: "failure", failing: ["ci"] }, headSha: "bbbbbbb2" }));
+    await t.ring("linear", "uuid-12");
+    const after = t.hooks.store.openNeeds(t.binding().id).find((n) => n.kind === "approve-pr")!;
+    expect(after.data.decideListing).toBeUndefined();
+    expect(after.how).not.toContain("Decide list:");
+  });
+
   it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {
     const t = await withPull([reviewMarker("owner-reviewed")], { pullOver: { reviews: [{ author: "jane", state: "approved", submittedAt: "2026-10-14T17:00:00Z", commit: head }] } });
     const owner = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { approval: unknown; gateMet: boolean };

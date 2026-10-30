@@ -297,7 +297,8 @@ describe("the nightly prompt", () => {
     expect(escalation).not.toContain("## The record since");
   });
 
-  it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {    const { s, bind } = world();
+  it("shows the project's standing-rules list in an approval wake, and works with none configured (BB-54)", () => {
+    const { s, bind } = world();
     const b = bind("ENG-12");
     const x = s.escalate({ bindingId: b.id, kind: "approval", question: "Approve ENG-12's spec?", meanwhile: "Waiting.", route: "project", recommendation: null });
     const withRules = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [], standingRules: ["Migrations are append-only.", "The PR body carries the restart note."] });

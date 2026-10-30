@@ -167,7 +167,7 @@ export function explainDecision(files: readonly string[] | null | undefined, dec
  */
 export function formatDecisionListing(explanation: DecisionExplanation): string {
   const entries = explanation.unreadable
-    ? "Decide list: the changed files were not read, so no entry was matched."
+    ? `Decide list: ${explanation.reason}, so no entry was matched.`
     : explanation.matched.length === 0
       ? "Decide list: no entry's paths matched the changed files."
       : [

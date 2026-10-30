@@ -4941,17 +4941,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         ? `Submit an APPROVED review as you from the Stewards page; that is what counts as your approval.`
         : `Post the unsigned comment "Approved ${shortSha(headSha)} from the Stewards page" as you; that is what counts as your approval.`;
       // A later refresh (checks went red) may not have the files at hand; keep
-      // the listing an earlier wake stored rather than dropping it (BB-135).
+      // the listing an earlier wake stored for the same head rather than
+      // dropping it or showing the previous head's listing (BB-135).
       const url = pull.url ?? pull.key;
       const existing = store.openNeeds(b.id).find((n) => n.kind === "approve-pr" && n.url === url);
-      const carried = listing ?? (typeof existing?.data.decideListing === "string" ? existing.data.decideListing : null);
+      const carried = listing ?? (existing?.data.decideListingSha === headSha && typeof existing.data.decideListing === "string" ? existing.data.decideListing : null);
       store.fileNeed({
         bindingId: b.id,
         kind: "approve-pr",
         url,
         what: `Approve ${pull.key} on GitHub`,
         how: carried === null ? how : `${how}\n\n${carried}`,
-        data: { sha: headSha, escalationId, foreign, ...(carried === null ? {} : { decideListing: carried }) },
+        data: { sha: headSha, escalationId, foreign, ...(carried === null ? {} : { decideListing: carried, decideListingSha: headSha }) },
         filedBy: "plugin",
       });
     }
@@ -5705,7 +5706,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       headSha: string | null;
       lane: string | null;
       marker: { round: number; sha: string; verdict: string } | null;
-      decision: { entry: string | null; decide: "project" | "user"; why: string | null; listing: string };
+      decision: { entry: string | null; decide: "project" | "user"; why: string; listing: string };
       approval: { kind: "owner-comment" | "owner-review" | "project-marker"; sha: string | null; at: string | null } | null;
       checks: { state: string | null; green: boolean };
       openItems: string[];
@@ -5783,7 +5784,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     /** The human-readable `bb stewards gate` output; `--json` emits the same fields. */
     function formatGateReport(r: GateReport): string {
       const marker = r.marker === null ? "none" : `round ${r.marker.round} at ${shortSha(r.marker.sha)} (${r.marker.verdict})`;
-      const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}${r.decision.why === null ? "" : `: ${r.decision.why}`})` : `"${r.decision.entry}" (${r.decision.decide})`;
+      const decision = r.decision.entry === null ? `no matching entry (${r.decision.decide}: ${r.decision.why})` : `"${r.decision.entry}" (${r.decision.decide})`;
       const listing = r.decision.listing.split("\n").map((l) => `  ${l}`).join("\n");
       const approval = r.approval === null ? "none" : `${r.approval.kind}${r.approval.sha === null ? "" : ` at ${shortSha(r.approval.sha)}`}${r.approval.at === null ? "" : ` (${r.approval.at})`}`;
       return [
@@ -7540,7 +7541,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
                 url: forwarding.url ?? target.url ?? "",
                 what: `Approve ${key} on GitHub`,
                 how: listing === null ? how : `${how}\n\n${listing}`,
-                data: { sha: forwarding.headSha, escalationId: forwarding.id, ...(listing === null ? {} : { decideListing: listing }) },
+                data: { sha: forwarding.headSha, escalationId: forwarding.id, ...(listing === null ? {} : { decideListing: listing, decideListingSha: forwarding.headSha }) },
                 filedBy: "plugin",
               });
             }

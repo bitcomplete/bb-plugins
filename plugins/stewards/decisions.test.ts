@@ -146,8 +146,10 @@ describe("explainDecision names the entries that matched and the one that decide
       expect(e.matched).toEqual([]);
       expect(e.mark).toBe("user");
       expect(e.reason).toMatch(/could not be read|changes no files/u);
-      expect(formatDecisionListing(e)).toContain("the changed files were not read");
     }
+    // The listing keeps the two failed reads apart (BB-135 review round 1).
+    expect(formatDecisionListing(explainDecision(null, overlap))).toContain("the changed files could not be read, so no entry was matched");
+    expect(formatDecisionListing(explainDecision([], overlap))).toContain("the pull request changes no files, so no entry was matched");
   });
 });
 
