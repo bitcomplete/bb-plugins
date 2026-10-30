@@ -18,7 +18,7 @@ import type {
 } from "@get-bb/plugin-sdk/environment-provider";
 import { createFakePluginHost, makeHostResponse, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { git, gitIn, gitLine } from "./git.js";
-import { EMPTY_REPOS, dirFromUrl } from "./repos.js";
+import { EMPTY_REPOS, dirFromUrl, parseReposFile } from "./repos.js";
 import { repoSetViewSchema } from "./contract.js";
 import plugin from "./server.js";
 import { ENVIRONMENT_PROVIDER_ID } from "./shared.js";
@@ -635,9 +635,12 @@ describe("seeding an empty repo set", () => {
     const write = harness.experimental_hostRpcCalls.find((call) => call.method === "writeProjectSourceRepos");
     expect(write).toBeDefined();
     const reposJson = (write?.input as { reposJson: string }).reposJson;
-    // The sibling checkout is proposed...
-    expect(reposJson).toContain("sibling");
-    // ...but the project source's own origin is not repeated in the file.
+    // The sibling checkout is the whole proposed set...
+    const parsed = parseReposFile(reposJson);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.repos).toEqual([{ dir: "sibling", url: SIBLING_URL, inferredDir: true }]);
+    // ...and the project source's own origin is not repeated in the file.
     expect(reposJson).not.toContain(PRIMARY_URL);
   });
 });
