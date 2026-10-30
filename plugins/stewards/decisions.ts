@@ -47,16 +47,28 @@ export function isSelfWidening(files: readonly string[]): boolean {
 }
 
 /**
+ * The first `decide: user` entry with paths that the changed files touch, or
+ * undefined. A pull request that touches a `user` entry's paths is the user's,
+ * whatever `project` entries also match (BB-125, fail closed).
+ */
+export function matchingUserEntry(files: readonly string[], decisions: readonly BigDecision[]): BigDecision | undefined {
+  return decisions.find((d) => d.decide === "user" && d.paths.length > 0 && touchesAny(files, d.paths));
+}
+
+/**
  * The mark for an entry named by the project steward. A missing name, an
  * unknown entry, or an unknown mark is the user's. The project steward's
  * words are matched to the list case-insensitively, by text. When the entry
  * names `paths`, the pull request's changed files must touch one of them.
+ * When the files touch any `user` entry's paths the mark is the user's, even
+ * when the named entry is marked project.
  */
 export function decideForEntry(entry: string | null | undefined, decisions: readonly BigDecision[], files?: readonly string[]): DecideMark {
   const wanted = (entry ?? "").trim();
   if (wanted === "") return "user";
   const found = decisions.find((d) => d.text === wanted || d.text.toLowerCase() === wanted.toLowerCase());
   if (found === undefined) return "user";
+  if (files !== undefined && matchingUserEntry(files, decisions) !== undefined) return "user";
   if (files !== undefined && found.paths.length > 0 && !touchesAny(files, found.paths)) return "user";
   return found.decide === "project" ? "project" : "user";
 }
@@ -84,6 +96,7 @@ export function decideFor(files: readonly string[] | null | undefined, entry: st
 export function decideForPull(files: readonly string[] | null | undefined, decisions: readonly BigDecision[]): DecideMark {
   if (files === null || files === undefined || files.length === 0) return "user";
   if (isSelfWidening(files)) return "user";
+  if (matchingUserEntry(files, decisions) !== undefined) return "user";
   const match = decisions.find((d) => d.decide === "project" && d.paths.length > 0 && touchesAny(files, d.paths));
   return match === undefined ? "user" : decideForEntry(match.text, decisions, files);
 }
@@ -97,6 +110,8 @@ export function decideForRefusal(files: readonly string[] | null | undefined, en
   if (files === null || files === undefined) return "the changed files could not be read";
   if (files.length === 0) return "the pull request changes no files";
   if (isSelfWidening(files)) return "the change touches the decide list or the code that enforces it";
+  const userEntry = matchingUserEntry(files, decisions);
+  if (userEntry !== undefined) return `the changed files touch ${JSON.stringify(userEntry.text)}, which is the user's decision`;
   const wanted = (entry ?? "").trim();
   if (wanted === "") return "no decide-list entry was given";
   const found = decisions.find((d) => d.text === wanted || d.text.toLowerCase() === wanted.toLowerCase());

@@ -76,7 +76,52 @@ describe("the decide list fails closed", () => {
     expect(decideForRefusal(["bb-plugins/plugins/stewards/store.ts"], "A store migration", decisions)).toBe("the change touches the decide list or the code that enforces it");
     expect(decideForRefusal(["bb-plugins/plugins/linear/store.ts"], "A store migration", decisions)).toBeNull();
     expect(decideForRefusal(["bb-plugins/plugins/linear/wake.ts"], "A store migration", decisions)).toMatch(/do not touch/u);
-    expect(decideForRefusal(["bb-plugins/plugins/linear/source-contract.ts"], null, decisions)).toBe("no decide-list entry was given");
+    // A file that touches no entry still gets the no-entry text; a file that
+    // touches a user entry gets the user-entry text even with no entry named
+    // (BB-125, the user entry is checked before the entry-named checks).
+    expect(decideForRefusal(["bb-plugins/plugins/linear/foo.ts"], null, decisions)).toBe("no decide-list entry was given");
+    expect(decideForRefusal(["bb-plugins/plugins/linear/source-contract.ts"], null, decisions)).toContain("A public API change other teams depend on");
+  });
+});
+
+describe("a user entry wins over a project entry (BB-125)", () => {
+  const overlap: BigDecision[] = [
+    { text: "Identity and access", decide: "user", paths: ["bb-gate/hooks/**"] },
+    { text: "A cross-repo contract", decide: "project", paths: ["bb-gate/docs/hooks.md"] },
+  ];
+
+  it("keeps a files-matching-only-a-project-entry pull request with the project steward", () => {
+    expect(decideForPull(["bb-gate/docs/hooks.md"], overlap)).toBe("project");
+    expect(decideFor(["bb-gate/docs/hooks.md"], "A cross-repo contract", overlap)).toBe("project");
+    expect(decideForRefusal(["bb-gate/docs/hooks.md"], "A cross-repo contract", overlap)).toBeNull();
+  });
+
+  it("makes the pull request the user's when the files also touch a user entry's paths", () => {
+    const files = ["bb-gate/hooks/slack.go", "bb-gate/docs/hooks.md"];
+    expect(decideForPull(files, overlap)).toBe("user");
+    // decideFor with the project entry named still yields the user's, because
+    // the files touch the user entry's paths too.
+    expect(decideFor(files, "A cross-repo contract", overlap)).toBe("user");
+    expect(decideForRefusal(files, "A cross-repo contract", overlap)).toContain("Identity and access");
+  });
+
+  it("places bb-gate#50's file list as the user's", () => {
+    const entries: BigDecision[] = [
+      {
+        text: "Identity and access changes (a credential, a token, cluster access, the bb-gate router, the verifier sidecar, devbox-gate auth, the bb-gate hooks adapter, or Tailscale admission)",
+        decide: "user",
+        paths: ["bb-gate/hooks/**"],
+      },
+      {
+        text: "A cross-repo contract (source-contract.ts and its copies, hooks.md, the devbox connect API, clients.json, the devbox-provider defaults)",
+        decide: "project",
+        paths: ["bb-gate/docs/hooks.md"],
+      },
+    ];
+    // GitHub returns repo-relative filenames; the entries are workspace-relative.
+    const files = ["hooks/slack.go", "hooks/server.go", "docs/hooks.md"];
+    expect(decideForPull(files, entries)).toBe("user");
+    expect(decideForRefusal(files, entries[1].text, entries)).toContain("Identity and access changes");
   });
 });
 
