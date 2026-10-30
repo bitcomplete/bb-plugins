@@ -5,7 +5,7 @@ import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { ESCALATED_NEED_KINDS } from "./store.js";
-import { LINEAR_TICKETS } from "./templates.js";
+import { GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
 import { STANDING_RULES, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
@@ -65,6 +65,30 @@ describe("a steward's wake", () => {
     expect(wake).toContain("--provider claude-code --model claude-opus-5-5 --reasoning-level high");
     expect(wake).toContain("your workers' and reviewers' models");
     expect(wake).toContain("not yours to choose");
+  });
+
+  // BB-134: the plugin ships build-tickets and pr-reviewer, so the ticket and
+  // PR steward wakes name them for the worker task; a review steward's own
+  // playbook does not use them.
+  it("names the worker and reviewer skills for a ticket or PR steward to put in the worker task", () => {
+    const ticket = formatWake(wakeInput());
+    expect(ticket).toContain("follows the `build-tickets` skill");
+    expect(ticket).toContain("spawn its reviewer with the `pr-reviewer` skill");
+    expect(ticket).toContain("`.bb/skills/<name>` copy overrides either");
+
+    const { s } = world();
+    const playbook = (name: string, text: string) => {
+      const parsed = parsePlaybook(text, name);
+      if (!parsed.ok) throw new Error(parsed.error);
+      return parsed.value;
+    };
+    const pr = s.create({ projectId: "p1", source: "github", entityId: "acme/web#7", entityKey: "acme/web#7", url: "https://github.com/acme/web/pull/7", title: "Fix", kind: "pr", playbook: "github-prs", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    const prPlaybook = playbook("github-prs", GITHUB_PRS);
+    expect(formatWake(wakeInput({ binding: pr, playbook: prPlaybook, gate: gateState(prPlaybook, pr.ready, "") }))).toContain("follows the `build-tickets` skill");
+
+    const review = s.create({ projectId: "p1", source: "github", entityId: "acme/web#8", entityKey: "acme/web#8", url: "https://github.com/acme/web/pull/8", title: "Review", kind: "review", playbook: "github-reviews", playbookVersion: "v1", parentBindingId: null, phase: "open", stage: "review" });
+    const reviewPlaybook = playbook("github-reviews", GITHUB_REVIEWS);
+    expect(formatWake(wakeInput({ binding: review, playbook: reviewPlaybook, gate: gateState(reviewPlaybook, review.ready, "") }))).not.toContain("follows the `build-tickets` skill");
   });
 
   // BB-55: the Todo wake must say that an unjudged substantiality is settled

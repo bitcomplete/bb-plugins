@@ -4825,7 +4825,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * is the thread that posted build-tickets' "Independent review running"
      * comment, or the newest worker still in flight. When it has ended and
      * cannot be reached, the ticket steward is woken with the decision under
-     * "What changed" and starts a fresh worker at section 4c.
+     * "What changed" and starts a fresh worker at the build-tickets merge step.
      */
     async function deliverProjectApproval(b: Binding, entity: EntitySnapshot, decision: { verdict: "approved" | "declined"; sha: string; entry: string | null; reasoning: string }): Promise<"worker" | "steward"> {
       const signed = reviewWorkerThread(entity.comments);
@@ -4833,14 +4833,14 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const info = thread === null ? null : await threadInfo(thread).catch(() => null);
       const label = decision.verdict === "approved" ? "approved" : "declined";
       const entry = decision.entry === null ? "" : ` (entry ${JSON.stringify(decision.entry)})`;
-      const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets section 4c), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
+      const next = decision.verdict === "approved" ? "the lane gate is met: merge it now (build-tickets, The merge gate), do not wait for the owner" : "the lane gate is not met: treat this as a change request and address it";
       if (info !== null && info.deletedAt === null && info.archivedAt === null) {
         if ((await sendTo(thread!, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning}\n\n${next}.`)) === "sent") {
           store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}; its worker was told.`, true);
           return "worker";
         }
       }
-      store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning} Start a worker at build-tickets section 4c ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
+      store.note(b.id, `The project steward ${label} ${entity.key}${entry} at ${shortSha(decision.sha)}: ${decision.reasoning} Start a worker at build-tickets, The merge gate, ${decision.verdict === "approved" ? "to merge it" : "to address the change request"}.`, false);
       scheduleReconcile(b.id);
       return "steward";
     }
@@ -5820,15 +5820,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      * it is unmet or a worker is in flight, squash-merge, post the "Merged:"
      * comment, and close the binding's Merge need. The caller reads the pull
      * request fresh and passes it in; `where` names the surface in the need's
-     * closure.
+     * closure. `exceptThreadId` is the worker that is doing the merging: it is
+     * not "another worker in flight", so a worker may merge its own pull
+     * request through the CLI (BB-134). The page passes none, so its Merge
+     * item still refuses while any worker is in flight.
      */
-    async function mergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, where: string): Promise<{ ok: true; summary: string; mergeSha: string | null } | { ok: false; message: string }> {
+    async function mergePullRequest(b: Binding, ref: { repo: string; number: number }, pull: EntitySnapshot, where: string, opts: { exceptThreadId?: string } = {}): Promise<{ ok: true; summary: string; mergeSha: string | null } | { ok: false; message: string }> {
       // The same `prGate` with the project's approvals the page's Merge item
       // and the wake use, so the page, `bb stewards gate` and `bb stewards
       // merge` cannot disagree.
       const gate = prGate(pull, { projectApprovals: projectApprovalsFor(b) });
       if (!gate.gateMet) return { ok: false, message: `The gate is not met: ${gate.missing ?? "the pull request could not be read"}.` };
-      if (anyWorkerInFlight(store.workers(b.id))) return { ok: false, message: "A worker is still running on this pull request." };
+      if (anyWorkerInFlight(store.workers(b.id).filter((w) => w.threadId !== opts.exceptThreadId))) return { ok: false, message: "A worker is still running on this pull request." };
       const summary = mergeSummary(gate);
       const since = sinceApproval(gate);
       const restart = await restartNoteFor(b.projectId, ref.repo);
@@ -8301,7 +8304,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
 
           merge: cliCommand({
             summary: "Merge a pull request whose lane gate is met, through the same path as the Stewards page",
-            description: "Re-reads the pull request, re-checks the gate with the project's approvals, and refuses with the gate's reason when it is unmet or a worker is in flight. Otherwise squash-merges, posts the \"Merged:\" comment, and closes the binding's Merge item. Exit 1 on a refusal.",
+            description: "Re-reads the pull request, re-checks the gate with the project's approvals, and refuses with the gate's reason when it is unmet or another worker is in flight. Otherwise squash-merges, posts the \"Merged:\" comment, and closes the binding's Merge item. Exit 1 on a refusal.",
             positionals: [{ name: "ref", description: "The pull request, owner/repo#N", required: true }],
             options: { project: PROJECT_OPTION },
             async run(input, ctx) {
@@ -8311,7 +8314,7 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
               if (b === null) throw new PluginCliError(`No binding watches ${ref.repo}#${ref.number}; pass --project or run from the thread that owns it.`, { code: "binding_not_found" });
               const pull = await readPullRef(ref);
               if (pull === null) throw new PluginCliError(`Could not read ${ref.repo}#${ref.number} from GitHub.`, { code: "pull_unreadable" });
-              const result = await mergePullRequest(b, ref, pull, "with bb stewards merge");
+              const result = await mergePullRequest(b, ref, pull, "with bb stewards merge", { exceptThreadId: ctx.threadId });
               if (!result.ok) return { exitCode: 1, stdout: result.message };
               // The same record the page leaves, so the binding's steward is woken.
               const fresh = store.binding(b.id);

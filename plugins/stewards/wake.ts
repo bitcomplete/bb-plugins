@@ -70,6 +70,14 @@ export function spawnCommand(input: { projectId: string; entityKey: string; work
 }
 
 const DESCRIPTION_CHARS = 4000;
+
+/**
+ * The worker and reviewer skill names a ticket or PR steward puts in its
+ * worker's task (BB-134). The plugin ships both as plugin skills; a
+ * `.bb/skills/<name>` copy with the same name overrides the plugin's.
+ */
+const WORKER_SKILLS =
+  "Write the worker's task so it follows the `build-tickets` skill, which tells the worker to spawn its reviewer with the `pr-reviewer` skill; a `.bb/skills/<name>` copy overrides either.";
 const COMMENT_CHARS = 1500;
 const RESULT_CHARS = 1500;
 
@@ -440,6 +448,7 @@ export function formatWake(input: WakeInput): string {
     ...spawnCommand({ projectId: binding.projectId, entityKey: e.key, workerFlags: input.workerFlags })
       .split("\n")
       .map((line) => `    ${line}`),
+    ...(binding.kind === "ticket" || binding.kind === "pr" ? ["", WORKER_SKILLS] : []),
     "",
     "Follow it up with `bb thread tell <id> <message>`. A worker finishing starts no turn of yours: its final message arrives in your next wake, which lists it under Workers. Once that report has been consumed the worker's thread is archived, and `bb thread tell` refuses an archived thread: bring it back with `bb thread unarchive <id>` first, or start a fresh worker.",
     "Those `--provider`/`--model`/`--reasoning-level` flags are your workers' and reviewers' models, from the playbook or the project. They are not yours to choose: never ask the user for a model.",
@@ -567,6 +576,7 @@ export function formatBrief(input: BriefInput, maxChars?: number): string {
   if (!ops) {
     if (input.workerFlags === null) head.push("", "Run `bb stewards spawn-flags` for the exact worker spawn command: the project's machine has not been read on this server yet.");
     else head.push("", "Start a worker with:", "", spawnCommand({ projectId: b.projectId, entityKey: b.entityKey, workerFlags: input.workerFlags }));
+    if (b.kind === "ticket" || b.kind === "pr") head.push("", WORKER_SKILLS);
   }
 
   const middle: string[] = [];

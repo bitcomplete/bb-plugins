@@ -4872,7 +4872,7 @@ describe("needs you items", () => {
     const wakes = t.sends.filter((s) => s.threadId === t.steward);
     expect(wakes.length).toBeGreaterThan(before);
     expect(wakes.at(-1)!.text).toMatch(/The project steward approved acme\/web#7/u);
-    expect(wakes.at(-1)!.text).toMatch(/section 4c/u);
+    expect(wakes.at(-1)!.text).toMatch(/build-tickets, The merge gate/u);
   });
 
   it("posts a declined marker and tells the worker to treat it as a change request (BB-77)", async () => {
@@ -9249,6 +9249,14 @@ describe("the reviewer role and the gate and merge commands (BB-133)", () => {
     expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
     await t.flush();
     expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/merged with bb stewards merge/u);
+  });
+
+  it("lets the owning worker merge through the CLI while it is still in flight (BB-134)", async () => {
+    const t = await withPull([reviewMarker("no-review")]);
+    await t.created("thr_w1", t.steward, "ENG-12: Implement");
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"], { threadId: "thr_w1", projectId: "p1" });
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
   });
 
   it("names the approved sha and the since-then line when the head moved past it", async () => {
