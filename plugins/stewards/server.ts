@@ -2960,7 +2960,10 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
      */
     async function dedupFingerprints(team: string | null, fingerprints: string[]): Promise<Map<string, string> | null> {
       const adopted = new Map<string, string>();
-      if (team === null || fingerprints.length === 0) return adopted;
+      if (fingerprints.length === 0) return adopted;
+      // No team to search is not "nothing found": dedup did not run, so the
+      // caller marks the new findings unavailable rather than risk a duplicate.
+      if (team === null) return null;
       for (const fingerprint of fingerprints) {
         let out: z.infer<typeof sourceContract.sourceSearchIssues.output>;
         try {
@@ -2970,9 +2973,11 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           return null;
         }
         if (out.unsupported || out.errors.length > 0) return null;
-        for (const issue of out.issues) {
-          if (hasFingerprintLine(issue.description, fingerprint)) adopted.set(fingerprint, issue.key);
-        }
+        const matches = out.issues.filter((issue) => hasFingerprintLine(issue.description, fingerprint));
+        // A duplicate line is meant to be impossible, but if two tickets carry
+        // it, prefer one that can still be commented on over one already resolved.
+        const open = matches.find((issue) => issue.stateType !== "completed" && issue.stateType !== "canceled");
+        if (matches.length > 0) adopted.set(fingerprint, (open ?? matches[0]!).key);
       }
       return adopted;
     }

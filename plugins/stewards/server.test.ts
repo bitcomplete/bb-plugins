@@ -6294,6 +6294,14 @@ describe("ops stewards", () => {
     expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: null });
   });
 
+  it("prefers an open ticket when two carry the same exact fingerprint line", async () => {
+    const closed = issue({ id: "ENG-80", key: "ENG-80", title: "Old", state: "Done", stateType: "completed", description: `Fingerprint: \`${FP}\`` });
+    const open = issue({ id: "ENG-81", key: "ENG-81", title: "Current", state: "In Progress", stateType: "started", description: `Fingerprint: \`${FP}\`` });
+    const { t, wakes } = await watched({ entities: [["ENG-80", closed], ["ENG-81", open]] });
+    expect(wakes()[0]).toMatch(/Recurring on ENG-81 \(open\)/u);
+    expect(t.hooks.store.fingerprint("p1", FP)).toMatchObject({ ticketKey: "ENG-81" });
+  });
+
   it("marks the finding dedup unavailable and tells the steward to search itself when the search fails", async () => {
     const { t, wakes } = await watched({ searchError: "Linear rate limited the read" });
     const first = wakes()[0]!;
