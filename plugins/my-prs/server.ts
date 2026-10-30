@@ -178,9 +178,22 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       const project = await bb.sdk.projects.get({ projectId });
       const source = project.sources.find((source) => source.isDefault) ?? (project.sources.length === 1 ? project.sources[0] : undefined);
       if (source === undefined) throw new Error("Choose a default project checkout in BB before addressing feedback.");
-      const environment: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"] = {
+      let environment: Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"] = {
         type: "host", hostId: source.hostId, workspace: { type: "unmanaged", path: source.path },
       };
+      const { plugins } = await bb.sdk.plugins.list();
+      if (plugins.some((plugin) => plugin.id === "multi-repo" && plugin.enabled)) {
+        const repoSet = await bb.sdk.plugins.callRpc({
+          pluginId: "multi-repo", method: "repoSet", input: { projectId },
+          outputSchema: z.object({ reposJson: z.string().nullable(), error: z.string().nullable() }),
+          signal: lifecycle.signal,
+        });
+        if (repoSet.error !== null) throw new Error(`Could not read the project's repo set: ${repoSet.error}`);
+        if (repoSet.reposJson !== null) environment = {
+          type: "provider", environmentProviderId: "multi-repo-workspace", inputs: null,
+          machine: { type: "existing", hostId: source.hostId },
+        };
+      }
       const client = githubClient();
       const allowed = configuration.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean);
       const refreshed: (PullRequest | null)[] = [];

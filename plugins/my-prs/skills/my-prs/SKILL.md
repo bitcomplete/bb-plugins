@@ -20,8 +20,9 @@ approval notes need a reply. Drafts count. Workstreams is not required.
 - `address <id>...` starts one thread for 1–20 distinct PRs. It refreshes and
   checks that each still needs your response. Organization mappings choose the
   project, falling back to the default; mixed destinations require an explicit
-  project through the page's picker. Threads use that project's default checkout
-  and enrolled machine. Use only when the user asks to
+  project through the page's picker. Threads use that project's default machine.
+  A configured repo set selects a fresh Multi-repo workspace; other projects use
+  their default checkout. A repo-set read failure stops dispatch. Use only when the user asks to
   address that feedback. The thread may edit, push code, and reply on GitHub.
   Its prompt forbids merging, approving, closing PRs, and automatic resolution.
 - `clear <id>` permits another attempt after its thread is idle or failed.
