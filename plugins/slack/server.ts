@@ -486,9 +486,10 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
 
     /**
      * A lease the service refused. `owned` means another server's connection
-     * holds the session; the owner gets one backstop reply so they know. Any
-     * other reason (a capability that did not verify) is logged and retried.
-     * The capability itself is never named.
+     * holds the session; the owner gets one best-effort backstop reply (the
+     * other server's live lease makes the service refuse it, so the log line
+     * is the reliable half). Any other reason (a capability that did not
+     * verify) is logged and retried. The capability itself is never named.
      */
     function onLeaseRejected(rejections: Rejection[]): void {
       for (const rejection of rejections) {
