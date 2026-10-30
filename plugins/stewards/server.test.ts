@@ -8987,3 +8987,152 @@ describe("strict owner dispatch (BB-115)", () => {
     expect((await problemsOf(t)).some((p) => p.includes("GitHub login cannot be read"))).toBe(true);
   });
 });
+
+describe("the reviewer role and the gate and merge commands (BB-133)", () => {
+  const head = "aaaaaaa1";
+  const reviewMarker = (lane: string, id = "m1") => comment({ id, author: "trotterdylan", body: `<!-- bb-review round=1 sha=${head} verdict=approved lane=${lane} -->`, signedBy: "thr_reviewer", createdAt: "2026-10-14T16:00:00Z" });
+
+  /** A bound ticket with one linked pull request, observed. */
+  async function withPull(comments: ReturnType<typeof comment>[], over: { repo?: string; number?: number; pullOver?: Record<string, unknown>; entityOver?: Record<string, unknown>; files?: string[] } = {}) {
+    const repo = over.repo ?? "acme/web";
+    const number = over.number ?? 7;
+    const key = `${repo}#${number}`;
+    const t = await setup();
+    t.entities.set("uuid-12", issue({ linkedPulls: [{ key, url: `https://github.com/${repo}/pull/${number}` }] }));
+    t.entities.set(key, pull({ id: key, key, url: `https://github.com/${repo}/pull/${number}`, unit: repo, comments, ...over.entityOver }, { checks: { state: "success", failing: [] }, ...over.pullOver }));
+    if (over.files !== undefined) t.githubFiles.set(key, over.files);
+    await t.ring("linear", "uuid-12");
+    const [project, steward] = t.spawns.map((x) => x.id) as [string, string];
+    return { ...t, project, steward, key, binding: () => t.hooks.store.find("ENG-12")! };
+  }
+
+  it("prints the reviewer spawn command from models.reviewer, and errors clearly with none", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    await t.ring("linear", "uuid-12");
+
+    // No reviewer model: a clear refusal, not a guess.
+    const missing = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer", "ENG-12", "--project", "p1"]);
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stderr).toMatch(/No reviewer model/u);
+
+    // The worker default is unchanged.
+    const worker = await t.harness.behavior.runCli(["spawn-flags", "ENG-12", "--project", "p1"]);
+    expect(worker.stdout).toContain("--model claude-opus-5-5");
+    expect(worker.stdout).not.toContain("--visibility hidden");
+    expect(worker.stdout).not.toContain("--permission-mode");
+
+    // A playbook reviewer model, then a binding override, both read back.
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("  worker: claude/claude-opus-5-5/high", "  worker: claude/claude-opus-5-5/high\n  reviewer: pi/fireworks/accounts/fireworks/models/glm-5p3");
+    t.hooks.forgetConfigs();
+    const reviewer = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer", "ENG-12", "--project", "p1"]);
+    expect(reviewer.exitCode).toBe(0);
+    expect(reviewer.stdout).toContain("--visibility hidden --permission-mode full");
+    expect(reviewer.stdout).toContain("--provider pi --model fireworks/accounts/fireworks/models/glm-5p3");
+    expect(reviewer.stdout).toContain('--title "Review ENG-12: <task>"');
+
+    const update = await t.tool("steward_update", { binding: "ENG-12", reviewerModel: "pi/fireworks/accounts/fireworks/models/other-reviewer" }, t.spawns[0]!.id);
+    expect(update.error, update.text).toBe(false);
+    expect(t.hooks.store.find("ENG-12")!.modelReviewer).toBe("pi/fireworks/accounts/fireworks/models/other-reviewer");
+    const overridden = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer", "ENG-12", "--project", "p1"]);
+    expect(overridden.stdout).toContain("--model fireworks/accounts/fireworks/models/other-reviewer");
+  });
+
+  it("resolves spawn-flags --role reviewer from the invoking worker thread", async () => {
+    const t = await setup();
+    t.entities.set("uuid-12", issue());
+    t.files[playbookPath("linear-tickets")] = LINEAR_TICKETS.replace("  worker: claude/claude-opus-5-5/high", "  worker: claude/claude-opus-5-5/high\n  reviewer: pi/fireworks/accounts/fireworks/models/glm-5p3");
+    t.hooks.forgetConfigs();
+    await t.ring("linear", "uuid-12");
+    const steward = t.spawns[1]!.id;
+    await t.created("thr_w1", steward, "ENG-12: Implement");
+    const out = await t.harness.behavior.runCli(["spawn-flags", "--role", "reviewer"], { threadId: "thr_w1", projectId: "p1" });
+    expect(out.exitCode).toBe(0);
+    expect(out.stdout).toContain('--title "Review ENG-12: <task>"');
+    expect(out.stdout).toContain("--visibility hidden --permission-mode full");
+  });
+
+  it("prints the gate verdict and exits 0 when met, 1 when not, with --json", async () => {
+    const unmet = await withPull([]);
+    const notMet = await unmet.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1"]);
+    expect(notMet.exitCode).toBe(1);
+    expect(notMet.stdout).toMatch(/lane \(none\)/u);
+    expect(notMet.stdout).toMatch(/reviewer: none/u);
+    expect(notMet.stdout).toMatch(/gate met: no — no reviewer round yet/u);
+
+    const met = await withPull([reviewMarker("no-review")]);
+    const metOut = await met.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1"]);
+    expect(metOut.exitCode).toBe(0);
+    expect(metOut.stdout).toMatch(/lane no-review/u);
+    expect(metOut.stdout).toMatch(/reviewer: round 1 at aaaaaaa \(approved\)/u);
+    expect(metOut.stdout).toMatch(/gate met: yes/u);
+    const json = JSON.parse((await met.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { ref: string; binding: string; lane: string; marker: unknown; decision: unknown; approval: unknown; checks: unknown; gateMet: boolean };
+    expect(json).toMatchObject({ ref: "acme/web#7", binding: "ENG-12", lane: "no-review", checks: { state: "success", green: true }, gateMet: true, decision: { decide: "user" } });
+    expect(json.marker).toMatchObject({ round: 1, sha: head, verdict: "approved" });
+    expect(json.approval).toBeNull();
+  });
+
+  it("names the matched decide-list entry and who decides", async () => {
+    const t = await withPull([reviewMarker("owner-reviewed")], { files: ["bb-gate/docs/hooks.md"] });
+    const json = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { decision: { entry: string | null; decide: string }; gateMet: boolean };
+    expect(json.decision).toEqual({ entry: "A cross-repo contract other repos implement", decide: "project", why: null });
+    // The project steward's approval is still needed, so the gate is not met.
+    expect(json.gateMet).toBe(false);
+  });
+
+  it("reports an owner review with its sha, and the project steward's marker with its sha", async () => {
+    const t = await withPull([reviewMarker("owner-reviewed")], { pullOver: { reviews: [{ author: "jane", state: "approved", submittedAt: "2026-10-14T17:00:00Z", commit: head }] } });
+    const owner = JSON.parse((await t.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { approval: unknown; gateMet: boolean };
+    expect(owner.approval).toEqual({ kind: "owner-review", sha: head, at: "2026-10-14T17:00:00Z" });
+    expect(owner.gateMet).toBe(true);
+
+    // The project steward records the approval under the matching entry; the
+    // marker it posts is what the next fresh read sees.
+    const t2 = await withPull([reviewMarker("owner-reviewed")], { files: ["bb-gate/docs/hooks.md"] });
+    const update = await t2.tool("steward_update", { binding: "ENG-12", approve: true, entry: "A cross-repo contract other repos implement" }, t2.project);
+    expect(update.error).toBe(false);
+    const markerBody = t2.githubComments.at(-1)!.body.split("\n")[0]!;
+    t2.entities.set("acme/web#7", pull({ comments: [reviewMarker("owner-reviewed"), comment({ id: "IC_1", author: "jane", body: markerBody, signedBy: t2.project, createdAt: "2026-10-14T18:00:00Z" })] }, { checks: { state: "success", failing: [] } }));
+    const project = JSON.parse((await t2.harness.behavior.runCli(["gate", "acme/web#7", "--project", "p1", "--json"])).stdout) as { approval: unknown; decision: { decide: string }; gateMet: boolean };
+    expect(project.approval).toEqual({ kind: "project-marker", sha: head, at: "2026-10-14T18:00:00Z" });
+    expect(project.decision.decide).toBe("project");
+    expect(project.gateMet).toBe(true);
+  });
+
+  it("merges through the shared path, posting the Merged comment and closing the Merge item, and refuses when unmet or a worker is in flight", async () => {
+    const unmet = await withPull([]);
+    const refused = await unmet.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stdout).toMatch(/The gate is not met: no reviewer round yet/u);
+    expect(unmet.githubMerges).toEqual([]);
+
+    const busy = await withPull([reviewMarker("no-review")]);
+    await busy.created("thr_w1", busy.steward, "ENG-12: Implement");
+    const running = await busy.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(running.exitCode).toBe(1);
+    expect(running.stdout).toMatch(/A worker is still running on this pull request/u);
+    expect(busy.githubMerges).toEqual([]);
+
+    const t = await withPull([reviewMarker("no-review")]);
+    const b = t.binding();
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(true);
+    const merged = await t.harness.behavior.runCli(["merge", "acme/web#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(merged.stdout).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
+    expect(t.githubMerges).toEqual([{ repo: "acme/web", number: 7, title: "Merge acme/web#7", body: "Merged: no-review lane, reviewer approved aaaaaaa, checks green." }]);
+    const comment = t.githubComments.at(-1)!;
+    expect(comment.body).toMatch(/Merged: no-review lane, reviewer approved aaaaaaa, checks green/u);
+    expect(comment.body).toMatch(/merge commit cccccccccccccccccccccccccccccccccccccccc/u);
+    expect(t.hooks.store.openNeeds(b.id).some((n) => n.kind === "merge")).toBe(false);
+    await t.flush();
+    expect(t.sends.filter((s) => s.threadId === t.steward).at(-1)!.text).toMatch(/merged with bb stewards merge/u);
+  });
+
+  it("carries the restart note when the project's guidance says a merge to that repo restarts servers", async () => {
+    const t = await withPull([reviewMarker("no-review")], { repo: "bitcomplete/bb-plugins" });
+    t.files["AGENTS.md"] = "## Shipping a plugin change\n\nLanding on `bb-plugins` main is not instant: a new image is built, and every developer's server will restart when they press Restart now.\n";
+    const merged = await t.harness.behavior.runCli(["merge", "bitcomplete/bb-plugins#7", "--project", "p1"]);
+    expect(merged.exitCode).toBe(0);
+    expect(t.githubComments.at(-1)!.body).toMatch(/moves the pin and stages a restart/u);
+  });
+});

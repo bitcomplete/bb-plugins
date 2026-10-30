@@ -419,6 +419,12 @@ export const VALIDATION_MIGRATIONS = [
 // before this step has no pull request and behaves as before.
 export const LESSON_PR_MIGRATIONS = [`ALTER TABLE lessons ADD COLUMN pr TEXT`, `ALTER TABLE lessons ADD COLUMN retire_pr TEXT`];
 
+// BB-133: a binding-level reviewer model, overriding the playbook's
+// `models.reviewer` for the reviewer threads a worker starts. Additive and
+// defaulted: a binding from before this step has no override and reads the
+// playbook's reviewer model, exactly as a worker model override does.
+export const REVIEWER_MODEL_MIGRATIONS = [`ALTER TABLE bindings ADD COLUMN model_reviewer TEXT`];
+
 // BB-35 step 6: the hand-written guidance's meter. One row per (project, unit,
 // binding): the distinct-binding count is the number of rows, and the newest
 // `last_cited_at` is when it was last cited. The unit's file and text are kept
@@ -475,7 +481,7 @@ export const ACTOR_MIGRATIONS = [
     WHERE CASE WHEN json_valid(status) THEN json_extract(status, '$.actor') END = 'me'`,
 ];
 
-export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS];
+export const MIGRATIONS = [...BASE_MIGRATIONS, ...CHAIN_MIGRATIONS, ...LESSON_COUNTER_MIGRATIONS, ...WORKER_CHECK_MIGRATIONS, ...DECLINED_PR_MIGRATIONS, ...DEPLOYMENT_MIGRATIONS, ...FINISHED_AND_DIGEST_MIGRATIONS, ...LESSON_TIER_MIGRATIONS, ...RATIONALE_MIGRATIONS, ...VALIDATION_MIGRATIONS, ...GUIDANCE_MIGRATIONS, ...IDLE_MIGRATIONS, ...APPROVAL_MARKER_MIGRATIONS, ...ACTOR_MIGRATIONS, ...LESSON_PR_MIGRATIONS, ...REVIEWER_MODEL_MIGRATIONS];
 
 // ---- values kept as JSON ------------------------------------------------------------
 
@@ -605,6 +611,8 @@ export type Binding = {
   clearedToStart: boolean;
   modelSteward: string | null;
   modelWorker: string | null;
+  /** A binding-level reviewer model override, or null to use the playbook's. */
+  modelReviewer: string | null;
   status: StatusRecord | null;
   statusAt: number | null;
   /** When the status record last moved: a new phase, summary or next action. */
@@ -687,6 +695,7 @@ function rowToBinding(r: BindingRow): Binding {
     clearedToStart: Number(r.cleared_to_start ?? 0) === 1,
     modelSteward: str("model_steward"),
     modelWorker: str("model_worker"),
+    modelReviewer: str("model_reviewer"),
     status: json(storedStatusRecordSchema.nullable(), str("status"), null),
     statusAt: num("status_at"),
     advancedAt: num("advanced_at"),
@@ -743,6 +752,7 @@ const COLUMNS = {
   clearedToStart: "cleared_to_start",
   modelSteward: "model_steward",
   modelWorker: "model_worker",
+  modelReviewer: "model_reviewer",
   status: "status",
   statusAt: "status_at",
   advancedAt: "advanced_at",

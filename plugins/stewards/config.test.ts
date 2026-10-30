@@ -180,6 +180,21 @@ describe("playbooks", () => {
     }
   });
 
+  it("takes a reviewer model with the same syntax, and keeps the models map strict (BB-133)", () => {
+    const withReviewer = LINEAR_TICKETS.replace(
+      "models:\n  steward: claude/claude-sonnet-5-5/medium\n  worker: claude/claude-opus-5-5/high",
+      "models:\n  steward: claude/claude-sonnet-5-5/medium\n  worker: claude/claude-opus-5-5/high\n  reviewer: pi/fireworks/accounts/fireworks/models/glm-5p3",
+    );
+    const parsed = parsePlaybook(withReviewer, "linear-tickets");
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.models.reviewer).toMatchObject({ providerId: "pi", model: "fireworks/accounts/fireworks/models/glm-5p3", reasoningLevel: null });
+    const plain = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
+    if (!plain.ok) throw new Error(plain.error);
+    expect(plain.value.models.reviewer).toBeNull();
+    // The map is still strict: a misspelled key is refused.
+    expect(parsePlaybook(LINEAR_TICKETS.replace("models:\n", "models:\n  reviewers: claude/opus\n"), "linear-tickets")).toMatchObject({ ok: false });
+  });
+
   it("tells the default playbooks to raise credentials as a secret escalation and to escalate build-time blockers", () => {
     const linear = parsePlaybook(LINEAR_TICKETS, "linear-tickets");
     if (!linear.ok) throw new Error(linear.error);

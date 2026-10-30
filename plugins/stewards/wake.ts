@@ -51,10 +51,19 @@ export const STANDING_RULES = [
 export const BRIEF_PREFIX =
   "Your context may have been compacted, and this turn may not be a wake (a plain message, a `bb thread tell`, a child notice). Run `bb stewards brief` before acting: it prints your thread id, allowed actions, phase instructions, ready gate, guidance and holds, the standing rules and the exact worker spawn command.";
 
-/** The worker spawn command, shared by the wake, `bb stewards spawn-flags` and the brief. */
-export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string }): string {
+/**
+ * The spawn command, shared by the wake, `bb stewards spawn-flags` and the
+ * brief. A worker is the default and its output is unchanged; a reviewer
+ * (BB-133) is hidden, runs with full permissions (Pi accepts only `full`) and
+ * is started from the worker thread it reviews for, so `--parent-self` makes
+ * it that worker's child and the lifecycle owner stays the worker.
+ */
+export function spawnCommand(input: { projectId: string; entityKey: string; workerFlags: string; role?: "worker" | "reviewer" }): string {
+  const reviewer = input.role === "reviewer";
+  const extra = reviewer ? " --visibility hidden --permission-mode full" : "";
+  const title = reviewer ? `Review ${input.entityKey}: <task>` : `${input.entityKey}: <task>`;
   return [
-    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${input.entityKey}: <task>" --prompt-file - <<'EOF'`,
+    `bb thread spawn --project ${input.projectId} --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID"${extra}${input.workerFlags === "" ? "" : ` ${input.workerFlags}`} --title "${title}" --prompt-file - <<'EOF'`,
     "<the whole task>",
     "EOF",
   ].join("\n");

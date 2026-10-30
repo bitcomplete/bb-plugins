@@ -708,7 +708,7 @@ export const frontMatterSchema = z
     promote: z.string().trim().max(1000).optional(),
     /** What the steward may do on the entity. Policy the wake states, not a wall. */
     may: z.array(z.string().trim().min(1).max(60)).default([]),
-    models: z.object({ steward: modelSpecSchema.optional(), worker: modelSpecSchema.optional() }).strict().default({}),
+    models: z.object({ steward: modelSpecSchema.optional(), worker: modelSpecSchema.optional(), reviewer: modelSpecSchema.optional() }).strict().default({}),
     "requeue-default": durationSchema.default(2 * 86_400_000),
     /**
      * How long a binding in a build or review stage may sit with nothing to
@@ -734,7 +734,7 @@ export type Playbook = {
   ready: ReadyConfig | null;
   promote: string | null;
   may: string[];
-  models: { steward: ModelSpec | null; worker: ModelSpec | null };
+  models: { steward: ModelSpec | null; worker: ModelSpec | null; reviewer: ModelSpec | null };
   requeueDefaultMs: number;
   /** How long a binding may sit idle in an active stage before its steward is woken (BB-83). */
   idleGraceMs: number;
@@ -806,7 +806,7 @@ export function parsePlaybook(text: string, expectedName: string): Parsed<Playbo
       ready: fm.ready ?? null,
       promote: fm.promote ?? null,
       may: fm.may,
-      models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null },
+      models: { steward: fm.models.steward ?? null, worker: fm.models.worker ?? null, reviewer: fm.models.reviewer ?? null },
       requeueDefaultMs: fm["requeue-default"],
       idleGraceMs: fm["idle-grace"],
       followThroughMs: fm["follow-through"],
