@@ -20,8 +20,9 @@ Started PRs keep their thread links after the feedback clears.
 ## Requirements
 
 Use the BB server's authenticated GitHub CLI or configure a secret GitHub token.
-Choose a BB project whose default environment has the repository checkouts for
-Address threads. Optional provider and model settings override that project's
+Choose a BB project for Address threads. Projects with a repo set provision a
+fresh Multi-repo workspace on their default machine; other projects use their
+default checkout. Optional provider and model settings override that project's
 defaults. Agent work uses the configured provider account.
 
 My PRs runs independently of Workstreams. Review Watch is its companion for

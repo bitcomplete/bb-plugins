@@ -9,7 +9,9 @@ const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0)) await dispose(); });
 async function setup(settings: Record<string, unknown> = {}) {
   const data = [fixture(), fixture(2)]; let fail = false;
-  const host = createFakePluginHost({ pluginId: "my-prs", settings: { project: "project-test", ...settings }, sdk: { threads: {
+  const host = createFakePluginHost({ pluginId: "my-prs", settings: { project: "project-test", ...settings }, sdk: { plugins: {
+    list: async () => ({ plugins: [] }),
+  }, threads: {
     spawn: async () => makeThreadResponse({ id: "thread-address" }),
     get: async () => makeThreadResponse({ id: "thread-address", status: "idle" }),
   } } });
@@ -154,6 +156,45 @@ it("targets the selected project and its remote machine when addressing feedback
   expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
     projectId: "project-parsley", environment: { type: "host", hostId: "parsley-host", workspace: { type: "unmanaged", path: "/home/dev/parsley" } },
   });
+});
+
+it("provisions a multi-repo workspace on the selected project's machine", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  env.harness.inspection.sdk.stub("plugins.list", async () => ({ plugins: [{ id: "multi-repo", enabled: true }] }));
+  env.harness.inspection.sdk.stub("plugins.callRpc", async () => ({ reposJson: '{"version":1,"repos":[]}', error: null }));
+  await env.rpc("address", { items: [selection], projectId: "project-parsley" });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+    projectId: "project-parsley",
+    environment: {
+      type: "provider", environmentProviderId: "multi-repo-workspace", inputs: null,
+      machine: { type: "existing", hostId: "parsley-host" },
+    },
+  });
+  expect(env.harness.inspection.sdk.callsTo("plugins.callRpc")[0]?.[0]).toMatchObject({
+    pluginId: "multi-repo", method: "repoSet", input: { projectId: "project-parsley" },
+  });
+});
+
+it("keeps a native checkout when the multi-repo plugin has no repo set for the project", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  env.harness.inspection.sdk.stub("plugins.list", async () => ({ plugins: [{ id: "multi-repo", enabled: true }] }));
+  env.harness.inspection.sdk.stub("plugins.callRpc", async () => ({ reposJson: null, error: null }));
+  await env.rpc("address", { items: [selection] });
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+    environment: { type: "host", hostId: "devbox-host", workspace: { type: "unmanaged", path: "/project-checkout" } },
+  });
+});
+
+it("does not dispatch into a native checkout when reading the multi-repo configuration fails", async () => {
+  const env = await setup(); const selection = await firstSelection(env);
+  env.harness.inspection.sdk.stub("plugins.list", async () => ({ plugins: [{ id: "multi-repo", enabled: true }] }));
+  env.harness.inspection.sdk.stub("plugins.callRpc", async () => ({ reposJson: null, error: "Invalid repos.json" }));
+  await expect(env.rpc("address", { items: [selection] })).rejects.toThrow("Invalid repos.json");
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+  expect((await env.view()).rows.every((row) => row.dispatch.kind === "none")).toBe(true);
+  env.harness.inspection.sdk.stub("plugins.callRpc", async () => { throw new Error("Project machine disconnected"); });
+  await expect(env.rpc("address", { items: [selection] })).rejects.toThrow("Project machine disconnected");
+  expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
 });
 
 it("preselects the organization mapping and uses it for CLI-style starts", async () => {

@@ -54,7 +54,10 @@ Choose one PR's **Address**, or select several rows and choose **Address N**.
 Checkboxes select individual PRs, with one select-all control at the top.
 Organization and area headings are labels and counts. Shift-click selects a range. Press **b** to
 address the selection or **Esc** to clear it. Address opens a project picker, then starts one thread on the chosen project's
-default checkout and machine. Organization mappings preselect the project; the
+default machine. Projects with a configured repo set get a fresh **Multi-repo
+workspace**, which provisions their repository checkouts. Other projects use
+their default checkout. Repo-set read failures stop dispatch and display the
+error. Organization mappings preselect the project; the
 configured default is a fallback. Override it for an individual PR or batch.
 A batch spanning different mapped projects requires a choice. The thread finds checkouts, fixes code,
 runs checks, pushes the changes, and replies to review comments. It includes bot comments
