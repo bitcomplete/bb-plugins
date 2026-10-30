@@ -55,6 +55,8 @@ const POLL_MS = 30_000;
 const REFETCH_DEBOUNCE_MS = 300;
 /** How long the sidebar's Open PR handoff waits for the detail page before opening externally (BB-102). */
 const OPEN_PR_HANDOFF_MS = 500;
+/** How long a project switch keeps the previous list dimmed before the skeleton (BB-127). */
+const STALE_LIST_MS = 150;
 
 /** Stable empties, so a memoised row's props keep their identity (BB-95). */
 const EMPTY_NEEDS: readonly SidebarNeedItem[] = [];
@@ -1987,6 +1989,32 @@ function revealSections(tabs: readonly SidebarTab[], activeThreadId: string | nu
 }
 
 /**
+ * The list body while the RPC has no data for the project on screen (BB-127):
+ * a section header line and a few row placeholders in the shape of the real
+ * sections, in muted `bg-state-hover` tones with a gentle pulse. No spinner and
+ * no visible "Loading…" text; `motion-safe:` respects `prefers-reduced-motion`,
+ * and the `sr-only` status keeps the pending state perceivable to a screen
+ * reader.
+ */
+function SidebarSkeleton() {
+  return (
+    <>
+      <span role="status" className="sr-only">Loading the stewards list</span>
+      <div data-sidebar-skeleton="" aria-hidden="true" className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
+        <section className="flex flex-col">
+          <div className="mx-2 my-1 h-3 w-24 rounded bg-state-hover motion-safe:animate-pulse" />
+          <ul className="flex flex-col gap-1 px-1">
+            {[0, 1, 2].map((i) => (
+              <li key={i} className="h-9 rounded-md bg-state-hover motion-safe:animate-pulse" />
+            ))}
+          </ul>
+        </section>
+      </div>
+    </>
+  );
+}
+
+/**
  * The sidebar thread list (BB-44), mounted by the host in the
  * `experimental_threadList` slot. It follows the thread route through its
  * `activeThreadId` and `activeProjectId` props, and the Stewards page through
@@ -2005,7 +2033,7 @@ function StewardsSidebarCore({
   onNewThread: (projectId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const { status, threads, projects } = experimental_useSidebarThreads();
+  const { threads, projects } = experimental_useSidebarThreads();
   // The Stewards page's route, when that panel is mounted (BB-94). It is null
   // on a thread route, where the props above are the source.
   const boardRoute = useBoardRoute();
@@ -2051,6 +2079,24 @@ function StewardsSidebarCore({
   // until the next route change (BB-117).
   const wanted = picked ?? routeProject ?? lastProject.current;
   const { data, error, loaded, refetch } = usePolled(useCallback(() => rpc.call("stewardsSidebar", { projectId: wanted }), [rpc, wanted]));
+  // BB-127: the body is pending until the RPC has data for the project on
+  // screen. A null `data.projectId` is a landed answer for a project with no
+  // stewards config (`server.ts` returns it for an unconfigured or absent
+  // project): the wanted tab's one-off threads render as before, and no
+  // bindings can arrive to reshuffle them. A non-null answer for another
+  // project is not ready, so the previous list stays visible dimmed for
+  // `STALE_LIST_MS`, then the skeleton takes over if the answer has still not
+  // arrived.
+  const rpcReady = data !== null && (data.projectId === null || wanted === null || data.projectId === wanted);
+  const [skeleton, setSkeleton] = useState(false);
+  useEffect(() => {
+    if (rpcReady) {
+      setSkeleton(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSkeleton(true), STALE_LIST_MS);
+    return () => window.clearTimeout(timer);
+  }, [rpcReady, wanted]);
   // Finish a board pick whose remembered effort key still has to be checked:
   // once the picked project's list has loaded, go to the effort if it is still
   // there and to the project page otherwise (BB-113).
@@ -2108,7 +2154,7 @@ function StewardsSidebarCore({
   byIdRef.current = byId;
   // The requested project's needs items, only while the data matches the tab on
   // screen; a stale answer for a previous project shows nothing (BB-100).
-  const needItems = active !== null && data?.projectId === active.projectId ? data.needs.items : EMPTY_NEEDS;
+  const needsFor = (tab: SidebarTab) => (data?.projectId === tab.projectId ? data.needs.items : EMPTY_NEEDS);
   const now = Date.now();
   const activeKey = boardRoute.key;
   const openThreads = useMemo(() => revealThreads(tabs, activeThreadId), [tabs, activeThreadId]);
@@ -2153,14 +2199,19 @@ function StewardsSidebarCore({
   const newThread = useCallback(() => {
     if (active !== null) onNewThread(active.projectId);
   }, [active, onNewThread]);
-  const rows = (list: readonly SidebarEffort[]) =>
+  // BB-127: while the RPC has no data for the project on screen the body is
+  // pending. A stale answer for another project keeps its tab visible dimmed
+  // for `STALE_LIST_MS`, then the skeleton takes over; the live threads are
+  // never rendered ungrouped.
+  const staleTab = !rpcReady && data !== null && data.projectId !== null ? tabs.find((t) => t.projectId === data.projectId) ?? null : null;
+  const rows = (tab: SidebarTab, list: readonly SidebarEffort[]) =>
     list.map((e) => (
       <SidebarEffortRow
         key={e.key}
         effort={e}
-        needs={needItems}
+        needs={needsFor(tab)}
         byId={byId}
-        projectId={active!.projectId}
+        projectId={tab.projectId}
         activeKey={activeKey}
         activeThreadId={activeThreadId}
         openThreads={openThreads}
@@ -2170,6 +2221,86 @@ function StewardsSidebarCore({
         entered={loaded}
       />
     ));
+  const body = (tab: SidebarTab, dimmed: boolean) => (
+    <div
+      data-sidebar-stale={dimmed ? "" : undefined}
+      className={`flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1 ${dimmed ? "pointer-events-none opacity-60" : ""}`}
+    >
+      {data !== null && data.roleProblem !== null ? (
+        <p className="rounded-md border border-border bg-state-hover px-2 py-1 text-xs text-attention">{data.roleProblem}</p>
+      ) : null}
+      {tab.blocked.length > 0 ? (
+        <SidebarSection title="Blocked" count={tab.blocked.length}>
+          <ul className="flex flex-col">{rows(tab, tab.blocked)}</ul>
+        </SidebarSection>
+      ) : null}
+      <SidebarSection title="In flight" count={tab.efforts.length}>
+        {tab.efforts.length === 0 ? (
+          <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>
+        ) : (
+          <ul className="flex flex-col">{rows(tab, tab.efforts)}</ul>
+        )}
+      </SidebarSection>
+      {tab.threads.length > 0 ? (
+        <SidebarCollapsible title="Threads" count={tab.threads.length} revealed={openSections.has("Threads")} unread={sectionHasUnread(tab.threads, byId)}>
+          <ul className="flex flex-col">
+            {tab.threads.map((e) => {
+              const t = byId.get(e.rootThreadId);
+              return t === undefined ? null : (
+                <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(e.children, byId)} entered={loaded} />
+              );
+            })}
+          </ul>
+        </SidebarCollapsible>
+      ) : null}
+      {tab.monitors.length > 0 ? (
+        <SidebarCollapsible title="Monitors" count={tab.monitors.length} revealed={openSections.has("Monitors")} unread={sectionHasUnread(tab.monitors, byId)}>
+          <ul className="flex flex-col">{rows(tab, tab.monitors)}</ul>
+        </SidebarCollapsible>
+      ) : null}
+      {tab.ended.length > 0 ? (
+        <SidebarCollapsible title="Recently ended" count={tab.ended.length} revealed={openSections.has("Recently ended")} unread={sectionHasUnread(tab.ended, byId)}>
+          <ul className="flex flex-col">
+            {tab.ended.map((e) => (
+              <SidebarEffortRow
+                key={`${e.key}-${e.endedAt}`}
+                effort={e}
+                needs={needsFor(tab)}
+                byId={byId}
+                projectId={tab.projectId}
+                activeKey={activeKey}
+                activeThreadId={activeThreadId}
+                openThreads={openThreads}
+                unreadKey={unreadKey(e.children, byId)}
+                onNavigate={onNavigate}
+                onChanged={refetch}
+                trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
+                entered={loaded}
+              />
+            ))}
+          </ul>
+        </SidebarCollapsible>
+      ) : null}
+      {tab.projectStewardThreadId !== null && byId.has(tab.projectStewardThreadId) ? (
+        <div className="mt-auto border-t border-border pt-1">
+          <SidebarThreadRow
+            thread={byId.get(tab.projectStewardThreadId)!}
+            role="thread"
+            children={NO_CHILDREN}
+            depth={0}
+            byId={byId}
+            onNavigate={onNavigate}
+            glyph="quiet"
+            activeThreadId={activeThreadId}
+            openThreads={openThreads}
+            unreadKey=""
+            entered={loaded}
+            meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
   return (
     <div className="flex h-full flex-col text-sm">
       <ProjectTabs
@@ -2179,86 +2310,14 @@ function StewardsSidebarCore({
         onPick={pick}
         onNewThread={newThread}
       />
-      {status === "loading" && data === null ? (
-        <p className="p-3 text-muted-foreground">Loading…</p>
+      {!rpcReady ? (
+        !skeleton && staleTab !== null ? body(staleTab, true) : <SidebarSkeleton />
       ) : active === null ? (
         <p className="p-3 text-muted-foreground">No projects yet.</p>
+      ) : data?.projectId === null || data?.projectId === active.projectId ? (
+        body(active, false)
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
-          {data !== null && data.roleProblem !== null ? (
-            <p className="rounded-md border border-border bg-state-hover px-2 py-1 text-xs text-attention">{data.roleProblem}</p>
-          ) : null}
-          {active.blocked.length > 0 ? (
-            <SidebarSection title="Blocked" count={active.blocked.length}>
-              <ul className="flex flex-col">{rows(active.blocked)}</ul>
-            </SidebarSection>
-          ) : null}
-          <SidebarSection title="In flight" count={active.efforts.length}>
-            {active.efforts.length === 0 ? (
-              <p className="px-2 py-1 text-muted-foreground">Nothing in flight.</p>
-            ) : (
-              <ul className="flex flex-col">{rows(active.efforts)}</ul>
-            )}
-          </SidebarSection>
-          {active.threads.length > 0 ? (
-            <SidebarCollapsible title="Threads" count={active.threads.length} revealed={openSections.has("Threads")} unread={sectionHasUnread(active.threads, byId)}>
-              <ul className="flex flex-col">
-                {active.threads.map((e) => {
-                  const t = byId.get(e.rootThreadId);
-                  return t === undefined ? null : (
-                    <SidebarThreadRow key={e.key} thread={t} role="thread" children={e.children} depth={0} byId={byId} onNavigate={onNavigate} glyph={oneOffGlyph(t)} activeThreadId={activeThreadId} openThreads={openThreads} unreadKey={unreadKey(e.children, byId)} entered={loaded} />
-                  );
-                })}
-              </ul>
-            </SidebarCollapsible>
-          ) : null}
-          {active.monitors.length > 0 ? (
-            <SidebarCollapsible title="Monitors" count={active.monitors.length} revealed={openSections.has("Monitors")} unread={sectionHasUnread(active.monitors, byId)}>
-              <ul className="flex flex-col">{rows(active.monitors)}</ul>
-            </SidebarCollapsible>
-          ) : null}
-          {active.ended.length > 0 ? (
-            <SidebarCollapsible title="Recently ended" count={active.ended.length} revealed={openSections.has("Recently ended")} unread={sectionHasUnread(active.ended, byId)}>
-              <ul className="flex flex-col">
-                {active.ended.map((e) => (
-                  <SidebarEffortRow
-                    key={`${e.key}-${e.endedAt}`}
-                    effort={e}
-                    needs={needItems}
-                    byId={byId}
-                    projectId={active.projectId}
-                    activeKey={activeKey}
-                    activeThreadId={activeThreadId}
-                    openThreads={openThreads}
-                    unreadKey={unreadKey(e.children, byId)}
-                    onNavigate={onNavigate}
-                    onChanged={refetch}
-                    trailing={<span className="shrink-0 text-[11px] text-muted-foreground">{ago(e.endedAt, now)}</span>}
-                    entered={loaded}
-                  />
-                ))}
-              </ul>
-            </SidebarCollapsible>
-          ) : null}
-          {active.projectStewardThreadId !== null && byId.has(active.projectStewardThreadId) ? (
-            <div className="mt-auto border-t border-border pt-1">
-              <SidebarThreadRow
-                thread={byId.get(active.projectStewardThreadId)!}
-                role="thread"
-                children={NO_CHILDREN}
-                depth={0}
-                byId={byId}
-                onNavigate={onNavigate}
-                glyph="quiet"
-                activeThreadId={activeThreadId}
-                openThreads={openThreads}
-                unreadKey=""
-                entered={loaded}
-                meta={<span className="shrink-0 text-[10px] uppercase text-muted-foreground">project steward</span>}
-              />
-            </div>
-          ) : null}
-        </div>
+        <SidebarSkeleton />
       )}
       {error !== null ? <p className="px-2 py-1 text-xs text-destructive">Refresh failed: {error}</p> : null}
     </div>

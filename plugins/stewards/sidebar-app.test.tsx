@@ -3,7 +3,7 @@
 // two-line effort rows with the four glyphs, inline needs-you actions, and the
 // Blocked / In flight / Threads / Monitors / Recently ended sections.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type CapturedPluginApp, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import { PROJECT_CHANGED } from "./channels.js";
@@ -198,6 +198,7 @@ const renderSidebar = async (options: Parameters<typeof renderSlot>[2] = {}, pro
 
 afterEach(() => {
   app = null;
+  vi.useRealTimers();
   resetOpenPrHandoff();
   setBoardRoute({ projectId: null, key: null });
   window.localStorage.clear();
@@ -478,7 +479,7 @@ describe("the stewards sidebar list (BB-44)", () => {
     const slot = await renderSidebar(
       {
         sidebarThreads: { projects, threads: [thread({ id: "thr_personal", projectId: "personal", displayTitle: "My notes" })] },
-        rpc: { stewardsSidebar: () => sidebarData() } as never,
+        rpc: { stewardsSidebar: (input: { projectId: string | null }) => sidebarData({ projectId: input.projectId ?? "p1" }) } as never,
       },
       { activeProjectId: "personal" },
     );
@@ -1994,5 +1995,93 @@ describe("the sidebar's one-project RPC (BB-100)", () => {
     });
     await waitFor(() => expect(slot.getByRole("option", { name: "Acme (3)" })).toBeTruthy());
     slot.lifecycle.unmount();
+  });
+});
+
+// BB-127: while the RPC has no data for the project on screen the body is a
+// skeleton, never the live threads ungrouped. A project switch keeps the
+// previous list visible dimmed for a moment so a fast switch does not flash a
+// skeleton.
+describe("the sidebar's loading state (BB-127)", () => {
+  it("shows the skeleton and no thread rows while the first RPC is pending", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: { projects, threads: [thread({ id: "thr_a", displayTitle: "A one-off" })] },
+      rpc: { stewardsSidebar: () => new Promise(() => {}) } as never,
+    });
+    await waitFor(() => expect(slot.getByLabelText("Project")).toBeTruthy());
+    expect(slot.container.querySelector("[data-sidebar-skeleton]")).not.toBeNull();
+    expect(slot.queryByText("A one-off")).toBeNull();
+    expect(slot.queryByRole("button", { name: /Threads/u })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("replaces the skeleton with the grouped sections once the RPC lands", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_steward", displayTitle: "ENG-1: Fix login" }), thread({ id: "thr_p", displayTitle: "Project steward" })],
+      },
+      rpc: { stewardsSidebar: () => sidebarData({ bindings: [binding()], projectStewardThreadId: "thr_p" }) } as never,
+    });
+    await waitFor(() => expect(slot.getByText("Fix login")).toBeTruthy());
+    expect(slot.container.querySelector("[data-sidebar-skeleton]")).toBeNull();
+    expect(slot.getByRole("heading", { name: /In flight/u })).toBeTruthy();
+    // The project-steward footer is part of the grouped rendering.
+    expect(slot.getByText("project steward")).toBeTruthy();
+    // The stewarded effort is grouped, so there is no one-off Threads section.
+    expect(slot.queryByRole("button", { name: /Threads/u })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("renders the wanted project's one-offs when the answer names no project", async () => {
+    const slot = await renderSidebar(
+      {
+        sidebarThreads: { projects, threads: [thread({ id: "thr_a", projectId: "personal", displayTitle: "A one-off" })] },
+        rpc: { stewardsSidebar: () => ({ ...sidebarData(), projectId: null }) } as never,
+      },
+      { activeProjectId: "personal" },
+    );
+    await waitFor(() => expect(slot.getByText("A one-off")).toBeTruthy());
+    expect(slot.container.querySelector("[data-sidebar-skeleton]")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps the previous list dimmed on a project switch, then shows the skeleton after 150 ms", async () => {
+    const slot = await renderSidebar({
+      sidebarThreads: {
+        projects,
+        threads: [thread({ id: "thr_p1", displayTitle: "P1 work" }), thread({ id: "thr_personal", projectId: "personal", displayTitle: "Personal work" })],
+      },
+      rpc: {
+        stewardsSidebar: (input: { projectId: string | null }) =>
+          input.projectId === "personal" ? new Promise(() => {}) : sidebarData({ projectId: "p1", bindings: [binding({ key: "ENG-1", threadId: "thr_p1" })] }),
+      } as never,
+    });
+    try {
+      await waitFor(() => expect(slot.getByText("P1 work")).toBeTruthy());
+      const select = slot.getByLabelText("Project") as HTMLSelectElement;
+      vi.useFakeTimers();
+      fireEvent.change(select, { target: { value: "personal" } });
+      // The previous project's grouped list stays, dimmed and inert.
+      const stale = slot.container.querySelector("[data-sidebar-stale]");
+      expect(stale).not.toBeNull();
+      expect(stale!.className).toContain("opacity-60");
+      expect(stale!.className).toContain("pointer-events-none");
+      expect(slot.getByText("P1 work")).toBeTruthy();
+      // The new project's threads are never shown ungrouped.
+      expect(slot.queryByText("Personal work")).toBeNull();
+      expect(slot.queryByRole("button", { name: /Threads/u })).toBeNull();
+      // After the window, a still-pending answer gives way to the skeleton.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150);
+      });
+      expect(slot.container.querySelector("[data-sidebar-stale]")).toBeNull();
+      expect(slot.container.querySelector("[data-sidebar-skeleton]")).not.toBeNull();
+      expect(slot.queryByText("P1 work")).toBeNull();
+      expect(slot.queryByText("Personal work")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      slot.lifecycle.unmount();
+    }
   });
 });
