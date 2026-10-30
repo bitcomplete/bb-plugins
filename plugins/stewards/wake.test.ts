@@ -6,7 +6,7 @@ import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { ESCALATED_NEED_KINDS } from "./store.js";
 import { LINEAR_TICKETS } from "./templates.js";
-import { STANDING_RULES, formatProjectWake, formatWake, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { STANDING_RULES, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
 const DAY = 86_400_000;
@@ -278,5 +278,23 @@ describe("the nightly prompt", () => {
     const none = formatProjectWake({ reason: "approval", bindings: [], routed: [{ escalation: x, from: b }], problems: [], digestDue: false, notes: [], bigDecisions: [], questions: [] });
     expect(none).toMatch(/no standing-rules list configured/u);
     expect(none).toMatch(/Add only the limits this change needs, in at most three points/u);
+  });
+});
+
+describe("the spawn command (BB-133)", () => {
+  const flags = "--environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5";
+
+  it("is unchanged for the worker role, and adds the reviewer's hidden full-permission flags", () => {
+    const worker = spawnCommand({ projectId: "p1", entityKey: "ENG-12", workerFlags: flags });
+    expect(worker).toContain('bb thread spawn --project p1 --parent-self --parent-notifications off --lifecycle-owner-thread "$BB_THREAD_ID" --environment-provider multi-repo-workspace --provider claude-code --model claude-opus-5-5 --title "ENG-12: <task>" --prompt-file -');
+    expect(worker).not.toContain("--visibility hidden");
+    expect(worker).not.toContain("--permission-mode");
+
+    const reviewer = spawnCommand({ projectId: "p1", entityKey: "ENG-12", workerFlags: flags, role: "reviewer" });
+    expect(reviewer).toContain("--visibility hidden --permission-mode full");
+    expect(reviewer).toContain('--title "Review ENG-12: <task>"');
+    // The reviewer is started from the worker thread, so `--parent-self` makes
+    // it that worker's child, and the lifecycle owner stays the worker.
+    expect(reviewer).toContain("--parent-self --parent-notifications off --lifecycle-owner-thread \"$BB_THREAD_ID\"");
   });
 });
