@@ -6,8 +6,10 @@ import { comment, issue, pull } from "./fixtures.js";
 import { gateState } from "./reconcile.js";
 import { MIGRATIONS, RESOLUTION_KINDS, createStore } from "./store.js";
 import { ESCALATED_NEED_KINDS } from "./store.js";
-import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS } from "./templates.js";
-import { STANDING_RULES, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import { DEPS_PRS, GITHUB_PRS, GITHUB_REVIEWS, LINEAR_TICKETS, OPS_WATCH, DEPS_ALERTS } from "./templates.js";
+import { STANDING_RULES, formatDepsWake, formatOpsWake, formatProjectWake, formatWake, spawnCommand, workerQuestion, type DigestRecords, type WakeInput } from "./wake.js";
+import type { OpsFinding } from "./ops.js";
+import type { DepsFinding } from "./deps.js";
 
 const T = Date.parse("2026-10-18T05:00:00Z");
 const DAY = 86_400_000;
@@ -366,5 +368,114 @@ describe("the spawn command (BB-133)", () => {
     // The reviewer is started from the worker thread, so `--parent-self` makes
     // it that worker's child, and the lifecycle owner stays the worker.
     expect(reviewer).toContain("--parent-self --parent-notifications off --lifecycle-owner-thread \"$BB_THREAD_ID\"");
+  });
+});
+
+describe("the ops and deps wake classification lines (BB-136)", () => {
+  const at = Date.parse("2026-10-18T05:00:00Z");
+  const binding = (key: string) => world().bind(key);
+  const parsedPlaybook = (text: string, name: string) => {
+    const parsed = parsePlaybook(text, name);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parsed.value;
+  };
+  const opsFinding = (over: Partial<OpsFinding> = {}): OpsFinding => ({
+    fingerprint: "k8s-namespace/bb-gate-production/bb-gate-router/router#CrashLoopBackOff:Error:1",
+    workload: "bb-gate-router",
+    pods: ["bb-gate-router-6d4f9c7b8-x2k4q"],
+    container: "router",
+    signature: "CrashLoopBackOff:Error:1",
+    summary: "Container router is in CrashLoopBackOff, 7 restarts",
+    restarts: 7,
+    events: [],
+    logs: null,
+    previous: true,
+    class: "new",
+    ticket: null,
+    ticketState: null,
+    closedAt: null,
+    window: null,
+    assignee: "Jane",
+    dedupUnavailable: false,
+    firstSeenAt: at,
+    lastCommentedAt: null,
+    ...over,
+  });
+  const opsWake = (finding: OpsFinding) =>
+    formatOpsWake({
+      reason: "changed",
+      binding: binding("k8s-namespace/bb-gate-production"),
+      playbook: parsedPlaybook(OPS_WATCH, "ops-watch"),
+      look: { at, target: "k8s-namespace/bb-gate-production", error: null, pods: 1, healthy: 0, deployments: [], warnings: [], logs: "unneeded", notes: [], findings: [finding] },
+      team: "ENG",
+      label: "bb-managed",
+      owner: "Jane",
+      autoAdopt: [],
+      escalations: [],
+      changes: [],
+    });
+  const depsFinding = (over: Partial<DepsFinding> = {}): DepsFinding => ({
+    fingerprint: "acme/web#4",
+    alertNumber: 4,
+    severity: "high",
+    package: "lodash",
+    ecosystem: "npm",
+    manifestPath: "package-lock.json",
+    ghsaId: null,
+    fixedVersion: "4.17.21",
+    summary: "high lodash",
+    state: "open",
+    url: null,
+    dueAt: at + 86_400_000,
+    priority: "high",
+    class: "new",
+    ticket: null,
+    ticketState: null,
+    closedAt: null,
+    window: null,
+    assignee: "Jane",
+    dedupUnavailable: false,
+    firstSeenAt: at,
+    lastCommentedAt: null,
+    batch: { kind: "new" },
+    ...over,
+  });
+  const depsWake = (finding: DepsFinding) =>
+    formatDepsWake({
+      reason: "changed",
+      binding: binding("dependabot/acme/web"),
+      playbook: parsedPlaybook(DEPS_ALERTS, "deps-alerts"),
+      look: { at, target: "dependabot/acme/web", error: null, viewer: "jane", alerts: [finding] },
+      team: "ENG",
+      label: "bb-managed",
+      owner: "Jane",
+      autoAdopt: [],
+      timeZone: "UTC",
+      escalations: [],
+      changes: [],
+    });
+
+  it("shows the class, the ticket and the assignee for every class, in both formatters", () => {
+    expect(opsWake(opsFinding())).toMatch(/New \(no ticket found\)/u);
+    expect(opsWake(opsFinding())).toMatch(/Assignee: Jane/u);
+    const recurring = opsWake(opsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "In Progress" }));
+    expect(recurring).toMatch(/Recurring on ENG-50 \(open\)/u);
+    expect(recurring).toMatch(/ticket ENG-50 \(In Progress\)/u);
+    const returned = opsWake(opsFinding({ class: "returned", ticket: "ENG-50", ticketState: "Done", closedAt: "2026-10-05T00:00:00Z", window: "within" }));
+    expect(returned).toMatch(/Returned: ENG-50 closed 2026-10-05T00:00:00Z, within two weeks/u);
+    expect(returned).toMatch(/Assignee: Jane/u);
+
+    expect(depsWake(depsFinding())).toMatch(/New \(no ticket found\)/u);
+    expect(depsWake(depsFinding())).toMatch(/Assignee: Jane/u);
+    expect(depsWake(depsFinding({ class: "recurring", ticket: "ENG-50", ticketState: "Todo" }))).toMatch(/Recurring on ENG-50 \(open\)/u);
+    expect(depsWake(depsFinding({ class: "returned", ticket: "ENG-50", ticketState: "Done", closedAt: "2026-10-01T00:00:00Z", window: "outside" }))).toMatch(/Returned: ENG-50 closed 2026-10-01T00:00:00Z, outside two weeks/u);
+  });
+
+  it("says unassigned and the dedup note when the login or the search is unavailable", () => {
+    const ops = opsWake(opsFinding({ assignee: "unassigned", dedupUnavailable: true }));
+    expect(ops).toMatch(/Assignee: unassigned \(login unreadable\)/u);
+    expect(ops).toMatch(/Dedup unavailable/u);
+    expect(ops).toMatch(/linear_search/u);
+    expect(depsWake(depsFinding({ assignee: "unassigned", dedupUnavailable: true }))).toMatch(/Dedup unavailable/u);
   });
 });

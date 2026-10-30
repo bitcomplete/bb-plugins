@@ -214,6 +214,14 @@ export const entitySnapshotSchema = z.object({
   description: z.string().nullable(),
   createdAt: z.string().nullable(),
   updatedAt: z.string().nullable(),
+  /**
+   * Linear: when the issue moved to a completed state, and when it was
+   * canceled; null otherwise. Optional so a source copy that does not send
+   * them (an older linear, or github) still parses; stewards then falls back
+   * to `updatedAt`.
+   */
+  completedAt: z.string().nullable().optional(),
+  canceledAt: z.string().nullable().optional(),
   /** The newest comments (and, on a pull request, reviews and review comments), oldest first. */
   comments: z.array(snapshotCommentSchema),
   parent: z.object({ id: z.string(), key: z.string() }).nullable(),
@@ -239,6 +247,25 @@ export const adoptableEntitySchema = z.object({
   createdAt: z.string().nullable(),
 });
 export type AdoptableEntity = z.infer<typeof adoptableEntitySchema>;
+
+/**
+ * One issue a source's search returned, with the description the caller
+ * matches an exact `Fingerprint:` line in. Linear serves it; GitHub has no
+ * issue search and declines with `unsupported: true`.
+ */
+export const searchIssueSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  title: z.string().nullable(),
+  description: z.string().nullable(),
+  state: z.string(),
+  stateType: z.string().nullable(),
+  /** The team key, or "owner/repo" on GitHub. */
+  unit: z.string(),
+  /** The assignee's login, or null when the issue is unassigned. */
+  assignee: z.string().nullable(),
+});
+export type SearchIssue = z.infer<typeof searchIssueSchema>;
 
 // ---- Dependabot alerts -------------------------------------------------------
 
@@ -321,6 +348,28 @@ export const sourceContract = {
     output: z.object({
       viewer: z.string().nullable(),
       entities: z.array(adoptableEntitySchema),
+      errors: z.array(z.string()),
+    }),
+  },
+  /**
+   * Search a source for issues matching a term, for stewards' dedup: a
+   * fingerprint the map has lost but the source still has a ticket for.
+   * Linear serves it team-scoped, closed issues included, with a small
+   * result count; the caller verifies the exact `Fingerprint:` line itself.
+   * GitHub has no issue search and answers `unsupported: true`; an older
+   * source without the method at all is a missing RPC. Stewards treats
+   * either as "dedup unavailable".
+   */
+  sourceSearchIssues: {
+    input: z.object({
+      units: z.array(z.string().min(1).max(200)).max(100),
+      query: z.string().min(1).max(500),
+      limit: z.number().int().min(1).max(50).default(20),
+    }),
+    output: z.object({
+      issues: z.array(searchIssueSchema),
+      /** Set when the source does not offer the capability at all. */
+      unsupported: z.boolean().default(false),
       errors: z.array(z.string()),
     }),
   },

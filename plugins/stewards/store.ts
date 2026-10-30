@@ -1189,6 +1189,7 @@ export function createStore(db: Database.Database, now: () => number, options: S
   );
   const setTicket = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, filed_at = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
   const setCommented = db.prepare("UPDATE ops_fingerprints SET ticket_key = ?, last_commented_at = ? WHERE project_id = ? AND fingerprint = ?");
+  const setAdopted = db.prepare("UPDATE ops_fingerprints SET ticket_key = ? WHERE project_id = ? AND fingerprint = ?");
 
   const getProject = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE project_id = ?");
   const byProjectThread = db.prepare<[string], Record<string, unknown>>("SELECT * FROM project_stewards WHERE thread_id = ?");
@@ -2136,6 +2137,15 @@ export function createStore(db: Database.Database, now: () => number, options: S
       const at = now();
       const key = ticketKey.toUpperCase();
       const changed = did === "commented" ? setCommented.run(key, at, projectId, fingerprint) : setTicket.run(key, at, at, projectId, fingerprint);
+      return changed.changes > 0;
+    },
+    /**
+     * Point a fingerprint at a ticket the dedup search found, without
+     * counting it as a filing or a comment: the steward has not spoken yet,
+     * so `last_commented_at` stays null.
+     */
+    adoptTicket(projectId: string, fingerprint: string, ticketKey: string): boolean {
+      const changed = setAdopted.run(ticketKey.toUpperCase(), projectId, fingerprint);
       return changed.changes > 0;
     },
 

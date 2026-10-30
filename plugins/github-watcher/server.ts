@@ -596,6 +596,13 @@ export function createGitHubPlugin(deps: GitHubPluginDeps): (bb: BbPluginApi) =>
         return { viewer, entities: entities.slice(0, limit), errors };
       },
 
+      // GitHub has no issue search; stewards' dedup asks for it, and this
+      // says so rather than failing, so the wake can tell the steward to
+      // search itself before filing. Only Linear serves it.
+      async sourceSearchIssues() {
+        return { issues: [], unsupported: true, errors: [] };
+      },
+
       // A repository's Dependabot alerts, read with the token through the
       // REST API. Each repository the token cannot read (no alert access,
       // alerts disabled, not visible) is named in `errors`; the rest are

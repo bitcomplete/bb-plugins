@@ -277,6 +277,14 @@ export const opsFindingSchema = z.object({
   ticket: z.string().nullable(),
   /** The ticket's state, when it could be read. */
   ticketState: z.string().nullable(),
+  /** When the ticket was resolved, when the source reports it; null otherwise. */
+  closedAt: z.string().nullable(),
+  /** Whether the ticket was resolved inside the two-week window; null when it was not resolved or has no date. */
+  window: z.enum(["within", "outside"]).nullable(),
+  /** The login the steward files under, or "unassigned" when it cannot be read. */
+  assignee: z.string(),
+  /** Set on a new finding when the dedup search could not run or was partial. */
+  dedupUnavailable: z.boolean().default(false),
   firstSeenAt: z.number(),
   lastCommentedAt: z.number().nullable(),
 });
@@ -309,7 +317,21 @@ export type RawLook = Omit<OpsLook, "at" | "target" | "error" | "findings"> & { 
 export type FingerprintRow = { fingerprint: string; ticketKey: string | null; firstSeenAt: number; lastCommentedAt: number | null };
 
 /** A ticket's state as the linear plugin reports it; null when it could not be read. */
-export type TicketState = { state: string; stateType: string | null } | null;
+export type TicketState = { state: string; stateType: string | null; closedAt?: string | null } | null;
+
+/** How long a resolved ticket is still "within two weeks" for a returned problem. */
+export const CLOSED_WINDOW_MS = 14 * 86_400_000;
+
+/** Whether a closed ticket is inside the two-week window, or null when it has no closed date. */
+export const closedWindow = (closedAt: string | null, now: number): "within" | "outside" | null => (closedAt === null ? null : now - Date.parse(closedAt) <= CLOSED_WINDOW_MS ? "within" : "outside");
+
+/**
+ * Whether a description carries the exact fingerprint line a steward puts in
+ * a ticket, on a line of its own. The dedup search adopts a ticket only on
+ * this, never on a title or a fuzzy match.
+ */
+export const hasFingerprintLine = (description: string | null, fingerprint: string): boolean =>
+  description !== null && description.split(/\r?\n/u).some((line) => line.trim() === `Fingerprint: \`${fingerprint}\``);
 
 const resolvedTicket = (t: TicketState) => t !== null && (t.stateType === "completed" || t.stateType === "canceled");
 
@@ -317,15 +339,28 @@ const resolvedTicket = (t: TicketState) => t !== null && (t.stateType === "compl
  * Each sighting against the fingerprint map: new when it has no ticket,
  * recurring while its ticket is open (or cannot be read: a comment on a
  * ticket that turns out closed does less harm than a duplicate), returned
- * once its ticket was resolved.
+ * once its ticket was resolved. `assignee` is the login the steward files
+ * under; null (the login could not be read) is reported as "unassigned".
  */
-export function classify(sightings: Sighting[], rows: ReadonlyMap<string, FingerprintRow>, tickets: ReadonlyMap<string, TicketState>, now: number): OpsFinding[] {
+export function classify(sightings: Sighting[], rows: ReadonlyMap<string, FingerprintRow>, tickets: ReadonlyMap<string, TicketState>, now: number, assignee: string | null = null): OpsFinding[] {
   return sightings.map((s) => {
     const row = rows.get(s.fingerprint);
     const ticket = row?.ticketKey ?? null;
     const state = ticket === null ? null : (tickets.get(ticket) ?? null);
     const cls: FindingClass = ticket === null ? "new" : resolvedTicket(state) ? "returned" : "recurring";
-    return { ...s, class: cls, ticket, ticketState: state?.state ?? null, firstSeenAt: row?.firstSeenAt ?? now, lastCommentedAt: row?.lastCommentedAt ?? null };
+    const closedAt = cls === "returned" ? (state?.closedAt ?? null) : null;
+    return {
+      ...s,
+      class: cls,
+      ticket,
+      ticketState: state?.state ?? null,
+      closedAt,
+      window: closedWindow(closedAt, now),
+      assignee: assignee ?? "unassigned",
+      dedupUnavailable: false,
+      firstSeenAt: row?.firstSeenAt ?? now,
+      lastCommentedAt: row?.lastCommentedAt ?? null,
+    };
   });
 }
 

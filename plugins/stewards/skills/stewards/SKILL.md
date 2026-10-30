@@ -241,15 +241,23 @@ namespace you may run kubectl on the target yourself, but only `get`,
 broad, and nothing else stops a write. You cannot query Sentry: the token
 is the plugin's, so diagnose from the wake and the code in your workspace.
 
-- **New:** search the team for an open ticket about it, then file one ticket
-  per problem with `linear_create_issue`: pod and container, since when, the
-  evidence quoted, your diagnosis, a priority, and a line
-  ``Fingerprint: `<fingerprint>` ``. Assign every ticket you file to this
-  server's owner (`assignee: "me"`) and to no one else; the wake names the
-  owner, and one that cannot be read files unassigned. Raise one `decision`
-  escalation for the tickets of the turn: "Filed BB-N (high): …. Recommend
-  adopting." A priority the wake says `ops.autoAdopt` covers you label and move
-  to Todo yourself, with no escalation.
+**Defaults.** Put every problem's fingerprint in the ticket description on a
+line of its own, ``Fingerprint: `<fingerprint>` ``. Assign every ticket you
+file to this server's owner with `assignee: "me"` and to no one else; when
+the wake says the login cannot be read, file it unassigned rather than
+guessing. A ticket already assigned to someone else is classified and
+commented on, never reassigned. A recurrence is a comment on its ticket,
+never a second ticket. Before you file, the plugin searches the team for the
+exact `Fingerprint:` line and reports a hit as Recurring or Returned; if the
+wake says dedup is unavailable, run `linear_search` yourself for that
+fingerprint before filing.
+
+- **New:** file one ticket per problem with `linear_create_issue`: pod and
+  container, since when, the evidence quoted, your diagnosis, a priority, and
+  the fingerprint line. Raise one `decision` escalation for the tickets of the
+  turn: "Filed BB-N (high): …. Recommend adopting." A priority the wake says
+  `ops.autoAdopt` covers you label and move to Todo yourself, with no
+  escalation.
 - **Recurring:** comment on its ticket when the evidence moved; file nothing.
 - **Returned:** as the playbook says: comment and escalate a reopen, or file
   anew linking the old ticket.

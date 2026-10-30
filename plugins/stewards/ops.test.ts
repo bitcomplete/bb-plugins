@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { crashingPod, healthyPod, warningEvent } from "./fixtures.js";
-import { classify, eventsOf, findingsOf, logTail, lookChanges, opsTargetKey, parseOpsTargetKey, podsOf, workloadOf, type OpsLook, type Sighting } from "./ops.js";
+import { classify, eventsOf, findingsOf, hasFingerprintLine, logTail, lookChanges, opsTargetKey, parseOpsTargetKey, podsOf, workloadOf, type OpsLook, type Sighting } from "./ops.js";
 
 const target = { kind: "k8s-namespace", name: "bb-gate-production" } as const;
 const now = Date.parse("2026-10-14T15:00:00Z");
@@ -92,6 +92,31 @@ describe("the fingerprint map", () => {
     expect(classify([sighting], row("OPS-5"), new Map([["OPS-5", { state: "Canceled", stateType: "canceled" }]]), now)[0]!.class).toBe("returned");
     // A ticket that cannot be read is taken as open: a comment does less harm than a duplicate.
     expect(classify([sighting], row("OPS-5"), new Map([["OPS-5", null]]), now)[0]).toMatchObject({ class: "recurring", ticketState: null });
+  });
+
+  it("dates a returned ticket's close and whether it is inside the two-week window", () => {
+    const days = (n: number) => new Date(now - n * 86_400_000).toISOString();
+    const returned = (closedAt: string | null) => classify([sighting], row("OPS-5"), new Map([["OPS-5", { state: "Done", stateType: "completed", closedAt }]]), now)[0]!;
+    expect(returned(days(13))).toMatchObject({ class: "returned", closedAt: days(13), window: "within" });
+    expect(returned(days(15))).toMatchObject({ class: "returned", closedAt: days(15), window: "outside" });
+    // A resolved ticket the source gave no date for is returned with an unknown window.
+    expect(returned(null)).toMatchObject({ class: "returned", closedAt: null, window: null });
+    // An open ticket is never dated.
+    expect(classify([sighting], row("OPS-5"), new Map([["OPS-5", { state: "In Progress", stateType: "started", closedAt: days(2) }]]), now)[0]).toMatchObject({ class: "recurring", closedAt: null, window: null });
+  });
+
+  it("carries the assignee the steward files under, or unassigned when the login cannot be read", () => {
+    expect(classify([sighting], new Map(), new Map(), now, "Jane")[0]).toMatchObject({ assignee: "Jane" });
+    expect(classify([sighting], new Map(), new Map(), now, null)[0]).toMatchObject({ assignee: "unassigned" });
+    expect(classify([sighting], new Map(), new Map(), now)[0]).toMatchObject({ assignee: "unassigned", dedupUnavailable: false });
+  });
+
+  it("matches a fingerprint only on its exact line, never a title or a fuzzy match", () => {
+    expect(hasFingerprintLine(`seen again\nFingerprint: \`${sighting.fingerprint}\`\nmore`, sighting.fingerprint)).toBe(true);
+    expect(hasFingerprintLine(`Fingerprint: ${sighting.fingerprint}`, sighting.fingerprint)).toBe(false);
+    expect(hasFingerprintLine(`The fingerprint is Fingerprint: \`${sighting.fingerprint}\`.`, sighting.fingerprint)).toBe(false);
+    expect(hasFingerprintLine(`Fingerprint: \`${sighting.fingerprint}\` elsewhere`, sighting.fingerprint)).toBe(false);
+    expect(hasFingerprintLine(null, sighting.fingerprint)).toBe(false);
   });
 
   it("makes a new or returned problem worth a turn at once, and a recurring one only at the requeue", () => {

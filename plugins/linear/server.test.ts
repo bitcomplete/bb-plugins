@@ -352,6 +352,23 @@ describe("tools", () => {
     expect(linear.calls.at(-1)!.body!.variables).toEqual({ term: "login", filter: undefined, first: 5 });
   });
 
+  it("sourceSearchIssues searches a team with closed issues included, for stewards' dedup (BB-136)", async () => {
+    const { harness, linear } = await setup({
+      token: "at-0",
+      linear: {
+        answer: (body) =>
+          body.query.includes("searchIssues")
+            ? { data: { searchIssues: { nodes: [issue({ description: "Fingerprint: `acme/web#4`", state: { name: "Done", type: "completed" } })] } } }
+            : { data: { issues: { nodes: [] } } },
+      },
+    });
+    const out = (await harness.callRpc("sourceSearchIssues", { units: ["eng"], query: "acme/web#4", limit: 10 })) as { issues: Array<Record<string, unknown>>; unsupported: boolean; errors: string[] };
+    expect(out.unsupported).toBe(false);
+    expect(out.errors).toEqual([]);
+    expect(out.issues).toEqual([{ id: "uuid-1", key: "ENG-123", title: "Fix login", description: "Fingerprint: `acme/web#4`", state: "Done", stateType: "completed", unit: "ENG", assignee: "jane" }]);
+    expect(linear.calls.at(-1)!.body!.variables).toEqual({ term: "acme/web#4", filter: { team: { key: { eq: "ENG" } } }, first: 10 });
+  });
+
   it("linear_comment signs the comment with the thread and reports the URL", async () => {
     const { tool, text, linear } = await setup({
       token: "at-0",
