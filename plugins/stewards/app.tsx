@@ -676,7 +676,10 @@ function BoardPage({ subPath }: { subPath: string }) {
                       className={`-mb-px border-b-2 px-3 py-1.5 ${active ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground"}`}
                       onClick={() => navigate.toPluginPanel(BOARD_PATH, { subPath: boardSubPath(p.projectId) })}
                     >
-                      {p.name}
+                      <span className="inline-flex items-center gap-1.5">
+                        {p.name}
+                        {!p.enabled ? <Badge tone="warn">off</Badge> : null}
+                      </span>
                     </button>
                   );
                 })}
@@ -811,9 +814,44 @@ function boardCountLine(efforts: readonly BoardEffort[], ended: number): string 
  */
 function ProjectView({ board: b, refetch }: { board: Board; refetch: () => void }) {
   const now = Date.now();
+  const rpc = useRpc<typeof rpcContract>();
+  const [turnOn, setTurnOn] = useState<"idle" | "running" | { error: string }>("idle");
   const { efforts, orphans } = boardEfforts(b);
+  const enable = () => {
+    setTurnOn("running");
+    rpc.call("stewardsSetProjectEnabled", { projectId: b.projectId, enabled: true }).then(
+      () => {
+        setTurnOn("idle");
+        refetch();
+      },
+      (e: unknown) => setTurnOn({ error: message(e) }),
+    );
+  };
   return (
     <>
+      {!b.enabled ? (
+        <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
+          <p>
+            Stewards are off for this project on this server: nothing is adopted, no steward is woken, and the ticket and pull request labels do nothing here. This is a
+            per-server setting.
+          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={false}
+              aria-label={`Stewards for ${b.name}`}
+              disabled={turnOn === "running"}
+              className="rounded-md border border-input px-3 py-1 text-xs hover:bg-state-hover disabled:opacity-50"
+              onClick={enable}
+            >
+              {turnOn === "running" ? "Saving…" : "Turn on"}
+            </button>
+            <span className="text-muted-foreground">Or turn it on in Settings → Plugins → Stewards → Status.</span>
+          </div>
+          {typeof turnOn === "object" ? <p className="text-xs text-destructive">{turnOn.error}</p> : null}
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h1 className="text-lg font-medium">{b.name}</h1>
         {b.projectStewardThreadId === null ? (

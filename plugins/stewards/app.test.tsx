@@ -83,10 +83,11 @@ const renderBoard = async (needs: Need[], questions: Question[]): Promise<Render
   return renderSlot(panel, { subPath: "" }, {
     rpc: {
       stewardsBoard: () => ({
-        projects: [{ projectId: "p1", name: "Acme" }],
+        projects: [{ projectId: "p1", name: "Acme", enabled: true }],
         board: {
           projectId: "p1",
           name: "Acme",
+          enabled: true,
           paused: false,
           projectStewardThreadId: "thr_p",
           stages: [],
@@ -214,10 +215,11 @@ describe("the rationale box and lessons block (BB-35 step 4)", () => {
     return renderSlot(panel, { subPath: "" }, {
       rpc: {
         stewardsBoard: () => ({
-          projects: [{ projectId: "p1", name: "Acme" }],
+          projects: [{ projectId: "p1", name: "Acme", enabled: true }],
           board: {
             projectId: "p1",
             name: "Acme",
+            enabled: true,
             paused: false,
             projectStewardThreadId: null,
             stages: [],
@@ -521,8 +523,8 @@ describe("the stewards sidebar's picker counts and refresh (BB-46)", () => {
         stewardsBoard: () => {
           calls += 1;
           return {
-            projects: [{ projectId: "p1", name: "Acme" }],
-            board: { projectId: "p1", name: "Acme", paused: false, projectStewardThreadId: null, stages: [], digest: null, questions: [], withUser: [], needs: [], lessons: [], lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 }, stewards: [], stuck: [], ended: [] },
+            projects: [{ projectId: "p1", name: "Acme", enabled: true }],
+            board: { projectId: "p1", name: "Acme", enabled: true, paused: false, projectStewardThreadId: null, stages: [], digest: null, questions: [], withUser: [], needs: [], lessons: [], lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 }, stewards: [], stuck: [], ended: [] },
           };
         },
       },
@@ -664,10 +666,11 @@ const renderBoardWith = async (over: { subPath?: string; stewards?: unknown[]; q
   return renderSlot(panel, { subPath: over.subPath ?? "" }, {
     rpc: {
       stewardsBoard: () => ({
-        projects: [{ projectId: "p1", name: "Acme" }],
+        projects: [{ projectId: "p1", name: "Acme", enabled: true }],
         board: {
           projectId: "p1",
           name: "Acme",
+          enabled: true,
           paused: false,
           projectStewardThreadId: "thr_p",
           stages: [],
@@ -913,3 +916,85 @@ describe("the Stewards page's project view and detail views (BB-85)", () => {
   });
 });
 
+// BB-119: a configured project whose stewards are off on this server shows a
+// notice at the top of the project view (with an inline Turn on switch and a
+// pointer to the settings), and the picker marks it off.
+describe("the Stewards page's off-project notice (BB-119)", () => {
+  const renderOff = async (options: { enabled: boolean; projects?: Array<{ projectId: string; name: string; enabled: boolean }>; onEnable?: (args: { projectId: string; enabled: boolean }) => void }): Promise<RenderedSlot> => {
+    const captured = await loadApp();
+    const panel = captured.navPanels[0]!;
+    let enabled = options.enabled;
+    return renderSlot(panel, { subPath: "p1" }, {
+      rpc: {
+        stewardsBoard: () => ({
+          projects: options.projects ?? [{ projectId: "p1", name: "Acme", enabled }],
+          board: {
+            projectId: "p1",
+            name: "Acme",
+            enabled,
+            paused: false,
+            projectStewardThreadId: "thr_p",
+            stages: [],
+            digest: null,
+            questions: [],
+            withUser: [],
+            needs: [],
+            lessons: [],
+            lessonCounts: { candidate: 0, trial: 0, promoted: 0, retired: 0 },
+            stewards: [],
+            stuck: [],
+            ended: [],
+          },
+        }),
+        stewardsSetProjectEnabled: (args: { projectId: string; enabled: boolean }) => {
+          options.onEnable?.(args);
+          enabled = args.enabled;
+          return { ok: true, message: "on", enabled: args.enabled };
+        },
+      } as never,
+    });
+  };
+
+  it("explains an off project with the three facts, the switch and the settings pointer, and shows no notice for an on one", async () => {
+    const off = await renderOff({ enabled: false });
+    const notice = await waitFor(() => off.getByText(/Stewards are off for this project on this server/u));
+    expect(notice.textContent).toContain("nothing is adopted");
+    expect(notice.textContent).toContain("no steward is woken");
+    expect(notice.textContent).toContain("labels do nothing");
+    expect(off.getByText(/per-server setting/u)).toBeTruthy();
+    expect(off.getByText(/Settings → Plugins → Stewards → Status/u)).toBeTruthy();
+    expect(off.getByRole("switch", { name: "Stewards for Acme" })).toBeTruthy();
+    off.lifecycle.unmount();
+
+    const on = await renderOff({ enabled: true });
+    await waitFor(() => expect(on.getByText("Acme")).toBeTruthy());
+    expect(on.queryByText(/Stewards are off for this project/u)).toBeNull();
+    expect(on.queryByRole("switch", { name: "Stewards for Acme" })).toBeNull();
+    on.lifecycle.unmount();
+  });
+
+  it("calls stewardsSetProjectEnabled on Turn on and drops the notice after the refresh", async () => {
+    const calls: Array<{ projectId: string; enabled: boolean }> = [];
+    const slot = await renderOff({ enabled: false, onEnable: (args) => calls.push(args) });
+    const toggle = await waitFor(() => slot.getByRole("switch", { name: "Stewards for Acme" }));
+    fireEvent.click(toggle);
+    await waitFor(() => expect(calls).toEqual([{ projectId: "p1", enabled: true }]));
+    await waitFor(() => expect(slot.queryByText(/Stewards are off for this project/u)).toBeNull());
+    slot.lifecycle.unmount();
+  });
+
+  it("marks off projects with the off badge in the picker", async () => {
+    const slot = await renderOff({
+      enabled: false,
+      projects: [
+        { projectId: "p1", name: "Acme", enabled: false },
+        { projectId: "p2", name: "Beta", enabled: true },
+      ],
+    });
+    const acme = await waitFor(() => slot.getByRole("button", { name: /Acme/u }));
+    const beta = slot.getByRole("button", { name: /Beta/u });
+    expect(acme.textContent).toContain("off");
+    expect(beta.textContent).not.toContain("off");
+    slot.lifecycle.unmount();
+  });
+});
