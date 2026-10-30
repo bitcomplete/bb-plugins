@@ -2,7 +2,7 @@
 
 Talk to your own bb from Slack. One team Slack app named `bb` is installed
 once; a DM to it reaches the server of the Slack user who sent it, which runs
-a bb thread and replies in the same Slack thread.
+a bb thread on the first message and replies in the same Slack thread.
 
 A DM and the first channel mention in a conversation reach the server of the
 Slack user who sent them. The first routed mention in a conversation sets its
@@ -35,7 +35,9 @@ on the pod.
 - **The wake.** A DM from that user arrives as `event: session`,
   `source: "slack"` on the same SSE stream the Linear plugin uses. The plugin
   maps the conversation (`channel:thread`) to one bb thread: the first message
-  spawns it, a follow-up is sent to it.
+  spawns it, a follow-up is sent to it. Opening the assistant pane sends
+  `assistant_thread_started`, which posts a canned one-line greeting and
+  starts no bb thread; the first real message then spawns the thread as usual.
 - **Replies.** The plugin never holds the bot token. `slack_reply` posts
   through bb-gate-hooks with the connection id and the text; the service posts
   as the app. `assistant.threads.setStatus` shows a thinking indicator while
