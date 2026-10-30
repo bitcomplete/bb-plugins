@@ -136,8 +136,16 @@ export function createMultiRepoHostEntry() {
           input.message,
           context.signal,
           input.layout ?? "standalone",
+          input.publish,
         );
-        return { committed: result.committed, head: result.head, message: result.message };
+        return {
+          ok: result.ok,
+          committed: result.committed,
+          head: result.head,
+          mode: result.mode,
+          prUrl: result.prUrl,
+          message: result.message,
+        };
       },
 
       async discoverCheckouts(input, context) {

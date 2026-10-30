@@ -302,6 +302,7 @@ export function ReposPanel() {
   const [suggestions, setSuggestions] = useState<DiscoveredCheckout[]>([]);
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<string[] | null>(null);
+  const [published, setPublished] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
   const [jsonOpen, setJsonOpen] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -343,6 +344,7 @@ export function ReposPanel() {
     setLoadError(null);
     setDraft(null);
     setSaveError(null);
+    setPublished(null);
   }, [projectId]);
 
   useEffect(load, [load]);
@@ -379,12 +381,30 @@ export function ReposPanel() {
     [view?.cache],
   );
 
+  /** The line a successful write's publish result should show in the panel. */
+  const publishMessage = (result: {
+    mode: "push" | "pull-request" | null;
+    prUrl: string | null;
+    message: string | null;
+  }): string | null => {
+    if (result.message !== null) return result.message;
+    if (result.mode === "pull-request") {
+      return result.prUrl === null ? "Opened a pull request for the change." : `Opened ${result.prUrl} for the change.`;
+    }
+    if (result.mode === "push") return "Pushed the change to origin.";
+    return null;
+  };
+
   const addRepo = useCallback(
     async (repo: RepoSeed): Promise<string | null> => {
       if (projectId === null) return "No project selected.";
       const result = await rpc.call("addRepo", { projectId, repo });
-      if (result.ok) load();
-      return result.ok ? null : result.error;
+      if (result.ok) {
+        setPublished(publishMessage(result));
+        load();
+        return null;
+      }
+      return result.error;
     },
     [rpc, projectId, load],
   );
@@ -393,8 +413,12 @@ export function ReposPanel() {
     async (dir: string): Promise<string | null> => {
       if (projectId === null) return "No project selected.";
       const result = await rpc.call("removeRepo", { projectId, dir });
-      if (result.ok) load();
-      return result.ok ? null : result.error;
+      if (result.ok) {
+        setPublished(publishMessage(result));
+        load();
+        return null;
+      }
+      return result.error;
     },
     [rpc, projectId, load],
   );
@@ -403,8 +427,12 @@ export function ReposPanel() {
     async (dir: string, branch: string | null): Promise<string | null> => {
       if (projectId === null) return "No project selected.";
       const result = await rpc.call("setRepoBranch", { projectId, dir, branch });
-      if (result.ok) load();
-      return result.ok ? null : result.error;
+      if (result.ok) {
+        setPublished(publishMessage(result));
+        load();
+        return null;
+      }
+      return result.error;
     },
     [rpc, projectId, load],
   );
@@ -441,6 +469,7 @@ export function ReposPanel() {
       .call("saveRepoSet", { projectId, reposJson: draft })
       .then((result) => {
         if (result.ok) {
+          setPublished(publishMessage(result));
           setDraft(null);
           load();
         } else {
@@ -546,6 +575,13 @@ export function ReposPanel() {
                 <li key={line}>{line}</li>
               ))}
             </ul>
+          </div>
+        )}
+
+        {!creating && published !== null && (
+          <div className="bg-muted/40 rounded-md border px-3 py-2 text-xs">
+            <div className="font-medium">Change published</div>
+            <div className="text-muted-foreground mt-1 break-all">{published}</div>
           </div>
         )}
 

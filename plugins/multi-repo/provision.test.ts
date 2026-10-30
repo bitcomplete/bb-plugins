@@ -497,6 +497,12 @@ describe("merging a published lesson branch", () => {
     await bootstrapProjectSource(canonical, EMPTY_REPOS);
     await gitIn(canonical, ["config", "user.email", "test@example.invalid"]);
     await gitIn(canonical, ["config", "user.name", "Test"]);
+    // `AGENTS.md` defaults to a pull request in a standalone repo. These tests
+    // exercise the self-merge mechanics, so pin the policy to `push`; the
+    // pull-request half is covered in `publish.test.ts`.
+    await writeFile(path.join(canonical, "repos.json"), '{"version":1,"repos":[],"publish":"push"}\n', "utf8");
+    await gitIn(canonical, ["add", "--", "repos.json"]);
+    await gitIn(canonical, ["commit", "--quiet", "-m", "push policy"]);
     const workspaceBb = path.join(scratch, "lesson-workspace");
     await git(["clone", "--quiet", canonical, workspaceBb]);
     await gitIn(workspaceBb, ["config", "user.email", "test@example.invalid"]);

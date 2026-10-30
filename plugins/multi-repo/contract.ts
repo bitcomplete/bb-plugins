@@ -20,6 +20,17 @@ export const projectLayoutSchema = z.enum(["standalone", "primary"]);
 export type ProjectLayoutValue = z.infer<typeof projectLayoutSchema>;
 
 /**
+ * The `publish` policy, mirrored from `repos.ts` to keep this module safe for
+ * the frontend bundle: `repos.ts` reaches `paths.ts`, which needs
+ * `node:crypto`. The enum is the whole of the shape the host contract carries,
+ * and `repos.ts` owns the strict parse that rejects an unknown value.
+ */
+const publishPolicySchema = z.union([
+  z.enum(["push", "pull-request"]),
+  z.record(z.string().min(1).max(PROJECT_FILE_PATH_MAX), z.enum(["push", "pull-request"])),
+]);
+
+/**
  * Commits on the project checkout's default branch that its origin lacks.
  *
  * Computed host-side at `create()` and carried in the workspace manifest so
@@ -298,7 +309,7 @@ export const hostContract = defineRpcContract({
       .strict(),
   },
 
-  /** Write `repos.json` in the canonical checkout and commit it. */
+  /** Write `repos.json` in the canonical checkout and publish it by the project's policy. */
   writeProjectSourceRepos: {
     input: z
       .object({
@@ -307,13 +318,25 @@ export const hostContract = defineRpcContract({
         message: z.string().min(1).max(300),
         /** Which layout's definition path to write; defaults to `standalone`. */
         layout: projectLayoutSchema.optional(),
+        /**
+         * The `publish` policy parsed from the file being written. Kept a
+         * separate, optional field so the host does not re-parse, and so a
+         * caller on an older server image that does not send it gets the
+         * layout defaults.
+         */
+        publish: publishPolicySchema.optional(),
       })
       .strict(),
     output: z
       .object({
+        ok: z.boolean(),
         committed: z.boolean(),
         head: z.string().max(64).nullable(),
-        /** Why the commit did not happen, when it did not. */
+        /** `push` or `pull-request`; the mode the policy resolved to. */
+        mode: z.enum(["push", "pull-request"]),
+        /** The pull request opened or found, for `pull-request`. */
+        prUrl: z.string().max(600).nullable(),
+        /** Why the publish failed, or a note; null on a clean success. */
         message: z.string().max(600).nullable(),
       })
       .strict(),
@@ -686,7 +709,16 @@ export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
 /** The outcome of one structured edit to `repos.json`. */
 export const editResultSchema = z
-  .object({ ok: z.boolean(), error: z.string().max(2000).nullable() })
+  .object({
+    ok: z.boolean(),
+    error: z.string().max(2000).nullable(),
+    /** How the write reached `origin`; null when it did not get that far. */
+    mode: z.enum(["push", "pull-request"]).nullable(),
+    /** The pull request opened or found, for `pull-request`. */
+    prUrl: z.string().max(600).nullable(),
+    /** A note (for example, no remote), or why the publish failed. */
+    message: z.string().max(600).nullable(),
+  })
   .strict();
 
 export const rpcContract = defineRpcContract({
@@ -777,7 +809,17 @@ export const rpcContract = defineRpcContract({
     input: z
       .object({ projectId: z.string().min(1).max(100), reposJson: z.string().max(200_000) })
       .strict(),
-    output: z.object({ ok: z.boolean(), error: z.string().max(2000).nullable() }).strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        error: z.string().max(2000).nullable(),
+        /** How the write reached `origin`; null when it did not get that far. */
+        mode: z.enum(["push", "pull-request"]).nullable(),
+        prUrl: z.string().max(600).nullable(),
+        /** A note (for example, no remote), or why the publish failed. */
+        message: z.string().max(600).nullable(),
+      })
+      .strict(),
   },
 
   /*

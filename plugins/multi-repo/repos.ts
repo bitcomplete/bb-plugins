@@ -15,7 +15,7 @@
  * filesystem, no git — the caller owns both ends.
  */
 import { z } from "zod";
-import { PROJECT_SOURCE_DIR } from "./paths.js";
+import { PROJECT_SOURCE_DIR, type ProjectLayout } from "./paths.js";
 import { PROJECT_FILE_PATH_MAX, dirFromUrl, isSafeSegment, normalizeRemoteUrl, projectFilePathProblem } from "./names.js";
 
 export { dirFromUrl };
@@ -129,6 +129,48 @@ export function publishPolicyProblem(value: unknown): string | null {
     }
   }
   return null;
+}
+
+/**
+ * The publish mode for one `.bb`-relative path, from the policy and layout.
+ *
+ * Precedence: an explicit policy value wins; a policy object's most specific
+ * matching key wins; otherwise the layout default applies. The defaults are
+ * the settled ones from BB-148 deliverable 2:
+ *
+ * - A **primary** project's `.bb/` sits on a code repo's default branch, so
+ *   every path — `repos.json` included — is reviewed like code and defaults to
+ *   `pull-request`; `push` is opt-in through the key.
+ * - A **standalone** `.bb` repo's `repos.json` is a mechanical one-line diff
+ *   and defaults to `push`; `AGENTS.md`, `skills/`, `stewards/` and anything
+ *   else default to `pull-request`.
+ *
+ * Pure, so the defaults and the split are testable without git or a server.
+ */
+export function resolvePublishMode(
+  policy: PublishPolicy | undefined,
+  layout: ProjectLayout,
+  relativePath: string,
+): PublishMode {
+  const target = relativePath.replace(/^\.\//u, "").replace(/^\/+/u, "");
+  if (typeof policy === "string") return policy;
+  if (policy !== undefined) {
+    let best: { key: string; mode: PublishMode } | null = null;
+    for (const [key, mode] of Object.entries(policy)) {
+      if (!publishKeyMatches(key, target)) continue;
+      // Longest key wins, so `stewards/playbooks/` beats `stewards/`.
+      if (best === null || key.length > best.key.length) best = { key, mode };
+    }
+    if (best !== null) return best.mode;
+  }
+  if (layout === "primary") return "pull-request";
+  return target === REPOS_FILE ? "push" : "pull-request";
+}
+
+/** Whether a policy key names `target`: the path itself, or a directory above it. */
+function publishKeyMatches(key: string, target: string): boolean {
+  if (key.endsWith("/")) return target === key.slice(0, -1) || target.startsWith(key);
+  return target === key || target.startsWith(`${key}/`);
 }
 
 export const reposFileInputSchema = z
