@@ -26,10 +26,21 @@ describe("toMrkdwn", () => {
     expect(toMrkdwn("#no space is not a heading")).toBe("#no space is not a heading");
   });
 
+  it("does not double the bold on a heading that is already bold", () => {
+    expect(toMrkdwn("# **Title**")).toBe("*Title*");
+    expect(toMrkdwn("# a **b**")).toBe("a *b*");
+    expect(toMrkdwn("# _Title_")).toBe("_Title_");
+  });
+
   it("turns a Markdown link into a Slack link and leaves a bare URL alone", () => {
     expect(toMrkdwn("[label](https://example.com)")).toBe("<https://example.com|label>");
     expect(toMrkdwn("see https://example.com now")).toBe("see https://example.com now");
     expect(toMrkdwn("[a](https://x.test) and [b](https://y.test)")).toBe("<https://x.test|a> and <https://y.test|b>");
+  });
+
+  it("keeps a link token well-formed when the URL holds >, < or |", () => {
+    expect(toMrkdwn("[x](https://e.test/a>b)")).toBe("<https://e.test/a%3Eb|x>");
+    expect(toMrkdwn("[x](https://e.test/a|b)")).toBe("<https://e.test/a%7Cb|x>");
   });
 
   it("escapes &, < and > in plain text", () => {
@@ -74,5 +85,9 @@ describe("toMrkdwn", () => {
   it("leaves an unmatched marker and unrelated text alone", () => {
     expect(toMrkdwn("2 * 3 = 6")).toBe("2 * 3 = 6");
     expect(toMrkdwn("plain text, no Markdown")).toBe("plain text, no Markdown");
+  });
+
+  it("still reads headings and lists when the lines end with CRLF", () => {
+    expect(toMrkdwn("# Head\r\n- item\r\n**bold**")).toBe("*Head*\n• item\n*bold*");
   });
 });

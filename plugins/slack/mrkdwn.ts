@@ -40,7 +40,7 @@ function convertText(text: string): string {
   while ((match = pattern.exec(text)) !== null) {
     out += escapeText(text.slice(last, match.index));
     const [, label, url, boldStars, boldUnders, strike, italicStar, italicUnders] = match;
-    if (url !== undefined) out += `<${url}|${escapeText(label ?? "")}>`;
+    if (url !== undefined) out += `<${url.replace(/[<>|]/gu, (c) => encodeURIComponent(c))}|${escapeText(label ?? "")}>`;
     else if (boldStars !== undefined || boldUnders !== undefined) out += `*${escapeText(boldStars ?? boldUnders ?? "")}*`;
     else if (strike !== undefined) out += `~${escapeText(strike)}~`;
     else out += `_${escapeText(italicStar ?? italicUnders ?? "")}_`;
@@ -98,7 +98,14 @@ function convertLine(line: string): string {
   const trimmed = line.trimStart();
   const indent = line.slice(0, line.length - trimmed.length);
   const heading = /^#{1,6}[ \t]+(.+)$/u.exec(trimmed);
-  if (heading !== null) return `${indent}*${convertInline(heading[1]!)}*`;
+  if (heading !== null) {
+    const converted = convertInline(heading[1]!);
+    // Slack has no nested bold. If the content is already emphasis, or carries
+    // its own bold, do not wrap it again: `# **Title**` would otherwise become
+    // `**Title**` and render with stray asterisks.
+    if (converted.includes("*") || /^[*_].*[*_]$/su.test(converted)) return `${indent}${converted}`;
+    return `${indent}*${converted}*`;
+  }
   const list = /^[-*][ \t]+(.+)$/u.exec(trimmed);
   if (list !== null) return `${indent}• ${convertInline(list[1]!)}`;
   return indent + convertInline(trimmed);
@@ -122,7 +129,8 @@ export function toMrkdwn(input: string): string {
         out.push(`${indent}${fence}`);
         continue;
       }
-      out.push(convertLine(line));
+      // A CRLF line ending would otherwise hide the heading or list marker.
+      out.push(convertLine(line.replace(/\r$/u, "")));
       continue;
     }
     if (marks !== null && marks[2]!.trim() === "" && marks[1]!.length >= fence.length) fence = null;
