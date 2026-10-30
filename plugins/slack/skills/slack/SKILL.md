@@ -35,6 +35,10 @@ reply per Slack message:
   connection id and the text, so never put a token or secret in it.
 - Each Slack message gets one reply. A second `slack_reply` for the same
   message is refused; a new Slack message is a new wake and can be answered.
+- The session is leased to this server: the wake carries an opaque capability
+  that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
+  half its life. Reply rights therefore survive a restart of bb-gate-hooks and
+  are not limited to a day.
 - If the turn that handled a wake ends without calling `slack_reply`, the
   plugin posts one error reply itself, so the developer is not left waiting.
 - While the turn runs the plugin sets the Slack assistant status to
@@ -46,10 +50,9 @@ reply per Slack message:
 - "This thread is not answering a Slack conversation": the wake has no session
   mapped to this thread, or the bb thread it was mapped to was deleted and the
   mapping was forgotten. A new Slack message starts a new thread.
-- "bb-gate-hooks refused: this Slack conversation was not routed to this
-  server's Slack user": the service did not route the session here, its last
-  message was more than a day ago, or the service restarted. Nothing was
-  posted.
+- "bb-gate-hooks refused: this Slack conversation is not routed to this
+  server's Slack user": the service did not route the session here and no
+  live lease holds it. Nothing was posted.
 - "not connected to bb-gate-hooks": the server's stream is reconnecting, or
   the server has no `BB_HOOKS_URL`. Try again, or ask the developer to check
   Settings → Plugins → Slack.

@@ -38,6 +38,12 @@ on the pod.
   as the app. `assistant.threads.setStatus` shows a thinking indicator while
   the turn runs, and the bb thread's title is pushed with
   `assistant.threads.setTitle`.
+- **Ownership.** Each wake carries an opaque capability for the session, and
+  the plugin echoes it to `POST /v1/subscribe` after every `hello` and at half
+  the lease's life. The lease is the owner of record, so reply rights survive a
+  restart of bb-gate-hooks and a gap longer than the old 24-hour route window.
+  Archiving the bb thread drops the session from the renewal set; a session
+  the service says another server owns gets one backstop reply.
 - **No reply.** If a turn that handled a wake ends without calling
   `slack_reply`, the plugin posts one error reply itself, so every message
   gets an answer.

@@ -28,6 +28,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
   return {
     source: "slack",
     session: "D0123:1712345678.901234",
+    capability: "",
     action: "message",
     mention: false,
     channel: "D0123",

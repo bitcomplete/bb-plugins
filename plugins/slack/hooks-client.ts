@@ -1,10 +1,12 @@
 // The subscriber side of bb-gate-hooks for Slack (bb-gate/docs/hooks.md,
 // "Slack agent"): one SSE stream, carrying `event: session` wakes for the one
-// server bound to a Slack user. There are no leases and no doorbells; Slack
-// has no entities to watch. The connection id from the hello is also what the
-// sign-in start/exchange and the reply/status/title calls name, so this module
-// owns them all and the pod never holds a Slack credential beyond the
-// developer's own sign-in token.
+// server bound to a Slack user. A wake carries an opaque `capability`, and the
+// session it names is leased on `POST /v1/subscribe`, so ownership and reply
+// rights survive a restart or a gap longer than the route window. Slack has no
+// doorbells. The connection id from the hello is also what the sign-in
+// start/exchange and the reply/status/title calls name, so this module owns
+// them all and the pod never holds a Slack credential beyond the developer's
+// own sign-in token.
 //
 // Everything that touches the world is injected: fetch, the clock, the token,
 // and what to do on a wake. The token goes into one request body and nowhere
@@ -123,6 +125,13 @@ export const sessionEventSchema = z
     source: z.literal(SOURCE),
     /** Empty on an `invited` or `block_action` wake: there is no conversation. */
     session: z.string().max(200),
+    /**
+     * The opaque proof that this session belongs to `owner`, echoed to
+     * `POST /v1/subscribe` to lease it. Empty (and omitted) when `session` is
+     * empty, as on `invited` and `block_action` wakes. Secret-like: it is
+     * never logged and never put in a wake's text.
+     */
+    capability: z.string().max(2000).default(""),
     action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
     /** True for a channel app_mention, false for a DM or assistant-thread event. */
     mention: z.boolean().default(false),
@@ -208,11 +217,51 @@ async function getJson<T>(fetchImpl: FetchLike, baseUrl: string, path: string, s
 
 /**
  * POST /v1/identify: prove which Slack user this server acts for, with the
- * developer's own sign-in token. Slack has no leases, so `teams` is empty.
- * The token goes into the body and nowhere else.
+ * developer's own sign-in token. `teams` is empty (Slack has no teams). The
+ * token goes into the body and nowhere else.
  */
 export function identify(fetchImpl: FetchLike, baseUrl: string, connection: string, token: string, signal: AbortSignal): Promise<IdentifyResponse> {
   return postJson(fetchImpl, baseUrl, "/v1/identify", { connection, source: SOURCE, token, teams: [] }, identifyResponseSchema, "identify", signal);
+}
+
+/** The service refuses more watches than this in one call (413). */
+export const SUBSCRIBE_BATCH = 100;
+
+/** A session lease: the owner of record for one Slack conversation. */
+export type SessionLease = { kind: "session"; id: string; capability: string };
+
+/** `POST /v1/subscribe`'s answer. */
+export const subscribeResponseSchema = z.object({
+  leases: z.array(z.object({ kind: z.string(), id: z.string() }).loose()).default([]),
+  rejected: z.array(z.object({ kind: z.string(), id: z.string(), reason: z.string() }).loose()).default([]),
+});
+export type SubscribeResponse = z.infer<typeof subscribeResponseSchema>;
+/** A lease the service refused; `reason` is `owned` or `forbidden`. */
+export type Rejection = SubscribeResponse["rejected"][number];
+
+/**
+ * POST /v1/subscribe for these session leases, in batches the service
+ * accepts. No token is needed and none is read: the connection's bound Slack
+ * user is the subject, and each capability must verify for that user. The
+ * capability goes into the body and nowhere else: never a log line, never an
+ * error message.
+ */
+export async function subscribe(fetchImpl: FetchLike, baseUrl: string, connection: string, leases: SessionLease[], signal: AbortSignal): Promise<SubscribeResponse> {
+  const merged: SubscribeResponse = { leases: [], rejected: [] };
+  for (let i = 0; i < leases.length; i += SUBSCRIBE_BATCH) {
+    const watches = leases.slice(i, i + SUBSCRIBE_BATCH).map(({ kind, id, capability }) => ({ kind, id, capability }));
+    const response = await fetchImpl(new URL("/v1/subscribe", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ connection, source: SOURCE, watches }),
+      signal,
+    });
+    if (!response.ok) throw new HooksRequestError(`bb-gate-hooks answered HTTP ${response.status} to subscribe`, response.status, await response.text().catch(() => ""));
+    const parsed = subscribeResponseSchema.parse(await response.json());
+    merged.leases.push(...parsed.leases);
+    merged.rejected.push(...parsed.rejected);
+  }
+  return merged;
 }
 
 /** POST /v1/slack/signin/start: mint a state and an authorize URL for this connection. */
@@ -322,6 +371,10 @@ export interface HooksLoopDeps {
   onSession: (event: SessionEvent) => void;
   /** The service's answer to an identify, for the settings view and logs. */
   onIdentified?: (identity: IdentifyResponse) => void;
+  /** Everything to hold a session lease for right now: one per live bb thread. */
+  leases?: () => SessionLease[];
+  /** Leases the service refused. The caller decides what each reason means. */
+  onRejected?: (rejections: Rejection[]) => void;
   /** A new connection's hello, for housekeeping that belongs to a fresh stream. */
   onHello?: () => void;
   /** The service refused this token (401): it is bad, expired or revoked, so sign in again. */
@@ -384,6 +437,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
   /** Aborting this drops the current stream so the outer loop reconnects. */
   let stream: AbortController | null = null;
   let identifyUnsupportedLogged = false;
+  let wrongUrlLogged = false;
 
   let state: HooksState["state"] = "stopped";
   let stateSince = deps.now();
@@ -440,6 +494,54 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
     }
   }
 
+  /**
+   * Lease every live session on the current connection. A 404 means the
+   * connection is gone and drops the stream. Never throws: a failed renewal
+   * costs ownership until the next one, and the route table still routes.
+   */
+  async function leaseNow(signal: AbortSignal): Promise<void> {
+    if (connection === null) return;
+    // A lease is proved by the connection's bound Slack user, which identify
+    // establishes; without a token there is nobody to lease for.
+    const token = deps.identity();
+    if (token === null || token === "") return;
+    const leases = deps.leases?.() ?? [];
+    if (leases.length === 0) return;
+    const current = connection;
+    try {
+      const result = await subscribe(deps.fetch, deps.baseUrl, current, leases, signal);
+      if (connection !== current) return;
+      if (result.rejected.length > 0) deps.onRejected?.(result.rejected);
+    } catch (error) {
+      if (signal.aborted) return;
+      if (error instanceof HooksRequestError && error.status === 404) {
+        if (error.unknownConnection) {
+          if (connection === current) {
+            deps.log.warn("bb-gate-hooks forgot our connection; reconnecting");
+            stream?.abort();
+          }
+          return;
+        }
+        if (!wrongUrlLogged) {
+          wrongUrlLogged = true;
+          deps.log.warn(`${HOOKS_URL_ENV} looks wrong: ${deps.baseUrl} answers 404 to /v1/subscribe without naming the connection`);
+        }
+        return;
+      }
+      deps.log.warn(`Slack session lease failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Prove the identity and lease every live session. Identify runs first so
+   * the lease has a bound user to prove against. Never throws: it runs from
+   * timers and the hello.
+   */
+  async function renew(signal: AbortSignal): Promise<void> {
+    await identifyNow(signal);
+    await leaseNow(signal);
+  }
+
   async function consume(body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<void> {
     let renewTimer: ReturnType<typeof setInterval> | null = null;
     try {
@@ -455,10 +557,11 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
           leaseMs = hello.data.leaseSeconds === undefined ? timing.defaultLeaseMs : hello.data.leaseSeconds * 1000;
           deps.log.info(`Slack: connected to bb-gate-hooks as ${connection}`);
           deps.onHello?.();
-          // Not awaited: wakes behind the hello must not wait for identify.
-          void identifyNow(signal);
+          // Not awaited: wakes behind the hello must not wait for identify or
+          // the leases. Identify runs first so the lease has a bound user.
+          void renew(signal);
           if (renewTimer !== null) clearInterval(renewTimer);
-          renewTimer = setInterval(() => void identifyNow(signal), Math.max(1000, leaseMs * timing.renewFraction));
+          renewTimer = setInterval(() => void renew(signal), Math.max(1000, leaseMs * timing.renewFraction));
         } else if (event.event === "session") {
           let parsed: unknown;
           try {
@@ -496,7 +599,7 @@ export function createHooksLoop(deps: HooksLoopDeps): HooksLoop {
 
     async reidentify() {
       if (connection === null || stream === null) return;
-      await identifyNow(stream.signal);
+      await renew(stream.signal);
     },
 
     reconnect() {

@@ -28,6 +28,7 @@ function fakeHooks() {
   const ephemerals: Array<Record<string, unknown>> = [];
   const responses: Array<{ url: string; body: Record<string, unknown> }> = [];
   const joins: Array<{ connection: string; channel: string }> = [];
+  const subscribes: Array<{ connection: string; source: string; watches: Array<{ kind: string; id: string; capability?: string }> }> = [];
   let botChannelRequests = 0;
   const state: {
     start: () => Response | Promise<Response>;
@@ -35,12 +36,14 @@ function fakeHooks() {
     identify: () => Response | Promise<Response>;
     botChannels: () => Response | Promise<Response>;
     join: () => Response | Promise<Response>;
+    subscribe: (body: (typeof subscribes)[number]) => Response | Promise<Response>;
   } = {
     start: () => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
     exchange: () => Response.json({ token: "xoxp-user-token" }),
     identify: () => Response.json({ user: { id: "U0123", name: "Alice" }, teams: [], rejected: [] }),
     botChannels: () => Response.json({ channels: ["C0123", "G0456"] }),
     join: () => Response.json({ ok: true }),
+    subscribe: (body) => Response.json({ leases: body.watches, rejected: [] }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const u = String(url);
@@ -62,6 +65,11 @@ function fakeHooks() {
       const body = JSON.parse(String(init?.body)) as (typeof identifies)[number];
       identifies.push(body);
       return state.identify();
+    }
+    if (u === `${HOOKS_URL}/v1/subscribe`) {
+      const body = JSON.parse(String(init?.body)) as (typeof subscribes)[number];
+      subscribes.push(body);
+      return state.subscribe(body);
     }
     if (u === `${HOOKS_URL}/v1/slack/signin/start`) {
       signinStarts.push(JSON.parse(String(init?.body)) as { connection: string });
@@ -112,6 +120,7 @@ function fakeHooks() {
     ephemerals,
     responses,
     joins,
+    subscribes,
     state,
     botChannelRequests: () => botChannelRequests,
     last: () => streams.at(-1)!,
@@ -340,6 +349,74 @@ describe("Slack plugin", () => {
     expect(sends).toHaveLength(1);
     expect(sends[0]![0]).toMatchObject({ threadId: "thr-1", mode: "auto" });
     expect(JSON.stringify(sends[0]![0])).toContain("also the SSO page");
+    await s.stop();
+  });
+
+  it("leases each live Slack session on the next hello and never logs the capability", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    // A fresh hello (a reconnect) re-subscribes every live session.
+    s.hooks.last().send(s.hooks.hello("c_2"));
+    await tick();
+    expect(s.hooks.subscribes).toEqual([
+      { connection: "c_2", source: "slack", watches: [{ kind: "session", id: "D0123:1712345678.901234", capability: "cap-secret" }] },
+    ]);
+    expect(s.harness.logEntries.map((l) => l.message).join("\n")).not.toContain("cap-secret");
+    await s.stop();
+  });
+
+  it("renews the session lease at half its life", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
+    await tick();
+    expect(s.hooks.subscribes).toEqual([]);
+    await tick(30 * 60 * 1000);
+    expect(s.hooks.subscribes.at(-1)?.watches).toEqual([{ kind: "session", id: "D0123:1712345678.901234", capability: "cap-secret" }]);
+    await s.stop();
+  });
+
+  it("keeps a live session past the old 24-hour window and still leases it", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
+    await tick();
+    s.advance(25 * 60 * 60 * 1000);
+    await s.tool("slack_reply", { text: "still here" }, { threadId: "thr-1" });
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, unknown>;
+    expect(Object.keys(stored)).toContain("D0123:1712345678.901234");
+    await s.stop();
+  });
+
+  it("drops a session from the renewal set when its thread is archived", async () => {
+    let spawned = 0;
+    const s = await live({ token: "xoxp-test", spawn: () => ({ id: `thr-${++spawned}` }) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-one" }));
+    await tick();
+    s.hooks.last().send(s.hooks.session({ session: "D9999:2.3", channel: "D9999", capability: "cap-two", comment: { text: "second", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.spawn")).toHaveLength(2);
+    await s.harness.behavior.emitThreadEvent("thread.archived", { thread: { id: "thr-1" } as never });
+    await tick(30 * 60 * 1000);
+    expect(s.hooks.subscribes.at(-1)?.watches).toEqual([{ kind: "session", id: "D9999:2.3", capability: "cap-two" }]);
+    await s.stop();
+  });
+
+  it("reports an owned rejection once, with a backstop reply and no capability", async () => {
+    const s = await live({ token: "xoxp-test" });
+    s.hooks.state.subscribe = (body) => Response.json({ leases: [], rejected: body.watches.map((w) => ({ kind: w.kind, id: w.id, reason: "owned" })) });
+    s.hooks.last().send(s.hooks.session({ capability: "cap-secret" }));
+    await tick();
+    s.hooks.last().send(s.hooks.hello("c_2"));
+    await tick();
+    const notice = () => s.hooks.messages.filter((m) => String(m.body.text).includes("Another bb server holds"));
+    expect(notice()).toHaveLength(1);
+    const logs = s.harness.logEntries.map((l) => l.message).join("\n");
+    expect(logs).toContain("another bb server holds");
+    expect(logs).not.toContain("cap-secret");
+    // The next renewal is rejected too, but the owner is told only once.
+    await tick(30 * 60 * 1000);
+    expect(notice()).toHaveLength(1);
     await s.stop();
   });
 

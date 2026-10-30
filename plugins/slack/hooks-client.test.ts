@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createHooksLoop, SseParser, sessionEventSchema } from "./hooks-client.js";
+import { createHooksLoop, HooksRequestError, SseParser, sessionEventSchema, subscribe } from "./hooks-client.js";
 
 const BASE = "http://bb-gate-hooks.test:8081";
 
@@ -79,6 +79,28 @@ describe("sessionEventSchema", () => {
   });
 });
 
+describe("subscribe", () => {
+  it("posts session leases with their capability and no token", async () => {
+    const bodies: unknown[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      expect(String(url)).toBe(`${BASE}/v1/subscribe`);
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({ leases: [{ kind: "session", id: "D1:1" }], rejected: [] });
+    }) as unknown as typeof fetch;
+    const result = await subscribe(fetchImpl, BASE, "c_1", [{ kind: "session", id: "D1:1", capability: "cap-secret" }], new AbortController().signal);
+    expect(bodies).toEqual([{ connection: "c_1", source: "slack", watches: [{ kind: "session", id: "D1:1", capability: "cap-secret" }] }]);
+    expect(JSON.stringify(bodies[0])).not.toContain("token");
+    expect(result.leases).toEqual([{ kind: "session", id: "D1:1" }]);
+  });
+
+  it("keeps the capability out of a failed request's message", async () => {
+    const fetchImpl = vi.fn(async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
+    const error = await subscribe(fetchImpl, BASE, "c_1", [{ kind: "session", id: "D1:1", capability: "cap-secret" }], new AbortController().signal).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(HooksRequestError);
+    expect(String((error as Error).message)).not.toContain("cap-secret");
+  });
+});
+
 describe("createHooksLoop", () => {
   it("identifies with source slack and no teams on the hello, and forwards a session wake", async () => {
     const encoder = new TextEncoder();
@@ -114,6 +136,55 @@ describe("createHooksLoop", () => {
     await vi.waitFor(() => expect(seen).toHaveLength(1));
     expect(identifies).toEqual([{ connection: "c_1", source: "slack", token: "tok", teams: [] }]);
     expect(loop.connectionId).toBe("c_1");
+    abort.abort();
+    await running;
+  });
+
+  it("leases the live sessions on the hello and hands rejections back", async () => {
+    const encoder = new TextEncoder();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let streamReady!: () => void;
+    const ready = new Promise<void>((resolve) => (streamReady = resolve));
+    const subscribes: unknown[] = [];
+    const rejected: unknown[] = [];
+    const logs: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      const u = String(url);
+      if (u === `${BASE}/v1/events`) {
+        const body = new ReadableStream<Uint8Array>({
+          start: (c) => {
+            controller = c;
+            streamReady();
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      if (u === `${BASE}/v1/identify`) return Response.json({ user: { id: "U1", name: "Alice" }, teams: [], rejected: [] });
+      if (u === `${BASE}/v1/subscribe`) {
+        subscribes.push(JSON.parse(String(init?.body)));
+        return Response.json({ leases: [], rejected: [{ kind: "session", id: "D1:1", reason: "owned" }] });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const loop = createHooksLoop({
+      fetch: fetchImpl,
+      baseUrl: BASE,
+      now: () => 1,
+      log: { info: (m) => logs.push(m), warn: (m) => logs.push(m) },
+      identity: () => "tok",
+      leases: () => [{ kind: "session", id: "D1:1", capability: "cap-secret" }],
+      onRejected: (r) => rejected.push(r),
+      onSession: () => undefined,
+    });
+    const abort = new AbortController();
+    const running = loop.run(abort.signal);
+    await ready;
+    controller.enqueue(encoder.encode(`event: hello\ndata: ${JSON.stringify({ connection: "c_1", leaseSeconds: 3600 })}\n\n`));
+    await vi.waitFor(() => expect(subscribes).toHaveLength(1));
+    expect(subscribes[0]).toEqual({ connection: "c_1", source: "slack", watches: [{ kind: "session", id: "D1:1", capability: "cap-secret" }] });
+    expect(rejected).toEqual([[{ kind: "session", id: "D1:1", reason: "owned" }]]);
+    expect(logs.join("\n")).not.toContain("cap-secret");
     abort.abort();
     await running;
   });
