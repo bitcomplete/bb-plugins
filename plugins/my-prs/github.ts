@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { feedbackOf } from "./feedback.js";
-import type { PullRequest } from "./types.js";
+import { statusSchema, type PullRequest } from "./types.js";
 
 const run = promisify(execFile);
 export type Transport = (query: string, variables: Record<string, string>, signal?: AbortSignal) => Promise<unknown>;
@@ -10,7 +10,7 @@ const envelope = z.object({ data: z.unknown().optional(), message: z.string().op
 
 export class GithubRateLimitError extends Error {
   constructor(readonly retryAt: string) {
-    super(`GitHub's API allowance is temporarily exhausted. Try again after ${new Date(retryAt).toUTCString()}. Your inbox was kept.`);
+    super(`GitHub's API allowance is temporarily exhausted. Try again after ${new Date(retryAt).toUTCString()}. Your PR snapshot was kept.`);
   }
 }
 
@@ -45,7 +45,7 @@ export function githubTransport(token?: string): Transport {
     if (token?.trim()) {
       const response = await fetch("https://api.github.com/graphql", {
         method: "POST", signal: abort,
-        headers: { authorization: `Bearer ${token.trim()}`, "content-type": "application/json", "user-agent": "bb-plugin-pr-inbox" },
+        headers: { authorization: `Bearer ${token.trim()}`, "content-type": "application/json", "user-agent": "bb-plugin-my-prs" },
         body: JSON.stringify({ query, variables }),
       });
       return responseData(await response.json(), response.headers, response.status);
@@ -80,16 +80,21 @@ export const metadataSchema = z.object({
   id: z.string(), number: z.number().int().positive(), title: z.string(), url: z.string(), isDraft: z.boolean(),
   headRefOid: z.string(), headRefName: z.string(), updatedAt: z.string(), author: actor,
   repository: z.object({ nameWithOwner: z.string() }),
-  commits: z.object({ nodes: z.array(z.object({ commit: z.object({ committedDate: z.string() }) })) }),
+  reviewDecision: statusSchema.shape.reviewDecision.default(null),
+  mergeable: statusSchema.shape.mergeable.default("UNKNOWN"),
+  mergeStateStatus: z.string().default("UNKNOWN"),
+  commits: z.object({ nodes: z.array(z.object({ commit: z.object({ committedDate: z.string(),
+    statusCheckRollup: z.object({ state: statusSchema.shape.checks }).nullable().default(null),
+  }) })) }),
 });
 export type Metadata = z.infer<typeof metadataSchema>;
 export type Review = z.infer<typeof reviewSchema>;
 export type Comment = z.infer<typeof commentSchema>;
 export type ReviewThread = z.infer<typeof threadSchema>;
 
-const metadataFields = `id number title url isDraft headRefOid headRefName updatedAt
+const metadataFields = `id number title url isDraft headRefOid headRefName updatedAt reviewDecision mergeable mergeStateStatus
   author { login __typename } repository { nameWithOwner }
-  commits(last:1) { nodes { commit { committedDate } } }`;
+  commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }`;
 const commentFields = "id body createdAt updatedAt author { login __typename }";
 const threadCommentFields = `${commentFields} pullRequestReview { id }`;
 const pageFields = "pageInfo { hasNextPage endCursor }";
@@ -108,10 +113,10 @@ export function createGithubClient(transport: Transport) {
       result.push(...next.nodes);
       if (!next.pageInfo.hasNextPage) return result;
       after = next.pageInfo.endCursor;
-      if (!after || cursors.has(after)) throw new Error("GitHub pagination did not advance; the previous inbox was kept.");
+      if (!after || cursors.has(after)) throw new Error("GitHub pagination did not advance; the previous PR snapshot was kept.");
       cursors.add(after);
     }
-    throw new Error("GitHub exceeded the pagination limit; the previous inbox was kept.");
+    throw new Error("GitHub exceeded the pagination limit; the previous PR snapshot was kept.");
   }
 
   async function field<T extends z.ZodType>(options: {
@@ -173,7 +178,7 @@ export function createGithubClient(transport: Transport) {
 
   return {
     fetchPullRequest,
-    async fetchInbox(allowlist: string[], signal?: AbortSignal): Promise<{ login: string; prs: PullRequest[] }> {
+    async fetchMyPrs(allowlist: string[], signal?: AbortSignal): Promise<{ login: string; prs: PullRequest[] }> {
       const { viewer } = z.object({ viewer: z.object({ login: z.string() }) }).parse(
         await transport("query { viewer { login } }", {}, signal));
       const searchSchema = z.object({ search: z.object({ nodes: z.array(metadataSchema), pageInfo, issueCount: z.number() }) });
@@ -183,7 +188,7 @@ export function createGithubClient(transport: Transport) {
         } }`, variables: { search: `is:pr is:open author:${viewer.login}` }, schema: metadataSchema, signal,
         read: (data) => {
           const { search } = searchSchema.parse(data);
-          if (search.issueCount > 1000) throw new Error("GitHub search exceeds 1,000 open PRs; the previous inbox was kept.");
+          if (search.issueCount > 1000) throw new Error("GitHub search exceeds 1,000 open PRs; the previous PR snapshot was kept.");
           return search;
         },
       });

@@ -16,7 +16,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [slack](plugins/slack) | Sign in with Slack once; a DM to the team's bb app reaches your bb and replies in the Slack thread |
 | [github-watcher](plugins/github-watcher) | Lets a thread watch a GitHub pull request or issue with the server's `gh` login and be woken when reviews, checks, comments or state change |
 | [stewards](plugins/stewards) | Gives a labelled Linear ticket or GitHub pull request, and every teammate's pull request, a long-lived thread that manages it as you by a playbook in `.bb` |
-| [My PRs](plugins/pr-inbox) | Human feedback waiting on your authored PRs, with dismiss and Address comments |
+| [My PRs](plugins/my-prs) | Human feedback waiting on your authored PRs, with dismiss and Address comments |
 | [repo-dashboard](plugins/repo-dashboard) | Shows weekly pull request activity by contributor for Parsley Health, Bit Complete, and Cscc |
 | [review-watch](plugins/review-watch) | Queues the GitHub pull requests that need your review and opens a thread for one when you press Start |
 

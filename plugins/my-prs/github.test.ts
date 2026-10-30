@@ -25,20 +25,20 @@ describe("GitHub reads", () => {
       }
       return base(query, variables, signal);
     };
-    const result = await createGithubClient(transport).fetchInbox([]);
+    const result = await createGithubClient(transport).fetchMyPrs([]);
     expect(seen).toEqual(["first", "review-page-2"]);
     expect(result.prs[0]?.turn?.why).toContain("1 open thread");
   });
   it("refuses a truncated search or repeating pagination cursor", async () => {
     const truncated: Transport = async (query) => query.includes("{ viewer {") ? { viewer: { login: "me" } } : { search: { ...page([]), issueCount: 1001 } };
-    await expect(createGithubClient(truncated).fetchInbox([])).rejects.toThrow("1,000");
+    await expect(createGithubClient(truncated).fetchMyPrs([])).rejects.toThrow("1,000");
     const repeat: Transport = async (query) => query.includes("{ viewer {") ? { viewer: { login: "me" } } : { search: { nodes: [], issueCount: 1, pageInfo: { hasNextPage: true, endCursor: "same" } } };
-    await expect(createGithubClient(repeat).fetchInbox([])).rejects.toThrow("did not advance");
+    await expect(createGithubClient(repeat).fetchMyPrs([])).rejects.toThrow("did not advance");
   });
   it("filters repository allowlists case insensitively before reading feedback", async () => {
-    const result = await createGithubClient(transportFor(() => [fixture()])).fetchInbox(["EXAMPLE/EDITOR"]);
+    const result = await createGithubClient(transportFor(() => [fixture()])).fetchMyPrs(["EXAMPLE/EDITOR"]);
     expect(result.prs).toHaveLength(1);
-    expect((await createGithubClient(transportFor(() => [fixture()])).fetchInbox(["other/repo"])).prs).toEqual([]);
+    expect((await createGithubClient(transportFor(() => [fixture()])).fetchMyPrs(["other/repo"])).prs).toEqual([]);
   });
 });
 

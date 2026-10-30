@@ -10,7 +10,7 @@
     { "name": "html-preview", "source": "./plugins/html-preview" },
     { "name": "image-copy", "source": "./plugins/image-copy" },
     { "name": "repo-dashboard", "source": "./plugins/repo-dashboard" },
-    { "name": "pr-inbox", "source": "./plugins/pr-inbox" },
+    { "name": "my-prs", "source": "./plugins/my-prs" },
     { "name": "thread-briefs", "source": "./plugins/thread-briefs" },
     { "name": "multi-repo", "source": "./plugins/multi-repo" },
     { "name": "team-setup", "source": "./plugins/team-setup" },

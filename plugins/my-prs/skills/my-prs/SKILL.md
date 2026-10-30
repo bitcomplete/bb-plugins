@@ -1,12 +1,12 @@
 ---
-name: pr-inbox
+name: my-prs
 description: Read the Your turn list in My PRs, refresh GitHub feedback, dismiss rows, or start a thread to address selected PRs.
 ---
 
 # My PRs
 
-Use `bb pr-inbox list --json` for the current snapshot and
-`bb pr-inbox poll --json` for fresh GitHub state. `status` reports the last
+Use `bb my-prs list --json` for the current snapshot and
+`bb my-prs poll --json` for fresh GitHub state. `status` reports the last
 poll and its error. PR ids come from each row's `id` field. `holdUntil` is null for active rows or
 the ISO timestamp when a temporary hold ends. Held rows are excluded from
 Your turn counts and cannot be dispatched until resumed or expired.

@@ -9,7 +9,7 @@ const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const dispose of cleanup.splice(0)) await dispose(); });
 async function setup(settings: Record<string, unknown> = {}) {
   const data = [fixture(), fixture(2)]; let fail = false;
-  const host = createFakePluginHost({ pluginId: "pr-inbox", settings: { project: "project-test", ...settings }, sdk: { threads: {
+  const host = createFakePluginHost({ pluginId: "my-prs", settings: { project: "project-test", ...settings }, sdk: { threads: {
     spawn: async () => makeThreadResponse({ id: "thread-address" }),
     get: async () => makeThreadResponse({ id: "thread-address", status: "idle" }),
   } } });
@@ -29,7 +29,7 @@ async function setup(settings: Record<string, unknown> = {}) {
   const factory = createPlugin({ transport: (query, variables, signal) => { reads.push({ query, id: variables.id }); if (fail) throw new Error("GitHub unavailable"); return base(query, variables, signal); } });
   await factory(host.bb);
   const rpc = host.harness.behavior.callRpc;
-  const view = async () => viewSchema.parse(await rpc("inbox_get", null));
+  const view = async () => viewSchema.parse(await rpc("prs_get", null));
   await rpc("poll_now", null);
   return { ...host, data, rpc, view, factory, reads, fail: () => { fail = true; } };
 }
@@ -45,10 +45,10 @@ describe("My PRs behavior", () => {
     expect((await env.view()).rows[0]?.dismissed).toBe(true);
     const next = await env.harness.lifecycle.reload(env.factory);
     cleanup.push(() => next.harness.lifecycle.dispose());
-    expect(viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null)).rows[0]?.dismissed).toBe(true);
+    expect(viewSchema.parse(await next.harness.behavior.callRpc("prs_get", null)).rows[0]?.dismissed).toBe(true);
     env.data[0]?.comments.push(comment());
     await next.harness.behavior.callRpc("poll_now", null);
-    expect(viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null)).rows[0]?.dismissed).toBe(false);
+    expect(viewSchema.parse(await next.harness.behavior.callRpc("prs_get", null)).rows[0]?.dismissed).toBe(false);
   });
   it("starts one batch thread from selected PRs, retains its links, and blocks duplicates", async () => {
     const env = await setup(); const items = (await env.view()).rows.map(({ id, activity }) => ({ id, activity }));
@@ -89,7 +89,7 @@ describe("My PRs behavior", () => {
     expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
   });
   it("aborts an in-flight GitHub read when the background service stops", async () => {
-    const host = createFakePluginHost({ pluginId: "pr-inbox", settings: { project: "project-test" } });
+    const host = createFakePluginHost({ pluginId: "my-prs", settings: { project: "project-test" } });
     cleanup.push(() => host.harness.lifecycle.dispose());
     let ready = () => {};
     const started = new Promise<void>((resolve) => { ready = resolve; });
@@ -121,7 +121,7 @@ it("persists holds through reload and new feedback, blocks dispatch, then expire
   cleanup.push(() => next.harness.lifecycle.dispose());
   env.data[0]?.comments.push(comment());
   await next.harness.behavior.callRpc("poll_now", null);
-  const read = async () => viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null));
+  const read = async () => viewSchema.parse(await next.harness.behavior.callRpc("prs_get", null));
   expect((await read()).rows.find((row) => row.id === selection.id)?.holdUntil).toBe(until);
   const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse(until));
   try { expect((await read()).rows.find((row) => row.id === selection.id)?.holdUntil).toBeNull(); }
@@ -141,7 +141,7 @@ it("validates hold times and stale activity, and allows early resume", async () 
 
 it("reads saved state from before holds were introduced without losing dismissal or dispatch", async () => {
   const env = await setup(); const selection = await firstSelection(env);
-  env.bb.storage.database().prepare("INSERT OR REPLACE INTO inbox_state (id, body) VALUES (?, ?)").run(selection.id,
+  env.bb.storage.database().prepare("INSERT OR REPLACE INTO prs_state (id, body) VALUES (?, ?)").run(selection.id,
     JSON.stringify({ dismissedActivity: selection.activity, dispatch: { kind: "linked", threadId: "thread-address" } }));
   expect((await env.view()).rows.find((row) => row.id === selection.id)).toMatchObject({
     holdUntil: null, dismissed: true, dispatch: { kind: "linked", threadId: "thread-address" },
@@ -208,7 +208,7 @@ it("keeps the snapshot and suspends GitHub reads until reset, including after re
   cleanup.push(() => next.harness.lifecycle.dispose());
   const poll = await next.harness.behavior.callRpc("poll_now", null);
   expect(poll).toMatchObject({ error: expect.stringContaining("Try again after"), retryAt: expect.any(String) });
-  expect(viewSchema.parse(await next.harness.behavior.callRpc("inbox_get", null)).rows).toEqual(before.rows);
+  expect(viewSchema.parse(await next.harness.behavior.callRpc("prs_get", null)).rows).toEqual(before.rows);
   await next.harness.behavior.callRpc("poll_now", null);
   next.harness.inspection.sdk.stub("projects.get", async () => ({ sources: [{ hostId: "devbox-host", path: "/project-checkout", isDefault: true }] }));
   await expect(next.harness.behavior.callRpc("address", { items: [item] })).rejects.toThrow("Try again after");

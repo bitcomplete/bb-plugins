@@ -1,13 +1,14 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { importLegacy } from "./import-legacy.js";
 import { parseOrganizationProjects, projectChoiceSchema, suggestedProject } from "./projects.js";
 import { createGithubClient, githubTransport, GithubRateLimitError, type Transport } from "./github.js";
 import { pollSchema, pullRequestSchema, savedStateSchema, selectionSchema, viewSchema,
   type PullRequest, type Row, type SavedState, type Selection } from "./types.js";
 
 export const rpcContract = defineRpcContract({
-  inbox_get: { input: z.null(), output: viewSchema },
+  prs_get: { input: z.null(), output: viewSchema },
   poll_now: { input: z.null(), output: pollSchema },
   dismiss: { input: selectionSchema.extend({ dismissed: z.boolean() }), output: z.object({ ok: z.literal(true) }) },
   hold: { input: selectionSchema.extend({ until: z.string().datetime().nullable() }), output: z.object({ ok: z.literal(true) }) },
@@ -53,21 +54,21 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     let current = await settings.get();
     const db = bb.storage.database();
     bb.storage.migrate(db, [
-      "CREATE TABLE inbox_prs (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
-      "CREATE TABLE inbox_state (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+      "CREATE TABLE prs (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
+      "CREATE TABLE prs_state (id TEXT PRIMARY KEY, body TEXT NOT NULL)",
     ]);
     const bodySchema = z.object({ body: z.string() });
-    const readPrs = () => db.prepare("SELECT body FROM inbox_prs").all()
+    const readPrs = () => db.prepare("SELECT body FROM prs").all()
       .map((row) => pullRequestSchema.parse(JSON.parse(bodySchema.parse(row).body)));
     const readState = (id: string): SavedState => {
-      const row = db.prepare("SELECT body FROM inbox_state WHERE id = ?").get(id);
+      const row = db.prepare("SELECT body FROM prs_state WHERE id = ?").get(id);
       return row ? savedStateSchema.parse(JSON.parse(bodySchema.parse(row).body)) : { dismissedActivity: null, dispatch: { kind: "none" }, holdUntil: null };
     };
     const saveState = (id: string, value: SavedState) => {
-      db.prepare("INSERT OR REPLACE INTO inbox_state (id, body) VALUES (?, ?)").run(id, JSON.stringify(value));
-      bb.realtime.publish("inbox-changed", {});
+      db.prepare("INSERT OR REPLACE INTO prs_state (id, body) VALUES (?, ?)").run(id, JSON.stringify(value));
+      bb.realtime.publish("prs-changed", {});
     };
-    for (const row of db.prepare("SELECT id, body FROM inbox_state").all()) {
+    for (const row of db.prepare("SELECT id, body FROM prs_state").all()) {
       const parsed = z.object({ id: z.string(), body: z.string() }).parse(row);
       const state = savedStateSchema.parse(JSON.parse(parsed.body));
       if (state.dispatch.kind === "starting") saveState(parsed.id, { ...state,
@@ -79,10 +80,10 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     settings.onChange((next) => {
       if (current.githubToken !== next.githubToken || current.repoAllowlist !== next.repoAllowlist) {
         revision++;
-        db.prepare("DELETE FROM inbox_prs").run();
+        db.prepare("DELETE FROM prs").run();
       }
       current = next;
-      bb.realtime.publish("inbox-changed", {});
+      bb.realtime.publish("prs-changed", {});
     });
 
     const readPoll = async () => {
@@ -113,15 +114,15 @@ export function createPlugin(options: { transport?: Transport } = {}) {
         let result: z.infer<typeof pollSchema>;
         try {
           const client = githubClient();
-          const inbox = await client.fetchInbox(current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean), AbortSignal.any([signal, lifecycle.signal]));
+          const snapshot = await client.fetchMyPrs(current.repoAllowlist.split(",").map((repo) => repo.trim()).filter(Boolean), AbortSignal.any([signal, lifecycle.signal]));
           if (revision !== startedRevision) throw new Error("GitHub settings changed during refresh. Refresh again.");
           db.transaction(() => {
-            db.prepare("DELETE FROM inbox_prs").run();
-            const insert = db.prepare("INSERT INTO inbox_prs (id, body) VALUES (?, ?)");
-            for (const pr of inbox.prs) insert.run(pr.id, JSON.stringify(pr));
+            db.prepare("DELETE FROM prs").run();
+            const insert = db.prepare("INSERT INTO prs (id, body) VALUES (?, ?)");
+            for (const pr of snapshot.prs) insert.run(pr.id, JSON.stringify(pr));
           })();
           const at = new Date().toISOString();
-          result = { at, login: inbox.login, error: null, lastSuccess: at, retryAt: null };
+          result = { at, login: snapshot.login, error: null, lastSuccess: at, retryAt: null };
         } catch (cause) {
           if (lifecycle.signal.aborted || signal.aborted) throw cause;
           const error = cause instanceof Error ? cause.message : String(cause);
@@ -130,7 +131,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
             lastSuccess: previous?.lastSuccess ?? null, error, retryAt: cause instanceof GithubRateLimitError ? cause.retryAt : null };
         }
         await bb.storage.kv.set("poll", result);
-        bb.realtime.publish("inbox-changed", {});
+        bb.realtime.publish("prs-changed", {});
         return result;
       })().finally(() => { polling = null; });
       return polling;
@@ -183,11 +184,11 @@ export function createPlugin(options: { transport?: Transport } = {}) {
       db.transaction(() => {
         for (const [index, item] of items.entries()) {
           const pr = refreshed[index];
-          if (pr) db.prepare("INSERT OR REPLACE INTO inbox_prs (id, body) VALUES (?, ?)").run(pr.id, JSON.stringify(pr));
-          else db.prepare("DELETE FROM inbox_prs WHERE id = ?").run(item.id);
+          if (pr) db.prepare("INSERT OR REPLACE INTO prs (id, body) VALUES (?, ?)").run(pr.id, JSON.stringify(pr));
+          else db.prepare("DELETE FROM prs WHERE id = ?").run(item.id);
         }
       })();
-      bb.realtime.publish("inbox-changed", {});
+      bb.realtime.publish("prs-changed", {});
       const selected = items.map((item) => {
         const pr = checked(item), state = readState(pr.id);
         if (!pr.turn || state.dismissedActivity === pr.activity) throw new Error(`${pr.repo}#${pr.number} no longer waits on you.`);
@@ -217,7 +218,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     }
 
     const handlers = {
-      inbox_get: view, poll_now: () => poll(),
+      prs_get: view, poll_now: () => poll(),
       dismiss: async ({ id, activity, dismissed }: Selection & { dismissed: boolean }) => {
         checked({ id, activity });
         saveState(id, { ...readState(id), dismissedActivity: dismissed ? activity : null });
@@ -254,13 +255,18 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     };
     bb.rpc.register(rpcContract, handlers);
     bb.cli.register({
-      name: "pr-inbox", summary: "Read and address human feedback on your pull requests",
-      commands: ["list", "poll", "status", "dismiss", "restore", "address", "clear"].map((name) => ({ name, summary: `${name} My PRs`, usage: `bb pr-inbox ${name} [PR-id...] [--json]` })),
+      name: "my-prs", summary: "Read and address human feedback on your pull requests",
+      commands: ["list", "poll", "status", "dismiss", "restore", "address", "clear", "import"].map((name) => ({ name, summary: `${name} My PRs`, usage: `bb my-prs ${name} [PR-id...] [--json]` })),
       async run(argv) {
         const [command, ...ids] = argv.filter((arg) => arg !== "--json");
         try {
           let result: unknown;
-          if (command === "poll") result = await poll();
+          if (command === "import") {
+            if (polling) await polling;
+            result = await importLegacy(bb, (values) => settings.experimental_set(values), Boolean(current.githubToken));
+            retryAt = await bb.storage.kv.get<string>("github-retry-at");
+          }
+          else if (command === "poll") result = await poll();
           else if (command === "status") result = await readPoll();
           else if (command === "list" || !command) result = await view();
           else if (command === "address") {
@@ -276,7 +282,7 @@ export function createPlugin(options: { transport?: Transport } = {}) {
             } else throw new Error("Unknown command. Use list, poll, status, dismiss, restore, address, or clear.");
           } else throw new Error("Supply one PR id, or a list of PR ids for address.");
           const stdout = JSON.stringify(result, null, argv.includes("--json") ? undefined : 2);
-          if (Buffer.byteLength(stdout) > 200_000) throw new Error("Inbox exceeds CLI output limit. Read it in the My PRs page.");
+          if (Buffer.byteLength(stdout) > 200_000) throw new Error("My PRs exceeds CLI output limit. Read it in the My PRs page.");
           return { exitCode: command === "poll" && (await readPoll())?.error ? 1 : 0, stdout };
         } catch (cause) { return { exitCode: 1, stderr: cause instanceof Error ? cause.message : String(cause) }; }
       },

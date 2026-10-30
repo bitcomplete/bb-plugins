@@ -9,10 +9,10 @@ review of other people's PRs. My PRs does not require Workstreams.
 Install the plugin from the collection:
 
 ```sh
-bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin pr-inbox --yes
-bb plugin config pr-inbox set project <project-id>
-bb plugin reload pr-inbox
-bb pr-inbox poll --json
+bb plugin install git:https://github.com/bitcomplete/bb-plugins.git@main --plugin my-prs --yes
+bb plugin config my-prs set project <project-id>
+bb plugin reload my-prs
+bb my-prs poll --json
 ```
 
 Open **My PRs** in the sidebar. The first successful refresh shows your open
@@ -20,12 +20,30 @@ PRs. By default, the poller uses the BB server's authenticated `gh`. If that
 server has no `gh` login, set the secret `githubToken` in the plugin settings.
 The token needs read access to the repositories you want to follow.
 
-The page uses Workstreams' PR layout: a blue **Your turn** section followed by
+The page uses Workstreams' PR layout: an amber **Your turn** section followed by
 an always-visible **Other open PRs** section, each with its own count and empty
 state. Within each section, it groups PRs alphabetically by GitHub organization,
 then by area. Its branch icon distinguishes My PRs in the sidebar.
 Groups come from PR title scopes, falling back to the repository name. Compact rows wrap titles in narrow
 panes and show feedback age and the linked thread's current status.
+
+A segmented overview and matching row dots show who has the ball: **Your turn**,
+**Conflicts / CI**, **Waiting on reviewer**, **Approved**, **Draft**, and **Held**.
+Each PR appears in one segment. Held PRs take precedence, followed by feedback
+waiting on you, drafts, conflicts or failed CI, approvals, and reviewer waits.
+Snapshots imported before status collection show **Status unknown** until refreshed.
+The reviewer summary flags PRs whose last GitHub update was at least four days ago.
+
+The page and badges share their snapshot and in-flight reads. Returning shows
+cached PRs immediately; data older than 15 seconds refreshes in the background.
+Realtime changes invalidate the snapshot immediately. A failed refresh keeps the
+last successful view, and hidden windows skip periodic reads.
+
+For an existing installation under the previous plugin identity, keep it enabled
+while running `bb my-prs import --json`. This copies settings, saved PRs, holds,
+dismissals, thread links, and rate-limit state once. If a secret GitHub token is
+configured, set it in My PRs first. Then disable the previous plugin and run
+`bb my-prs poll --json`. Repeating the import leaves current state intact.
 
 The header and navigation badge show the number of PRs on Your turn. The
 navigation badge clears when nothing needs your response. This requires a BB
@@ -76,11 +94,11 @@ Workstreams' local **Confirm handled** records do not transfer to My PRs.
 
 GitHub search, reviews, conversation comments, review requests, review threads,
 and comments inside threads all paginate. The search limit is 1,000 open authored
-PRs. An incomplete or failed read keeps the last successful inbox and displays
+PRs. An incomplete or failed read keeps the last successful PR snapshot and displays
 an error. Address reads only the selected PRs and checks their current heads and
 feedback before dispatch. Each PR’s initial feedback connections share one
 request; further pages load only when needed. If GitHub rate limits a request,
-the plugin keeps the inbox and pauses API reads until the reported reset time,
+the plugin keeps the PR snapshot and pauses API reads until the reported reset time,
 including across plugin reloads.
 
 ## Settings
@@ -101,13 +119,13 @@ refresh. The project picker works even when no default project is configured.
 ## CLI
 
 ```sh
-bb pr-inbox list --json
-bb pr-inbox status --json
-bb pr-inbox poll --json
-bb pr-inbox dismiss <PR-node-id>
-bb pr-inbox restore <PR-node-id>
-bb pr-inbox address <PR-node-id> [<PR-node-id>...]
-bb pr-inbox clear <PR-node-id>
+bb my-prs list --json
+bb my-prs status --json
+bb my-prs poll --json
+bb my-prs dismiss <PR-node-id>
+bb my-prs restore <PR-node-id>
+bb my-prs address <PR-node-id> [<PR-node-id>...]
+bb my-prs clear <PR-node-id>
 ```
 
 Use the `id` field from `list`. Address accepts up to 20 distinct PRs. Dismiss,

@@ -7,7 +7,7 @@ not add a PR. Drafts stay visible when a person is waiting.
 
 Dismiss a PR until new commits or human feedback arrive. Restore it from the
 dismissed list whenever you want. Refresh manually or let the background poll
-keep the page current. Failed reads display an error and retain the previous inbox.
+keep the page current. Failed reads display an error and retain the previous PR snapshot.
 
 ## Address comments
 

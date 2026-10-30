@@ -6,7 +6,8 @@ export const page = <T>(nodes: T[]) => ({ nodes, pageInfo: { hasNextPage: false,
 export const metadata = (number = 1): Metadata => ({
   id: "PR_" + number, number, title: "Improve the editor " + number, url: "https://github.com/example/editor/pull/" + number,
   headRefOid: "a".repeat(40), headRefName: "fix-editor", updatedAt: at(12), isDraft: false,
-  author: actor("me"), repository: { nameWithOwner: "example/editor" }, commits: { nodes: [{ commit: { committedDate: at(8) } }] },
+  reviewDecision: "REVIEW_REQUIRED", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+  author: actor("me"), repository: { nameWithOwner: "example/editor" }, commits: { nodes: [{ commit: { committedDate: at(8), statusCheckRollup: { state: "SUCCESS" } } }] },
 });
 export const review = (patch: Partial<Review> = {}): Review => ({ id: "R1", author: actor("reviewer"), state: "COMMENTED", body: "Please fix this", submittedAt: at(10), ...patch });
 export const comment = (patch: Partial<Comment> = {}): Comment => ({ id: "C1", author: actor("reviewer"), body: "A question", createdAt: at(10), updatedAt: at(10), ...patch });
