@@ -19,6 +19,7 @@
  * ceiling is testable without a server.
  */
 
+import type { UnpushedSummary } from "./contract.js";
 import type { ProjectLayout } from "./paths.js";
 
 /** Core truncates a contribution at 4096 characters. Stay under it deliberately. */
@@ -61,8 +62,30 @@ export interface WorkspaceManifest {
   projectSourcePath: string;
   /** The default-branch commit `.bb/` was materialized from, for a primary project. */
   definitionBase: string | null;
+  /**
+   * Commits on the project checkout's default branch that `origin` does not
+   * have, when there are any. Computed once at `create()` and stored, because
+   * the instruction block is formatted synchronously and cannot run git.
+   */
+  unpushed: UnpushedSummary | null;
   repos: WorkspaceRepo[];
   createdAt: number;
+}
+
+/**
+ * How far the project checkout's default branch is ahead of its origin.
+ *
+ * `subjects` are the one-line subjects of those commits, newest first; they
+ * may be fewer than `count` when the list was capped. `branch` is the default
+ * branch the commits sit on, so the rendered push command can name it.
+ */
+export function formatUnpushedLine(summary: UnpushedSummary, projectSourcePath: string): string {
+  const commits = summary.count === 1 ? "1 commit" : `${summary.count} commits`;
+  const shown = summary.subjects.slice(0, 10);
+  const more = summary.count - shown.length;
+  const list = shown.length > 0 ? `: ${shown.join("; ")}${more > 0 ? `, and ${more} more` : ""}` : "";
+  const push = `git -C ${JSON.stringify(projectSourcePath)} push origin ${summary.branch}`;
+  return `${commits} on ${summary.branch} are live on this server only${list}. Push with: ${push}`;
 }
 
 /** The repos an agent can actually work in, in `repos.json` order. */
@@ -136,9 +159,13 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
   lines.push("");
   lines.push(
     manifest.layout === "primary"
-      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. In this workspace `.bb/` is a link to the primary clone's `.bb/`, so an edit under it is a working-tree change in that clone on this thread's branch. Changes to it are reviewed like code: commit them with the thread's pull request, or publish them on their own with `workspace_publish_guidance` (it commits for you on a `guidance-<thread>` branch)."
-      : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
+      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. In this workspace `.bb/` is a link to the primary clone's `.bb/`, so an edit under it is a working-tree change in that clone on this thread's branch. The Repos panel, `bb repos add`/`remove` and `workspace_add_repo` commit on the project checkout's `main` and do not push it; the plugin reads that local `main` while it is ahead of `origin/main`, so such a change is live on this server only. Guidance applies elsewhere only once it is on `origin/main` — publish a branch with `workspace_publish_guidance` and merge it there."
+      : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. The Repos panel, `bb repos add`/`remove` and `workspace_add_repo` commit on the project checkout's `main` and do not push it; the plugin reads that local `main` while it is ahead of `origin/main`, so such a change is live on this server only. Guidance applies elsewhere only once it is on `origin/main`.",
   );
+  if (manifest.unpushed !== null) {
+    lines.push("");
+    lines.push(`**Unpushed \`.bb\`.** ${formatUnpushedLine(manifest.unpushed, manifest.projectSourcePath)}`);
+  }
   lines.push("");
   lines.push(
     "Use `workspace_add_repo` to add a repo to this workspace without restarting the thread; the table above is fixed at thread start and will not show later additions.",

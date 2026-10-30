@@ -29,10 +29,12 @@ import {
   type RepoRequest,
   type RepoSeed,
   type RepoTarget,
+  type UnpushedSummary,
 } from "./contract.js";
 import {
   describeRepo,
   formatInstructions,
+  formatUnpushedLine,
   readyRepos,
   withSharedNotice,
   type WorkspaceManifest,
@@ -152,6 +154,10 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     // The default-branch commit `.bb/` was materialized from, so guidance
     // publish can warn when `.bb/` moved on the default branch since.
     `ALTER TABLE workspaces ADD COLUMN definition_base TEXT`,
+    // Commits on the project checkout's default branch its origin lacks, as
+    // JSON, or NULL when the branch is level. Computed once at create() so
+    // the synchronous instruction block can print the unpushed line.
+    `ALTER TABLE workspaces ADD COLUMN unpushed TEXT`,
   ]);
 
   const host = bb.hosts.experimental_client({
@@ -179,8 +185,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   function saveManifest(manifest: WorkspaceManifest): void {
     db.prepare(
       `INSERT INTO workspaces
-         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, definition_base, repos, instructions, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, definition_base, unpushed, repos, instructions, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (host_id, path_key) DO UPDATE SET
          thread_id = excluded.thread_id,
          project_id = excluded.project_id,
@@ -189,6 +195,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
          project_source_path = excluded.project_source_path,
          layout = excluded.layout,
          definition_base = excluded.definition_base,
+         unpushed = excluded.unpushed,
          repos = excluded.repos,
          instructions = excluded.instructions,
          created_at = excluded.created_at`,
@@ -202,6 +209,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       manifest.projectSourcePath,
       manifest.layout,
       manifest.definitionBase,
+      manifest.unpushed === null ? null : JSON.stringify(manifest.unpushed),
       JSON.stringify(manifest.repos),
       formatInstructions(manifest),
       manifest.createdAt,
@@ -220,6 +228,10 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         layout: row.layout === "primary" ? "primary" : "standalone",
         projectSourcePath: String(row.project_source_path),
         definitionBase: typeof row.definition_base === "string" ? row.definition_base : null,
+        unpushed:
+          typeof row.unpushed === "string" && row.unpushed.length > 0
+            ? (JSON.parse(row.unpushed) as UnpushedSummary)
+            : null,
         repos: JSON.parse(String(row.repos)) as WorkspaceRepo[],
         createdAt: Number(row.created_at),
       };
@@ -577,19 +589,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     location: SourceLocation,
     options: { bootstrap: boolean },
     signal?: AbortSignal,
-  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null; layout: ProjectLayout; remote: string | null }> {
+  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null; layout: ProjectLayout; remote: string | null; unpushed: UnpushedSummary | null }> {
     const prepared = await host.call(
       "prepareProjectSource",
       { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: options.bootstrap },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
     if (prepared.reposJson === null) {
-      return { text: null, file: EMPTY_REPOS, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote };
+      return { text: null, file: EMPTY_REPOS, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote, unpushed: prepared.unpushed };
     }
     const parsed = parseReposFile(prepared.reposJson);
     return parsed.ok
-      ? { text: prepared.reposJson, file: parsed.value, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote }
-      : { text: prepared.reposJson, file: null, error: parsed.error, layout: prepared.layout ?? "standalone", remote: prepared.remote };
+      ? { text: prepared.reposJson, file: parsed.value, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote, unpushed: prepared.unpushed }
+      : { text: prepared.reposJson, file: null, error: parsed.error, layout: prepared.layout ?? "standalone", remote: prepared.remote, unpushed: prepared.unpushed };
   }
 
   async function writeRepoSet(
@@ -896,6 +908,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           layout,
           projectSourcePath: location.path,
           definitionBase: provisioned.definitionBase,
+          unpushed: prepared.unpushed ?? null,
           repos: provisioned.repos,
           createdAt: Date.now(),
         };
@@ -1202,7 +1215,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     description:
       "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
     instructions:
-      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side on a guidance-<thread> branch cut from the default branch, leaving the thread's own branch alone — there is no need to commit inside .bb yourself. In the primary layout .bb/ is a link into the primary clone, so the same edits can instead be committed and pushed with the thread's code.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side on a guidance-<thread> branch cut from the default branch, leaving the thread's own branch alone — there is no need to commit inside .bb yourself. In the primary layout .bb/ is a link into the primary clone, so the same edits can instead be committed and pushed with the thread's code. Publishing to origin is best-effort: read the result message, which says whether the branch reached origin or only the local canonical checkout, and push it yourself when it did not.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {
@@ -1328,6 +1341,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                     source: location,
                     layout: set.layout,
                     primary: primaryView(set.remote),
+                    unpushed: set.unpushed,
                     repos: set.file.repos,
                     cache: cache.entries,
                   },
@@ -1354,6 +1368,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               exitCode: 0,
               stdout: [
                 `layout\t${set.layout}`,
+                ...(set.unpushed === null
+                  ? []
+                  : [`unpushed\t${formatUnpushedLine(set.unpushed, location.path)}`]),
                 "dir\tbranch\turl\tcache",
                 ...primaryLine,
                 ...lines,
