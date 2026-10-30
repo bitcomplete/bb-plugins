@@ -4,11 +4,11 @@ Talk to your own bb from Slack. One team Slack app named `bb` is installed
 once; a DM to it reaches the server of the Slack user who sent it, which runs
 a bb thread and replies in the same Slack thread.
 
-A DM and a channel mention of the app both reach the server of the Slack user
-who sent them. The first routed mention in a conversation sets its owner, and
-a later mention by someone else goes to that same server, held for the owner
-to confirm (see "Other people's text"). Posting as "Alice's bb" per message
-is a separate later step.
+A DM and the first channel mention in a conversation reach the server of the
+Slack user who sent them. The first routed mention in a conversation sets its
+owner, and a later mention by someone else goes to that same server, held for
+the owner to confirm (see "Other people's text"). Posting as "Alice's bb" per
+message is a separate later step.
 
 ## How it fits together
 
