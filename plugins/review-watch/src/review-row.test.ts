@@ -54,9 +54,9 @@ describe("an area", () => {
     const area = { key: "repo:inkwell/folio", label: "folio", repos: ["folio"], items: [item, next] };
     const now = Date.parse("2026-09-24T12:00:00Z");
     const children = area.items.map((entry) => createElement(ReviewRow, { key: entry.key, item: entry, now, busy: false, onPick: noop, onStart: noop, onDismiss: noop }));
-    const html = renderToStaticMarkup(createElement(AreaSection, { area, picked: new Set<string>(), onPickScope: noop, children }));
+    const html = renderToStaticMarkup(createElement(AreaSection, { area, children }));
     // The title closes, the card opens, and every row sits in it.
-    const card = html.match(/<\/h3><ul class="([^"]*)">(.*)<\/ul><\/section>$/u);
+    const card = html.match(/<\/h4><ul class="([^"]*)">(.*)<\/ul><\/section>$/u);
     expect(card).not.toBeNull();
     expect(card![1]!.split(" ")).toEqual(expect.arrayContaining("rounded-[10px] border border-border/50 bg-foreground/[0.015] px-2 py-1".split(" ")));
     expect(card![2]!.match(/<li /gu)).toHaveLength(2);

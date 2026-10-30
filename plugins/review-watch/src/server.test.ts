@@ -25,14 +25,27 @@ function item(number: number, rule: QueueItem["rule"] = "review-requested"): Que
   };
 }
 
-async function setup(items: QueueItem[], githubToken?: string) {
+async function setup(items: QueueItem[], githubToken?: string, organizationProjects = "{}") {
   const host = createFakePluginHost({ settings: {
     project: "project-test",
+    organizationProjects,
     ...(githubToken === undefined ? {} : { githubToken }),
   } });
   hosts.push(host);
   await host.bb.storage.kv.set("queue", items);
   host.harness.sdk.stub("threads.spawn", async () => ({ id: "thread-1" }));
+  host.harness.sdk.stub("projects.get", async () => ({
+    id: "project-test",
+    sources: [
+      { hostId: "server-host", path: "/wrong-checkout", isDefault: false },
+      { hostId: "devbox-host", path: "/project-checkout", isDefault: true },
+    ],
+  }));
+  host.harness.sdk.stub("projects.list", async () => [
+    { id: "project-test", name: "Default", sources: [{ isDefault: true }] },
+    { id: "project-parsley", name: "Parsley", sources: [{ isDefault: true }] },
+    { id: "project-no-checkout", name: "No checkout", sources: [] },
+  ]);
   await plugin(host.bb);
   return host;
 }
@@ -287,7 +300,51 @@ describe("refresh after a review-watch thread becomes idle", () => {
 });
 
 describe("batch review start", () => {
-  it("spawns one project-default thread and starts each selected review", async () => {
+  it("previews an organization mapping without starting a thread", async () => {
+    const first = { ...item(1), repo: "ParsleyHealth/sage" };
+    const host = await setup([first], undefined, '{"parsleyhealth":"project-parsley"}');
+    expect(await host.harness.behavior.callRpc("review_targets", { keys: [first.key] })).toEqual({
+      projects: [{ id: "project-test", name: "Default" }, { id: "project-parsley", name: "Parsley" }],
+      projectId: "project-parsley", reason: "organization",
+    });
+    expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    await host.harness.behavior.callRpc("item_start", { key: first.key });
+    expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({ projectId: "project-parsley" });
+  });
+
+  it("requires a choice for mixed projects, then honors an override and its machine", async () => {
+    const first = { ...item(1), repo: "parsleyhealth/sage" }, second = item(2);
+    const host = await setup([first, second], undefined, '{"parsleyhealth":"project-parsley"}');
+    const keys = [first.key, second.key];
+    expect(await host.harness.behavior.callRpc("review_targets", { keys })).toMatchObject({ projectId: null, reason: "mixed" });
+    await expect(host.harness.behavior.callRpc("item_batch_start", { keys })).rejects.toThrow("Choose one project");
+    expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(await host.bb.storage.kv.get("queue")).toEqual([first, second]);
+    host.harness.sdk.stub("projects.get", async ({ projectId }) => ({
+      id: projectId, sources: [{ isDefault: true, hostId: "parsley-host", path: "/home/dev/parsley" }],
+    }));
+    await host.harness.behavior.callRpc("item_batch_start", { keys, projectId: "project-parsley" });
+    expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
+      projectId: "project-parsley",
+      environment: { type: "host", hostId: "parsley-host", workspace: { type: "unmanaged", path: "/home/dev/parsley" } },
+    });
+  });
+
+  it("lets a single review override an organization mapping", async () => {
+    const first = item(1);
+    const host = await setup([first], undefined, '{"owner":"project-parsley"}');
+    await host.harness.behavior.callRpc("item_start", { key: first.key, projectId: "project-test" });
+    expect(host.harness.sdk.callsTo("projects.get")[0]?.[0]).toEqual({ projectId: "project-test" });
+    expect(host.harness.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({ projectId: "project-test" });
+  });
+
+  it("asks for a choice when a mapped project is unavailable", async () => {
+    const first = item(1);
+    const host = await setup([first], undefined, '{"owner":"project-deleted"}');
+    expect(await host.harness.behavior.callRpc("review_targets", { keys: [first.key] })).toMatchObject({ projectId: null, reason: "choose" });
+  });
+
+  it("starts selected reviews on the default checkout's remote machine", async () => {
     const first = item(1);
     const second = item(2, "review-followup");
     const host = await setup([first, second]);
@@ -307,7 +364,10 @@ describe("batch review start", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.[0]).toMatchObject({
       projectId: "project-test",
-      environment: { type: "project-default" },
+      environment: {
+        type: "host", hostId: "devbox-host",
+        workspace: { type: "unmanaged", path: "/project-checkout" },
+      },
     });
     const prompt = (calls[0]?.[0] as { prompt: string }).prompt;
     expect(prompt).toContain("owner/repo#1 (Fix review issue number 1)");
@@ -372,7 +432,20 @@ describe("batch review start", () => {
     expect(spawn.prompt).toContain(`Full title: ${followup.title}`);
     expect(spawn.prompt).toContain("`gh pr diff 4 -R owner/repo`");
     expect(spawn.prompt).toContain("If a matching local checkout exists");
-    expect(spawn.environment).toEqual({ type: "project-default" });
+    expect(spawn.environment).toEqual({
+      type: "host", hostId: "devbox-host",
+      workspace: { type: "unmanaged", path: "/project-checkout" },
+    });
+  });
+
+  it("leaves reviews queued when the project has no default checkout", async () => {
+    const first = item(3);
+    const host = await setup([first]);
+    host.harness.sdk.stub("projects.get", async () => ({ id: "project-test", sources: [] }));
+    await expect(host.harness.behavior.callRpc("item_batch_start", { keys: [first.key] }))
+      .rejects.toThrow("Choose a default project checkout");
+    expect(host.harness.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(await host.bb.storage.kv.get<QueueItem[]>("queue")).toEqual([first]);
   });
 
   it("uses gh as the source for an initial review", async () => {

@@ -2,7 +2,7 @@
 //
 // Start and Review N ask the server to spawn threads; Dismiss drops a row. The
 // page never talks to GitHub; the server's poller owns that.
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import * as HoverCard from "@radix-ui/react-hover-card";
 import {
   definePluginApp,
@@ -11,17 +11,19 @@ import {
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
+import type { ExperimentalBadge, PluginThreadHeaderActionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { groupByArea, type AreaGroup } from "./src/areas";
+import { groupByOrganization, type AreaGroup } from "./src/areas";
 import type { QueueItem, Rule } from "./src/types";
+import { ReviewProjectDialog } from "./review-project-dialog";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { createSnapshotCache, useSnapshot } from "./lib/snapshot-cache";
+import type { z } from "zod";
 
 /** The panel's route segment. Shared so every jump to it names one string. */
 const REVIEWS_PATH = "reviews";
-const REVIEWS_ICON = "review-watch/reviews";
 
 /** Headings, in the order a human should work them. */
 const SECTIONS: readonly { rule: Rule; title: string }[] = [
@@ -90,7 +92,7 @@ function PrRef({ repo, number, href, strong }: { repo: string; number: number; h
       title={`${repo} #${number}`}
       className={cn("flex w-[124px] shrink-0 justify-start gap-1 whitespace-nowrap rounded-sm text-muted-foreground hover:underline @min-[720px]:w-[156px]", RING)}
     >
-      {/* The org adds nothing in a personal inbox: the repository's own name, with the full slug in the title. */}
+      {/* The organization is shown above the group; keep the full slug in the title. */}
       <span className="min-w-0 truncate">{repo.split("/").pop()}</span>
       <b className={cn("shrink-0 font-medium", strong ? "text-foreground" : "text-foreground/80")}>#{number}</b>
     </UrlLink>
@@ -183,19 +185,15 @@ function QueueCountChip({
 function QueueCountChips({
   initial,
   followups,
-  sidebar = false,
 }: {
   initial: number;
   followups: number;
-  sidebar?: boolean;
 }) {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full border border-border bg-muted tabular-nums",
-        sidebar
-          ? "min-w-[3rem] justify-center gap-0.5 px-0.5 py-0.5"
-          : "gap-1.5 px-1.5 py-0.5",
+        "gap-1.5 px-1.5 py-0.5",
       )}
     >
       <QueueCountChip
@@ -211,28 +209,21 @@ function QueueCountChips({
 }
 
 /** The queue, kept current by the server's "queue-changed" signal. */
+export const queueCache = createSnapshotCache<z.infer<(typeof rpcContract)["queue_list"]["output"]>>();
+
 function useQueue() {
   const rpc = useRpc<typeof rpcContract>();
-  const [items, setItems] = useState<QueueItem[] | null>(null);
-  const [lastPoll, setLastPoll] = useState<LastPoll>(null);
   const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => rpc.call("queue_list"), [rpc]);
+  const snapshot = useSnapshot(queueCache, load);
   const report = useCallback((cause: unknown) => {
     setError(cause instanceof Error ? cause.message : String(cause));
   }, []);
-  const refetch = useCallback(() => {
-    rpc.call("queue_list").then((result) => {
-      setItems(result.items);
-      setLastPoll(result.lastPoll);
-      setError(null);
-    }, report);
-  }, [rpc, report]);
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
+  const refetch = useCallback(() => { setError(null); queueCache.refresh(load); }, [load]);
   // The poller publishes after every change it writes, so a pass that runs
   // while this page is open shows up without a reload.
   useRealtime("queue-changed", refetch);
-  return { rpc, items, lastPoll, error, report, refetch };
+  return { rpc, items: snapshot.data?.items ?? null, lastPoll: snapshot.data?.lastPoll ?? null, error: error ?? snapshot.error, report, refetch };
 }
 
 export function ReviewRow({
@@ -357,26 +348,14 @@ function ScopeCheckbox({
 /** An area's title, then its rows in a card under it. */
 export function AreaSection({
   area,
-  picked,
-  onPickScope,
   children,
 }: {
   area: AreaGroup;
-  picked: ReadonlySet<string>;
-  onPickScope: (keys: readonly string[], select: boolean) => void;
   children: ReactNode;
 }) {
   return (
     <section className="min-w-0" aria-label={area.label}>
-      {/* ml-9 puts the box over the rows' boxes (the card's margin, border, and
-          padding plus the row's pl-2), and gap-2 puts the label over their PR column. */}
-      <h3 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
-        <ScopeCheckbox
-          keys={area.items.filter(canBatchReview).map((item) => item.key)}
-          picked={picked}
-          label={area.label}
-          onPick={onPickScope}
-        />
+      <h4 className="ml-9 flex min-w-0 items-center gap-2 pb-0.5 pt-1.5 text-[11px] font-medium text-muted-foreground">
         <span className="min-w-0 truncate">
           {area.label}
           {area.repos.join(", ") === area.label ? null : (
@@ -384,7 +363,7 @@ export function AreaSection({
           )}
         </span>
         <span className="font-normal tabular-nums">{area.items.length}</span>
-      </h3>
+      </h4>
       {/* The card's edge lines up with the section's title, which keeps its rows where they were, under the area's title. */}
       <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>{children}</ul>
     </section>
@@ -395,6 +374,7 @@ function ReviewsPage() {
   const { rpc, items, lastPoll, error, report, refetch } = useQueue();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [reviewKeys, setReviewKeys] = useState<string[] | null>(null);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const anchor = useRef<string | null>(null);
   const [polling, setPolling] = useState(false);
@@ -404,9 +384,9 @@ function ReviewsPage() {
   const now = Date.now();
   const activeItems = items?.filter(isActiveItem) ?? [];
   const archivedItems = items?.filter((item) => item.state === "archived") ?? [];
-  const areas = groupByArea(activeItems);
+  const organizations = groupByOrganization(activeItems);
   // Selectable rows in drawn order: Shift ranges and the section's box use it.
-  const selectable = areas.flatMap((area) => area.items.filter(canBatchReview).map((item) => item.key));
+  const selectable = organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter(canBatchReview).map((item) => item.key)));
   const selection = selectable.filter((key) => picked.has(key));
 
   useEffect(() => {
@@ -428,36 +408,27 @@ function ReviewsPage() {
   };
   const clear = () => setPicked(new Set());
 
-  const startBatch = (keys: string[]) => {
-    if (keys.length < 2) return;
+  const startReviews = async (projectId: string) => {
+    if (reviewKeys === null) return;
     setBatchBusy(true);
-    rpc
-      .call("item_batch_start", { keys })
-      .then(
-        ({ threadId }) => {
-          clear();
-          refetch();
-          navigate.toThread(threadId);
-        },
-        report,
-      )
-      .finally(() => setBatchBusy(false));
+    try {
+      const result = reviewKeys.length === 1
+        ? await rpc.call("item_start", { key: reviewKeys[0]!, projectId }).then(({ item }) => ({ threadId: item.threadId }))
+        : await rpc.call("item_batch_start", { keys: reviewKeys, projectId });
+      if (result.threadId === undefined) throw new Error("Started review has no thread.");
+      clear();
+      setReviewKeys(null);
+      refetch();
+      navigate.toThread(result.threadId);
+    } finally { setBatchBusy(false); }
   };
 
-  const act = (key: string, method: "item_start" | "item_dismiss") => {
+  const dismiss = (key: string) => {
     setBusyKey(key);
     rpc
-      .call(method, { key })
-      .then(({ item }) => {
+      .call("item_dismiss", { key })
+      .then(() => {
         setPicked((keys) => new Set([...keys].filter((current) => current !== key)));
-        const threadId = item.threadId;
-        if (method === "item_start") {
-          if (threadId === undefined) {
-            report(new Error("Started review has no thread."));
-            return;
-          }
-          navigate.toThread(threadId);
-        }
         refetch();
       }, report)
       .finally(() => setBusyKey(null));
@@ -467,8 +438,7 @@ function ReviewsPage() {
   // One selected opens its own thread; two or more share one batch thread.
   const review = () => {
     if (starting || busyKey !== null) return;
-    if (selection.length === 1) act(selection[0]!, "item_start");
-    else startBatch(selection);
+    if (selection.length > 0) setReviewKeys(selection);
   };
 
   const poll = () => {
@@ -494,7 +464,7 @@ function ReviewsPage() {
       const root = rootRef.current;
       const active = document.activeElement;
       if (!root || (active && active !== document.body && !root.contains(active))) return;
-      if (event.metaKey || event.ctrlKey || event.altKey || typingTarget(event.target)) return;
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || typingTarget(event.target)) return;
       if (shortcut.current.count === 0) return;
       if (event.key === "Escape") {
         event.preventDefault();
@@ -512,12 +482,13 @@ function ReviewsPage() {
     item,
     now,
     busy: batchBusy || busyKey === item.key,
-    onStart: () => act(item.key, "item_start"),
-    onDismiss: () => act(item.key, "item_dismiss"),
+    onStart: () => setReviewKeys([item.key]),
+    onDismiss: () => dismiss(item.key),
   });
 
   return (
     <div ref={rootRef} className={cn("flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground", POINTER_CURSORS)}>
+      {reviewKeys === null ? null : <ReviewProjectDialog keys={reviewKeys} onClose={() => setReviewKeys(null)} onStart={startReviews} />}
       <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/70 px-3 py-1">
         <h1 className="text-[13px] font-semibold">Reviews</h1>
         <button
@@ -555,12 +526,17 @@ function ReviewsPage() {
                   {activeItems.length}
                 </span>
               </div>
-              {areas.length === 0 ? (
+              {organizations.length === 0 ? (
                 <p className={EMPTY}>Nothing waiting on you.</p>
               ) : (
                 <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-7 pb-1.5 pt-0.5">
-                  {areas.map((area) => (
-                    <AreaSection key={area.key} area={area} picked={picked} onPickScope={pickScope}>
+                  {organizations.map((organization) => <section key={organization.label} aria-label={`${organization.label} reviews`} className="min-w-0">
+                    <h3 className="ml-[19px] flex min-w-0 items-center gap-2 pb-1 pt-2 text-[12px] font-semibold">
+                      <span className="min-w-0 truncate">{organization.label}</span>
+                      <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span>
+                    </h3>
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3">
+                    {organization.areas.map((area) => <AreaSection key={area.key} area={area}>
                       {area.items.map((item) => (
                         <ReviewRow
                           key={item.key}
@@ -569,8 +545,9 @@ function ReviewsPage() {
                           onPick={(shift) => pick(item.key, shift)}
                         />
                       ))}
-                    </AreaSection>
-                  ))}
+                    </AreaSection>)}
+                    </div>
+                  </section>)}
                 </div>
               )}
               {archivedItems.length > 0 ? (
@@ -578,9 +555,14 @@ function ReviewsPage() {
                   <summary className={cn("ml-9 w-fit rounded-sm text-[11px] text-muted-foreground hover:text-foreground", RING)}>
                     {archivedItems.length} archived · show
                   </summary>
-                  <ul className={cn("ml-[19px] mt-0.5 grid list-none grid-cols-[minmax(0,1fr)] opacity-70", GROUP_CARD)}>
-                    {archivedItems.map((item) => <ReviewRow key={item.key} {...rowProps(item)} />)}
-                  </ul>
+                  <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 pt-2 opacity-70">
+                    {groupByOrganization(archivedItems).map((organization) => <section key={organization.label} aria-label={`${organization.label} archived`}>
+                      <h3 className="ml-9 pb-1 text-[12px] font-medium">{organization.label} <span className="text-[11px] font-normal tabular-nums text-muted-foreground">{organization.items.length}</span></h3>
+                      <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
+                        {organization.items.map((item) => <ReviewRow key={item.key} {...rowProps(item)} />)}
+                      </ul>
+                    </section>)}
+                  </div>
                 </details>
               ) : null}
             </section>
@@ -612,86 +594,21 @@ function ReviewsPage() {
   );
 }
 
-/**
- * How many items still want a human. Each caller keeps its own copy: the
- * header action mounts once per visible pane in a split layout, so the count
- * cannot live in a module-level singleton.
- */
+/** The page, badges, and split-pane headers read one shared queue snapshot. */
 function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
-  const rpc = useRpc<typeof rpcContract>();
-  const [activeReviews, setActiveReviews] = useState<QueueItem[]>([]);
-  const [lastPoll, setLastPoll] = useState<LastPoll>(null);
-  const refetch = useCallback(() => {
-    rpc.call("queue_list").then(
-      (result) => {
-        setActiveReviews(result.items.filter(isActiveItem));
-        setLastPoll(result.lastPoll);
-      },
-      // Keep the last queue response visible while a transient fetch fails.
-      () => {},
-    );
-  }, [rpc]);
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
-  useRealtime("queue-changed", refetch);
-  return { items: activeReviews, lastPoll };
+  const { items, lastPoll } = useQueue();
+  return { items: items?.filter(isActiveItem) ?? [], lastPoll };
 }
 
-// Registered icons lack PluginContext; the app overlay owns the live SDK hooks.
-let initialReviewCount = 0;
-const initialReviewListeners = new Set<() => void>();
-
-function ReviewIconSync() {
-  const { items } = useActiveReviewItems();
-  const initial = items.filter((item) => item.rule === "review-requested").length;
-  useEffect(() => {
-    if (initialReviewCount === initial) return;
-    initialReviewCount = initial;
-    for (const listener of initialReviewListeners) listener();
-  }, [initial]);
-  return null;
-}
-
-function ReviewsIcon({ className }: { className?: string }) {
-  const initial = useSyncExternalStore(
-    (listener) => {
-      initialReviewListeners.add(listener);
-      return () => { initialReviewListeners.delete(listener); };
-    },
-    () => initialReviewCount,
-  );
-  return (
-    <span className={className} style={{ position: "relative", display: "inline-flex" }} title={`${initial} initial reviews`}>
-      <Icon name="GitPullRequest" style={{ width: "100%", height: "100%" }} />
-      <span style={{ position: "absolute", right: -8, top: -6, display: "flex", height: 14, minWidth: 14, alignItems: "center", justifyContent: "center", borderRadius: 9999, border: "1px solid var(--background)", backgroundColor: "var(--color-sky-600, #0284c7)", padding: "0 2px", boxSizing: "border-box", fontSize: 9, fontWeight: 500, lineHeight: 1, color: "white", fontVariantNumeric: "tabular-nums" }}>
-        {initial > 99 ? "99+" : initial}
-      </span>
-    </span>
-  );
-}
-
-/**
- * The count on the sidebar row. No public SDK API lets a plugin raise a user
- * notification, so for a notify-only plugin this badge and the realtime signal
- * are the notification.
- */
-function QueuedBadge() {
+function useQueuedBadge(): ExperimentalBadge | null {
   const { items } = useActiveReviewItems();
   const initial = items.filter((item) => item.rule === "review-requested").length;
   const followups = items.filter((item) => item.rule === "review-followup").length;
-  return (
-    <span
-      role="img"
-      aria-label={`${initial} initial reviews, ${followups} follow-up reviews`}
-    >
-      <QueueCountChips
-        initial={initial}
-        followups={followups}
-        sidebar
-      />
-    </span>
-  );
+  return items.length > 0 ? {
+    count: items.length,
+    tone: followups > 0 ? "warning" : "neutral",
+    label: `${initial} initial reviews, ${followups} follow-up reviews`,
+  } : null;
 }
 
 /**
@@ -794,15 +711,13 @@ function QueuedHeaderAction({
 }
 
 export default definePluginApp((app) => {
-  app.experimental_icons.register({ name: REVIEWS_ICON, component: ReviewsIcon });
-  app.slots.experimental_appOverlay({ id: "review-icon-sync", component: ReviewIconSync });
   app.slots.navPanel({
     id: "reviews",
     title: "Reviews",
-    icon: REVIEWS_ICON,
+    icon: "GitPullRequest",
     path: REVIEWS_PATH,
     component: ReviewsPage,
-    experimental_sidebarAccessory: QueuedBadge,
+    experimental_useBadge: useQueuedBadge,
   });
   app.slots.experimental_threadHeaderAction({
     id: "queued-count",

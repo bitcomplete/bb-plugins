@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupByArea, scopeKey, titleScope } from "./areas.js";
+import { groupByArea, groupByOrganization, scopeKey, titleScope } from "./areas.js";
 import { itemKey, type QueueItem } from "./types.js";
 
 let next = 0;
@@ -119,4 +119,14 @@ describe("groupByArea", () => {
   it("returns no groups for an empty queue", () => {
     expect(groupByArea([])).toEqual([]);
   });
+});
+
+it("groups owners case-insensitively without merging shared scopes across owners", () => {
+  const parsley = queueItem("fix(catalog): one", "ParsleyHealth/sage");
+  const otherParsley = queueItem("feat(catalog): two", "parsleyhealth/store");
+  const bit = queueItem("fix(catalog): three", "bitcomplete/hiringloop");
+  const groups = groupByOrganization([parsley, bit, otherParsley]);
+  expect(groups.map((group) => group.label)).toEqual(["bitcomplete", "parsleyhealth"]);
+  expect(groups.map((group) => group.areas[0]?.items)).toEqual([[bit], [parsley, otherParsley]]);
+  expect(groupByOrganization([])).toEqual([]);
 });
