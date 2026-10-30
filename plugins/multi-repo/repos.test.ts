@@ -5,7 +5,9 @@ import {
   findRepo,
   parseReposFile,
   removeRepo,
+  resolveRepoEntry,
   serializeReposFile,
+  setRepoBranch,
   validateRepoSet,
   MAX_REPOS,
 } from "./repos.js";
@@ -54,6 +56,49 @@ describe("parseReposFile", () => {
 
   it("rejects comments, because the file is strict JSON", () => {
     expect(parseReposFile('{ "version": 1, /* nope */ "repos": [] }').ok).toBe(false);
+  });
+
+  it("infers a missing dir from the repo name", () => {
+    const parsed = parseReposFile(
+      JSON.stringify({ version: 1, repos: [{ url: "git@github.com:you/bb-dylan.git" }] }),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.repos[0].dir).toBe("bb-dylan");
+    expect(parsed.value.repos[0].inferredDir).toBe(true);
+  });
+
+  it("still catches a duplicate when one side's dir is inferred", () => {
+    const parsed = parseReposFile(
+      JSON.stringify({
+        version: 1,
+        repos: [{ dir: "repo", url: "https://example.com/a" }, { url: "https://example.com/repo" }],
+      }),
+    );
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("already used");
+  });
+
+  it("says so when a missing dir cannot be inferred", () => {
+    const parsed = parseReposFile(JSON.stringify({ version: 1, repos: [{ url: "https://github.com/you/.hidden" }] }));
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("repos[0]");
+    expect(parsed.error).toContain('"dir"');
+  });
+});
+
+describe("resolveRepoEntry", () => {
+  it("keeps an explicit dir and does not mark it inferred", () => {
+    expect(resolveRepoEntry({ dir: "mine", url: "https://example.com/theirs" })).toEqual({
+      dir: "mine",
+      url: "https://example.com/theirs",
+    });
+  });
+
+  it("returns null when the url yields no usable name", () => {
+    expect(resolveRepoEntry({ url: "/" })).toBeNull();
   });
 });
 
@@ -110,6 +155,26 @@ describe("serializeReposFile", () => {
     expect(again.value).toEqual(parsed.value);
   });
 
+  it("writes an inferred dir back out as the absence it was", () => {
+    const text = serializeReposFile({
+      version: 1,
+      repos: [
+        { dir: "bb-dylan", url: "git@github.com:you/bb-dylan.git", inferredDir: true },
+        { dir: "other", url: "https://example.com/repo" },
+      ],
+    });
+    expect(text).not.toContain('"dir": "bb-dylan"');
+    expect(text).toContain('"dir": "other"');
+    const again = parseReposFile(text);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(again.value.repos[0]).toEqual({
+      dir: "bb-dylan",
+      url: "git@github.com:you/bb-dylan.git",
+      inferredDir: true,
+    });
+  });
+
   it("writes keys in a fixed order so an edit is a one-line diff", () => {
     const text = serializeReposFile({ version: 1, repos: [{ branch: "x", url: "u", dir: "d" } as never] });
     expect(text.indexOf('"dir"')).toBeLessThan(text.indexOf('"url"'));
@@ -119,6 +184,18 @@ describe("serializeReposFile", () => {
 
 describe("edits", () => {
   const base = { version: 1 as const, repos: [{ dir: "a", url: "https://example.com/a" }] };
+
+  it("adds a repo with a dir inferred from its url", () => {
+    const result = addRepo(base, { url: "https://example.com/b.git" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.repos[1]).toEqual({ dir: "b", url: "https://example.com/b.git", inferredDir: true });
+  });
+
+  it("refuses an add whose dir cannot be inferred", () => {
+    const result = addRepo(base, { url: "/" });
+    expect(result.ok).toBe(false);
+  });
 
   it("adds a repo", () => {
     const result = addRepo(base, { dir: "b", url: "https://example.com/b" });
@@ -150,6 +227,27 @@ describe("edits", () => {
     expect(missing.ok).toBe(false);
     if (missing.ok) return;
     expect(missing.error).toContain("nope");
+  });
+
+  it("sets, changes and clears a repo's base branch without touching its shape", () => {
+    const inferred = { version: 1 as const, repos: [{ dir: "a", url: "https://example.com/a", inferredDir: true }] };
+    const set = setRepoBranch(inferred, "a", "release");
+    expect(set.ok).toBe(true);
+    if (!set.ok) return;
+    expect(set.value.repos[0]).toEqual({ dir: "a", url: "https://example.com/a", inferredDir: true, branch: "release" });
+    // Serialized, the inferred dir stays absent and the branch is the only addition.
+    expect(JSON.parse(serializeReposFile(set.value)).repos[0]).toEqual({ url: "https://example.com/a", branch: "release" });
+    const cleared = setRepoBranch(set.value, "a", null);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    expect(cleared.value.repos[0]).toEqual(inferred.repos[0]);
+    const blank = setRepoBranch(set.value, "a", "   ");
+    expect(blank.ok && blank.value.repos[0].branch).toBeUndefined();
+  });
+
+  it("refuses a branch for an unknown repo or one that reads as an option", () => {
+    expect(setRepoBranch(base, "nope", "main").ok).toBe(false);
+    expect(setRepoBranch(base, "a", "--upload-pack=x").ok).toBe(false);
   });
 
   it("finds an existing repo by dir or by equivalent url", () => {

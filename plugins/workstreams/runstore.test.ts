@@ -49,14 +49,16 @@ describe("agent runs", () => {
     expect(await store.signal("thr-folio-2", { kind: "active" }, read)).toEqual([]);
   });
 
-  it("does not attribute an earlier turn's Result to a legacy continue run", async () => {
+  it("waits for a continue run's own active signal before an idle turn can finish it", async () => {
     const { store, tick } = setup();
-    store.begin({ ...TARGET, action: "address-comments", mode: "continue", threadId: "thr-margin-3" });
+    const id = store.begin({ ...TARGET, action: "address-comments", mode: "continue", threadId: "thr-margin-3" });
     tick(500);
     const none = async () => "Result: the earlier task";
-    expect(await store.signal("thr-margin-3", { kind: "active" }, none)).toEqual([]);
-    const [done] = await store.signal("thr-margin-3", { kind: "idle", text: "Result: the earlier task" }, none);
-    expect(done).toMatchObject({ status: "done", result: null });
+    expect(await store.signal("thr-margin-3", { kind: "idle", text: "Result: the earlier task" }, none)).toEqual([]);
+    expect(store.recent(0).find((run) => run.id === id)?.status).toBe("running");
+    expect(await store.signal("thr-margin-3", { kind: "active" }, none)).toEqual([expect.objectContaining({ id, status: "running" })]);
+    const [done] = await store.signal("thr-margin-3", { kind: "idle", text: "Result: the requested task" }, none);
+    expect(done).toMatchObject({ status: "done", result: "the requested task" });
   });
 
   it("does not give one queued turn's Result to two open actions in the same legacy thread", async () => {
@@ -153,11 +155,9 @@ describe("stranded continue runs", () => {
     expect(store.recent(0)[0]?.status).toBe("running");
   });
 
-  it("leaves a new-thread run alone, while a legacy continue run remains ambiguous", async () => {
+  it("leaves a new-thread run alone while closing an unarmed continue run after six hours", async () => {
     const { store, tick } = setup();
     store.begin({ ...TARGET, action: "address-review", mode: "continue", threadId: "thr-colophon-5" });
-    tick(1_000);
-    expect(await store.signal("thr-colophon-5", { kind: "active" }, async () => null)).toEqual([]);
     const fresh = store.begin({ ...TARGET, action: "investigate-ci", mode: "new", threadId: null });
     store.attach(fresh, "thr-colophon-6");
     tick(7 * HOUR);
@@ -166,13 +166,14 @@ describe("stranded continue runs", () => {
   });
 });
 
-describe("settling a run from its answer", () => {
-  it("turns a cleanly finished run into a failure with a short reason when its answer was unusable", () => {
+describe("settling a run with a reason", () => {
+  it("ends an open claim as a failure with a short reason when its batch thread is gone, so its PR is not held forever", () => {
     const { store } = setup();
-    const id = store.begin({ path: "/p", ticket: null, prUrl: null, prNumber: null, action: "linear-fetch", mode: "new", threadId: null });
-    const failed = store.settle(id, false, "No json block in the final message.");
-    expect(failed).toEqual(expect.objectContaining({ id, status: "failed", error: "No json block in the final message.", result: null }));
+    const id = store.begin({ ...TARGET, action: "address-feedback", mode: "new", threadId: "thr-batch-1" });
+    const failed = store.settle(id, false, "Its batch thread is gone.");
+    expect(failed).toEqual(expect.objectContaining({ id, status: "failed", error: "Its batch thread is gone.", result: null }));
     expect(failed?.finishedAt).not.toBeNull();
-    expect(store.settle(id, true, "Stored 2 of 3 tickets")).toEqual(expect.objectContaining({ status: "done", result: "Stored 2 of 3 tickets", error: null }));
+    expect(store.openIn("thr-batch-1")).toEqual([]);
+    expect(store.settle(id, true, "Done")).toEqual(expect.objectContaining({ status: "done", result: "Done", error: null }));
   });
 });

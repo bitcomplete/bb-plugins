@@ -10,9 +10,15 @@ containing a checkout of each**.
   .bb/                  the project definition: repos.json, AGENTS.md, skills/
 ```
 
-A project's source stops being *code* and becomes the **workspace definition**:
-a small `.bb` git repo holding the repo set, cross-repo guidance, and project
-skills. Every repo is equal — there is no privileged primary repo.
+A project's source is the **primary repo** — one real repo whose default
+branch carries `.bb/`, a directory holding the repo set, cross-repo guidance
+and project skills. `.bb/repos.json` lists only the *other* repos; the primary
+is derived from the project source's own `origin` and is not repeated. The
+standalone `.bb`-repo layout is still supported, so a machine that has not
+adopted keeps working; `bb repos adopt` moves a standalone definition into the
+primary, per machine.
+
+Every repo is equal in the workspace; the primary is one of them.
 
 Standalone: no bb fork, no bb-internal packages, no dependency on any other
 plugin.
@@ -27,7 +33,14 @@ Then pick **Multi-repo workspace** as the environment when creating a thread.
 
 ## Getting started
 
-Two ways in, identical afterwards.
+Open the **Repos** panel and press **New project**. One form: a name, the
+machine the project's `.bb` checkout lives on, where it goes (suggested as
+`~/bb/<name>`, editable), and either the repos to start with or the URL of an
+existing `.bb` repo to clone. The plugin initializes or clones the checkout,
+commits it, and creates the project pointing at it. Then pick **Multi-repo
+workspace** as the environment when you start a thread there.
+
+The same two ways in exist without the panel, and are identical afterwards.
 
 **From scratch.** Create a project pointing at an empty directory. The first
 thread initializes `.bb` in it — `git init`, a seeded `AGENTS.md`, an empty
@@ -38,10 +51,10 @@ travel.
 **Shared.** Clone an existing `.bb` repo and create the project pointing at it.
 A teammate gets the whole workspace definition from one URL.
 
-Then give it a repo set. `--project` targets a project you are not currently
-working in, which is the usual case when setting one up; without it the
-commands act on the project in context. Either this or the Repos panel will
-create `.bb` if it does not exist yet.
+Then give it a repo set, in the panel or from the CLI. `--project` targets a
+project you are not currently working in, which is the usual case when setting
+one up; without it the commands act on the project in context. Either this or
+the panel will create `.bb` if it does not exist yet.
 
 ```sh
 bb repos add git@github.com:you/bb-dylan.git  --project proj_abc123
@@ -55,14 +68,18 @@ bb repos list --project proj_abc123
 {
   "version": 1,
   "repos": [
-    { "dir": "bb-dylan",   "url": "git@github.com:you/bb-dylan.git" },
-    { "dir": "bb-plugins", "url": "git@github.com:you/bb-plugins.git", "branch": "main" }
+    { "url": "git@github.com:you/bb-dylan.git" },
+    { "url": "git@github.com:you/bb-plugins.git", "branch": "main" },
+    { "dir": "bb-plugins-fork", "url": "git@github.com:me/bb-plugins.git" }
   ]
 }
 ```
 
-- `dir` — the directory name inside the workspace. Required and explicit, so
-  two repos sharing a basename are unambiguous.
+- `dir` — the directory name inside the workspace. Optional: it defaults to the
+  repo's own name (the URL's last component, minus `.git`). Spell it out when
+  two repos would otherwise share a basename, or when the URL's name is not the
+  one you want. An entry written without it is also *written back* without it,
+  so the plugin's own edits stay one-line diffs.
 - `url` — anything git can clone, **including a local path**, which makes
   "base this on my local checkout" a first-class option.
 - `branch` — optional base branch; defaults to that repo's default branch.
@@ -80,9 +97,10 @@ parse fails the launch with a message naming the offending entry.
 
 | Where | What |
 |---|---|
-| **Repos** nav panel | The repo set, each repo's object-cache state, and an editor for `repos.json` with loud validation. |
+| **Repos** nav panel | The repo set as a list — add by URL with completions from local checkouts, change a base branch inline, remove — each change one commit in `.bb`. A **New project** form that creates a multi-repo project in one step. `repos.json` as text behind a disclosure, which opens itself when the file does not parse. |
 | **Changes** thread panel | Per-repo diff and pull request. Opened from the thread panel's Actions list. |
-| `bb repos` | `list`, `add`, `remove` (each takes `--project`), and `status` for the current thread. |
+| Composer banner | One row above the composer naming the repos that changed, their file counts and the `+`/`−` totals. Click it to open the Changes panel. Hidden when nothing has changed. |
+| `bb repos` | `list`, `add`, `remove` (each takes `--project`), `adopt <primary>`, and `status` for the current thread. |
 | Agent tools | `workspace_list_repos`, `workspace_add_repo`, `workspace_remove_repo`, `workspace_publish_guidance`. |
 | Agent instructions | A generated table of `repo → branch → path`, plus a `multi-repo` skill. |
 
@@ -113,6 +131,33 @@ to a worktree's.
 A second benefit: two threads cannot both check out `main` as worktrees of one
 repo, but independent clones can — and `.bb` is on its default branch in every
 workspace.
+
+### Where `.bb` lives
+
+`.bb/` is a directory on the primary repo's default branch, next to the code,
+reviewed like code. The project source is a clone of that primary repo, and
+core reads `<workspace>/.bb/AGENTS.md` and `<workspace>/.bb/skills` from the
+workspace root — so each thread gets `<workspace>/.bb` as a symlink to
+`<workspace>/<primary>/.bb`, and sees what its own checkout of the primary
+carries, exactly as a single-repo thread sees its checkout's `.bb/`. An edit
+under `.bb/` is a working-tree change in the primary clone: it can go with the
+thread's code, or on its own through `workspace_publish_guidance`. When the
+link cannot be made (the primary failed to clone, its branch has no `.bb/`, or
+the platform refuses a symlink) the thread gets a copy of `.bb/` from the
+default branch's committed tip instead. Reads (`readProjectFiles`, `repoSet`)
+come from the default branch's committed tip, never the working tree or a
+feature branch.
+
+The **standalone** layout — a small `.bb` git repo that is the project source —
+is still read and written exactly as before. `bb repos adopt <primary>` copies
+a standalone tree into `.bb/` on a branch of the primary and opens a pull
+request; once it merges, running `bb repos adopt` again re-points
+`project_sources.path` in place. The project id, every stewards binding and
+every thread stay as they are (BB-106, Case A).
+
+A workspace built before an adopt keeps publishing guidance to the old
+standalone checkout; `bb repos status` and the Changes panel say so, and a
+branch it publishes has to be re-applied to the primary by hand.
 
 ### The object cache
 
@@ -162,17 +207,41 @@ the generated block cannot be edited.
 ### Writing back to `.bb`
 
 The canonical `.bb` checkout is outside the agent's sandbox, so the write is
-inverted: the canonical repo *fetches* from the workspace clone, initiated by
-the plugin's host entry.
+inverted: the plugin's host entry does it.
+
+On the **standalone** layout, the canonical repo *fetches* from the workspace
+clone:
 
 ```
 git -C <canonical-.bb> fetch <workspace>/.bb HEAD:refs/heads/guidance-<threadId>
 ```
 
-That avoids the sandbox and `receive.denyCurrentBranch` at once, and leaves a
-named branch to review and merge. `workspace_publish_guidance` is the agent's
-entry point; `repos.json` edits from the tools, the CLI and the panel take the
-same host-side route, which is why they work under `accept-edits`.
+On the **primary** layout, `.bb/` is a directory in the primary repo and the
+default branch is reviewed like code, so `workspace_publish_guidance` builds a
+`guidance-<threadId>` branch with the workspace's `.bb/` content and stops
+there — it never moves the default branch. `mergeGuidance` reports that a
+lesson needs a pull request (BB-108 adds that flow). That avoids the sandbox and
+`receive.denyCurrentBranch` at once, and leaves a named branch to review and
+merge. `workspace_publish_guidance` is the agent's entry point; `repos.json`
+edits from the tools, the CLI and the panel take the same host-side route,
+which is why they work under `accept-edits`.
+
+### Reading `.bb` from another plugin
+
+Two RPCs are a contract with other plugins, written with stewards in mind:
+`repoSet({ projectId })` returns the parsed repo set, and
+`readProjectFiles({ projectId, paths })` returns up to 50 files from the
+project's `.bb`. Both read the canonical checkout, after the same refresh
+provisioning uses — fetch, then `merge --ff-only` from the upstream, at most
+once per TTL, and left alone when it would not fast-forward.
+`readProjectFiles` reads from the committed `HEAD`, never from the working
+tree, so an edit someone has not committed in the canonical checkout is not
+served, and a playbook published from a thread takes effect when its
+`guidance-<threadId>` branch is merged. It returns the commit it read as
+`head`, `content: null` for a path that commit does not hold as a regular
+file, and refuses absolute paths and `..`. A file over 200,000 characters is
+not truncated: it comes back `null` and `error` names it. multi-repo depends
+on no other plugin.
 
 ### Diff and pull requests
 
@@ -189,6 +258,37 @@ uncommitted edits and those are what you want to see.
 Pull requests go through `gh`, per repo, cached for a minute. A workspace can
 span two orgs and an Enterprise host, so each repo is asked independently and a
 machine without `gh` is reported per repo rather than failing the panel.
+
+**The thread view says a diff exists.** bb's own changed-files summary above
+the composer reads the thread's checkout, finds a plain directory rather than a
+git repo, and shows nothing — so every fact about the diff used to live behind
+the panel launcher, with nothing in the thread view to suggest opening it. A
+composer banner fills that gap with one row: which repos moved, how many files
+each, and the totals. It carries no pull-request state and no actions, because
+the panel is still the surface to act on. It polls more slowly than the panel —
+it is a glance mounted on every thread, not a diff someone is reading — and it
+stops polling entirely on a thread with no workspace.
+
+**The two halves refresh independently, and the diff half refreshes itself.**
+Nothing in bb tells a panel that a file on a machine changed, so the diff half
+re-reads itself every few seconds while the tab is visible, and a finished turn
+publishes a signal so it lands sooner than the next tick. Pull requests stay
+out of that loop — they shell out to `gh` over the network — and a `gh` failure
+therefore shows as its own line rather than taking the diffs down with it. The
+Refresh button is the force path for both.
+
+## Forks share a checkout
+
+A forked thread keeps the environment it was forked from — core's behaviour,
+not this plugin's — so it keeps this plugin's workspace too. The fork gets the
+same directory, the same repos and the same branch as its source thread, rather
+than an empty panel and a workspace it cannot see.
+
+Both threads are told. The agent's instruction block gains a shared-checkout
+warning, the Changes panel names the other threads, and `bb repos status` lists
+them. Nothing stops two agents from committing to the same branch in the same
+directory, so treat the warning as one: let one thread work at a time, or give
+the fork its own environment when you create it.
 
 ## Failure policy
 
@@ -224,6 +324,10 @@ Accepted consequences, not bugs.
 - **The repo set is fixed at `create()`.** Existing workspaces do not gain
   repos added later except through `workspace_add_repo`. Deliberate: a
   workspace should not mutate under a running thread.
+- **A fork cannot get its own checkout of the same environment.** Core reuses
+  the environment for a fork, and a plugin cannot provision a second workspace
+  for an environment core considers provisioned. Sharing is surfaced rather
+  than prevented.
 - **A rebuild re-clones.** `pathKeys: "per-thread"` means a rebuild takes a
   fresh key to avoid dead paths. The object cache keeps that cost local rather
   than networked.
@@ -237,7 +341,7 @@ Accepted consequences, not bugs.
 ```sh
 npm install
 npm run typecheck
-npm test          # 129 tests, including end-to-end provisioning against real git repos
+npm test          # 173 tests, including end-to-end provisioning against real git repos
 npm run build
 ```
 

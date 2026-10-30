@@ -2,13 +2,14 @@ See work across repositories by ticket and by the action it needs next.
 
 ## Explore and act
 
+- **Efforts:** Flip through one card per effort, each listing its open pull
+  requests by the move each needs. Every GitHub write lists each pull request
+  in a confirm first, and merges run only from a fresh merge preview.
+- **All PRs:** See every open pull request you author or an effort names, with
+  the ones waiting on you first.
 - **Map:** Explore ticket clusters within named efforts, programs, and domains.
   Levels collapse when they add no useful grouping. Switch between theme and
   risk, filter by status or code surface, and open linked agent threads.
-- **Board:** Group checkouts by Action or Effort while keeping urgent work first
-  within each group. Find CI fixes, review responses, merges, and reviewer
-  nudges. Confirm direct GitHub actions, or review a prompt before an agent
-  starts work in a dedicated thread.
 - **CLI:** Run `bb workstreams list [--json]` to read the board, `bb workstreams
   refresh` to rescan, and `bb workstreams group <TICKET> <name>` to set an effort
   name.

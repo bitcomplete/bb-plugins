@@ -3,7 +3,7 @@
 // is checked is how a payload is read, not how it was fetched.
 import { describe, expect, it } from "vitest";
 import { prSchema } from "./contract.js";
-import { latestReviewStates, latestReviewers, mergeCommitOf, parseLiveReviewRequests, parseMergeStateStatus, parsePrList } from "./gh.js";
+import { latestReviewStates, latestReviewers, mergeCommitOf, parseMergeStateStatus, parsePrList } from "./gh.js";
 import { namingResponse, parseNames } from "./naming.js";
 
 describe("PR commit identity", () => {
@@ -18,6 +18,13 @@ describe("PR commit identity", () => {
     expect(pr?.headRefOid).toBeUndefined();
     expect(pr?.baseRefOid).toBeUndefined();
     expect(prSchema.safeParse(pr).success).toBe(true);
+  });
+
+  it("accepts complete review-thread counts beyond one page through the reader's 2,000-thread limit", () => {
+    const pr = parsePrList(JSON.stringify([{ number: 42 }]))?.pr;
+    expect(prSchema.parse({ ...pr, unresolvedReviewThreads: 101, resolvedReviewThreads: 1_899 }))
+      .toMatchObject({ unresolvedReviewThreads: 101, resolvedReviewThreads: 1_899 });
+    expect(prSchema.safeParse({ ...pr, unresolvedReviewThreads: 2_001 }).success).toBe(false);
   });
 });
 
@@ -85,20 +92,19 @@ describe("latestReviewers", () => {
     ]);
   });
 
+  it("keeps when each review was submitted, because attention dates approvals and answered requests by it, and drops an unreadable time", () => {
+    expect(latestReviewers([
+      { author: { login: "reader-ada" }, state: "APPROVED", submittedAt: "2026-09-24T09:00:00Z" },
+      { author: { login: "reader-lin" }, state: "COMMENTED", submittedAt: "yesterday" },
+    ])).toEqual([
+      { login: "reader-ada", state: "APPROVED", submittedAt: "2026-09-24T09:00:00Z" },
+      { login: "reader-lin", state: "COMMENTED" },
+    ]);
+  });
+
   it("drops an entry with no author or state rather than inventing a reviewer", () => {
     expect(latestReviewers(undefined)).toEqual([]);
     expect(latestReviewers([null, { state: "APPROVED" }, { author: { login: "reader-lin" } }, { author: null, state: "APPROVED" }])).toEqual([]);
-  });
-});
-
-describe("parseLiveReviewRequests", () => {
-  it("requires a readable state and reviewer list so a nudge cannot use stale scan data", () => {
-    expect(parseLiveReviewRequests(JSON.stringify({ state: "open", reviewRequests: [
-      { login: "ada-inkwell" },
-      { __typename: "Team", slug: "reviewers", organization: { login: "inkwell" } },
-    ] }))).toEqual({ state: "OPEN", reviewers: ["ada-inkwell", "inkwell/reviewers"] });
-    expect(parseLiveReviewRequests("not json")).toBeNull();
-    expect(parseLiveReviewRequests(JSON.stringify({ state: "open" }))).toBeNull();
   });
 });
 
@@ -188,6 +194,14 @@ describe("parsePrList", () => {
     const parsed = parsePrList(row())!.pr;
     const { createdAt: _oldField, ...older } = parsed;
     expect(prSchema.parse(older).createdAt).toBeUndefined();
+  });
+
+  it("carries the latest PR update time and accepts older scans without it", () => {
+    expect(parsePrList(row({ updatedAt: "2030-01-02T10:00:00Z" }))?.pr.updatedAt).toBe("2030-01-02T10:00:00Z");
+    expect(parsePrList(row({ updatedAt: "yesterday-ish" }))?.pr.updatedAt).toBeNull();
+    const parsed = parsePrList(row())!.pr;
+    const { updatedAt: _oldField, ...older } = parsed;
+    expect(prSchema.parse(older).updatedAt).toBeUndefined();
   });
 
   it("reads unparseable output as no pull request rather than throwing", () => {

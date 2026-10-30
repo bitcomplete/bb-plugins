@@ -1,4 +1,5 @@
 import type {
+  BlockReason,
   BriefCard,
   BriefStage,
   BriefStatus,
@@ -57,74 +58,61 @@ export function isStatusOverrideStale(stored: StoredBrief): boolean {
 
 /**
  * The status this brief reports: the manual one while it holds, otherwise the
- * derivation over the brief's own fields.
+ * one the summarizer judged.
  *
- * The override sits *in front of* {@link deriveStatus} rather than editing the
- * fields it reads, because `renderTranscript` feeds the previous brief into the
- * next summary as a starting point: a `nextStep` blanked in storage would
- * simply be written back, where a pin is a separate fact the summarizer never
- * sees and cannot undo.
- *
- * It exists for the one thing the derivation cannot see. A `nextStep` addressed
- * to you and carried out *outside the thread* — reload a client, check a
- * rollout, confirm a glyph — leaves no trace in the transcript, so no summary
- * can retire it and re-summarizing reads the same unresolved instruction back.
- * That thread is `waiting-on-me` forever unless you can say otherwise.
+ * The manual pin exists for the one thing no summary can see: a step carried
+ * out somewhere the transcript does not reach. The summarizer is asked whether
+ * the task is finished *assuming* you do what the thread asks of you, so a step
+ * that is only yours already reads done; the pin is for the rest — a thread
+ * waiting on your go-ahead that you settled elsewhere, or a reading you simply
+ * disagree with.
  */
 export function effectiveStatus(stored: StoredBrief): StoredBriefStatus {
   const override = stored.statusOverride ?? null;
   if (override !== null && !isStatusOverrideStale(stored)) return override;
-  return deriveStatus({
-    nextStep: stored.fields.nextStep,
-    blockedOn: stored.fields.blockedOn,
-    nextStepActor: stored.fields.nextStepActor,
-  });
+  return stored.modelStatus ?? legacyStatus(stored.fields);
 }
 
 /**
- * Status as far as a *stored* brief can tell. Mechanical rather than a model
- * judgement, so it stays right between summaries:
+ * The status of a brief written before the summarizer was asked for one, read
+ * from its fields the way it used to be: nothing to do and nothing blocking is
+ * done, a blocker or an outside actor is waiting on someone else, and anything
+ * else is waiting on you.
  *
- * - nothing to do and nothing blocking → the work is done
- * - blocked on something → waiting on someone else
- * - otherwise → waiting on me
- *
- * `done` requires *both* fields empty. The summarizer's prompt already promises
- * a non-empty `nextStep` whenever anything is outstanding, but testing
- * `blockedOn` here makes "a blocked thread is not done" a guarantee of this
- * code rather than of the prompt, so one wayward summary cannot put a green
- * tick on a thread that is waiting for a review.
- *
- * `nextStepActor` is the one input the model has to judge: a next step only we
- * can take ("test it", "decide X", "reply to Y") reads the same in prose as one
- * the agent could take unprompted. An actor of `other` therefore means waiting
- * on someone else even when the summarizer named no `blockedOn`.
- *
- * `waiting-on-me` is the fallback because an idle thread with unfinished work
- * needs a human look by default — whether or not the agent's last turn happened
- * to end in a question, and whether or not we know the actor.
- *
- * `working` is deliberately absent: it is live thread state, not a property of
- * a brief, so it is applied per row by {@link rowDecoration}. The return type
- * says so — narrowing to the stored statuses is what lets a caller that needs
- * one, like the refresher's `writtenForStatus`, take this value without a cast.
+ * Only for old rows. Such a brief stays on this reading until its thread is
+ * next summarized, which writes a `modelStatus` that replaces it.
  */
-export function deriveStatus(args: {
+export function legacyStatus(fields: {
   nextStep: string;
   blockedOn: string;
   nextStepActor?: NextStepActor | undefined;
 }): StoredBriefStatus {
-  const nextStep = args.nextStep.trim();
-  const blockedOn = args.blockedOn.trim();
+  const nextStep = fields.nextStep.trim();
+  const blockedOn = fields.blockedOn.trim();
   if (nextStep === "" && blockedOn === "") return "done";
-  if (blockedOn !== "" || args.nextStepActor === "other") {
+  if (blockedOn !== "" || fields.nextStepActor === "other") {
     return "waiting-on-other";
   }
-  // `agent` — an idle thread the agent could carry on by itself — has no status
-  // of its own yet, and collapses into waiting-on-me because the nudge is ours
-  // to give. If that turns out to be a common bucket in practice it earns its
-  // own status then, rather than being guessed at now.
   return "waiting-on-me";
+}
+
+/**
+ * The user's block reason as the UI shows it, without the cursor the server
+ * keeps beside it.
+ */
+export function blockReasonOf(stored: StoredBrief): BlockReason | null {
+  const reason = stored.blockReason ?? null;
+  return reason === null
+    ? null
+    : { text: reason.text, recordedAt: reason.recordedAt };
+}
+
+/** Whether a stage or status pin is in force right now. */
+export function isPinned(stored: StoredBrief): boolean {
+  return (
+    (stored.stageOverride !== null && !isStageOverrideStale(stored)) ||
+    ((stored.statusOverride ?? null) !== null && !isStatusOverrideStale(stored))
+  );
 }
 
 export function resolveBrief(stored: StoredBrief): ResolvedBrief {
@@ -139,6 +127,7 @@ export function resolveBrief(stored: StoredBrief): ResolvedBrief {
     statusOverride: isStatusOverrideStale(stored)
       ? null
       : (stored.statusOverride ?? null),
+    blockReason: blockReasonOf(stored),
     lastSummarizedAt: stored.lastSummarizedAt,
   };
 }
@@ -239,8 +228,15 @@ export const STATUS_LABELS: Record<BriefStatus, string> = {
  * grouping says it in the section header, but grouping is off by default and
  * nothing else on an ungrouped row says it at all.
  */
-export function rowLabelFor(stage: BriefStage, status: BriefStatus): string {
-  return `${STAGE_LABELS[stage]} — ${STATUS_LABELS[status]}`;
+export function rowLabelFor(
+  stage: BriefStage,
+  status: BriefStatus,
+  pinned = false,
+): string {
+  const base = `${STAGE_LABELS[stage]} — ${STATUS_LABELS[status]}`;
+  // A pin is the one fact on the row the model did not decide, and the ring
+  // draws nothing for it, so the label is the only place it is said.
+  return pinned ? `${base} · set by hand` : base;
 }
 
 /**
@@ -263,6 +259,7 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
     status: effectiveStatus(stored),
     stageOverride: resolved.stageOverride,
     statusOverride: resolved.statusOverride,
+    blockReason: resolved.blockReason,
     nextStep: resolved.nextStep,
     // Spread rather than assigned, so an absent actor stays absent: the schema
     // is `.strict()` and an explicit `undefined` is not the same as no key.
@@ -271,20 +268,49 @@ export function briefCardFor(stored: StoredBrief): BriefCard {
       : { nextStepActor: resolved.nextStepActor }),
     blockedOn: resolved.blockedOn,
     lastSummarizedAt: resolved.lastSummarizedAt,
+    // Always true now: the per-key opt-out is gone, so a thread with a stored
+    // brief is always auto-archivable. Kept on the wire for the board's shape.
+    autoArchive: true,
   };
 }
 
-export function rowSignalFor(brief: ResolvedBrief): RowSignal {
+export function rowSignalFor(stored: StoredBrief): RowSignal {
+  const brief = resolveBrief(stored);
+  const pinned = brief.stageOverride !== null || brief.statusOverride !== null;
   return {
     threadId: brief.threadId,
     status: brief.status,
     stage: brief.stage,
-    label: rowLabelFor(brief.stage, brief.status),
+    label: rowLabelFor(brief.stage, brief.status, pinned),
+    pinned,
+    stageOverride: brief.stageOverride,
+    statusOverride: brief.statusOverride,
+    // Both always true now that the single off switch removes a thread's brief
+    // entirely: a stored brief is always auto-archivable and always draws a
+    // ring. Kept on the wire for the client's shape.
+    autoArchive: true,
+    ring: true,
   };
 }
 
 /** bb's convention for a plugin's own icon-registry names: `<pluginId>/<name>`. */
 const ICON_PREFIX = "thread-briefs/";
+
+/**
+ * The live marks a ring can carry on top of its stage and colour.
+ *
+ * Both are bb's own per-row facts, read off the sidebar view rather than
+ * stored with the brief: `unread` is bb's `isUnread`, the condition its own
+ * activity dot was drawn on, and `working` is `isLiveWorking` of its thread
+ * status. Independent, so a ring can carry both — a running thread whose last
+ * turn you have not read yet.
+ */
+export type RingMarks = {
+  /** Draw the centre dot: the thread has output you have not seen. */
+  unread?: boolean;
+  /** Animate the ring: the agent is running or queued. */
+  working?: boolean;
+};
 
 /**
  * The registry name of the ring drawn for a stage — one quarter filled per
@@ -295,8 +321,28 @@ const ICON_PREFIX = "thread-briefs/";
  * `BRIEF_STAGES` cannot get a name without also getting artwork: `app.tsx`
  * registers its icons by mapping this same function over the same list.
  */
-export function stageRingIcon(stage: BriefStage, colorIndex?: number): string {
-  return `${ICON_PREFIX}stage-${stage}${ringColorSuffix(colorIndex)}`;
+export function stageRingIcon(
+  stage: BriefStage,
+  colorIndex?: number,
+  marks: RingMarks = {},
+): string {
+  return `${ICON_PREFIX}stage-${stage}${markSuffix(marks)}${ringColorSuffix(
+    colorIndex,
+  )}`;
+}
+
+/**
+ * The suffix on a ring's registry name for its live marks, in a fixed order
+ * so the same marks always name the same icon.
+ *
+ * The centre dot means unread. It used to mean a pin; the pin gave the centre
+ * up because the dot was already bb's own mark for "new output since you
+ * looked", drawn on every row until the ring displaced it, and that reading is
+ * worth more on a row than "a human overrode the summarizer" — which the hover
+ * label still says. Before either, a filled centre meant `done`.
+ */
+function markSuffix({ unread = false, working = false }: RingMarks): string {
+  return `${unread ? "-unread" : ""}${working ? "-working" : ""}`;
 }
 
 /**
@@ -312,18 +358,30 @@ function ringColorSuffix(colorIndex: number | undefined): string {
 }
 
 /** {@link DONE_RING_ICON} in a project's colour, or neutral without one. */
-export function doneRingIcon(colorIndex?: number): string {
-  return `${DONE_RING_ICON}${ringColorSuffix(colorIndex)}`;
+export function doneRingIcon(colorIndex?: number, marks: RingMarks = {}): string {
+  return `${DONE_RING_ICON}${markSuffix(marks)}${ringColorSuffix(colorIndex)}`;
+}
+
+/** {@link STALE_DONE_RING_ICON}, with whichever live marks hold. */
+export function staleDoneRingIcon(marks: RingMarks = {}): string {
+  return `${STALE_DONE_RING_ICON}${markSuffix(marks)}`;
 }
 
 /**
- * The closed, filled ring drawn for `done`, in place of any stage ring.
+ * The ring drawn for `done` in place of any stage ring: all four quarters
+ * filled, gaps kept.
  *
  * `done` is a status, not a fifth stage: the arc is over, so which stage it
  * ended in stops being the interesting fact about the row. Keeping it off the
  * ring is also what holds the ring at four 90° segments, and four is the point
  * where the fill's endpoint lands on a clock position you can read without
  * counting marks. A fifth segment in a 16px glyph is where that stops working.
+ *
+ * It is drawn the same as the closed review ring. It was a seamless circle for
+ * a while, to tell the two apart at a glance, and the circle looked wrong
+ * beside the segmented rings; the section heading and the hover label say
+ * `done`, and a day later the grey says it louder. The centre is not used for
+ * it either, because the centre means unread — see {@link stageRingIcon}.
  */
 export const DONE_RING_ICON = `${ICON_PREFIX}done`;
 
@@ -369,8 +427,8 @@ export function idleFor(ms: number): string {
  * The one channel a named icon leaves free — colour — goes to the **project**,
  * because `sidebarGrouping status` is what takes the sidebar's own project
  * grouping away and nothing else on the row replaces it. `done` used to hold
- * that channel and gives it up: it already has the two marks that do not need
- * it, the filled centre and its section heading, where the project has neither.
+ * that channel and gives it up: it already has its section heading and the
+ * grey it turns once cold, where the project has neither.
  *
  * Unconditionally, including where only one project is on screen. A colour that
  * appeared only sometimes would have to be interpreted before it could be read,
@@ -381,64 +439,78 @@ export function idleFor(ms: number): string {
  * `waiting-on-me` and `waiting-on-other` still draw the same ring, told apart
  * by the section header or by the label on hover when grouping is off.
  *
- * Precedence is live first, stored second: a thread whose agent is running or
- * queued is `working` no matter what its brief says, and `working` still draws
- * nothing. Three reasons, in order of how much they cost:
+ * Precedence is live first, stored second, and the live facts are *marks* on
+ * the ring rather than a reason to drop it. A thread whose agent is running or
+ * queued is `working` no matter what its brief says, and its ring animates;
+ * one with output you have not read yet gets the centre dot, which is bb's own
+ * mark for the same thing. The ring stays, so the stage is readable in both
+ * states — a running thread is still a thread at some stage.
+ *
+ * Two things to know about what bb does with the result:
  *
  * - bb hides a plugin row status outright when its own indicator is `runtime`,
- *   `unread-error` or `waiting-for-input`, so for a plain running thread a
- *   decoration here is ignored anyway.
- * - It is *not* hidden for `plan-mode`, `goal`, `workflow` or
- *   `background-agent`, where it would displace a shimmering live glyph that
- *   says something a stored brief cannot.
+ *   `unread-error` or `waiting-for-input`. The failed-turn dot and the
+ *   needs-input glyph therefore stay bb's; the animated ring shows wherever
+ *   the host lets a plugin status through on a running row.
  * - bb paints the status in place of the unsent-draft pencil, so decorating a
  *   row always costs the pencil there.
  *
- * `liveWorking` is client-side truth the sidebar already holds, so applying it
- * here costs no server round trip — which is the whole reason `listRowSignals`
+ * `live` is client-side truth the sidebar already holds, so applying it here
+ * costs no server round trip — which is the whole reason `listRowSignals`
  * does no per-thread lookups.
  *
  * `stale` is the same kind of thing: a done thread nobody has touched since,
  * computed from the attention cursor on the sidebar row beside the same brief.
  * It takes the ring's colour away rather than adding a mark, because the row
  * has no second channel to add one to — and giving up the project colour is the
- * honest thing for a thread that is about to leave the sidebar entirely.
+ * honest thing for a thread that is about to leave the sidebar entirely. A
+ * working thread is never stale: somebody came back.
  */
 export function rowDecoration(
   signal: RowSignal,
-  liveWorking: boolean,
+  live: RowLiveState,
   project: { id: string; name: string } | null = null,
   stale: { idleMs: number; archiving: boolean } | null = null,
 ): { icon: string; label: string; tone: "default" | "error" | "running" | "success" } | null {
-  if (liveWorking) return null;
   const isDone = signal.status === "done";
   // Only a done row can be stale; anything else is a caller bug, and drawing
   // the done ring for it would be worse than ignoring it.
-  const staleDone = isDone ? stale : null;
+  const staleDone = isDone && !live.working ? stale : null;
   const colorIndex =
     project === null ? undefined : projectColorIndex(project.id);
+  const marks: RingMarks = { unread: live.unread, working: live.working };
+  const status: BriefStatus = live.working ? "working" : signal.status;
   const label =
     staleDone === null
-      ? rowLabelFor(signal.stage, signal.status)
+      ? rowLabelFor(signal.stage, status, signal.pinned)
       : // The grey is not self-explanatory the way the ring's shape is, so the
         // label is where "why has this one gone flat" gets answered — including
         // the fact that it is on its way out, which nothing else says.
-        `${rowLabelFor(signal.stage, signal.status)} · idle ${idleFor(
+        `${rowLabelFor(signal.stage, status, signal.pinned)} · idle ${idleFor(
           staleDone.idleMs,
         )}${staleDone.archiving ? ", archiving soon" : ""}`;
   return {
     icon: staleDone !== null
-      ? STALE_DONE_RING_ICON
+      ? staleDoneRingIcon(marks)
       : isDone
-        ? doneRingIcon(colorIndex)
-        : stageRingIcon(signal.stage, colorIndex),
-    // Never `success`. The colour channel belongs to the project now, and a
-    // green that showed up only on the rows this function happens to be handed
-    // no project for would be a second, invisible rule competing with it.
-    // `done` keeps the two marks that do not need the channel: the filled
-    // centre, and its section heading.
-    tone: "default",
+        ? doneRingIcon(colorIndex, marks)
+        : stageRingIcon(signal.stage, colorIndex, marks),
+    // `running` for a working ring, so whatever the host does for a running
+    // status (it shimmers) joins the ring's own animation. Never `success`:
+    // the colour channel belongs to the project, and a green that showed up
+    // only on the rows this function happens to be handed no project for would
+    // be a second, invisible rule competing with it.
+    tone: live.working ? "running" : "default",
     label:
       project === null || project.name === "" ? label : `${label} (${project.name})`,
   };
 }
+
+/**
+ * The live half of a row, read off bb's sidebar view: whether the agent is
+ * running or queued, and whether the thread has output you have not read.
+ */
+export type RowLiveState = {
+  working: boolean;
+  unread: boolean;
+};

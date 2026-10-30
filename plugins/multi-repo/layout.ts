@@ -19,6 +19,8 @@
  * ceiling is testable without a server.
  */
 
+import type { ProjectLayout } from "./paths.js";
+
 /** Core truncates a contribution at 4096 characters. Stay under it deliberately. */
 export const INSTRUCTIONS_MAX = 4096;
 
@@ -44,12 +46,21 @@ export interface WorkspaceManifest {
   root: string;
   pathKey: string;
   hostId: string;
+  /**
+   * The thread `create()` ran for. Not the only thread that may be using this
+   * checkout — a fork keeps its source's environment, and therefore this
+   * workspace. Ask the binding table who else is here.
+   */
   threadId: string;
   projectId: string;
   /** The shared thread branch, from `context.suggestedBranchName`. */
   branchName: string;
+  /** Which layout the project source had when this workspace was provisioned. */
+  layout: ProjectLayout;
   /** The canonical `.bb` checkout on this machine, outside the sandbox. */
   projectSourcePath: string;
+  /** The default-branch commit `.bb/` was materialized from, for a primary project. */
+  definitionBase: string | null;
   repos: WorkspaceRepo[];
   createdAt: number;
 }
@@ -124,7 +135,9 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
 
   lines.push("");
   lines.push(
-    "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
+    manifest.layout === "primary"
+      ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. In this workspace `.bb/` is a link to the primary clone's `.bb/`, so an edit under it is a working-tree change in that clone on this thread's branch. Changes to it are reviewed like code: commit them with the thread's pull request, or publish them on their own with `workspace_publish_guidance` (it commits for you on a `guidance-<thread>` branch)."
+      : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread.",
   );
   lines.push("");
   lines.push(
@@ -138,6 +151,37 @@ export function formatInstructions(manifest: WorkspaceManifest): string {
   // Cut whole lines from the end and say so.
   const notice = "\n\n(Repo list truncated.)";
   let kept = lines;
+  while (kept.length > 1 && kept.join("\n").length + notice.length > INSTRUCTIONS_MAX) {
+    kept = kept.slice(0, -1);
+  }
+  return kept.join("\n") + notice;
+}
+
+/**
+ * The shared-checkout warning, appended to the stored instruction block.
+ *
+ * Kept out of `formatInstructions` because it is not a fact of the workspace:
+ * `create()` writes the block once, and a second thread can attach to the same
+ * checkout at any time afterwards by being forked from the first. The block is
+ * stored, this is added on the way out.
+ *
+ * It matters enough to spend characters on. Two agents on one branch in one
+ * directory will overwrite each other's work, and neither can see the other
+ * from inside the sandbox — this line is the only warning there is.
+ */
+export function withSharedNotice(instructions: string, args: { others: number; branchName: string }): string {
+  if (args.others <= 0) return instructions;
+  const others =
+    args.others === 1 ? "Another thread is" : `${args.others} other threads are`;
+  const notice = [
+    "",
+    "",
+    `**This checkout is shared.** ${others} working in this same directory on the same branch \`${args.branchName}\` — a forked thread keeps the environment it was forked from. Your commits land on the branch they are committing to, and neither side can see the other's uncommitted work as anything but its own. Check with the user before committing, rebasing, or pushing.`,
+  ].join("\n");
+  if (instructions.length + notice.length <= INSTRUCTIONS_MAX) return instructions + notice;
+  // The warning outranks the tail of the block: a truncated repo table is a
+  // nuisance, two agents silently sharing a branch is lost work.
+  let kept = instructions.split("\n");
   while (kept.length > 1 && kept.join("\n").length + notice.length > INSTRUCTIONS_MAX) {
     kept = kept.slice(0, -1);
   }

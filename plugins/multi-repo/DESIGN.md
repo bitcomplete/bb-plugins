@@ -20,7 +20,9 @@ Core references below were verified against bb at commit `611e34892` (2026-09-24
 
 ## 1. Concepts
 
-A **project's source is a `.bb` git repo** — the workspace definition, not the code. It contains:
+A **project's source is the primary repo** — one real repo whose default
+branch carries `.bb/`, a directory holding the workspace definition, not the
+code. `.bb/` contains:
 
 ```
 repos.json      the repo set
@@ -39,7 +41,7 @@ A **thread workspace** is a plain directory holding one clone per repo, plus `.b
     .bb/                     clone of the project-source checkout
 ```
 
-`<pathKey>` is the provider's per-thread path key. Repo directory names come from `repos.json`, not derived from URLs, so two repos sharing a basename are unambiguous.
+`<pathKey>` is the provider's per-thread path key. A repo's directory name is whatever `repos.json` says, defaulting to the repo's own name — so two repos sharing a basename can still be disambiguated explicitly.
 
 ## 2. Configuration
 
@@ -49,13 +51,14 @@ A **thread workspace** is a plain directory holding one clone per repo, plus `.b
 {
   "version": 1,
   "repos": [
-    { "dir": "bb-dylan",   "url": "git@github.com:you/bb-dylan.git" },
-    { "dir": "bb-plugins", "url": "git@github.com:you/bb-plugins.git", "branch": "main" }
+    { "url": "git@github.com:you/bb-dylan.git" },
+    { "url": "git@github.com:you/bb-plugins.git", "branch": "main" },
+    { "dir": "bb-plugins-fork", "url": "git@github.com:me/bb-plugins.git" }
   ]
 }
 ```
 
-- `dir` — directory name inside the workspace. Required, explicit, must be a safe single path segment.
+- `dir` — directory name inside the workspace, and a safe single path segment. Optional: the parser infers it from the URL's last component minus `.git`, and fails the entry by name when nothing usable comes out rather than inventing `repo-1`. Resolution happens once, at parse; everything downstream sees a `dir`. An inferred `dir` is flagged as such so serialization omits it again, keeping an unrelated add or remove a one-line diff.
 - `url` — anything git can clone, including a local path. A local path makes "base this on my local checkout" a first-class option.
 - `branch` — optional base branch. Defaults to that repo's default branch.
 
@@ -67,14 +70,40 @@ Keep it strict JSON. Documentation lives in the seeded `AGENTS.md` and the plugi
 
 ### Where `.bb` lives
 
-`project_sources.path` is the canonical `.bb` checkout, per `(projectId, hostId)` — one per machine (`packages/db/src/schema.ts:496`).
+`project_sources.path` is the canonical project-source checkout, per
+`(projectId, hostId)` — one per machine (`packages/db/src/schema.ts:496`).
+There are two layouts, detected from the default branch's committed tree:
 
-Two ways in, same code path afterwards:
+- **primary** — the checkout is a clone of the primary repo and the definition
+  sits at `P/.bb/`. `repos.json` lists only the other repos; P is derived from
+  the checkout's `origin` and materialised into the workspace in addition to
+  them. `<workspace>/.bb` is a symlink to `<workspace>/P/.bb`, because core
+  reads `<workspacePath>/.bb/AGENTS.md` and `.bb/skills` from the workspace
+  root only; a copy from the default branch's committed tip is the fallback
+  when the link cannot be made.
+- **standalone** — the checkout is a `.bb` git repo with the definition at its
+  root. This is the original layout, still read and written as before so a
+  machine that has not adopted keeps working.
 
-- **Shared** — the `.bb` repo has a remote. Clone it, create the project pointing at it. A teammate gets the whole workspace definition from one URL.
-- **Local, from scratch** — create the project pointing at a fresh directory. The plugin initializes `.bb` on first use. No remote, no setup.
+Reads (`readProjectFiles`, `repoSet`) resolve the default branch's committed
+tip — `origin/<default>`, or the local default branch when the plugin's own
+commit is ahead of it — never the working tree or a feature branch.
 
-The local variant upgrades to shared with `git remote add` and a push. Nothing else in the design changes and there is no migration.
+Ways in:
+
+- **Primary, from an existing repo** — point the project at a clone of P. If it
+  does not carry `.bb/`, the plugin seeds it on the default branch and publishes
+  a `guidance-<seed>` branch with a pull request.
+- **Shared** — the standalone `.bb` repo has a remote. Clone it, create the
+  project pointing at it.
+- **Local, from scratch** — create the project pointing at a fresh directory;
+  the plugin initializes a standalone `.bb` there.
+
+`bb repos adopt <primary>` (and the panel) copies a standalone tree into
+`.bb/` on a branch of the primary and opens a pull request; once it merges, a
+later run re-points `project_sources.path` in place. That is BB-106 Case A: the
+SDK's `bb.sdk.projects.sources.update` re-points the source row for the same
+project id, so no store re-key and no steward respawn is needed.
 
 ## 3. Why a plain-directory workspace root
 
@@ -162,6 +191,26 @@ Take both defaults, deliberately (`packages/plugin-sdk/src/environment-provider.
 
 A repo that fails to materialize should not fail the whole environment. Record per-repo status and surface it in the panel; the thread is still useful with three of four repos present.
 
+### One workspace, several threads
+
+**A thread resolves its workspace through a binding, never through its own id.** Threads are many-to-one with environments — a fork reuses its source thread's environment by default, so `create()` never runs for the fork and no second workspace is provisioned. A `workspaces` row per `(hostId, pathKey)` with a single `thread_id` therefore answered nothing for a fork: the Changes panel, the repo list, the layout block and every `workspace_*` tool went blank while the checkout sat on disk, fully populated.
+
+So `workspace_threads (thread_id → hostId, pathKey)` is the mapping, written in three places:
+
+- `create()`, for the thread the workspace was built for.
+- `thread.created`, for a fork. This is the only moment early enough to matter: `contributeInstructions` is synchronous and can only read a binding that is already persisted, so a fork's *first* turn carries the layout block only if the event bound it.
+- Lazily, in any async path (RPC, tool, CLI) that misses — with a short negative cache and per-thread deduplication, because the file opener asks for a workspace on every file bb opens anywhere.
+
+**Resolution asks core for the environment; it does not walk lineage.** `threads.get({ include: "environment" })` returns `environmentProviderId`, `hostId` and `environmentProviderInstanceKey` — and that instance key is exactly the `pathKey` core hands `create()`, which is half of `workspaces`' primary key. So a fork resolves in one indexed read, and refusing the environment when `environmentProviderId` is not ours is what keeps a child thread's git worktree out of this.
+
+Following `sourceThreadId` back through the fork chain would reach the same row the long way round — `sourceThreadId` is the *immediate* source, so it is a walk, not a lookup — and it would be wrong for a fork that was given its own environment. Lineage is not the fact this plugin needs; the environment is.
+
+**The binding table holds nothing core does not already know.** It exists for the synchronous path only: `contributeInstructions` gets `{ threadId, projectId }` and cannot await, so the answer has to be on hand locally before the first turn. An in-memory cache would do the same job until the next server restart, which is precisely when a session is reconstructed and instructions are resolved. (`bb.agents.configure` *does* receive the environment synchronously and can return instructions — a genuinely mapping-free alternative, at the price of also owning tool and skill selection, where an invalid selection drops this plugin's entire contribution for that resolution.)
+
+The table is also the only way to answer the *inverse* question synchronously — who else is in this checkout. Core has no `environmentId` filter on `threads.list`, so deriving it would mean listing the project's threads and filtering, asynchronously, which the instruction path cannot do.
+
+**Sharing is real and must be visible.** Two threads on one checkout means two agents on one branch in one directory, each seeing the other's uncommitted work as its own. The instruction block gains a shared-checkout warning appended at read time (`withSharedNotice`), the Changes panel names the other threads, and `bb repos status` lists them. Nothing prevents the collision — this is the only warning there is.
+
 ## 7. Sandbox boundaries
 
 | Path | Agent can write |
@@ -230,9 +279,21 @@ This is the expensive part of a diff UI and it comes free.
 
 Reference material in bb (read, don't import): the `gh --json` field list and the checks/review/mergeability normalizers at `packages/host-workspace/src/git-host.ts:35-38,235-282`; the bundled `github` plugin's batched polling into a plugin SQLite table at `plugins/github/server.ts:670-695`.
 
+### Staying current
+
+Nothing in bb tells a panel that a file on a machine changed: there is no
+watcher signal a plugin can subscribe to, so a panel that loads once at mount
+shows the thread's opening snapshot forever. The diff half therefore polls
+while the tab is visible — three short git commands per repo against a warm
+checkout — and a `thread.idle` listener publishes a realtime signal so a
+finished turn lands without waiting for the tick.
+
+The `gh` half is explicitly excluded from that loop, and the two halves fail
+independently: a machine without `gh` must not be able to hide the diffs.
+
 Defer bb's hardening until it's needed: diff tiering and pagination, list virtualization, byte budgeting, patch-section splitting. Cap file count and per-file bytes instead.
 
-Surfaces: `ui.threadPanelAction` for the panel, `ui.fileOpener` to claim workspace file-open targets so timeline file links route in rather than dead-ending.
+Surfaces: `ui.threadPanelAction` for the panel, `ui.fileOpener` to claim workspace file-open targets so timeline file links route in rather than dead-ending, and `app.composer.customize({ banners })` for a one-row changed-files summary above the composer — bb's own prompt-context git section reads the thread checkout and finds a plain directory, so without it the thread view gives no sign that a diff exists and no reason to open the panel. The banner reuses the panel's `changes` RPC, polls on a slower interval because it is mounted on every thread rather than open on request, and stops polling when the first read reports no repos.
 
 **Estimate: ~1,650–2,150 LOC, for §9 only.** It excludes provisioning, the cache, and the file lock from §5 — milestones 4 and 5 are where an estimate like this usually breaks, so treat it as a floor.
 
@@ -287,6 +348,7 @@ Accepted consequences, not bugs:
 - **Cold start is a full network clone per repo**, once per machine. Mitigated by the cache and local mirroring, not eliminated.
 - **`bb project show` displays the `.bb` remote** as the project's git remote, since core probes it from the project source. Defensible — the project *is* the workspace definition — but it reads oddly at first.
 - **`repos.json` sits on the critical path** for every thread creation in the project. Validate with a schema and fail naming the offending entry.
+- **A fork shares its source thread's checkout, branch and all.** Core reuses the environment; a plugin cannot provision a second workspace for an environment core considers provisioned. Both threads are warned, in the layout block and in the panel, and coordinating is left to the user.
 - **The repo set is fixed at `create()`.** Existing workspaces don't gain repos added later except via `workspace_add_repo`. Deliberate: a workspace shouldn't mutate under a running thread.
 
 ## Out of scope

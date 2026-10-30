@@ -39,8 +39,6 @@ const unit: RawUnit = {
 };
 
 async function load(threads: ReturnType<typeof makeThreadResponse>[] = []) {
-  const hostCalls: string[] = [];
-  let liveReviewers = ["inkwell/reviewers"];
   const { bb, harness } = createFakePluginHost({
     pluginId: "workstreams",
     settings: { scanRoots: "/p" },
@@ -54,18 +52,14 @@ async function load(threads: ReturnType<typeof makeThreadResponse>[] = []) {
       },
     },
     experimental_callHostRpc: ({ method }) => {
-      hostCalls.push(method);
       if (method === "scan") return { units: [unit], warnings: [] };
-      if (method === "checkoutState") return { ok: true, branch: unit.branch, rebasing: false };
-      if (method === "prReviewers") return { ok: true, reviewers: liveReviewers };
-      if (method === "prWrite") return { ok: true, detail: "Re-requested review." };
       throw new Error(`unexpected host call ${method}`);
     },
   });
   await plugin(bb);
   const refresh = await harness.runCli(["refresh"]);
   expect(refresh, refresh.stderr).toMatchObject({ exitCode: 0 });
-  return { harness, hostCalls, setLiveReviewers: (reviewers: string[]) => { liveReviewers = reviewers; } };
+  return { harness };
 }
 
 describe("backend reliability", () => {
@@ -80,20 +74,6 @@ describe("backend reliability", () => {
     expect(board.threadCoverage.threads).toBe(501);
     expect(board.threadCoverage.linked).toBeGreaterThan(0);
     expect(harness.sdk.callsTo("threads.list").some(([args]) => (args as { offset?: number }).offset === 500)).toBe(true);
-    await harness.lifecycle.dispose();
-  });
-
-  it("refuses a nudge when pending reviewers changed since confirmation", async () => {
-    const { harness, hostCalls, setLiveReviewers } = await load();
-    setLiveReviewers(["another-reviewer"]);
-    expect(await harness.callRpc("action_nudge", { path: PATH, rerequest: true, comment: null })).toMatchObject({
-      ok: false,
-      error: expect.stringContaining("Rescan"),
-    });
-    expect(hostCalls).not.toContain("prWrite");
-    setLiveReviewers(["inkwell/reviewers"]);
-    expect(await harness.callRpc("action_nudge", { path: PATH, rerequest: true, comment: null })).toMatchObject({ ok: true });
-    expect(hostCalls).toContain("prWrite");
     await harness.lifecycle.dispose();
   });
 });

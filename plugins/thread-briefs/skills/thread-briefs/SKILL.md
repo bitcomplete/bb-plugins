@@ -1,6 +1,6 @@
 ---
 name: thread-briefs
-description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page and its sidebar count, the re-entry refresher above the composer, the manual stage and status overrides, and renaming threads to the brief's title.
+description: Configure or diagnose the Thread briefs plugin — the per-thread goal/state/next-step brief, its summarizer endpoint, the sidebar glyphs, the grey ring and auto-archiving of stale done threads, the side-panel Brief tab, the Briefs board page, the re-entry refresher above the composer, the manual stage and status overrides (Brief panel and the Stage and Status thread menu entries), and renaming threads to the brief's title.
 ---
 
 # Thread briefs
@@ -27,18 +27,38 @@ Set these with `bb plugin config thread-briefs set <key> <value>`.
 | Key | Default | What it does |
 | --- | --- | --- |
 | `baseUrl` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. Either the API root or the full `/chat/completions` URL works; trailing slashes are fine. |
-| `apiKey` | _(unset, secret)_ | Bearer token for that endpoint. The plugin reports `needs-configuration` until it is set. |
+| `apiKey` | _(unset, secret)_ | Bearer token for that endpoint. The plugin reports `needs-configuration` until it is set here or in the [server's environment](#deployment-wide-defaults). |
 | `model` | `gpt-4o-mini` | Model used for summarizing. Any small instruction-following model works. |
 | `jsonMode` | `true` | Send `response_format: {type: "json_object"}`. Turn **off** for endpoints that reject it (many local servers do). |
-| `quietSeconds` | `120` | How long a thread must be quiet before it is **re**-summarized. A thread's first brief does not wait for it — see [When a brief is regenerated](#when-a-brief-is-regenerated). |
 | `refresherIdleHours` | `8` | Idle hours before opening a thread shows the re-entry refresher above the composer. `0` turns it off. See [The re-entry refresher](#the-re-entry-refresher). |
 | `renameThreads` | `false` | `true` renames each thread to the short name its brief chose. See [Thread titles](#thread-titles). |
 | `doneStaleHours` | `24` | Idle hours after which a `done` thread's ring goes grey instead of taking its project's colour. `0` keeps every done ring coloured. See [Stale done threads](#stale-done-threads). |
 | `doneArchiveHours` | `48` | Idle hours after which a `done` thread is archived. `0` turns auto-archiving off. See [Stale done threads](#stale-done-threads). |
-| `sidebarGrouping` | `off` | `status` groups the sidebar into status sections instead of by project; `off` restores it. See [Sidebar sections](#sidebar-sections). |
+| `sidebarGrouping` | `off` | `status` groups the sidebar into status sections instead of by project; `off` restores it. Reordering the sections by hand sticks. See [Sidebar sections](#sidebar-sections). |
 
 The key is a secret setting, so it stays on the server and is never sent to the
 frontend.
+
+### Deployment-wide defaults
+
+A deployment that runs one server per developer can give every server the same
+summarizer through the server process's environment, so nobody has to find and
+paste a key:
+
+| Variable | Stands in for |
+| --- | --- |
+| `THREAD_BRIEFS_API_KEY` | `apiKey` |
+| `THREAD_BRIEFS_BASE_URL` | `baseUrl` |
+| `THREAD_BRIEFS_MODEL` | `model` |
+| `THREAD_BRIEFS_JSON_MODE` | `jsonMode` (`true`/`false`, `1`/`0`, `on`/`off`) |
+
+A stored setting always wins over the variable, so a developer can point their
+own server elsewhere; `bb plugin config thread-briefs unset <key>` returns to
+the deployment's value. The non-secret variables become the settings' defaults,
+so the settings form shows what is in use. The key is never a default — a
+default is part of the form — and is resolved only when a request is made.
+The variables are read when the plugin loads, so a change to them takes a
+server restart.
 
 Worked example, Fireworks:
 
@@ -52,11 +72,22 @@ A 404 naming a doubled path (`/chat/completions/chat/completions`) meant an olde
 build appended the path to a `baseUrl` that already ended in it. Both spellings
 are accepted now.
 
+Clearing `baseUrl` or `model` in the settings form stores an empty string, and
+a stored value wins over the deployment's — so an older build then requested
+`/chat/completions` with no host and every brief failed with `Failed to parse
+URL`. A blank stored value is now read as unset and falls back like `unset`
+does; on a build that predates this, run `unset` instead of clearing the field.
+
 ## When a brief is regenerated
 
-1. `thread.idle` fires at every turn boundary and starts a `quietSeconds`
-   debounce for that thread. `thread.active` cancels it — a thread mid-burst is
-   not summarized until the burst stops.
+1. `thread.idle` fires at every turn boundary and the thread is summarized at
+   once — there is no quiet period. If a summary of that thread is still in
+   flight from the previous turn boundary, it is aborted and the thread is
+   summarized again from the newer transcript: the last turn boundary wins, and
+   the brief that lands is never older than the thread it describes.
+   `thread.active` does not cancel anything — a running summary describes a real
+   turn boundary and is left to finish; the turn that just started supersedes
+   it when it ends.
 2. A `*/10 * * * *` sweep is the backstop for activity whose `thread.idle` never
    arrived (server restart, plugin reload, a turn that ended in `error`). It only
    enqueues threads whose stored cursor is behind the thread's own.
@@ -64,28 +95,28 @@ are accepted now.
    `conversationOutline().maxSeq` against `lastActivitySeen` and skips threads
    that have not actually moved.
 
-Re-summarize is available in the Brief panel; it bypasses the debounce.
+Summaries run one at a time, so on a server with many threads finishing at
+once a brief can queue behind the others. The panel says **Summarizing…** while
+it waits. An aborted request may still be billed for its input by the
+provider; that is the cost of briefs that follow the turn rather than a timer.
 
-### The first brief does not wait
+Re-summarize is available in the Brief panel; it runs even when the thread has
+not moved.
 
-A thread with **no brief yet** is on a 5-second delay instead of `quietSeconds`,
-and is summarized from `thread.active` — while its first turn is still
-running — rather than waiting for that turn to end:
+### The first brief does not wait for the turn
 
-- The quiet period exists to stop a thread in active back-and-forth being
-  re-summarized every turn. On the first brief there is nothing to protect, and
-  it is the cheapest summary that thread will ever cost, because the transcript
-  is at its shortest.
-- It is also where the absence shows: until the first brief lands there is no row
+A thread with **no brief yet** is summarized from `thread.active` — while its
+first turn is still running — rather than waiting for that turn to end:
+
+- It is where the absence shows: until the first brief lands there is no row
   glyph, no sidebar section, an empty Brief panel, and bb's opening-prompt title
   still on the thread. An agentic first turn can run for ten minutes, and waiting
   for it means the thread spends all ten looking like one the plugin has never
   heard of.
+- It is the cheapest summary that thread will ever cost, because the transcript
+  is at its shortest.
 - The opening prompt alone is enough for a goal, a `discovery` ring and a
   sidebar section. Every field is corrected by the summary that follows the turn.
-
-The delay is capped at `quietSeconds`, so setting that below five seconds makes
-first briefs faster rather than slower.
 
 With `renameThreads` on, a pre-turn brief renames the thread **only if bb never
 named it** — a null `title`, where the sidebar falls back to the opening prompt
@@ -121,29 +152,23 @@ re-enqueued on every sweep forever — an unbounded burst of requests across the
 whole thread list the first time a key is configured, and an endless retry for
 any thread whose summary keeps failing.
 
-So a thread reports `summarizing` only while work is genuinely debounced,
-queued, or in flight; otherwise it reports `absent`, which the UI renders as an
+So a thread reports `summarizing` only while work is genuinely queued or in
+flight; otherwise it reports `absent`, which the UI renders as an
 offer rather than a spinner. A failed summary drops back to `absent`.
 
 ## Stage and status
 
 `stage` is a semantic judgement from the transcript: discovery, planning,
 implementation, review. It is what the sidebar row's ring draws — see
-[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel to
-override it; the override is anchored to the thread's activity cursor and retires
+[Sidebar glyphs](#sidebar-glyphs). Pick a stage by hand in the Brief panel, or from **Stage** in any thread
+actions menu, to override it; the override is anchored to the thread's activity cursor and retires
 itself on the next real turn. Clicking the active manual stage clears it. The
 override moves the row's ring too, immediately.
 
-Stage and `nextStep` come back from one model call, and nothing in that call
-makes the model answer both consistently — the usual failure is a stage left at
-`implementation` beside an empty `nextStep`, on a thread whose agent has just
-narrated what it built and deployed. Since an empty `nextStep` derives `done`,
-that pair renders as "Implementation — Done" and drags out of the board's Done
-column back into Implementation. `reconcileStage` in `summarize.ts` promotes it:
-nothing owed means the work is made, so the stage is `review`. Only from
-`implementation` — a `discovery` or `planning` thread with nothing owed was
-dropped before any work existed, and there is nothing there to review. A pinned
-stage short-circuits it, since a pin promises to come back as given.
+Stage and status come back from one model call and are stored as answered.
+The parser does not correct one against the other: "Implementation — Done" is a
+model answer to fix in the prompt, not to paper over. A pinned stage is passed to
+the model as fixed and returned as given.
 
 Both overrides share that anchor rule, and "the next real turn" means a summary
 whose conversation cursor has moved past where the pin was set — so
@@ -151,43 +176,60 @@ whose conversation cursor has moved past where the pin was set — so
 actual turn drops it. The anchor is never re-stamped to the new cursor; one that
 advanced in step with the activity meant to expire it would never expire.
 
-`status` is derived mechanically, so it stays correct between summaries. It has
-a live half and a stored half, and the live half wins:
+`status` has a live half and a stored half, and the live half wins:
 
 - the thread is `active`, `starting` or `pending` → **working**, whatever the
   brief says. A run in flight is newer information than the brief, which
   describes the last turn that finished.
 - otherwise, from the stored brief:
-  - a manual status override in force → that status, whatever the fields say
-  - `nextStep` **and** `blockedOn` both empty → **done**
-  - `blockedOn` non-empty, or `nextStepActor` is `other` → **waiting-on-other**
-  - otherwise → **waiting-on-me**
+  - a manual status override in force → that status
+  - the status the summarizer answered (`modelStatus` on the row)
+  - a brief written before the summarizer was asked for a status has none, and
+    reads the old way until its thread is next summarized: `nextStep` and
+    `blockedOn` both empty → done, `blockedOn` set or `nextStepActor` `other` →
+    waiting-on-other, otherwise waiting-on-me
 
-**done** needs both fields empty, so a blocked thread cannot read as done even
-if a summary comes back without a next step. And **waiting-on-me** is the
-fallback: an idle thread with work left needs a human look whether or not its
-last turn ended in a question, and whether or not the actor is known.
+The summarizer is asked one question: **assume you do whatever the thread asks of
+you — is the task then finished, or does the thread have more to do?**
+
+- **done** — finished. A step that is only yours ("approve PR #12", "run the
+  rollout check"), an offer of extra work ("want me to add a lint rule?") and an
+  optional check do not keep it open: nothing more happens in the thread either
+  way. `nextStep` may still carry it, as a suggestion.
+- **waiting-on-me** — your answer, decision or go-ahead starts more work in the
+  thread ("the diff is ready but uncommitted — should I push?"), or the task is
+  otherwise unfinished.
+- **waiting-on-other** — the work cannot go on until something outside the
+  thread acts, named in `blockedOn`.
+
+One rule holds whatever the model says: a brief with a non-empty `blockedOn` is
+never **done** — it reads **waiting-on-other**. A status the parser cannot read
+falls back to **waiting-on-me**, because a thread wrongly left waiting costs a
+glance and one wrongly called done is archived two days later.
+
+`nextStep` and `blockedOn` are **not** fed back into the next summary as part of
+the previous brief; only title, goal, currentState and constraints are. Fed
+back, they outlived the turns that retired them — a step the agent had since
+dropped, a rollout that had since finished — and kept finished threads out of
+Done. Both are re-read from the transcript every time.
 
 ### Overriding the status by hand
 
-Pick a status in the Brief panel to pin it, exactly as with the stage: the pin
+Pick a status in the Brief panel, or from **Status** in any thread actions
+menu, to pin it, exactly as with the stage: the pin
 is anchored to the thread's activity cursor, retires on the next real turn, and
 clears if you click the one that is already pinned. It moves the sidebar
 section as well as the row, because sections are keyed on this status.
 
-**Why it exists.** The derivation reads the brief's prose, and the prose can
-record a `nextStep` that is addressed to you and carried out somewhere the
-transcript cannot see — "reload an open client and confirm the panel tab
-opens", "check the rollout landed", "confirm the glyph looks right". Doing it
-leaves no trace for any summary to read, so **Re-summarize** just writes the
-same unresolved instruction back and the thread is **waiting-on-me** forever.
-The pin is the only way to say you did it.
+**Why it exists.** The summarizer only sees the transcript. A go-ahead you gave
+somewhere else, or a PR you merged on github.com that the thread was waiting
+on, leaves no trace for any summary to read, so **Re-summarize** reads the same
+open question back. The pin is the way to say it is settled — or simply that you
+read the thread differently from the model.
 
-The pin sits *in front of* the derivation rather than editing the fields it
-reads. Blanking `nextStep` in storage would not work: `renderTranscript` feeds
-the previous brief into the next summary as a starting point, so the field would
-simply come back. A pin is a separate fact the summarizer is never shown and
-cannot undo.
+The pin sits *in front of* the model's status rather than replacing it. It is a
+separate fact the summarizer is never shown as a status and cannot undo; it is
+told about it only so the refresher prose agrees.
 
 Dragging the row into another sidebar section is **not** a substitute. Section
 assignment never feeds back into a brief, so the next reconcile — on plugin
@@ -195,64 +237,65 @@ start, after any batch of briefs, or on a settings change — files the thread
 straight back where its status says. Pin the status instead and the section
 follows.
 
-`nextStepActor` is the one input the model judges rather than the code: "try it
-and tell me if the glyph looks right" and "keep porting the call sites" are both
-concrete next actions, and nothing in the prose separates them. It is **optional**
-— absent means unknown, which covers both a brief written before the field
-existed and one whose `nextStep` is empty — and an actor the parser does not
-recognise is dropped rather than failing the brief, the same bar as an
-unrecognised stage. Either way the status falls back to the rules above with the
-actor clause skipped.
+### Parking a thread: the block reason
 
-An actor of `agent` — an idle thread the agent could carry on by itself — has no
-status of its own and currently reads **waiting-on-me**, because the nudge is
-yours to give. If that bucket turns out to be common it earns its own status
-then.
+Pinning **Blocked** is how you park a thread — "not now" — and the panel asks
+why as you do it. The reason is optional, one line, and is the one input the
+summarizer gets that is not the transcript.
 
-Briefs are not re-summarized to pick the field up: old rows gain an actor on
-their next natural summary. To see how far that has spread, compare the rows
-that have one against the total.
+It is **guidance, not a field**. The reason is not copied into `blockedOn`;
+it is placed in the conversation the summarizer reads, as a note at the point
+you made it (`[User's note, recorded 2026-10-03: this thread is blocked
+because "…"]`), with an instruction to treat it as true unless the
+conversation after it shows the block resolved. The model then writes
+`blockedOn` and `status` from it in its own words, as it would from a message,
+and the refresher prose says the thread was parked, why, and what resuming
+would take. Because a non-empty `blockedOn` is never `done`, the status
+follows without any further rule.
 
-Beyond that guard, **done** is only as good as the summarizer's bar for
-"finished", and the prompt sets that bar at **whether anybody owes the thread an
-action** — something a person or team must do, that will not happen on its own,
-and that would be dropped if the brief did not record it.
+The panel shows the reason as **Your note**, with its date and Edit and Clear,
+under the status buttons — not in the Blocked-on slot, which is the model's
+reading. The note is what you typed; the slot is what the summary made of it.
+The board's expanded card has the same control.
 
-That test cuts both ways, and the prompt names both halves because each has its
-own failure:
+**It outlives the pin.** The pin retires on the next turn like any pin, and a
+turn the agent was still running when you parked the thread counts. The
+reason does not retire with it: it is handed to every later summary until one
+of two things happens.
 
-- An obligation **outside the chat** still counts, and is the one that gets
-  silently dropped: a PR open for review or merge, a patch carried on a fork
-  until it lands upstream, a temporary workaround to undo, a rollout to finish
-  and confirm. These earn a `nextStep` and a `blockedOn`, so the thread reads
-  **waiting-on-other** rather than done.
-- **Nothing is owed to the passage of time.** Open-ended watching — "check back
-  in a few days", "keep an eye on it", "confirm it behaves in real use" — has no
-  owner and no definite outcome, so it does not keep a thread open. Neither does
-  work the transcript puts out of scope, nor an idea nobody adopted.
+- **You clear it**, in the panel or the card. Pinning the thread to any status
+  other than Blocked also clears it — pinning done or waiting-on-you is you
+  saying the block is over. Clearing a Blocked pin does *not* clear it.
+- **You write to the thread and the summary reads it as resolved.** A summary
+  that follows a *new user message* and comes back with a status other than
+  `waiting-on-other` releases the reason: the model read your message as
+  lifting the block. A summary over the same user messages — a forced
+  re-summary, an agent turn finishing — keeps the reason whatever the model
+  said, because nothing you did has changed, and one bad reading by a small
+  model must not quietly un-park a thread. `bb plugin logs thread-briefs`
+  records a release as `block reason on <id> released`.
 
-The second half exists because the first, on its own, made `done` a function of
-the agent's closing rhetoric rather than of the work. Agents habitually hedge
-when they sign off — "worth a glance", "I'd flag this as open" — and a bar of
-"nothing outstanding anywhere" is unfalsifiable, so any such sentence kept a
-finished thread out of Done. Two threads that had both shipped and rolled out
-landed in different sections purely because one agent volunteered a caveat. The
-prompt now says to judge the state of the work, not the tone of the sign-off.
+The note's place in the conversation is a count of user messages at the time
+it was recorded, because the outline carries no per-message sequence. It is
+rendered just before the user message that followed it rather than straight
+after the one before, since a thread is nearly always parked after reading the
+agent's reply.
 
-`blockedOn` carries a **higher** bar than `nextStep`, because it is the field
-that jams the door: any non-empty value forces **waiting-on-other**, and
-`renderTranscript` feeds the previous brief back into the next summary, so a
-stray value is sticky. It must name a party or artifact someone could go
-chase — a specific review, a person, an upstream fix, a running build, an access
-grant — never a duration, "real usage", or "more data". The Blocked section is
-meant to be a list of things you could go poke; if you cannot say who would be
-chased, it is not blocked.
+Setting or clearing a reason queues the same forced re-summary a pin does, so
+the status, the section and the refresher follow within seconds.
 
-A thread whose brief disagrees with this bar is usually one written before the
-bar changed: **Re-summarize** from the Brief panel. That re-reads the
-transcript under the current prompt, but note it also feeds the old brief back
-as a starting point, so a wrong `blockedOn` can survive if the transcript still
-reads as though it were true.
+`nextStepActor` says who would take `nextStep` — `me`, `agent` or `other` — and
+no longer feeds the status. It is optional, dropped when `nextStep` is empty or
+the word is not one of the three. Its one use is the board's
+`agent can continue` hint.
+
+**Re-summarize** re-reads a thread under the current prompt. Old briefs are not
+re-summarized in bulk: every idle thread that now read done would already be
+past the archive threshold, and the next sweep would take them all at once.
+
+The numbers behind the current prompt, and the harness to re-measure a change
+to it, are in the plugin's `eval/` directory and README ("Measuring a prompt
+change").
 
 ## The re-entry refresher
 
@@ -337,8 +380,8 @@ shown.
 
 The pin is scoped to the two prose fields in the prompt, and the prompt says so:
 the five fields still describe the work as the transcript leaves it, for the
-same reason the pin sits in front of the derivation rather than editing what it
-reads.
+same reason the pin sits in front of the model's status rather than editing
+what it reads.
 
 ### Where it renders
 
@@ -403,6 +446,9 @@ Other things worth knowing:
 - **Turning it off does not undo anything.** bb's original title is not kept
   anywhere; the last name the plugin wrote stays. Rename by hand to change it.
 - Branch names are derived at thread creation and are unaffected.
+- A thread whose spawning plugin set `threadBriefs: false` in its own
+  metadata namespace is left alone entirely. See
+  [Threads a plugin exempted](#threads-a-plugin-exempted).
 
 ## Sidebar glyphs
 
@@ -415,16 +461,39 @@ stage the thread has reached:
 | half (ends at 6) | planning |
 | three quarters (ends at 9) | implementation |
 | closed ring, hollow | review |
-| closed ring, centre filled | status `done`, any stage |
+| closed ring, hollow | status `done`, any stage — same ring as review; the section heading and the hover label say which, and the grey a day later says it louder |
+| a **dot in the centre** | bb's `isUnread`: output you have not read — see [the unread dot](#the-unread-dot) |
+| the filled quarters **pulse** | bb's thread status is running or queued — see [`working`](#working) |
 | the ring's **colour** | which project the thread is in |
 
 Names are registered by the app through `app.experimental_icons.register` as
-`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in a `-c<n>`
-variant per palette slot, plus `thread-briefs/done-stale`; a row status takes an
-icon *name*, not a component, so the artwork has to go in the registry first.
-They are mapped off `BRIEF_STAGES` and `PROJECT_RING_HUES`, so adding a stage or
-a hue adds its rings. `done-stale` has no `-c<n>` variants — see
-[Stale done threads](#stale-done-threads).
+`thread-briefs/stage-<stage>` and `thread-briefs/done`, each also in
+`-unread`, `-working` and `-unread-working` variants and a `-c<n>` variant per
+palette slot (in that order: `stage-review-unread-working-c3`), plus
+`thread-briefs/done-stale` with the same three mark variants; a row status
+takes an icon *name*, not a component, so the artwork has to go in the registry
+first. They are mapped off `BRIEF_STAGES`, `RING_MARKS` and
+`PROJECT_RING_HUES`, so adding a stage or a hue adds its rings. `done-stale` has
+no `-c<n>` variants — see [Stale done threads](#stale-done-threads).
+
+### The unread dot
+
+The dot is bb's own activity dot, drawn where bb drew it before the ring took
+the row: a filled centre means the thread has output you have not seen. The
+condition is bb's `isUnread` off `experimental_useSidebarThreads()`, so it
+clears exactly when bb's would — on opening the thread — and the label does
+not repeat it, because the dot is the whole message. It is additive: an unread
+done thread shows the full ring and the dot, in grey once cold.
+
+bb hides a plugin row status outright while its own indicator is
+`unread-error`, so a turn that ended in an error keeps bb's red dot rather than
+getting this one. Only the success case is drawn here.
+
+**The pin draws nothing on the ring.** A stage or status set by hand is named
+in the hover label (`Implementation — Blocked · set by hand`) and, on the
+board, by the card's `pinned` marker. The centre was the pin's for a while;
+it went to unread because that reading was already bb's and is worth more on
+a row at a glance.
 
 ### The project colour
 
@@ -442,8 +511,8 @@ change without any thread having changed.
 
 `done` therefore has **no green**: the success tone is gone from the row
 entirely, rather than surviving on the rows that reach the decoration without a
-project. `done` keeps the two marks that never needed the colour channel — the
-filled centre, and its section heading. A thread the host reports with no
+project. `done` keeps the mark that never needed the colour channel — its
+section heading — and the grey it turns once cold. A thread the host reports with no
 project id keeps the plain `currentColor` ring and is skipped rather than
 throwing, so one bad entry cannot cost the other rows their glyphs.
 
@@ -471,6 +540,12 @@ gains the reason: `Review — Done · idle 2 days, archiving soon`. At
 bb plugin config thread-briefs set doneStaleHours 24    # 0 keeps every done ring coloured
 bb plugin config thread-briefs set doneArchiveHours 48  # 0 never auto-archives
 ```
+
+A done thread may still carry a step that is yours — approving a PR, running a
+check — and is archived on the same clock. That is deliberate: the step sits on
+the card in the Done section for two days, the hover label warns for the second,
+and an archived thread un-archived by hand is never auto-archived again. If you
+want longer, raise `doneArchiveHours`.
 
 The grey **replaces** the project hue; there is no `-c<n>` variant of it. The row
 has one channel, colour on it means a live project, and a thread about to leave
@@ -519,32 +594,41 @@ from done. `done` stays off the ring as a status, not a fifth stage — four
 segments is where you can read the fill's endpoint as a clock position instead of
 counting marks.
 
-**What this costs.** `waiting-on-me` and `waiting-on-other` draw the **same**
-ring. Grouping tells them apart; with grouping off, only the hover label does
-(`Implementation — Blocked`). If that bites, the cheap fix is a centre mark on
-the blocked ring rather than a different glyph family.
+**What this costs.** A `waiting-on-me` and a model-read `waiting-on-other` draw
+the **same** ring. Grouping tells them apart; with grouping off, only the hover
+label does (`Implementation — Blocked`). A thread *you* blocked is named as
+such in the label (`· set by hand`) for as long as the pin holds — see
+[Parking a thread](#parking-a-thread-the-block-reason).
 
-`working` still draws **nothing**, so the live override reads as a
-**suppression**: a running thread shows no brief glyph, and its stored ring comes
-back the moment it goes idle. Three reasons, and the first is not the plugin's
-choice:
+### `working`
+
+`working` is a **mark**, not a suppression: a running or queued thread keeps
+its stage ring and the filled quarters **pulse**, with `tone: "running"` and a
+label that reads `Working` in place of the stored status. The fill's endpoint
+does not move — a spinning ring would say "busy" and nothing else, and where
+the fill stops is the whole reading of the glyph. The pulse is SMIL inside the
+artwork, so it needs no stylesheet. A working thread is never drawn grey:
+grey means nobody came back, and a running turn is the proof they did.
+
+Three things bb does with it, and the first is not the plugin's choice:
 
 - bb hides a plugin row status outright when its own indicator is `runtime`,
-  `unread-error` or `waiting-for-input`, so a decoration on a plain running
-  thread is ignored anyway.
+  `unread-error` or `waiting-for-input`. A plain running thread's row is
+  `runtime`, so whether the pulsing ring or bb's spinner shows there is the
+  host's call; the ring is set either way, and shows wherever the host lets a
+  plugin status through on a running row.
 - It is *not* hidden for `plan-mode`, `goal`, `workflow` or `background-agent`,
-  where a ring would displace a shimmering live glyph that says something a
-  stored brief cannot.
+  where the ring displaces that live glyph.
 - bb paints the status in place of the unsent-draft pencil, so any decorated row
   loses its pencil.
 
-The live half is computed in the client from `experimental_useSidebarThreads()`,
-which is why no row needs a server round trip to stay current, and why
-`listRowSignals` does no per-thread lookups.
+The live half — running, unread — is computed in the client from
+`experimental_useSidebarThreads()`, which is why no row needs a server round
+trip to stay current, and why `listRowSignals` does no per-thread lookups.
 
 One consequence worth knowing: the Brief panel shows the **stored** status, so
 a running thread whose brief says "Waiting on you" will say that in the panel
-while its row shows no glyph. The row is live; the panel is the brief.
+while its row pulses and says Working. The row is live; the panel is the brief.
 
 The panel is also where the ring is learned — the stage control draws each option
 beside its own ring, and the status line at the top draws the ring that thread's
@@ -611,8 +695,8 @@ project's colour (the same glyph as the sidebar row, including the grey one for 
 cold done thread), a status badge, `blockedOn`, the project, and the idle age.
 
 `agent can continue` appears when `nextStepActor` is `agent` and the status is
-`waiting-on-me`. The derivation collapses those two cases (see
-[Stage and status](#stage-and-status)), so this is the only place the difference
+`waiting-on-me`. That status covers both a thread waiting on your answer and
+one the agent could carry on by itself, so this is the only place the difference
 shows.
 
 Order inside a column: pinned threads, then `waiting-on-me` → Blocked → Working →
@@ -634,8 +718,8 @@ is what the `pinned` marker on the card is warning about.
 | to or from **No stage** | nothing |
 
 Dragging out of Done *pins* rather than clears because a done reading can come
-from the derivation as well as a pin; clearing would hand the card back to a
-derivation that still says done and it would snap straight back.
+from the model as well as a pin; clearing would hand the card back to a model
+reading that still says done and it would snap straight back.
 
 Drag-and-drop does not work on touch, so the **expanded card carries the panel's
 own stage and status controls**. On a compact viewport the columns stack into one
@@ -671,12 +755,11 @@ view could move back into the URL and become linkable again.
 The project chips only list projects that have a thread on the board, and appear
 only when there is more than one.
 
-### The count on the sidebar row
+### No count beside Briefs
 
-The number beside **Briefs** is threads `waiting-on-me`, with running threads
-excluded (they are `working`). It costs no request: the overlay that draws the row
-glyphs has already folded the briefs against the live thread list, and the badge
-reads that store. Nothing is drawn at zero.
+Up to bb 0.45 the board's sidebar entry showed how many threads were waiting
+on you. bb 0.46's navigation rail mounts no panel accessory, so the plugin
+dropped it; a missing number there is expected, not a fault.
 
 ### Cost
 
@@ -703,6 +786,15 @@ Threads last is the design, not an oversight. A thread with no brief is left
 set — including a thread created since the last sync, which needs no sync to
 appear. Hiding it would lose threads, so don't add `threads` to `hiddenGroups`.
 
+That order is only the **default**. Reorder the sections in the sidebar — drag
+them, or write `manualSectionOrder` yourself — and the sync leaves your order
+alone from then on: an order holding the same entries is treated as correct
+however it is arranged, whichever way up `threads` sits. The default order only
+decides where a *new* entry lands, inserted after the last entry the default
+puts above it rather than appended, so a section added later shows up beside its
+siblings. An entry the sync does not own — a retired section, a duplicate — is
+dropped the next time it has to write the order at all.
+
 There is **no section for running threads**. `working` is live state and never
 reaches a stored brief, so a section keyed on it could not have members; a
 running thread sits where its last brief puts it and keeps bb's own running
@@ -714,7 +806,9 @@ What the sync owns, and hands back on `off`:
 - the three sections — deleted on `off`, which clears their assignments
 - `organizationMode` → `chronological`
 - `chronologicalSort` → `updated` (newest first inside each section)
-- `manualSectionOrder` → pinned, the three sections, then `threads`
+- `manualSectionOrder` → pinned, the three sections, then `threads`, but only
+  while the stored order is missing an entry; a reordering of the same entries is
+  yours and is never overwritten
 
 Prior values are recorded before the first write and restored on `off`; a
 preference bb had never been given is reset rather than guessed at, because
@@ -727,6 +821,28 @@ so a burst is one pass), and whenever the setting changes. It is idempotent: a
 thread already in the right section is not touched, and a settled sidebar costs
 no preference writes.
 
+## Threads a plugin exempted
+
+A plugin that spawns a thread can turn thread-briefs off for it entirely by
+setting `threadBriefs: false` in its own metadata namespace on that thread.
+thread-briefs reads it through the thread's `originPluginId`. Stewards does
+this for every steward, the project steward included, and for the workers and
+reviewers a steward spawns.
+
+- Off means no summary, no stored brief, no rename, no status section, no
+  ring, no auto-archive and no re-entry refresher. The Brief panel says the
+  thread's plugin keeps it out of briefs. The plugin that spawned the thread
+  archives it, if it archives it at all.
+- A thread tagged before this was a single switch carries the old
+  `threadBriefs: { rename, group, archive, ring }` object; any one key being
+  `false` reads as off, so it needs no re-tag. That reading can go a release
+  later.
+- If the owning plugin's namespace cannot be read (the plugin is gone, or the
+  request fails), the thread is treated as off for that pass: it is skipped
+  and its brief is kept, rather than read as on and deleted. The logs show
+  `could not read <plugin>'s metadata`.
+- To see what a thread asked for: the origin plugin's namespace itself.
+
 ## Diagnosing
 
 - `bb plugin list` — service and schedule status, including the sweep's
@@ -737,19 +853,29 @@ no preference writes.
 - Sections exist but the sidebar still groups by project: check
   `bb thread-list prefs get organizationMode`. Something changed it back after
   the sync; the next reconcile will set it again.
+- A section order that reverts: expected only up to the first pass after a
+  section is added or retired, which is the one pass that rewrites the order. A
+  drag that reverts on *every* brief write is a bug — the sync compares entry
+  sets, not arrangements.
 - No glyphs at all, but the Brief panel works: the bb client predates
   `experimental_setThreadRowStatus`, which the content script feature-detects.
 - A lightning bolt where a ring should be: that is bb's `Zap` fallback for an
   unknown icon name, so the ring registrations did not take. The client predates
   `app.experimental_icons`, or the app bundle is stale — rebuild with
   `bb plugin build` and reload.
-- Briefs stuck on "Summarizing…": check `apiKey` is set and
+- Briefs stuck on "Summarizing…": check `apiKey` is set, or
+  `THREAD_BRIEFS_API_KEY` in the server's environment, and
   `bb plugin logs thread-briefs` for HTTP errors from `baseUrl`.
+- Every brief failing with `Failed to parse URL from /chat/completions`: the
+  effective `baseUrl` is empty. `bb plugin config thread-briefs` shows
+  `baseUrl = ""` — a cleared field stored as a blank, which beat the
+  deployment's `THREAD_BRIEFS_BASE_URL`. `bb plugin config thread-briefs unset
+  baseUrl` (and `unset model` if it is blank too) restores the deployment's
+  value; current builds treat the blank as unset on their own.
 - A brief that describes work already finished: read the **Summarized …** line
-  under the status. Briefs are only rewritten after `quietSeconds` of quiet, so
-  one that predates the last few turns is expected rather than broken;
-  **Re-summarize** forces it. Note this does not apply to a *first* brief, which
-  does not wait.
+  under the status. A brief is rewritten at every turn boundary, so one that
+  predates the last turn is only expected while that summary is still running
+  (the panel says **Summarizing…**); **Re-summarize** forces one otherwise.
 - A brand-new thread whose brief reads as though the work has not started: also
   expected. That is the pre-turn brief, written from the opening prompt while the
   first turn runs, and the summary after that turn replaces it.
@@ -758,13 +884,31 @@ no preference writes.
   prompt — is named by the pre-turn brief instead of waiting. If such a row keeps
   its prompt, the rename failed: check `bb plugin logs thread-briefs` for
   `could not rename`.
-- A thread stuck on **Waiting on you** whose next step you have already carried
-  out: expected if the step happened outside the thread, because nothing in the
-  transcript can record that. Pin the status to **Done** in the Brief panel —
-  see [Overriding the status by hand](#overriding-the-status-by-hand).
+- A finished thread stuck on **Waiting on you**: first check the brief is new —
+  a brief written before the summarizer answered status reads the old way, and
+  **Re-summarize** rewrites it. If it is new and the thread waits on a go-ahead
+  you gave elsewhere, pin the status to **Done** in the Brief panel — see
+  [Overriding the status by hand](#overriding-the-status-by-hand).
+- A **Done** thread that still shows a next step: expected. Done means nothing
+  more happens in the thread once you do what it asked; the step left on the
+  card is yours, and the thread is archived on the usual clock.
 - A thread that will not stay in the section you drag it to: sections are keyed
   on status and nothing feeds an assignment back into a brief, so the next
   reconcile undoes the move. Pin the status instead.
+- A thread you parked is back in **Waiting on you**: you wrote to it, and the
+  summary after that message read the block as resolved, which releases the
+  reason — `bb plugin logs thread-briefs` says `block reason on <id> released`.
+  If the block still stands, say so in the thread, or pin Blocked again with
+  the reason; the panel's **Your note** block shows whether one is held.
+- A thread you parked still reads Blocked after you said the block was over:
+  the summary after your message still answered blocked, so the reason was
+  kept. Clear it by hand from **Your note**, or pin another status, which
+  clears it too.
+- A dot in the centre of a ring: a stage or status pin is in force on that
+  thread. It goes with the pin, on the next real turn.
+- A thread the model read as Blocked shows **Add a reason…** and no editor:
+  expected. The editor opens by itself only when *you* pin Blocked; a reason
+  can still be added to a model-read block from that link.
 - No re-entry refresher on a thread you have not touched in days: check
   `refresherIdleHours` is not `0`, that the thread has a brief at all, and that
   you have not already dismissed it for that activity — it shows once per new
@@ -789,7 +933,7 @@ no preference writes.
   the `pinned` marker on the card says one is in force.
 - A card that will not stay out of **Done**: pin the status to something else from
   the expanded card. Dragging already does this, but a re-summary after the next
-  turn will re-derive `done` if the brief still has nothing outstanding.
+  turn may read `done` again if the transcript still says the task is finished.
 - Drag does nothing on a phone or tablet: expected — it is an HTML5 pointer drag.
   Use the stage and status controls on the expanded card.
 - No **Briefs** item in the sidebar: it is a nav panel, so it can be hidden or

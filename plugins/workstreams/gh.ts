@@ -10,7 +10,7 @@ const KNOWN_MERGE_STATE_STATUSES = new Set<string>(MERGE_STATE_STATUSES);
 
 /** Shared by checkout scans and the authored PR inventory. */
 export const PR_FIELDS =
-  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,headRefOid,baseRefOid,mergeCommit,mergedAt,createdAt,reviewRequests,body";
+  "number,state,isDraft,reviewDecision,latestReviews,statusCheckRollup,url,title,mergeable,mergeStateStatus,baseRefName,headRefName,headRefOid,baseRefOid,mergeCommit,mergedAt,createdAt,updatedAt,reviewRequests,body";
 
 /**
  * GitHub's authoritative "can this merge right now" signal, from
@@ -67,9 +67,9 @@ export function checkConclusions(rollup: unknown): string[] {
       const record = entry as Record<string, unknown>;
       // Checks report `conclusion`; commit statuses report `state`.
       const value = record.conclusion ?? record.state;
-      return typeof value === "string" && value !== ""
-        ? [value.toUpperCase()]
-        : [];
+      if (typeof value === "string" && value !== "") return [value.toUpperCase()];
+      // A check run's conclusion stays empty until it completes: still running, not green.
+      return typeof record.status === "string" && record.status.toUpperCase() !== "COMPLETED" ? ["PENDING"] : [];
     })
     .slice(0, 100);
 }
@@ -87,9 +87,9 @@ export function latestReviewStates(reviews: unknown): string[] {
 }
 
 /**
- * Who left each latest review, and its state, from the same `latestReviews`
- * payload. Bots are kept: they review like people. Display only, never passed
- * to gh, so a login is bounded rather than validated.
+ * Who left each latest review, its state, and when, from the same `latestReviews`
+ * payload. Bots are kept: they review like people. A login is bounded here, and
+ * validated as a reviewer only where a re-request passes it to gh.
  */
 export function latestReviewers(reviews: unknown): { login: string; state: string }[] {
   if (!Array.isArray(reviews)) return [];
@@ -102,7 +102,8 @@ export function latestReviewers(reviews: unknown): { login: string; state: strin
         author !== null && typeof author === "object" ? (author as Record<string, unknown>).login : undefined;
       const state = record.state;
       if (typeof login !== "string" || login === "" || typeof state !== "string" || state === "") return [];
-      return [{ login: login.slice(0, 140), state: state.toUpperCase().slice(0, 40) }];
+      const submittedAt = typeof record.submittedAt === "string" && !Number.isNaN(Date.parse(record.submittedAt)) ? record.submittedAt.slice(0, 40) : null;
+      return [{ login: login.slice(0, 140), state: state.toUpperCase().slice(0, 40), ...(submittedAt === null ? {} : { submittedAt }) }];
     })
     .slice(0, 50);
 }
@@ -178,6 +179,10 @@ export function parsePrList(raw: string): { pr: Pr; mergeCommit: string | null }
       typeof view.createdAt === "string" && !Number.isNaN(Date.parse(view.createdAt))
         ? view.createdAt.slice(0, 40)
         : null,
+    updatedAt:
+      typeof view.updatedAt === "string" && !Number.isNaN(Date.parse(view.updatedAt))
+        ? view.updatedAt.slice(0, 40)
+        : null,
     // The description is reduced to the ticket IDs it states, here, and dropped.
     ticketRefs: ticketRefsOf(view.body),
   };
@@ -196,16 +201,3 @@ export function parseLinkback(raw: string): string | null | undefined {
   return linkbackTicketOf((parsed as { comments?: unknown }).comments);
 }
 
-/** Current PR state and pending reviewers from a live `gh pr view`. */
-export function parseLiveReviewRequests(raw: string): { state: string; reviewers: string[] } | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const view = value as Record<string, unknown>;
-  if (typeof view.state !== "string" || !Array.isArray(view.reviewRequests)) return null;
-  return { state: view.state.toUpperCase(), reviewers: parseReviewRequests(view.reviewRequests) };
-}

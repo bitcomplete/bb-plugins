@@ -12,6 +12,12 @@ export const LINEAR_TEAMS_TTL_MS = 24 * 60 * 60 * 1_000;
 export const LINEAR_BATCH = 25;
 /** How much of a description is kept: context for naming, not a copy of the ticket. */
 export const DESCRIPTION_CHARS = 500;
+/** A PR merged this recently keeps its tickets in the sync, so Reconcile reads them fresh; an older merge keeps its last read. */
+export const LINEAR_MERGED_MS = 14 * 86_400_000;
+/** Linear moves a merged PR's tickets itself, soon after the merge: a read sooner than this after it may come before Linear did. */
+export const LINEAR_SETTLE_MS = 10 * 60_000;
+/** A ticket's read speaks for it after a merge that names it only once made LINEAR_SETTLE_MS past the merge. */
+export const readSettled = (readAt: number | undefined, mergedAt: number) => readAt !== undefined && readAt >= mergedAt + LINEAR_SETTLE_MS;
 
 /**
  * Every key the two settings hold, in order, without duplicates. A secret
@@ -94,57 +100,71 @@ export function routeTeams(workspaces: readonly LinearWorkspace[]): {
 
 /**
  * Split tickets by the key that can see them. A ticket whose prefix no key owns
- * is `unowned`: it gets no Linear detail from a key, which is not an error, and
- * it is the only kind of ticket the manual agent fallback may ever ask about.
+ * is left out: it gets no Linear detail, which is not an error.
  */
-export function planFetch(
-  tickets: readonly string[],
-  owner: ReadonlyMap<string, number>,
-): { byKey: Map<number, string[]>; unowned: string[] } {
+export function planFetch(tickets: readonly string[], owner: ReadonlyMap<string, number>): Map<number, string[]> {
   const byKey = new Map<number, string[]>();
-  const unowned: string[] = [];
   for (const ticket of tickets) {
     const index = owner.get(ticketPrefix(ticket));
-    if (index === undefined) {
-      unowned.push(ticket);
-      continue;
-    }
+    if (index === undefined) continue;
     const bucket = byKey.get(index);
     if (bucket === undefined) byKey.set(index, [ticket]);
     else bucket.push(ticket);
   }
-  return { byKey, unowned };
+  return byKey;
 }
 
-/** One aliased query for a batch: `t0: issue(id: "ABC-1") { ... } t1: ...`. */
+/** One aliased query for a batch: `t0: issue(id: "ABC-1") { ... } t1: ...`. Initiatives are capped so a batch stays well inside Linear's query cost. */
 export function detailQuery(batch: readonly string[]): string {
-  const fields =
-    "identifier title description state { name type } project { id name } parent { identifier title } labels { nodes { name } } url updatedAt";
+  const fields = "identifier title description state { name type } priority priorityLabel estimate " +
+    "project { id name description targetDate initiatives(first: 5) { nodes { id name } } } parent { identifier title } labels { nodes { name } } " +
+    "assignee { name displayName } cycle { number name endsAt } dueDate url createdAt startedAt completedAt canceledAt updatedAt";
   return `query {${batch.map((ticket, slot) => ` t${slot}: issue(id: ${JSON.stringify(ticket)}) { ${fields} }`).join("")} }`;
 }
 
-/** What the board keeps about one ticket. Every field past the identifier may be missing. */
+/**
+ * What the board keeps about one ticket. Every field past the identifier may be missing. The optional fields came with the Linear seed
+ * (A16): a key read always sets them, and a row cached before them, or by the removed agent fetch (`source: "agent"`), has none.
+ */
 export type LinearDetail = {
   identifier: string;
   title: string | null;
   description: string | null;
   state: { name: string; type: string | null } | null;
-  project: { id: string | null; name: string } | null;
+  project: { id: string | null; name: string; description?: string | null; targetDate?: string | null; initiatives?: { id: string; name: string }[] } | null;
   parent: { identifier: string | null; title: string | null } | null;
   labels: string[];
+  assignee?: string | null;
+  cycle?: { number: number; name: string | null; endsAt: string | null } | null;
+  /** The ticket's own due date, as Linear's calendar date (2026-10-17). */
+  dueDate?: string | null;
+  /**
+   * Linear's priority, 0 for none, then 1 Urgent to 4 Low, and its word for it; its points; and when it was created, started, completed,
+   * and canceled. Effort card v2 added them: a row cached before has none until its 12-hour cache runs out.
+   */
+  priority?: number | null; priorityLabel?: string | null; estimate?: number | null;
+  createdAt?: string | null; startedAt?: string | null; completedAt?: string | null; canceledAt?: string | null;
   url: string | null;
   updatedAt: string | null;
   source: "key" | "agent";
 };
+/** A key read cached before the seed's fields: refetched on the next sync rather than after its TTL. */
+export const missingSeedFields = (detail: LinearDetail | null) => detail !== null && !("cycle" in detail);
 
 const issueSchema = z.object({
   identifier: z.string(),
   title: z.string().nullish(),
   description: z.string().nullish(),
   state: z.object({ name: z.string(), type: z.string().nullish() }).nullish(),
-  project: z.object({ id: z.string().nullish(), name: z.string() }).nullish(),
+  project: z.object({ id: z.string().nullish(), name: z.string(), description: z.string().nullish(), targetDate: z.string().nullish(),
+    initiatives: z.object({ nodes: z.array(z.object({ id: z.string(), name: z.string() })) }).nullish() }).nullish(),
   parent: z.object({ identifier: z.string().nullish(), title: z.string().nullish() }).nullish(),
   labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }).nullish(),
+  assignee: z.object({ name: z.string().nullish(), displayName: z.string().nullish() }).nullish(),
+  cycle: z.object({ number: z.number(), name: z.string().nullish(), endsAt: z.string().nullish() }).nullish(),
+  dueDate: z.string().nullish(),
+  priority: z.number().nullish(), priorityLabel: z.string().nullish(), estimate: z.number().nullish(),
+  createdAt: z.string().nullish(), startedAt: z.string().nullish(), completedAt: z.string().nullish(), canceledAt: z.string().nullish(),
   url: z.string().nullish(),
   updatedAt: z.string().nullish(),
 });
@@ -185,12 +205,19 @@ export function parseDetails(batch: readonly string[], payload: unknown): Map<st
       title: value.title ?? null,
       description: value.description === null || value.description === undefined ? null : value.description.slice(0, DESCRIPTION_CHARS),
       state: value.state === null || value.state === undefined ? null : { name: value.state.name, type: value.state.type ?? null },
-      project: value.project === null || value.project === undefined ? null : { id: value.project.id ?? null, name: value.project.name },
+      project: value.project === null || value.project === undefined ? null : { id: value.project.id ?? null, name: value.project.name,
+        description: value.project.description?.slice(0, DESCRIPTION_CHARS) ?? null, targetDate: value.project.targetDate ?? null,
+        initiatives: (value.project.initiatives?.nodes ?? []).map((initiative) => ({ id: initiative.id, name: initiative.name })) },
       parent:
         value.parent === null || value.parent === undefined
           ? null
           : { identifier: value.parent.identifier ?? null, title: value.parent.title ?? null },
       labels: (value.labels?.nodes ?? []).map((label) => label.name).slice(0, 20),
+      assignee: value.assignee?.displayName ?? value.assignee?.name ?? null,
+      cycle: value.cycle ? { number: value.cycle.number, name: value.cycle.name ?? null, endsAt: value.cycle.endsAt ?? null } : null,
+      dueDate: value.dueDate ?? null,
+      priority: value.priority ?? null, priorityLabel: value.priorityLabel ?? null, estimate: value.estimate ?? null,
+      createdAt: value.createdAt ?? null, startedAt: value.startedAt ?? null, completedAt: value.completedAt ?? null, canceledAt: value.canceledAt ?? null,
       url: value.url ?? null,
       updatedAt: value.updatedAt ?? null,
       source: "key",

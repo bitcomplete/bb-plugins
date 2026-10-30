@@ -33,6 +33,7 @@
     "board-page.tsx",
     "app.tsx",
     "*.test.ts",
-    "*.test.tsx"
+    "*.test.tsx",
+    "eval/*.ts"
   ]
 }

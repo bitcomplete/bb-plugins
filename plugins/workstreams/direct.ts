@@ -4,6 +4,7 @@
 // write, and the write itself is pinned to the head sha the user confirmed.
 import { mergeVerdict, shouldDeleteBranch, type LiveMergeFacts, type MergeMethod } from "./actions.js";
 import type { PrWrite } from "./contract.js";
+import type { ApprovalFeedbackRecord } from "./approval-feedback.js";
 
 export type WriteResult = { ok: true; detail: string } | { ok: false; error: string };
 export type LiveRead = { ok: true; live: LiveMergeFacts } | { ok: false; error: string };
@@ -11,6 +12,7 @@ export type LiveRead = { ok: true; live: LiveMergeFacts } | { ok: false; error: 
 export type MergeDeps = {
   live: (prUrl: string) => Promise<LiveRead>;
   write: (request: PrWrite) => Promise<WriteResult>;
+  feedbackRecord?: (prUrl: string) => ApprovalFeedbackRecord | null;
 };
 
 export async function executeMerge(
@@ -20,7 +22,7 @@ export async function executeMerge(
   const read = await deps.live(args.prUrl);
   if (!read.ok) return read;
   const { live } = read;
-  const verdict = mergeVerdict(live);
+  const verdict = mergeVerdict(live, deps.feedbackRecord?.(args.prUrl) ?? null);
   if (verdict.refusals.length > 0) return { ok: false, error: `Not merged. ${verdict.refusals.join(" ")}` };
   if (live.headRefOid !== args.sha) {
     return { ok: false, error: "Not merged: new commits were pushed since the dialog opened. Reopen it to review the new head." };

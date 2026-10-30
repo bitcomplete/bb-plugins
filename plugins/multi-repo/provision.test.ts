@@ -7,14 +7,24 @@
  * and assert the properties the design depends on.
  */
 import { access, mkdtemp, readFile, readdir, rm, writeFile, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cacheDefaultBranch, cachePathFor, cacheStatus, ensureCache, findMirror } from "./cache.js";
-import { workspaceRepoSchema } from "./contract.js";
+import { PROJECT_FILE_MAX_CHARS, hostContract, rpcContract, workspaceRepoSchema } from "./contract.js";
 import { repoChanges, repoLiveStatus, filePatch } from "./diff.js";
 import { git, gitIn, gitLine } from "./git.js";
-import { bootstrapProjectSource, pushGuidance, readReposJson, writeReposJson } from "./source.js";
+import {
+  bootstrapProjectSource,
+  cloneProjectSource,
+  defaultProjectSourcePath,
+  mergeGuidance,
+  pushGuidance,
+  readCommittedFiles,
+  readReposJson,
+  refreshProjectSource,
+  writeReposJson,
+} from "./source.js";
 import { EMPTY_REPOS, parseReposFile } from "./repos.js";
 import { provisionWorkspace, removeWorkspace, workspaceRoot } from "./workspace.js";
 
@@ -457,6 +467,178 @@ describe("the project source", () => {
   });
 });
 
+describe("merging a published lesson branch", () => {
+  /** A canonical `.bb` and a clone of it, both with an identity to commit with. */
+  async function pair() {
+    const canonical = path.join(scratch, "lesson-canonical");
+    await mkdir(canonical, { recursive: true });
+    await bootstrapProjectSource(canonical, EMPTY_REPOS);
+    await gitIn(canonical, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(canonical, ["config", "user.name", "Test"]);
+    const workspaceBb = path.join(scratch, "lesson-workspace");
+    await git(["clone", "--quiet", canonical, workspaceBb]);
+    await gitIn(workspaceBb, ["config", "user.email", "test@example.invalid"]);
+    await gitIn(workspaceBb, ["config", "user.name", "Test"]);
+    return { canonical, workspaceBb };
+  }
+
+  /** Append `text` to `file` in the workspace and commit it. */
+  async function append(workspaceBb: string, file: string, text: string): Promise<void> {
+    const current = await readFile(path.join(workspaceBb, file), "utf8");
+    await writeFile(path.join(workspaceBb, file), `${current}\n${text}\n`, "utf8");
+    await gitIn(workspaceBb, ["add", "--", file]);
+    await gitIn(workspaceBb, ["commit", "--quiet", "-m", "record a lesson"]);
+  }
+
+  const lesson = "A new column read with SELECT * breaks the previous image.";
+
+  it("fast-forwards the canonical checkout to the lesson's own file, and returns the sha", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result).toMatchObject({ ok: true, branch: "refs/heads/guidance-thr_lesson" });
+    expect(result.sha).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
+    expect(await gitLine(canonical, ["rev-parse", "HEAD"])).toBe(result.sha);
+    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toContain(lesson);
+  });
+
+  it("refuses a dirty canonical checkout and leaves the branch", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+    await writeFile(path.join(canonical, "AGENTS.md"), "half-written by hand\n", "utf8");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/uncommitted changes/u);
+    // The branch is exactly where it was published: nothing was merged.
+    expect(await gitLine(canonical, ["rev-parse", "guidance-thr_lesson"])).toBe(await gitLine(workspaceBb, ["rev-parse", "HEAD"]));
+    expect(await readFile(path.join(canonical, "AGENTS.md"), "utf8")).toBe("half-written by hand\n");
+  });
+
+  it("refuses a non-fast-forward", async () => {
+    const { canonical, workspaceBb } = await pair();
+    // The canonical branch moves on after the workspace branched: the
+    // workspace's commit is no longer a descendant.
+    await writeFile(path.join(canonical, "canonical-only.md"), "moved on\n", "utf8");
+    await gitIn(canonical, ["add", "--", "canonical-only.md"]);
+    await gitIn(canonical, ["commit", "--quiet", "-m", "canonical moves on"]);
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/not a fast-forward/u);
+  });
+
+  it("refuses a commit range that changes anything but the lesson's file", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", lesson);
+    await append(workspaceBb, "repos.json", "// unrelated\n");
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/changes files other than AGENTS\.md: repos\.json/u);
+  });
+
+  it("refuses a file that does not carry the lesson text", async () => {
+    const { canonical, workspaceBb } = await pair();
+    await append(workspaceBb, "AGENTS.md", "Something else entirely.");
+    await pushGuidance(canonical, workspaceBb, "thr_lesson");
+
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/does not carry the lesson text/u);
+  });
+
+  it("refuses when nothing has been published", async () => {
+    const { canonical } = await pair();
+    const result = await mergeGuidance(canonical, "thr_lesson", "AGENTS.md", lesson);
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/No guidance branch refs\/heads\/guidance-thr_lesson has been published/u);
+  });
+});
+
+describe("reading project files for another plugin", () => {
+  async function canonicalWithPlaybook() {
+    const dir = await makeRemote("canonical");
+    await mkdir(path.join(dir, "playbooks"), { recursive: true });
+    await writeFile(path.join(dir, "playbooks", "linear-tickets.md"), "committed\n", "utf8");
+    await gitIn(dir, ["add", "-A"]);
+    await gitIn(dir, ["commit", "--quiet", "-m", "add a playbook"]);
+    return dir;
+  }
+
+  it("reads committed content and names the commit it read", async () => {
+    const dir = await canonicalWithPlaybook();
+    const result = await readCommittedFiles(dir, ["playbooks/linear-tickets.md", "README.md"], PROJECT_FILE_MAX_CHARS);
+    expect(result.error).toBeNull();
+    expect(result.head).toBe(await gitLine(dir, ["rev-parse", "HEAD"]));
+    expect(result.files).toEqual([
+      { path: "playbooks/linear-tickets.md", content: "committed\n" },
+      { path: "README.md", content: "# canonical\n" },
+    ]);
+  });
+
+  it("ignores an uncommitted edit in the canonical checkout", async () => {
+    const dir = await canonicalWithPlaybook();
+    await writeFile(path.join(dir, "playbooks", "linear-tickets.md"), "half-written\n", "utf8");
+    await writeFile(path.join(dir, "playbooks", "untracked.md"), "never committed\n", "utf8");
+    const result = await readCommittedFiles(dir, ["playbooks/linear-tickets.md", "playbooks/untracked.md"], PROJECT_FILE_MAX_CHARS);
+    expect(result.files).toEqual([
+      { path: "playbooks/linear-tickets.md", content: "committed\n" },
+      { path: "playbooks/untracked.md", content: null },
+    ]);
+  });
+
+  it("returns null for a path the commit does not have, or has as a directory", async () => {
+    const dir = await canonicalWithPlaybook();
+    const result = await readCommittedFiles(dir, ["playbooks/missing.md", "playbooks", "nope/x.md"], PROJECT_FILE_MAX_CHARS);
+    expect(result.error).toBeNull();
+    expect(result.files.map((file) => file.content)).toEqual([null, null, null]);
+  });
+
+  it("refuses a path that leaves the repo, host-side and at the schema", async () => {
+    const dir = await canonicalWithPlaybook();
+    for (const bad of ["../x", "playbooks/../../x", "/etc/passwd", "a\\b", "a//b", "./x"]) {
+      const result = await readCommittedFiles(dir, [bad], PROJECT_FILE_MAX_CHARS);
+      expect(result.error).not.toBeNull();
+      expect(result.files).toEqual([]);
+      expect(rpcContract.readProjectFiles.input.safeParse({ projectId: "p", paths: [bad] }).success).toBe(false);
+      expect(
+        hostContract.readProjectSourceFiles.input.safeParse({ path: dir, fetchTtlMs: 0, files: [bad] }).success,
+      ).toBe(false);
+    }
+    expect(rpcContract.readProjectFiles.input.safeParse({ projectId: "p", paths: [] }).success).toBe(false);
+  });
+
+  it("does not truncate a file over the limit", async () => {
+    const dir = await canonicalWithPlaybook();
+    const result = await readCommittedFiles(dir, ["playbooks/linear-tickets.md", "README.md"], 5);
+    expect(result.files).toEqual([
+      { path: "playbooks/linear-tickets.md", content: null },
+      { path: "README.md", content: null },
+    ]);
+    expect(result.error).toContain("playbooks/linear-tickets.md");
+  });
+
+  it("sees a commit pushed to the remote once the refresh fast-forwards", async () => {
+    const remote = await canonicalWithPlaybook();
+    const canonical = path.join(scratch, "canonical-clone");
+    await git(["clone", "--quiet", remote, canonical]);
+    await writeFile(path.join(remote, "playbooks", "linear-tickets.md"), "merged upstream\n", "utf8");
+    await gitIn(remote, ["commit", "--quiet", "-am", "revise the playbook"]);
+
+    expect(await refreshProjectSource(canonical, 0)).toEqual([]);
+    const result = await readCommittedFiles(canonical, ["playbooks/linear-tickets.md"], PROJECT_FILE_MAX_CHARS);
+    expect(result.head).toBe(await gitLine(remote, ["rev-parse", "HEAD"]));
+    expect(result.files[0].content).toBe("merged upstream\n");
+  });
+});
+
 describe("diff data", () => {
   async function workspaceWithChanges() {
     const alpha = await makeRemote("alpha");
@@ -695,5 +877,64 @@ describe("standing up a brand new project", () => {
     const written = await writeReposJson(dir, `{"version":1,"repos":[]}\n`, "Update the repo set");
     expect(written.committed).toBe(false);
     expect(written.message).not.toBeNull();
+  });
+});
+
+describe("creating a project source", () => {
+  it("seeds a fresh .bb with the repos it was given, and leaves an existing one alone", async () => {
+    const dir = path.join(scratch, "fresh");
+    const seeded = await bootstrapProjectSource(dir, {
+      version: 1,
+      repos: [{ dir: "alpha", url: "https://example.com/alpha", inferredDir: true }],
+    });
+    expect(seeded.bootstrapped).toBe(true);
+    const text = await readReposJson(dir);
+    expect(text).not.toBeNull();
+    const parsed = parseReposFile(text ?? "");
+    expect(parsed.ok && parsed.value.repos.map((repo) => repo.dir)).toEqual(["alpha"]);
+    // The inferred dir is written as the absence it was.
+    expect(JSON.parse(text ?? "")).toEqual({ version: 1, repos: [{ url: "https://example.com/alpha" }] });
+    // Committed, so the project can be cloned from here on.
+    expect(await gitLine(dir, ["rev-parse", "HEAD"])).not.toBeNull();
+
+    const again = await bootstrapProjectSource(dir, {
+      version: 1,
+      repos: [{ dir: "beta", url: "https://example.com/beta" }],
+    });
+    expect(again.bootstrapped).toBe(false);
+    expect(await readReposJson(dir)).toBe(text);
+  });
+
+  it("clones an existing .bb repo into an empty or absent directory", async () => {
+    const remote = await makeRemote("shared-bb");
+    await writeFile(path.join(remote, "repos.json"), '{"version":1,"repos":[]}\n', "utf8");
+    await gitIn(remote, ["add", "-A"]);
+    await gitIn(remote, ["commit", "--quiet", "-m", "repo set"]);
+
+    const absent = path.join(scratch, "projects", "absent");
+    expect(await cloneProjectSource(remote, absent)).toEqual({ ok: true, message: null });
+    expect(await readReposJson(absent)).toBe('{"version":1,"repos":[]}\n');
+    expect(await gitLine(absent, ["config", "--get", "remote.origin.url"])).toBe(remote);
+
+    const empty = path.join(scratch, "projects", "empty");
+    await mkdir(empty, { recursive: true });
+    expect((await cloneProjectSource(remote, empty)).ok).toBe(true);
+  });
+
+  it("refuses to clone over a directory with contents, and a URL that reads as an option", async () => {
+    const remote = await makeRemote("shared-bb");
+    const occupied = path.join(scratch, "projects", "occupied");
+    await mkdir(occupied, { recursive: true });
+    await writeFile(path.join(occupied, "note.txt"), "x", "utf8");
+    const result = await cloneProjectSource(remote, occupied);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("not empty");
+    expect((await cloneProjectSource("--upload-pack=x", path.join(scratch, "projects", "opt"))).ok).toBe(false);
+  });
+
+  it("suggests a location under the home directory, named after the project", async () => {
+    const suggestion = await defaultProjectSourcePath("My Project");
+    expect(suggestion.path).toBe(path.join(homedir(), "bb", "my-project"));
+    expect(typeof suggestion.exists).toBe("boolean");
   });
 });

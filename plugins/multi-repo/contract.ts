@@ -11,8 +11,41 @@
  */
 import { defineRpcContract, type ExperimentalHostSignals } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { PROJECT_FILE_PATH_MAX, projectFilePathProblem } from "./names.js";
 
 const absolutePath = z.string().min(1).max(4096);
+
+/** Which of the two project-source shapes a checkout has. */
+export const projectLayoutSchema = z.enum(["standalone", "primary"]);
+export type ProjectLayoutValue = z.infer<typeof projectLayoutSchema>;
+
+/**
+ * The most text one file in `readProjectFiles` may carry.
+ *
+ * A file over it is not truncated: half a playbook reads as a whole one. It
+ * comes back with `content: null` and the response's `error` names it, so a
+ * caller can tell it from a file that is not in the commit at all.
+ */
+export const PROJECT_FILE_MAX_CHARS = 200_000;
+export const PROJECT_FILES_MAX = 50;
+
+/** A file inside the `.bb` repo, as a relative POSIX path. */
+export const projectFilePathSchema = z
+  .string()
+  .min(1)
+  .max(PROJECT_FILE_PATH_MAX)
+  .superRefine((value, context) => {
+    const problem = projectFilePathProblem(value);
+    if (problem !== null) context.addIssue({ code: "custom", message: problem });
+  });
+
+export const projectFileSchema = z
+  .object({
+    path: z.string().max(PROJECT_FILE_PATH_MAX),
+    /** Null when the commit has no regular file at this path, or it is too large. */
+    content: z.string().max(PROJECT_FILE_MAX_CHARS).nullable(),
+  })
+  .strict();
 
 export const repoStatusSchema = z.enum(["ready", "failed"]);
 
@@ -42,6 +75,21 @@ export const repoRequestSchema = z
   .strict();
 
 export type RepoRequest = z.infer<typeof repoRequestSchema>;
+
+/**
+ * One repo as a person writes it: `dir` and `branch` optional, resolved later
+ * by `resolveRepoEntry`. The shape of a row in the panel's add form and of an
+ * entry seeded into a brand-new `repos.json`.
+ */
+export const repoSeedSchema = z
+  .object({
+    dir: z.string().min(1).max(100).optional(),
+    url: z.string().min(1).max(2000),
+    branch: z.string().min(1).max(300).optional(),
+  })
+  .strict();
+
+export type RepoSeed = z.infer<typeof repoSeedSchema>;
 
 /** A repo the panel or the diff layer already knows the location of. */
 export const repoTargetSchema = z
@@ -180,6 +228,11 @@ export const hostContract = defineRpcContract({
          * as a side effect of a read.
          */
         bootstrap: z.boolean(),
+        /**
+         * The repo set a bootstrapped `repos.json` starts with. Ignored when
+         * the directory is already a repo: nothing here overwrites a file.
+         */
+        seed: z.array(repoSeedSchema).max(64).optional(),
       })
       .strict(),
     output: z
@@ -189,6 +242,34 @@ export const hostContract = defineRpcContract({
         reposJson: z.string().max(200_000).nullable(),
         remote: z.string().max(2000).nullable(),
         defaultBranch: z.string().max(300).nullable(),
+        /** `standalone` (definition at the root) or `primary` (`.bb/`). */
+        layout: projectLayoutSchema,
+        warnings: z.array(z.string().max(600)).max(20),
+      })
+      .strict(),
+  },
+
+  /**
+   * Read files from the canonical checkout's committed `HEAD`.
+   *
+   * Refreshes first — fetch and fast-forward, at most once per TTL, exactly
+   * as `prepareProjectSource` does — then reads each path out of the commit
+   * rather than off disk, so an uncommitted edit in the checkout is never
+   * served. `head` is the commit read.
+   */
+  readProjectSourceFiles: {
+    input: z
+      .object({
+        path: absolutePath,
+        fetchTtlMs: z.number().int().nonnegative(),
+        files: z.array(projectFilePathSchema).min(1).max(PROJECT_FILES_MAX),
+      })
+      .strict(),
+    output: z
+      .object({
+        head: z.string().max(64).nullable(),
+        files: z.array(projectFileSchema).max(PROJECT_FILES_MAX),
+        error: z.string().max(2000).nullable(),
         warnings: z.array(z.string().max(600)).max(20),
       })
       .strict(),
@@ -201,6 +282,8 @@ export const hostContract = defineRpcContract({
         path: absolutePath,
         reposJson: z.string().max(200_000),
         message: z.string().min(1).max(300),
+        /** Which layout's definition path to write; defaults to `standalone`. */
+        layout: projectLayoutSchema.optional(),
       })
       .strict(),
     output: z
@@ -211,6 +294,28 @@ export const hostContract = defineRpcContract({
         message: z.string().max(600).nullable(),
       })
       .strict(),
+  },
+
+  /**
+   * Clone an existing `.bb` repo to become this machine's canonical checkout.
+   *
+   * The shared way into a project: a teammate's workspace definition from one
+   * URL. Refuses a destination that already holds anything, because a clone
+   * into a directory with contents is either a mistake or a second project.
+   */
+  cloneProjectSource: {
+    input: z.object({ url: z.string().min(1).max(2000), path: absolutePath }).strict(),
+    output: z.object({ ok: z.boolean(), message: z.string().max(600).nullable() }).strict(),
+  },
+
+  /**
+   * Where a new project's `.bb` checkout would go by default on this machine,
+   * and whether something is already there. The panel shows it as an editable
+   * suggestion; it decides nothing.
+   */
+  suggestProjectSourcePath: {
+    input: z.object({ name: z.string().min(1).max(300) }).strict(),
+    output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
   },
 
   /**
@@ -235,6 +340,10 @@ export const hostContract = defineRpcContract({
         operationId: z.string().min(1).max(200),
         pathKey: z.string().min(1).max(200),
         projectSourcePath: absolutePath,
+        /** Which shape the project source has; decides how `.bb/` is materialized. */
+        layout: projectLayoutSchema.optional(),
+        /** The primary work repo's directory; `.bb/` is copied out of it. */
+        primaryDir: z.string().min(1).max(100).nullable().optional(),
         repos: z.array(repoRequestSchema).max(64),
         branchName: z.string().min(1).max(300),
         fetchTtlMs: z.number().int().nonnegative(),
@@ -246,6 +355,8 @@ export const hostContract = defineRpcContract({
       .object({
         root: absolutePath,
         repos: z.array(workspaceRepoSchema).max(64),
+        /** The default-branch commit `.bb/` was materialized from, or null. */
+        definitionBase: z.string().max(64).nullable(),
       })
       .strict(),
   },
@@ -382,12 +493,88 @@ export const hostContract = defineRpcContract({
         projectSourcePath: absolutePath,
         workspaceBbPath: absolutePath,
         threadId: z.string().min(1).max(100),
+        /** The default-branch commit the workspace `.bb/` was materialized from. */
+        definitionBase: z.string().max(64).nullable().optional(),
       })
       .strict(),
     output: z
       .object({
         ok: z.boolean(),
         ref: z.string().max(300).nullable(),
+        message: z.string().max(2000),
+      })
+      .strict(),
+  },
+
+  /**
+   * Fast-forward the canonical checkout to a thread's published guidance
+   * branch. The narrow merge a self-merged lesson uses; `source.ts` has the
+   * refusals. Leaves the branch in place on any refusal.
+   */
+  mergeGuidance: {
+    input: z
+      .object({
+        projectSourcePath: absolutePath,
+        threadId: z.string().min(1).max(100),
+        file: projectFilePathSchema,
+        text: z.string().min(1).max(20_000),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        sha: z.string().max(64).nullable(),
+        branch: z.string().max(300).nullable(),
+        message: z.string().max(2000),
+      })
+      .strict(),
+  },
+
+  /**
+   * Copy a standalone `.bb` tree into a primary repo as `.bb/` on a branch, or
+   * report that it already carries one. Idempotent; never touches the default
+   * branch.
+   */
+  adoptProjectSource: {
+    input: z
+      .object({
+        standalonePath: absolutePath,
+        primaryUrl: z.string().min(1).max(2000),
+        primaryPath: absolutePath,
+        branch: z.string().min(1).max(300),
+        openPullRequest: z.boolean(),
+      })
+      .strict(),
+    output: z
+      .object({
+        status: z.enum(["already", "pull-request", "failed"]),
+        message: z.string().max(2000),
+        prUrl: z.string().max(600).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
+        primaryPath: absolutePath,
+        defaultBranch: z.string().max(300).nullable(),
+      })
+      .strict(),
+  },
+
+  /** Clone/ensure a primary repo and seed `.bb/` on it when it does not carry one. */
+  preparePrimaryProjectSource: {
+    input: z
+      .object({
+        url: z.string().min(1).max(2000),
+        path: absolutePath,
+        seed: z.string().max(200_000),
+        branch: z.string().min(1).max(300),
+        openPullRequest: z.boolean(),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        layout: projectLayoutSchema,
+        seeded: z.boolean(),
+        prUrl: z.string().max(600).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
         message: z.string().max(2000),
       })
       .strict(),
@@ -424,6 +611,10 @@ export const repoSetViewSchema = z
     /** Null when this project has no `.bb` checkout on a reachable machine. */
     projectSourcePath: absolutePath.nullable(),
     hostId: z.string().max(100).nullable(),
+    /** `standalone` (definition at the root) or `primary` (`.bb/`). */
+    layout: projectLayoutSchema,
+    /** The primary repo derived from the source's `origin`, or null. */
+    primary: z.object({ dir: z.string().max(100), url: z.string().max(2000) }).strict().nullable(),
     /** The file's raw text, for the editor. Null when it does not exist yet. */
     reposJson: z.string().max(200_000).nullable(),
     /** Parsed entries, empty when `error` is set. */
@@ -436,17 +627,44 @@ export const repoSetViewSchema = z
 
 export type RepoSetView = z.infer<typeof repoSetViewSchema>;
 
+/** Another thread working in the same checkout, as the panel names it. */
+export const sharingThreadSchema = z
+  .object({
+    threadId: z.string().min(1).max(100),
+    /** Null when the thread could not be read, or has no title yet. */
+    title: z.string().max(300).nullable(),
+  })
+  .strict();
+
 export const workspaceViewSchema = z
   .object({
     root: absolutePath,
     branchName: z.string().max(300),
     hostId: z.string().max(100),
     projectSourcePath: absolutePath,
+    /**
+     * True when this workspace was provisioned from a standalone `.bb` and the
+     * project source has since been adopted into a primary repo. Guidance
+     * published from it still goes to the old canonical checkout, so it has to
+     * be re-applied to the primary by hand.
+     */
+    predatesAdopt: z.boolean(),
     repos: z.array(workspaceRepoSchema).max(64),
+    /**
+     * The other threads attached to this same checkout — forks, which keep
+     * the environment they were forked from. Empty for the common case of one
+     * thread per workspace.
+     */
+    sharedWith: z.array(sharingThreadSchema).max(16),
   })
   .strict();
 
 export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
+
+/** The outcome of one structured edit to `repos.json`. */
+export const editResultSchema = z
+  .object({ ok: z.boolean(), error: z.string().max(2000).nullable() })
+  .strict();
 
 export const rpcContract = defineRpcContract({
   /**
@@ -480,12 +698,211 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(100) }).strict(),
     output: repoSetViewSchema,
   },
+  /**
+   * Fast-forward the canonical `.bb` checkout to a thread's published guidance
+   * branch. Stewards calls it, and only stewards: a lesson is the one thing
+   * that writes itself into the guidance every steward reads, and the project
+   * steward's own tooling is the only thing that may ask for it. `file` and
+   * `text` are the lesson's own; the host refuses a merge that would change
+   * anything else.
+   */
+  mergeGuidance: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        threadId: z.string().min(1).max(100),
+        file: projectFilePathSchema,
+        text: z.string().min(1).max(20_000),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        sha: z.string().max(64).nullable(),
+        branch: z.string().max(300).nullable(),
+        message: z.string().max(2000),
+      })
+      .strict(),
+  },
+
+  /**
+   * Files from the project's `.bb` repo, read from the canonical checkout's
+   * committed `HEAD` after a fast-forward-only refresh.
+   *
+   * The cross-plugin half of this contract, with `repoSet`: stewards reads its
+   * playbooks and settings through it. `head` is the commit read; a file the
+   * commit does not have comes back with `content: null`.
+   */
+  readProjectFiles: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        paths: z.array(projectFilePathSchema).min(1).max(PROJECT_FILES_MAX),
+      })
+      .strict(),
+    output: z
+      .object({
+        /** Null when this project has no `.bb` checkout on a reachable machine. */
+        projectSourcePath: absolutePath.nullable(),
+        head: z.string().max(64).nullable(),
+        files: z.array(projectFileSchema).max(PROJECT_FILES_MAX),
+        error: z.string().max(2000).nullable(),
+      })
+      .strict(),
+  },
   saveRepoSet: {
     input: z
       .object({ projectId: z.string().min(1).max(100), reposJson: z.string().max(200_000) })
       .strict(),
     output: z.object({ ok: z.boolean(), error: z.string().max(2000).nullable() }).strict(),
   },
+
+  /*
+   * Structured edits. Each one is a single commit with a message naming the
+   * change, which is what the CLI and the agent tools already produce and what
+   * `saveRepoSet` — a whole-file replacement — never could.
+   */
+  addRepo: {
+    input: z.object({ projectId: z.string().min(1).max(100), repo: repoSeedSchema }).strict(),
+    output: editResultSchema,
+  },
+  removeRepo: {
+    input: z.object({ projectId: z.string().min(1).max(100), dir: z.string().min(1).max(100) }).strict(),
+    output: editResultSchema,
+  },
+  setRepoBranch: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        dir: z.string().min(1).max(100),
+        /** Null returns the repo to its default branch. */
+        branch: z.string().max(300).nullable(),
+      })
+      .strict(),
+    output: editResultSchema,
+  },
+
+  /**
+   * Local checkouts on the project's machine, for the add form's autocomplete.
+   * The same discovery that seeds the object cache and proposes a repo set for
+   * an empty project; here it is a person choosing rather than the plugin.
+   */
+  suggestRepos: {
+    /**
+     * Keyed by machine and `.bb` path rather than project, because the form
+     * for a project that does not exist yet has no id to offer — only the
+     * machine it chose and the path it was suggested.
+     */
+    input: z.object({ hostId: z.string().min(1).max(100), path: absolutePath }).strict(),
+    output: z.object({ checkouts: z.array(discoveredCheckoutSchema).max(500) }).strict(),
+  },
+
+  /** Machines a new project's `.bb` checkout could live on. */
+  hosts: {
+    input: z.null(),
+    output: z
+      .object({
+        hosts: z
+          .array(
+            z
+              .object({
+                id: z.string().max(100),
+                name: z.string().max(300),
+                connected: z.boolean(),
+                /** The server's own machine, which is the sensible default. */
+                primary: z.boolean(),
+              })
+              .strict(),
+          )
+          .max(200),
+      })
+      .strict(),
+  },
+
+  /** A default `.bb` location for a project that does not exist yet. */
+  suggestProjectSource: {
+    input: z.object({ hostId: z.string().min(1).max(100), name: z.string().min(1).max(300) }).strict(),
+    output: z.object({ path: absolutePath, exists: z.boolean() }).strict(),
+  },
+
+  /**
+   * Create a project whose source is a `.bb` checkout, in one step.
+   *
+   * Either initializes a fresh checkout seeded with `repos`, or clones an
+   * existing `.bb` repo. The git work runs first so a failure there leaves no
+   * dangling project; a failure after it leaves an initialized directory,
+   * which the next attempt adopts rather than re-creates.
+   */
+  createProject: {
+    input: z
+      .object({
+        name: z.string().min(1).max(300),
+        hostId: z.string().min(1).max(100),
+        path: absolutePath,
+        source: z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("fresh"), repos: z.array(repoSeedSchema).max(64) }).strict(),
+          z.object({ kind: z.literal("clone"), url: z.string().min(1).max(2000) }).strict(),
+          z
+            .object({
+              kind: z.literal("primary"),
+              url: z.string().min(1).max(2000),
+              /** The other repos to seed `.bb/repos.json` with. */
+              repos: z.array(repoSeedSchema).max(64),
+              /** Publish a seed branch and open a pull request. */
+              openPullRequest: z.boolean().optional(),
+            })
+            .strict(),
+        ]),
+      })
+      .strict(),
+    output: z
+      .object({
+        ok: z.boolean(),
+        projectId: z.string().max(100).nullable(),
+        error: z.string().max(2000).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
+        /** The layout the source ended up with, when the project was created. */
+        layout: projectLayoutSchema.nullable(),
+        /** The seed/adopt pull request, when one was opened. */
+        prUrl: z.string().max(600).nullable(),
+      })
+      .strict(),
+  },
+
+  /**
+   * Adopt a standalone `.bb` into a primary repo, per machine.
+   *
+   * The first run copies the tree to `.bb/` on a branch and opens a pull
+   * request; a later run, once `.bb/` is on the default branch, re-points the
+   * project source at the primary checkout. Case A of BB-106: the project id,
+   * every binding and every thread stay as they are.
+   */
+  adoptProjectSource: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(100),
+        /** URL or local path of the primary repo. */
+        primary: z.string().min(1).max(2000),
+        /** Where the primary clone lives or should be cloned to. */
+        path: absolutePath,
+        /** Publish a branch and open a pull request. */
+        openPullRequest: z.boolean().optional(),
+      })
+      .strict(),
+    output: z
+      .object({
+        status: z.enum(["already", "pull-request", "failed"]),
+        message: z.string().max(2000),
+        prUrl: z.string().max(600).nullable(),
+        warnings: z.array(z.string().max(600)).max(20),
+        primaryPath: absolutePath,
+        defaultBranch: z.string().max(300).nullable(),
+        /** True when the project source now points at the primary checkout. */
+        repointed: z.boolean(),
+      })
+      .strict(),
+  },
+
   /** The thread's workspace manifest, or null when the thread has none. */
   workspace: {
     input: z.object({ threadId: z.string().min(1).max(100) }).strict(),

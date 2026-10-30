@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defaultMessageTarget, orderMessageTargets, sendRowMessage, type MessageSdk } from "./threadmessage.js";
+import { sendRowMessage, type MessageSdk } from "./threadmessage.js";
 
 const pr = {
   repo: "inkwell/quill",
@@ -26,26 +26,6 @@ function sdk(archivedAt: number | null = null, delivery: "sent" | "queued" = "se
 }
 
 describe("sendRowMessage", () => {
-  it("ranks a workstream-started thread above checkout activity while keeping recent order within each tier", () => {
-    const options = [
-      { id: "thr_path_recent", tier: "paths" as const },
-      { id: "thr_ticket", tier: "ticket" as const },
-      { id: "thr_started", tier: "started" as const },
-      { id: "thr_environment", tier: "environment" as const },
-      { id: "thr_path_old", tier: "paths" as const },
-    ];
-    expect(orderMessageTargets(options).map((thread) => thread.id)).toEqual([
-      "thr_started", "thr_environment", "thr_ticket", "thr_path_recent", "thr_path_old",
-    ]);
-    expect(options[0]?.id).toBe("thr_path_recent");
-  });
-
-  it("requires an explicit target whenever more than one thread is associated", () => {
-    expect(defaultMessageTarget(links)).toBe("thr_author");
-    expect(defaultMessageTarget([...links, { id: "thr_possible", tier: "paths" }])).toBe("");
-    expect(defaultMessageTarget([])).toBe("");
-  });
-
   it("sends one instruction to the selected linked thread with PR context", async () => {
     const { client, calls } = sdk();
     expect(await sendRowMessage(client, { threadId: "thr_author", message: " Rebase and post PTAL. ", links, pr })).toEqual({ ok: true, delivery: "sent" });

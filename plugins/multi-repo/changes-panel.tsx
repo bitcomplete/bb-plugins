@@ -17,7 +17,7 @@
  * virtualization, byte budgeting and patch-section splitting. This caps the
  * file count and the per-file patch instead, and says so where it happens.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   experimental_Diff as Diff,
   experimental_Icon as Icon,
@@ -34,7 +34,14 @@ import type {
   WorkspaceView,
   rpcContract,
 } from "./contract.js";
-import { REPOS_CHANGED_CHANNEL, changeStatusLabel, changeStatusTone } from "./shared.js";
+import {
+  CHANGES_POLL_MS,
+  REPOS_CHANGED_CHANNEL,
+  THREAD_CHANGES_CHANNEL,
+  changeStatusLabel,
+  changeStatusTone,
+  threadSignal,
+} from "./shared.js";
 
 type PatchState = { loading: boolean; patch: string; truncated: boolean; error: string | null };
 
@@ -387,6 +394,25 @@ function RepoSection({
   );
 }
 
+/**
+ * The panel.
+ *
+ * **Why it polls.** Nothing in bb tells a panel that a file on a machine
+ * changed: there is no watcher signal to subscribe to, and the plugin's own
+ * realtime channels fire on environment and repo-set edits. Loading once at
+ * mount therefore froze the tab on whatever was on disk when it opened — a tab
+ * opened at the start of a thread showed "no changes" for the rest of it. So
+ * the diff half re-reads itself on a timer while the tab is visible, and a
+ * finished turn publishes `THREAD_CHANGES_CHANNEL` so it lands sooner than the
+ * next tick.
+ *
+ * **The two halves refresh independently.** Diffs and working-tree status are
+ * a few short git commands against a warm checkout. Pull requests shell out to
+ * `gh` per repo, over the network, and are server-side cached for a minute —
+ * so they are deliberately left out of the poll, and a `gh` failure must not
+ * take the diffs down with it. They used to share one `Promise.all`, which is
+ * exactly what that failure did.
+ */
 export function ChangesPanel({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -397,36 +423,95 @@ export function ChangesPanel({ threadId }: { threadId: string }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [patches, setPatches] = useState<Record<string, PatchState>>({});
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [prError, setPrError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const load = useCallback(
-    (refreshPrs: boolean) => {
-      setLoading(true);
-      void rpc
-        .call("workspace", { threadId })
-        .then(async (result) => {
-          setWorkspace(result.workspace);
-          if (result.workspace === null) return;
-          const [nextChanges, nextStatus, nextPrs] = await Promise.all([
-            rpc.call("changes", { threadId }),
-            rpc.call("workspaceStatus", { threadId }),
-            rpc.call("pullRequests", { threadId, refresh: refreshPrs }),
-          ]);
-          setChanges(nextChanges.repos);
-          setStatus(nextStatus.repos);
-          setPrs(nextPrs.repos);
-        })
-        .catch((error: unknown) => setNotice(error instanceof Error ? error.message : "Could not load changes."))
-        .finally(() => setLoading(false));
+  /** The cheap half: the manifest, the diffs, the working-tree counters. */
+  const loadDiffs = useCallback(async () => {
+    const result = await rpc.call("workspace", { threadId });
+    setWorkspace(result.workspace);
+    if (result.workspace === null) return;
+    const [nextChanges, nextStatus] = await Promise.all([
+      rpc.call("changes", { threadId }),
+      rpc.call("workspaceStatus", { threadId }),
+    ]);
+    setChanges(nextChanges.repos);
+    setStatus(nextStatus.repos);
+  }, [rpc, threadId]);
+
+  /** The `gh` half. `refresh` bypasses the server's one-minute cache. */
+  const loadPrs = useCallback(
+    async (refresh: boolean) => {
+      const next = await rpc.call("pullRequests", { threadId, refresh });
+      setPrs(next.repos);
     },
     [rpc, threadId],
   );
 
-  // Stable identity for both, so a re-render does not re-subscribe.
-  const reload = useCallback(() => load(false), [load]);
-  useEffect(reload, [reload]);
-  useRealtime(REPOS_CHANGED_CHANNEL, reload);
+  // A poll that overlapped the previous one would queue host calls behind each
+  // other on a slow machine and never catch up. Only polls are dropped, never
+  // a click: the Refresh button already guards itself with `loading`.
+  const running = useRef(false);
+
+  const load = useCallback(
+    (options: { prs: boolean; refreshPrs?: boolean; quiet?: boolean }) => {
+      const quiet = options.quiet === true;
+      if (quiet && running.current) return;
+      running.current = true;
+      if (!quiet) setLoading(true);
+      const diffs = loadDiffs().then(
+        () => setDiffError(null),
+        (error: unknown) => setDiffError(error instanceof Error ? error.message : "Could not load changes."),
+      );
+      const pulls = options.prs
+        ? loadPrs(options.refreshPrs === true).then(
+            () => setPrError(null),
+            (error: unknown) =>
+              setPrError(error instanceof Error ? error.message : "Could not load pull requests."),
+          )
+        : Promise.resolve();
+      void Promise.all([diffs, pulls]).finally(() => {
+        running.current = false;
+        if (!quiet) setLoading(false);
+      });
+    },
+    [loadDiffs, loadPrs],
+  );
+
+  // Stable identities, so a re-render does not re-subscribe or restart the timer.
+  const initial = useCallback(() => load({ prs: true }), [load]);
+  const poll = useCallback(() => load({ prs: false, quiet: true }), [load]);
+
+  useEffect(initial, [initial]);
+
+  useEffect(() => {
+    // A hidden tab has no reader to serve, and a phone in a pocket should not
+    // be spawning git processes on someone's machine.
+    const tick = () => {
+      if (document.visibilityState === "visible") poll();
+    };
+    const timer = window.setInterval(tick, CHANGES_POLL_MS);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [poll]);
+
+  useRealtime(REPOS_CHANGED_CHANNEL, poll);
+  useRealtime(
+    THREAD_CHANGES_CHANNEL,
+    useCallback(
+      (payload: unknown) => {
+        const signal = threadSignal(payload);
+        if (signal === null || signal.threadId !== threadId) return;
+        load({ prs: signal.pullRequests, quiet: true });
+      },
+      [load, threadId],
+    ),
+  );
 
   const statusByDir = useMemo(() => new Map(status.map((entry) => [entry.dir, entry])), [status]);
   const prByDir = useMemo(() => new Map(prs.map((entry) => [entry.dir, entry])), [prs]);
@@ -468,27 +553,34 @@ export function ChangesPanel({ threadId }: { threadId: string }) {
   const act = useCallback(
     (dir: string, action: Parameters<typeof rpc.call<"pullRequestAction">>[1]["action"]) => {
       setBusy(true);
-      setNotice(null);
+      setActionNotice(null);
       void rpc
         .call("pullRequestAction", { threadId, dir, action })
         .then((result) => {
-          setNotice(`${dir}: ${result.message}`);
-          load(true);
+          setActionNotice(`${dir}: ${result.message}`);
+          load({ prs: true, refreshPrs: true });
         })
-        .catch((error: unknown) => setNotice(error instanceof Error ? error.message : "The action failed."))
+        .catch((error: unknown) =>
+          setActionNotice(error instanceof Error ? error.message : "The action failed."),
+        )
         .finally(() => setBusy(false));
     },
     [rpc, threadId, load],
   );
 
   if (workspace === undefined) {
-    return <div className="text-muted-foreground p-4 text-sm">Loading…</div>;
+    return (
+      <div className="text-muted-foreground p-4 text-sm">
+        {diffError === null ? "Loading…" : diffError}
+      </div>
+    );
   }
   if (workspace === null) {
     return (
       <div className="p-4 text-sm">
         <p className="text-muted-foreground">
-          This thread does not have a multi-repo workspace. Its environment was created by a different provider.
+          This thread has no multi-repo workspace: no environment created by the Multi-repo workspace provider is
+          attached to it.
         </p>
       </div>
     );
@@ -505,7 +597,7 @@ export function ChangesPanel({ threadId }: { threadId: string }) {
         <button
           type="button"
           className="hover:bg-muted ml-auto flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs disabled:opacity-50"
-          onClick={() => load(true)}
+          onClick={() => load({ prs: true, refreshPrs: true })}
           disabled={loading || busy}
         >
           <Icon name="RefreshCw" className="size-3" />
@@ -514,7 +606,58 @@ export function ChangesPanel({ threadId }: { threadId: string }) {
       </div>
 
       <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
-        {notice !== null && <div className="bg-muted/50 rounded-md border px-3 py-2 text-xs">{notice}</div>}
+        {actionNotice !== null && (
+          <div className="bg-muted/50 rounded-md border px-3 py-2 text-xs">{actionNotice}</div>
+        )}
+
+
+        {diffError !== null && (
+          <div className="border-destructive/40 bg-destructive/10 text-destructive rounded-md border px-3 py-2 text-xs">
+            {diffError}
+          </div>
+        )}
+
+        {/* Deliberately its own banner rather than a reason to hide the diffs:
+            `gh` can be missing or unauthenticated on a perfectly good checkout. */}
+        {prError !== null && (
+          <div className="text-muted-foreground rounded-md border px-3 py-2 text-xs">
+            Pull requests unavailable: {prError}
+          </div>
+        )}
+
+        {workspace.predatesAdopt && (
+          <div className="rounded-md border px-3 py-2 text-xs">
+            <div className="font-medium">This workspace predates the adopt</div>
+            <p className="text-muted-foreground mt-1">
+              It was built from the standalone <code className="font-mono">.bb</code> at{" "}
+              <span className="font-mono">{workspace.projectSourcePath}</span>, and the project source is now a
+              primary repo. Guidance published from this thread goes to the old checkout; re-apply such a branch to
+              the primary by hand.
+            </p>
+          </div>
+        )}
+
+        {workspace.sharedWith.length > 0 && (
+          <div className="rounded-md border px-3 py-2 text-xs">
+            <div className="flex items-center gap-1.5 font-medium">
+              <Icon name="GitFork" className="size-3" />
+              {workspace.sharedWith.length === 1
+                ? "Another thread shares this checkout"
+                : `${workspace.sharedWith.length} other threads share this checkout`}
+            </div>
+            <ul className="text-muted-foreground mt-1 space-y-0.5">
+              {workspace.sharedWith.map((other) => (
+                <li key={other.threadId}>{other.title ?? other.threadId}</li>
+              ))}
+            </ul>
+            <p className="text-muted-foreground mt-1">
+              A forked thread keeps the environment it was forked from, so these threads work in{" "}
+              <span className="font-mono">{workspace.root}</span> on{" "}
+              <span className="font-mono">{workspace.branchName}</span> together. Commits from either land on the same
+              branch.
+            </p>
+          </div>
+        )}
 
         {failed.length > 0 && (
           <div className="border-destructive/40 bg-destructive/10 rounded-md border px-3 py-2 text-xs">

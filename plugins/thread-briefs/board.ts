@@ -15,9 +15,9 @@ import type {
 } from "./contract.js";
 import {
   STAGE_LABELS,
-  STALE_DONE_RING_ICON,
   STATUS_LABELS,
   doneRingIcon,
+  staleDoneRingIcon,
   stageRingIcon,
 } from "./brief.js";
 import {
@@ -104,6 +104,8 @@ export type BoardRowThread = {
   href: string;
   /** bb's live execution status, for the `working` fold. */
   status: string;
+  /** bb's "output you have not seen", for the ring's centre dot. */
+  isUnread: boolean;
   isPinned: boolean;
   isHidden: boolean;
   latestAttentionAt: number;
@@ -117,6 +119,8 @@ export type BoardRow = {
   /** Null for a thread with no project, which cannot take a project colour. */
   project: { id: string; name: string } | null;
   isPinned: boolean;
+  /** The thread has output nobody has read; drawn as the ring's centre dot. */
+  isUnread: boolean;
   latestAttentionAt: number;
   /**
    * The status the card shows: `working` where bb says the agent is running or
@@ -194,7 +198,7 @@ export function buildRows(args: {
       })
         ? {
             idleMs: idleMsSince(thread.latestAttentionAt, args.now),
-            archiving: args.archiveAfterMs > 0,
+            archiving: args.archiveAfterMs > 0 && (card?.autoArchive ?? true),
           }
         : null;
 
@@ -212,6 +216,7 @@ export function buildRows(args: {
             }
           : null,
       isPinned: thread.isPinned,
+      isUnread: thread.isUnread,
       latestAttentionAt: thread.latestAttentionAt,
       status,
       card,
@@ -646,8 +651,8 @@ export function countByStatus(
 /**
  * The one thing the status badge cannot say.
  *
- * `deriveStatus` collapses a next step the *agent* could take by itself into
- * `waiting-on-me`, because the nudge is ours to give — so two cards reading
+ * `waiting-on-me` covers a thread the *agent* could carry on by itself as well
+ * as one that needs your answer, because the nudge is ours to give — so two cards reading
  * "Waiting on you" can want completely different amounts of work from you. On a
  * board, where the whole task is choosing between them, that difference is worth
  * a word.
@@ -663,21 +668,20 @@ export function actorHint(
 /**
  * The ring a card draws, or null for a briefless one.
  *
- * The same three-facts-in-one-glyph as the sidebar row — how far round is the
- * stage, a filled centre is done, the hue is the project, grey is done and cold
- * — so the vocabulary learned in one place reads in the other. It differs from
- * `rowDecoration` in one way: a `working` card still draws its brief's ring here.
- * On a row that decoration is suppressed because bb has a live glyph of its own
- * to put there; a card has room for both and the stage is still the fact that
- * says how close the running thread is to finished.
+ * The same glyph as the sidebar row — how far round is the stage, all four
+ * quarters is done, a dot in the centre is unread, a pulse is the agent
+ * working, the hue is the project, grey is done and cold — so the vocabulary
+ * learned in one place reads in the other. The pin is not on the ring; the
+ * card has its own `pinned` marker for it, where a row has only its label.
  */
 export function cardRingIcon(row: BoardRow): string | null {
   if (row.card === null) return null;
-  if (row.stale !== null) return STALE_DONE_RING_ICON;
+  const marks = { unread: row.isUnread, working: row.status === "working" };
+  if (row.stale !== null) return staleDoneRingIcon(marks);
   const colorIndex =
     row.project === null ? undefined : projectColorIndex(row.project.id);
-  if (row.status === "done") return doneRingIcon(colorIndex);
-  return stageRingIcon(row.card.stage, colorIndex);
+  if (row.status === "done") return doneRingIcon(colorIndex, marks);
+  return stageRingIcon(row.card.stage, colorIndex, marks);
 }
 
 /** Whether either pin is in force on this card, for the "pinned" marker. */

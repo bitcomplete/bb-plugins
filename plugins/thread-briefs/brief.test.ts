@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  deriveStatus,
+  legacyStatus,
   effectiveStage,
   effectiveStatus,
   idleFor,
@@ -40,30 +40,59 @@ const stored = (overrides: Partial<StoredBrief> = {}): StoredBrief => ({
   ...overrides,
 });
 
-describe("deriveStatus", () => {
+describe("effectiveStatus", () => {
+  it("reports the status the summarizer judged", () => {
+    // Done with a suggestion still standing: nextStep no longer decides.
+    expect(effectiveStatus(stored({ modelStatus: "done" }))).toBe("done");
+    expect(
+      effectiveStatus(
+        stored({ modelStatus: "waiting-on-me", fields: { ...stored().fields, nextStep: "" } }),
+      ),
+    ).toBe("waiting-on-me");
+  });
+
+  it("reads a brief written before status was asked for the old way", () => {
+    // Not backfilled: such a brief keeps its reading until the thread is
+    // next summarized.
+    expect(effectiveStatus(stored())).toBe("waiting-on-me");
+    expect(
+      effectiveStatus(stored({ fields: { ...stored().fields, nextStep: "" } })),
+    ).toBe("done");
+  });
+
+  it("lets a pin in force win over the model", () => {
+    expect(
+      effectiveStatus(
+        stored({ modelStatus: "waiting-on-me", statusOverride: "done", statusOverrideSeq: 50 }),
+      ),
+    ).toBe("done");
+  });
+});
+
+describe("legacyStatus", () => {
   it("reports done only when nothing is outstanding and nothing blocking", () => {
-    expect(deriveStatus({ nextStep: "   ", blockedOn: "" })).toBe("done");
+    expect(legacyStatus({ nextStep: "   ", blockedOn: "" })).toBe("done");
   });
 
   it("does not call a blocked thread done, whatever the next step says", () => {
     // The prompt promises a non-empty nextStep whenever anything is
     // outstanding. This is the guard for when it does not deliver one.
-    expect(deriveStatus({ nextStep: "", blockedOn: "Review from Dylan" })).toBe(
+    expect(legacyStatus({ nextStep: "", blockedOn: "Review from Dylan" })).toBe(
       "waiting-on-other",
     );
-    expect(deriveStatus({ nextStep: "  ", blockedOn: "  Upstream fix " })).toBe(
+    expect(legacyStatus({ nextStep: "  ", blockedOn: "  Upstream fix " })).toBe(
       "waiting-on-other",
     );
   });
 
   it("reports waiting-on-other when something is blocking", () => {
     expect(
-      deriveStatus({ nextStep: "Merge it", blockedOn: "Review from Dylan" }),
+      legacyStatus({ nextStep: "Merge it", blockedOn: "Review from Dylan" }),
     ).toBe("waiting-on-other");
   });
 
   it("falls back to waiting-on-me for unfinished, unblocked work", () => {
-    expect(deriveStatus({ nextStep: "Pick an approach", blockedOn: "" })).toBe(
+    expect(legacyStatus({ nextStep: "Pick an approach", blockedOn: "" })).toBe(
       "waiting-on-me",
     );
   });
@@ -71,16 +100,16 @@ describe("deriveStatus", () => {
   it("does not need a trailing question to report waiting-on-me", () => {
     // An idle thread with work left needs a human look either way, so the
     // question signal no longer changes the outcome.
-    expect(deriveStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
+    expect(legacyStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
       "waiting-on-me",
     );
   });
 });
 
-describe("deriveStatus with an actor", () => {
+describe("legacyStatus with an actor", () => {
   it("treats an external actor as blocked even with no blockedOn text", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Land the upstream PR",
         blockedOn: "",
         nextStepActor: "other",
@@ -90,7 +119,7 @@ describe("deriveStatus with an actor", () => {
 
   it("reports waiting-on-me for a step only the user can take", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Try it and say whether the glyph looks right",
         blockedOn: "",
         nextStepActor: "me",
@@ -100,7 +129,7 @@ describe("deriveStatus with an actor", () => {
 
   it("reports waiting-on-me for a step the agent could take, since the nudge is ours", () => {
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Keep porting the remaining call sites",
         blockedOn: "",
         nextStepActor: "agent",
@@ -110,21 +139,21 @@ describe("deriveStatus with an actor", () => {
 
   it("lets done win over any actor, so a finished thread is never a prompt", () => {
     expect(
-      deriveStatus({ nextStep: "", blockedOn: "", nextStepActor: "other" }),
+      legacyStatus({ nextStep: "", blockedOn: "", nextStepActor: "other" }),
     ).toBe("done");
   });
 
   it("preserves the actor-free behaviour when the actor is absent", () => {
     // Every brief written before this field existed lands here.
-    expect(deriveStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
-      deriveStatus({
+    expect(legacyStatus({ nextStep: "Keep going", blockedOn: "" })).toBe(
+      legacyStatus({
         nextStep: "Keep going",
         blockedOn: "",
         nextStepActor: undefined,
       }),
     );
     expect(
-      deriveStatus({
+      legacyStatus({
         nextStep: "Keep going",
         blockedOn: "",
         nextStepActor: undefined,
@@ -213,7 +242,7 @@ describe("status overrides", () => {
       statusOverrideSeq: 50,
       lastActivitySeen: 50,
     });
-    expect(deriveStatus(brief.fields)).toBe("waiting-on-me");
+    expect(legacyStatus(brief.fields)).toBe("waiting-on-me");
     expect(effectiveStatus(brief)).toBe("done");
     expect(isStatusOverrideStale(brief)).toBe(false);
   });
@@ -280,13 +309,22 @@ describe("status overrides", () => {
       statusOverrideSeq: 50,
       lastActivitySeen: 50,
     });
-    const decoration = rowDecoration(rowSignalFor(resolveBrief(pinned)), false);
+    const decoration = rowDecoration(rowSignalFor(pinned), IDLE);
+    // The ring draws nothing for the pin; the label is what says so.
     expect(decoration?.icon).toBe("thread-briefs/done");
+    expect(decoration?.label).toBe("Implementation — Done · set by hand");
   });
 });
 
+/** The live half of a row at rest: idle agent, nothing unread. */
+const IDLE = { working: false, unread: false };
+/** The live half of a row whose agent is running. */
+const RUNNING = { working: true, unread: false };
+/** The live half of a row with output nobody has read yet. */
+const UNREAD = { working: false, unread: true };
+
 describe("rowDecoration", () => {
-  const signalFor = (brief: StoredBrief) => rowSignalFor(resolveBrief(brief));
+  const signalFor = (brief: StoredBrief) => rowSignalFor(brief);
 
   const blocked = stored({
     fields: { ...stored().fields, blockedOn: "Waiting on CI" },
@@ -296,7 +334,7 @@ describe("rowDecoration", () => {
   });
 
   it("draws the stage ring, not the status", () => {
-    const decoration = rowDecoration(signalFor(stored()), false);
+    const decoration = rowDecoration(signalFor(stored()), IDLE);
     expect(decoration?.icon).toBe("thread-briefs/stage-implementation");
     expect(decoration?.tone).toBe("default");
   });
@@ -304,10 +342,10 @@ describe("rowDecoration", () => {
   it("leads the label with the stage the ring draws, and still names the status", () => {
     // The ring is the only thing on the row, so the label is the only place
     // either word appears — and with grouping off, the only place at all.
-    expect(rowDecoration(signalFor(stored()), false)?.label).toBe(
+    expect(rowDecoration(signalFor(stored()), IDLE)?.label).toBe(
       "Implementation — Waiting on you",
     );
-    expect(rowDecoration(signalFor(blocked), false)?.label).toBe(
+    expect(rowDecoration(signalFor(blocked), IDLE)?.label).toBe(
       "Implementation — Blocked",
     );
   });
@@ -316,7 +354,7 @@ describe("rowDecoration", () => {
     expect(
       BRIEF_STAGES.map(
         (stage) =>
-          rowDecoration(signalFor(stored({ modelStage: stage })), false)?.icon,
+          rowDecoration(signalFor(stored({ modelStage: stage })), IDLE)?.icon,
       ),
     ).toEqual([
       "thread-briefs/stage-discovery",
@@ -332,45 +370,84 @@ describe("rowDecoration", () => {
       stageOverrideSeq: 50,
       lastActivitySeen: 50,
     });
-    expect(rowDecoration(signalFor(overridden), false)?.icon).toBe(
+    expect(rowDecoration(signalFor(overridden), IDLE)?.icon).toBe(
       "thread-briefs/stage-review",
     );
+    expect(rowDecoration(signalFor(overridden), IDLE)?.label).toBe(
+      "Review — Waiting on you · set by hand",
+    );
+  });
+
+  it("drops the pin from the label once it has retired", () => {
+    const retired = stored({
+      stageOverride: "review",
+      stageOverrideSeq: 50,
+      lastActivitySeen: 51,
+    });
+    const decoration = rowDecoration(signalFor(retired), IDLE);
+    expect(decoration?.icon).toBe("thread-briefs/stage-implementation");
+    expect(decoration?.label).toBe("Implementation — Waiting on you");
   });
 
   it("draws the same ring for waiting-on-me and blocked", () => {
     // Status is what the sidebar's own grouping puts in the section header, so
     // the glyph spends its one slot on the stage instead. The label separates
     // them; so does the section.
-    expect(rowDecoration(signalFor(blocked), false)?.icon).toBe(
-      rowDecoration(signalFor(stored()), false)?.icon,
+    expect(rowDecoration(signalFor(blocked), IDLE)?.icon).toBe(
+      rowDecoration(signalFor(stored()), IDLE)?.icon,
     );
   });
 
   it("closes the ring for a finished thread, whatever stage it ended in", () => {
     // `done` is a status, not a fifth stage: the arc is over.
-    const decoration = rowDecoration(signalFor(done), false);
+    const decoration = rowDecoration(signalFor(done), IDLE);
     expect(decoration?.icon).toBe("thread-briefs/done");
     expect(
       rowDecoration(
         signalFor(
           stored({ modelStage: "discovery", fields: { ...done.fields } }),
         ),
-        false,
+        IDLE,
       )?.icon,
     ).toBe("thread-briefs/done");
   });
 
-  it("draws nothing while the agent is running, whatever the brief says", () => {
-    // Live working outranks the stored status. bb hides a plugin row status for
-    // a running thread anyway, and would let one displace its plan-mode or goal
-    // glyph, which says more than a stored stage can.
-    expect(rowDecoration(signalFor(blocked), true)).toBeNull();
-    expect(rowDecoration(signalFor(done), true)).toBeNull();
-    expect(rowDecoration(signalFor(stored()), true)).toBeNull();
+  it("animates the ring while the agent is running, whatever the brief says", () => {
+    // Live working outranks the stored status, but as a mark on the ring, not
+    // a reason to drop it: the stage is still the stage while the agent runs.
+    expect(rowDecoration(signalFor(blocked), RUNNING)).toEqual({
+      icon: "thread-briefs/stage-implementation-working",
+      label: "Implementation — Working",
+      tone: "running",
+    });
+    expect(rowDecoration(signalFor(done), RUNNING)?.icon).toBe(
+      "thread-briefs/done-working",
+    );
+    expect(rowDecoration(signalFor(stored()), RUNNING)?.label).toBe(
+      "Implementation — Working",
+    );
+  });
+
+  it("dots the ring of a thread with output nobody has read", () => {
+    // bb's own activity dot, in the ring's centre: the condition is bb's
+    // `isUnread`, and the label does not repeat it because the dot is the
+    // whole message.
+    expect(rowDecoration(signalFor(stored()), UNREAD)).toEqual({
+      icon: "thread-briefs/stage-implementation-unread",
+      label: "Implementation — Waiting on you",
+      tone: "default",
+    });
+    expect(rowDecoration(signalFor(done), UNREAD)?.icon).toBe(
+      "thread-briefs/done-unread",
+    );
+    // Independent of working: a running thread you have not caught up on.
+    expect(
+      rowDecoration(signalFor(stored()), { working: true, unread: true })?.icon,
+    ).toBe("thread-briefs/stage-implementation-unread-working");
   });
 
   it("restores the stored glyph once the thread goes idle again", () => {
-    expect(rowDecoration(signalFor(blocked), false)?.icon).toBe(
+    expect(rowDecoration(signalFor(blocked), IDLE)?.icon).toBe(
       "thread-briefs/stage-implementation",
     );
   });
@@ -380,8 +457,8 @@ describe("rowDecoration", () => {
 
     it("keeps the stage on the ring and puts the project in its colour", () => {
       // The suffix is the only difference: same stage, same artwork, repainted.
-      const plain = rowDecoration(signalFor(stored()), false);
-      const colored = rowDecoration(signalFor(stored()), false, alpha);
+      const plain = rowDecoration(signalFor(stored()), IDLE);
+      const colored = rowDecoration(signalFor(stored()), IDLE, alpha);
       expect(colored?.icon).toBe(
         `${plain?.icon}-c${projectColorIndex(alpha.id)}`,
       );
@@ -390,7 +467,7 @@ describe("rowDecoration", () => {
     it("colours the closed ring too, and gives up the done green for it", () => {
       // Nothing is lost: `done` still has its own artwork and its own section
       // heading, where the project has neither.
-      const decoration = rowDecoration(signalFor(done), false, alpha);
+      const decoration = rowDecoration(signalFor(done), IDLE, alpha);
       expect(decoration?.icon).toBe(
         `thread-briefs/done-c${projectColorIndex(alpha.id)}`,
       );
@@ -400,12 +477,12 @@ describe("rowDecoration", () => {
       // The colour channel means "project" on every row. A green surviving on
       // the rows that happen to reach here without a project would be a second
       // rule for the same channel, and an invisible one.
-      expect(rowDecoration(signalFor(done), false, alpha)?.tone).toBe("default");
-      expect(rowDecoration(signalFor(done), false)?.tone).toBe("default");
+      expect(rowDecoration(signalFor(done), IDLE, alpha)?.tone).toBe("default");
+      expect(rowDecoration(signalFor(done), IDLE)?.tone).toBe("default");
     });
 
     it("names the project in the label, since a hue cannot name itself", () => {
-      expect(rowDecoration(signalFor(stored()), false, alpha)?.label).toBe(
+      expect(rowDecoration(signalFor(stored()), IDLE, alpha)?.label).toBe(
         "Implementation — Waiting on you (Alpha)",
       );
     });
@@ -413,7 +490,7 @@ describe("rowDecoration", () => {
     it("still colours by id when the project's name has not loaded", () => {
       // The sidebar can hold a thread whose project is not in the list yet. The
       // colour comes from the id, so only the label's suffix waits.
-      const decoration = rowDecoration(signalFor(stored()), false, {
+      const decoration = rowDecoration(signalFor(stored()), IDLE, {
         id: alpha.id,
         name: "",
       });
@@ -425,13 +502,15 @@ describe("rowDecoration", () => {
 
     it("gives two projects different rings for the same stage", () => {
       const beta = { id: "proj_beta", name: "Beta" };
-      expect(rowDecoration(signalFor(stored()), false, alpha)?.icon).not.toBe(
-        rowDecoration(signalFor(stored()), false, beta)?.icon,
+      expect(rowDecoration(signalFor(stored()), IDLE, alpha)?.icon).not.toBe(
+        rowDecoration(signalFor(stored()), IDLE, beta)?.icon,
       );
     });
 
-    it("draws nothing while the agent is running, project or not", () => {
-      expect(rowDecoration(signalFor(stored()), true, alpha)).toBeNull();
+    it("keeps the project's colour on a working ring", () => {
+      expect(rowDecoration(signalFor(stored()), RUNNING, alpha)?.icon).toBe(
+        `thread-briefs/stage-implementation-working-c${projectColorIndex(alpha.id)}`,
+      );
     });
   });
 
@@ -443,7 +522,7 @@ describe("rowDecoration", () => {
       // The row has one channel. A thread on its way out of the sidebar has no
       // use for the colour that says whose project it is, so the grey takes it
       // rather than trying to share it.
-      const decoration = rowDecoration(signalFor(done), false, alpha, stale);
+      const decoration = rowDecoration(signalFor(done), IDLE, alpha, stale);
       expect(decoration?.icon).toBe("thread-briefs/done-stale");
       expect(decoration?.tone).toBe("default");
     });
@@ -451,14 +530,14 @@ describe("rowDecoration", () => {
     it("says how long, and that it is on its way out", () => {
       // The shape still says done; nothing but the label says why the colour
       // has drained out of it or what happens next.
-      expect(rowDecoration(signalFor(done), false, alpha, stale)?.label).toBe(
+      expect(rowDecoration(signalFor(done), IDLE, alpha, stale)?.label).toBe(
         "Implementation — Done · idle 2 days, archiving soon (Alpha)",
       );
     });
 
     it("does not promise an archiving that is switched off", () => {
       expect(
-        rowDecoration(signalFor(done), false, alpha, {
+        rowDecoration(signalFor(done), IDLE, alpha, {
           ...stale,
           archiving: false,
         })?.label,
@@ -468,15 +547,27 @@ describe("rowDecoration", () => {
     it("ignores staleness on a row that is not done", () => {
       // Only a finished thread can be finished-and-forgotten. A caller that
       // passed one anyway must not get the done ring drawn for it.
-      const decoration = rowDecoration(signalFor(blocked), false, alpha, stale);
+      const decoration = rowDecoration(signalFor(blocked), IDLE, alpha, stale);
       expect(decoration?.icon).toBe(
         `thread-briefs/stage-implementation-c${projectColorIndex(alpha.id)}`,
       );
       expect(decoration?.label).toBe("Implementation — Blocked (Alpha)");
     });
 
-    it("still draws nothing while the agent is running", () => {
-      expect(rowDecoration(signalFor(done), true, alpha, stale)).toBeNull();
+    it("is not stale while the agent is running: somebody came back", () => {
+      // Grey means "nobody returned". A running turn is the proof they did,
+      // so the ring takes the project's colour back and pulses.
+      const decoration = rowDecoration(signalFor(done), RUNNING, alpha, stale);
+      expect(decoration?.icon).toBe(
+        `thread-briefs/done-working-c${projectColorIndex(alpha.id)}`,
+      );
+      expect(decoration?.label).toBe("Implementation — Working (Alpha)");
+    });
+
+    it("keeps the grey, dotted, for cold output nobody has read", () => {
+      expect(
+        rowDecoration(signalFor(done), UNREAD, alpha, stale)?.icon,
+      ).toBe("thread-briefs/done-stale-unread");
     });
   });
 });

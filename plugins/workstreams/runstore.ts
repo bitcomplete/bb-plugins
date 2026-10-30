@@ -171,9 +171,8 @@ export function createRunStore(db: RunDb, now: () => number = Date.now) {
       return get(id)!;
     },
     /**
-     * Overwrite a finished agent run's outcome with what code found in its
-     * answer: a run whose thread ended cleanly can still have produced nothing
-     * usable, and that is a failure with a reason, not "done".
+     * Overwrite a run's outcome with what code found: a claim whose batch
+     * thread is gone ends as a failure with a reason, not "done".
      */
     settle(id: number, ok: boolean, text: string): Run | null {
       db.prepare(`UPDATE action_runs SET status = ?, result = ?, error = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?`).run(
@@ -208,7 +207,7 @@ export function createRunStore(db: RunDb, now: () => number = Date.now) {
       const at = now();
       const changed: Run[] = [];
       const open = openIn(threadId);
-      const ambiguous = open.length > 1 || open.some((run) => run.mode === "continue");
+      const ambiguous = open.length > 1;
       if (ambiguous && (signal.kind === "idle" || signal.kind === "failed")) {
         for (const run of open) {
           db.prepare(

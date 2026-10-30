@@ -35,26 +35,28 @@ describe("projectForPath", () => {
 
 describe("startThread", () => {
   const unit = { path: "/p/folio-abc-101", ticket: "ABC-101" };
+  const model = { providerId: "codex", model: "gpt-6-sol", reasoningLevel: "xhigh" } as const;
 
-  it("spawns in the checkout itself, seeds the cluster ticket as metadata, and names no provider or model", async () => {
+  it("spawns in the checkout with the model it is given, independent of project defaults", async () => {
     const { sdk, spawned } = fakeSdk();
-    const result = await startThread(sdk, unit, "  Pick up folio #47.  ");
+    const result = await startThread(sdk, unit, "  Pick up folio #47.  ", model);
     expect(result).toEqual({ ok: true, threadId: "thr_new", ticket: "ABC-101" });
     expect(spawned).toEqual([
       {
         projectId: "prj_folio",
+        providerId: "codex",
+        model: "gpt-6-sol",
+        reasoningLevel: "xhigh",
         environment: { type: "host", hostId: "host_b", workspace: { type: "unmanaged", path: "/p/folio-abc-101" } },
         prompt: "Pick up folio #47.",
         pluginMetadata: { ticket: "ABC-101" },
       },
     ]);
-    expect(spawned[0]).not.toHaveProperty("providerId");
-    expect(spawned[0]).not.toHaveProperty("model");
   });
 
   it("refuses, without spawning, when no BB project contains the checkout, rather than guessing one", async () => {
     const { sdk, spawned } = fakeSdk([PROJECTS[2]!]);
-    const result = await startThread(sdk, unit, "Pick up folio #47.");
+    const result = await startThread(sdk, unit, "Pick up folio #47.", model);
     expect(result.ok).toBe(false);
     expect(result.ok ? "" : result.error).toContain("No BB project contains /p/folio-abc-101");
     expect(spawned).toEqual([]);
@@ -62,13 +64,13 @@ describe("startThread", () => {
 
   it("refuses a checkout the last scan did not see, because the client only names a path", async () => {
     const { sdk, spawned } = fakeSdk();
-    expect((await startThread(sdk, undefined, "go")).ok).toBe(false);
+    expect((await startThread(sdk, undefined, "go", model)).ok).toBe(false);
     expect(spawned).toEqual([]);
   });
 
   it("refuses an empty prompt", async () => {
     const { sdk, spawned } = fakeSdk();
-    expect((await startThread(sdk, unit, "   ")).ok).toBe(false);
+    expect((await startThread(sdk, unit, "   ", model)).ok).toBe(false);
     expect(spawned).toEqual([]);
   });
 });

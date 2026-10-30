@@ -1,49 +1,5 @@
-import Database from "better-sqlite3";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEffortStore, EFFORT_MIGRATIONS } from "./effort-store.js";
-import { activeCheckoutThread, effortParent } from "./effort-routing.js";
-
-const databases: Database.Database[] = [];
-afterEach(() => databases.splice(0).forEach((db) => db.close()));
-const prUrl = "https://github.com/inkwell/folio/pull/42";
-const parent = (id: string) => ({ id, title: id, status: "idle", canSpawnChild: true, archivedAt: null as number | null, deletedAt: null as number | null });
-function setup() {
-  const db = new Database(":memory:"); databases.push(db);
-  EFFORT_MIGRATIONS.forEach((sql) => db.exec(sql));
-  const store = createEffortStore(db);
-  const record = store.establish({ sourceKey: "a", name: "Review", goal: "Improve reviews", projectId: "project", members: { tickets: [], prUrls: [prUrl] } });
-  const effort = store.save({ ...record, coordinatorThreadId: "coordinator", coordinatorState: "ready" });
-  return { store, effort };
-}
-
-describe("effort repair parents", () => {
-  it("uses the prior PR worker for a follow-up, without nesting under an earlier follow-up", async () => {
-    const { store, effort } = setup();
-    store.recordWorker(effort.id, "worker", prUrl, "pr");
-    store.recordWorker(effort.id, "followup", prUrl, "followup");
-    const get = vi.fn(async (id: string) => parent(id));
-    expect(await effortParent(store, effort, prUrl, get)).toMatchObject({ role: "followup", thread: { id: "worker" } });
-    expect(get).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([
-    { status: "running" }, { archivedAt: 1 }, { deletedAt: 1 }, { canSpawnChild: false },
-  ])("falls back to the coordinator when the previous PR worker cannot accept a child: %j", async (change) => {
-    const { store, effort } = setup();
-    store.recordWorker(effort.id, "worker", prUrl, "pr");
-    const get = async (id: string) => ({ ...parent(id), ...(id === "worker" ? change : {}) });
-    expect(await effortParent(store, effort, prUrl, get)).toMatchObject({ role: "pr", thread: { id: "coordinator" } });
-  });
-
-  it("returns no parent when depth or missing-thread checks reject every candidate", async () => {
-    const { store, effort } = setup();
-    store.recordWorker(effort.id, "worker", prUrl, "pr");
-    expect(await effortParent(store, effort, prUrl, async (id) => {
-      if (id === "worker") throw new Error("missing");
-      return { ...parent(id), canSpawnChild: false };
-    })).toBeNull();
-  });
-});
+import { describe, expect, it, vi } from "vitest";
+import { activeCheckoutThread } from "./effort-routing.js";
 
 describe("active checkout ownership", () => {
   it("blocks only the same path on the same host, including waiting writers and unknown hosts", async () => {

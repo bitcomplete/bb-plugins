@@ -3,18 +3,13 @@
 import { describe, expect, it } from "vitest";
 import {
   RESULT_MAX,
-  ROW_RUN_MS,
   STRANDED_MS,
-  STRIP_RECENT_MS,
   applySignal,
   badgeValue,
   directOutcome,
   extractResult,
   isStranded,
-  rowRun,
-  runDetail,
   runLabel,
-  stripCounts,
   type Run,
   type TrackedRun,
 } from "./runs.js";
@@ -150,10 +145,6 @@ function run(overrides: Partial<Run> = {}): Run {
 describe("directOutcome", () => {
   it("keeps a short reason per action, dropping the repo and PR the row already shows", () => {
     expect(directOutcome("merge", { ok: true, detail: "Merged inkwell/quill #42 and deleted its branch." })).toEqual({ ok: true, text: "Merged" });
-    expect(directOutcome("update-branch", { ok: true, detail: "Updated the branch of inkwell/folio #47." })).toEqual({ ok: true, text: "Branch updated" });
-    expect(
-      directOutcome("nudge", { ok: true, detail: "inkwell/margin #61: re-requested 2 reviewers and commented." }),
-    ).toEqual({ ok: true, text: "Re-requested 2 reviewers and commented" });
   });
 
   it("keeps the refusal as the failure reason", () => {
@@ -161,22 +152,6 @@ describe("directOutcome", () => {
       ok: false,
       text: "Not merged: It has merge conflicts with its base.",
     });
-  });
-});
-
-describe("rowRun", () => {
-  it("shows the row's latest run, not an older one on the same row", () => {
-    const older = run({ id: 1, status: "done", startedAt: NOON - 60 * MIN, finishedAt: NOON - 50 * MIN });
-    const newer = run({ id: 2, kind: "direct", action: "merge", status: "succeeded", startedAt: NOON - 2 * MIN, finishedAt: NOON - 2 * MIN });
-    expect(rowRun([older, newer], "/p/quill-abc-101", NOON)?.id).toBe(2);
-    expect(rowRun([older, newer], "/p/folio-abc-102", NOON)).toBeNull();
-  });
-
-  it("drops a finished run after a day, but keeps an open one however old", () => {
-    const stale = run({ status: "done", finishedAt: NOON - ROW_RUN_MS - 1 });
-    expect(rowRun([stale], stale.path, NOON)).toBeNull();
-    const stuck = run({ status: "needs-you", startedAt: NOON - 3 * ROW_RUN_MS });
-    expect(rowRun([stuck], stuck.path, NOON)).toBe(stuck);
   });
 });
 
@@ -197,36 +172,6 @@ describe("runLabel", () => {
     expect(runLabel(merged, NOON)).toBe("Merged 2m ago");
     expect(runLabel({ ...merged, action: "nudge", finishedAt: NOON - 60 * MIN }, NOON)).toBe("Nudged 1h ago");
     expect(runLabel({ ...merged, status: "failed", result: null, error: "Head moved; refused" }, NOON)).toBe("Failed: Head moved; refused");
-  });
-
-  it("puts the full outcome and both times in the tooltip", () => {
-    const done = run({ status: "done", result: "Pushed", finishedAt: NOON });
-    expect(runDetail(done, (at) => `t${at - NOON}`)).toBe(`Pushed\nStarted t${-4 * MIN}\nFinished t0`);
-    expect(runDetail(run(), (at) => String(at - NOON))).toBe(`Started ${-4 * MIN}\nStill running`);
-  });
-});
-
-describe("stripCounts", () => {
-  it("counts running, needs-you and today's finished runs", () => {
-    const counts = stripCounts(
-      [
-        run({ status: "running" }),
-        run({ status: "running" }),
-        run({ status: "needs-you" }),
-        run({ status: "done", finishedAt: NOON - 5 * 60 * MIN }),
-        run({ kind: "direct", status: "succeeded", finishedAt: NOON - 10 * MIN }),
-        run({ status: "failed", finishedAt: NOON - MIN }),
-        run({ status: "done", finishedAt: NOON - 20 * 60 * MIN }),
-      ],
-      NOON,
-    );
-    expect(counts).toEqual({ running: 2, needsYou: 1, doneToday: 2, failedToday: 1, show: true });
-  });
-
-  it("hides when nothing is open and nothing finished in the last few hours", () => {
-    expect(stripCounts([run({ status: "done", finishedAt: NOON - STRIP_RECENT_MS - 1 })], NOON).show).toBe(false);
-    expect(stripCounts([], NOON).show).toBe(false);
-    expect(stripCounts([run({ status: "done", finishedAt: NOON - MIN })], NOON).show).toBe(true);
   });
 });
 

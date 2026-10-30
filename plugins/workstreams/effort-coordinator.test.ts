@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEffortStore, EFFORT_MIGRATIONS } from "./effort-store.js";
+import { createEffortStore, EFFORT_MIGRATIONS, REPO_CONTROLLER_MIGRATION } from "./effort-store.js";
 import { createCoordinatorService, type CoordinatorSdk, type EffortPlan } from "./effort-coordinator.js";
 import { inventoryEffort } from "./effort-membership.js";
 
@@ -10,13 +10,58 @@ const members = { tickets: ["ABC-101"], prUrls: ["https://github.com/inkwell/fol
 const input = { groupKey: "suggested", name: "Improve review", goal: "Review manuscripts reliably", projectId: "proj-1", members };
 const plan: EffortPlan = { ok: true, name: input.name, goal: "", members, projects: [{ id: "proj-1", name: "Folio" }], threads: [{ id: "existing", title: "Prior planning", projectId: "proj-1" }], effort: null };
 function setup() {
-  const db = new Database(":memory:"); dbs.push(db); EFFORT_MIGRATIONS.forEach((sql) => db.exec(sql));
+  const db = new Database(":memory:"); dbs.push(db); EFFORT_MIGRATIONS.forEach((sql) => db.exec(sql)); db.exec(REPO_CONTROLLER_MIGRATION);
   const store = createEffortStore(db);
   const sdk: CoordinatorSdk = { get: vi.fn(async (id) => ({ id, projectId: "proj-1", title: null, status: "idle", archivedAt: null, deletedAt: null, canSpawnChild: true })),
-    rename: vi.fn(async () => undefined), associate: vi.fn(async () => undefined), recover: vi.fn(async () => []), spawn: vi.fn(async () => ({ id: "spawned" })) };
+    rename: vi.fn(async () => undefined), associate: vi.fn(async () => undefined), recover: vi.fn(async () => []), spawn: vi.fn(async () => ({ id: "spawned" })),
+    models: async () => ({ code: { providerId: "codex", model: "gpt-6-sol", reasoningLevel: "high" }, planning: { providerId: "codex", model: "gpt-6-sol", reasoningLevel: "medium" } }) };
   return { store, sdk, service: createCoordinatorService(store, sdk) };
 }
 describe("coordinator identity and launch safety", () => {
+  it("lazily creates a coordinator for an established effort in its saved project", async () => {
+    const { store, sdk, service } = setup();
+    const existing = store.establish({ ...input, sourceKey: "group-a", coordinatorState: "none" });
+    const ready = await service.ensureExisting(existing.id, "another-repository-project");
+    expect(ready).toMatchObject({ id: existing.id, coordinatorThreadId: "spawned", coordinatorState: "ready", projectId: input.projectId });
+    expect(sdk.spawn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ projectId: input.projectId }));
+  });
+  it("launches once for a coordinator-free promoted effort and preserves its identity", async () => {
+    const { store, sdk, service } = setup();
+    const promoted = store.establish({ ...input, sourceKey: input.groupKey, goal: "", projectId: "", coordinatorState: "none" });
+    expect(await service.coordinate(input, { ...plan, effort: promoted })).toMatchObject({ ok: true,
+      effort: { id: promoted.id, coordinatorState: "ready", coordinatorThreadId: "spawned", goal: input.goal, projectId: input.projectId } });
+    expect(sdk.spawn).toHaveBeenCalledTimes(1);
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: true, effort: { id: promoted.id } });
+    expect(sdk.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not launch twice after an ambiguous coordinator-free promotion launch", async () => {
+    const { store, sdk, service } = setup();
+    store.establish({ ...input, sourceKey: input.groupKey, goal: "", projectId: "", coordinatorState: "none" });
+    vi.mocked(sdk.spawn).mockRejectedValue(new Error("transport lost"));
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: false });
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: false });
+    expect(sdk.spawn).toHaveBeenCalledTimes(1);
+    expect(store.source(input.groupKey)?.coordinatorState).toBe("creating");
+  });
+  it("releases only a definitively rejected workspace claim so the same effort can retry", async () => {
+    const { store, sdk, service } = setup();
+    vi.mocked(sdk.spawn).mockRejectedValueOnce(Object.assign(new Error(
+      "Workspace path is inside bb-managed storage but is not a workspace of this project"), { status: 409 }));
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: false });
+    const rejected = store.source(input.groupKey)!;
+    expect(rejected).toMatchObject({ coordinatorState: "none", coordinatorThreadId: null });
+    expect(await service.coordinate(input, plan)).toMatchObject({ ok: true,
+      effort: { id: rejected.id, coordinatorState: "ready", coordinatorThreadId: "spawned" } });
+    expect(sdk.spawn).toHaveBeenCalledTimes(2);
+  });
+  it("does not reset a coordinator claim changed after the rejected attempt", () => {
+    const { store } = setup();
+    const claim = store.establish({ ...input, sourceKey: "claim" });
+    store.save({ ...claim, name: "Updated review" });
+    expect(store.resetRejectedCoordinator(claim)).toBe(false);
+    expect(store.get(claim.id)).toMatchObject({ coordinatorState: "creating", name: "Updated review" });
+  });
   it("deduplicates a double click after the durable record exists but before spawn returns", async () => {
     const { store, sdk, service } = setup();
     let finish!: (thread: { id: string }) => void;
@@ -25,9 +70,10 @@ describe("coordinator identity and launch safety", () => {
     const stableKey = store.source(input.groupKey)!.key;
     const second = service.coordinate(input, plan);
     const third = service.coordinate({ ...input, groupKey: stableKey }, plan);
-    expect(sdk.spawn).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(sdk.spawn).toHaveBeenCalledTimes(1));
     finish({ id: "spawned" });
     expect(await first).toEqual(await second); expect(await second).toEqual(await third);
+    expect(sdk.spawn).toHaveBeenCalledTimes(1);
   });
   it("recovers a completed spawn after reload without creating a second coordinator", async () => {
     const { store, sdk } = setup();

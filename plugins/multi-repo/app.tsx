@@ -1,19 +1,29 @@
 /**
  * Frontend registrations.
  *
- * Three surfaces, each answering something bb cannot answer for a workspace
+ * Four surfaces, each answering something bb cannot answer for a workspace
  * whose root is not a git repo: a nav panel for the repo set (there is no
  * project-settings slot to put it in), a thread panel for diff and pull
  * requests (the native diff tab and PR badge never appear for these threads),
+ * a composer banner so the thread view says a diff exists at all (bb's own
+ * changed-files section reads the thread checkout and finds a plain directory),
  * and a file opener so a workspace file link lands with its repo named.
  */
 import { useEffect, useState } from "react";
 import type { ComponentType } from "react";
 import { definePluginApp, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./contract.js";
+import { ChangesBanner } from "./changes-banner.js";
 import { ChangesPanel } from "./changes-panel.js";
 import { ReposPanel } from "./repos-panel.js";
-import { CHANGES_ACTION_ID, CHANGES_TAB_TITLE, REPOS_PANEL_ID, REPOS_PANEL_PATH } from "./shared.js";
+import {
+  CHANGES_ACTION_ID,
+  CHANGES_BANNER_ID,
+  CHANGES_TAB_TITLE,
+  COMPOSER_CUSTOMIZATION_ID,
+  REPOS_PANEL_ID,
+  REPOS_PANEL_PATH,
+} from "./shared.js";
 
 /**
  * Extensions the file opener claims.
@@ -115,6 +125,15 @@ export default definePluginApp((app) => {
     run: ({ openPanel }) => {
       openPanel({ title: CHANGES_TAB_TITLE });
     },
+  });
+
+  // Scoped to the thread composer: this is a fact about one thread's checkout,
+  // so it has nothing to say in root compose, and a queued message being
+  // edited is not the place to put it either.
+  app.composer.customize({
+    id: COMPOSER_CUSTOMIZATION_ID,
+    scopes: ["thread"],
+    banners: [{ id: CHANGES_BANNER_ID, chrome: "card", component: ChangesBanner }],
   });
 
   app.slots.fileOpener({

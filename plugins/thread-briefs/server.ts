@@ -7,13 +7,13 @@ import {
   type BriefStage,
   type BriefState,
   type RefresherState,
+  type StoredBlockReason,
   type StoredBrief,
   type StoredRefresher,
 } from "./contract.js";
 import {
   briefCardFor,
   briefKey,
-  deriveStatus,
   effectiveStatus,
   overrideHolds,
   planRename,
@@ -38,9 +38,18 @@ import {
   requestSummary,
   type CompletionConfig,
 } from "./summarize.js";
+import {
+  ENV_API_KEY,
+  resolveApiKey,
+  resolveCompletion,
+  settingDefaults,
+} from "./config.js";
 import { endsWithQuestion, renderTranscript, type OutlineItem } from "./transcript.js";
 import {
-  manualSectionOrder,
+  readOptOut,
+} from "./optout.js";
+import {
+  mergeSectionOrder,
   planAssignments,
   planSections,
   sectionNameForStatus,
@@ -51,27 +60,6 @@ import {
 
 /** Cap on one summarizer call, so a hung endpoint cannot stall the queue. */
 const REQUEST_TIMEOUT_MS = 60_000;
-/**
- * Delay before a thread's **first** brief, in place of `quietSeconds`.
- *
- * The quiet period exists to stop a thread in active back-and-forth being
- * re-summarized every turn. On the first brief there is nothing to protect —
- * and that is when the absence shows most: no row glyph, no sidebar section, an
- * empty Brief panel, and bb's opening-prompt title still on the thread. It is
- * also the cheapest summary that thread will ever cost, because the transcript
- * is at its shortest.
- *
- * Long enough to coalesce a thread that goes idle and straight back to work,
- * short enough that the panel's "Summarizing…" arrives while you are looking.
- */
-const FIRST_BRIEF_DELAY_MS = 5_000;
-
-/**
- * The first-brief delay, never longer than the quiet period it stands in for —
- * a `quietSeconds` tuned below it is asking for briefs sooner, not later.
- */
-const firstBriefDelayMs = (quietMs: number) =>
-  Math.min(FIRST_BRIEF_DELAY_MS, quietMs);
 /** Backstop sweep: catches activity whose `thread.idle` we never saw. */
 const SWEEP_CRON = "*/10 * * * *";
 /** Threads considered per sweep, newest first. */
@@ -95,6 +83,8 @@ const ARCHIVE_CRON = "17 * * * *";
  * is still eligible in an hour.
  */
 const ARCHIVE_LIMIT = 500;
+/** Threads per plugin-metadata list request: bb's own cap. */
+const METADATA_PAGE_SIZE = 200;
 /** The plugin that owns the sidebar list, and so its layout preferences. */
 const THREAD_LIST_PLUGIN_ID = "thread-list";
 /** Where the grouping records what it changed, so `off` can put it back. */
@@ -118,6 +108,12 @@ const GROUPED_PREFS = {
   chronologicalSort: "updated",
 } as const;
 
+/** The `thread-list` preference holding the sidebar's section order. */
+const ORDER_PREF = "manualSectionOrder";
+
+/** Every preference the grouping can write, and so has to put back. */
+const RESTORED_PREFS: readonly string[] = [...Object.keys(GROUPED_PREFS), ORDER_PREF];
+
 /** What the grouping changed, recorded before the first write. */
 interface SidebarGroupingState {
   applied: boolean;
@@ -128,23 +124,39 @@ interface SidebarGroupingState {
 export { rpcContract };
 
 export default async function plugin(bb: BbPluginApi) {
+  // The server's environment can carry deployment-wide summarizer defaults
+  // (THREAD_BRIEFS_*), so a fleet of servers shares one key and endpoint. A
+  // stored setting wins over them; see config.ts.
+  const env = process.env;
+  const envDefaults = settingDefaults(env);
   const settings = bb.settings.define({
     baseUrl: {
       type: "string",
       label: "API base URL (root or full /chat/completions endpoint)",
-      default: "https://api.openai.com/v1",
+      description:
+        "Unset, the server's THREAD_BRIEFS_BASE_URL is used when the deployment sets one.",
+      default: envDefaults.baseUrl,
     },
-    apiKey: { type: "string", label: "API key", secret: true },
-    model: { type: "string", label: "Model", default: "gpt-4o-mini" },
+    apiKey: {
+      type: "string",
+      label: "API key",
+      description:
+        "Unset, the server's THREAD_BRIEFS_API_KEY is used when the deployment sets one.",
+      secret: true,
+    },
+    model: {
+      type: "string",
+      label: "Model",
+      description:
+        "Unset, the server's THREAD_BRIEFS_MODEL is used when the deployment sets one.",
+      default: envDefaults.model,
+    },
     jsonMode: {
       type: "boolean",
       label: "Request JSON mode",
-      default: true,
-    },
-    quietSeconds: {
-      type: "number",
-      label: "Quiet period before summarizing (seconds)",
-      default: 120,
+      description:
+        "Send response_format json_object. Turn off for endpoints that reject it. The deployment's THREAD_BRIEFS_JSON_MODE sets the default.",
+      default: envDefaults.jsonMode,
     },
     refresherIdleHours: {
       type: "number",
@@ -188,19 +200,20 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Group sidebar threads by brief status",
       description:
-        '"status" replaces the sidebar\'s project grouping with Waiting on you / Blocked / Done sections, newest first inside each. "off" puts the previous grouping back and removes the sections.',
+        '"status" replaces the sidebar\'s project grouping with Waiting on you / Blocked / Done sections, newest first inside each. Reorder the sections in the sidebar and that order is kept. "off" puts the previous grouping back and removes the sections.',
       options: ["off", "status"],
       default: "off",
     },
   });
 
+  /** Whether a summary can be requested at all: a key stored or in the environment. */
+  const hasApiKey = (values: { apiKey?: unknown }): boolean =>
+    resolveApiKey(values.apiKey, env) !== null;
+
   const initial = await settings.get();
-  if (
-    typeof initial.apiKey !== "string" ||
-    initial.apiKey.trim() === ""
-  ) {
+  if (!hasApiKey(initial)) {
     bb.status.needsConfiguration(
-      `Set an API key with \`bb plugin config ${bb.pluginId} set apiKey <key>\`, then reload.`,
+      `Set an API key with \`bb plugin config ${bb.pluginId} set apiKey <key>\` (or ${ENV_API_KEY} in the server's environment), then reload.`,
     );
   }
 
@@ -275,8 +288,13 @@ export default async function plugin(bb: BbPluginApi) {
    * backfilled.
    */
   const loadedAt = Date.now();
-  /** Per-thread debounce timers: the thread must stay quiet to be summarized. */
-  const debounces = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Aborts the summary the worker is running right now. A later turn boundary
+   * on the same thread trips it: the brief it was about to write describes a
+   * state the thread has already left, so it is dropped and the thread is
+   * summarized again from the newer transcript. See {@link supersede}.
+   */
+  let inFlightRun: AbortController | null = null;
   /** Threads waiting for the single worker, in arrival order. */
   const queue: string[] = [];
   /** Threads to summarize even when the activity cursor has not moved. */
@@ -293,7 +311,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Whether a summary for this thread is genuinely pending or running. */
   const isPending = (threadId: string) =>
-    debounces.has(threadId) || queue.includes(threadId) || inFlight === threadId;
+    queue.includes(threadId) || inFlight === threadId;
 
   const enqueue = (threadId: string) => {
     if (!queue.includes(threadId)) queue.push(threadId);
@@ -301,28 +319,20 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /**
-   * Debounce a thread. `thread.idle` fires on every turn boundary, so a thread
-   * in active back-and-forth would otherwise be re-summarized every turn; we
-   * want the brief written once the burst has actually stopped.
+   * Summarize a thread now, dropping any summary of it still in flight.
+   *
+   * There is no quiet period. `thread.idle` fires at every turn boundary and
+   * each one starts a summary at once, so the brief, ring and status follow
+   * the turn by the length of one summarizer call rather than by a timer. A
+   * thread in quick back-and-forth is protected the other way round: a turn
+   * that ends while its predecessor's summary is still running aborts that
+   * request — its result was going to be stale on arrival — and the newest
+   * transcript is summarized instead. The last turn boundary always wins, and
+   * the brief that lands is never older than the thread it describes.
    */
-  const scheduleSummary = (threadId: string, delayMs: number) => {
-    const existing = debounces.get(threadId);
-    if (existing !== undefined) clearTimeout(existing);
-    const timer = setTimeout(() => {
-      debounces.delete(threadId);
-      enqueue(threadId);
-    }, delayMs);
-    // Never hold the process open for a brief.
-    timer.unref?.();
-    debounces.set(threadId, timer);
-  };
-
-  const cancelSummary = (threadId: string) => {
-    const existing = debounces.get(threadId);
-    if (existing !== undefined) {
-      clearTimeout(existing);
-      debounces.delete(threadId);
-    }
+  const supersede = (threadId: string) => {
+    if (inFlight === threadId) inFlightRun?.abort();
+    enqueue(threadId);
   };
 
   async function drain() {
@@ -336,13 +346,22 @@ export default async function plugin(bb: BbPluginApi) {
         const force = forced.delete(threadId);
         const beforeFirstTurn = preTurn.delete(threadId);
         inFlight = threadId;
+        const run = new AbortController();
+        inFlightRun = run;
         try {
-          const changed = await summarizeThread(threadId, { force, beforeFirstTurn });
+          const changed = await summarizeThread(threadId, {
+            force,
+            beforeFirstTurn,
+            signal: run.signal,
+          });
           if (changed) {
             wrote = true;
             announce();
           }
         } catch (error) {
+          // Superseded by a later turn boundary, and already re-queued: not a
+          // failure, and not worth a line in the log.
+          if (run.signal.aborted) continue;
           bb.log.warn(
             `brief for ${threadId} failed: ${
               error instanceof Error ? error.message : String(error)
@@ -350,6 +369,7 @@ export default async function plugin(bb: BbPluginApi) {
           );
         } finally {
           inFlight = null;
+          inFlightRun = null;
           // The thread drops back to `absent` on failure, so the UI stops
           // saying "summarizing" and offers an explicit retry instead.
           announce();
@@ -365,20 +385,130 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------- summarizing
 
   const completionConfig = async (): Promise<CompletionConfig> => {
-    const values = await settings.get();
-    const apiKey = typeof values.apiKey === "string" ? values.apiKey.trim() : "";
-    if (apiKey === "") {
+    const config = resolveCompletion(await settings.get(), env);
+    if (config === null) {
       throw Object.assign(new Error("no API key configured"), {
         name: "NeedsConfigurationError",
       });
     }
-    return {
-      baseUrl: values.baseUrl,
-      apiKey,
-      model: values.model,
-      jsonMode: values.jsonMode,
-    };
+    return config;
   };
+
+  // ------------------------------------------------------------- opt-outs
+
+  /**
+   * Thread id → the plugin that owns it, memoized across passes. A thread's
+   * origin plugin and its lifecycle-owner chain never change, and a hidden
+   * steward is absent from some batches, so caching saves a read per worker.
+   */
+  const pluginOwner = new Map<string, string | null>();
+
+  /**
+   * Whether each thread is off, read from the namespace of the plugin that
+   * owns it: its own origin plugin, or the nearest ancestor's through the
+   * lifecycle-owner chain when it has none (a worker or reviewer spawned by
+   * the CLI). See `optout.ts`.
+   *
+   * A thread no plugin owns costs nothing. The rest are batched per plugin,
+   * so a pass over the whole sidebar is one request per plugin rather than one
+   * per thread. null means that namespace could not be read, and each caller
+   * decides what not knowing means for it: off for this pass, keeping the
+   * brief and skipping the thread rather than reading the failure as "on".
+   */
+  async function briefsOffFor(
+    threads: readonly {
+      id: string;
+      originPluginId: string | null;
+      lifecycleOwnerThreadId?: string | null;
+    }[],
+  ): Promise<Map<string, boolean | null>> {
+    const result = new Map<string, boolean | null>();
+    const byPlugin = new Map<string, string[]>();
+    // A thread's owning plugin never changes, so the answer is kept across
+    // passes: a hidden steward is absent from some batches, and its workers
+    // would otherwise be re-read every reconcile.
+    for (const thread of threads) {
+      if (thread.originPluginId !== null) pluginOwner.set(thread.id, thread.originPluginId);
+    }
+    /**
+     * The plugin that owns a thread: its origin plugin, or the nearest
+     * ancestor's through the lifecycle-owner chain. A thread spawned by the
+     * CLI has no origin plugin of its own, so this is how its steward's
+     * namespace — where the stewards plugin tags its workers and reviewers —
+     * is found. undefined when a read failed: the caller treats the thread as
+     * unknown for this pass rather than opted in, and nothing is cached.
+     */
+    const ownerPlugin = async (threadId: string, depth = 0): Promise<string | null | undefined> => {
+      const known = pluginOwner.get(threadId);
+      if (known !== undefined) return known;
+      if (depth > 10) return null;
+      let info: { originPluginId?: string | null; lifecycleOwnerThreadId?: string | null };
+      try {
+        info = (await bb.sdk.threads.get({ threadId })) as {
+          originPluginId?: string | null;
+          lifecycleOwnerThreadId?: string | null;
+        };
+      } catch (error) {
+        bb.log.warn(
+          `could not read thread ${threadId} to find its owning plugin: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return undefined;
+      }
+      let found: string | null;
+      if (info.originPluginId != null) found = info.originPluginId;
+      else if (info.lifecycleOwnerThreadId == null) found = null;
+      else {
+        const inherited = await ownerPlugin(info.lifecycleOwnerThreadId, depth + 1);
+        if (inherited === undefined) return undefined;
+        found = inherited;
+      }
+      pluginOwner.set(threadId, found);
+      return found;
+    };
+    for (const thread of threads) {
+      let pluginId: string | null | undefined;
+      if (thread.originPluginId !== null) pluginId = thread.originPluginId;
+      else if (thread.lifecycleOwnerThreadId == null) pluginId = null;
+      else pluginId = await ownerPlugin(thread.lifecycleOwnerThreadId);
+      if (pluginId === undefined) {
+        // A read failed: unknown, which every caller treats as off for this
+        // pass rather than opted in.
+        result.set(thread.id, null);
+        continue;
+      }
+      if (pluginId === null) {
+        result.set(thread.id, false);
+        continue;
+      }
+      const ids = byPlugin.get(pluginId) ?? [];
+      ids.push(thread.id);
+      byPlugin.set(pluginId, ids);
+    }
+    for (const [pluginId, ids] of byPlugin) {
+      for (let start = 0; start < ids.length; start += METADATA_PAGE_SIZE) {
+        const chunk = ids.slice(start, start + METADATA_PAGE_SIZE);
+        try {
+          const { threads: rows } = await bb.sdk.threads.experimental_listPluginMetadata({
+            pluginId,
+            threadIds: chunk,
+          });
+          // A thread with nothing in the namespace has no row at all.
+          const metadata = new Map(rows.map((row) => [row.threadId, row.metadata]));
+          for (const id of chunk) result.set(id, readOptOut(metadata.get(id)));
+        } catch (error) {
+          bb.log.warn(
+            `could not read ${pluginId}'s metadata on ${chunk.length} thread(s): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          for (const id of chunk) result.set(id, null);
+        }
+      }
+    }
+    return result;
+  }
 
   /**
    * Put the brief's title on the thread, and report the title we are now on
@@ -459,6 +589,28 @@ export default async function plugin(bb: BbPluginApi) {
     return { value: kept, seq: anchorSeq ?? cursor };
   }
 
+  /** How many user messages an outline holds: the cursor a block note sits on. */
+  const countUserMessages = (items: readonly { role: string }[]): number =>
+    items.filter((item) => item.role === "user").length;
+
+  /**
+   * A block reason as stored, placed at the thread's current user-message
+   * count. Null for a blank, which is how both callers spell "clear".
+   */
+  async function recordBlockReason(
+    threadId: string,
+    text: string | null | undefined,
+  ): Promise<StoredBlockReason | null> {
+    const trimmed = text?.trim() ?? "";
+    if (trimmed === "") return null;
+    const outline = await bb.sdk.threads.conversationOutline({ threadId });
+    return {
+      text: trimmed,
+      recordedAt: Date.now(),
+      userMessagesSeen: countUserMessages(outline.items),
+    };
+  }
+
   /**
    * Returns true when a brief was written (so callers know to announce).
    *
@@ -478,7 +630,11 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function summarizeThread(
     threadId: string,
-    { force, beforeFirstTurn }: { force: boolean; beforeFirstTurn: boolean },
+    {
+      force,
+      beforeFirstTurn,
+      signal: superseded,
+    }: { force: boolean; beforeFirstTurn: boolean; signal: AbortSignal },
   ): Promise<boolean> {
     const thread = await bb.sdk.threads
       .get({ threadId })
@@ -489,6 +645,17 @@ export default async function plugin(bb: BbPluginApi) {
     }
     // Hidden threads are plugin workers, not work the user is tracking.
     if (thread.visibility === "hidden" || thread.deletedAt !== null) {
+      await deleteBrief(threadId);
+      return true;
+    }
+    // A thread its plugin keeps out of briefs entirely: drop any stored brief
+    // and stop. Everything else — the panel, the board, the ring, the sections
+    // and the archive sweep — skips it because there is no brief. null is a
+    // namespace we could not read: off for this pass, so the thread is skipped
+    // and its brief kept rather than deleted on a read failure.
+    const off = (await briefsOffFor([thread])).get(thread.id) ?? null;
+    if (off === null) return false;
+    if (off) {
       await deleteBrief(threadId);
       return true;
     }
@@ -511,8 +678,9 @@ export default async function plugin(bb: BbPluginApi) {
 
     // A stage override in force is passed to the model as fixed; one the thread
     // has moved past is dropped here, which is what "sticks until real thread
-    // activity" means. The status override needs no such handoff — the model is
-    // never asked for a status — but expires on the same terms.
+    // activity" means. The status override expires on the same terms, but is not
+    // passed as fixed: the model still judges the status from the transcript,
+    // and only the refresher prose is told about the pin.
     const stagePin = carryOverride(
       stored?.stageOverride,
       stored?.stageOverrideSeq,
@@ -524,6 +692,7 @@ export default async function plugin(bb: BbPluginApi) {
       outline.maxSeq,
     );
 
+    const blockReason = stored?.blockReason ?? null;
     const transcript = renderTranscript({
       title: thread.title ?? thread.titleFallback,
       outline: outline.items.map(
@@ -531,10 +700,11 @@ export default async function plugin(bb: BbPluginApi) {
       ),
       lastAssistantText: output,
       previousBrief: stored?.fields ?? null,
+      blockReason,
     });
 
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const signal = AbortSignal.any([timeout, lifetime.signal]);
+    const signal = AbortSignal.any([timeout, lifetime.signal, superseded]);
     const reply = await requestSummary(
       config,
       buildUserPrompt({
@@ -544,10 +714,32 @@ export default async function plugin(bb: BbPluginApi) {
         // fields keep describing the work, and only the paragraph that tells
         // the user what to do is asked to agree with what they pinned.
         pinnedStatus: statusPin.value,
+        hasBlockReason: blockReason !== null,
       }),
       signal,
     );
+    // The request can return in the same tick the abort lands. A superseded
+    // summary writes nothing: a newer one is already queued behind it.
+    if (superseded.aborted) return false;
     const summary = parseSummary(reply, stagePin.value);
+
+    // The reason outlives the pin, but not the user's own say-so: a summary
+    // that follows a *new user message* and still reads the thread as not
+    // blocked means the model read that message as resolving it, and the
+    // reason is released. A summary over the same messages — a forced
+    // re-summary, an agent turn finishing — keeps it whatever the model said,
+    // because nothing the user did has changed, and a small model's one bad
+    // reading must not quietly un-park a thread.
+    const userMessages = countUserMessages(outline.items);
+    const keepReason =
+      blockReason !== null &&
+      !(
+        userMessages > blockReason.userMessagesSeen &&
+        summary.status !== "waiting-on-other"
+      );
+    if (blockReason !== null && !keepReason) {
+      bb.log.info(`block reason on ${threadId} released: the thread moved on`);
+    }
 
     // A thread bb has already named waits for its first turn to end before this
     // plugin renames it; one showing nothing but its own opening prompt does
@@ -580,7 +772,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? null
         : {
             ...summary.refresher,
-            writtenForStatus: statusPin.value ?? deriveStatus(fields),
+            writtenForStatus: statusPin.value ?? summary.status,
           };
 
     await writeBrief({
@@ -588,10 +780,12 @@ export default async function plugin(bb: BbPluginApi) {
       threadId,
       fields,
       modelStage: summary.stage,
+      modelStatus: summary.status,
       stageOverride: stagePin.value,
       stageOverrideSeq: stagePin.seq,
       statusOverride: statusPin.value,
       statusOverrideSeq: statusPin.seq,
+      blockReason: keepReason ? blockReason : null,
       endedWithQuestion: endsWithQuestion(output),
       appliedTitle,
       refresher,
@@ -603,11 +797,28 @@ export default async function plugin(bb: BbPluginApi) {
 
   // -------------------------------------------------------------- reading
 
+  /**
+   * One thread's off switch, fetched fresh. Used by `briefState` to tell a
+   * thread its plugin keeps out of briefs from one that simply has none yet.
+   * null means the namespace could not be read, which reads as on here: the
+   * panel should not claim an opt-out it could not confirm.
+   */
+  const briefOffFor = async (threadId: string): Promise<boolean | null> => {
+    const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    if (thread === null) return null;
+    return (await briefsOffFor([thread])).get(thread.id) ?? null;
+  };
+
   const briefState = async (threadId: string): Promise<BriefState> => {
     const stored = await readBrief(threadId);
     if (stored === null) {
-      const values = await settings.get();
-      if (typeof values.apiKey !== "string" || values.apiKey.trim() === "") {
+      // A thread its plugin keeps out of briefs has no brief and never will,
+      // so say that rather than offering to summarize it. Only asked when there
+      // is no brief: a stale one is removed by the next summary, and checking
+      // the namespace on every panel read of every thread would cost a
+      // `threads.get` for nothing.
+      if ((await briefOffFor(threadId)) === true) return { state: "off" };
+      if (!hasApiKey(await settings.get())) {
         return {
           state: "unconfigured",
           message: "Add an API key in this plugin's settings to generate briefs.",
@@ -710,9 +921,7 @@ export default async function plugin(bb: BbPluginApi) {
       // No live thread lookups here: the client folds the running/queued
       // override and the staleness in per row, off the sidebar view it
       // already has.
-      signals: await mapStoredBriefs((stored) =>
-        rowSignalFor(resolveBrief(stored)),
-      ),
+      signals: await mapStoredBriefs(rowSignalFor),
       ...(await ringThresholds()),
     }),
 
@@ -736,15 +945,29 @@ export default async function plugin(bb: BbPluginApi) {
       return briefState(threadId);
     },
 
-    setStatusOverride: async ({ threadId, status }) => {
+    setStatusOverride: async ({ threadId, status, reason }) => {
       const stored = await readBrief(threadId);
       if (stored === null) return briefState(threadId);
+      // The reason rides with a Blocked pin and is cleared by any other pin:
+      // pinning a thread done or waiting-on-you is the user saying the block
+      // is over, and a note that kept telling the summarizer otherwise would
+      // argue with them on the next summary. Clearing the pin (null) leaves
+      // the note alone — the pin retiring is not a change of mind.
+      const blockReason =
+        status === "waiting-on-other"
+          ? reason === undefined
+            ? (stored.blockReason ?? null)
+            : await recordBlockReason(threadId, reason)
+          : status === null
+            ? (stored.blockReason ?? null)
+            : null;
       await writeBrief({
         ...stored,
         statusOverride: status,
         // Anchored to the activity the user was looking at, so the next real
         // turn retires it — the same contract as the stage override.
         statusOverrideSeq: status === null ? null : stored.lastActivitySeen,
+        blockReason,
       });
       announce();
       // The status is what the sidebar sections are keyed on, so a pin has to
@@ -755,8 +978,22 @@ export default async function plugin(bb: BbPluginApi) {
       return briefState(threadId);
     },
 
+    setBlockReason: async ({ threadId, text }) => {
+      const stored = await readBrief(threadId);
+      if (stored === null) return briefState(threadId);
+      await writeBrief({
+        ...stored,
+        blockReason: await recordBlockReason(threadId, text),
+      });
+      announce();
+      // The note changes what the summarizer writes for `blockedOn` and
+      // `status`, and the sections key on the status, so it is re-read now
+      // rather than on the next turn. Same path as a pin.
+      rewriteRefresher(threadId);
+      return briefState(threadId);
+    },
+
     refresh: ({ threadId }) => {
-      cancelSummary(threadId);
       // An explicit Re-summarize is a full brief, title included, even if a
       // pre-turn one was already queued for this thread.
       preTurn.delete(threadId);
@@ -799,7 +1036,6 @@ export default async function plugin(bb: BbPluginApi) {
    * `summarizeThread` would otherwise decide there is nothing new to say.
    */
   const rewriteRefresher = (threadId: string) => {
-    cancelSummary(threadId);
     forced.add(threadId);
     enqueue(threadId);
   };
@@ -874,8 +1110,13 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /** Visible, live threads, in pages, capped. */
-  const listGroupableThreads = async (): Promise<SectionedThread[]> => {
-    const threads: SectionedThread[] = [];
+  const listGroupableThreads = async (): Promise<
+    (SectionedThread & { originPluginId: string | null; lifecycleOwnerThreadId: string | null })[]
+  > => {
+    const threads: (SectionedThread & {
+      originPluginId: string | null;
+      lifecycleOwnerThreadId: string | null;
+    })[] = [];
     for (let offset = 0; offset < SECTION_THREAD_LIMIT; offset += SECTION_PAGE_SIZE) {
       const page = await bb.sdk.threads.list({
         limit: SECTION_PAGE_SIZE,
@@ -886,7 +1127,12 @@ export default async function plugin(bb: BbPluginApi) {
         // Archived threads are out regardless of status: the grouping is for
         // work still in front of you.
         if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
-        threads.push({ id: thread.id, sectionId: thread.sectionId ?? null });
+        threads.push({
+          id: thread.id,
+          sectionId: thread.sectionId ?? null,
+          originPluginId: thread.originPluginId,
+          lifecycleOwnerThreadId: thread.lifecycleOwnerThreadId,
+        });
       }
       if (page.length < SECTION_PAGE_SIZE) break;
     }
@@ -922,7 +1168,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const id of ours) {
       await bb.sdk.threadSections.delete({ id });
     }
-    for (const key of [...Object.keys(GROUPED_PREFS), "manualSectionOrder"]) {
+    for (const key of RESTORED_PREFS) {
       const previous = state.previous?.[key];
       // Reset rather than guess when we never saw a prior value: thread-list
       // owns its own defaults and they can change without us.
@@ -956,17 +1202,26 @@ export default async function plugin(bb: BbPluginApi) {
 
     const sections = await ensureSections();
     const sectionIds = new Map(sections.map(({ name, id }) => [name, id]));
+    const prefs = await readThreadListPrefs();
+    // null when the stored order already holds our sections in some order of
+    // its own: a hand-drag in the sidebar outranks our top-to-bottom default.
+    const order = mergeSectionOrder(
+      prefs[ORDER_PREF],
+      sections.map(({ id }) => id),
+    );
     const desired: Record<string, JsonValue> = {
       ...GROUPED_PREFS,
-      manualSectionOrder: manualSectionOrder(sections.map(({ id }) => id)),
+      ...(order === null ? {} : { [ORDER_PREF]: order }),
     };
 
-    const prefs = await readThreadListPrefs();
     if (!state.applied) {
       await bb.storage.kv.set(SIDEBAR_STATE_KEY, {
         applied: true,
+        // The order pref is snapshotted whether or not we are writing it this
+        // pass: teardown restores every key we own, and on a first apply that
+        // leaves the order alone we still have to remember what it was.
         previous: Object.fromEntries(
-          Object.keys(desired).map((key) => [key, prefs[key] ?? null]),
+          RESTORED_PREFS.map((key) => [key, prefs[key] ?? null]),
         ),
       });
     }
@@ -978,9 +1233,19 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
+    const threads = await listGroupableThreads();
+    const briefsOff = await briefsOffFor(threads);
+    const targets = await sectionIdByThreadId(sectionIds);
+    // A thread its plugin keeps out of the grouping is planned as briefless,
+    // which takes it out of our sections and back to bb's Threads group. One
+    // whose plugin we could not read is left exactly where it is: a failed
+    // read should not shuffle the sidebar for one pass.
+    for (const [threadId, off] of briefsOff) {
+      if (off) targets.delete(threadId);
+    }
     const moves = planAssignments({
-      threads: await listGroupableThreads(),
-      sectionIdByThreadId: await sectionIdByThreadId(sectionIds),
+      threads: threads.filter((thread) => briefsOff.get(thread.id) !== null),
+      sectionIdByThreadId: targets,
       ownedSectionIds: new Set(sectionIds.values()),
     });
     for (const move of moves) {
@@ -1055,42 +1320,29 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.idle", ({ thread }) => {
     // A turn boundary has been reached, so whatever we write now is a real
-    // brief and may name the thread.
+    // brief and may name the thread — including a pre-turn brief still in
+    // flight, which `supersede` aborts and this re-queues as a post-turn one.
     preTurn.delete(thread.id);
-    void (async () => {
-      const values = await settings.get();
-      // A thread with no brief yet skips the quiet period: nothing is being
-      // protected from re-summarizing, and the empty state is what makes the
-      // plugin feel unresponsive. See {@link FIRST_BRIEF_DELAY_MS}.
-      const quietMs = Math.max(1, values.quietSeconds) * 1000;
-      const first = (await readBrief(thread.id)) === null;
-      scheduleSummary(thread.id, first ? firstBriefDelayMs(quietMs) : quietMs);
-    })();
+    supersede(thread.id);
   });
 
   bb.events.on("thread.active", ({ thread }) => {
-    // A summary already pending on this thread was scheduled by a `thread.idle`,
-    // so a turn has ended and its brief is entitled to name the thread. Read
-    // before the cancel below clears it.
-    const afterATurn = isPending(thread.id);
-    // A thread that started running again is not quiet; let the next idle
-    // restart its debounce rather than summarizing mid-turn.
-    cancelSummary(thread.id);
+    // A summary already running or queued was started by a `thread.idle`. It
+    // describes a real turn boundary, so it is left to finish: the turn that
+    // just started will supersede it when it ends.
+    if (isPending(thread.id)) return;
     if (thread.visibility === "hidden") return;
     void (async () => {
-      const values = await settings.get();
-      if (typeof values.apiKey !== "string" || values.apiKey.trim() === "") return;
-      // Except on a thread with no brief at all: the opening prompt is enough
-      // for a goal, a discovery-stage ring and a sidebar section, and waiting
-      // for the turn to end means a long first turn spends its whole length
-      // looking like a thread the plugin has never heard of. Every field is
-      // corrected by the summary that follows the turn.
+      if (!hasApiKey(await settings.get())) return;
+      // A thread that already has a brief is not summarized mid-turn. One with
+      // no brief at all is: the opening prompt is enough for a goal, a
+      // discovery-stage ring and a sidebar section, and waiting for the turn
+      // to end means a long first turn spends its whole length looking like a
+      // thread the plugin has never heard of. Every field is corrected by the
+      // summary that follows the turn.
       if ((await readBrief(thread.id)) !== null) return;
-      if (!afterATurn) preTurn.add(thread.id);
-      scheduleSummary(
-        thread.id,
-        firstBriefDelayMs(Math.max(1, values.quietSeconds) * 1000),
-      );
+      preTurn.add(thread.id);
+      enqueue(thread.id);
     })();
   });
 
@@ -1101,7 +1353,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.deleted", ({ thread }) => {
-    cancelSummary(thread.id);
+    if (inFlight === thread.id) inFlightRun?.abort();
     preTurn.delete(thread.id);
     void deleteBrief(thread.id).then(announce);
   });
@@ -1115,18 +1367,16 @@ export default async function plugin(bb: BbPluginApi) {
    * threads that actually moved.
    */
   bb.background.schedule("brief-sweep", SWEEP_CRON, async () => {
-    const values = await settings.get();
-    if (typeof values.apiKey !== "string" || values.apiKey.trim() === "") return;
-
     const threads = await bb.sdk.threads.list({ limit: SWEEP_LIMIT });
-    const quietBefore = Date.now() - Math.max(1, values.quietSeconds) * 1000;
+
+    const values = await settings.get();
+    if (!hasApiKey(values)) return;
 
     for (const thread of threads) {
       if (thread.visibility === "hidden") continue;
       if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
       if (thread.status === "active" || thread.status === "starting") continue;
-      if (thread.updatedAt > quietBefore) continue;
-      if (debounces.has(thread.id) || queue.includes(thread.id)) continue;
+      if (isPending(thread.id)) continue;
 
       const stored = await readBrief(thread.id);
       if (stored === null) {
@@ -1170,6 +1420,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (archiveAfterMs <= 0) return;
 
     const threads = await bb.sdk.threads.list({ limit: ARCHIVE_LIMIT });
+    const briefsOff = await briefsOffFor(
+      threads.filter((thread) => thread.archivedAt === null && thread.deletedAt === null),
+    );
     const candidates: ArchiveCandidate[] = threads.map((thread) => ({
       id: thread.id,
       latestAttentionAt: thread.latestAttentionAt,
@@ -1178,6 +1431,8 @@ export default async function plugin(bb: BbPluginApi) {
       deletedAt: thread.deletedAt,
       visibility: thread.visibility,
       status: thread.status,
+      // Not knowing is a reason to keep it: a failed read is off for this pass.
+      optedOut: briefsOff.get(thread.id) ?? true,
     }));
 
     // Briefs read per candidate rather than by scanning the kv prefix: the
@@ -1239,8 +1494,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.onDispose(() => {
     lifetime.abort();
-    for (const timer of debounces.values()) clearTimeout(timer);
-    debounces.clear();
     if (sectionTimer !== null) clearTimeout(sectionTimer);
     queue.length = 0;
     forced.clear();
@@ -1248,6 +1501,4 @@ export default async function plugin(bb: BbPluginApi) {
   });
 }
 
-// Re-exported for tests that exercise the derivation without a server.
-export { deriveStatus };
 export type { BriefStage };

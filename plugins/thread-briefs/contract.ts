@@ -56,6 +56,50 @@ export type NextStepActor = z.infer<typeof nextStepActorSchema>;
 export const MAX_TITLE_LENGTH = 48;
 
 /**
+ * How long a block reason may run.
+ *
+ * It is a line the summarizer is handed every time, not a field it writes, and
+ * it is shown back to the user as their own note. A paragraph would be a second
+ * brief inside the brief; a line is "waiting on the design review" or "not
+ * before the release", which is all the summary needs to carry it forward.
+ */
+export const MAX_BLOCK_REASON_LENGTH = 240;
+
+/**
+ * A reason the user gave for a thread being blocked, as the UI sees it.
+ *
+ * Not a field of the brief and never written by the model. It is handed to the
+ * summarizer as a fact it cannot read from the transcript — the way a stage
+ * pin is handed as fixed — and the model writes `blockedOn` and `status` from
+ * it, in its own words. That is why the UI shows it as *your note* and not in
+ * the Blocked-on slot: the brief says what the model made of it.
+ */
+export const blockReasonSchema = z
+  .object({
+    text: z.string().min(1).max(MAX_BLOCK_REASON_LENGTH),
+    recordedAt: z.number(),
+  })
+  .strict();
+export type BlockReason = z.infer<typeof blockReasonSchema>;
+
+/**
+ * The stored form of {@link blockReasonSchema}: the note plus where in the
+ * conversation it was made.
+ *
+ * `userMessagesSeen` is the count of user messages in the thread when the
+ * reason was recorded. The outline carries no per-item sequence, so a count is
+ * the only cursor that can place the note *between* messages — which the
+ * summarizer needs (the transcript marks the spot) and the release rule needs
+ * (a summary that follows a new user message and reads the thread as not
+ * blocked retires the reason; one that merely re-reads the same messages does
+ * not).
+ */
+export const storedBlockReasonSchema = blockReasonSchema
+  .extend({ userMessagesSeen: z.number().int().nonnegative() })
+  .strict();
+export type StoredBlockReason = z.infer<typeof storedBlockReasonSchema>;
+
+/**
  * The fields the summarizer is asked to return, exactly as it returns them.
  *
  * The five prose fields are strings, where an empty string means "nothing to
@@ -135,10 +179,11 @@ export const storedRefresherSchema = refresherProseSchema
   .strict();
 export type StoredRefresher = z.infer<typeof storedRefresherSchema>;
 
-/** What the summarizer returns: the five fields, the stage, the refresher. */
+/** What the summarizer returns: the five fields, the stage, the status, the refresher. */
 export const summaryResultSchema = briefFieldsSchema
   .extend({
     stage: briefStageSchema,
+    status: storedBriefStatusSchema,
     /**
      * Null when the model returned nothing usable for either variant. A brief
      * with no refresher is a brief that simply never shows one — the same
@@ -153,10 +198,10 @@ export type SummaryResult = z.infer<typeof summaryResultSchema>;
  * The persisted row, one per thread, under kv key `brief:<threadId>`.
  *
  * `stage` and `status` are deliberately absent: `stage` is
- * `stageOverride ?? modelStage` and `status` is `statusOverride` falling back to
- * a derivation over `nextStep`, `blockedOn` and `nextStepActor`, all resolved on
- * read so none goes stale between summaries. The live `working` override is applied later still, per row
- * on the client.
+ * `stageOverride ?? modelStage` and `status` is `statusOverride ?? modelStatus`,
+ * both resolved on read so a pin that has expired stops applying without a
+ * write. The live `working` override is applied later still, per row on the
+ * client.
  *
  * New fields must be optional and `version` must stay at 1. `readBrief` deletes
  * any row that fails this parse, and briefs are never backfilled, so a required
@@ -170,6 +215,16 @@ export const storedBriefSchema = z
     fields: briefFieldsSchema,
     /** The stage the summarizer judged from the transcript. */
     modelStage: briefStageSchema,
+    /**
+     * The status the summarizer judged from the transcript.
+     *
+     * Absent on a brief written before the summarizer was asked for a status.
+     * Those keep the old reading, derived from `nextStep` and `blockedOn` (see
+     * `legacyStatus`), until their thread is next summarized; they are not
+     * backfilled, because re-summarizing every idle thread at once would put
+     * every one that now reads done straight onto the archive clock.
+     */
+    modelStatus: storedBriefStatusSchema.optional(),
     /** A manual stage that wins over `modelStage` until real new activity. */
     stageOverride: briefStageSchema.nullable(),
     /**
@@ -199,6 +254,20 @@ export const storedBriefSchema = z
      * thread's cursor moves past it.
      */
     statusOverrideSeq: z.number().nullable().optional(),
+    /**
+     * Why the user says this thread is blocked, if they said.
+     *
+     * Outlives the status pin beside it. The pin is a hard override and retires
+     * on the next turn like every pin; the reason is *guidance*, fed to the
+     * summarizer on every summary until it is cleared — by hand, or by a
+     * summary that follows a new user message and still reads the thread as
+     * not blocked (see `summarizeThread`). That split is what lets "park this
+     * thread" survive the running turn finishing: the pin may go, the reason
+     * stays, and the next summary reads blocked from it again.
+     *
+     * Optional and nullable, like every field added after version 1.
+     */
+    blockReason: storedBlockReasonSchema.nullable().optional(),
     /**
      * Whether the thread's last assistant turn read as a question.
      *
@@ -254,6 +323,14 @@ export const storedBriefSchema = z
      * get from their sequence anchors.
      */
     autoArchivedAt: z.number().nullable().optional(),
+    /**
+     * The per-key `optOut` that used to sit here is gone with the single
+     * switch (BB-101). A row written before this carries it, and `.strict()`
+     * makes that row fail to parse, so `readBrief` drops it. That is the
+     * intended one-time cleanup: the only rows that ever carried `optOut` were
+     * the threads whose plugin had opted them out of something, and those are
+     * exactly the threads this change turns off entirely.
+     */
     lastSummarizedAt: z.number(),
     /** The thread's `conversationOutline().maxSeq` at summarize time. */
     lastActivitySeen: z.number(),
@@ -270,6 +347,8 @@ export const resolvedBriefSchema = briefFieldsSchema
     stageOverride: briefStageSchema.nullable(),
     /** The manual status, only while it is still in force. */
     statusOverride: storedBriefStatusSchema.nullable(),
+    /** The user's own note on why the thread is blocked, while one is held. */
+    blockReason: blockReasonSchema.nullable(),
     lastSummarizedAt: z.number(),
   })
   .strict();
@@ -278,16 +357,19 @@ export type ResolvedBrief = z.infer<typeof resolvedBriefSchema>;
 /**
  * What the frontend sees for one thread.
  *
- * `summarizing` means work is genuinely pending — debounced, queued, or in
- * flight. `absent` means there is no brief and none is coming, which is the
- * normal state for a thread that was already dormant when the plugin arrived:
- * briefs are not backfilled, so the UI offers to make one on demand rather
- * than claiming a summary is on its way.
+ * `summarizing` means work is genuinely pending — queued or in flight. `absent`
+ * means there is no brief and none is coming, which is the normal state for a
+ * thread that was already dormant when the plugin arrived: briefs are not
+ * backfilled, so the UI offers to make one on demand rather than claiming a
+ * summary is on its way. `off` means the thread's owning plugin asked for
+ * thread-briefs to leave it alone entirely (see `optout.ts`): there is no brief
+ * and there never will be, so the UI explains rather than offering a summary.
  */
 export const briefStateSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("ready"), brief: resolvedBriefSchema }).strict(),
   z.object({ state: z.literal("summarizing") }).strict(),
   z.object({ state: z.literal("absent") }).strict(),
+  z.object({ state: z.literal("off") }).strict(),
   z.object({ state: z.literal("unconfigured"), message: z.string() }).strict(),
   z.object({ state: z.literal("error"), message: z.string() }).strict(),
 ]);
@@ -354,10 +436,13 @@ export const briefCardSchema = z
     status: storedBriefStatusSchema,
     stageOverride: briefStageSchema.nullable(),
     statusOverride: storedBriefStatusSchema.nullable(),
+    blockReason: blockReasonSchema.nullable(),
     nextStep: z.string(),
     nextStepActor: nextStepActorSchema.optional(),
     blockedOn: z.string(),
     lastSummarizedAt: z.number(),
+    /** False when the thread's plugin exempted it from auto-archiving. */
+    autoArchive: z.boolean(),
   })
   .strict();
 export type BriefCard = z.infer<typeof briefCardSchema>;
@@ -374,6 +459,31 @@ export const rowSignalSchema = z
      * thing that names it.
      */
     label: z.string(),
+    /**
+     * Whether a stage or status pin is in force on this thread.
+     *
+     * The one bit on the row the model did not decide. It draws as the centre
+     * dot, and it is true exactly while a human is overriding the summarizer —
+     * once a pin retires and the model agrees, there is nothing to mark.
+     */
+    pinned: z.boolean(),
+    /**
+     * The pins themselves, for the Stage and Status thread actions: picking the
+     * value already pinned clears it, as in the panel, and the menu can only
+     * know which one that is from here. `pinned` is these two, or'd.
+     */
+    stageOverride: briefStageSchema.nullable(),
+    statusOverride: storedBriefStatusSchema.nullable(),
+    /**
+     * False when the thread's plugin exempted it from auto-archiving, so a
+     * grey ring does not promise an archiving the sweep will never do.
+     */
+    autoArchive: z.boolean(),
+    /**
+     * False when the thread's plugin asked for no ring on its row. The signal
+     * is still sent: the Stage and Status thread actions read it.
+     */
+    ring: z.boolean(),
   })
   .strict();
 export type RowSignal = z.infer<typeof rowSignalSchema>;
@@ -449,11 +559,34 @@ export const rpcContract = defineRpcContract({
       .object({
         threadId: z.string().min(1),
         status: storedBriefStatusSchema.nullable(),
+        /**
+         * A reason, when pinning `waiting-on-other`: "park this, because".
+         * Written in the same call so the gesture is one write. Ignored for
+         * any other status, which clears the reason instead — pinning a
+         * thread done or waiting-on-you is the user saying the block is over.
+         */
+        reason: z.string().max(MAX_BLOCK_REASON_LENGTH).optional(),
       })
       .strict(),
     output: briefStateSchema,
   },
-  /** Queue an immediate re-summary, bypassing the quiet-period debounce. */
+  /**
+   * Set, replace or clear the block reason on its own.
+   *
+   * Separate from the pin because the two have different lifetimes: editing
+   * the note on a thread whose pin has already retired must not re-pin it, and
+   * clearing the note must not clear a pin that still holds.
+   */
+  setBlockReason: {
+    input: z
+      .object({
+        threadId: z.string().min(1),
+        text: z.string().max(MAX_BLOCK_REASON_LENGTH).nullable(),
+      })
+      .strict(),
+    output: briefStateSchema,
+  },
+  /** Queue a re-summary even if the thread has not moved since the last one. */
   refresh: {
     input: z.object({ threadId: z.string().min(1) }).strict(),
     output: z.object({ queued: z.boolean() }).strict(),

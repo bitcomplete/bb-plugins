@@ -5,6 +5,19 @@
   "plugins": [
     { "name": "workstreams", "source": "./plugins/workstreams" },
     { "name": "kubernetes-provider", "source": "./plugins/kubernetes-provider" },
+    { "name": "devbox-provider", "source": "./plugins/devbox-provider" },
+    { "name": "diff-explorer", "source": "./plugins/diff-explorer" },
+    { "name": "html-preview", "source": "./plugins/html-preview" },
+    { "name": "image-copy", "source": "./plugins/image-copy" },
+    { "name": "repo-dashboard", "source": "./plugins/repo-dashboard" },
+    { "name": "pr-inbox", "source": "./plugins/pr-inbox" },
+    { "name": "thread-briefs", "source": "./plugins/thread-briefs" },
+    { "name": "multi-repo", "source": "./plugins/multi-repo" },
+    { "name": "team-setup", "source": "./plugins/team-setup" },
+    { "name": "linear", "source": "./plugins/linear" },
+    { "name": "github-watcher", "source": "./plugins/github-watcher" },
+    { "name": "stewards", "source": "./plugins/stewards" },
+    { "name": "slack", "source": "./plugins/slack" },
     { "name": "review-watch", "source": "./plugins/review-watch" }
   ]
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   manualSectionOrder,
+  mergeSectionOrder,
   planAssignments,
   planSections,
   sectionNameForStatus,
@@ -90,6 +91,55 @@ describe("the section table", () => {
       "section:c",
       "threads",
     ]);
+  });
+});
+
+describe("mergeSectionOrder", () => {
+  const canonical = ["pinned", "section:a", "section:b", "section:c", "threads"];
+
+  it("writes the canonical order when the sidebar has none of its own", () => {
+    expect(mergeSectionOrder(undefined, ["a", "b", "c"])).toEqual(canonical);
+    expect(mergeSectionOrder(["pinned", "sections", "threads"], ["a", "b", "c"])).toEqual(
+      canonical,
+    );
+  });
+
+  it("leaves a hand-reordered sidebar alone", () => {
+    // The whole point: a reconcile runs on every brief write, so an order that
+    // merely differs from ours is a drag we must not undo.
+    expect(
+      mergeSectionOrder(
+        ["threads", "pinned", "section:c", "section:a", "section:b"],
+        ["a", "b", "c"],
+      ),
+    ).toBeNull();
+    expect(mergeSectionOrder(canonical, ["a", "b", "c"])).toBeNull();
+  });
+
+  it("keeps the user's order when a new section has to be slotted in", () => {
+    expect(
+      mergeSectionOrder(["threads", "pinned", "section:c", "section:a"], ["a", "b", "c"]),
+    ).toEqual(["threads", "pinned", "section:c", "section:a", "section:b"]);
+  });
+
+  it("slots a new section beside its siblings, not below bb's Threads group", () => {
+    expect(mergeSectionOrder(["pinned", "section:b", "threads"], ["a", "b", "c"])).toEqual(
+      ["pinned", "section:a", "section:b", "section:c", "threads"],
+    );
+  });
+
+  it("drops an entry we no longer own and a duplicate", () => {
+    expect(
+      mergeSectionOrder(
+        ["pinned", "section:gone", "section:c", "section:c", "threads"],
+        ["a", "b", "c"],
+      ),
+    ).toEqual(["pinned", "section:a", "section:b", "section:c", "threads"]);
+  });
+
+  it("writes the canonical order when the stored value is not a string list", () => {
+    expect(mergeSectionOrder(["pinned", 3], ["a", "b", "c"])).toEqual(canonical);
+    expect(mergeSectionOrder("pinned", ["a", "b", "c"])).toEqual(canonical);
   });
 });
 

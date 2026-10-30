@@ -10,7 +10,6 @@ import {
   routeTeams,
   ticketPrefix,
 } from "./linear.js";
-import { AGENT_FETCH_MAX, agentFetchPrompt, parseAgentAnswer, startLinearFetch } from "./linearagent.js";
 
 describe("parseLinearKeys", () => {
   it("splits on commas and any whitespace, because a secret setting cannot be multi-line", () => {
@@ -39,14 +38,13 @@ describe("team routing", () => {
   it("routes each ticket to the key whose workspace owns its prefix", () => {
     const { owner } = routeTeams([inkwell, press]);
     const plan = planFetch(["ABC-101", "WEB-7", "ABC-102"], owner);
-    expect(plan.byKey.get(0)).toEqual(["ABC-101", "ABC-102"]);
-    expect(plan.byKey.get(1)).toEqual(["WEB-7"]);
-    expect(plan.unowned).toEqual([]);
+    expect(plan.get(0)).toEqual(["ABC-101", "ABC-102"]);
+    expect(plan.get(1)).toEqual(["WEB-7"]);
   });
 
-  it("leaves a prefix no key owns unowned rather than guessing a workspace, because a wrong workspace answers about a different ticket", () => {
+  it("sends a prefix no key owns to no key rather than guessing a workspace, because a wrong workspace answers about a different ticket", () => {
     const { owner } = routeTeams([inkwell]);
-    expect(planFetch(["SHOP-12"], owner)).toEqual({ byKey: new Map(), unowned: ["SHOP-12"] });
+    expect(planFetch(["SHOP-12"], owner)).toEqual(new Map());
   });
 
   it("gives a team two keys claim to the first key, whatever order discovery finished in, and reports it once", () => {
@@ -76,7 +74,9 @@ describe("the batched detail query", () => {
     expect(query).toContain('t0: issue(id: "ABC-101")');
     expect(query).toContain('t1: issue(id: "ABC-102")');
     expect(query.match(/issue\(/gu)).toHaveLength(2);
-    for (const field of ["title", "description", "state { name type }", "project { id name }", "parent { identifier title }", "labels { nodes { name } }", "url", "updatedAt"]) {
+    for (const field of ["title", "description", "state { name type }", "project { id name description targetDate initiatives(first: 5) { nodes { id name } } }",
+      "parent { identifier title }", "labels { nodes { name } }", "assignee { name displayName }", "cycle { number name endsAt }", "dueDate", "url", "updatedAt",
+      "priority priorityLabel estimate", "createdAt startedAt completedAt canceledAt"]) {
       expect(query).toContain(field);
     }
   });
@@ -89,9 +89,15 @@ describe("the batched detail query", () => {
           title: "Gift card balances",
           description: "x".repeat(2_000),
           state: { name: "In Progress", type: "started" },
-          project: { id: "p1", name: "Checkout polish" },
+          project: { id: "p1", name: "Checkout polish", description: "y".repeat(900), targetDate: "2026-10-17",
+            initiatives: { nodes: [{ id: "i1", name: "Holiday season" }] } },
           parent: { identifier: "ABC-100", title: "Gift cards" },
           labels: { nodes: [{ name: "frontend" }] },
+          assignee: { name: "Dana Reyes", displayName: "dana" },
+          cycle: { number: 42, name: null, endsAt: "2026-10-03T00:00:00.000Z" },
+          dueDate: "2026-10-10",
+          priority: 2, priorityLabel: "High", estimate: 3,
+          createdAt: "2026-08-01T00:00:00.000Z", startedAt: "2026-08-20T00:00:00.000Z", completedAt: null, canceledAt: null,
           url: "https://linear.app/inkwell/issue/ABC-101",
           updatedAt: "2026-09-01T00:00:00.000Z",
         },
@@ -101,9 +107,18 @@ describe("the batched detail query", () => {
     const found = details?.get("ABC-101");
     expect(found?.title).toBe("Gift card balances");
     expect(found?.description).toHaveLength(DESCRIPTION_CHARS);
-    expect(found?.project).toEqual({ id: "p1", name: "Checkout polish" });
+    // The project's summary is a seeded effort's goal, so it is kept, capped like a description.
+    expect(found?.project).toEqual({ id: "p1", name: "Checkout polish", description: "y".repeat(DESCRIPTION_CHARS), targetDate: "2026-10-17",
+      initiatives: [{ id: "i1", name: "Holiday season" }] });
     expect(found?.parent).toEqual({ identifier: "ABC-100", title: "Gift cards" });
     expect(found?.labels).toEqual(["frontend"]);
+    expect(found).toMatchObject({ assignee: "dana", cycle: { number: 42, name: null, endsAt: "2026-10-03T00:00:00.000Z" }, dueDate: "2026-10-10" });
+    // Priority and points feed the rows' ticket chips and the p expand; the dates are kept for scope growth.
+    expect(found).toMatchObject({ priority: 2, priorityLabel: "High", estimate: 3, createdAt: "2026-08-01T00:00:00.000Z", startedAt: "2026-08-20T00:00:00.000Z",
+      completedAt: null, canceledAt: null });
+    // A key read always states them, so an absent assignee, cycle, priority, or estimate reads as none rather than as a row to refetch.
+    expect(parseDetails(["ABC-2"], { data: { t0: { identifier: "ABC-2" } } })?.get("ABC-2")).toMatchObject({ assignee: null, cycle: null, dueDate: null,
+      priority: null, priorityLabel: null, estimate: null, createdAt: null, completedAt: null });
     expect(found?.source).toBe("key");
     expect(details?.get("ABC-404")).toBeNull();
     expect(parseDetails(["ABC-1"], { errors: [] })).toBeNull();
@@ -133,108 +148,5 @@ describe("the batched detail query", () => {
     const base = parseDetails(["ABC-1"], { data: { t0: { identifier: "ABC-1", parent: { identifier: "ABC-0", title: "Gift cards" } } } })?.get("ABC-1");
     expect(projectNameOf(base)).toBe("Gift cards");
     expect(projectNameOf(null)).toBeNull();
-  });
-});
-
-describe("the agent fallback", () => {
-  it("asks for exactly one json block of the fields the cache keeps, and says what to do without Linear tools", () => {
-    const prompt = agentFetchPrompt(["SHOP-12", "SHOP-13"]);
-    expect(prompt).toContain("SHOP-12, SHOP-13");
-    expect(prompt).toContain("exactly one fenced ```json block");
-    for (const field of ["identifier", "title", "state", "project", "parentIdentifier", "parentTitle", "url"]) expect(prompt).toContain(field);
-    expect(prompt).toContain("empty array");
-    expect(prompt).toContain("Do not change anything in Linear");
-  });
-
-  it("parses a valid answer into agent-sourced detail", () => {
-    const text = 'Found both.\n```json\n[{"identifier":"SHOP-12","title":"Spine labels","state":"Todo","project":"Print run","parentIdentifier":"SHOP-10","parentTitle":"Bindery","url":"https://linear.app/inkwell/issue/SHOP-12"}]\n```';
-    const parsed = parseAgentAnswer(text, ["SHOP-12"]);
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    expect(parsed.details).toEqual([
-      expect.objectContaining({
-        identifier: "SHOP-12",
-        title: "Spine labels",
-        project: { id: null, name: "Print run" },
-        parent: { identifier: "SHOP-10", title: "Bindery" },
-        source: "agent",
-      }),
-    ]);
-  });
-
-  it("takes the LAST json block, because earlier ones are the agent working it out", () => {
-    const text = '```json\n[{"identifier":"SHOP-12","title":"draft"}]\n```\nOn reflection:\n```json\n[{"identifier":"SHOP-12","title":"Spine labels"}]\n```';
-    const parsed = parseAgentAnswer(text, ["SHOP-12"]);
-    expect(parsed.ok && parsed.details[0]?.title).toBe("Spine labels");
-  });
-
-  it("accepts an empty array as a real answer: the session had no Linear tools", () => {
-    expect(parseAgentAnswer("No Linear tools here.\n```json\n[]\n```", ["SHOP-12"])).toEqual({ ok: true, details: [] });
-  });
-
-  it("fails with a short reason on invalid output, so nothing half-parsed is stored", () => {
-    expect(parseAgentAnswer("no block at all", ["SHOP-12"])).toEqual({ ok: false, reason: "No json block in the final message." });
-    expect(parseAgentAnswer("```json\n{not json\n```", ["SHOP-12"]).ok).toBe(false);
-    expect(parseAgentAnswer('```json\n{"identifier":"SHOP-12"}\n```', ["SHOP-12"]).ok).toBe(false);
-    expect(parseAgentAnswer(null, ["SHOP-12"]).ok).toBe(false);
-  });
-
-  it("stores only tickets it was asked about, so an agent cannot add rows to the cache", () => {
-    const parsed = parseAgentAnswer('```json\n[{"identifier":"SHOP-12"},{"identifier":"ABC-999"}]\n```', ["SHOP-12"]);
-    expect(parsed.ok && parsed.details.map((detail) => detail.identifier)).toEqual(["SHOP-12"]);
-  });
-
-  it("caps a run at a bounded number of tickets", () => {
-    expect(AGENT_FETCH_MAX).toBeLessThanOrEqual(100);
-  });
-});
-
-describe("starting the agent fallback", () => {
-  function fakeSdk(projects: { id: string; sources: { hostId: string; path: string }[] }[]) {
-    const spawned: unknown[] = [];
-    return {
-      spawned,
-      sdk: {
-        projects: { list: async () => projects },
-        threads: {
-          spawn: async (args: unknown) => {
-            spawned.push(args);
-            return { id: "thr-fetch-1" };
-          },
-        },
-      },
-    };
-  }
-
-  it("spawns ONE thread in the deepest project containing the scan root, so that project's Linear identity answers", async () => {
-    const { sdk, spawned } = fakeSdk([
-      { id: "prj-home", sources: [{ hostId: "host-a", path: "/Users/inkwell" }] },
-      { id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/Users/inkwell/checkouts" }] },
-    ]);
-    const result = await startLinearFetch(sdk, ["/Users/inkwell/checkouts"], ["SHOP-12", "SHOP-13"]);
-    expect(result).toEqual({ ok: true, threadId: "thr-fetch-1", root: "/Users/inkwell/checkouts", asked: ["SHOP-12", "SHOP-13"] });
-    expect(spawned).toHaveLength(1);
-    expect(spawned[0]).toEqual(
-      expect.objectContaining({
-        projectId: "prj-inkwell",
-        environment: { type: "host", hostId: "host-a", workspace: { type: "unmanaged", path: "/Users/inkwell/checkouts" } },
-        prompt: agentFetchPrompt(["SHOP-12", "SHOP-13"]),
-      }),
-    );
-  });
-
-  it("spawns nothing when there is nothing to ask, or no project holds the checkouts", async () => {
-    const empty = fakeSdk([{ id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/Users/inkwell/checkouts" }] }]);
-    expect((await startLinearFetch(empty.sdk, ["/Users/inkwell/checkouts"], [])).ok).toBe(false);
-    const orphan = fakeSdk([{ id: "prj-other", sources: [{ hostId: "host-a", path: "/elsewhere" }] }]);
-    expect((await startLinearFetch(orphan.sdk, ["/Users/inkwell/checkouts"], ["SHOP-12"])).ok).toBe(false);
-    expect([...empty.spawned, ...orphan.spawned]).toEqual([]);
-  });
-
-  it("caps the tickets one run asks about", async () => {
-    const { sdk } = fakeSdk([{ id: "prj-inkwell", sources: [{ hostId: "host-a", path: "/c" }] }]);
-    const many = Array.from({ length: AGENT_FETCH_MAX + 10 }, (_, index) => `SHOP-${index + 1}`);
-    const result = await startLinearFetch(sdk, ["/c"], many);
-    expect(result.ok && result.asked).toHaveLength(AGENT_FETCH_MAX);
   });
 });

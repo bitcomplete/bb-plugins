@@ -23,9 +23,11 @@ const card = (overrides: Partial<BriefCard> = {}): BriefCard => ({
   status: "waiting-on-me",
   stageOverride: null,
   statusOverride: null,
+  blockReason: null,
   nextStep: "Push the branch",
   blockedOn: "",
   lastSummarizedAt: NOW - 1000,
+  autoArchive: true,
   ...overrides,
 });
 
@@ -59,6 +61,7 @@ const READY: BriefState = {
     status: "waiting-on-me",
     stageOverride: null,
     statusOverride: null,
+    blockReason: null,
     lastSummarizedAt: NOW - 1000,
   },
 };
@@ -142,8 +145,9 @@ describe("registration", () => {
     const panel = captured.navPanels[0]!;
     expect(panel.path).toBe("board");
     expect(panel.title).toBe("Briefs");
-    // The badge is the reason to open the board, so it has to be on the row.
-    expect(panel.experimental_sidebarAccessory).toBeDefined();
+    // bb 0.46's navigation rail mounts no accessory, so registering one would
+    // be dead code that reads as a live count.
+    expect(panel.experimental_sidebarAccessory).toBeUndefined();
   });
 });
 

@@ -1,7 +1,8 @@
 // Per-machine scanning. Runs in the BB host worker, so node:child_process and
 // node:fs are available here and only here.
 import { execFile } from "node:child_process";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import Anthropic from "@anthropic-ai/sdk";
@@ -13,16 +14,14 @@ import {
   checkConclusions,
   parseAheadBehind,
   parseLinkback,
-  parseLiveReviewRequests,
   parsePrList,
   repoFromRemote,
 } from "./gh.js";
-import { prTarget, readLiveMerge, readReviewThreads, runMerge, runNudge, runUpdateBranch, type GhRunner } from "./ghactions.js";
+import { prTarget, readApprovalHandling, readLiveMerge, readRateLimitReset, readReviewThreads, runMerge, runNudge, runReady, type GhRunner } from "./ghactions.js";
 import { namingResponse, type NamedGroupRow } from "./naming.js";
 import { checkoutBranch } from "./rebase.js";
-import { readAuthoredPrs, readInventoryPrs } from "./inventory.js";
-import { readAdvancePr } from "./advance-host.js";
-import { prepareAdvanceWorkspace } from "./advance-workspace.js";
+import { readAuthoredPrs, readInventoryPrs, readOpenAuthoredPrs, reviewFacts } from "./inventory.js";
+import { readEqualHeadTrees } from "./advance-host.js";
 
 const GIT_TIMEOUT_MS = 10_000;
 const GH_TIMEOUT_MS = 20_000;
@@ -69,7 +68,10 @@ function ghRunner(signal: AbortSignal): GhRunner {
         { cwd: homedir(), timeout: GH_WRITE_TIMEOUT_MS, signal, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout, stderr) => {
           if (error) {
-            resolve({ ok: false, error: (stderr || error.message).replace(/\s+/gu, " ").trim().slice(0, 600) });
+            const detail = (stderr || error.message).replace(/\s+/gu, " ").trim().slice(0, 600);
+            // A gh killed at its timeout or by a stop may have reached GitHub first; say so, so a write's answer reads as unclear.
+            const stopped = (error as { killed?: boolean }).killed === true || error.name === "AbortError";
+            resolve({ ok: false, error: stopped ? `gh stopped before it finished: ${detail}` : detail });
             return;
           }
           resolve({ ok: true, stdout: stdout.toString() });
@@ -321,18 +323,8 @@ async function inspect(
   }
   unit.observed = { status: status !== null, pr: true };
   unit.pr = parsed.pr;
-  if (parsed.pr.state === "OPEN" && !parsed.pr.isDraft &&
-      (parsed.pr.reviewDecision === "APPROVED" || parsed.pr.reviewDecision === "CHANGES_REQUESTED")) {
-    const threads = await reviewThreadsOf(parsed.pr.url,
-      parsed.pr.reviewDecision === "CHANGES_REQUESTED" || parsed.pr.approvalHasBody === true);
-    if (!threads.ok) warn(`${dirName}: cannot check PR review threads: ${threads.error}`);
-    else {
-      unit.pr.unresolvedReviewThreads = threads.count;
-      unit.pr.resolvedReviewThreads = threads.resolvedCount;
-      unit.pr.approvalNoteFollowedUp = threads.approvalNoteFollowedUp;
-      unit.pr.reviewFollowupPosted = threads.reviewFollowupPosted;
-    }
-  }
+  // The inventory's review read, on the same PRs, with the conversation and links, which say whether feedback to address was answered.
+  if (parsed.pr.state === "OPEN") await reviewFacts((url) => reviewThreadsOf(url, true), unit.pr, warn);
   if (parsed.pr.state === "MERGED") {
     unit.shipped = await shippedOf(unit.repo, path, parsed.mergeCommit);
   }
@@ -559,11 +551,22 @@ export async function inspectAll(
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
-    advanceInspect: ({ prUrl }, context) => readAdvancePr(ghRunner(context.signal), prUrl),
-    advanceWorkspace: (input, context) => prepareAdvanceWorkspace(
-      (args, cwd) => run("git", args, cwd, GH_WRITE_TIMEOUT_MS, context.signal), ghRunner(context.signal), input),
+    contextWorkspace: async () => {
+      // BB reserves plugin host-data for its own storage, not unmanaged thread workspaces.
+      const path = join(homedir(), ".local", "share", "bb-workstreams", "contexts", randomUUID());
+      await mkdir(path, { recursive: true, mode: 0o700 });
+      return { path: await realpath(path) };
+    },
+    approvalHandling: async ({ prUrl }, context) => {
+      const target = prTarget(prUrl);
+      return target === null ? { ok: false as const, error: "That is not a pull request URL." } : readApprovalHandling(ghRunner(context.signal), target);
+    },
+    equalHeadTrees: ({ prUrl, priorHeadOid, currentHeadOid }, context) =>
+      readEqualHeadTrees(ghRunner(context.signal), prUrl, priorHeadOid, currentHeadOid),
+    githubRateLimit: async (_input, context) => ({ resetAt: await readRateLimitReset(ghRunner(context.signal)) }),
     authoredPrs: ({ owners }, context) => readAuthoredPrs(ghRunner(context.signal), owners),
     inspectPrs: ({ prUrls }, context) => readInventoryPrs(ghRunner(context.signal), prUrls),
+    pollAuthoredPrs: ({ owners }, context) => readOpenAuthoredPrs(ghRunner(context.signal), owners),
     checkoutState: async ({ path }, context) => {
       if (!(await isUnit(path))) return { ok: false as const, error: "Checkout is unavailable." };
       const local = await localBranchState(path, context.signal);
@@ -595,16 +598,6 @@ export default experimental_defineHostEntry({
       for (const path of paths) if (await isUnit(path)) units.push(path);
       return inspectAll(units, [], context.signal);
     },
-    prReviewers: async ({ prUrl }, context) => {
-      const target = prTarget(prUrl);
-      if (target === null) return { ok: false as const, error: "That is not a pull request URL." };
-      const result = await ghRunner(context.signal)(["pr", "view", String(target.number), "--repo", target.slug, "--json", "state,reviewRequests"]);
-      if (!result.ok) return { ok: false as const, error: `Could not read current reviewers: ${result.error}` };
-      const live = parseLiveReviewRequests(result.stdout);
-      if (live === null) return { ok: false as const, error: "GitHub did not return the PR's current reviewers." };
-      if (live.state !== "OPEN") return { ok: false as const, error: "This pull request is no longer open. Rescan and try again." };
-      return { ok: true as const, reviewers: live.reviewers };
-    },
     prLive: async ({ prUrl }, context) => {
       const target = prTarget(prUrl);
       if (target === null) return { ok: false as const, error: "That is not a pull request URL." };
@@ -617,10 +610,10 @@ export default experimental_defineHostEntry({
       switch (request.kind) {
         case "merge":
           return runMerge(gh, target, request.method, request.sha, request.deleteBranch);
-        case "update-branch":
-          return runUpdateBranch(gh, target);
         case "nudge":
           return runNudge(gh, target, request.reviewers, request.comment);
+        case "ready":
+          return runReady(gh, target, request.headOid);
       }
     },
     linkbacks: async ({ prUrls }, context) => {

@@ -3,7 +3,10 @@
 // schemas below are the single definition of what a scan returns.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { advanceInspectionSchema, advanceWorkspaceInputSchema, advanceWorkspaceSchema } from "./advance-contract.js";
+import { approvalFeedbackSchema } from "./approval-feedback.js";
+import { approvalHandlingSchema } from "./approval-evidence.js";
+import { prAttentionSchema } from "./pr-attention.js";
+import { reviewFeedbackSchema } from "./feedback-to-address.js";
 
 /**
  * GitHub's authoritative "can this merge right now" signal
@@ -48,6 +51,8 @@ export const prSchema = z
     latestReviewStates: z.array(z.string().max(40)).max(50),
     /** GitHub's PR open time. Optional so older persisted scans still load. */
     createdAt: z.string().max(40).nullable().optional(),
+    /** GitHub's latest PR update time. Optional so older persisted scans still load. */
+    updatedAt: z.string().max(40).nullable().optional(),
     /**
      * When the PR merged, from the same `gh pr list` call. It dates the Board's
      * Recently merged section. Defaulted so a unit cached before the field
@@ -73,19 +78,35 @@ export const prSchema = z
      * existed still parses.
      */
     latestReviews: z
-      .array(z.object({ login: z.string().max(140), state: z.string().max(40) }).strict())
+      .array(z.object({ login: z.string().max(140), state: z.string().max(40),
+        /** When the review was submitted; absent on older scans. PR attention ages approvals and answered requests by it. */
+        submittedAt: z.string().max(40).optional() }).strict())
       .max(50)
       .default([]),
+    /** The head commit's date, the last push as near as GitHub dates it; absent until an inventory read dates it. */
+    headCommittedAt: z.string().max(40).optional(),
+    /** When each currently requested reviewer was last asked, from the PR timeline; absent until an inventory read dates it. */
+    reviewRequestedAt: z.array(z.object({ reviewer: z.string().max(140), at: z.string().max(40) }).strict()).max(20).optional(),
     /** The latest approving review has body text; absent on older scans. */
     approvalHasBody: z.boolean().optional(),
-    /** Its inline threads were addressed, or the author explicitly replied to its standalone note after a newer head. */
+    /** Retained only so older cached PR rows load; readiness ignores this former reply heuristic. */
     approvalNoteFollowedUp: z.boolean().optional(),
+    /** Snapshot of approving-review feedback from a complete live review read. */
+    approvalFeedback: approvalFeedbackSchema.optional(),
+    /** Server comparison with the current head-bound verification record. */
+    approvalFeedbackVerified: z.boolean().optional(),
+    /** Your own evidence-checked confirmation covers the current head and notes (feedback-to-address.ts); a worker's evidence never sets it. */
+    approvalFeedbackConfirmed: z.boolean().optional(),
+    /** Why approval feedback is not yet verified against the current PR. */
+    approvalFeedbackVerification: z.enum(["none", "verified", "missing", "head-changed", "feedback-changed", "unknown"]).optional(),
     /** Changes requested remains GitHub's decision, but the author posted a verified PTAL after a newer head. */
     reviewFollowupPosted: z.boolean().optional(),
     /** Null until review threads are checked; zero means no unresolved threads. */
-    unresolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
+    unresolvedReviewThreads: z.number().int().min(0).max(2_000).nullable().default(null),
     /** Complete-page count of resolved review threads; null when unread or incomplete. */
-    resolvedReviewThreads: z.number().int().min(0).max(100).nullable().default(null),
+    resolvedReviewThreads: z.number().int().min(0).max(2_000).nullable().default(null),
+    /** Feedback only the PR's own review read proves (feedback-to-address.ts); absent until that read. */
+    reviewFeedback: reviewFeedbackSchema.optional(),
     /**
      * Ticket IDs the PR description states, extracted on the host from its
      * first 8 KB. The description itself is client content and is never kept,
@@ -150,10 +171,15 @@ export const inventoryInspectionSchema = z.object({
   closed: z.array(z.string().max(500)).max(100),
   failed: z.array(z.string().max(500)).max(100),
   warnings: z.array(z.string().max(500)).max(50),
+  /** The closed PRs that merged. */
+  merged: z.array(z.object({ url: z.string().max(500), at: z.string().max(40), title: z.string().max(300), headRefName: z.string().max(300).nullable() }).strict())
+    .max(100).optional(),
 }).strict();
 export const inventoryBoardSchema = z.object({
   owners: z.array(z.string()),
-  entries: z.array(inventoryEntrySchema.extend({ stale: z.boolean(), effortKey: z.string().optional(), effortName: z.string().optional() })),
+  entries: z.array(inventoryEntrySchema.extend({ stale: z.boolean(), effortKey: z.string().optional(), effortName: z.string().optional(),
+    /** What the PR waits on, who acts, and for how long; absent on a board built before attention existed. */
+    attention: prAttentionSchema.optional() })),
   complete: z.boolean(),
   lastSuccessAt: z.string().nullable(),
   lastAttemptAt: z.string().nullable(),
@@ -224,6 +250,8 @@ export const liveMergeSchema = z
     }).strict()).max(3),
     approvalNotesMore: z.number().int().min(0),
     approvalNotesComplete: z.boolean(),
+    approvalFeedback: approvalFeedbackSchema,
+    reviewFeedback: reviewFeedbackSchema.optional(),
   })
   .strict();
 
@@ -242,7 +270,8 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
       deleteBranch: z.boolean(),
     })
     .strict(),
-  z.object({ kind: z.literal("update-branch"), prUrl: z.string().max(500) }).strict(),
+  /** Mark ready names the head it was confirmed on. */
+  z.object({ kind: z.literal("ready"), prUrl: z.string().max(500), headOid: z.string().regex(/^[0-9a-f]{40}$/u) }).strict(),
   z
     .object({
       kind: z.literal("nudge"),
@@ -255,11 +284,26 @@ export const prWriteSchema = z.discriminatedUnion("kind", [
 export type PrWrite = z.infer<typeof prWriteSchema>;
 
 export const hostContract = defineRpcContract({
-  advanceInspect: {
-    input: z.object({ prUrl: z.string().max(500) }).strict(),
-    output: advanceInspectionSchema,
+  /** An isolated, non-Git workspace for a conversation or controller thread. */
+  contextWorkspace: {
+    input: z.object({}).strict(),
+    output: z.object({ path: z.string().min(1) }).strict(),
   },
-  advanceWorkspace: { input: advanceWorkspaceInputSchema, output: advanceWorkspaceSchema },
+  /** Read-only: an approval's notes and what since shows them handled, for the confirm. */
+  approvalHandling: {
+    input: z.object({ prUrl: z.string().max(500) }).strict(),
+    output: approvalHandlingSchema,
+  },
+  equalHeadTrees: {
+    input: z.object({ prUrl: z.string().max(500), priorHeadOid: z.string().regex(/^[0-9a-f]{40}$/u),
+      currentHeadOid: z.string().regex(/^[0-9a-f]{40}$/u) }).strict(),
+    output: z.discriminatedUnion("ok", [
+      z.object({ ok: z.literal(true), priorTreeOid: z.string().regex(/^[0-9a-f]{40}$/u), currentTreeOid: z.string().regex(/^[0-9a-f]{40}$/u) }).strict(),
+      z.object({ ok: z.literal(false) }).strict(),
+    ]),
+  },
+  /** Read-only: when GitHub's exhausted rate limits reset, in epoch ms; the read doesn't count against them. */
+  githubRateLimit: { input: z.object({}).strict(), output: z.object({ resetAt: z.number().nullable() }).strict() },
   authoredPrs: {
     input: z.object({ owners: z.array(z.string().max(39)).max(50) }).strict(),
     output: inventoryResultSchema,
@@ -268,19 +312,16 @@ export const hostContract = defineRpcContract({
     input: z.object({ prUrls: z.array(z.string().max(500)).max(100) }).strict(),
     output: inventoryInspectionSchema,
   },
+  /** Read-only: every open PR you author in these organizations from one batched GraphQL search, without the evidence only a PR's own read proves. */
+  pollAuthoredPrs: {
+    input: z.object({ owners: z.array(z.string().max(39)).max(50) }).strict(),
+    output: inventoryResultSchema,
+  },
   /** Cheap live local guard before a direct PR write; never trusts the last scan's branch state. */
   checkoutState: {
     input: z.object({ path: z.string().max(1_000) }).strict(),
     output: z.discriminatedUnion("ok", [
       z.object({ ok: z.literal(true), branch: z.string().max(300).nullable(), rebasing: z.boolean() }).strict(),
-      z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
-    ]),
-  },
-  /** Recheck the PR and its pending reviewers immediately before a nudge. */
-  prReviewers: {
-    input: z.object({ prUrl: z.string().max(500) }).strict(),
-    output: z.discriminatedUnion("ok", [
-      z.object({ ok: z.literal(true), reviewers: z.array(z.string().max(140)).max(20) }).strict(),
       z.object({ ok: z.literal(false), error: z.string().max(800) }).strict(),
     ]),
   },

@@ -2,26 +2,25 @@ import { displayTitle } from "./workstreams.js";
 import { ticketsIn } from "./threads.js";
 import type { Pr } from "./contract.js";
 import type { EstablishedEffort } from "./effort-store.js";
+import { prWorkItemKey } from "./work-item-index.js";
 
 type Group = { key: string; name: string; clusters: readonly { ticket: string; units: readonly { pr: { url: string } | null }[] }[] };
 /** Checkout availability affects actions, never exact-ticket membership. Ambiguous tickets stay unassigned. */
 export function inventoryEffort(pr: Pick<Pr, "url" | "title" | "headRefName">, groups: readonly Group[], efforts: readonly EstablishedEffort[], pattern: RegExp): { effortKey: string; effortName: string } | null {
-  const url = pr.url.toLowerCase();
+  const url = prWorkItemKey(pr.url);
   const ticketRefs = ticketsIn(`${pr.title}\n${pr.headRefName ?? ""}`, pattern);
-  const exact = efforts.find((effort) => effort.members.prUrls.includes(url));
+  const exact = efforts.find((effort) => effort.members.prUrls.some((member) => prWorkItemKey(member) === url));
   if (exact) return { effortKey: exact.key, effortName: exact.name };
   const explicit = efforts.filter((effort) => ticketRefs.some((ticket) => effort.members.tickets.includes(ticket)));
   if (explicit.length === 1) return { effortKey: explicit[0]!.key, effortName: explicit[0]!.name };
   if (explicit.length > 1) return null;
   const matched = groups.filter((group) => group.clusters.some((cluster) =>
-    cluster.units.some((unit) => unit.pr?.url.toLowerCase() === url) || ticketRefs.includes(cluster.ticket)));
+    cluster.units.some((unit) => unit.pr && prWorkItemKey(unit.pr.url) === url) || ticketRefs.includes(cluster.ticket)));
   return matched.length === 1 ? { effortKey: matched[0]!.key, effortName: matched[0]!.name } : null;
 }
 
 
 export type InventoryTicketEffort = { key: string; name: string; ticket: string; prUrls: string[]; repoCount: number };
-const prKey = (url: string) => url.replace(/\/$/u, "").toLowerCase();
-
 /** Exact remote ticket cohorts add membership, never pretend to be local checkouts. */
 export function inventoryTicketEfforts(
   entries: readonly { repo: string; pr: Pick<Pr, "url" | "title" | "headRefName" | "state"> }[],
@@ -29,15 +28,15 @@ export function inventoryTicketEfforts(
   cachedTitles: ReadonlyMap<string, string> = new Map(),
 ): InventoryTicketEffort[] {
   const anchoredTickets = new Set([...groups.flatMap((group) => group.clusters.map((cluster) => cluster.ticket)), ...efforts.flatMap((effort) => effort.members.tickets)]);
-  const anchoredUrls = new Set([...groups.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.flatMap((unit) => unit.pr ? [prKey(unit.pr.url)] : []))), ...efforts.flatMap((effort) => effort.members.prUrls.map(prKey))]);
+  const anchoredUrls = new Set([...groups.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.flatMap((unit) => unit.pr ? [prWorkItemKey(unit.pr.url)] : []))), ...efforts.flatMap((effort) => effort.members.prUrls.map(prWorkItemKey))]);
   const cohorts = new Map<string, Map<string, (typeof entries)[number]>>();
   for (const entry of entries) {
-    if (entry.pr.state !== "OPEN" || anchoredUrls.has(prKey(entry.pr.url))) continue;
+    if (entry.pr.state !== "OPEN" || anchoredUrls.has(prWorkItemKey(entry.pr.url))) continue;
     const tickets = ticketsIn(`${entry.pr.title}\n${entry.pr.headRefName ?? ""}`, pattern);
     if (tickets.length !== 1 || anchoredTickets.has(tickets[0]!)) continue;
     const ticket = tickets[0]!;
     const cohort = cohorts.get(ticket) ?? new Map();
-    cohort.set(prKey(entry.pr.url), entry);
+    cohort.set(prWorkItemKey(entry.pr.url), entry);
     cohorts.set(ticket, cohort);
   }
   return [...cohorts].filter(([, members]) => members.size >= 2).sort(([a], [b]) => a.localeCompare(b)).map(([ticket, members]) => {

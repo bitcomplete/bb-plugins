@@ -2,6 +2,7 @@
 // Kept out of server.ts behind a narrow SDK interface, so the exact spawn
 // request can be tested against a fake without a live BB.
 import { withinPath } from "./threads.js";
+import type { ModelChoice } from "./execution.js";
 
 /** The slice of `bb.sdk` this needs. */
 export type SpawnSdk = {
@@ -9,7 +10,7 @@ export type SpawnSdk = {
     list(): Promise<readonly { id: string; sources: readonly { hostId: string; path: string }[] }[]>;
   };
   threads: {
-    spawn(args: {
+    spawn(args: ModelChoice & {
       projectId: string;
       environment: {
         type: "host";
@@ -49,8 +50,8 @@ export function projectForPath(
 
 /**
  * Spawn a thread that works IN the checkout: an unmanaged workspace at the
- * checkout's own path, so the new thread's environment is that checkout. No
- * provider or model is named, so BB applies the project's own defaults. The
+ * checkout's own path, so the new thread's environment is that checkout. The
+ * explicit execution choice keeps project defaults from selecting another model. The
  * cluster ticket is seeded into this plugin's thread metadata at spawn time,
  * which links the thread to its row before it has done anything.
  *
@@ -61,6 +62,7 @@ export async function startThread(
   sdk: SpawnSdk,
   unit: { path: string; ticket: string } | undefined,
   prompt: string,
+  model: ModelChoice,
   parentThreadId?: string,
 ): Promise<StartResult> {
   if (unit === undefined) return { ok: false, error: "That checkout is not on the board any more. Rescan and try again." };
@@ -74,6 +76,7 @@ export async function startThread(
     };
   }
   const thread = await sdk.threads.spawn({
+    ...model,
     projectId: project.projectId,
     environment: { type: "host", hostId: project.hostId, workspace: { type: "unmanaged", path: unit.path } },
     prompt: text,

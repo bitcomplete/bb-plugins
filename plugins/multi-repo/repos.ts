@@ -15,7 +15,10 @@
  * filesystem, no git — the caller owns both ends.
  */
 import { z } from "zod";
-import { PROJECT_SOURCE_DIR, isSafeSegment, normalizeRemoteUrl } from "./paths.js";
+import { PROJECT_SOURCE_DIR } from "./paths.js";
+import { dirFromUrl, isSafeSegment, normalizeRemoteUrl } from "./names.js";
+
+export { dirFromUrl };
 
 export const REPOS_FILE = "repos.json";
 export const REPOS_VERSION = 1;
@@ -30,15 +33,46 @@ export const REPOS_VERSION = 1;
  */
 export const MAX_REPOS = 32;
 
-export const repoEntrySchema = z
+/**
+ * One entry as it may be written on disk.
+ *
+ * `dir` is optional: the common case is one checkout per repo under the name
+ * the repo already has, and repeating it is noise. Only a repo whose URL does
+ * not end in the name you want it to have — a fork, a second checkout, a
+ * `.git`-less path — needs to say so.
+ */
+export const repoEntryInputSchema = z
   .object({
-    dir: z.string().min(1).max(100),
+    dir: z.string().min(1).max(100).optional(),
     url: z.string().min(1).max(2000),
     branch: z.string().min(1).max(300).optional(),
   })
   .strict();
 
+export type RepoEntryInput = z.infer<typeof repoEntryInputSchema>;
+
+/**
+ * One entry as everything downstream of the parser sees it: `dir` resolved.
+ *
+ * `inferredDir` records that the file did not say it, which is what lets an
+ * unrelated edit serialize the entry back the way it was written rather than
+ * materializing a name the author deliberately left out.
+ */
+export const repoEntrySchema = repoEntryInputSchema
+  .extend({
+    dir: z.string().min(1).max(100),
+    inferredDir: z.boolean().optional(),
+  })
+  .strict();
+
 export type RepoEntry = z.infer<typeof repoEntrySchema>;
+
+export const reposFileInputSchema = z
+  .object({
+    version: z.literal(REPOS_VERSION),
+    repos: z.array(repoEntryInputSchema).max(MAX_REPOS),
+  })
+  .strict();
 
 export const reposFileSchema = z
   .object({
@@ -84,7 +118,7 @@ export function parseReposFile(text: string): ParseResult {
       error: `${REPOS_FILE} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  const parsed = reposFileSchema.safeParse(json);
+  const parsed = reposFileInputSchema.safeParse(json);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
     return {
@@ -92,9 +126,32 @@ export function parseReposFile(text: string): ParseResult {
       error: `${REPOS_FILE} is invalid at ${issueLocation(issue.path)}: ${issue.message}`,
     };
   }
-  const semantic = validateRepoSet(parsed.data.repos);
+  const repos: RepoEntry[] = [];
+  for (const [index, entry] of parsed.data.repos.entries()) {
+    const resolved = resolveRepoEntry(entry);
+    if (resolved === null) {
+      return {
+        ok: false,
+        error: `${REPOS_FILE} repos[${index}]: no dir, and none can be inferred from url ${JSON.stringify(entry.url)}. Add an explicit "dir".`,
+      };
+    }
+    repos.push(resolved);
+  }
+  const semantic = validateRepoSet(repos);
   if (semantic !== null) return { ok: false, error: semantic };
-  return { ok: true, value: parsed.data };
+  return { ok: true, value: { version: parsed.data.version, repos } };
+}
+
+/**
+ * Fill in `dir` from the URL when the entry omits it.
+ *
+ * Returns null when nothing usable comes out, so the caller says so instead of
+ * inventing a name — see `dirFromUrl`.
+ */
+export function resolveRepoEntry(entry: RepoEntryInput): RepoEntry | null {
+  if (entry.dir !== undefined) return { ...entry, dir: entry.dir };
+  const dir = dirFromUrl(entry.url);
+  return dir === null ? null : { ...entry, dir, inferredDir: true };
 }
 
 /** The rules the schema cannot state. Returns the first failure, or null. */
@@ -143,8 +200,11 @@ export function validateRepoSet(repos: readonly RepoEntry[]): string | null {
  * reformatting the whole file underneath them.
  */
 export function serializeReposFile(file: ReposFile): string {
+  // An inferred `dir` is written back out as the absence it was: an unrelated
+  // add or remove should be a one-line diff, not a pass that names every repo
+  // whose author left the name to the URL.
   const repos = file.repos.map((repo) => ({
-    dir: repo.dir,
+    ...(repo.inferredDir === true ? {} : { dir: repo.dir }),
     url: repo.url,
     ...(repo.branch === undefined ? {} : { branch: repo.branch }),
   }));
@@ -155,25 +215,15 @@ export type EditResult =
   | { ok: true; value: ReposFile }
   | { ok: false; error: string };
 
-/**
- * The directory name a repo gets when the caller did not pick one: the URL's
- * last component, minus `.git`.
- *
- * Returns null rather than a fallback when nothing usable comes out, so
- * `workspace_add_repo` asks for an explicit `dir` instead of inventing
- * `repo-1` and leaving the agent to discover what it got.
- */
-export function dirFromUrl(url: string): string | null {
-  const trimmed = url.trim().replace(/\/+$/u, "").replace(/\.git$/u, "");
-  const candidate = trimmed.split(/[/:\\]/u).pop() ?? "";
-  return isSafeSegment(candidate) ? candidate : null;
-}
-
-export function addRepo(file: ReposFile, entry: RepoEntry): EditResult {
+export function addRepo(file: ReposFile, entry: RepoEntryInput): EditResult {
   if (file.repos.length >= MAX_REPOS) {
     return { ok: false, error: `A workspace may hold at most ${MAX_REPOS} repos.` };
   }
-  const next: ReposFile = { version: REPOS_VERSION, repos: [...file.repos, entry] };
+  const resolved = resolveRepoEntry(entry);
+  if (resolved === null) {
+    return { ok: false, error: `Could not derive a directory name from ${JSON.stringify(entry.url)}.` };
+  }
+  const next: ReposFile = { version: REPOS_VERSION, repos: [...file.repos, resolved] };
   const problem = validateRepoSet(next.repos);
   return problem === null ? { ok: true, value: next } : { ok: false, error: problem };
 }
@@ -183,6 +233,28 @@ export function removeRepo(file: ReposFile, dir: string): EditResult {
   if (repos.length === file.repos.length) {
     return { ok: false, error: `No repo named ${JSON.stringify(dir)} is in ${REPOS_FILE}.` };
   }
+  return { ok: true, value: { version: REPOS_VERSION, repos } };
+}
+
+/**
+ * Change one repo's base branch in place; `null` returns it to the default.
+ *
+ * The entry keeps its position and its inferred-`dir` flag, so the commit is
+ * the one-line diff a branch change should be.
+ */
+export function setRepoBranch(file: ReposFile, dir: string, branch: string | null): EditResult {
+  const index = file.repos.findIndex((repo) => repo.dir === dir);
+  if (index === -1) {
+    return { ok: false, error: `No repo named ${JSON.stringify(dir)} is in ${REPOS_FILE}.` };
+  }
+  const trimmed = branch?.trim() ?? "";
+  if (trimmed.length > 300 || trimmed.startsWith("-")) {
+    return { ok: false, error: `${JSON.stringify(trimmed)} is not a usable branch name.` };
+  }
+  const { branch: _previous, ...rest } = file.repos[index];
+  const next = trimmed.length === 0 ? rest : { ...rest, branch: trimmed };
+  const repos = [...file.repos];
+  repos[index] = next;
   return { ok: true, value: { version: REPOS_VERSION, repos } };
 }
 

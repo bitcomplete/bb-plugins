@@ -1,0 +1,45 @@
+{
+  "name": "bb-plugin-diff-explorer",
+  "version": "0.1.4",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "bb": ">=0.44",
+    "bbPluginSdk": ">=0.5.29"
+  },
+  "bb": {
+    "name": "Diff Explorer",
+    "description": "Scrollable diff of every changed file, with go to definition.",
+    "branding": {
+      "icon": "FileDiff"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "host": "./host.ts",
+    "skills": [
+      "skills"
+    ]
+  },
+  "dependencies": {
+    "esbuild": "0.28.2",
+    "monaco-editor": "0.57.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "postinstall": "node scripts/build-monaco.mjs",
+    "build:monaco": "node scripts/build-monaco.mjs",
+    "test": "esbuild host.test.ts app.test.ts server.test.ts file-models.test.ts commit.test.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node --test dist/host.test.js dist/app.test.js dist/server.test.js dist/file-models.test.js dist/commit.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "packageManager": "pnpm@10.34.6",
+  "overrides": {
+    "dompurify": "3.4.16"
+  }
+}

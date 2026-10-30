@@ -65,11 +65,34 @@ It is the **wrong** place for anything specific to one thread.
 The canonical `.bb` checkout lives outside your sandbox, so `git push` from
 `.bb` will not reach it. Instead:
 
-1. Commit inside `<workspace>/.bb` as normal.
+1. Edit the files under `<workspace>/.bb`.
 2. Call `workspace_publish_guidance`.
 
-That lands your commits on a `guidance-<thread>` branch in the canonical
-checkout, for a person to review and merge.
+It commits them host-side and lands them on a `guidance-<thread>` branch in
+the canonical checkout, for a person to review and merge. There is no need to
+commit inside `.bb` yourself.
+
+In the primary layout, `<workspace>/.bb` is a symlink to `<primary>/.bb`: the
+primary repo carries `.bb/` on its default branch, and the link shows you the
+copy on your own checkout of it, on this thread's branch. An edit under `.bb/`
+is therefore a working-tree change in the primary clone, and you have two ways
+to land it: commit it there and push it with the thread's code, or call
+`workspace_publish_guidance` to send only the `.bb/` changes on a
+`guidance-<thread>` branch cut from the default branch. `bb repos status` shows
+the `.bb` row as "Linked to"; the primary's row carries its change counts.
+
+## A shared checkout
+
+If your instruction block says **this checkout is shared**, another thread — a
+fork of yours, or the thread yours was forked from — is working in the same
+directory on the same branch. You cannot see it from inside the sandbox: its
+uncommitted edits look exactly like your own, and its commits land on the
+branch you are committing to.
+
+Treat that as a coordination problem, not a git problem. `bb repos status`
+names the other threads. Check with the user before committing, rebasing,
+resetting or pushing, and prefer leaving uncommitted work alone over "cleaning
+up" changes you did not make.
 
 ## Missing repos
 

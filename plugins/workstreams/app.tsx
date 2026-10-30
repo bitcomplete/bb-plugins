@@ -1,8 +1,7 @@
 // bb-plugin-workstreams — frontend entry.
 //
-// Two views of one fetch: the Map (map.tsx), a spatial picture of the grouping
-// hierarchy, and the Board (inbox.tsx), ordered by effort or next action. Everything either shows comes from
-// board_get; the server publishes "board-changed" after each scan and the board
+// The effort deck and All PRs lead; the Map (map.tsx), a spatial picture of the grouping hierarchy, and Efforts admin sit
+// behind More. The Map reads board_get; the server publishes "board-changed" after each scan and the board
 // refetches. Nothing here computes a count or a sentence — the server already
 // did, so the board and the CLI can never disagree.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -20,13 +19,20 @@ import { groupChildren, relativeTime, type Lens, type Lifecycle } from "./workst
 import { HOW_TAB, HowThisWorks } from "./howto";
 import { EASE_CSS } from "./layout";
 import { MapView } from "./map";
-import { InboxBoard } from "./inbox";
+import { EffortsView } from "./efforts-view";
 import { countApprovedOpenPrs } from "./approval-filter";
 import { Icon } from "@/components/ui/icon";
 import { Tip } from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { POINTER_CURSORS, cn } from "@/lib/utils";
-import { readLastView, storeLastView, viewFromSubPath, type ViewId } from "./view-preference";
+import { inventoryRoute, deckRoute, readLastView, storeLastView, viewFromSubPath, type ViewId } from "./view-preference";
+import { ThreadEffortControl } from "./thread-effort-control";
+import { InventoryNavView, useInventory } from "./inventory-screen";
+import { yourTurnRows } from "./inventory-view-model";
+import { DeckNavView } from "./deck-nav-view";
+import { PaletteBody, viewPaletteItems, WorkstreamsHeader, type HeaderProps, type HeaderTarget } from "./deck-screen";
+import { DeckDialog } from "./deck-flow";
+import { paletteMatch, type PaletteItem } from "./deck-view-model";
 
 export type Group = WireGroup;
 export type Cluster = Group["clusters"][number];
@@ -221,17 +227,50 @@ function Warnings({ warnings }: { warnings: string[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// The page: one fetch, two views of it.
+// The page: one fetch, three primary views of it.
 // ---------------------------------------------------------------------------
 
 /**
  * Each view has an explicit path so panel history keeps walking with browser
  * back and forward. The panel root redirects to the last view opened here.
+ * `V` cycles these outside the deck and All PRs.
  */
-const VIEWS = [
-  { id: "map", title: "Map", icon: "GridView" },
-  { id: "board", title: "Board", icon: "Columns2" },
-] as const;
+const CYCLE: readonly ViewId[] = ["deck", "inventory", "map", "efforts"];
+
+/** How fresh the board is, as the shared header says it on the views that read it. */
+function boardRead(board: Board | null, now: number): HeaderProps["read"] {
+  if (board === null) return { text: "Loading…", error: null };
+  return { error: null, text: `${board.lastScanAt === null ? "Not scanned" : `Scanned ${relativeTime(board.lastScanAt, now)}`} · ${board.lastPrCheckedAt === null
+    ? "GitHub not checked" : `GitHub ${relativeTime(board.lastPrCheckedAt, now)}`}`,
+  title: `Checkouts: ${board.lastScanAt === null ? "no scan yet" : new Date(board.lastScanAt).toLocaleString()}. GitHub PRs: ${board.lastPrCheckedAt === null
+    ? "no check yet" : new Date(board.lastPrCheckedAt).toLocaleString()}.` };
+}
+
+/** ⌘K on a view with no actions palette of its own: go to any view, or How this works. */
+function ViewsPalette({ open, view, onClose, onPick }: { open: boolean; view: HeaderProps["view"]; onClose(): void; onPick(target: HeaderTarget): void }) {
+  const [query, setQuery] = useState("");
+  const [highlight, setHighlight] = useState(0);
+  const opener = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    setQuery("");
+    setHighlight(0);
+    opener.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+  }, [open]);
+  const items = paletteMatch(viewPaletteItems(view), query);
+  const live = items.filter((item) => item.on);
+  const pick = (item: PaletteItem) => { onClose(); onPick(item.key as HeaderTarget); };
+  return <DeckDialog open={open} title="Go to" bare onClose={onClose} onReturn={() => { if (opener.current?.isConnected) opener.current.focus({ preventScroll: true }); }}>
+    {open ? <div onKeyDown={(event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setHighlight((current) => Math.max(0, Math.min(live.length - 1, current + (event.key === "ArrowDown" ? 1 : -1))));
+      } else if (event.key === "Enter" && !event.metaKey && !event.ctrlKey) { event.preventDefault(); const item = live[highlight]; if (item) pick(item); }
+      else if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); onClose(); }
+    }}><PaletteBody query={query} items={items} highlight={highlight} onQuery={(next) => { setQuery(next); setHighlight(0); }} onRun={pick} onHighlight={setHighlight} /></div>
+      : null}
+  </DeckDialog>;
+}
 
 /** Typing in a field is never a view switch. */
 function isEditable(target: EventTarget | null): boolean {
@@ -283,6 +322,18 @@ function ViewLayer({ leaving, children }: { leaving: boolean; children: ReactNod
 
 function WorkstreamsPage({ subPath }: { subPath: string }) {
   const { rpc, board, error, refetch } = useBoard();
+  useEffect(() => {
+    const poll = () => {
+      if (document.visibilityState === "visible") void rpc.call("pr_poll", null).catch(() => {});
+    };
+    poll();
+    document.addEventListener("visibilitychange", poll);
+    const timer = window.setInterval(poll, 45_000);
+    return () => {
+      document.removeEventListener("visibilitychange", poll);
+      window.clearInterval(timer);
+    };
+  }, [rpc]);
   const { prefs, update } = usePrefs();
   const navigate = useBbNavigate();
   const explicitView = viewFromSubPath(subPath);
@@ -296,9 +347,8 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
   }, [explicitView, navigate, view]);
   const approvedCount = useMemo(() => {
     if (board === null) return 0;
-    const local = board.groups.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.map((unit) => unit.pr)));
-    return countApprovedOpenPrs(view === "map" ? local : [...local, ...board.prInventory.entries.map((entry) => entry.pr)]);
-  }, [board, view]);
+    return countApprovedOpenPrs(board.groups.flatMap((group) => group.clusters.flatMap((cluster) => cluster.units.map((unit) => unit.pr))));
+  }, [board]);
   const now = useNow(30_000);
   const panel = experimental_useAppPanel();
   const openHow = useCallback(() => {
@@ -306,8 +356,7 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
       toast.error("Could not open How this works", { description: "Open BB's right panel and choose its How this works tab." });
     }
   }, [panel]);
-  // The selection all views share: a cluster focused on the Map is the
-  // row either Board opens on, and the circle the Map flies back to.
+  // The cluster focused on the Map, kept while another view shows so the Map flies back to it.
   const [focusTicket, setFocusTicket] = useState<string | null>(null);
 
   const [leaving, setLeaving] = useState<ViewId | null>(null);
@@ -320,116 +369,84 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
     return () => window.clearTimeout(timer);
   }, [view]);
 
-  // `V` toggles Map and Board from anywhere on the page. The Map's own keys are
+  const go = useCallback((target: HeaderTarget) => {
+    if (target === "how") openHow();
+    else navigate.toPluginPanel("board", { subPath: target });
+  }, [navigate, openHow]);
+  const [palette, setPalette] = useState(false);
+  const pageRef = useRef<HTMLDivElement | null>(null);
+
+  // `V` cycles the views from anywhere on the page. The Map's own keys are
   // + − 0 Esc Backspace and the arrows, and Tab stays focus navigation.
-  // `?` opens How this works from any view.
+  // `?` opens How this works from any view, and ⌘K the Go to palette. The effort deck and All PRs own their keys, ⌘K and `?` included.
   useEffect(() => {
+    if (view === "deck" || view === "inventory") return;
     const onKey = (event: KeyboardEvent) => {
+      const active = document.activeElement;
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "k") {
+        if (active && active !== document.body && !pageRef.current?.contains(active)) return;
+        event.preventDefault();
+        setPalette(true);
+        return;
+      }
       if (event.key !== "v" && event.key !== "V" && event.key !== "?") return;
-      if (event.metaKey || event.ctrlKey || event.altKey || isEditable(event.target)) return;
+      if (event.metaKey || event.ctrlKey || event.altKey || isEditable(event.target) || (event.target instanceof HTMLElement && event.target.closest("[role=dialog], [role=menu], [role=combobox]"))) return;
       event.preventDefault();
       if (event.key === "?") openHow();
-      else navigate.toPluginPanel("board", { subPath: view === "map" ? "board" : "map" });
+      else navigate.toPluginPanel("board", { subPath: CYCLE[(CYCLE.indexOf(view) + 1) % CYCLE.length]! });
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [navigate, openHow, view]);
 
-  const render = (id: ViewId) =>
-    id !== "map" ? (
-      board === null ? (
-        <div className="p-4">
-          <Notice>Loading the board…</Notice>
-        </div>
-      ) : (
-        <InboxBoard
-          dispatchControls
-          board={board}
-          prefs={prefs}
-          onPrefs={update}
-          focusTicket={focusTicket}
-          onFocusTicket={setFocusTicket}
-          onShowOnMap={() => navigate.toPluginPanel("board", { subPath: "map" })}
+  const read = boardRead(board, now);
+  const header = (id: Exclude<ViewId, "deck" | "inventory">, tools?: ReactNode) => <WorkstreamsHeader view={id} read={read} palette="go to" help="How this works"
+    tools={tools} onView={go} onPalette={() => setPalette(true)} onHelp={openHow} />;
+  // The Map keeps its Approved filter, Rescan, and scan notices beside More.
+  const boardTools = <>
+    <Tip label="Approved open PRs with scanned checkouts on the Map. Approval can still need comment, check, or branch work.">
+      <button type="button" aria-pressed={prefs.approvedOnly} disabled={board === null} onClick={() => update({ approvedOnly: !prefs.approvedOnly })}
+        className={cn("shrink-0 rounded-md border px-2 py-1 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50", prefs.approvedOnly ? "border-ring/50 bg-foreground/[0.08]" : "border-border text-muted-foreground")}>Approved {approvedCount}</button>
+    </Tip>
+    <Tip label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}>
+      <button
+        type="button"
+        disabled={board?.scanning === true}
+        aria-label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}
+        onClick={() => {
+          rpc.call("board_refresh").then(refetch, refetch);
+        }}
+        className="flex h-7 shrink-0 items-center gap-1.5 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-60"
+      >
+        <Icon
+          name={board?.scanning === true ? "Loading" : "ArrowReloadHorizontal"}
+          className={cn("size-3.5", board?.scanning === true && "animate-spin")}
         />
-      )
+        {board?.scanning === true ? "Scanning…" : "Rescan"}
+      </button>
+    </Tip>
+    {board === null ? null : <Warnings warnings={board.warnings} />}
+  </>;
+
+  const render = (id: ViewId) =>
+    id === "deck" ? (
+      <DeckNavView openCard={deckRoute(subPath)} onView={go} />
+    ) : id === "inventory" ? (
+      <InventoryNavView onView={go} openPr={inventoryRoute(subPath)} />
+    ) : id === "efforts" ? (
+      <>{header("efforts")}<EffortsView board={board} /></>
     ) : (
-      <MapView
+      <>{header("map", boardTools)}<MapView
         board={board}
         prefs={prefs}
         onPrefs={update}
         selected={focusTicket}
         onSelect={setFocusTicket}
-      />
+      /></>
     );
 
   return (
-    <div className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
-      <header className="flex min-h-10 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border/60 px-3 py-1">
-        {/* Map and Board share one fetch. */}
-        <div role="tablist" aria-label="Workstreams views" className="flex shrink-0 items-center gap-3">
-          {VIEWS.map((entry) => (
-            <button
-              key={entry.id}
-              type="button"
-              role="tab"
-              aria-selected={view === entry.id}
-              title={`${entry.title} (V toggles)`}
-              onClick={() => navigate.toPluginPanel("board", { subPath: entry.id })}
-              className={cn(
-                "text-xs transition-colors duration-150",
-                view === entry.id
-                  ? "font-medium text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {entry.title}
-            </button>
-          ))}
-        </div>
-        <Tip label={`Approved open PRs ${view === "map" ? "with scanned checkouts on the Map" : "across tracked checkouts and the PR inventory"}. Approval can still need comment, check, or branch work.`}>
-          <button type="button" aria-pressed={prefs.approvedOnly} disabled={board === null} onClick={() => update({ approvedOnly: !prefs.approvedOnly })}
-            className={cn("shrink-0 rounded-md border px-2 py-1 text-[11.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50", prefs.approvedOnly ? "border-ring/50 bg-foreground/[0.08]" : "border-border text-muted-foreground")}>Approved {approvedCount}</button>
-        </Tip>
-        {board === null ? (
-          <p className="truncate text-[11px] text-muted-foreground">Loading…</p>
-        ) : (
-          <Tip label={board.lastScanAt === null ? "No scan has finished yet" : `Last scan: ${new Date(board.lastScanAt).toLocaleString()}`}>
-            <p tabIndex={0} className="truncate text-[11px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              {board.lastScanAt === null ? "Never scanned" : `scanned ${relativeTime(board.lastScanAt, now)}`}
-            </p>
-          </Tip>
-        )}
-        <span className="flex-1" />
-        <Tip label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}>
-          <button
-            type="button"
-            disabled={board?.scanning === true}
-            aria-label={board?.scanning === true ? "A scan is running" : "Rescan every checkout now"}
-            onClick={() => {
-              rpc.call("board_refresh").then(refetch, refetch);
-            }}
-            className="flex h-7 items-center gap-1.5 rounded-full px-2 text-[11px] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-60"
-          >
-            <Icon
-              name={board?.scanning === true ? "Loading" : "ArrowReloadHorizontal"}
-              className={cn("size-3.5", board?.scanning === true && "animate-spin")}
-            />
-            {board?.scanning === true ? "Scanning…" : "Rescan"}
-          </button>
-        </Tip>
-        {board === null ? null : <Warnings warnings={board.warnings} />}
-        <Tip label="How this works (?)">
-          <button
-            type="button"
-            aria-label="How this works (?)"
-            onClick={openHow}
-            className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.06] hover:text-foreground"
-          >
-            <Icon name="Info" className="size-4" />
-          </button>
-        </Tip>
-      </header>
-
+    <div ref={pageRef} className={cn("flex h-full min-h-0 flex-1 flex-col", POINTER_CURSORS)}>
       {error === null ? null : (
         <p role="alert" className="shrink-0 px-3 pt-2 text-sm text-destructive">
           {error}
@@ -437,14 +454,15 @@ function WorkstreamsPage({ subPath }: { subPath: string }) {
       )}
 
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-        {VIEWS.map((entry) =>
-          entry.id === view || entry.id === leaving ? (
-            <ViewLayer key={entry.id} leaving={entry.id !== view}>
-              {render(entry.id)}
+        {(["deck", "inventory", "map", "efforts"] as const).map((id) =>
+          id === view || id === leaving ? (
+            <ViewLayer key={id} leaving={id !== view}>
+              {render(id)}
             </ViewLayer>
           ) : null,
         )}
       </div>
+      <ViewsPalette open={palette} view={view} onClose={() => setPalette(false)} onPick={go} />
     </div>
   );
 }
@@ -471,9 +489,10 @@ function HowThisWorksTab() {
 }
 
 /**
- * The count beside "Workstreams" in BB's sidebar: agents waiting on you first
- * (rose), else agents running. Nothing at zero. Refetches on the same signal
- * the Board does, so it never polls.
+ * The counts beside "Workstreams" in BB's sidebar: agents waiting on you first
+ * (rose), else agents running, nothing at zero; then, in violet, your PRs
+ * where it's your turn, as All PRs lists them. Each refetches on the signals
+ * its view does, so neither polls.
  */
 function RunsBadge() {
   const rpc = useRpc<typeof rpcContract>();
@@ -483,13 +502,16 @@ function RunsBadge() {
   }, [rpc]);
   useEffect(refetch, [refetch]);
   useRealtime("board-changed", refetch);
+  const { view } = useInventory();
+  const turn = view ? yourTurnRows(view, Date.now()).length : null;
   const badge = badgeValue(open);
-  if (badge === null) return null;
-  const label = badge.needsYou
+  if (badge === null && turn === null) return null;
+  const label = badge?.needsYou
     ? `${badge.count} ${badge.count === 1 ? "agent needs" : "agents need"} you`
-    : `${badge.count} ${badge.count === 1 ? "agent" : "agents"} running`;
+    : badge ? `${badge.count} ${badge.count === 1 ? "agent" : "agents"} running` : "";
   return (
-    <span
+    <span className="inline-flex items-center gap-1">
+    {badge ? <span
       role="status"
       aria-label={label}
       title={label}
@@ -499,11 +521,21 @@ function RunsBadge() {
       )}
     >
       {badge.count}
+    </span> : null}
+    {turn !== null ? <span role="status" aria-label={`Your turn on ${turn} ${turn === 1 ? "PR" : "PRs"}`}
+      title={`Your turn on ${turn} ${turn === 1 ? "PR" : "PRs"}`} className="rounded bg-violet-500/10 px-1 py-0.5 text-[10px] font-medium leading-none tabular-nums text-violet-800 dark:text-violet-200">
+      {turn > 99 ? "99+" : turn}
+    </span> : null}
     </span>
   );
 }
 
 export default definePluginApp((app) => {
+  app.composer.customize({
+    id: "thread-effort",
+    scopes: ["thread"],
+    banners: [{ id: "thread-effort-control", chrome: "bare", component: ThreadEffortControl }],
+  });
   app.slots.navPanel({
     id: "board",
     title: "Workstreams",

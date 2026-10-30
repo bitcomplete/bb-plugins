@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { INSTRUCTIONS_MAX, describeRepo, findWorkspaceRepo, formatInstructions, readyRepos, type WorkspaceManifest } from "./layout.js";
+import {
+  INSTRUCTIONS_MAX,
+  describeRepo,
+  findWorkspaceRepo,
+  formatInstructions,
+  readyRepos,
+  withSharedNotice,
+  type WorkspaceManifest,
+} from "./layout.js";
 
 function manifest(overrides: Partial<WorkspaceManifest> = {}): WorkspaceManifest {
   return {
@@ -9,7 +17,9 @@ function manifest(overrides: Partial<WorkspaceManifest> = {}): WorkspaceManifest
     threadId: "thr_1",
     projectId: "proj_1",
     branchName: "dylan/fix-the-thing",
+    layout: "standalone",
     projectSourcePath: "/home/me/projects/acme",
+    definitionBase: null,
     createdAt: 0,
     repos: [
       {
@@ -159,5 +169,30 @@ describe("helpers", () => {
     });
     expect(line).toContain("MISSING");
     expect(line).toContain("no such branch");
+  });
+});
+
+describe("withSharedNotice", () => {
+  it("adds nothing when the thread is alone in its checkout", () => {
+    const text = formatInstructions(manifest());
+    expect(withSharedNotice(text, { others: 0, branchName: "b" })).toBe(text);
+  });
+
+  it("names the branch the other thread is committing to", () => {
+    const notice = withSharedNotice("block", { others: 1, branchName: "bb/thing" });
+    expect(notice.startsWith("block\n\n")).toBe(true);
+    expect(notice).toContain("Another thread is");
+    expect(notice).toContain("`bb/thing`");
+  });
+
+  it("counts more than one", () => {
+    expect(withSharedNotice("block", { others: 3, branchName: "b" })).toContain("3 other threads are");
+  });
+
+  it("keeps the warning when the block is already at the ceiling", () => {
+    const long = Array.from({ length: 400 }, (_, index) => `| repo-${index} | branch | /path |`).join("\n");
+    const notice = withSharedNotice(long.slice(0, INSTRUCTIONS_MAX), { others: 1, branchName: "b" });
+    expect(notice.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
+    expect(notice).toContain("This checkout is shared.");
   });
 });

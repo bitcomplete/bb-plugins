@@ -104,3 +104,50 @@ describe("plain workstreams CLI scan health", () => {
     await harness.lifecycle.dispose();
   });
 });
+
+describe("compact workstreams CLI", () => {
+  it("pages stable ticket clusters and reports the next offset", async () => {
+    const units = [101, 102, 103].map((number) => ({ ...checkout, path: `/p/quill-abc-${number}`, dirName: `quill-abc-${number}`, branch: `abc-${number}` }));
+    const { harness } = await load(units);
+    await harness.runCli(["refresh"]);
+    const first = await harness.runCli(["list", "--compact", "--limit", "2"]);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toContain("clusters: 3; showing 2 at offset 0");
+    expect(first.stdout).toContain("Next page: bb workstreams list --compact --limit 2 --offset 2");
+    const second = await harness.runCli(["list", "--compact", "--limit", "2", "--offset", "2"]);
+    expect(second.stdout).toContain("ABC-103");
+    expect(second.stdout).not.toContain("ABC-101");
+    await harness.lifecycle.dispose();
+  });
+
+  it("emits the compact JSON schema and caps pages at 50", async () => {
+    const { harness } = await load([checkout]);
+    await harness.runCli(["refresh"]);
+    const result = await harness.runCli(["list", "--compact", "--json", "--limit", "50"]);
+    const parsed = JSON.parse(result.stdout);
+    expect(Object.keys(parsed).sort()).toEqual(["items", "limit", "nextOffset", "offset", "scan", "total", "warningCount"].sort());
+    expect(parsed.items[0]).toMatchObject({ ticket: "ABC-101", lifecycle: expect.any(String), summary: expect.any(String), groupPath: expect.any(Array) });
+    expect(parsed.items[0].groupPath[0]).toMatchObject({ name: expect.any(String), key: expect.any(String), level: expect.any(String) });
+    expect((await harness.runCli(["list", "--compact", "--limit", "51"])).exitCode).not.toBe(0);
+    expect((await harness.runCli(["list", "--limit", "2"])).exitCode).not.toBe(0);
+    expect((await harness.runCli(["list", "--compact", "--limit"])).exitCode).not.toBe(0);
+    expect((await harness.runCli(["list", "--compact", "--offset"])).exitCode).not.toBe(0);
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps legacy plain and full JSON outputs unchanged by default", async () => {
+    const { harness } = await load([checkout]);
+    await harness.runCli(["refresh"]);
+    const plain = await harness.runCli(["list"]);
+    const plainAgain = await harness.runCli(["list"]);
+    expect(plain.stdout).toBe(plainAgain.stdout);
+    expect(plain.stdout).toContain("[effort]");
+    expect(plain.stdout).toContain("ABC-101");
+    expect(plain.stdout).toContain("unverified");
+    const json = await harness.runCli(["list", "--json"]);
+    const jsonAgain = await harness.runCli(["list", "--json"]);
+    expect(json.stdout).toBe(jsonAgain.stdout);
+    expect(Object.keys(JSON.parse(json.stdout))).toEqual(expect.arrayContaining(["groups", "prInventory", "threadCoverage"]));
+    await harness.lifecycle.dispose();
+  });
+});

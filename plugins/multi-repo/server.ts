@@ -27,12 +27,14 @@ import {
   type CacheEntry,
   type RepoPullRequest,
   type RepoRequest,
+  type RepoSeed,
   type RepoTarget,
 } from "./contract.js";
 import {
   describeRepo,
   formatInstructions,
   readyRepos,
+  withSharedNotice,
   type WorkspaceManifest,
   type WorkspaceRepo,
 } from "./layout.js";
@@ -45,10 +47,14 @@ import {
   findRepo,
   parseReposFile,
   removeRepo,
+  resolveRepoEntry,
   serializeReposFile,
+  setRepoBranch,
+  validateRepoSet,
+  type RepoEntry,
   type ReposFile,
 } from "./repos.js";
-import { PROJECT_SOURCE_DIR, normalizeRemoteUrl } from "./paths.js";
+import { PROJECT_SOURCE_DIR, normalizeRemoteUrl, type ProjectLayout } from "./paths.js";
 import {
   CACHE_BACKGROUND_MS,
   CACHE_FRESH_MS,
@@ -57,12 +63,25 @@ import {
   MAX_PATCH_BYTES,
   PR_CACHE_TTL_MS,
   REPOS_CHANGED_CHANNEL,
+  THREAD_CHANGES_CHANNEL,
 } from "./shared.js";
 
 const CREATE_TIMEOUT_MS = 60 * 60 * 1000;
 const REMOVE_TIMEOUT_MS = 10 * 60 * 1000;
 const READ_TIMEOUT_MS = 90_000;
 const ACTION_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * What this plugin needs off `threads.get({ include: "environment" })`.
+ * Structural on purpose — the SDK's shape is much wider and none of the rest
+ * of it is any of this plugin's business.
+ */
+interface ThreadEnvironment {
+  id: string;
+  hostId: string;
+  environmentProviderId: string | null;
+  environmentProviderInstanceKey: string | null;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -106,6 +125,33 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
        fetched_at INTEGER NOT NULL,
        PRIMARY KEY (thread_id, dir)
      )`,
+    // Threads are many-to-one with workspaces, because environments are
+    // many-to-one with threads: a fork reuses its source thread's environment,
+    // so `create()` never runs for it and no second workspace exists. Resolving
+    // by `workspaces.thread_id` made every thread-scoped surface go blank for a
+    // fork. This table is what a thread now resolves through, and the backfill
+    // keeps every workspace written before it bound to its creating thread.
+    //
+    // It holds no fact core does not already own — core knows which environment
+    // a thread runs on. It exists because `contributeInstructions` is
+    // synchronous and asking core is not, so the answer has to be on hand
+    // locally before a thread's first turn.
+    `CREATE TABLE IF NOT EXISTS workspace_threads (
+       thread_id TEXT PRIMARY KEY,
+       host_id TEXT NOT NULL,
+       path_key TEXT NOT NULL,
+       bound_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS workspace_threads_workspace ON workspace_threads (host_id, path_key)`,
+    `INSERT OR IGNORE INTO workspace_threads (thread_id, host_id, path_key, bound_at)
+       SELECT thread_id, host_id, path_key, created_at FROM workspaces`,
+    // The project-source layout this workspace was provisioned from. Existing
+    // rows default to `standalone`, which is what they are; a workspace whose
+    // layout no longer matches the project's is one that predates an adopt.
+    `ALTER TABLE workspaces ADD COLUMN layout TEXT NOT NULL DEFAULT 'standalone'`,
+    // The default-branch commit `.bb/` was materialized from, so guidance
+    // publish can warn when `.bb/` moved on the default branch since.
+    `ALTER TABLE workspaces ADD COLUMN definition_base TEXT`,
   ]);
 
   const host = bb.hosts.experimental_client({
@@ -133,14 +179,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   function saveManifest(manifest: WorkspaceManifest): void {
     db.prepare(
       `INSERT INTO workspaces
-         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, repos, instructions, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (host_id, path_key, thread_id, project_id, root, branch_name, project_source_path, layout, definition_base, repos, instructions, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (host_id, path_key) DO UPDATE SET
          thread_id = excluded.thread_id,
          project_id = excluded.project_id,
          root = excluded.root,
          branch_name = excluded.branch_name,
          project_source_path = excluded.project_source_path,
+         layout = excluded.layout,
+         definition_base = excluded.definition_base,
          repos = excluded.repos,
          instructions = excluded.instructions,
          created_at = excluded.created_at`,
@@ -152,6 +200,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       manifest.root,
       manifest.branchName,
       manifest.projectSourcePath,
+      manifest.layout,
+      manifest.definitionBase,
       JSON.stringify(manifest.repos),
       formatInstructions(manifest),
       manifest.createdAt,
@@ -167,7 +217,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         projectId: String(row.project_id),
         root: String(row.root),
         branchName: String(row.branch_name),
+        layout: row.layout === "primary" ? "primary" : "standalone",
         projectSourcePath: String(row.project_source_path),
+        definitionBase: typeof row.definition_base === "string" ? row.definition_base : null,
         repos: JSON.parse(String(row.repos)) as WorkspaceRepo[],
         createdAt: Number(row.created_at),
       };
@@ -176,35 +228,205 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
   }
 
+  /** Where a workspace lives: the one key every read and binding is written against. */
+  interface WorkspaceKey {
+    hostId: string;
+    pathKey: string;
+  }
+
+  /**
+   * Attach a thread to a workspace.
+   *
+   * Many-to-one deliberately. The alternative — one workspace per thread — is
+   * what core already declined to do for forks, and a plugin cannot provision
+   * a second checkout for an environment core considers provisioned.
+   */
+  function bindThread(threadId: string, key: WorkspaceKey): void {
+    db.prepare(
+      `INSERT INTO workspace_threads (thread_id, host_id, path_key, bound_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (thread_id) DO UPDATE SET
+         host_id = excluded.host_id,
+         path_key = excluded.path_key,
+         bound_at = excluded.bound_at`,
+    ).run(threadId, key.hostId, key.pathKey, Date.now());
+    unresolved.delete(threadId);
+  }
+
   /** Synchronous on purpose — `contributeInstructions` cannot await. */
   function manifestForThread(threadId: string): WorkspaceManifest | null {
     const row = db
-      .prepare(`SELECT * FROM workspaces WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1`)
+      .prepare(
+        `SELECT w.* FROM workspace_threads b
+           JOIN workspaces w ON w.host_id = b.host_id AND w.path_key = b.path_key
+          WHERE b.thread_id = ?`,
+      )
       .get(threadId) as Record<string, unknown> | undefined;
     return row === undefined ? null : rowToManifest(row);
   }
 
+  function manifestForKey(key: WorkspaceKey): WorkspaceManifest | null {
+    const row = db
+      .prepare(`SELECT * FROM workspaces WHERE host_id = ? AND path_key = ?`)
+      .get(key.hostId, key.pathKey) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToManifest(row);
+  }
+
+  /** The other threads working in one workspace, oldest binding first. */
+  function sharingThreads(key: WorkspaceKey, exceptThreadId: string): string[] {
+    const rows = db
+      .prepare(
+        `SELECT thread_id FROM workspace_threads
+          WHERE host_id = ? AND path_key = ? AND thread_id <> ?
+          ORDER BY bound_at ASC LIMIT 16`,
+      )
+      .all(key.hostId, key.pathKey, exceptThreadId) as { thread_id: string }[];
+    return rows.map((row) => row.thread_id);
+  }
+
+  /**
+   * Threads a lookup has already failed for, and when.
+   *
+   * The file opener calls `workspace` for every file bb opens anywhere, so the
+   * miss path is the hot one and it is the path that costs an SDK round trip.
+   * Short-lived on purpose: a thread whose `create()` is still running is a
+   * miss that becomes a hit, and `bindThread` clears the entry the moment it
+   * does.
+   */
+  const unresolved = new Map<string, number>();
+  const UNRESOLVED_TTL_MS = 60_000;
+
+  /** In-flight `bindInheritedWorkspace` walks, one per thread. */
+  const resolving = new Map<string, Promise<WorkspaceManifest | null>>();
+
+  /**
+   * The workspace a thread is working in, binding it first when it has
+   * inherited one it was never bound to.
+   *
+   * Every asynchronous path goes through this rather than `manifestForThread`:
+   * a fork's first surface — a panel, a tool call, `bb repos status` — is
+   * usually what discovers the binding, and discovering it means persisting it
+   * so the synchronous instruction path can read it on the next turn.
+   */
+  async function resolveManifest(threadId: string): Promise<WorkspaceManifest | null> {
+    const bound = manifestForThread(threadId);
+    if (bound !== null) return bound;
+    const failedAt = unresolved.get(threadId);
+    if (failedAt !== undefined && Date.now() - failedAt < UNRESOLVED_TTL_MS) return null;
+    // One walk per thread at a time: a panel load asks four of these questions
+    // at once, and they would otherwise be four identical SDK walks racing to
+    // write the same binding.
+    const running = resolving.get(threadId);
+    if (running !== undefined) return running;
+    const walk = bindInheritedWorkspace(threadId)
+      .then((manifest) => {
+        if (manifest === null) unresolved.set(threadId, Date.now());
+        return manifest;
+      })
+      .finally(() => resolving.delete(threadId));
+    resolving.set(threadId, walk);
+    return walk;
+  }
+
+  /**
+   * Bind a thread to the workspace its environment already has.
+   *
+   * No lineage is involved, deliberately. Core tells us which environment the
+   * thread runs on and which instance key that environment was provisioned
+   * under — and that key *is* this table's `path_key`, so the answer is one
+   * primary-key read. Walking `sourceThreadId` back through a fork chain would
+   * reach the same row the long way round, and would get a fork that was given
+   * its own environment wrong.
+   */
+  async function bindInheritedWorkspace(threadId: string): Promise<WorkspaceManifest | null> {
+    let environment: ThreadEnvironment | null;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId, include: "environment" });
+      environment = "environment" in thread ? thread.environment ?? null : null;
+    } catch (error) {
+      bb.log.debug(`Could not read thread ${threadId}: ${errorMessage(error)}`);
+      return null;
+    }
+    // No environment yet, or someone else's: nothing of ours to attach to.
+    if (environment === null || environment.environmentProviderId !== ENVIRONMENT_PROVIDER_ID) return null;
+    // Mirrors how core derives the `pathKey` it hands `create()`.
+    const key = {
+      hostId: environment.hostId,
+      pathKey: environment.environmentProviderInstanceKey ?? environment.id,
+    };
+    const manifest = manifestForKey(key);
+    if (manifest === null) return null;
+    bindThread(threadId, key);
+    return manifest;
+  }
+
+  /**
+   * The generated block, as this thread should read it.
+   *
+   * Stored text plus one thing `create()` could not know: whether someone else
+   * is in the same directory by now.
+   */
   function instructionsForThread(threadId: string): string | null {
     const row = db
-      .prepare(`SELECT instructions FROM workspaces WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1`)
-      .get(threadId) as { instructions?: unknown } | undefined;
+      .prepare(
+        `SELECT w.instructions, w.host_id, w.path_key, w.branch_name FROM workspace_threads b
+           JOIN workspaces w ON w.host_id = b.host_id AND w.path_key = b.path_key
+          WHERE b.thread_id = ?`,
+      )
+      .get(threadId) as
+      | { instructions?: unknown; host_id: string; path_key: string; branch_name: string }
+      | undefined;
     const text = row?.instructions;
-    return typeof text === "string" && text.length > 0 ? text : null;
+    if (row === undefined || typeof text !== "string" || text.length === 0) return null;
+    const others = sharingThreads({ hostId: row.host_id, pathKey: row.path_key }, threadId);
+    return withSharedNotice(text, { others: others.length, branchName: row.branch_name });
   }
 
   function forgetWorkspace(hostId: string, pathKey: string): void {
-    const row = db
-      .prepare(`SELECT thread_id FROM workspaces WHERE host_id = ? AND path_key = ?`)
-      .get(hostId, pathKey) as { thread_id?: unknown } | undefined;
+    const rows = db
+      .prepare(`SELECT thread_id FROM workspace_threads WHERE host_id = ? AND path_key = ?`)
+      .all(hostId, pathKey) as { thread_id: string }[];
+    db.prepare(`DELETE FROM workspace_threads WHERE host_id = ? AND path_key = ?`).run(hostId, pathKey);
     db.prepare(`DELETE FROM workspaces WHERE host_id = ? AND path_key = ?`).run(hostId, pathKey);
-    if (typeof row?.thread_id === "string") {
+    for (const row of rows) {
       db.prepare(`DELETE FROM pr_cache WHERE thread_id = ?`).run(row.thread_id);
+      // A thread whose workspace just went away may still inherit another
+      // one — let it ask again rather than serving it a cached miss.
+      unresolved.delete(row.thread_id);
     }
   }
 
   function changed(): void {
     bb.realtime.publish(REPOS_CHANGED_CHANNEL, { at: Date.now() });
   }
+
+  /**
+   * One thread's working tree may have moved.
+   *
+   * `pullRequests` says whether the `gh`-backed half moved too, so a routine
+   * turn-finished signal does not make every open panel shell out to `gh`.
+   */
+  function threadChanged(threadId: string, options: { pullRequests: boolean } = { pullRequests: false }): void {
+    bb.realtime.publish(THREAD_CHANGES_CHANNEL, {
+      at: Date.now(),
+      threadId,
+      pullRequests: options.pullRequests,
+    });
+  }
+
+  /**
+   * A finished turn is the moment the diff is worth looking at again.
+   *
+   * Nothing in bb tells a panel that files on a machine changed, and every
+   * other publisher on these channels fires on environment or repo-set edits
+   * only — which is why an open Changes tab used to keep showing whatever was
+   * on disk when it mounted. The panel also polls while it is open; this is
+   * what makes a finished turn land without waiting for the next tick.
+   */
+  bb.events.on("thread.idle", ({ thread }) => {
+    if (manifestForThread(thread.id) === null) return;
+    threadChanged(thread.id);
+  });
 
   /* ------------------------------------------------- the project source */
 
@@ -234,6 +456,116 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   }
 
   /**
+   * True when a workspace was built from a standalone `.bb` and the project's
+   * source is now a primary checkout — i.e. a machine has run adopt since.
+   *
+   * Such a workspace keeps publishing guidance to the old canonical checkout
+   * until it ends; the branch it publishes has to be re-applied to the primary
+   * by hand. Every surface that describes the workspace says so.
+   */
+  async function predatesAdopt(manifest: WorkspaceManifest): Promise<boolean> {
+    if (manifest.layout !== "standalone") return false;
+    try {
+      const current = await projectSource(manifest.projectId);
+      return current !== null && current.path !== manifest.projectSourcePath;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The adopt flow behind both the RPC and `bb repos adopt`.
+   *
+   * Runs host-side on the project's machine, then, when the primary already
+   * carries `.bb/`, re-points `project_sources.path` in place. That is the
+   * whole of Case A: no new project, no store re-key, no respawn.
+   */
+  async function performAdopt(
+    projectId: string,
+    primary: string,
+    path: string,
+    openPullRequest: boolean,
+  ): Promise<{
+    status: "already" | "pull-request" | "failed";
+    message: string;
+    prUrl: string | null;
+    warnings: string[];
+    primaryPath: string;
+    defaultBranch: string | null;
+    repointed: boolean;
+  }> {
+    const location = await projectSource(projectId);
+    if (location === null) {
+      return {
+        status: "failed",
+        message: "This project has no checkout on any machine.",
+        prUrl: null,
+        warnings: [],
+        primaryPath: path,
+        defaultBranch: null,
+        repointed: false,
+      };
+    }
+    const branch = `bb/adopt-bb-${Date.now().toString(36)}`;
+    let result: {
+      status: "already" | "pull-request" | "failed";
+      message: string;
+      prUrl: string | null;
+      warnings: string[];
+      primaryPath: string;
+      defaultBranch: string | null;
+    };
+    try {
+      result = await host.call(
+        "adoptProjectSource",
+        {
+          standalonePath: location.path,
+          primaryUrl: primary,
+          primaryPath: path,
+          branch,
+          openPullRequest,
+        },
+        { hostId: location.hostId, timeoutMs: CREATE_TIMEOUT_MS },
+      );
+    } catch (error) {
+      return {
+        status: "failed",
+        message: errorMessage(error),
+        prUrl: null,
+        warnings: [],
+        primaryPath: path,
+        defaultBranch: null,
+        repointed: false,
+      };
+    }
+
+    let repointed = false;
+    if (result.status === "already") {
+      try {
+        const project = await bb.sdk.projects.get({ projectId });
+        const source = project.sources.find(
+          (entry) => entry.type === "local_path" && entry.hostId === location.hostId && entry.path === location.path,
+        );
+        if (source !== undefined) {
+          await bb.sdk.projects.sources.update({
+            projectId,
+            sourceId: source.id,
+            type: "local_path",
+            path: result.primaryPath,
+          });
+          repointed = true;
+          changed();
+        } else {
+          result.warnings.push("The project source row could not be found; re-point it by hand.");
+        }
+      } catch (error) {
+        result.warnings.push(`Could not re-point the project source: ${errorMessage(error)}`);
+      }
+    }
+    return { ...result, repointed };
+  }
+
+  /**
    * Read the repo set.
    *
    * `bootstrap` is true only where an absent `.git` genuinely should be
@@ -245,17 +577,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     location: SourceLocation,
     options: { bootstrap: boolean },
     signal?: AbortSignal,
-  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null }> {
+  ): Promise<{ text: string | null; file: ReposFile | null; error: string | null; layout: ProjectLayout; remote: string | null }> {
     const prepared = await host.call(
       "prepareProjectSource",
       { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: options.bootstrap },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
-    if (prepared.reposJson === null) return { text: null, file: EMPTY_REPOS, error: null };
+    if (prepared.reposJson === null) {
+      return { text: null, file: EMPTY_REPOS, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote };
+    }
     const parsed = parseReposFile(prepared.reposJson);
     return parsed.ok
-      ? { text: prepared.reposJson, file: parsed.value, error: null }
-      : { text: prepared.reposJson, file: null, error: parsed.error };
+      ? { text: prepared.reposJson, file: parsed.value, error: null, layout: prepared.layout ?? "standalone", remote: prepared.remote }
+      : { text: prepared.reposJson, file: null, error: parsed.error, layout: prepared.layout ?? "standalone", remote: prepared.remote };
   }
 
   async function writeRepoSet(
@@ -263,10 +597,11 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     file: ReposFile,
     message: string,
     signal?: AbortSignal,
+    layout: ProjectLayout = "standalone",
   ): Promise<void> {
     const result = await host.call(
       "writeProjectSourceRepos",
-      { path: location.path, reposJson: serializeReposFile(file), message },
+      { path: location.path, reposJson: serializeReposFile(file), message, layout },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
     // The file is written either way, but an uncommitted change is not shared
@@ -276,6 +611,93 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       throw new Error(`${REPOS_FILE} was written but not committed: ${result.message}`);
     }
     changed();
+  }
+
+  /**
+   * The three structured edits, shared by the CLI, the agent tools and the
+   * panel so each surface commits the same one-line diff with the same
+   * message. A failure carries a code the CLI can surface and a sentence the
+   * other two can show as it is.
+   */
+  type EditOutcome = { ok: true; dir: string } | { ok: false; code: string; error: string };
+
+  async function addRepoToProject(
+    location: SourceLocation,
+    seed: RepoSeed,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: true }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const entry = resolveRepoEntry(seed);
+    if (entry === null) {
+      return {
+        ok: false,
+        code: "dir_required",
+        error: `Could not derive a directory name from ${seed.url}. Give the repo an explicit directory name.`,
+      };
+    }
+    const clash = findRepo(current.file, { dir: entry.dir, url: seed.url });
+    if (clash !== null) {
+      return { ok: false, code: "duplicate_repo", error: `${clash.dir} is already in the repo set (${clash.url}).` };
+    }
+    const edited = addRepo(current.file, entry);
+    if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
+    await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout);
+    return { ok: true, dir: entry.dir };
+  }
+
+  async function removeRepoFromProject(
+    location: SourceLocation,
+    dir: string,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: false }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const edited = removeRepo(current.file, dir);
+    if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
+    await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout);
+    return { ok: true, dir };
+  }
+
+  async function setProjectRepoBranch(
+    location: SourceLocation,
+    dir: string,
+    branch: string | null,
+    signal?: AbortSignal,
+  ): Promise<EditOutcome> {
+    const current = await readRepoSet(location, { bootstrap: false }, signal);
+    if (current.file === null) {
+      return { ok: false, code: "invalid_repos_json", error: current.error ?? `${REPOS_FILE} could not be read.` };
+    }
+    const edited = setRepoBranch(current.file, dir, branch);
+    if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
+    const next = edited.value.repos.find((repo) => repo.dir === dir)?.branch;
+    const message = next === undefined ? `Use the default branch for ${dir}` : `Base ${dir} on ${next}`;
+    await writeRepoSet(location, edited.value, message, signal, current.layout);
+    return { ok: true, dir };
+  }
+
+  /**
+   * Resolve and validate a repo set a person assembled in the panel before a
+   * project existed to commit it to. Returns the first problem as the panel
+   * should show it, or the entries ready to seed a fresh `repos.json`.
+   */
+  function resolveSeed(seed: readonly RepoSeed[]): { ok: true; repos: RepoEntry[] } | { ok: false; error: string } {
+    if (seed.length > MAX_REPOS) return { ok: false, error: `A workspace may hold at most ${MAX_REPOS} repos.` };
+    const repos: RepoEntry[] = [];
+    for (const entry of seed) {
+      const resolved = resolveRepoEntry(entry);
+      if (resolved === null) {
+        return { ok: false, error: `Could not derive a directory name from ${entry.url}. Give it an explicit directory name.` };
+      }
+      repos.push(resolved);
+    }
+    const problem = validateRepoSet(repos);
+    return problem === null ? { ok: true, repos } : { ok: false, error: problem };
   }
 
   /**
@@ -371,21 +793,70 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         context.report.step("Looking for repos already on this machine");
         const mirrors = await localCheckouts(hostId, location.path, context.signal);
 
+        // A primary project's repo set is `repos.json`'s entries *plus* the
+        // primary, which is not repeated in the file. It is identified by the
+        // project source's own `origin`, so a source without one cannot say
+        // which clone is the primary.
+        const layout: ProjectLayout = prepared.layout ?? "standalone";
+
+        if (layout === "primary" && prepared.remote === null) {
+          return {
+            status: "failed",
+            message: `The project source is a primary repo with no origin. Add one so the primary can be identified, or make it a standalone .bb repo.`,
+          };
+        }
+        const primaryRequest =
+          layout === "primary" && prepared.remote !== null
+            ? primaryRepoRequest(prepared.remote)
+            : null;
+        if (layout === "primary" && primaryRequest === null) {
+          return {
+            status: "failed",
+            message: `Could not derive a directory name for the primary repo from ${prepared.remote}.`,
+          };
+        }
+
         if (repoSet.repos.length === 0) {
           const seeded = proposeRepoSet(mirrors);
-          if (seeded.repos.length === 0) {
+          if (seeded.repos.length === 0 && layout !== "primary") {
             return {
               status: "failed",
               message: `No repos are configured. Add some to ${REPOS_FILE} in ${location.path}, or run \`bb repos add <url>\`.`,
             };
           }
-          context.report.log(
-            `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
-              .map((repo) => repo.dir)
-              .join(", ")}`,
+          if (seeded.repos.length > 0) {
+            context.report.log(
+              `Seeding an empty repo set with ${seeded.repos.length} repo(s) found on this machine: ${seeded.repos
+                .map((repo) => repo.dir)
+                .join(", ")}`,
+            );
+            await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
+            repoSet = seeded;
+          }
+        }
+
+        const repoRequests = repoSet.repos.map(toRepoRequest);
+        if (
+          primaryRequest !== null &&
+          !repoRequests.some((repo) => normalizeRemoteUrl(repo.url) === normalizeRemoteUrl(primaryRequest.url))
+        ) {
+          repoRequests.push(primaryRequest);
+        }
+        // A repos.json entry with the same directory name as the primary but a
+        // different remote (a fork) would clone two repos into one directory
+        // and fail the provision; name it instead.
+        if (primaryRequest !== null) {
+          const clash = repoRequests.find(
+            (repo) =>
+              repo.dir.toLowerCase() === primaryRequest.dir.toLowerCase() &&
+              normalizeRemoteUrl(repo.url) !== normalizeRemoteUrl(primaryRequest.url),
           );
-          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal);
-          repoSet = seeded;
+          if (clash !== undefined) {
+            return {
+              status: "failed",
+              message: `repos.json has "${clash.dir}", which collides with the primary repo's directory "${primaryRequest.dir}". Rename the entry or set the primary's directory.`,
+            };
+          }
         }
 
         // Claim before writing. Two environments must never share a root, and
@@ -395,14 +866,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           return { status: "failed", message: `${root} is already in use by another environment.` };
         }
 
-        context.report.step(`Preparing ${repoSet.repos.length} repo(s)`);
+        context.report.step(`Preparing ${repoRequests.length} repo(s)`);
         const provisioned = await host.call(
           "provisionWorkspace",
           {
             operationId,
             pathKey: context.pathKey,
             projectSourcePath: location.path,
-            repos: repoSet.repos.map(toRepoRequest),
+            layout,
+            primaryDir: primaryRequest?.dir ?? null,
+            repos: repoRequests,
             branchName: context.suggestedBranchName,
             fetchTtlMs: CACHE_FRESH_MS,
             mirrors,
@@ -417,11 +890,14 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           threadId: context.thread.id,
           projectId: context.project.id,
           branchName: context.suggestedBranchName,
+          layout,
           projectSourcePath: location.path,
+          definitionBase: provisioned.definitionBase,
           repos: provisioned.repos,
           createdAt: Date.now(),
         };
         saveManifest(manifest);
+        bindThread(context.thread.id, manifest);
         changed();
 
         const failed = provisioned.repos.filter((repo) => repo.status === "failed");
@@ -506,6 +982,24 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   }
 
   /**
+   * The primary repo as a workspace repo request, from the project source's
+   * `origin`. It is not repeated in `repos.json`, so every primary project's
+   * workspace gets one clone of it in addition to the entries in the file.
+   */
+  function primaryRepoRequest(remote: string): RepoRequest | null {
+    const dir = dirFromUrl(remote);
+    if (dir === null || dir === PROJECT_SOURCE_DIR) return null;
+    return { dir, url: remote, branch: null };
+  }
+
+  /** The primary repo as the panel's read-only view (no `branch`). */
+  function primaryView(remote: string | null): { dir: string; url: string } | null {
+    if (remote === null) return null;
+    const request = primaryRepoRequest(remote);
+    return request === null ? null : { dir: request.dir, url: request.url };
+  }
+
+  /**
    * Turn discovered checkouts into a starting repo set.
    *
    * Only ever used when `repos.json` holds nothing: the alternative is handing
@@ -524,7 +1018,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       if (dir === null || dir === PROJECT_SOURCE_DIR) continue;
       if (repos.some((repo) => repo.dir === dir)) continue;
       seen.add(key);
-      repos.push({ dir, url: mirror.url });
+      repos.push({ dir, url: mirror.url, inferredDir: true });
     }
     return { version: 1, repos };
   }
@@ -546,12 +1040,45 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     return instructionsForThread(threadId);
   });
 
+  /**
+   * Bind a fork to the workspace it inherited, before its first turn.
+   *
+   * The lazy bind in `resolveManifest` is the backstop for every asynchronous
+   * path, but `contributeInstructions` is synchronous and can only read a
+   * binding that is already persisted. This is the one place the binding can
+   * be written early enough for a fork's first turn to carry the layout block,
+   * which is why it runs on `thread.created` rather than on first use.
+   */
+  bb.events.on("thread.created", async ({ thread }) => {
+    if (thread.environmentId === null || manifestForThread(thread.id) !== null) return;
+    const manifest = await bindInheritedWorkspace(thread.id);
+    if (manifest !== null) changed();
+  });
+
+  /**
+   * Release a deleted thread's claim on a shared checkout, so the warning the
+   * other thread reads counts only threads someone might actually be running.
+   * An undeleted thread binds itself again on its next surface.
+   */
+  bb.events.on("thread.deleted", ({ thread }) => {
+    const had = manifestForThread(thread.id);
+    if (had === null) return;
+    db.prepare(`DELETE FROM workspace_threads WHERE thread_id = ?`).run(thread.id);
+    unresolved.delete(thread.id);
+    changed();
+  });
+
   /** The workspace a tool call is running inside, or a thrown explanation. */
-  function requireManifest(threadId: string | null | undefined): WorkspaceManifest {
-    const manifest = threadId === null || threadId === undefined ? null : manifestForThread(threadId);
+  async function requireManifest(threadId: string | null | undefined): Promise<WorkspaceManifest> {
+    const manifest =
+      threadId === null || threadId === undefined ? null : await resolveManifest(threadId);
     if (manifest === null) {
+      // Deliberately does not blame another provider. The overwhelmingly
+      // common way to get here used to be a fork of a thread this very
+      // provider built, and being told the opposite sent people looking in the
+      // wrong place entirely.
       throw new Error(
-        "This thread does not have a multi-repo workspace. Its environment was created by a different provider.",
+        "This thread has no multi-repo workspace: no environment created by the Multi-repo workspace provider is attached to it.",
       );
     }
     return manifest;
@@ -566,7 +1093,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     presentation: { label: { pending: "Listing workspace repos", completed: "Listed workspace repos" } },
     parameters: z.object({}),
     async execute(_input, { threadId }) {
-      const manifest = requireManifest(threadId);
+      const manifest = await requireManifest(threadId);
       const lines = manifest.repos.map(describeRepo);
       return [`dir\tbranch\tpath`, ...lines].join("\n");
     },
@@ -590,28 +1117,21 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       branch: z.string().min(1).max(300).optional().describe("Base branch. Defaults to the repo's default branch."),
     }),
     async execute(input, { threadId, signal }) {
-      const manifest = requireManifest(threadId);
+      const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const current = await readRepoSet(location, { bootstrap: true }, signal);
-      if (current.file === null) throw new Error(current.error ?? `${REPOS_FILE} could not be read.`);
-
-      const dir = input.dir ?? dirFromUrl(input.url);
-      if (dir === null) {
-        throw new Error(`Could not derive a directory name from ${input.url}. Pass an explicit "dir".`);
-      }
-      const clash = findRepo(current.file, { dir, url: input.url });
-      if (clash !== null) {
-        throw new Error(`${clash.dir} is already in the repo set (${clash.url}).`);
-      }
-
-      const entry = { dir, url: input.url, ...(input.branch === undefined ? {} : { branch: input.branch }) };
-      const edited = addRepo(current.file, entry);
-      if (!edited.ok) throw new Error(edited.error);
-
+      const seed: RepoSeed = {
+        ...(input.dir === undefined ? {} : { dir: input.dir }),
+        url: input.url,
+        ...(input.branch === undefined ? {} : { branch: input.branch }),
+      };
       // All three writes run host-side: the commit in the canonical checkout,
       // the cache population, and the clone into the live workspace. That is
       // what makes this work while the agent is sandboxed.
-      await writeRepoSet(location, edited.value, `Add ${dir} to the repo set`, signal);
+      const outcome = await addRepoToProject(location, seed, signal);
+      if (!outcome.ok) throw new Error(outcome.error);
+      const dir = outcome.dir;
+      const entry = resolveRepoEntry(seed);
+      if (entry === null) throw new Error(`Could not derive a directory name from ${input.url}.`);
 
       const added = await host.call(
         "addWorkspaceRepo",
@@ -654,13 +1174,10 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     presentation: { label: { pending: "Removing a repo from the repo set", completed: "Removed a repo from the repo set" } },
     parameters: z.object({ dir: z.string().min(1).max(100) }),
     async execute(input, { threadId, signal }) {
-      const manifest = requireManifest(threadId);
+      const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const current = await readRepoSet(location, { bootstrap: true }, signal);
-      if (current.file === null) throw new Error(current.error ?? `${REPOS_FILE} could not be read.`);
-      const edited = removeRepo(current.file, input.dir);
-      if (!edited.ok) throw new Error(edited.error);
-      await writeRepoSet(location, edited.value, `Remove ${input.dir} from the repo set`, signal);
+      const outcome = await removeRepoFromProject(location, input.dir, signal);
+      if (!outcome.ok) throw new Error(outcome.error);
       // Deliberately leaves the checkout alone. A workspace should not mutate
       // under a running thread, and deleting a directory the agent may have
       // uncommitted work in would be the worst possible way to learn that.
@@ -671,13 +1188,13 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
   bb.agents.registerTool({
     name: "workspace_publish_guidance",
     description:
-      "Publish commits made in this workspace's .bb directory (AGENTS.md, skills, repos.json) back to the project's canonical checkout, as a branch to review and merge.",
+      "Publish changes under this workspace's .bb directory (AGENTS.md, skills, repos.json) as a guidance-<thread> branch to review and merge.",
     instructions:
-      "Commit inside .bb first, then call workspace_publish_guidance. The canonical checkout is outside your sandbox, so a plain git push will not reach it.",
+      "Edit the files under .bb/ first, then call workspace_publish_guidance. It commits them host-side on a guidance-<thread> branch cut from the default branch, leaving the thread's own branch alone — there is no need to commit inside .bb yourself. In the primary layout .bb/ is a link into the primary clone, so the same edits can instead be committed and pushed with the thread's code.",
     presentation: { label: { pending: "Publishing workspace guidance", completed: "Published workspace guidance" } },
     parameters: z.object({}),
     async execute(_input, { threadId, signal }) {
-      const manifest = requireManifest(threadId);
+      const manifest = await requireManifest(threadId);
       const source = manifest.repos.find((repo) => repo.dir === PROJECT_SOURCE_DIR);
       if (source === undefined || source.status !== "ready") {
         throw new Error("This workspace has no .bb checkout to publish from.");
@@ -687,7 +1204,11 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         {
           projectSourcePath: manifest.projectSourcePath,
           workspaceBbPath: source.path,
-          threadId: manifest.threadId,
+          definitionBase: manifest.definitionBase,
+          // The calling thread, not the workspace's creator: two threads
+          // sharing one checkout must not push onto one `guidance-<thread>`
+          // ref and silently overwrite each other's proposal.
+          threadId: threadId ?? manifest.threadId,
         },
         { hostId: manifest.hostId, timeoutMs: ACTION_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
       );
@@ -790,10 +1311,21 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
             if (input.options.json) {
               return {
                 exitCode: 0,
-                stdout: JSON.stringify({ source: location, repos: set.file.repos, cache: cache.entries }, null, 2),
+                stdout: JSON.stringify(
+                  {
+                    source: location,
+                    layout: set.layout,
+                    primary: primaryView(set.remote),
+                    repos: set.file.repos,
+                    cache: cache.entries,
+                  },
+                  null,
+                  2,
+                ),
               };
             }
-            if (set.file.repos.length === 0) {
+            const primaryDir = set.layout === "primary" && set.remote !== null ? dirFromUrl(set.remote) : null;
+            if (set.file.repos.length === 0 && primaryDir === null) {
               return { exitCode: 0, stdout: `No repos configured in ${location.path}/${REPOS_FILE}.` };
             }
             const byUrl = new Map(cache.entries.map((entry) => [entry.url, entry]));
@@ -802,7 +1334,19 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               const state = entry === undefined || !entry.present ? "not cached" : describeCacheEntry(entry);
               return `${repo.dir}\t${repo.branch ?? "(default)"}\t${repo.url}\t${state}`;
             });
-            return { exitCode: 0, stdout: ["dir\tbranch\turl\tcache", ...lines].join("\n") };
+            const primaryLine =
+              primaryDir === null || set.remote === null
+                ? []
+                : [`${primaryDir}\t(default)\t${set.remote}\t(primary)`];
+            return {
+              exitCode: 0,
+              stdout: [
+                `layout\t${set.layout}`,
+                "dir\tbranch\turl\tcache",
+                ...primaryLine,
+                ...lines,
+              ].join("\n"),
+            };
           },
         }),
 
@@ -816,28 +1360,24 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const set = await readRepoSet(location, { bootstrap: true }, ctx.signal);
-            if (set.file === null) {
-              throw new PluginCliError(set.error ?? `${REPOS_FILE} could not be read.`, { code: "invalid_repos_json" });
-            }
-            const url = input.positionals.url;
-            const dir = input.options.dir ?? dirFromUrl(url);
-            if (dir === null) {
-              throw new PluginCliError(`Could not derive a directory name from ${url}.`, {
-                code: "dir_required",
-                hint: "Pass --dir <name>.",
+            const outcome = await addRepoToProject(
+              location,
+              {
+                ...(input.options.dir === undefined ? {} : { dir: input.options.dir }),
+                url: input.positionals.url,
+                ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
+              },
+              ctx.signal,
+            );
+            if (!outcome.ok) {
+              throw new PluginCliError(outcome.error, {
+                code: outcome.code,
+                ...(outcome.code === "dir_required" ? { hint: "Pass --dir <name>." } : {}),
               });
             }
-            const edited = addRepo(set.file, {
-              dir,
-              url,
-              ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
-            });
-            if (!edited.ok) throw new PluginCliError(edited.error, { code: "invalid_repo_set" });
-            await writeRepoSet(location, edited.value, `Add ${dir} to the repo set`, ctx.signal);
             return {
               exitCode: 0,
-              stdout: `Added ${dir}. New threads in this project will get it; existing workspaces are unchanged.`,
+              stdout: `Added ${outcome.dir}. New threads in this project will get it; existing workspaces are unchanged.`,
             };
           },
         }),
@@ -848,14 +1388,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           options: { project: PROJECT_OPTION },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const set = await readRepoSet(location, { bootstrap: false }, ctx.signal);
-            if (set.file === null) {
-              throw new PluginCliError(set.error ?? `${REPOS_FILE} could not be read.`, { code: "invalid_repos_json" });
-            }
-            const edited = removeRepo(set.file, input.positionals.dir);
-            if (!edited.ok) throw new PluginCliError(edited.error, { code: "unknown_repo" });
-            await writeRepoSet(location, edited.value, `Remove ${input.positionals.dir} from the repo set`, ctx.signal);
-            return { exitCode: 0, stdout: `Removed ${input.positionals.dir}. Existing workspaces are unchanged.` };
+            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal);
+            if (!outcome.ok) throw new PluginCliError(outcome.error, { code: outcome.code });
+            return { exitCode: 0, stdout: `Removed ${outcome.dir}. Existing workspaces are unchanged.` };
           },
         }),
 
@@ -868,7 +1403,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                 hint: "Run `bb repos status` from inside a thread.",
               });
             }
-            const manifest = manifestForThread(ctx.threadId);
+            const manifest = await resolveManifest(ctx.threadId);
             if (manifest === null) {
               return { exitCode: 0, stdout: "This thread does not have a multi-repo workspace." };
             }
@@ -881,10 +1416,58 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               (repo) =>
                 `${repo.dir}\t${repo.branch ?? "-"}\t+${repo.ahead}/-${repo.behind}\t${repo.dirty} changed, ${repo.untracked} untracked${repo.error === null ? "" : `\t${repo.error}`}`,
             );
+            const shared = sharingThreads(manifest, ctx.threadId);
+            const stale = await predatesAdopt(manifest);
             return {
               exitCode: 0,
-              stdout: [`${manifest.root} (branch ${manifest.branchName})`, "", "dir\tbranch\tahead/behind\tworking tree", ...lines].join("\n"),
+              stdout: [
+                `${manifest.root} (branch ${manifest.branchName})`,
+                `layout\t${manifest.layout}`,
+                ...(stale
+                  ? [
+                      `This workspace predates the adopt: it was built from the standalone .bb at ${manifest.projectSourcePath}.`,
+                      "Guidance published from it goes to that checkout, not the primary repo; re-apply such a branch to the primary by hand.",
+                    ]
+                  : []),
+                ...(shared.length === 0
+                  ? []
+                  : [
+                      `Shared with ${shared.length} other thread(s): ${shared.join(", ")} — same directory, same branch.`,
+                    ]),
+                "",
+                "dir\tbranch\tahead/behind\tworking tree",
+                ...lines,
+              ].join("\n"),
             };
+          },
+        }),
+
+        adopt: cliCommand({
+          summary: "Copy a standalone .bb into a primary repo and re-point the project source",
+          positionals: [
+            { name: "primary", description: "URL or local path of the primary repo", required: true },
+          ],
+          options: {
+            project: PROJECT_OPTION,
+            path: { type: "string", description: "Where the primary clone lives (default: beside the .bb checkout)" },
+            "no-pr": { type: "boolean", description: "Do not open a pull request for the seed branch" },
+          },
+          async run(input, ctx) {
+            const projectId = await resolveProjectId(ctx, input.options.project);
+            const location = await requireSource(projectId);
+            const primaryPath =
+              input.options.path ?? `${parentOf(location.path)}/${dirFromUrl(input.positionals.primary) ?? "primary"}`;
+            const result = await performAdopt(projectId, input.positionals.primary, primaryPath, !input.options["no-pr"]);
+            const lines = [
+              result.message,
+              ...(result.repointed
+                ? [`Re-pointed the project source to ${result.primaryPath}.`]
+                : result.status === "pull-request"
+                  ? ["Merge the pull request, then run `bb repos adopt` again to re-point the project source."]
+                  : []),
+              ...result.warnings,
+            ];
+            return { exitCode: result.status === "failed" ? 1 : 0, stdout: lines.join("\n") };
           },
         }),
       },
@@ -927,7 +1510,16 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async repoSet({ projectId }) {
       const location = await projectSource(projectId);
       if (location === null) {
-        return { projectSourcePath: null, hostId: null, reposJson: null, repos: [], error: null, cache: [] };
+        return {
+          projectSourcePath: null,
+          hostId: null,
+          layout: "standalone" as const,
+          primary: null,
+          reposJson: null,
+          repos: [],
+          error: null,
+          cache: [],
+        };
       }
       try {
         const set = await readRepoSet(location, { bootstrap: false });
@@ -948,6 +1540,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         return {
           projectSourcePath: location.path,
           hostId: location.hostId,
+          layout: set.layout,
+          primary: primaryView(set.remote),
           reposJson: set.text,
           repos,
           error: set.error,
@@ -957,11 +1551,69 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         return {
           projectSourcePath: location.path,
           hostId: location.hostId,
+          layout: "standalone" as const,
+          primary: null,
           reposJson: null,
           repos: [],
           error: errorMessage(error),
           cache: [],
         };
+      }
+    },
+
+    /**
+     * Files from the project's `.bb`, for another plugin — stewards reads its
+     * playbooks through this. Open to any caller like `repoSet` beside it:
+     * everything it can return is already in a repo whose `repos.json` that
+     * RPC hands to every client.
+     */
+    async readProjectFiles({ projectId, paths }) {
+      let location: SourceLocation | null;
+      try {
+        location = await projectSource(projectId);
+      } catch (error) {
+        return { projectSourcePath: null, head: null, files: [], error: errorMessage(error) };
+      }
+      if (location === null) return { projectSourcePath: null, head: null, files: [], error: null };
+      try {
+        const read = await host.call(
+          "readProjectSourceFiles",
+          { path: location.path, fetchTtlMs: CACHE_FRESH_MS, files: paths },
+          { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
+        );
+        // A failed refresh still leaves a commit to read; it is only stale.
+        for (const warning of read.warnings) bb.log.debug(`readProjectFiles(${projectId}): ${warning}`);
+        return { projectSourcePath: location.path, head: read.head, files: read.files, error: read.error };
+      } catch (error) {
+        return { projectSourcePath: location.path, head: null, files: [], error: errorMessage(error) };
+      }
+    },
+
+    /**
+     * Fast-forward the canonical `.bb` to a thread's published guidance
+     * branch. Only the stewards plugin may ask: the project steward's lesson
+     * tooling is the one thing that writes itself into every steward's
+     * guidance, and a `procedure` lesson is the only thing it may write.
+     */
+    async mergeGuidance({ projectId, threadId, file, text }, { experimental_caller: caller }) {
+      if (caller.kind !== "plugin" || caller.pluginId !== "stewards") {
+        return { ok: false, sha: null, branch: null, message: "Only the stewards plugin merges a lesson." };
+      }
+      let location: SourceLocation | null;
+      try {
+        location = await projectSource(projectId);
+      } catch (error) {
+        return { ok: false, sha: null, branch: null, message: errorMessage(error) };
+      }
+      if (location === null) return { ok: false, sha: null, branch: null, message: "This project has no .bb checkout on any machine." };
+      try {
+        return await host.call(
+          "mergeGuidance",
+          { projectSourcePath: location.path, threadId, file, text },
+          { hostId: location.hostId, timeoutMs: ACTION_TIMEOUT_MS },
+        );
+      } catch (error) {
+        return { ok: false, sha: null, branch: null, message: errorMessage(error) };
       }
     },
 
@@ -979,20 +1631,171 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         // directory, which made this panel unable to be the thing that sets a
         // project up. Committing a repo set is a deliberate enough act to
         // stand up the repo that holds it.
-        await host.call(
+        const prepared = await host.call(
           "prepareProjectSource",
           { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true },
           { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
         );
-        await writeRepoSet(location, parsed.value, `Update the repo set`);
+        await writeRepoSet(location, parsed.value, `Update the repo set`, undefined, prepared.layout ?? "standalone");
         return { ok: true, error: null };
       } catch (error) {
         return { ok: false, error: errorMessage(error) };
       }
     },
 
-    workspace({ threadId }) {
-      const manifest = manifestForThread(threadId);
+    async addRepo({ projectId, repo }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await addRepoToProject(location, repo);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async removeRepo({ projectId, dir }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await removeRepoFromProject(location, dir);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async setRepoBranch({ projectId, dir, branch }) {
+      const location = await projectSource(projectId);
+      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      try {
+        const outcome = await setProjectRepoBranch(location, dir, branch);
+        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+      } catch (error) {
+        return { ok: false, error: errorMessage(error) };
+      }
+    },
+
+    async suggestRepos({ hostId, path }) {
+      return { checkouts: await localCheckouts(hostId, path) };
+    },
+
+    async hosts() {
+      const [all, config] = await Promise.all([bb.sdk.hosts.list(), bb.sdk.system.config()]);
+      return {
+        hosts: all
+          .filter((entry) => entry.lifecycle.phase === "active")
+          .map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            connected: entry.status === "connected",
+            primary: entry.id === config.primaryHostId,
+          })),
+      };
+    },
+
+    async suggestProjectSource({ hostId, name }) {
+      return host.call("suggestProjectSourcePath", { name }, { hostId, timeoutMs: READ_TIMEOUT_MS });
+    },
+
+    async createProject({ name, hostId, path, source }) {
+      const warnings: string[] = [];
+      let layout: ProjectLayout | null = null;
+      let prUrl: string | null = null;
+      const fail = (error: string) => ({ ok: false as const, projectId: null, error, warnings, layout, prUrl });
+
+      // Refuse to stack a second project on a directory one already owns. Core
+      // may or may not reject it, and either way the panel would then show two
+      // projects editing one repos.json.
+      const existing = await bb.sdk.projects.list({ includePersonal: true });
+      const taken = existing.find((project) =>
+        project.sources.some((entry) => entry.type === "local_path" && entry.hostId === hostId && entry.path === path),
+      );
+      if (taken !== undefined) return fail(`${path} is already the source of the project "${taken.name}".`);
+
+      // The git work first: a failure here leaves no project behind.
+      try {
+        if (source.kind === "fresh") {
+          const resolved = resolveSeed(source.repos);
+          if (!resolved.ok) return fail(resolved.error);
+          const prepared = await host.call(
+            "prepareProjectSource",
+            { path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true, seed: source.repos },
+            { hostId, timeoutMs: READ_TIMEOUT_MS },
+          );
+          warnings.push(...prepared.warnings);
+          layout = prepared.layout ?? "standalone";
+          if (!prepared.bootstrapped && source.repos.length > 0) {
+            // Adopting a directory that is already a `.bb` repo: the seed was
+            // not written, so merge the entries in the ordinary way.
+            const location: SourceLocation = { hostId, path };
+            for (const entry of source.repos) {
+              const outcome = await addRepoToProject(location, entry);
+              if (!outcome.ok) warnings.push(outcome.error);
+            }
+          }
+        } else if (source.kind === "clone") {
+          const cloned = await host.call(
+            "cloneProjectSource",
+            { url: source.url, path },
+            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
+          );
+          if (!cloned.ok) return fail(cloned.message ?? "Could not clone the .bb repo.");
+          layout = "standalone";
+        } else {
+          // A primary repo: clone it if it is not here, seed `.bb/` when it
+          // does not carry one, and publish the seed for review.
+          const resolved = resolveSeed(source.repos);
+          if (!resolved.ok) return fail(resolved.error);
+          const prepared = await host.call(
+            "preparePrimaryProjectSource",
+            {
+              url: source.url,
+              path,
+              seed: serializeReposFile({ version: 1, repos: resolved.repos }),
+              branch: `bb/seed-bb-${Date.now().toString(36)}`,
+              openPullRequest: source.openPullRequest ?? true,
+            },
+            { hostId, timeoutMs: CREATE_TIMEOUT_MS },
+          );
+          warnings.push(...prepared.warnings);
+          if (!prepared.ok) return fail(prepared.message);
+          layout = prepared.layout ?? "standalone";
+          prUrl = prepared.prUrl;
+        }
+      } catch (error) {
+        return fail(errorMessage(error));
+      }
+
+      try {
+        const project = await bb.sdk.projects.create({
+          name,
+          source: { type: "local_path", hostId, path },
+        });
+        changed();
+        return { ok: true, projectId: project.id, error: null, warnings: warnings.slice(0, 20), layout, prUrl };
+      } catch (error) {
+        return fail(
+          `${path} is ready but the project could not be created: ${errorMessage(error)}. Try again, or create it with \`bb project create --root ${path}\`.`,
+        );
+      }
+    },
+
+    /**
+     * Adopt a standalone `.bb` into a primary repo, per machine (BB-106).
+     *
+     * The first run copies the tree to `.bb/` on a branch and opens a pull
+     * request; a later run, once `.bb/` is on the default branch, re-points the
+     * project source at the primary checkout. Case A: `projects.sources.update`
+     * re-points the row in place, so the project id, every stewards binding and
+     * every thread stay as they are.
+     */
+    async adoptProjectSource({ projectId, primary, path, openPullRequest }) {
+      return performAdopt(projectId, primary, path, openPullRequest ?? true);
+    },
+
+    async workspace({ threadId }) {
+      const manifest = await resolveManifest(threadId);
       if (manifest === null) return { workspace: null };
       return {
         workspace: {
@@ -1000,13 +1803,15 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           branchName: manifest.branchName,
           hostId: manifest.hostId,
           projectSourcePath: manifest.projectSourcePath,
+          predatesAdopt: await predatesAdopt(manifest),
           repos: manifest.repos,
+          sharedWith: await describeSharing(manifest, threadId),
         },
       };
     },
 
     async workspaceStatus({ threadId }) {
-      const manifest = manifestForThread(threadId);
+      const manifest = await resolveManifest(threadId);
       if (manifest === null) return { repos: [] };
       const result = await host.call(
         "workspaceStatus",
@@ -1017,7 +1822,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     },
 
     async changes({ threadId }) {
-      const manifest = manifestForThread(threadId);
+      const manifest = await resolveManifest(threadId);
       if (manifest === null) return { repos: [] };
       const result = await host.call(
         "diffSummary",
@@ -1028,7 +1833,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     },
 
     async filePatch({ threadId, dir, file, untracked }) {
-      const manifest = manifestForThread(threadId);
+      const manifest = await resolveManifest(threadId);
       const repo = manifest?.repos.find((entry) => entry.dir === dir);
       if (manifest === null || repo === undefined) {
         return { patch: "", truncated: false, error: "That repo is not in this workspace." };
@@ -1047,7 +1852,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     },
 
     async pullRequests({ threadId, refresh }) {
-      const manifest = manifestForThread(threadId);
+      const manifest = await resolveManifest(threadId);
       if (manifest === null) return { repos: [], fetchedAt: null };
       const work = readyRepos(manifest).filter((repo) => repo.dir !== PROJECT_SOURCE_DIR);
 
@@ -1066,7 +1871,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     },
 
     async pullRequestAction({ threadId, dir, action }) {
-      const manifest = manifestForThread(threadId);
+      const manifest = await resolveManifest(threadId);
       const repo = manifest?.repos.find((entry) => entry.dir === dir);
       if (manifest === null || repo === undefined) {
         return { ok: false, message: "That repo is not in this workspace.", url: null };
@@ -1083,10 +1888,36 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       // Any write invalidates the read, whether or not it succeeded: a failed
       // merge still may have changed the PR's mergeability.
       db.prepare(`DELETE FROM pr_cache WHERE thread_id = ? AND dir = ?`).run(threadId, dir);
-      changed();
+      threadChanged(threadId, { pullRequests: true });
       return result;
     },
   });
+
+  /**
+   * The other threads working in this checkout, named.
+   *
+   * Worth the SDK calls because an id is not an answer: the panel is telling
+   * someone their branch has a second author on it, and "thr_948yb2g8wz" does
+   * not tell them who. Capped by `sharingThreads`, and a thread that cannot be
+   * read is still reported — a warning that disappears on a transient failure
+   * is worse than one with a missing name.
+   */
+  async function describeSharing(
+    manifest: WorkspaceManifest,
+    threadId: string,
+  ): Promise<{ threadId: string; title: string | null }[]> {
+    const ids = sharingThreads(manifest, threadId);
+    return Promise.all(
+      ids.map(async (id) => {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: id });
+          return { threadId: id, title: thread.title ?? thread.titleFallback };
+        } catch {
+          return { threadId: id, title: null };
+        }
+      }),
+    );
+  }
 
   /** All of a thread's cached PR rows, or null when any is missing or stale. */
   function readPrCache(

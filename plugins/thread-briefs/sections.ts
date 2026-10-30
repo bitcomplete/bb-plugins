@@ -144,6 +144,51 @@ export function manualSectionOrder(sectionIds: readonly string[]): string[] {
   return ["pinned", ...sectionIds.map((id) => `section:${id}`), "threads"];
 }
 
+/**
+ * The order to write to `thread-list`, or null to leave the stored one alone.
+ *
+ * A stored order that already covers the same entries is treated as correct
+ * however it is arranged. Reordering sections is something you do by hand in
+ * the sidebar, and a reconcile runs on every brief write — so writing
+ * {@link manualSectionOrder} whenever it differed would undo the drag within
+ * seconds. The canonical order therefore only decides where an entry the stored
+ * order has never seen gets inserted.
+ *
+ * An entry the canonical order does not want is dropped, matching what a
+ * straight write of the canonical order would have done.
+ */
+export function mergeSectionOrder(
+  stored: unknown,
+  sectionIds: readonly string[],
+): string[] | null {
+  const canonical = manualSectionOrder(sectionIds);
+  if (!Array.isArray(stored) || stored.some((entry) => typeof entry !== "string")) {
+    return canonical;
+  }
+  // Deduped, because an order we are about to splice into has to be a set for
+  // the insertion points below to mean anything.
+  const kept = (stored as string[]).filter(
+    (entry, index) => canonical.includes(entry) && stored.indexOf(entry) === index,
+  );
+  // Same entries, so whatever arrangement they are in is the user's. No write.
+  if (kept.length === canonical.length) return null;
+  const merged = [...kept];
+  for (const entry of canonical) {
+    if (merged.includes(entry)) continue;
+    // Dropped in after the last entry the canonical order puts above it, so a
+    // newly created section lands beside its siblings rather than below bb's
+    // Threads group — and still does when the entries around it have been
+    // dragged out of canonical order.
+    const rank = canonical.indexOf(entry);
+    let after = -1;
+    for (const [index, other] of merged.entries()) {
+      if (canonical.indexOf(other) < rank) after = index;
+    }
+    merged.splice(after + 1, 0, entry);
+  }
+  return merged;
+}
+
 export interface SectionedThread {
   id: string;
   sectionId: string | null;

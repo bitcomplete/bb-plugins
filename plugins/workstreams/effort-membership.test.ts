@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { inventoryTicketEfforts } from "./effort-membership.js";
+import { inventoryEffort, inventoryTicketEfforts } from "./effort-membership.js";
 import { establishedEffortSchema } from "./effort-store.js";
 import type { Pr } from "./contract.js";
 
@@ -9,6 +9,12 @@ const pair = () => [entry(1), entry(2, "ABC-1: Reverse cancellation — admin UI
 const established = (tickets: string[], prUrls: string[]) => establishedEffortSchema.parse({ id: "saved", key: "effort:saved", name: "Saved outcome", goal: "", projectId: "project", coordinatorThreadId: null, coordinatorState: "ready", members: { tickets, prUrls }, createdAt: 0, updatedAt: 0 });
 
 describe("remote ticket efforts", () => {
+  it("keeps exact PR ownership across copied URL forms when another ticket appears in the title", () => {
+    const owned = established(["INK-1"], ["https://github.com/inkwell/folio/pull/42"]);
+    const other = { ...established(["INK-2"], []), id: "other", key: "effort:other", name: "Other effort" };
+    expect(inventoryEffort({ url: "https://GITHUB.COM/INKWELL/FOLIO/PULL/42/?tab=files", title: "INK-2 Follow-up", headRefName: "ink-2" },
+      [], [owned, other], /([A-Z]+)-(\d+)/giu)).toEqual({ effortKey: owned.key, effortName: owned.name });
+  });
   it("groups exact open ticket siblings without creating checkout units", () => {
     expect(inventoryTicketEfforts(pair(), [], [], pattern)).toEqual([{
       key: "ticket:ABC-1", ticket: "ABC-1", name: "Reverse cancellation (ABC-1)",

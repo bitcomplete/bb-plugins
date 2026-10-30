@@ -9,10 +9,10 @@ import {
 import {
   definePluginApp,
   experimental_Icon as Icon,
+  experimental_THREAD_ACTION_GROUPS,
   experimental_useSidebarThreads,
   useBbNavigate,
   useComposer,
-  useComposerView,
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
@@ -40,14 +40,15 @@ import {
 } from "./shared.js";
 import {
   doneRingIcon,
-  DONE_RING_ICON,
   rowDecoration,
-  STALE_DONE_RING_ICON,
+  staleDoneRingIcon,
   stageRingIcon,
   STATUS_LABELS,
   summarizedAgo,
+  type RingMarks,
 } from "./brief.js";
 import { Field, StageControl, StatusControl } from "./controls.js";
+import { stageAction, statusAction, type PinWrites } from "./actions.js";
 import { useNow } from "./clock.js";
 import { BoardPage, BOARD_PANEL_ID, BOARD_PATH } from "./board-page.js";
 
@@ -82,27 +83,26 @@ const STALE_TICK_MS = 60_000;
 const store = {
   decorations: new Map<string, Decoration>(),
   /**
-   * How many threads are waiting on you right now, for the board's sidebar
-   * accessory.
+   * Every stored brief's row signal by thread id, for the Stage and Status
+   * thread actions.
    *
-   * Published from here rather than fetched again because the count needs
-   * exactly what {@link BriefSync} has already assembled — the briefs off the
-   * wire and the live `working` fold — and the accessory is mounted in every
-   * sidebar, in every window. A second `listRowSignals` per window on every
-   * `briefs-changed` to draw one number would be the most expensive badge in
-   * bb. Before the first load it is null, which renders nothing; so does zero,
-   * so there is no state where the reading is wrong, only one where it is late.
+   * Published from here rather than fetched again because {@link BriefSync}
+   * already holds exactly this, kept current off `briefs-changed`; a second
+   * `listRowSignals` per window on every change, to fill a menu that is
+   * usually closed, would double the plugin's steady traffic for nothing.
+   * Replaced only when the signals are, so the minute tick that re-tests
+   * staleness does not re-evaluate every thread's menu.
    */
-  waitingOnMe: null as number | null,
+  signals: new Map<string, RowSignal>(),
   listeners: new Set<() => void>(),
 };
 
 function publish(next: {
   decorations: Map<string, Decoration>;
-  waitingOnMe: number;
+  signals: Map<string, RowSignal>;
 }) {
   store.decorations = next.decorations;
-  store.waitingOnMe = next.waitingOnMe;
+  store.signals = next.signals;
   for (const listener of store.listeners) listener();
 }
 
@@ -171,6 +171,22 @@ function BriefSync() {
     return ids;
   }, [threads]);
 
+  // bb's own "new output since you looked", the condition its activity dot
+  // was drawn on before the ring took the row. The ring draws it in its
+  // centre; a `Set` for the same reason as `workingIds`.
+  const unreadIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const thread of threads) {
+      if (thread.isUnread === true) ids.add(thread.id);
+    }
+    return ids;
+  }, [threads]);
+
+  const signalsById = useMemo(
+    () => new Map(signals.map((signal) => [signal.threadId, signal] as const)),
+    [signals],
+  );
+
   /**
    * The project each row belongs to.
    *
@@ -222,19 +238,12 @@ function BriefSync() {
 
   useEffect(() => {
     const next = new Map<string, Decoration>();
-    let waitingOnMe = 0;
     for (const signal of signals) {
-      // The same live fold the decoration below makes, counted before it: a
-      // thread whose agent is running is `working`, and is not waiting on you.
-      if (
-        !workingIds.has(signal.threadId) &&
-        signal.status === "waiting-on-me"
-      ) {
-        waitingOnMe += 1;
-      }
+      // Its plugin asked for bb's own indicators only: no decoration, so the
+      // content script clears the row.
+      if (!signal.ring) continue;
       // A thread with no row in the sidebar has no cursor to age, so it simply
-      // never greys: the one place this can happen is a thread the current
-      // window is not showing, which has no glyph to draw either.
+      // never greys, and has no glyph to draw either.
       const latestAttentionAt = attentionByThreadId.get(signal.threadId);
       const stale =
         latestAttentionAt !== undefined &&
@@ -246,24 +255,29 @@ function BriefSync() {
         })
           ? {
               idleMs: idleMsSince(latestAttentionAt, now),
-              archiving: thresholds.archiveAfterMs > 0,
+              archiving: thresholds.archiveAfterMs > 0 && signal.autoArchive,
             }
           : null;
       const decoration = rowDecoration(
         signal,
-        workingIds.has(signal.threadId),
+        {
+          working: workingIds.has(signal.threadId),
+          unread: unreadIds.has(signal.threadId),
+        },
         projectByThreadId.get(signal.threadId) ?? null,
         stale,
       );
       if (decoration !== null) next.set(signal.threadId, decoration);
     }
-    publish({ decorations: next, waitingOnMe });
+    publish({ decorations: next, signals: signalsById });
   }, [
     attentionByThreadId,
     now,
     projectByThreadId,
     signals,
+    signalsById,
     thresholds,
+    unreadIds,
     workingIds,
   ]);
 
@@ -292,7 +306,7 @@ const RING_QUARTERS = [
 
 /**
  * A ring with `filled` of its four quarters solid and the rest left as a track,
- * optionally with the centre filled in.
+ * optionally dotted for unread and animated for working.
  *
  * The track is what makes the glyph a ratio rather than a count: three quarters
  * against a visible whole reads instantly at 16px, where three marks against
@@ -301,11 +315,28 @@ const RING_QUARTERS = [
  * A `color` of `currentColor` leaves the host's tone class to paint it, which
  * is what the panel and the stage picker want. An explicit colour overrides
  * that class, so the two modes cannot both colour the same ring — which is what
- * lets one glyph carry three facts at 16px: how far round it goes is the stage,
- * whether the centre is filled is `done`, and the hue is the project (or grey,
- * for a done thread nobody has come back to).
+ * lets one glyph carry four facts at 16px: how far round it goes is the stage
+ * (all four quarters is `done`), a dot in the centre is unread, a pulse is the
+ * agent working, and the hue is the project (or grey, for a done thread
+ * nobody has come back to).
+ *
+ * The dot is bb's own mark, drawn where bb drew it: a filled centre is what the
+ * activity dot was before the ring displaced it, so the vocabulary carries
+ * over. It is small because it also has to read at 12px in the stage picker.
+ *
+ * Working *pulses* the filled quarters rather than spinning the ring. A spin
+ * is the more familiar "busy", but it moves the fill's endpoint, and where the
+ * fill stops is the whole reading of the glyph — a spinning ring says the
+ * thread is busy and nothing else. A pulse keeps the stage legible and still
+ * reads as alive at a glance; the track is left steady so the pulse has
+ * something to beat against. SMIL rather than a stylesheet, because an icon
+ * registered as a component has nowhere to put CSS and this way the motion
+ * travels with the artwork.
  */
-function ring(filled: number, complete = false, color = "currentColor") {
+function ring(
+  filled: number,
+  { unread = false, working = false, color = "currentColor" } = {},
+) {
   return function StageRing({ className }: { className?: string }) {
     return (
       <svg
@@ -321,55 +352,77 @@ function ring(filled: number, complete = false, color = "currentColor") {
             stroke={color}
             strokeWidth={2}
             opacity={index < filled ? 1 : 0.25}
-          />
+          >
+            {working && index < filled ? (
+              <animate
+                attributeName="opacity"
+                values="1;0.35;1"
+                dur="1.6s"
+                repeatCount="indefinite"
+              />
+            ) : null}
+          </path>
         ))}
-        {complete ? <circle cx={8} cy={8} r={2.75} fill={color} /> : null}
+        {unread ? <circle cx={8} cy={8} r={2.25} fill={color} /> : null}
       </svg>
     );
   };
 }
 
 /**
- * One ring per stage, plus the closed filled ring for `done`.
+ * Every combination of live marks a ring can carry, in the order the icons
+ * are registered. Four, because unread and working are independent facts.
+ */
+const RING_MARKS: readonly RingMarks[] = [
+  {},
+  { unread: true },
+  { working: true },
+  { unread: true, working: true },
+];
+
+/**
+ * One ring per stage, plus the done ring, each in every combination of marks.
  *
- * Mapped over `BRIEF_STAGES` in order, so the artwork and the names cannot
- * drift: `stageRingIcon` is the same function the row decoration calls, and a
- * stage added to the list gets its ring here without a second edit.
+ * Mapped off `BRIEF_STAGES` and the same name builders the decoration calls
+ * (`stageRingIcon`, `doneRingIcon`), so the registry and the row cannot
+ * drift: a stage added to the list gets its rings here without a second edit.
  */
 function ringSet(colorIndex?: number) {
   const color =
     colorIndex === undefined ? "currentColor" : projectRingColor(colorIndex);
-  return [
+  return RING_MARKS.flatMap((marks) => [
     ...BRIEF_STAGES.map((stage, index) => ({
-      name: stageRingIcon(stage, colorIndex),
-      component: ring(index + 1, false, color),
+      name: stageRingIcon(stage, colorIndex, marks),
+      component: ring(index + 1, { ...marks, color }),
     })),
     {
-      name: doneRingIcon(colorIndex),
-      component: ring(RING_QUARTERS.length, true, color),
+      name: doneRingIcon(colorIndex, marks),
+      component: ring(RING_QUARTERS.length, { ...marks, color }),
     },
-  ];
+  ]);
 }
 
 /**
- * The neutral set, plus one set per palette slot.
+ * The whole icon registry: every ring neutral, then in each palette colour.
  *
- * Every combination is registered up front because the registry is keyed by
- * name and filled once, at plugin init, where no project list exists yet —
+ * Registered at init, before any project is known, because the sidebar's
  * projects arrive later, per window, through `experimental_useSidebarThreads`.
  * Hashing a project into a fixed palette instead of registering an icon per
- * project is what makes that work: the set of names is knowable without knowing
- * the projects, and a project added later already has its artwork waiting.
+ * project is what makes that possible.
  */
 const RING_ICONS = [
   ...ringSet(),
   ...PROJECT_RING_HUES.flatMap((_hue, colorIndex) => ringSet(colorIndex)),
-  // One, not a set: the grey replaces a project's hue rather than varying with
-  // it. See {@link STALE_DONE_RING_ICON}.
-  {
-    name: STALE_DONE_RING_ICON,
-    component: ring(RING_QUARTERS.length, true, STALE_DONE_RING_COLOR),
-  },
+  // Four, not a set per colour: the grey replaces a project's hue rather than
+  // varying with it, and only the marks still vary. See
+  // {@link STALE_DONE_RING_ICON}.
+  ...RING_MARKS.map((marks) => ({
+    name: staleDoneRingIcon(marks),
+    component: ring(RING_QUARTERS.length, {
+      ...marks,
+      color: STALE_DONE_RING_COLOR,
+    }),
+  })),
 ];
 
 // ------------------------------------------------------------------ the panel
@@ -379,12 +432,14 @@ function BriefBody({
   state,
   onPick,
   onPickStatus,
+  onSetBlockReason,
   onRefresh,
 }: {
   now: number;
   state: BriefState | null;
   onPick: (stage: BriefStage | null) => void;
   onPickStatus: (status: StoredBriefStatus | null) => void;
+  onSetBlockReason: (text: string | null) => void;
   onRefresh: () => void;
 }) {
   if (state === null) {
@@ -392,6 +447,15 @@ function BriefBody({
   }
   if (state.state === "summarizing") {
     return <div className="text-sm text-muted-foreground">Summarizing…</div>;
+  }
+  if (state.state === "off") {
+    // The thread's plugin keeps it out of briefs entirely: there is no brief
+    // and no summary coming, so explain rather than offer to make one.
+    return (
+      <div className="text-sm text-muted-foreground">
+        This thread's plugin keeps it out of briefs.
+      </div>
+    );
   }
   if (state.state === "absent") {
     // Threads that were already dormant when the plugin arrived are not
@@ -427,14 +491,15 @@ function BriefBody({
           <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
             {/*
               The glyph this thread's sidebar row draws, beside the words it
-              stands for. A done thread is the case that needs it: its row shows
-              a closed ring and no stage, so the stage control below cannot
-              explain it.
+              stands for — without the live marks, which belong to the row:
+              you are reading this thread, so it is not unread. A done thread
+              is the case that needs it: its row shows a closed ring and no
+              stage, so the stage control below cannot explain it.
             */}
             <Icon
               name={
                 brief.status === "done"
-                  ? DONE_RING_ICON
+                  ? doneRingIcon()
                   : stageRingIcon(brief.stage)
               }
               className={`h-3.5 w-3.5 shrink-0 ${
@@ -497,7 +562,9 @@ function BriefBody({
       <StatusControl
         status={brief.status}
         statusOverride={brief.statusOverride}
+        blockReason={brief.blockReason}
         onPick={onPickStatus}
+        onSetBlockReason={onSetBlockReason}
       />
       <StageControl
         stage={brief.stage}
@@ -554,13 +621,23 @@ function useBrief(threadId: string) {
     [rpc, threadId, load],
   );
 
+  const setBlockReason = useCallback(
+    (text: string | null) => {
+      void rpc
+        .call("setBlockReason", { threadId, text })
+        .then(setState)
+        .catch(() => load());
+    },
+    [rpc, threadId, load],
+  );
+
   const refresh = useCallback(() => {
     void rpc.call("refresh", { threadId }).then(() => {
       setState({ state: "summarizing" });
     });
   }, [rpc, threadId]);
 
-  return { state, setStage, setStatus, refresh };
+  return { state, setStage, setStatus, setBlockReason, refresh };
 }
 
 /**
@@ -573,7 +650,8 @@ function useBrief(threadId: string) {
  * none of that is this component's problem.
  */
 function BriefPanel({ threadId }: { threadId: string }) {
-  const { state, setStage, setStatus, refresh } = useBrief(threadId);
+  const { state, setStage, setStatus, setBlockReason, refresh } =
+    useBrief(threadId);
   const now = useNow(30_000);
   return (
     <BriefBody
@@ -581,6 +659,7 @@ function BriefPanel({ threadId }: { threadId: string }) {
       state={state}
       onPick={setStage}
       onPickStatus={setStatus}
+      onSetBlockReason={setBlockReason}
       onRefresh={refresh}
     />
   );
@@ -623,41 +702,42 @@ function BriefHeaderAction({
   );
 }
 
-// ------------------------------------------------------ the sidebar accessory
+// ------------------------------------------------------ the thread actions
+
+/** What the Stage and Status actions' `item` reads; see `actions.ts`. */
+interface PinActionData {
+  signals: Map<string, RowSignal>;
+  writes: PinWrites;
+}
 
 /**
- * How many threads are waiting on you, at the trailing edge of the board's own
- * sidebar row.
+ * The data side of the Stage and Status thread actions.
  *
- * The reason to open the board, on the thing you click to open it. It costs no
- * request: {@link BriefSync} has already folded the briefs against the live
- * thread list to draw the row glyphs, so the count is read out of the same store
- * the content script reads. `useSyncExternalStore` rather than an effect because
- * the store is written outside React and this must not lag a frame behind the
- * glyphs beside it.
- *
- * Nothing is drawn at zero. An accessory is clipped to about 4rem by 1.25rem and
- * shares the row's trailing column with the host's own options button, so the
- * only badge worth that space is one that means "there is something here".
+ * bb calls this once for the whole app, not per thread or per menu, so it reads
+ * the signals {@link BriefSync} has already published rather than loading the
+ * `threadIds` the host offers: those are a subset of a list this window already
+ * holds in full. The writes resolve without the reply — `briefs-changed` brings
+ * the new pin back through `BriefSync` to the row glyph and the menu alike.
  */
-function WaitingBadge() {
-  const waitingOnMe = useSyncExternalStore(
+function usePinActionData(): PinActionData {
+  const rpc = useRpc<typeof rpcContract>();
+  const signals = useSyncExternalStore(
     subscribe,
-    () => store.waitingOnMe,
-    () => null,
+    () => store.signals,
+    () => store.signals,
   );
-  if (waitingOnMe === null || waitingOnMe === 0) return null;
-  const label = `${waitingOnMe} thread${waitingOnMe === 1 ? "" : "s"} waiting on you`;
-  return (
-    <span
-      role="status"
-      aria-label={label}
-      title={label}
-      className="rounded-full bg-amber-500/15 px-1.5 font-mono text-[10.5px] leading-4 tabular-nums text-amber-700 dark:text-amber-300"
-    >
-      {waitingOnMe}
-    </span>
+  const writes = useMemo<PinWrites>(
+    () => ({
+      setStage: async (threadId, stage) => {
+        await rpc.call("setStageOverride", { threadId, stage });
+      },
+      setStatus: async (threadId, status) => {
+        await rpc.call("setStatusOverride", { threadId, status });
+      },
+    }),
+    [rpc],
   );
+  return useMemo(() => ({ signals, writes }), [signals, writes]);
 }
 
 // -------------------------------------------------------- the re-entry card
@@ -690,9 +770,9 @@ const REFRESHER_BANNER_ID = "re-entry";
  */
 function ReentryRefresher() {
   const rpc = useRpc<typeof rpcContract>();
-  const view = useComposerView();
   const composer = useComposer();
-  const threadId = view.scope.kind === "thread" ? view.scope.threadId : null;
+  const threadId =
+    composer.scope.kind === "thread" ? composer.scope.threadId : null;
 
   const [state, setState] = useState<RefresherState | null>(null);
   const [isDismissed, setIsDismissed] = useState(false);
@@ -744,7 +824,7 @@ function ReentryRefresher() {
     dismissRef.current = dismiss;
   }, [dismiss]);
   useEffect(
-    () => composer.experimental_onSubmitted(() => dismissRef.current()),
+    () => composer.onSubmitted(() => dismissRef.current()),
     [composer],
   );
 
@@ -753,7 +833,7 @@ function ReentryRefresher() {
   // agent — makes the sentence describe a position that is already moving.
   // Hidden rather than dismissed: nothing was read, so nothing is recorded, and
   // the card is still owed when the thread goes quiet again.
-  if (view.run.isRunning) return null;
+  if (composer.isRunning) return null;
 
   return (
     // The card chrome is drawn here rather than taken from the host's
@@ -812,7 +892,6 @@ export default definePluginApp((app) => {
     icon: "Columns3",
     path: BOARD_PATH,
     component: BoardPage,
-    experimental_sidebarAccessory: WaitingBadge,
   });
 
   app.slots.threadPanelAction({
@@ -830,6 +909,36 @@ export default definePluginApp((app) => {
     id: "brief",
     title: "Thread brief",
     component: BriefHeaderAction,
+  });
+
+  // Stage and Status in every thread menu, beside bb's own Pin and Rename and
+  // after them, so bb's actions keep their places. Two registrations rather
+  // than one with a nested list: each is a choice list of its own, and a user
+  // can pin either one to the sidebar rows as a quick-action button.
+  app.slots.experimental_threadAction<PinActionData>({
+    id: "stage",
+    title: "Brief stage",
+    icon: "Columns3",
+    group: experimental_THREAD_ACTION_GROUPS.organize,
+    order: 70,
+    useData: usePinActionData,
+    item: ({ thread, data }) =>
+      stageAction(data.signals.get(thread.id), data.writes),
+  });
+
+  app.slots.experimental_threadAction<PinActionData>({
+    id: "status",
+    title: "Brief status",
+    icon: "CircleDot",
+    group: experimental_THREAD_ACTION_GROUPS.organize,
+    order: 71,
+    useData: usePinActionData,
+    item: ({ thread, data }) =>
+      statusAction(
+        data.signals.get(thread.id),
+        isLiveWorking(thread.status),
+        data.writes,
+      ),
   });
 
   app.composer.customize({

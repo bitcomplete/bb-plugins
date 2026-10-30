@@ -13,6 +13,7 @@ const SUMMARY = {
   blockedOn: "",
   constraints: "bb exposes no additive per-row sidebar slot",
   stage: "review",
+  status: "waiting-on-me",
 };
 
 function fakeCompletion(body: unknown) {
@@ -34,6 +35,37 @@ const thread = makeThreadResponse({
   status: "idle",
 });
 
+/**
+ * A completion that does not answer until released, and rejects when its
+ * request is aborted — the part of `fetch` the supersede path depends on.
+ */
+function slowCompletion(body: unknown) {
+  const pending: (() => void)[] = [];
+  const fn = vi.fn(
+    (_url: string, init: RequestInit) =>
+      new Promise<Response>((resolve, reject) => {
+        const signal = init.signal!;
+        const fail = () => reject(signal.reason ?? new Error("aborted"));
+        if (signal.aborted) {
+          fail();
+          return;
+        }
+        signal.addEventListener("abort", fail, { once: true });
+        pending.push(() =>
+          resolve(
+            new Response(
+              JSON.stringify({
+                choices: [{ message: { content: JSON.stringify(body) } }],
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          ),
+        );
+      }),
+  );
+  return { fn, release: (index: number) => pending[index]!() };
+}
+
 function host(options: { fetch: ReturnType<typeof fakeCompletion> }) {
   globalThis.fetch = options.fetch as unknown as typeof globalThis.fetch;
   return createFakePluginHost({
@@ -43,7 +75,6 @@ function host(options: { fetch: ReturnType<typeof fakeCompletion> }) {
       baseUrl: "https://api.test/v1",
       model: "test-model",
       jsonMode: true,
-      quietSeconds: 120,
     },
     sdk: {
       threads: {
@@ -86,6 +117,21 @@ function storedBrief(
     lastSummarizedAt: 1_000,
     lastActivitySeen: 12,
   };
+}
+
+/**
+ * A stub for `threads.experimental_listPluginMetadata` answering from one
+ * plugin's namespace per thread, the way bb answers a thread with nothing in
+ * it: no row.
+ */
+function metadataFrom(byThreadId: Record<string, Record<string, unknown>>) {
+  return async ({ threadIds }: { pluginId?: string; threadIds: readonly string[] }) => ({
+    threads: threadIds.flatMap((threadId) =>
+      byThreadId[threadId] === undefined
+        ? []
+        : [{ threadId, metadata: byThreadId[threadId] as never }],
+    ),
+  });
 }
 
 /** The summarizer queue drains off the rpc call, so tests wait on its effect. */
@@ -136,6 +182,113 @@ describe("registrations", () => {
   });
 });
 
+/**
+ * A deployment can hand every server one summarizer through the environment;
+ * a developer's own settings still win. The env is read when the plugin loads.
+ */
+describe("deployment environment", () => {
+  const ENV_KEYS = [
+    "THREAD_BRIEFS_API_KEY",
+    "THREAD_BRIEFS_BASE_URL",
+    "THREAD_BRIEFS_MODEL",
+    "THREAD_BRIEFS_JSON_MODE",
+  ] as const;
+  const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+
+  beforeEach(() => {
+    for (const key of ENV_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  function envHost(fetchMock: ReturnType<typeof fakeCompletion>, settings: Record<string, string>) {
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    return createFakePluginHost({
+      pluginId: "thread-briefs",
+      settings,
+      sdk: {
+        threads: {
+          get: async () => thread,
+          list: async () => [thread],
+          output: async () => ({ output: "done" }),
+          conversationOutline: async () => ({
+            items: [
+              { id: "1", role: "user", preview: "Build a briefs plugin", attachmentSummary: null },
+            ],
+            maxSeq: 1,
+          }),
+        },
+      },
+    });
+  }
+
+  async function summarizeOnce(h: ReturnType<typeof envHost>) {
+    await h.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await waitFor(async () => {
+      const result = (await h.harness.behavior.callRpc("getBrief", {
+        threadId: "thr_1",
+      })) as BriefState;
+      return result.state === "ready" ? result : null;
+    });
+  }
+
+  it("uses the environment's key and endpoint when nothing is stored", async () => {
+    process.env.THREAD_BRIEFS_API_KEY = "shared-key";
+    process.env.THREAD_BRIEFS_BASE_URL = "https://shared.test/v1";
+    process.env.THREAD_BRIEFS_MODEL = "shared-model";
+    process.env.THREAD_BRIEFS_JSON_MODE = "false";
+    const fetchMock = fakeCompletion(SUMMARY);
+    const h = envHost(fetchMock, {});
+    try {
+      await plugin(h.bb);
+      expect(h.harness.needsConfigurationMessages).toEqual([]);
+      await summarizeOnce(h);
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(url).toBe("https://shared.test/v1/chat/completions");
+      expect(new Headers(init.headers).get("authorization")).toBe("Bearer shared-key");
+      const body = JSON.parse(String(init.body));
+      expect(body.model).toBe("shared-model");
+      expect(body.response_format).toBeUndefined();
+    } finally {
+      await h.harness.lifecycle.dispose();
+    }
+  });
+
+  it("lets a stored setting override the environment", async () => {
+    process.env.THREAD_BRIEFS_API_KEY = "shared-key";
+    process.env.THREAD_BRIEFS_BASE_URL = "https://shared.test/v1";
+    const fetchMock = fakeCompletion(SUMMARY);
+    const h = envHost(fetchMock, { apiKey: "my-key", baseUrl: "https://mine.test/v1" });
+    try {
+      await plugin(h.bb);
+      await summarizeOnce(h);
+      const [url, init] = fetchMock.mock.calls[0]!;
+      expect(url).toBe("https://mine.test/v1/chat/completions");
+      expect(new Headers(init.headers).get("authorization")).toBe("Bearer my-key");
+    } finally {
+      await h.harness.lifecycle.dispose();
+    }
+  });
+
+  it("still reports needs-configuration with no key anywhere", async () => {
+    const h = envHost(fakeCompletion(SUMMARY), {});
+    try {
+      await plugin(h.bb);
+      expect(h.harness.needsConfigurationMessages.join(" ")).toMatch(/THREAD_BRIEFS_API_KEY/u);
+    } finally {
+      await h.harness.lifecycle.dispose();
+    }
+  });
+});
+
 describe("summarizing", () => {
   let current: Awaited<ReturnType<typeof host>> | null = null;
 
@@ -175,13 +328,13 @@ describe("summarizing", () => {
     expect(JSON.parse(String(init.body)).model).toBe("test-model");
   });
 
-  it("does not summarize a thread with a brief the moment it goes idle", async () => {
+  it("re-summarizes a thread with a brief the moment it goes idle", async () => {
     const fetchMock = fakeCompletion(SUMMARY);
     current = host({ fetch: fetchMock });
     await plugin(current.bb);
-    // Behind the thread's cursor, so only the quiet period is holding it back.
+    // Behind the thread's cursor: a turn has happened since this brief.
     await current.bb.storage.kv.set("brief:thr_1", {
-      ...storedBrief("thr_1", {}),
+      ...storedBrief("thr_1", { goal: "stale" }),
       lastActivitySeen: 5,
     });
 
@@ -189,29 +342,106 @@ describe("summarizing", () => {
       thread,
       lastAssistantText: "done",
     });
-    // The quiet period has to elapse first.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(fetchMock).not.toHaveBeenCalled();
+    // No quiet period: the brief follows the turn by one summarizer call.
+    const stored = await waitFor(async () => {
+      const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      return row?.lastActivitySeen === 12 ? row : null;
+    });
+    expect(stored.fields.goal).toBe(SUMMARY.goal);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   /**
-   * The first brief skips the quiet period, and arrives before the first turn
-   * has even finished. Timers are faked because the delays involved are seconds,
-   * and asserted on `fetch` rather than by polling: under fake timers the poll
-   * in {@link waitFor} would never tick.
+   * The protection against re-summarizing a busy thread every turn is not a
+   * delay but a cancel: a turn boundary that arrives while the previous one's
+   * summary is still running aborts that request and starts over.
+   */
+  describe("a later turn boundary", () => {
+    const seeded = async () => {
+      await current!.bb.storage.kv.set("brief:thr_1", {
+        ...storedBrief("thr_1", { goal: "stale" }),
+        lastActivitySeen: 5,
+      });
+    };
+    const idle = () =>
+      current!.harness.behavior.emitThreadEvent("thread.idle", {
+        thread,
+        lastAssistantText: "done",
+      });
+    const requests = (fn: ReturnType<typeof vi.fn>, n: number) =>
+      waitFor(async () => (fn.mock.calls.length >= n ? true : null));
+
+    it("aborts the summary it overtook and summarizes again", async () => {
+      const slow = slowCompletion(SUMMARY);
+      current = host({ fetch: slow.fn });
+      await plugin(current.bb);
+      await seeded();
+
+      await idle();
+      await requests(slow.fn, 1);
+      const first = (slow.fn.mock.calls[0]![1] as RequestInit).signal!;
+      expect(first.aborted).toBe(false);
+
+      await idle();
+      await requests(slow.fn, 2);
+      expect(first.aborted).toBe(true);
+      // The overtaken run wrote nothing.
+      const between = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      expect(between?.fields.goal).toBe("stale");
+
+      slow.release(1);
+      const stored = await waitFor(async () => {
+        const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+        return row?.lastActivitySeen === 12 ? row : null;
+      });
+      expect(stored.fields.goal).toBe(SUMMARY.goal);
+      expect(slow.fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("is the only thing that cancels: a new turn starting does not", async () => {
+      const slow = slowCompletion(SUMMARY);
+      current = host({ fetch: slow.fn });
+      await plugin(current.bb);
+      await seeded();
+
+      await idle();
+      await requests(slow.fn, 1);
+      // The thread picks up again. The running summary describes a real turn
+      // boundary, so it is left to land; the turn that just started will
+      // supersede it when it ends.
+      await current.harness.behavior.emitThreadEvent("thread.active", { thread });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const first = (slow.fn.mock.calls[0]![1] as RequestInit).signal!;
+      expect(first.aborted).toBe(false);
+
+      slow.release(0);
+      const stored = await waitFor(async () => {
+        const row = await current!.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+        return row?.lastActivitySeen === 12 ? row : null;
+      });
+      expect(stored.fields.goal).toBe(SUMMARY.goal);
+      expect(slow.fn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * The first brief arrives before the first turn has even finished. Timers
+   * are faked so the queue drains deterministically, and the tests assert on
+   * `fetch` rather than by polling: under fake timers the poll in
+   * {@link waitFor} would never tick.
    */
   describe("the first brief", () => {
     afterEach(() => {
       vi.useRealTimers();
     });
 
-    /** Let the debounce fire and the queue drain. */
+    /** Let the queue drain. */
     const settle = async (ms: number) => {
       await vi.advanceTimersByTimeAsync(ms);
       await vi.advanceTimersByTimeAsync(0);
     };
 
-    it("skips the quiet period when the thread has no brief", async () => {
+    it("is written as soon as the thread goes idle", async () => {
       const fetchMock = fakeCompletion(SUMMARY);
       current = host({ fetch: fetchMock });
       await plugin(current.bb);
@@ -221,12 +451,31 @@ describe("summarizing", () => {
         thread,
         lastAssistantText: "done",
       });
-      // Well inside the 120s quiet period this host is configured with.
-      await settle(6_000);
+      await settle(0);
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
       expect(stored?.fields.goal).toBe(SUMMARY.goal);
+    });
+
+    it("stores a done reading beside the suggestion it still carries", async () => {
+      const fetchMock = fakeCompletion({ ...SUMMARY, status: "done" });
+      current = host({ fetch: fetchMock });
+      await plugin(current.bb);
+      vi.useFakeTimers();
+
+      await current.harness.behavior.emitThreadEvent("thread.idle", {
+        thread,
+        lastAssistantText: "done",
+      });
+      await settle(6_000);
+
+      // Stored as the model answered: neither field is rewritten to agree
+      // with the other.
+      const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
+      expect(stored?.modelStatus).toBe("done");
+      expect(stored?.fields.nextStep).toBe(SUMMARY.nextStep);
+      expect(stored?.refresher?.writtenForStatus ?? "done").toBe("done");
     });
 
     it("summarizes a briefless thread as soon as it starts running", async () => {
@@ -261,7 +510,7 @@ describe("summarizing", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it("cancels a pending first brief when the thread starts running again", async () => {
+    it("is not written twice when the thread starts running again", async () => {
       const fetchMock = fakeCompletion(SUMMARY);
       current = host({ fetch: fetchMock });
       await plugin(current.bb);
@@ -271,13 +520,10 @@ describe("summarizing", () => {
         thread,
         lastAssistantText: "done",
       });
-      await vi.advanceTimersByTimeAsync(2_000);
+      // The post-turn brief is already pending, so `thread.active` does not
+      // queue a pre-turn one on top of it.
       await current.harness.behavior.emitThreadEvent("thread.active", { thread });
-      // The timer restarts from the new event rather than firing at 5s.
-      await settle(3_500);
-      expect(fetchMock).not.toHaveBeenCalled();
-
-      await settle(2_000);
+      await settle(0);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
@@ -380,7 +626,7 @@ describe("summarizing", () => {
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
     current = createFakePluginHost({
       pluginId: "thread-briefs",
-      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1" },
       sdk: {
         threads: {
           get: async () => old,
@@ -426,8 +672,7 @@ describe("summarizing", () => {
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
     current = createFakePluginHost({
       pluginId: "thread-briefs",
-      // A 1s quiet period keeps the test fast.
-      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1", quietSeconds: 1 },
+      settings: { apiKey: "test-key", baseUrl: "https://api.test/v1" },
       sdk: {
         threads: {
           get: async () => sweepThread,
@@ -445,21 +690,21 @@ describe("summarizing", () => {
     }) as typeof current;
     await plugin(current!.bb);
 
-    // Activity just after load, then let the quiet period elapse.
+    // Activity just after load, whose `thread.idle` never arrived.
     sweepThread = makeThreadResponse({
       id: "thr_live",
       status: "idle",
       updatedAt: Date.now() + 5,
     });
-    await new Promise((resolve) => setTimeout(resolve, 1200));
 
     await current!.harness.behavior.runSchedule("brief-sweep");
     await waitFor(async () => (fetchMock.mock.calls.length > 0 ? true : null));
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves a thread still inside its quiet period alone", async () => {
-    // `thread` defaults to updatedAt = now, so the sweep must not touch it.
+  it("leaves a briefless thread whose activity predates load alone", async () => {
+    // `thread` was built before the plugin loaded, so the sweep must not
+    // backfill it.
     const fetchMock = fakeCompletion(SUMMARY);
     current = host({ fetch: fetchMock });
     await plugin(current.bb);
@@ -487,6 +732,11 @@ describe("summarizing", () => {
         status: "waiting-on-me",
         stage: "review",
         label: "Review — Waiting on you",
+        pinned: false,
+        stageOverride: null,
+        statusOverride: null,
+        autoArchive: true,
+        ring: true,
       },
     ]);
   });
@@ -560,6 +810,9 @@ describe("the auto-archive sweep", () => {
   function archiveHost(options: {
     threads: ReturnType<typeof makeThreadResponse>[];
     doneArchiveHours?: number;
+    listPluginMetadata?: ReturnType<typeof metadataFrom>;
+    /** Fail every `threads.get`, as a transient read error would. */
+    getFails?: boolean;
   }) {
     globalThis.fetch = fakeCompletion(SUMMARY) as unknown as typeof globalThis.fetch;
     const archived: string[] = [];
@@ -569,18 +822,22 @@ describe("the auto-archive sweep", () => {
         apiKey: "test-key",
         baseUrl: "https://api.test/v1",
         model: "test-model",
-        quietSeconds: 120,
         doneArchiveHours: options.doneArchiveHours ?? 48,
       },
       sdk: {
         threads: {
           list: async () => options.threads,
-          get: async ({ threadId }) =>
-            options.threads.find((entry) => entry.id === threadId) ?? thread,
+          get: async ({ threadId }) => {
+            if (options.getFails === true) throw new Error("503");
+            return options.threads.find((entry) => entry.id === threadId) ?? thread;
+          },
           archive: async ({ threadId }) => {
             archived.push(threadId);
             return { id: threadId, archivedAt: Date.now() };
           },
+          ...(options.listPluginMetadata === undefined
+            ? {}
+            : { experimental_listPluginMetadata: options.listPluginMetadata }),
         },
       },
     });
@@ -659,6 +916,92 @@ describe("the auto-archive sweep", () => {
 
     await harness.behavior.runSchedule("archive-done");
     expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("leaves a thread its plugin exempted from archiving", async () => {
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_steward", 9, { originPluginId: "stewards" }),
+        coldThread("thr_worker", 9, { originPluginId: "stewards" }),
+      ],
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: { archive: false } },
+        // Spawned by the same plugin, but it asked for nothing.
+        thr_worker: { role: "worker" },
+      }),
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_steward");
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual(["thr_worker"]);
+    // One request for the plugin, not one per thread.
+    expect(harness.sdk.callsTo("threads.experimental_listPluginMetadata")).toHaveLength(1);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("honours a worker's opt-out keyed on its steward's namespace", async () => {
+    // The worker was spawned by the CLI, not the plugin, so it has no origin
+    // plugin of its own: its opt-out lives in its steward's namespace and is
+    // found through the lifecycle-owner chain.
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_steward", 9, { originPluginId: "stewards" }),
+        coldThread("thr_worker", 9, { lifecycleOwnerThreadId: "thr_steward" }),
+      ],
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "steward", threadBriefs: { archive: false } },
+        thr_worker: { role: "worker", threadBriefs: { archive: false } },
+      }),
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_steward");
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("treats a failed owner lookup as unknown, keeping a worker rather than archiving it", async () => {
+    // A transient `threads.get` failure while resolving the chain must not be
+    // cached as "no plugin": that would read as opted in and let the sweep
+    // archive a tagged worker, cascading to its reviewer (BB-14).
+    const { bb, harness, archived } = archiveHost({
+      threads: [coldThread("thr_worker", 9, { lifecycleOwnerThreadId: "thr_missing" })],
+      listPluginMetadata: metadataFrom({}),
+      getFails: true,
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_worker");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("leaves a plugin's thread alone when its metadata cannot be read", async () => {
+    const { bb, harness, archived } = archiveHost({
+      threads: [
+        coldThread("thr_plugin", 9, { originPluginId: "stewards" }),
+        coldThread("thr_mine", 9),
+      ],
+      listPluginMetadata: async () => {
+        throw new Error("503");
+      },
+    });
+    await plugin(bb);
+    await seedDoneBrief(bb, "thr_plugin");
+    await seedDoneBrief(bb, "thr_mine");
+
+    await harness.behavior.runSchedule("archive-done");
+    expect(archived).toEqual(["thr_mine"]);
 
     await harness.lifecycle.dispose();
   });
@@ -786,7 +1129,6 @@ describe("status override", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
       },
       sdk: {
         threads: {
@@ -942,6 +1284,284 @@ describe("status override", () => {
   });
 });
 
+describe("block reason", () => {
+  const BLOCKED = {
+    ...SUMMARY,
+    blockedOn: "the design review",
+    status: "waiting-on-other",
+  };
+
+  /**
+   * A host whose conversation can grow by user messages, and whose model can
+   * change its mind: the two things the release rule reads.
+   */
+  function talkingHost(initial: unknown) {
+    let reply = initial;
+    const items = [
+      { id: "1", role: "user", preview: "Build it", attachmentSummary: null },
+    ];
+    let maxSeq = 12;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: JSON.stringify(reply) } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    const created = createFakePluginHost({
+      pluginId: "thread-briefs",
+      settings: {
+        apiKey: "test-key",
+        baseUrl: "https://api.test/v1",
+        model: "test-model",
+        jsonMode: true,
+        quietSeconds: 120,
+      },
+      sdk: {
+        threads: {
+          get: async () => thread,
+          list: async () => [thread],
+          output: async () => ({ output: "All set." }),
+          conversationOutline: async () => ({ items: [...items], maxSeq }),
+          interactions: { list: async () => [] },
+        },
+      },
+    });
+    return {
+      ...created,
+      fetchMock,
+      answer: (next: unknown) => {
+        reply = next;
+      },
+      userSays: (preview: string) => {
+        items.push({
+          id: String(items.length + 1),
+          role: "user",
+          preview,
+          attachmentSummary: null,
+        });
+        maxSeq += 1;
+      },
+      agentSays: (preview: string) => {
+        items.push({
+          id: String(items.length + 1),
+          role: "assistant",
+          preview,
+          attachmentSummary: null,
+        });
+        maxSeq += 1;
+      },
+    };
+  }
+
+  const summarize = async (
+    harness: { behavior: { callRpc: (method: string, input: unknown) => Promise<unknown> } },
+    after = 0,
+  ) => {
+    await harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    return waitFor(async () => {
+      const result = (await harness.behavior.callRpc("getBrief", {
+        threadId: "thr_1",
+      })) as BriefState;
+      if (result.state !== "ready") return null;
+      return result.brief.lastSummarizedAt >= after ? result : null;
+    });
+  };
+
+  /** The user prompt of the most recent summarizer call. */
+  const lastPrompt = (fetchMock: ReturnType<typeof vi.fn>) => {
+    const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
+    const body = JSON.parse(String(init.body)) as {
+      messages: { role: string; content: string }[];
+    };
+    return body.messages.find((message) => message.role === "user")!.content;
+  };
+
+  it("records the reason with a Blocked pin, in one write", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+
+    const pinned = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "  not before the release  ",
+    })) as BriefState;
+    if (pinned.state !== "ready") throw new Error("unreachable");
+    expect(pinned.brief.status).toBe("waiting-on-other");
+    expect(pinned.brief.blockReason?.text).toBe("not before the release");
+    expect(pinned.brief.blockReason?.recordedAt).toBeGreaterThan(0);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("hands the reason to the summarizer in the conversation, with guidance", async () => {
+    const { bb, harness, fetchMock } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "waiting on the design review",
+    });
+    // The pin queues its own re-summary; wait for it so the next call we read
+    // is the one that saw the note.
+    await summarize(harness, first.brief.lastSummarizedAt + 1);
+
+    const prompt = lastPrompt(fetchMock);
+    expect(prompt).toContain("User's note");
+    expect(prompt).toContain('"waiting on the design review"');
+    expect(prompt).toContain("Treat it as true unless");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("outlives the pin: an agent turn retires the pin and keeps the reason", async () => {
+    // Parking a thread whose turn is still running is the common case. The
+    // turn ending advances the cursor and retires the pin like any pin; the
+    // reason has to survive that, or the park is undone by the agent.
+    const { bb, harness, agentSays, answer } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    agentSays("Finished the refactor.");
+    answer(BLOCKED);
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.statusOverride).toBeNull();
+    expect(after.brief.blockReason?.text).toBe("not before the release");
+    expect(after.brief.status).toBe("waiting-on-other");
+    expect(after.brief.blockedOn).toBe("the design review");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the reason when the model reads it as not blocked without a new user message", async () => {
+    // Nothing the user did has changed, so one bad reading by a small model
+    // must not quietly un-park the thread.
+    const { bb, harness, agentSays } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "not before the release",
+    });
+
+    agentSays("Done, want me to push?");
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason?.text).toBe("not before the release");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("releases the reason once the user has written and the model reads it as resolved", async () => {
+    const { bb, harness, userSays } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "waiting on the design review",
+    });
+
+    userSays("Design review is done, carry on.");
+    // SUMMARY answers waiting-on-me: the model read the message as resolving it.
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason).toBeNull();
+    expect(after.brief.status).toBe("waiting-on-me");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("keeps the reason across a user message the model still reads as blocked", async () => {
+    const { bb, harness, userSays, answer } = talkingHost(SUMMARY);
+    await plugin(bb);
+    const first = await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "waiting on the design review",
+    });
+
+    userSays("Where did we leave this?");
+    answer(BLOCKED);
+    const after = await summarize(harness, first.brief.lastSummarizedAt + 1);
+    expect(after.brief.blockReason?.text).toBe("waiting on the design review");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("clears the reason when another status is pinned, and not when the pin is cleared", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    const unpinned = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: null,
+    })) as BriefState;
+    if (unpinned.state !== "ready") throw new Error("unreachable");
+    expect(unpinned.brief.blockReason?.text).toBe("not before the release");
+
+    const done = (await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "done",
+    })) as BriefState;
+    if (done.state !== "ready") throw new Error("unreachable");
+    expect(done.brief.blockReason).toBeNull();
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("clears the reason on its own with a blank, leaving the pin", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "waiting-on-other",
+      reason: "not before the release",
+    });
+
+    const cleared = (await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: null,
+    })) as BriefState;
+    if (cleared.state !== "ready") throw new Error("unreachable");
+    expect(cleared.brief.blockReason).toBeNull();
+    expect(cleared.brief.statusOverride).toBe("waiting-on-other");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("rides along on the board card", async () => {
+    const { bb, harness } = talkingHost(SUMMARY);
+    await plugin(bb);
+    await summarize(harness);
+    await harness.behavior.callRpc("setBlockReason", {
+      threadId: "thr_1",
+      text: "not before the release",
+    });
+    const { cards } = (await harness.behavior.callRpc("listBriefCards", null)) as {
+      cards: { blockReason: { text: string } | null }[];
+    };
+    expect(cards[0]?.blockReason?.text).toBe("not before the release");
+
+    await harness.lifecycle.dispose();
+  });
+});
+
 describe("sidebar grouping by status", () => {
   const groupedThread = (overrides: Partial<ReturnType<typeof makeThreadResponse>>) =>
     makeThreadResponse({ visibility: "visible", status: "idle", ...overrides });
@@ -955,6 +1575,7 @@ describe("sidebar grouping by status", () => {
     threads: ReturnType<typeof makeThreadResponse>[];
     sections?: { id: string; name: string }[];
     grouping?: string;
+    listPluginMetadata?: ReturnType<typeof metadataFrom>;
   }) {
     const sections = options.sections ?? [];
     const prefs: Record<string, unknown> = {
@@ -972,7 +1593,6 @@ describe("sidebar grouping by status", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         sidebarGrouping: options.grouping ?? "status",
       },
       sdk: {
@@ -991,6 +1611,9 @@ describe("sidebar grouping by status", () => {
           output: async () => ({ output: "All set." }),
           conversationOutline: async () => ({ items: [], maxSeq: 0 }),
           interactions: { list: async () => [] },
+          ...(options.listPluginMetadata === undefined
+            ? {}
+            : { experimental_listPluginMetadata: options.listPluginMetadata }),
         },
         threadSections: {
           list: async () => [...sections],
@@ -1029,7 +1652,8 @@ describe("sidebar grouping by status", () => {
 
   /** The grouping reconcile is scheduled, so tests wait on its effect. */
   const settle = async (read: () => boolean) => {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
+    // 5s: long enough for a pass that has to wait out the reconcile debounce.
+    for (let attempt = 0; attempt < 500; attempt += 1) {
       if (read()) return;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -1054,6 +1678,125 @@ describe("sidebar grouping by status", () => {
       "threads",
     ]);
     expect(prefs.chronologicalSort).toBe("updated");
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("leaves a hand-reordered sidebar alone on later passes", async () => {
+    const threads = [groupedThread({ id: "thr_1", sectionId: null })];
+    const { bb, harness, prefs } = groupingHost({ threads });
+    await bb.storage.kv.set("brief:thr_1", storedBrief("thr_1", {}));
+    await plugin(bb);
+
+    // Waits for our own first write, so the drag below really is a later pass.
+    // Waits for our own first write, so the drag below really is a later pass.
+    await settle(() =>
+      (prefs.manualSectionOrder as string[]).includes("section:sec_1"),
+    );
+    // The sidebar as the user has since dragged it: Threads at the top, our
+    // three sections in an order of their own.
+    const dragged = [
+      "threads",
+      "pinned",
+      "section:sec_3",
+      "section:sec_1",
+      "section:sec_2",
+    ];
+    prefs.manualSectionOrder = [...dragged];
+
+    // Pinning a status is the cheapest way to make a later pass actually run,
+    // and it files the thread, so the pass is visibly a real one.
+    await harness.behavior.callRpc("setStatusOverride", {
+      threadId: "thr_1",
+      status: "done",
+    });
+    await settle(() => threads[0]!.sectionId === "sec_3");
+
+    // A reconcile runs on every brief write, so re-asserting our own order here
+    // would undo the drag within seconds of it being made.
+    expect(prefs.manualSectionOrder).toEqual(dragged);
+    expect(
+      harness.sdk
+        .callsTo("plugins.callRpc")
+        .map(([args]) => args as { method: string; input?: { key?: string } })
+        .filter(
+          (args) =>
+            args.method === "setPreference" &&
+            args.input?.key === "manualSectionOrder",
+        ),
+    ).toHaveLength(1);
+
+    await harness.lifecycle.dispose();
+    // Two reconciles, each behind the debounce, so this one needs the room.
+  }, 15_000);
+
+  it("takes a thread its plugin exempted out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_plain", sectionId: null }),
+      // Filed before its plugin asked to be left out, as the project steward
+      // was on servers that ran stewards before this.
+      groupedThread({ id: "thr_steward", sectionId: "sec_3", originPluginId: "stewards" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: { group: false } },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_plain", storedBrief("thr_plain", done));
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await plugin(bb);
+
+    await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("takes a thread tagged with the single switch out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_plain", sectionId: null }),
+      // Filed before its plugin asked for thread-briefs to leave it alone.
+      groupedThread({ id: "thr_steward", sectionId: "sec_3", originPluginId: "stewards" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "project", threadBriefs: false },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_plain", storedBrief("thr_plain", done));
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await plugin(bb);
+
+    await settle(() => threads[0]!.sectionId === "sec_3");
+    await settle(() => threads[1]!.sectionId === null);
+
+    await harness.lifecycle.dispose();
+  });
+
+  it("takes a worker keyed on its steward's namespace out of the sections", async () => {
+    const threads = [
+      groupedThread({ id: "thr_steward", sectionId: null, originPluginId: "stewards" }),
+      // Spawned by the CLI, so no origin plugin of its own; filed before its
+      // steward's opt-out reached thread-briefs.
+      groupedThread({ id: "thr_worker", sectionId: "sec_3", lifecycleOwnerThreadId: "thr_steward" }),
+    ];
+    const { bb, harness } = groupingHost({
+      threads,
+      listPluginMetadata: metadataFrom({
+        thr_steward: { role: "steward", threadBriefs: { group: false } },
+        thr_worker: { role: "worker", threadBriefs: { group: false } },
+      }),
+    });
+    const done = { nextStep: "", blockedOn: "" };
+    await bb.storage.kv.set("brief:thr_steward", storedBrief("thr_steward", done));
+    await bb.storage.kv.set("brief:thr_worker", storedBrief("thr_worker", done));
+    await plugin(bb);
+
+    await settle(() => threads[1]!.sectionId === null);
 
     await harness.lifecycle.dispose();
   });
@@ -1305,12 +2048,27 @@ describe("renaming threads", () => {
     /** Runs when the summarizer is called, to move the world mid-flight. */
     onRequest?: () => void;
     update?: (args: { threadId: string; title?: string | null }) => void;
+    /** The spawning plugin's namespace on the thread, when a plugin spawned it. */
+    originMetadata?: Record<string, unknown>;
+    /** The steward that owns a CLI-spawned worker: its metadata under the stewards namespace. */
+    ownerMetadata?: Record<string, unknown>;
+    /** The CLI-spawned worker's own opt-out under the owning plugin's namespace. */
+    workerMetadata?: Record<string, unknown>;
+    /** Fail every plugin-metadata read, as a transient error would. */
+    metadataFails?: boolean;
   }) {
+    const ownerId = "thr_steward";
+    const chain = options.ownerMetadata !== undefined;
+    const ownerThread = chain
+      ? makeThreadResponse({ id: ownerId, title: "Steward", visibility: "visible", status: "idle", originPluginId: "stewards" })
+      : null;
     const live = makeThreadResponse({
       id: "thr_1",
       title: options.title === undefined ? "Build me a thing that does..." : options.title,
       visibility: "visible",
       status: "idle",
+      originPluginId: options.originMetadata === undefined && !chain ? null : "stewards",
+      ...(chain ? { lifecycleOwnerThreadId: ownerId } : {}),
     });
     const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => {
       options.onRequest?.();
@@ -1332,6 +2090,13 @@ describe("renaming threads", () => {
     });
     globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
 
+    // Mutable, so a test can change what the plugin asks for between passes.
+    const metadata: Record<string, Record<string, unknown>> =
+      options.originMetadata === undefined ? {} : { thr_1: options.originMetadata };
+    if (chain) {
+      metadata[ownerId] = options.ownerMetadata!;
+      if (options.workerMetadata !== undefined) metadata.thr_1 = options.workerMetadata;
+    }
     // Advanced per summary so a test can wait for *that* summary's write,
     // rather than seeing the previous one's brief and racing ahead.
     let seq = 12;
@@ -1342,13 +2107,13 @@ describe("renaming threads", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         renameThreads: options.renameThreads ?? true,
       },
       sdk: {
         threads: {
-          get: async () => ({ ...live }),
-          list: async () => [live],
+          get: async ({ threadId }: { threadId: string }) =>
+            threadId === ownerId && ownerThread !== null ? { ...ownerThread } : { ...live },
+          list: async () => (ownerThread === null ? [live] : [live, ownerThread]),
           update: async (args) => {
             options.update?.(args as { threadId: string; title?: string | null });
             if (typeof args.title === "string") live.title = args.title;
@@ -1362,10 +2127,16 @@ describe("renaming threads", () => {
             maxSeq: seq,
           }),
           interactions: { list: async () => [] },
+          experimental_listPluginMetadata:
+            options.metadataFails === true
+              ? async () => {
+                  throw new Error("503");
+                }
+              : metadataFrom(metadata),
         },
       },
     });
-    return { ...created, live, fetchMock, nextSeq: () => (seq += 1) };
+    return { ...created, live, fetchMock, metadata, nextSeq: () => (seq += 1) };
   }
 
   /** Summarize once, and wait for that summary's brief to be stored. */
@@ -1456,6 +2227,70 @@ describe("renaming threads", () => {
     const stored = await current.bb.storage.kv.get<StoredBrief>("brief:thr_1");
     expect(stored?.appliedTitle).toBe("Sidebar grouping by status");
     expect(stored?.fields.title).toBe("Sidebar grouping by status");
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("writes no brief for a thread its plugin keeps out of briefs", async () => {
+    const current = renameHost({
+      title: "ENG-42: Fix the flaky test",
+      originMetadata: { role: "steward", threadBriefs: false },
+    });
+    await plugin(current.bb);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
+    expect(current.harness.sdk.callsTo("threads.update")).toHaveLength(0);
+    expect(current.fetchMock).not.toHaveBeenCalled();
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeUndefined();
+    const state = (await current.harness.behavior.callRpc("getBrief", {
+      threadId: "thr_1",
+    })) as BriefState;
+    expect(state.state).toBe("off");
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("reads the legacy per-key object as off, without a re-tag", async () => {
+    // A thread tagged before the single switch: any one key false is off, so
+    // it needs no re-tag and gets no brief.
+    const current = renameHost({
+      title: "ENG-42: Fix the flaky test",
+      originMetadata: { role: "steward", threadBriefs: { rename: false, archive: false } },
+    });
+    await plugin(current.bb);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(current.live.title).toBe("ENG-42: Fix the flaky test");
+    expect(current.fetchMock).not.toHaveBeenCalled();
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeUndefined();
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("keeps a brief when the owning plugin's namespace cannot be read", async () => {
+    // A read failure is off for this pass, not an opt-out: the thread is
+    // skipped and its existing brief kept, so a transient error never deletes
+    // a one-off thread's brief.
+    const current = renameHost({
+      originMetadata: { role: "worker" },
+      metadataFails: true,
+    });
+    await current.bb.storage.kv.set("brief:thr_1", storedBrief("thr_1", {}));
+    await plugin(current.bb);
+    await current.harness.behavior.callRpc("refresh", { threadId: "thr_1" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(await current.bb.storage.kv.get("brief:thr_1")).toBeDefined();
+    expect(current.fetchMock).not.toHaveBeenCalled();
+    await current.harness.lifecycle.dispose();
+  });
+
+  it("renames a plugin's thread that asked for nothing", async () => {
+    const current = renameHost({ originMetadata: { role: "worker" } });
+    await plugin(current.bb);
+    await summarize(current);
+
+    expect(current.live.title).toBe("Sidebar grouping by status");
     await current.harness.lifecycle.dispose();
   });
 
@@ -1610,7 +2445,6 @@ describe("re-entry refresher", () => {
         baseUrl: "https://api.test/v1",
         model: "test-model",
         jsonMode: true,
-        quietSeconds: 120,
         refresherIdleHours: options.refresherIdleHours ?? 1,
       },
       sdk: {

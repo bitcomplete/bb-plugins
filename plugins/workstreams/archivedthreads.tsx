@@ -3,19 +3,7 @@ import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type { ArchiveRecord } from "./threadarchive";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Icon } from "@/components/ui/icon";
 import { toast } from "sonner";
-
-export function ArchivedThreadsButton() {
-  const [open, setOpen] = useState(false);
-  return <>
-    <button type="button" aria-label="Archived threads" title="Archived threads" onClick={() => setOpen(true)}
-      className="flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
-      <Icon name="Archive" className="size-3.5" />
-    </button>
-    <ArchivedThreadsDialog open={open} onOpenChange={setOpen} />
-  </>;
-}
 
 /** Independent of linked-thread rows so the last thread can always be restored. */
 export function ArchivedThreadsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Pr, RawUnit } from "./contract.js";
+import { checkConclusions } from "./gh.js";
 import {
   ALL_LENSES,
   DAY_MS,
@@ -72,6 +73,7 @@ function pr(overrides: Partial<Pr> = {}): Pr {
     latestReviews: [],
     unresolvedReviewThreads: 0,
     resolvedReviewThreads: 0,
+    approvalFeedback: { status: "none", fingerprint: null, sourceIds: [] },
     ...overrides,
   };
 }
@@ -149,6 +151,14 @@ describe("unitLifecycle", () => {
     );
   });
 
+  it.each(["TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"])(
+    "keeps an approved PR with a %s check in the CI repair state",
+    (conclusion) => {
+      expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: [conclusion] }) }))).toBe("blocked");
+      expect(unitLifecycle(unit({ pr: pr({ isDraft: true, checkConclusions: [conclusion] }) }))).toBe("in-progress");
+    },
+  );
+
   it("separates awaiting-followup from blocked, because one waits on YOUR edit and the other waits on CI: merging them would hide the only state you can clear alone", () => {
     expect(
       unitLifecycle(unit({ pr: pr({ reviewDecision: "CHANGES_REQUESTED" }) })),
@@ -192,13 +202,23 @@ describe("unitLifecycle", () => {
   });
 
   it("keeps a written approval in Respond even when GitHub reports zero inline threads", () => {
-    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", approvalHasBody: true, unresolvedReviewThreads: 0 }) }))).toBe("approved-with-note");
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", approvalFeedback: { status: "present", fingerprint: "a".repeat(64), sourceIds: ["review-1"] }, unresolvedReviewThreads: 0 }) }))).toBe("approved-with-note");
   });
 
-  it("lets resolved inline feedback supersede its approval summary without erasing the note's history", () => {
-    const reviewed = pr({ reviewDecision: "APPROVED", approvalHasBody: true, approvalNoteFollowedUp: true, unresolvedReviewThreads: 0, resolvedReviewThreads: 6 });
+  // A worker's evidence verifies the head, but only your reply on the PR or your Confirm answers the reviewer.
+  it("keeps approved feedback visible until current-head evidence is verified and the note is answered", () => {
+    const reviewed = pr({ reviewDecision: "APPROVED", approvalHasBody: true,
+      approvalFeedback: { status: "present", fingerprint: "a".repeat(64), sourceIds: ["review-1"] }, approvalFeedbackVerified: true,
+      unresolvedReviewThreads: 0, resolvedReviewThreads: 6,
+      reviewFeedback: { openThreads: 0, comment: null, repliedAt: "2026-09-24T12:00:00Z", noteAt: "2026-09-24T11:00:00Z", followUpAt: null } });
     expect(unitLifecycle(unit({ pr: reviewed }))).toBe("awaiting-merge");
     expect(reviewed.approvalHasBody).toBe(true);
+    expect(unitLifecycle(unit({ pr: { ...reviewed, reviewFeedback: { ...reviewed.reviewFeedback!, repliedAt: null } } }))).toBe("approved-with-note");
+    expect(unitLifecycle(unit({ pr: { ...reviewed, approvalFeedbackConfirmed: true, reviewFeedback: { ...reviewed.reviewFeedback!, repliedAt: null } } })))
+      .toBe("awaiting-merge");
+    // Another person's comment no one answered holds it too.
+    expect(unitLifecycle(unit({ pr: { ...reviewed, reviewFeedback: { ...reviewed.reviewFeedback!, comment: { login: "pia-r", at: "2026-09-24T13:00:00Z" } } } })))
+      .toBe("approved-with-comments");
   });
 
   it("calls an approved PR with green checks and no open comments awaiting-merge, because it is waiting on nothing but a button", () => {
@@ -223,6 +243,16 @@ describe("unitLifecycle", () => {
         }),
       ),
     ).toBe("awaiting-review");
+  });
+
+  it("calls an approved PR with a check still running awaiting-review, because gh leaves a conclusion empty until the check completes", () => {
+    const rollup = [
+      { __typename: "CheckRun", name: "test", status: "IN_PROGRESS", conclusion: "" },
+      { __typename: "CheckRun", name: "build", status: "QUEUED", conclusion: "" },
+      { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "SUCCESS" },
+    ];
+    expect(checkConclusions(rollup)).toEqual(["PENDING", "PENDING", "SUCCESS"]);
+    expect(unitLifecycle(unit({ pr: pr({ reviewDecision: "APPROVED", checkConclusions: checkConclusions(rollup) }) }))).toBe("awaiting-review");
   });
 
   it("calls an approved PR with no checks at all awaiting-merge, because plenty of repos run no CI and calling those permanently unmergeable would be wrong", () => {
@@ -315,6 +345,9 @@ describe("lifecycle groups", () => {
 });
 
 describe("mostUrgent", () => {
+  it("keeps an empty aggregate in the completed lifecycle taxonomy", () => {
+    expect(mostUrgent([])).toBe("merged");
+  });
   it("surfaces the blocked member of a cluster, because that is the one thing the cluster needs from you", () => {
     expect(mostUrgent(["merged", "awaiting-merge", "blocked", "up-next"])).toBe("blocked");
   });
@@ -1424,6 +1457,13 @@ describe("the hierarchy and its collapse rules", () => {
     effortOf("Gift cards", ["ABC-2"]),
     effortOf("Homepage", ["ABC-9"]),
   ];
+
+  it("gives a program of empty established efforts a valid completed lifecycle", () => {
+    const empty = ["Empty A", "Empty B"].map((key) => ({ ...effortOf(key, []), lifecycle: "merged" as const }));
+    const groups = buildHierarchy({ efforts: [...efforts, ...empty],
+      programOf: (effort) => effort.key.startsWith("Empty") ? "Planning" : effort.key });
+    expect(groups.find((group) => group.key === "program:Planning")?.lifecycle).toBe("merged");
+  });
 
   it("renders no program wrapper around a single effort, because a group that restates its only child is noise the reader has to look past", () => {
     const groups = buildHierarchy({

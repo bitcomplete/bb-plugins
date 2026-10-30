@@ -22,6 +22,11 @@ export interface ArchiveCandidate {
   visibility: string;
   /** The thread's live execution status. */
   status: string;
+  /**
+   * The plugin that spawned the thread exempted it from auto-archiving, or
+   * its namespace could not be read: see `optout.ts`.
+   */
+  optedOut: boolean;
 }
 
 /** What the brief says about a thread, for the two facts this needs. */
@@ -68,6 +73,9 @@ export interface PlanArchivesArgs {
  *   anything inferred. It still goes grey — the ring stays honest about the
  *   thread being cold — it just never leaves.
  * - **Busy, hidden, deleted, already archived.** Nothing to do, or not ours.
+ * - **Opted out by its plugin.** A plugin running a long-lived thread knows
+ *   when it is finished; a brief reading "done for now" between wakes does
+ *   not.
  * - **Auto-archived before.** See `autoArchivedAt` on the stored brief: this is
  *   a thread we archived and the user pulled back, and that decision is final
  *   until they work in it again.
@@ -79,6 +87,7 @@ export function planArchives(args: PlanArchivesArgs): string[] {
     if (thread.archivedAt !== null || thread.deletedAt !== null) continue;
     if (thread.visibility === "hidden") continue;
     if (thread.pinnedAt !== null) continue;
+    if (thread.optedOut) continue;
     if (BUSY_STATUSES.has(thread.status)) continue;
     const brief = args.briefs.get(thread.id);
     if (brief === undefined) continue;
