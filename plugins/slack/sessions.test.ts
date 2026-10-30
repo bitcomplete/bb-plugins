@@ -31,6 +31,7 @@ function event(over: Partial<SessionEvent> = {}): SessionEvent {
     capability: "",
     action: "message",
     mention: false,
+    tagged: true,
     channel: "D0123",
     contextChannel: "",
     thread: "1712345678.901234",
@@ -96,6 +97,17 @@ describe("wakeText", () => {
     expect(text).toContain("halt work");
   });
 
+  it("says an untagged reply was not addressed to bb and does not need a reply", () => {
+    const text = wakeText(event({ tagged: false, mention: false, channel: "C0123", comment: { text: "what about the second one?", untrusted: false } }));
+    expect(text).toContain("session D0123:1712345678.901234");
+    expect(text).toContain("without addressing bb");
+    expect(text).toContain("does not need a reply");
+    expect(text).toContain("only if it is for bb");
+    // The old DM wording must not leak into an untagged channel reply.
+    expect(text).not.toContain("Slack DM from");
+    expect(text).not.toContain("Reply in Slack with the slack_reply tool");
+  });
+
   it("introduces an assistant-thread start without words", () => {
     const text = wakeText(event({ action: "assistant_thread_started", comment: { text: "", untrusted: false } }));
     expect(text).toContain("opened the assistant pane");
@@ -113,6 +125,8 @@ describe("sessionsSchema", () => {
   it("fills the title default and tolerates junk", () => {
     const parsed = sessionsSchema.parse({ a: { channel: "D1", thread: "1", threadId: "thr-1", projectId: "prj-1", eventAt: 1, events: 2, answered: 1, handedAt: 1 } });
     expect(parsed.a?.title).toBeNull();
+    // An older stored record without the field is read as no untagged wake waiting.
+    expect(parsed.a?.untagged).toBe(0);
     expect(sessionsSchema.parse("nonsense")).toEqual({});
   });
 });

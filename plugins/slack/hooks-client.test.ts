@@ -43,6 +43,42 @@ describe("sessionEventSchema", () => {
     expect(sessionEventSchema.safeParse({ source: "linear", session: "x", action: "created", channel: "c", thread: "t", asker: {}, owner: {}, fromOwner: true, comment: {} }).success).toBe(false);
   });
 
+  it("treats a missing tagged field as tagged, so an older service still expects a reply", () => {
+    const parsed = sessionEventSchema.parse({
+      source: "slack",
+      session: "D0123:1712345678.901234",
+      action: "message",
+      channel: "D0123",
+      thread: "1712345678.901234",
+      asker: { id: "U0123", name: "Alice" },
+      owner: { id: "U0123", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "build this", untrusted: false },
+      at: "2026-10-22T12:00:00Z",
+    });
+    expect(parsed.tagged).toBe(true);
+  });
+
+  it("carries tagged false for an untagged thread reply", () => {
+    const parsed = sessionEventSchema.parse({
+      source: "slack",
+      session: "C0123:1712345678.901234",
+      action: "message",
+      mention: false,
+      tagged: false,
+      channel: "C0123",
+      thread: "1712345678.901234",
+      asker: { id: "U0123", name: "Alice" },
+      owner: { id: "U0123", name: "Alice" },
+      fromOwner: true,
+      routedAs: "owner",
+      comment: { text: "what about the second one?", untrusted: false },
+      at: "2026-10-30T12:00:00Z",
+    });
+    expect(parsed.tagged).toBe(false);
+  });
+
   it("accepts the invited and block_action wakes, which carry no conversation", () => {
     const invited = sessionEventSchema.parse({
       source: "slack",

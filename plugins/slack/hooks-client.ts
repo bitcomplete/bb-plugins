@@ -135,6 +135,13 @@ export const sessionEventSchema = z
     action: z.enum(["message", "assistant_thread_started", "assistant_thread_context_changed", "invited", "block_action"]),
     /** True for a channel app_mention, false for a DM or assistant-thread event. */
     mention: z.boolean().default(false),
+    /**
+     * True when the message addressed bb directly (a DM or a channel mention),
+     * false for an untagged reply in a channel thread bb already follows. A
+     * missing field (an older service) is treated as tagged, so the plugin
+     * keeps requiring a reply as before.
+     */
+    tagged: z.boolean().default(true),
     channel: z.string().min(1).max(200),
     /**
      * The channel the user was viewing, on an assistant context change; "" on

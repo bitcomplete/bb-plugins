@@ -12,20 +12,30 @@ Slack conversation and posts the reply back through bb-gate-hooks, which holds
 the app's bot token. The pod never holds a Slack bot credential.
 
 A DM and a channel mention of the app both wake the server of the Slack user
-who sent them. A channel mention by someone other than the server's owner is
-held: no turn runs, and the plugin posts one reply asking the owner to
-`confirm <id>`. Only the owner's mention that names the id releases the held
-text into a thread. Which bb project a conversation starts in is chosen from
-the routing map (Settings → Plugins → Slack): a mention in a mapped channel
-uses that channel's project; everything else, DMs included, uses the fallback.
-The sign-in token and the map live in the plugin's own storage, not in bb's
-settings table.
+who sent them. A reply inside a channel thread bb is already part of also
+wakes the owner's server without tagging `@bb`; it is a continuation, not a
+request, so it does not owe a reply (see "Replying"). A channel mention by
+someone other than the server's owner is held: no turn runs, and the plugin
+posts one reply asking the owner to `confirm <id>`. Only the owner's mention
+that names the id releases the held text into a thread. Which bb project a
+conversation starts in is chosen from the routing map (Settings → Plugins →
+Slack): a mention in a mapped channel uses that channel's project; everything
+else, DMs included, uses the fallback. The sign-in token and the map live in
+the plugin's own storage, not in bb's settings table.
+
+An untagged reply arrives only after a Slack admin subscribes the app to
+`message.channels` and `message.groups` (adding the `channels:history` and
+`groups:history` bot scopes and reinstalling, then adding the two bot events);
+until then bb never sees it.
 
 ## Replying
 
 A Slack wake reaches a thread as a message naming the session
-(`channel:thread`) and telling you to use `slack_reply`. Post exactly one
-reply per Slack message:
+(`channel:thread`) and telling you whether it expects a reply. A tagged wake
+(a DM or an `@bb` mention) does: post exactly one reply per Slack message with
+`slack_reply`. An untagged wake is a reply in a thread bb is already part of;
+it does not owe a reply, so answer it only when it is for bb and otherwise end
+the turn silently.
 
 | Tool | Use it to |
 |---|---|
@@ -33,14 +43,17 @@ reply per Slack message:
 
 - The reply is posted by bb-gate-hooks as the app; the tool sends only the
   connection id and the text, so never put a token or secret in it.
-- Each Slack message gets one reply. A second `slack_reply` for the same
-  message is refused; a new Slack message is a new wake and can be answered.
+- Each tagged Slack message gets one reply. A second `slack_reply` for the
+  same message is refused; a new Slack message is a new wake and can be
+  answered. An untagged reply is not counted: reply only when it is for bb,
+  and a silent turn posts no error reply.
 - The session is leased to this server: the wake carries an opaque capability
   that the plugin echoes to `POST /v1/subscribe`, and the lease is renewed at
   half its life. Reply rights therefore survive a restart of bb-gate-hooks and
   are not limited to a day.
-- If the turn that handled a wake ends without calling `slack_reply`, the
-  plugin posts one error reply itself, so the developer is not left waiting.
+- If the turn that handled a tagged wake ends without calling `slack_reply`,
+  the plugin posts one error reply itself, so the developer is not left
+  waiting. An untagged reply posts nothing when the turn stays silent.
 - While the turn runs the plugin sets the Slack assistant status to
   "is thinking…", and it pushes the bb thread's title to the Slack
   conversation, so the title comes from bb, not from Slack.
