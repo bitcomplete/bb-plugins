@@ -260,6 +260,40 @@ function RepoRow({
   );
 }
 
+/**
+ * The primary repo's fixed row: it is the project source's own repo, so it
+ * comes from the source's `origin` rather than `repos.json` and cannot be
+ * edited or removed from this panel.
+ */
+function PrimaryRepoRow({
+  repo,
+  cache,
+}: {
+  repo: { dir: string; url: string };
+  cache: CacheEntry | undefined;
+}) {
+  return (
+    <li className="space-y-1 px-3 py-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <Icon name="FolderGit" className="text-muted-foreground size-3.5 shrink-0" />
+            <span className="truncate font-medium">{repo.dir}</span>
+            <CacheBadge entry={cache} />
+          </div>
+          <div className="text-muted-foreground mt-0.5 truncate font-mono text-xs">{repo.url}</div>
+        </div>
+        <span
+          className="text-muted-foreground bg-muted/40 shrink-0 rounded-md border px-2 py-0.5 text-xs"
+          title="The primary repo comes from the project source's origin, not repos.json. It cannot be edited or removed here."
+        >
+          primary · default branch
+        </span>
+      </div>
+    </li>
+  );
+}
+
 export function ReposPanel() {
   const { projects, projectId, choose, reload } = useProjectChoice();
   const rpc = useRpc<typeof rpcContract>();
@@ -460,7 +494,12 @@ export function ReposPanel() {
     );
   }
 
-  const existing = view?.repos.map((repo) => ({ dir: repo.dir, url: repo.url })) ?? [];
+  const existing = [
+    ...(view?.repos.map((repo) => ({ dir: repo.dir, url: repo.url })) ?? []),
+    ...(view?.primary === null || view?.primary === undefined
+      ? []
+      : [{ dir: view.primary.dir, url: view.primary.url }]),
+  ];
 
   return (
     <div className="h-full overflow-auto p-4 md:p-5">
@@ -546,8 +585,15 @@ export function ReposPanel() {
                   them here to decide for yourself.
                 </p>
               )}
-              {view.repos.length > 0 && (
+              {(view.primary !== null || view.repos.length > 0) && (
                 <ul className="divide-y rounded-md border">
+                  {view.primary !== null && (
+                    <PrimaryRepoRow
+                      key={`primary:${view.primary.dir}`}
+                      repo={view.primary}
+                      cache={cacheByUrl.get(view.primary.url)}
+                    />
+                  )}
                   {view.repos.map((repo) => (
                     <RepoRow
                       key={repo.dir}
@@ -569,13 +615,6 @@ export function ReposPanel() {
               </p>
               <p className="text-muted-foreground text-xs">
                 Layout: <code className="font-mono">{view.layout}</code>
-                {view.primary === null ? null : (
-                  <>
-                    {" · primary "}
-                    <code className="font-mono">{view.primary.dir}</code> (from the source's origin, not repeated in
-                    repos.json)
-                  </>
-                )}
               </p>
             </section>
 
