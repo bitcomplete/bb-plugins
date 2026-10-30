@@ -138,12 +138,21 @@ export function createPlugin(options: { transport?: Transport } = {}) {
     }
 
     async function view() {
+      const threadStatuses = new Map<string, Promise<string>>();
       const rows = await Promise.all(readPrs().map(async (pr): Promise<Row> => {
         const state = readState(pr.id);
         let threadStatus: string | null = null;
         if (state.dispatch.kind === "linked") {
-          try { threadStatus = (await bb.sdk.threads.get({ threadId: state.dispatch.threadId })).status; }
-          catch { threadStatus = "unavailable"; }
+          const threadId = state.dispatch.threadId;
+          let status = threadStatuses.get(threadId);
+          if (!status) {
+            status = (async () => {
+              try { return (await bb.sdk.threads.get({ threadId })).status; }
+              catch { return "unavailable"; }
+            })();
+            threadStatuses.set(threadId, status);
+          }
+          threadStatus = await status;
         }
         return { ...pr, dismissed: pr.turn !== null && state.dismissedActivity === pr.activity, dispatch: state.dispatch, threadStatus,
           holdUntil: state.holdUntil && Date.parse(state.holdUntil) > Date.now() ? state.holdUntil : null };

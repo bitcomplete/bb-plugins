@@ -53,6 +53,56 @@ it("reads a normal PR's feedback in two calls, including the final head check", 
   expect(transport.mock.calls.every(([query]) => !query.includes("search("))).toBe(true);
 });
 
+it("reads four PRs concurrently, preserves search order, and keeps every final head check", async () => {
+  const data = Array.from({ length: 9 }, (_, index) => fixture(index + 1));
+  const base = transportFor(() => data);
+  const waiting: (() => void)[] = [];
+  let active = 0;
+  let maximum = 0;
+  let checked = 0;
+  const transport: Transport = async (query, variables, signal) => {
+    if (variables.id && query.includes("viewer { login }")) {
+      active++;
+      maximum = Math.max(maximum, active);
+      await new Promise<void>((resolve) => { waiting.push(resolve); });
+      active--;
+    } else if (variables.id && query.includes("headRefOid")) checked++;
+    return base(query, variables, signal);
+  };
+  const result = createGithubClient(transport).fetchMyPrs([]);
+  await vi.waitFor(() => expect(waiting).toHaveLength(4));
+  waiting.splice(0).reverse().forEach((release) => release());
+  await vi.waitFor(() => expect(waiting).toHaveLength(4));
+  waiting.splice(0).reverse().forEach((release) => release());
+  await vi.waitFor(() => expect(waiting).toHaveLength(1));
+  waiting.splice(0).forEach((release) => release());
+  expect((await result).prs.map((pr) => pr.id)).toEqual(data.map((item) => item.pr.id));
+  expect(maximum).toBe(4);
+  expect(checked).toBe(9);
+});
+
+it("cancels the other reads on failure and never starts the rest of the queue", async () => {
+  const data = Array.from({ length: 9 }, (_, index) => fixture(index + 1));
+  const base = transportFor(() => data);
+  const started: string[] = [];
+  let fail = () => {};
+  const failure = new GithubRateLimitError("2099-01-01T00:00:00Z");
+  const transport: Transport = async (query, variables, signal) => {
+    if (!variables.id) return base(query, variables, signal);
+    started.push(variables.id);
+    return new Promise((_resolve, reject) => {
+      if (variables.id === "PR_1") fail = () => reject(failure);
+      signal?.addEventListener("abort", () => reject(new Error("Cancelled")), { once: true });
+    });
+  };
+  const result = createGithubClient(transport).fetchMyPrs([]);
+  const rejected = expect(result).rejects.toBe(failure);
+  await vi.waitFor(() => expect(started).toHaveLength(4));
+  fail();
+  await rejected;
+  expect(started).toEqual(["PR_1", "PR_2", "PR_3", "PR_4"]);
+});
+
 it("reports GitHub's reset time from HTTP-200 GraphQL rate limit errors", async () => {
   const reset = Math.floor(Date.now() / 1000) + 3600;
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ errors: [{ message: "API rate limit exceeded" }] }), {

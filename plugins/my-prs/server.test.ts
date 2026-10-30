@@ -62,6 +62,14 @@ describe("My PRs behavior", () => {
     await expect(env.rpc("address", { items })).rejects.toThrow("already has a dispatch");
     expect(env.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
   });
+  it("reads each shared batch thread only once per snapshot", async () => {
+    const env = await setup();
+    const items = (await env.view()).rows.map(({ id, activity }) => ({ id, activity }));
+    await env.rpc("address", { items });
+    const before = env.harness.inspection.sdk.callsTo("threads.get").length;
+    expect((await env.view()).rows.map((row) => row.threadStatus)).toEqual(["idle", "idle"]);
+    expect(env.harness.inspection.sdk.callsTo("threads.get").length - before).toBe(1);
+  });
   it("revalidates selected heads and keeps cached rows on GitHub failure without dispatching", async () => {
     const env = await setup(); const item = await firstSelection(env);
     if (env.data[0]) env.data[0].pr.headRefOid = "b".repeat(40);

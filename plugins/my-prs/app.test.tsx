@@ -31,7 +31,7 @@ it("shares a snapshot between the page and badge and renders cached rows immedia
 
 const cleanups: (() => void)[] = [];
 beforeEach(() => { vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} })); });
-afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); prsCache.clear(); vi.unstubAllGlobals(); });
+afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); prsCache.clear(); sessionStorage.clear(); vi.unstubAllGlobals(); });
 const targets = () => ({ projects: [{ id: "project-test", name: "Default" }, { id: "project-parsley", name: "Parsley" }], projectId: "project-test", reason: "default" });
 async function confirmAddress() {
   const dialog = within(await screen.findByRole("dialog"));
@@ -79,6 +79,50 @@ async function renderFeedback(rows: View["rows"]) {
 function row(number: number): View["rows"][number] {
   return { ...feedbackOf({ ...fixture(number), requested: [] }), dismissed: false, holdUntil: null, dispatch: { kind: "none" }, threadStatus: null };
 }
+
+it("filters from the legend and bar without refetching, including dismissed and held PRs", async () => {
+  const slot = await renderFeedback([
+    row(1), { ...row(2), turn: null },
+    { ...row(3), dismissed: true, status: { reviewDecision: "APPROVED", mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", checks: "SUCCESS" } },
+    { ...row(4), holdUntil: "2099-01-01T12:00:00Z" },
+  ]);
+  const calls = slot.inspection.rpcCalls.length;
+  fireEvent.click(slot.getByLabelText("Select example/editor#1"));
+  fireEvent.click(within(slot.getByRole("list", { name: "PR status counts" })).getByRole("button", { name: "Approved: 1" }));
+  expect(slot.queryByLabelText("Selection")).toBeNull();
+  expect(slot.getByText("Improve the editor 3").closest("details")).toBeNull();
+  expect(slot.queryByText("Improve the editor 1")).toBeNull();
+  expect(slot.getByRole("button", { name: "Restore example/editor#3" })).toBeTruthy();
+  fireEvent.click(slot.getByRole("button", { name: "Filter Held: 1" }));
+  expect(slot.getByRole("button", { name: "Resume example/editor#4" })).toBeTruthy();
+  expect(slot.queryByText("Improve the editor 3")).toBeNull();
+  fireEvent.click(slot.getByRole("button", { name: "Filter Held: 1" }));
+  expect(slot.getByRole("heading", { name: "Your turn" })).toBeTruthy();
+  expect(slot.getByText("Improve the editor 2")).toBeTruthy();
+  expect(slot.inspection.rpcCalls).toHaveLength(calls);
+});
+
+it("restores the filter and cached results immediately on return and can clear an empty filter", async () => {
+  const app = await loadPluginApp(() => import("./app.js"));
+  const panel = app.navPanels[0]; if (!panel) throw new Error("Missing My PRs page");
+  let rows: View["rows"] = [row(1), { ...row(2), turn: null }];
+  const rpc = { prs_get: () => ({ rows, project: "project-test", poll: null }) };
+  const first = renderSlot(panel, { subPath: "" }, { rpc });
+  await first.findByText("Improve the editor 2");
+  fireEvent.click(first.getByRole("button", { name: "Filter Waiting on reviewer: 1" }));
+  first.lifecycle.unmount();
+  const returned = renderSlot(panel, { subPath: "" }, { rpc });
+  cleanups.push(() => returned.lifecycle.unmount());
+  expect(returned.queryByText("Improve the editor 1")).toBeNull();
+  expect(returned.getByText("Improve the editor 2")).toBeTruthy();
+  expect(returned.getByRole("button", { name: "Filter Waiting on reviewer: 1" })).toHaveProperty("ariaPressed", "true");
+  expect(returned.inspection.rpcCalls).toHaveLength(0);
+  rows = [row(1)];
+  await returned.behavior.emitRealtime("prs-changed", {});
+  await returned.findByText("No PRs in this state.");
+  fireEvent.click(returned.getByRole("button", { name: "Show all PRs" }));
+  expect(returned.getByText("Improve the editor 1")).toBeTruthy();
+});
 
 it("groups related feedback across repositories and selects only actionable rows", async () => {
   const slot = await renderFeedback([

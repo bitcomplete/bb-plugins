@@ -32,12 +32,18 @@ A segmented overview and matching row dots show who has the ball: **Your turn**,
 Each PR appears in one segment. Held PRs take precedence, followed by feedback
 waiting on you, drafts, conflicts or failed CI, approvals, and reviewer waits.
 Snapshots imported before status collection show **Status unknown** until refreshed.
+Click a bar segment or state label to filter instantly. Click it again, or choose
+**Show all PRs**, to reset. Counts always describe the full queue. Filters include
+held and dismissed PRs, and returning to the page restores your filter and scroll
+position. Changing filters clears the batch selection.
 The reviewer summary flags PRs whose last GitHub update was at least four days ago.
 
 The page and badges share their snapshot and in-flight reads. Returning shows
 cached PRs immediately; data older than 15 seconds refreshes in the background.
 Realtime changes invalidate the snapshot immediately. A failed refresh keeps the
-last successful view, and hidden windows skip periodic reads.
+last successful view, and hidden windows skip periodic reads. GitHub refreshes
+read up to four PRs concurrently, retain the final head checks, and cancel the
+remaining reads on failure. Each shared batch thread is read once per snapshot.
 
 For an existing installation under the previous plugin identity, keep it enabled
 while running `bb my-prs import --json`. This copies settings, saved PRs, holds,

@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { AddressProjectDialog } from "./address-project-dialog.js";
 import { PrOverview } from "./pr-overview.js";
-import { PR_STATUSES, prStatus, statusDescription } from "./pr-status.js";
+import { PR_STATUSES, prStatus, statusDescription, type PrStatus } from "./pr-status.js";
 import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
 import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
@@ -25,6 +25,13 @@ const SECTION_HEAD = "flex min-h-9 flex-wrap items-center gap-x-2 gap-y-1 border
 const COUNT = "min-w-[18px] rounded-full px-1.5 text-center text-[11px] tabular-nums";
 const POINTER_CURSORS = "[&_button:not(:disabled)]:cursor-pointer [&_summary]:cursor-pointer [&_a[href]]:cursor-pointer [&_input[type=checkbox]:not(:disabled)]:cursor-pointer";
 type SectionKind = "turn" | "dismissed" | "other" | "held";
+const FILTER_KEY = "my-prs:status-filter";
+const scrollPositions = new Map<PrStatus | null, number>();
+
+function restoredFilter(): PrStatus | null {
+  try { return PR_STATUSES.find((status) => status.key === sessionStorage.getItem(FILTER_KEY))?.key ?? null; }
+  catch { return null; }
+}
 
 function age(at: number, now: number) {
   const seconds = Math.max(0, Math.floor((now - at) / 1_000));
@@ -133,20 +140,37 @@ export function MyPrsPage() {
   const { rpc, view, error, setError, report, refresh } = useMyPrs();
   const navigate = useBbNavigate();
   const rootRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const anchor = useRef<string | null>(null);
   const [selected, setSelected] = useState<Map<string, string>>(new Map());
   const [pending, setPending] = useState(false);
   const [addressItems, setAddressItems] = useState<Row[] | null>(null);
   const [polling, setPolling] = useState(false);
+  const [filter, setFilter] = useState(restoredFilter);
   const rows = view?.rows ?? [];
+  const filtered = filter === null ? rows : rows.filter((row) => prStatus(row) === filter);
+  const activeStatus = PR_STATUSES.find((status) => status.key === filter);
   const yours = rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil);
   const dismissed = rows.filter((row) => row.turn && row.dismissed && !row.holdUntil);
   const other = rows.filter((row) => !row.turn && !row.holdUntil);
   const held = rows.filter((row) => row.holdUntil);
   const organizations = groupByOrganization(yours);
-  const eligible = organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter((row) => row.dispatch.kind === "none")));
+  const eligible = filter === null || filter === "turn" ? organizations.flatMap((organization) => organization.areas.flatMap((area) => area.items.filter((row) => row.dispatch.kind === "none"))) : [];
   const chosen = eligible.filter((row) => selected.get(row.id) === row.activity);
   const now = Date.now();
+  const ready = view !== null;
+
+  useLayoutEffect(() => {
+    if (ready && scrollRef.current) scrollRef.current.scrollTop = scrollPositions.get(filter) ?? 0;
+  }, [filter, ready]);
+
+  const filterBy = (status: PrStatus | null) => {
+    setFilter(status);
+    setSelected(new Map());
+    anchor.current = null;
+    try { if (status === null) sessionStorage.removeItem(FILTER_KEY); else sessionStorage.setItem(FILTER_KEY, status); }
+    catch { /* Filtering still works when browser storage is unavailable. */ }
+  };
 
   useEffect(() => {
     if (!view) return;
@@ -220,12 +244,15 @@ export function MyPrsPage() {
             <span className="font-normal tabular-nums">{area.items.length}</span>
           </h4>
           <ul className={cn("ml-[19px] list-none", GROUP_CARD)}>
-            {area.items.map((row) => <FeedbackRow key={row.id} row={row} kind={kind} now={now} pending={pending}
-              selected={kind === "turn" && selected.get(row.id) === row.activity}
-              onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
-              onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
-              onHold={(until) => { void act(() => rpc.call("hold", { id: row.id, activity: row.activity, until })); }}
-              onDismiss={() => { void act(() => rpc.call("dismiss", { id: row.id, activity: row.activity, dismissed: kind !== "dismissed" })); }} />)}
+            {area.items.map((row) => {
+              const rowKind = row.holdUntil ? "held" : row.turn ? row.dismissed ? "dismissed" : "turn" : "other";
+              return <FeedbackRow key={row.id} row={row} kind={rowKind} now={now} pending={pending}
+                selected={rowKind === "turn" && selected.get(row.id) === row.activity}
+                onPick={(shift) => pick(row, shift)} onAddress={() => { void address([row]); }}
+                onClear={() => { void act(() => rpc.call("clear_dispatch", { id: row.id })); }}
+                onHold={(until) => { void act(() => rpc.call("hold", { id: row.id, activity: row.activity, until })); }}
+                onDismiss={() => { void act(() => rpc.call("dismiss", { id: row.id, activity: row.activity, dismissed: rowKind !== "dismissed" })); }} />;
+            })}
           </ul>
         </section>)}
       </div>
@@ -242,12 +269,21 @@ export function MyPrsPage() {
         <span className="truncate">{polling ? "Reading GitHub…" : lastRead ? `Last read ${age(Date.parse(lastRead), now)} ago` : "Not read yet"}</span>
       </button>
     </header>
-    <div className="@container min-h-0 flex-1 overflow-y-auto overscroll-contain">
+    <div ref={scrollRef} onScroll={(event) => scrollPositions.set(filter, event.currentTarget.scrollTop)}
+      className="@container min-h-0 flex-1 overflow-y-auto overscroll-contain">
       <main className={cn(COLUMN, "px-2 pb-10 pt-3 @min-[720px]:px-4")}>
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
-          <PrOverview rows={rows} now={now} />
-          <section aria-label="Your turn">
+          <PrOverview rows={rows} now={now} filter={filter} onFilter={filterBy} />
+          {activeStatus ? <section aria-label="Filtered PRs">
+            <div className={SECTION_HEAD}>
+              <span aria-hidden className={cn("h-3.5 w-[3px] shrink-0 rounded-full", activeStatus.color)} />
+              {filter === "turn" ? <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} /> : null}
+              <h2 className="text-[12.5px] font-semibold">{activeStatus.label}</h2>
+              <span role="status" className="text-[11px] tabular-nums text-muted-foreground">{filtered.length} of {rows.length} PRs</span>
+            </div>
+            {filtered.length ? renderGroups(filtered, filter === "turn" ? "turn" : "other") : <p className={EMPTY}>No PRs in this state.</p>}
+          </section> : <><section aria-label="Your turn">
             <div className={SECTION_HEAD}>
               <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-amber-500/80" />
               <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} />
@@ -276,6 +312,7 @@ export function MyPrsPage() {
             </div>
             {renderGroups(held, "held")}
           </section> : null}
+          </>}
         </>}
       </main>
     </div>

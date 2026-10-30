@@ -193,14 +193,23 @@ export function createGithubClient(transport: Transport) {
         },
       });
       const allowed = new Set(allowlist.map((repo) => repo.toLowerCase()));
-      const prs: PullRequest[] = [];
-      for (const pr of metadata) {
-        if (pr.author?.login.toLowerCase() !== viewer.login.toLowerCase()) continue;
-        if (allowed.size && !allowed.has(pr.repository.nameWithOwner.toLowerCase())) continue;
-        const fresh = await fetchPullRequest(pr.id, allowlist, signal);
-        if (fresh) prs.push(fresh);
-      }
-      return { login: viewer.login, prs };
+      const eligible = metadata.filter((pr) => pr.author?.login.toLowerCase() === viewer.login.toLowerCase() &&
+        (!allowed.size || allowed.has(pr.repository.nameWithOwner.toLowerCase())));
+      const snapshots: (PullRequest | null)[] = eligible.map(() => null);
+      const queue = eligible.entries();
+      const cancel = new AbortController();
+      const abort = signal ? AbortSignal.any([signal, cancel.signal]) : cancel.signal;
+      const failures: unknown[] = [];
+      await Promise.all(Array.from({ length: Math.min(4, eligible.length) }, async () => {
+        for (const [index, pr] of queue) {
+          if (abort.aborted) return;
+          try { snapshots[index] = await fetchPullRequest(pr.id, allowlist, abort); }
+          catch (cause) { failures.push(cause); cancel.abort(); return; }
+        }
+      }));
+      if (failures.length) throw failures[0];
+      signal?.throwIfAborted();
+      return { login: viewer.login, prs: snapshots.filter((pr) => pr !== null) };
     },
   };
 }
