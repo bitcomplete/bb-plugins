@@ -42,8 +42,10 @@ on the pod.
   the plugin echoes it to `POST /v1/subscribe` after every `hello` and at half
   the lease's life. The lease is the owner of record, so reply rights survive a
   restart of bb-gate-hooks and a gap longer than the old 24-hour route window.
-  Archiving the bb thread drops the session from the renewal set; a session
-  the service says another server owns gets one backstop reply.
+  Archiving the bb thread drops the session from the renewal set. A session the
+  service says another server owns is logged and gets a best-effort backstop
+  reply; the other server's live lease makes the service refuse that reply, so
+  the log line is the reliable half.
 - **No reply.** If a turn that handled a wake ends without calling
   `slack_reply`, the plugin posts one error reply itself, so every message
   gets an answer.

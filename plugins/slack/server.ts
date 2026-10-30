@@ -494,9 +494,11 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       for (const rejection of rejections) {
         if (rejection.kind !== "session") continue;
         if (rejection.reason === "owned") {
-          bb.log.warn(`bb-gate-hooks says another bb server holds Slack session ${rejection.id}; this server will not renew it`);
           if (!ownedNotified.has(rejection.id)) {
             ownedNotified.add(rejection.id);
+            bb.log.warn(`bb-gate-hooks says another bb server holds Slack session ${rejection.id}; this server will not renew it`);
+            // Best effort: the other server's live lease makes the service
+            // refuse this reply, so the log line above is the reliable half.
             void backstop(rejection.id, "Another bb server holds this Slack conversation now, so this one cannot answer in it.");
           }
           continue;
@@ -816,6 +818,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         title: previous?.title ?? null,
       };
       sessions.set(event.session, record);
+      // A wake for the session means the service routed it here again: a
+      // later `owned` rejection is a new episode and gets its own notice.
+      ownedNotified.delete(event.session);
       await saveSessions();
       if (!needsReply) {
         bb.log.info(`Slack session ${event.session} context changed; nothing to answer`);

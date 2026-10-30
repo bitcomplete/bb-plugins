@@ -53,6 +53,9 @@ reply per Slack message:
 - "bb-gate-hooks refused: this Slack conversation is not routed to this
   server's Slack user": the service did not route the session here and no
   live lease holds it. Nothing was posted.
+- "bb-gate-hooks says another bb server holds …": the session is leased to
+  another server, so this one cannot renew or answer in it. The notice reply
+  is best-effort; the server's log line is the reliable half.
 - "not connected to bb-gate-hooks": the server's stream is reconnecting, or
   the server has no `BB_HOOKS_URL`. Try again, or ask the developer to check
   Settings → Plugins → Slack.
