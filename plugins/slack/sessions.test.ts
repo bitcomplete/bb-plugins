@@ -130,6 +130,8 @@ describe("sessionsSchema", () => {
     expect(parsed.a?.title).toBeNull();
     // An older stored record without the field is read as no untagged wake waiting.
     expect(parsed.a?.untagged).toBe(0);
+    // An older record has no steer mark either.
+    expect(parsed.a?.steeredAt).toBeNull();
     expect(sessionsSchema.parse("nonsense")).toEqual({});
   });
 });

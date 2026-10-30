@@ -15,7 +15,7 @@ export const SESSION_TEXT_CHARS = 20_000;
  * line tells the agent to read the words as a correction or addition to that
  * work rather than a fresh question.
  */
-export const STEER_NOTE = "This message arrived while the previous one was being handled, so treat it as a correction or addition to that work, not a new question.";
+export const STEER_NOTE = "This message arrived while the previous one was being handled (or just after it finished), so treat it as a correction or addition to that work, not a new question.";
 
 /** One Slack conversation's mapping to a bb thread, and how many wakes it has had. */
 export const sessionRecordSchema = z.object({
@@ -46,6 +46,14 @@ export const sessionRecordSchema = z.object({
   untagged: z.number().default(0),
   /** When the latest wake was handed to the bb thread; null before it is. */
   handedAt: z.number().nullable(),
+  /**
+   * When the latest wake was delivered as a steer that joined a turn already
+   * running. The turn it joined ends with `thread.idle`, where the backstop
+   * treats this session as handled even when that turn's own input never named
+   * the session (it was started by something other than this wake). Null when
+   * no wake has joined a running turn.
+   */
+  steeredAt: z.number().nullable().default(null),
   /** The last Slack conversation title pushed, so it is not pushed twice. */
   title: z.string().nullable().default(null),
 });

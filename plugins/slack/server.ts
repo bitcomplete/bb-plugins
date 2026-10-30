@@ -363,7 +363,20 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       const session = typeof fromSubmission === "string" ? fromSubmission : sessionForThread(context.thread.id);
       // Only the plugin's own wake: it names its session, an ordinary message
       // to the thread does not.
-      if (session !== null && context.input.text.includes(`session ${session}`)) dispatchAttempts.set(session, context.attempt);
+      if (session !== null && context.input.text.includes(`session ${session}`)) {
+        dispatchAttempts.set(session, context.attempt);
+        // A join may be a queued row draining after `send` already returned, so
+        // the caller cannot learn it from the map. Mark the session instead, so
+        // `thread.idle` still treats the turn it joined as the one that handled
+        // the wake even when that turn's own input never named the session.
+        if (context.attempt === "join-turn") {
+          const r = sessions.get(session);
+          if (r !== undefined) {
+            sessions.set(session, { ...r, steeredAt: deps.now() });
+            void saveSessions();
+          }
+        }
+      }
       return { action: "proceed" };
     });
 
@@ -868,6 +881,21 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
       await saveSessions();
     }
 
+    /**
+     * Forget the steer marks on a thread's sessions. Called when the thread
+     * goes idle: the turn a steer joined has ended, so the mark has done its
+     * job and must not make a later idle look handled.
+     */
+    async function clearSteered(threadId: string): Promise<void> {
+      let changed = false;
+      for (const [session, r] of sessions) {
+        if (r.threadId !== threadId || r.steeredAt === null) continue;
+        sessions.set(session, { ...r, steeredAt: null });
+        changed = true;
+      }
+      if (changed) await saveSessions();
+    }
+
     /** Start the bb thread for a conversation, or answer with the reason it cannot. */
     async function spawnThread(event: SessionEvent, text: string, title: string, handedAt: number, record: SessionRecord): Promise<void> {
       const project = await targetProject(event);
@@ -913,6 +941,7 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         answered: previous?.answered ?? 0,
         untagged: (previous?.untagged ?? 0) + (untaggedWake ? 1 : 0),
         handedAt: previous?.handedAt ?? null,
+        steeredAt: previous?.steeredAt ?? null,
         title: previous?.title ?? null,
       };
       sessions.set(event.session, record);
@@ -1059,18 +1088,22 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     /**
      * The backstop for "one reply per message": a bb turn that handled a wake
      * ended without `slack_reply`. The turn that handled it is the one whose
-     * input named the session, so a turn already running when the wake arrived
-     * does not count. The title is pushed from the bb thread's own title here.
+     * input named the session, or, for a steer, the turn the wake joined
+     * (`steeredAt`). The title is pushed from the bb thread's own title here.
      */
     async function onThreadIdle(threadId: string): Promise<void> {
       await pushTitle(threadId);
-      const waiting = [...sessions].filter(([, r]) => r.threadId === threadId && !taggedAnswered(r));
+      const mine = [...sessions].filter(([, r]) => r.threadId === threadId);
+      const waiting = mine.filter(([, r]) => !taggedAnswered(r));
       // An untagged wake does not owe a reply, so a silent turn is the expected
       // outcome and never clears the thinking status; clear it for those
       // sessions, but only once the turn that handled the wake has run, so an
       // older turn's idle does not clear the indicator of a queued wake.
-      const untaggedWaiting = [...sessions].filter(([, r]) => r.threadId === threadId && r.untagged > 0);
-      if (waiting.length === 0 && untaggedWaiting.length === 0) return;
+      const untaggedWaiting = mine.filter(([, r]) => r.untagged > 0);
+      if (waiting.length === 0 && untaggedWaiting.length === 0) {
+        await clearSteered(threadId);
+        return;
+      }
       let starts: Array<{ createdAt: number; data: unknown }>;
       try {
         starts = (await bb.sdk.threads.events.list({ threadId, types: ["client/turn/start"], order: "desc", limit: "10" })) as Array<{ createdAt: number; data: unknown }>;
@@ -1078,17 +1111,20 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         bb.log.warn(`could not read thread ${threadId}'s turns to check its Slack replies: ${errorMessage(error)}`);
         return;
       }
+      // A wake whose dispatch was a join was consumed by the turn that just
+      // ended, whichever turn that was; `steeredAt` says so, because the turn's
+      // own input may not name the session.
+      const handled = (session: string, r: SessionRecord) => r.steeredAt !== null || starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));
       for (const [session, r] of untaggedWaiting) {
-        const handled = starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));
-        if (!handled) continue;
+        if (!handled(session, r)) continue;
         void hooks.status(session, "", checkSignal()).catch(() => undefined);
       }
       for (const [session, r] of waiting) {
-        const handled = starts.some((e) => e.createdAt >= (r.handedAt ?? 0) && JSON.stringify(e.data ?? {}).includes(session));
-        if (!handled) continue;
+        if (!handled(session, r)) continue;
         bb.log.warn(`thread ${threadId} ended the turn that handled Slack session ${sessionLogId(session)} without replying; answering for it`);
         await backstop(session, "The bb thread finished its turn without sending a reply here. Send another message to try again.", "tagged");
       }
+      await clearSteered(threadId);
     }
     bb.events.on("thread.idle", ({ thread }) => {
       void onThreadIdle(thread.id).catch((error: unknown) => bb.log.warn(`checking thread ${thread.id}'s Slack replies failed: ${errorMessage(error)}`));

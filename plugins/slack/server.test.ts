@@ -1068,9 +1068,17 @@ describe("Slack plugin", () => {
     s.hooks.last().send(s.hooks.session({ comment: { text: "wait", untrusted: false } }));
     await tick();
     expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    // The steer adds no obligation: the session still counts one tagged wake.
+    const stored = (await s.bb.storage.kv.get("sessions")) as Record<string, { events: number; steeredAt: number | null }>;
+    expect(stored["D0123:1712345678.901234"]).toMatchObject({ events: 1 });
+    expect(stored["D0123:1712345678.901234"]!.steeredAt).not.toBeNull();
     await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
     await tick();
     expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
+    // A second idle posts nothing more.
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages).toHaveLength(1);
     await s.stop();
   });
 
@@ -1091,6 +1099,34 @@ describe("Slack plugin", () => {
     const reply = await s.tool("slack_reply", { text: "Docs too." }, { threadId: "thr-1" });
     expect(s.text(reply)).toContain("Replied in Slack");
     expect(s.hooks.messages).toHaveLength(2);
+    await s.stop();
+  });
+
+  it("posts one backstop when a queued steer later joins a turn that does not name the session", async () => {
+    // `threads.send` can resolve `queued` (a turn was starting, or a plugin
+    // held it), so the hook has not run and the plugin reads no attempt. At
+    // drain the row joins a turn started by something other than this wake, so
+    // that turn's input never names the session; `steeredAt` is what tells the
+    // backstop the turn handled the wake.
+    const s = await live({ turns: [] });
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    s.hooks.last().send(s.hooks.session({ comment: { text: "wait", untrusted: false } }));
+    await tick();
+    expect(s.harness.sdk.callsTo("threads.send")).toHaveLength(1);
+    const hook = s.harness.registrations.hooks["message.dispatch"]!;
+    await hook(
+      makeMessageDispatchHookContext({
+        thread: { id: "thr-1" },
+        input: { blocks: [], text: "session D0123:1712345678.901234" },
+        attempt: "join-turn",
+        experimental_submission: { pluginId: "slack", data: { session: "D0123:1712345678.901234" } },
+      }),
+    );
+    await tick();
+    await s.harness.behavior.emitThreadEvent("thread.idle", { thread: { id: "thr-1" } as never, lastAssistantText: null });
+    await tick();
+    expect(s.hooks.messages.map((m) => m.body.text)).toEqual([expect.stringContaining("finished its turn without sending a reply")]);
     await s.stop();
   });
 
