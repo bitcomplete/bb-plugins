@@ -62,7 +62,8 @@ It is the **wrong** place for anything specific to one thread.
 
 ### Publishing changes to `.bb`
 
-A committed `.bb` write is not published on its own yet. The Repos panel,
+**How a `.bb` change lands.** A committed `.bb` write is not published on its
+own yet. The Repos panel,
 `bb repos add`/`remove` and `workspace_add_repo` commit on the project
 checkout's default branch and do not push it; the plugin reads that local
 branch while it is ahead of `origin`, so the change is live on this server

@@ -142,7 +142,7 @@ describe("formatInstructions", () => {
     const text = formatInstructions(
       manifest({ unpushed: { branch: "main", count: 1, subjects: ["Only change"] } }),
     );
-    expect(text).toContain("1 commit on main are live on this server only");
+    expect(text).toContain("1 commit on main is live on this server only");
   });
 
   it("caps the subjects it lists and counts the rest", () => {
@@ -170,6 +170,29 @@ describe("formatInstructions", () => {
     }));
     const text = formatInstructions(manifest({ repos: many }));
     expect(text.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
+  });
+
+  it("keeps the unpushed line and the .bb paragraph at the repo-set ceiling", () => {
+    const many = Array.from({ length: 32 }, (_, index) => ({
+      dir: `repository-number-${index}`,
+      path: `/data/workspaces/thr_1/repository-number-${index}`,
+      branch: "dylan/a-fairly-long-branch-name-here",
+      baseBranch: "main",
+      remote: `git@github.com:an-organization/repository-number-${index}.git`,
+      status: "ready" as const,
+    }));
+    const text = formatInstructions(
+      manifest({
+        repos: many,
+        unpushed: { branch: "main", count: 2, subjects: ["Add a repo", "Rewrite guidance"] },
+      }),
+    );
+    expect(text.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
+    // The table gives up rows; the prose after it and the unpushed line do not.
+    expect(text).toContain("Unpushed `.bb`");
+    expect(text).toContain("do not push it");
+    expect(text).toContain("workspace_add_repo");
+    expect(text).toContain("truncated");
   });
 
   it("cuts whole lines and says so rather than truncating mid-table", () => {

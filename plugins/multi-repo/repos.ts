@@ -200,12 +200,9 @@ export function parseReposFile(text: string): ParseResult {
       error: `${REPOS_FILE} is invalid at ${issueLocation(issue.path)}: ${issue.message}`,
     };
   }
-  // The schema accepts any non-empty path key; the semantic rule — a path
-  // inside `.bb` — is applied here so a bad key names itself.
-  if (parsed.data.publish !== undefined) {
-    const problem = publishPolicyProblem(parsed.data.publish);
-    if (problem !== null) return { ok: false, error: `${REPOS_FILE} ${problem}` };
-  }
+  // The schema itself validates both the modes and the split-path keys, so a
+  // bad `publish` fails `safeParse` above and the clearer sentence is built
+  // there; nothing further is needed here.
   const repos: RepoEntry[] = [];
   for (const [index, entry] of parsed.data.repos.entries()) {
     const resolved = resolveRepoEntry(entry);

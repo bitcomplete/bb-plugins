@@ -80,12 +80,13 @@ export interface WorkspaceManifest {
  * branch the commits sit on, so the rendered push command can name it.
  */
 export function formatUnpushedLine(summary: UnpushedSummary, projectSourcePath: string): string {
-  const commits = summary.count === 1 ? "1 commit" : `${summary.count} commits`;
+  const one = summary.count === 1;
+  const commits = one ? "1 commit" : `${summary.count} commits`;
   const shown = summary.subjects.slice(0, 10);
   const more = summary.count - shown.length;
   const list = shown.length > 0 ? `: ${shown.join("; ")}${more > 0 ? `, and ${more} more` : ""}` : "";
   const push = `git -C ${JSON.stringify(projectSourcePath)} push origin ${summary.branch}`;
-  return `${commits} on ${summary.branch} are live on this server only${list}. Push with: ${push}`;
+  return `${commits} on ${summary.branch} ${one ? "is" : "are"} live on this server only${list}. Push with: ${push}`;
 }
 
 /** The repos an agent can actually work in, in `repos.json` order. */
@@ -116,72 +117,83 @@ function pad(value: string, width: number): string {
  * discovering it as a confusing `ENOENT` halfway through a task.
  */
 export function formatInstructions(manifest: WorkspaceManifest): string {
-  const lines: string[] = [];
-  lines.push("## Multi-repo workspace");
-  lines.push("");
-  lines.push(
+  const head: string[] = [];
+  head.push("## Multi-repo workspace");
+  head.push("");
+  head.push(
     `Your working directory is a plain directory holding one git clone per repo. It is not itself a git repo — run git inside a repo directory, never at the root.`,
   );
-  lines.push("");
+  head.push("");
 
   const ready = manifest.repos.filter((repo) => repo.status === "ready");
+  // The repo table is the only part that grows with the repo set, so it is the
+  // part truncation gives up first: the prose after it — and the unpushed line
+  // — must survive at `MAX_REPOS`, where the block is closest to the ceiling.
+  const table: string[] = [];
+  const tail: string[] = [];
   if (ready.length > 0) {
     const dirWidth = Math.max(4, ...ready.map((repo) => repo.dir.length));
     const branchWidth = Math.max(6, ...ready.map((repo) => repo.branch.length));
-    lines.push("| " + pad("repo", dirWidth) + " | " + pad("branch", branchWidth) + " | path |");
-    lines.push("| " + "-".repeat(dirWidth) + " | " + "-".repeat(branchWidth) + " | ---- |");
+    table.push("| " + pad("repo", dirWidth) + " | " + pad("branch", branchWidth) + " | path |");
+    table.push("| " + "-".repeat(dirWidth) + " | " + "-".repeat(branchWidth) + " | ---- |");
     for (const repo of ready) {
-      lines.push(`| ${pad(repo.dir, dirWidth)} | ${pad(repo.branch, branchWidth)} | ${repo.path} |`);
+      table.push(`| ${pad(repo.dir, dirWidth)} | ${pad(repo.branch, branchWidth)} | ${repo.path} |`);
     }
-    lines.push("");
-    lines.push(
+    tail.push("");
+    tail.push(
       `Every work repo is on the same branch, \`${manifest.branchName}\`, so pull requests across repos correlate by head ref. Each repo's \`origin\` is its real remote; push and open PRs per repo as usual.`,
     );
     const bases = new Set(ready.map((repo) => repo.baseBranch));
-    lines.push(
+    tail.push(
       bases.size === 1
         ? `Each repo's changes are measured against \`${[...bases][0]}\`.`
         : `Base branches differ per repo: ${ready.map((repo) => `${repo.dir} → \`${repo.baseBranch}\``).join(", ")}.`,
     );
   } else {
-    lines.push("No repos materialized in this workspace. Check the plugin's Repos panel.");
+    table.push("No repos materialized in this workspace. Check the plugin's Repos panel.");
   }
 
   const failed = manifest.repos.filter((repo) => repo.status === "failed");
   if (failed.length > 0) {
-    lines.push("");
-    lines.push("**Missing repos.** These are in the repo set but are not on disk:");
+    tail.push("");
+    tail.push("**Missing repos.** These are in the repo set but are not on disk:");
     for (const repo of failed) {
-      lines.push(`- \`${repo.dir}\` — ${repo.message ?? "failed to clone"}`);
+      tail.push(`- \`${repo.dir}\` — ${repo.message ?? "failed to clone"}`);
     }
   }
 
-  lines.push("");
-  lines.push(
+  tail.push("");
+  tail.push(
     manifest.layout === "primary"
       ? "`.bb/` is the project definition: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is a directory on the primary repo's default branch, shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. In this workspace `.bb/` is a link to the primary clone's `.bb/`, so an edit under it is a working-tree change in that clone on this thread's branch. The Repos panel, `bb repos add`/`remove` and `workspace_add_repo` commit on the project checkout's `main` and do not push it; the plugin reads that local `main` while it is ahead of `origin/main`, so such a change is live on this server only. Guidance applies elsewhere only once it is on `origin/main` — publish a branch with `workspace_publish_guidance` and merge it there."
       : "`.bb/` is the project's own repo: the repo set (`repos.json`), cross-repo guidance (`AGENTS.md`), and project skills. It is shared by every thread in this project and versioned, so it is the right place to record durable cross-repo knowledge — and the wrong place for anything specific to this thread. The Repos panel, `bb repos add`/`remove` and `workspace_add_repo` commit on the project checkout's `main` and do not push it; the plugin reads that local `main` while it is ahead of `origin/main`, so such a change is live on this server only. Guidance applies elsewhere only once it is on `origin/main`.",
   );
   if (manifest.unpushed !== null) {
-    lines.push("");
-    lines.push(`**Unpushed \`.bb\`.** ${formatUnpushedLine(manifest.unpushed, manifest.projectSourcePath)}`);
+    tail.push("");
+    tail.push(`**Unpushed \`.bb\`.** ${formatUnpushedLine(manifest.unpushed, manifest.projectSourcePath)}`);
   }
-  lines.push("");
-  lines.push(
+  tail.push("");
+  tail.push(
     "Use `workspace_add_repo` to add a repo to this workspace without restarting the thread; the table above is fixed at thread start and will not show later additions.",
   );
 
-  const text = lines.join("\n");
-  if (text.length <= INSTRUCTIONS_MAX) return text;
-  // A repo set large enough to overflow has already lost the plot, but
-  // truncating mid-table would leave the agent with a row it cannot trust.
-  // Cut whole lines from the end and say so.
   const notice = "\n\n(Repo list truncated.)";
-  let kept = lines;
-  while (kept.length > 1 && kept.join("\n").length + notice.length > INSTRUCTIONS_MAX) {
+  const assemble = (tableLines: string[]): string => [...head, ...tableLines, ...tail].join("\n");
+  if (assemble(table).length <= INSTRUCTIONS_MAX) return assemble(table);
+  // Give up repo rows first, keeping the header and separator, so the prose
+  // that follows the table is never the thing that is lost.
+  let kept = table;
+  while (kept.length > 2 && assemble(kept).length + notice.length > INSTRUCTIONS_MAX) {
     kept = kept.slice(0, -1);
   }
-  return kept.join("\n") + notice;
+  if (assemble(kept).length + notice.length <= INSTRUCTIONS_MAX) return assemble(kept) + notice;
+  // Even the header and the prose are over the ceiling: cut whole lines from
+  // the end and say so. A repo set this large has already lost the plot.
+  let keptLines = [...head, ...kept, ...tail];
+  while (keptLines.length > 1 && keptLines.join("\n").length + notice.length > INSTRUCTIONS_MAX) {
+    keptLines = keptLines.slice(0, -1);
+  }
+  return keptLines.join("\n") + notice;
 }
 
 /**
