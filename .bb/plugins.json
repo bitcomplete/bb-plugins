@@ -17,6 +17,7 @@
     { "name": "linear", "source": "./plugins/linear" },
     { "name": "github-watcher", "source": "./plugins/github-watcher" },
     { "name": "stewards", "source": "./plugins/stewards" },
-    { "name": "slack", "source": "./plugins/slack" }
+    { "name": "slack", "source": "./plugins/slack" },
+    { "name": "review-watch", "source": "./plugins/review-watch" }
   ]
 }

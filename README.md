@@ -18,6 +18,7 @@ Plugins for [bb](https://getbb.app), maintained by Bit Complete.
 | [stewards](plugins/stewards) | Gives a labelled Linear ticket or GitHub pull request, and every teammate's pull request, a long-lived thread that manages it as you by a playbook in `.bb` |
 | [My PRs](plugins/pr-inbox) | Human feedback waiting on your authored PRs, with dismiss and Address comments |
 | [repo-dashboard](plugins/repo-dashboard) | Shows weekly pull request activity by contributor for Parsley Health, Bit Complete, and Cscc |
+| [review-watch](plugins/review-watch) | Queues the GitHub pull requests that need your review and opens a thread for one when you press Start |
 
 Install one:
 
