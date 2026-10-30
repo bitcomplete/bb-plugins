@@ -40,8 +40,9 @@ on the pod.
   starts no bb thread; the first real message then spawns the thread as usual.
 - **Replies.** The plugin never holds the bot token. `slack_reply` posts
   through bb-gate-hooks with the connection id and the text; the service posts
-  as the app. `assistant.threads.setStatus` shows a thinking indicator while
-  the turn runs, and the bb thread's title is pushed with
+  as the app. The text may be Markdown: the plugin converts it to Slack mrkdwn
+  before posting (see "Tools"). `assistant.threads.setStatus` shows a thinking
+  indicator while the turn runs, and the bb thread's title is pushed with
   `assistant.threads.setTitle`.
 - **Ownership.** Each wake carries an opaque capability for the session, and
   the plugin echoes it to `POST /v1/subscribe` after every `hello` and at half
@@ -171,7 +172,7 @@ signing secret, bot token or OAuth client secret; they are sealed with
 
 | Tool | What it does |
 |---|---|
-| `slack_reply` | Post the one reply on the Slack conversation that woke this thread. The service holds the bot token; the request carries only the connection id and the text. |
+| `slack_reply` | Post the one reply on the Slack conversation that woke this thread. The service holds the bot token; the request carries only the connection id and the text. The text may be Markdown (`**bold**`, `# Heading`, `- item`, `[label](url)`, fenced code): the plugin converts it to Slack mrkdwn before posting. |
 
 ## Other people's text
 

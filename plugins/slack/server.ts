@@ -16,6 +16,7 @@ import type { Context } from "hono";
 import { z } from "zod";
 import { createHooksLoop, HOOKS_URL_ENV, HooksRequestError, REPLY_BODY_MAX_BYTES, fetchBotChannels, type IdentifyResponse, type Rejection, type SessionEvent } from "./hooks-client.js";
 import { createSlackChannels, SlackTokenError, type SlackChannelList } from "./slack-channels.js";
+import { toMrkdwn } from "./mrkdwn.js";
 import {
   channelEntrySchema,
   channelMapFromLegacy,
@@ -579,13 +580,15 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     }
 
     /**
-     * Post a reply on a session and count it answered. Throws what replyError
-     * makes. `clearStatus` clears the thinking indicator after the reply; a
-     * caller that never set one (the assistant-pane greeting) passes false.
+     * Post a reply on a session and count it answered. The text is Markdown or
+     * mrkdwn; it is converted to mrkdwn here, the one path both `slack_reply`
+     * and the plugin's own backstop use. Throws what replyError makes.
+     * `clearStatus` clears the thinking indicator after the reply; a caller
+     * that never set one (the assistant-pane greeting) passes false.
      */
     async function postReply(session: string, text: string, signal: AbortSignal, slot: ReplySlot = "any", clearStatus = true): Promise<void> {
       try {
-        await hooks.reply(session, text, signal);
+        await hooks.reply(session, toMrkdwn(text), signal);
       } catch (error) {
         throw replyError(error);
       }
@@ -1206,12 +1209,12 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
     bb.agents.registerTool({
       name: "slack_reply",
       description:
-        "Reply in Slack on the conversation that woke this thread. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
+        "Reply in Slack on the conversation that woke this thread. Markdown is fine; it is converted to Slack mrkdwn before posting. The message is posted by bb-gate-hooks, which holds the team app's bot token; this server sends only the connection id and the text. Use it once, at the end of the turn that handled a Slack message.",
       instructions:
-        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Slack's mrkdwn, and say in one line who did it. Do not paste secrets or tokens.",
+        "A Slack DM that reached this thread is answered with slack_reply. The session id is in the message that woke the thread. Post one reply per Slack message, in Markdown or Slack's mrkdwn — Markdown is fine; it is converted — and say in one line who did it. Do not paste secrets or tokens.",
       presentation: { label: { pending: "Replying in Slack", completed: "Replied in Slack" } },
       parameters: z.object({
-        text: z.string().trim().min(1).max(30_000).describe("The reply, in Slack's mrkdwn."),
+        text: z.string().trim().min(1).max(30_000).describe("The reply, in Markdown or Slack's mrkdwn; Markdown is converted."),
         session: z.string().trim().min(1).max(200).optional().describe("The Slack session id from the wake. Leave it out: this thread's Slack conversation is used."),
       }),
       async execute({ text, session }, { threadId, signal }) {
@@ -1222,7 +1225,9 @@ export function createSlackPlugin(deps: SlackPluginDeps): (bb: BbPluginApi) => P
         if (r !== undefined && answered(r)) {
           return toolError(new Error("Every message in this Slack conversation already has its reply; each gets exactly one. Send a new Slack message to continue."));
         }
-        if (new TextEncoder().encode(text).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
+        // The size cap is on what is posted, so it is checked on the converted
+        // text: a conversion that grows the reply past the cap is refused here.
+        if (new TextEncoder().encode(toMrkdwn(text)).length > REPLY_BODY_MAX_BYTES) return toolError(new Error(`The reply is larger than Slack allows (${REPLY_BODY_MAX_BYTES / 1024} KiB). Shorten it.`));
         try {
           await postReply(id, text, signal);
           void pushTitle(threadId);

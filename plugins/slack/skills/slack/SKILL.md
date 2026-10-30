@@ -41,10 +41,16 @@ the turn silently.
 
 | Tool | Use it to |
 |---|---|
-| `slack_reply` | Post the reply on the Slack conversation that woke this thread. Pass `text` (Slack's mrkdwn) and, only when a thread has more than one conversation, the `session` from the wake. |
+| `slack_reply` | Post the reply on the Slack conversation that woke this thread. Pass `text` (Markdown is fine; it is converted to Slack mrkdwn) and, only when a thread has more than one conversation, the `session` from the wake. |
 
 - The reply is posted by bb-gate-hooks as the app; the tool sends only the
   connection id and the text, so never put a token or secret in it.
+- Write the reply in Markdown if that is what comes naturally: `**bold**`,
+  `*italic*`, `~~strike~~`, `# Heading`, `- item`, `[label](url)` and fenced
+  code are converted to Slack mrkdwn before posting. Existing Slack tokens
+  (`<@U…>`, `<#C…>`, `<!here>`, `<url|label>`), inline code and fenced code
+  pass through untouched. A single `*x*` is read as Markdown italic and becomes
+  `_x_`, so Slack-style `*bold*` is not preserved.
 - Each tagged Slack message gets one reply. A second `slack_reply` for the
   same message is refused; a new Slack message is a new wake and can be
   answered. An untagged reply is not counted: reply only when it is for bb,

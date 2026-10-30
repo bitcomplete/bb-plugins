@@ -910,6 +910,50 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
+  it("converts Markdown in a slack_reply to Slack mrkdwn before posting", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    const result = await s.tool("slack_reply", { text: "# Title\n\n**bold** and *italic* and ~~old~~\n\n- [docs](https://x.test)" }, { threadId: "thr-1" });
+    expect(s.text(result)).toContain("Replied in Slack");
+    expect(s.hooks.messages).toHaveLength(1);
+    expect(s.hooks.messages[0]!.body.text).toBe("*Title*\n\n*bold* and _italic_ and ~old~\n\n• <https://x.test|docs>");
+    await s.stop();
+  });
+
+  it("converts Markdown in a plugin backstop reply too", async () => {
+    const s = await live();
+    // A non-owner's held message is echoed in the plugin's own prompt, which is
+    // posted through the same postReply path as the agent's reply.
+    s.hooks.last().send(
+      s.hooks.session({
+        session: "C0123:1.2",
+        channel: "C0123",
+        mention: true,
+        fromOwner: false,
+        asker: { id: "U9999", name: "Carol" },
+        comment: { text: "**halt** work", untrusted: true },
+      }),
+    );
+    await tick();
+    const posted = String(s.hooks.messages.at(-1)?.body.text ?? "");
+    expect(posted).toContain('"*halt* work"');
+    expect(posted).not.toContain("**halt**");
+    await s.stop();
+  });
+
+  it("refuses a reply whose converted text would exceed the 32 KiB cap", async () => {
+    const s = await live();
+    s.hooks.last().send(s.hooks.session());
+    await tick();
+    // 20,000 ampersands are under the character cap, but escaping each to
+    // `&amp;` grows the posted text past 32 KiB.
+    const result = await s.tool("slack_reply", { text: "&".repeat(20_000) }, { threadId: "thr-1" });
+    expect(s.text(result)).toContain("Shorten it");
+    expect(s.hooks.messages).toEqual([]);
+    await s.stop();
+  });
+
   it("answers for a turn that ended without a reply, and pushes the bb thread's title", async () => {
     const s = await live({ turns: [{ createdAt: 1_000_000_000_001, data: { request: { params: { input: [{ type: "text", text: "session D0123:1712345678.901234" }] } } } }] });
     s.hooks.last().send(s.hooks.session());
