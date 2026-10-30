@@ -1690,7 +1690,10 @@ thread row is highlighted while its thread page is the route (`bg-state-active`,
 with `aria-current="page"` on the anchor). When navigation lands on a row
 inside a collapsed parent, the parent expands so the row is revealed: the
 effort's row for a worker or reviewer, the **Threads** section for a one-off
-thread, and **Monitors** or **Recently ended** for their rows. The Stewards
+thread, and **Monitors** or **Recently ended** for their rows. An unread
+worker or reviewer never opens its effort row (BB-131): workers are spawned
+with parent notifications off and are never marked read, so they are almost
+always unread and the row would otherwise sit open. The Stewards
 page has no sidebar of its own (BB-94): the host mounts one list, in the
 `experimental_threadList` slot, and it stays mounted across the page the way it
 does across thread pages. `BoardPage` publishes the project and effort its path

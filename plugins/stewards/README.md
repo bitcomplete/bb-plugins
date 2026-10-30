@@ -475,7 +475,10 @@ highlighted, and a thread row is highlighted while its thread page is the
 route. When navigation lands on a row inside a collapsed parent, the parent
 expands so the row is revealed: the effort's row for a worker or reviewer, the
 **Threads** section for a one-off thread, and **Monitors** or **Recently
-ended** for their rows.
+ended** for their rows. An unread worker or reviewer never opens its effort
+row (BB-131): workers are spawned with parent notifications off and are never
+marked read, so they are almost always unread and the row would otherwise sit
+open.
 
 **The needs-you items and the picker count (BB-46, BB-85).** The project
 dropdown shows each project's count in its option label, counting the yellow
