@@ -86,7 +86,8 @@ import {
   type Source,
   type WorkflowRun,
 } from "./source-contract.js";
-import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesWorkflow, recordMerged, reportDeployment, timeOut, timeoutsDue } from "./deploy.js";
+import { DEPLOY_STATES, allDeployed, applyDeployment, applyDeploymentRead, applyWorkflowRun, awaitingOnRepo, deploymentLines, deploymentReportSchema, matchesTarget, matchesWorkflow, pickWatch, recordMerged, reportDeployment, targetKeyOf, timeOut, timeoutsDue } from "./deploy.js";
+import { evaluateCarries, type CarriesReader } from "./carries.js";
 import { ACTORS, MIGRATIONS, ESCALATED_NEED_KINDS, NEEDS_KINDS, RESOLUTION_KINDS, createStore, needChoices, type Binding, type Escalation, type EscalationRoute, type Fingerprint, type Lesson, type Need, type Observed, type Question, type ReadyState, type Store, type Worker } from "./store.js";
 import { hasLessonAnchor, lessonAnchor, planLessonTransitions, planValidations, retiredLessonAnchor, withLessonAnchor } from "./lessons.js";
 import { AFTER_THE_FACT_RATIONALE_WHY, REPEAT_RATIONALE_WHY, ROUTINE_RATIONALE_WHY, clusterKey, routineRationaleWanted } from "./rationale.js";
@@ -1514,12 +1515,12 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const seen = new Set<string>();
       const out: DeploymentTarget[] = [];
       for (const playbook of Object.values(config.playbooks)) {
-        const target = playbook?.deployment;
-        if (target === undefined || target === null) continue;
-        const key = `${target.repo.toLowerCase()}\u0000${target.environment.toLowerCase()}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push(target);
+        for (const target of playbook?.deployments ?? []) {
+          const key = targetKeyOf(target).toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(target);
+        }
       }
       return out;
     }
@@ -1551,6 +1552,44 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
         return out.deployments;
       } catch (error) {
         bb.log.warn(`stewards: could not read deployments for ${target.repo} ${target.environment}: ${errorMessage(error)}`);
+        return null;
+      }
+    }
+
+    /**
+     * The github source as the carries evaluator's reader (BB-132), all
+     * through `sourceRpc`, never `gh` here. A failed read is returned as the
+     * reader's `error`, so the evaluator reports it and the steward is woken.
+     */
+    function carriesReader(): CarriesReader {
+      return {
+        fileAtRef: (repo, path, ref) => sourceRpc("github", "sourceFileAtRef", { repo, path, ref }, sourceContract.sourceFileAtRef.output),
+        latestCommit: (repo, branch, path, until) => sourceRpc("github", "sourceLatestCommit", { repo, branch, path, until }, sourceContract.sourceLatestCommit.output),
+        workflowRun: (repo, workflow, runNumber) => sourceRpc("github", "sourceWorkflowRun", { repo, workflow, runNumber }, sourceContract.sourceWorkflowRun.output),
+        compare: (repo, base, head) => sourceRpc("github", "sourceCompare", { repo, base, head }, sourceContract.sourceCompare.output),
+      };
+    }
+
+    /**
+     * A `workflow_run` doorbell's run start, from the doorbell when it carries
+     * one, else read back by the run id (BB-132). Null when it cannot be read,
+     * which leaves the older arrival-time comparison in place.
+     */
+    async function readRunStartedAt(repo: string, run: WorkflowRun, runId: string): Promise<number | null> {
+      if (run.startedAt !== null && run.startedAt !== "") {
+        const at = Date.parse(run.startedAt);
+        return Number.isNaN(at) ? null : at;
+      }
+      const parsed = Number(runId);
+      if (!Number.isInteger(parsed) || parsed <= 0) return null;
+      try {
+        const out = await sourceRpc("github", "sourceWorkflowRun", { repo, runId: parsed }, sourceContract.sourceWorkflowRun.output);
+        const startedAt = out.run?.startedAt ?? null;
+        if (out.error !== null || startedAt === null) return null;
+        const at = Date.parse(startedAt);
+        return Number.isNaN(at) ? null : at;
+      } catch (error) {
+        bb.log.warn(`stewards: could not read workflow run ${runId} start on ${repo}: ${errorMessage(error)}`);
         return null;
       }
     }
@@ -2556,48 +2595,74 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       const prev = b.lastSnapshot;
 
       // BB-53: a merged pull request whose playbook names a deployment target
-      // is recorded as awaiting one. The plugin never decides whether a
-      // deployment carries the merge; it records what it sees and wakes the
-      // steward with the playbook's rule.
-      const deployTarget = playbook.deployment;
+      // is recorded as awaiting one. The plugin evaluates a structured
+      // `carries` rule itself (BB-132); a free-text rule it leaves to the
+      // steward, exactly as before.
+      const deployTargets = playbook.deployments;
       const deploymentChanges: Change[] = [];
       const deploymentsBefore = b.deployments;
       let deployments = b.deployments;
-      if (deployTarget !== null) {
+      if (deployTargets.length > 0) {
         const beforeDeploy = deployments;
-        deployments = recordMerged(deployments, observed, deployTarget, now());
+        deployments = recordMerged(deployments, observed, deployTargets, now());
         if (deployments !== beforeDeploy) {
           const fresh = Object.keys(deployments).filter((k) => beforeDeploy[k] === undefined);
-          deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTarget.repo} ${deployTarget.environment}`, actionable: true });
+          deploymentChanges.push({ text: `Awaiting deployment: ${fresh.join(", ")} via ${deployTargets.map((t) => `${t.repo} ${t.environment}`).join(", ")}`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
         // BB-59: a deployment that already exists confirms a merge whose
         // doorbell was missed, on the first read and on every sweep. Read
         // before the timeout check so an existing deployment wins over the
-        // deadline; with none, the timeout path is exactly as before. The
-        // github plugin reads it through the source contract; the plugin
-        // never evaluates the playbook's carries rule.
-        if (Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying")) {
-          const read = await readDeployments(deployTarget);
-          if (read !== null) {
-            const applied = applyDeploymentRead(deployments, deployTarget, read, now());
-            if (applied.changed.length > 0 && applied.deployment !== null) {
-              deployments = applied.deployments;
+        // deadline; with none, the timeout path is exactly as before.
+        for (const target of deployTargets) {
+          if (!Object.values(deployments).some((w) => (w.state === "merged" || w.state === "deploying") && matchesTarget(target, w.repo, w.environment))) continue;
+          const read = await readDeployments(target);
+          if (read === null) continue;
+          const applied = applyDeploymentRead(deployments, target, read, now());
+          if (applied.changed.length > 0 && applied.deployment !== null) {
+            deployments = applied.deployments;
+            b = store.patch(b.id, { deployments });
+            const state = applied.deployment.state === "" ? "created" : applied.deployment.state;
+            b = store.note(b.id, `Deployment ${applied.deployment.id} (${state}) for ${target.repo} ${target.environment}${applied.deployment.url === null ? "" : ` — ${applied.deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`, false);
+            bb.log.info(`stewards: deployment ${applied.deployment.id} (${state}) on ${target.repo} ${target.environment} concerns ${applied.changed.join(", ")} (read)`);
+          }
+        }
+        // BB-132: the plugin evaluates a structured carries rule itself. A
+        // deployed or not-yet verdict settles the watch; a failed read or no
+        // matching rule leaves it and wakes the steward with the note.
+        const reader = carriesReader();
+        for (const [id, watch] of Object.entries(deployments)) {
+          if (watch.state !== "deploying") continue;
+          const target = deployTargets.find((t) => (watch.target === "" ? matchesTarget(t, watch.repo, watch.environment) : targetKeyOf(t) === watch.target));
+          if (target === undefined || typeof target.carries === "string") continue;
+          const verdict = await evaluateCarries(target, { merge: watch.mergeSha, prRepo: watch.prRepo, files: watch.files, ref: watch.ref }, reader);
+          if (verdict === null) continue;
+          const label = `${watch.key}${target.name === undefined ? "" : ` (${target.name})`}`;
+          if (verdict.kind === "deployed" || verdict.kind === "not-yet") {
+            const settled = reportDeployment(deployments, { state: verdict.kind, key: watch.key, ...(watch.target === "" ? {} : { target: watch.target }), note: verdict.note }, now(), target.timeout);
+            if (settled.changed !== null) {
+              deployments = settled.deployments;
               b = store.patch(b.id, { deployments });
-              const state = applied.deployment.state === "" ? "created" : applied.deployment.state;
-              b = store.note(b.id, `Deployment ${applied.deployment.id} (${state}) for ${deployTarget.repo} ${deployTarget.environment}${applied.deployment.url === null ? "" : ` — ${applied.deployment.url}`}; the playbook's rule: ${deployTarget.carries}`, false);
-              bb.log.info(`stewards: deployment ${applied.deployment.id} (${state}) on ${deployTarget.repo} ${deployTarget.environment} concerns ${applied.changed.join(", ")} (read)`);
+              bb.log.info(`stewards: carries ${verdict.kind} for ${label}: ${verdict.note}`);
             }
+          } else {
+            deployments = { ...deployments, [id]: { ...watch, note: verdict.note } };
+            b = store.patch(b.id, { deployments });
+            b = store.note(b.id, `Carries not decided for ${label}: ${verdict.note}`, false);
           }
         }
         const late = timeoutsDue(deployments, now());
         if (late.length > 0) {
+          const labels = late.map((id) => (deployments[id] === undefined ? id : `${deployments[id]!.key}${deployments[id]!.target === "" ? "" : ` (${deployments[id]!.target})`}`));
+          const first = deployments[late[0]!];
+          const target = first === undefined ? undefined : deployTargets.find((t) => (first.target === "" ? matchesTarget(t, first.repo, first.environment) : targetKeyOf(t) === first.target));
+          const within = target === undefined ? "" : ` within ${formatDuration(target.timeout)}`;
           deployments = timeOut(deployments, late, now());
-          deploymentChanges.push({ text: `No matching deployment for ${late.join(", ")} within ${formatDuration(deployTarget.timeout)}; check the run: https://github.com/${deployTarget.repo}/actions`, actionable: true });
+          deploymentChanges.push({ text: `No matching deployment for ${labels.join(", ")}${within}${first === undefined ? "" : `; check the run: https://github.com/${first.repo}/actions`}`, actionable: true });
         }
         if (deployments !== b.deployments) b = store.patch(b.id, { deployments });
       }
-      const awaitingDeploy = deployTarget !== null && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
+      const awaitingDeploy = deployTargets.length > 0 && Object.values(deployments).some((w) => w.state === "merged" || w.state === "deploying");
 
       const life = lifecycle(b, playbook, entity, config.file.label, { labelRequired: b.playbook !== depsPrsPlaybookName(config.file), owner: config.linearLogin });
       // A binding with no steward thread is still awaiting adoption: a first
@@ -3764,21 +3829,21 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
       if (repo === "") return;
       const projects = await stewardedProjects();
       for (const config of projects) {
-        const target = deploymentTargets(config).find((t) => t.repo.toLowerCase() === repo.toLowerCase() && t.environment.toLowerCase() === lc(deployment.environment));
-        if (target === undefined) continue;
         for (const b of store.open(config.projectId)) {
           const playbook = bindingPlaybook(config, b);
-          const named = playbook?.deployment;
-          if (named === undefined || named === null || lc(named.repo) !== lc(target.repo) || lc(named.environment) !== lc(target.environment)) continue;
-          const watches = Object.values(b.deployments).filter((w) => lc(w.repo) === lc(target.repo) && lc(w.environment) === lc(target.environment) && w.state !== "deployed" && w.state !== "failed");
-          if (watches.length === 0) continue;
-          const applied = applyDeployment(b.deployments, target, deployment, now());
-          if (applied.changed.length === 0) continue;
-          store.patch(b.id, { deployments: applied.deployments });
-          const state = deployment.state === "" ? "created" : deployment.state;
-          store.note(b.id, `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}; the playbook's rule: ${target.carries}`, false);
-          bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
-          scheduleReconcile(b.id);
+          if (playbook === null || playbook === undefined) continue;
+          for (const target of playbook.deployments) {
+            if (lc(target.repo) !== lc(repo) || lc(target.environment) !== lc(deployment.environment)) continue;
+            const watches = Object.values(b.deployments).filter((w) => lc(w.repo) === lc(target.repo) && lc(w.environment) === lc(target.environment) && w.state !== "deployed" && w.state !== "failed");
+            if (watches.length === 0) continue;
+            const applied = applyDeployment(b.deployments, target, deployment, now());
+            if (applied.changed.length === 0) continue;
+            store.patch(b.id, { deployments: applied.deployments });
+            const state = deployment.state === "" ? "created" : deployment.state;
+            store.note(b.id, `Deployment ${deployment.id} (${state}) for ${repo} ${target.environment}${deployment.url === null ? "" : ` — ${deployment.url}`}${typeof target.carries === "string" ? `; the playbook's rule: ${target.carries}` : ""}`, false);
+            bb.log.info(`stewards: deployment ${deployment.id} (${state}) on ${repo} ${target.environment} concerns ${applied.changed.join(", ")}`);
+            scheduleReconcile(b.id);
+          }
         }
       }
     }
@@ -3796,22 +3861,28 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
     async function onWorkflowRunDoorbell(id: string, run: WorkflowRun, receivedAt: number): Promise<void> {
       const hash = id.lastIndexOf("#");
       const repo = hash === -1 ? "" : id.slice(0, hash);
+      const runId = hash === -1 ? "" : id.slice(hash + 1);
       if (repo === "") return;
       const projects = await stewardedProjects();
       for (const config of projects) {
         for (const b of store.open(config.projectId)) {
           const playbook = bindingPlaybook(config, b);
-          const target = playbook?.deployment;
-          if (target === null || target === undefined) continue;
-          if (lc(target.repo) !== lc(repo)) continue;
-          if (!matchesWorkflow(target, run)) continue;
-          const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt);
+          if (playbook === null || playbook === undefined) continue;
+          const targets = playbook.deployments.filter((t) => lc(t.repo) === lc(repo) && matchesWorkflow(t, run));
+          if (targets.length === 0) continue;
+          // BB-132: the run's own start decides whether it can concern a
+          // watch, read back by run id when the doorbell does not carry it.
+          const runStartedAt = await readRunStartedAt(repo, run, runId);
+          const applied = applyWorkflowRun(b.deployments, id, repo, run, receivedAt, runStartedAt);
           if (applied.recorded.length === 0) continue;
-          // Persist the event even when it wakes nobody (an arrival-skipped
-          // watch): a repeat delivery of the same run and attempt must not
-          // wake that watch later (BB-61).
+          // Persist the event even when it wakes nobody (a run that started
+          // before every open watch's merge): a repeat delivery of the same
+          // run and attempt must not wake that watch later (BB-61, BB-132).
           store.patch(b.id, { deployments: applied.deployments });
-          if (applied.woken.length === 0) continue;
+          if (applied.woken.length === 0) {
+            store.note(b.id, `${workflowRunLine(repo, run, awaitingOnRepo(applied.deployments, repo))} It started before these merges, so it was recorded rather than woken.`, true);
+            continue;
+          }
           store.note(b.id, workflowRunLine(repo, run, awaitingOnRepo(applied.deployments, repo)), false);
           bb.log.info(`stewards: workflow run ${id} (${run.conclusion}) on ${repo} concerns ${applied.woken.join(", ")}`);
           scheduleReconcile(b.id);
@@ -6804,13 +6875,18 @@ export function createStewardsPlugin(deps: StewardsDeps): (bb: BbPluginApi) => P
           let deployments = b.deployments;
           let deploymentNote = "";
           if (input.deployment !== undefined) {
-            if (playbook?.deployment === null || playbook?.deployment === undefined) return toolError(new Error(`${b.entityKey}'s playbook names no deployment target, so there is no deployment to report.`));
-            const result = reportDeployment(b.deployments, input.deployment, now(), playbook.deployment.timeout);
+            const targets = playbook?.deployments ?? [];
+            if (targets.length === 0) return toolError(new Error(`${b.entityKey}'s playbook names no deployment target, so there is no deployment to report.`));
+            const watch = pickWatch(b.deployments, input.deployment);
+            if (watch === null) return toolError(new Error(`No deployment is awaiting a verdict for ${b.entityKey}${input.deployment.key === undefined ? "" : ` (${input.deployment.key})`}. A deployment doorbell must arrive first.`));
+            const target = targets.find((t) => (watch.target === "" ? matchesTarget(t, watch.repo, watch.environment) : targetKeyOf(t) === watch.target)) ?? targets[0]!;
+            const result = reportDeployment(b.deployments, input.deployment, now(), target.timeout);
             if (result.changed === null) return toolError(new Error(`No deployment is awaiting a verdict for ${b.entityKey}${input.deployment.key === undefined ? "" : ` (${input.deployment.key})`}. A deployment doorbell must arrive first.`));
             deployments = result.deployments;
             deploymentNote = ` ${result.changed.key} is ${result.changed.state}.`;
             if (allDeployed(deployments)) {
-              store.note(b.id, `Every pull request is merged and deployed (${playbook.deployment.repo} ${playbook.deployment.environment})`, false);
+              const where = targets.map((t) => `${t.repo} ${t.environment}`).join(", ");
+              store.note(b.id, `Every pull request is merged and deployed (${where})`, false);
               scheduleReconcile(b.id);
             }
           }

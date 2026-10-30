@@ -49,7 +49,7 @@ export const pull = (over: Partial<EntitySnapshot> = {}, pullOver: Partial<NonNu
   // The viewer is a requested reviewer by default: a review binding is made
   // only where this server's GitHub login is requested (BB-115). Tests for a
   // pull request that should not be reviewed override this.
-  pull: { draft: false, merged: false, base: "main", head: "retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: ["jane"], reviews: [], checks: { state: "pending", failing: [] }, ...pullOver },
+  pull: { draft: false, merged: false, base: "main", head: "retry", headSha: "aaaaaaa1", headAuthor: "sam", reviewDecision: null, requestedReviewers: ["jane"], reviews: [], checks: { state: "pending", failing: [] }, mergeCommit: null, files: [], ...pullOver },
   ...over,
 });
 

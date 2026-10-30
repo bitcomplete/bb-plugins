@@ -23,6 +23,9 @@ export const STEWARDS_PLUGIN_ID = "stewards";
 export const sourceSchema = z.enum(["linear", "github"]);
 export type Source = z.infer<typeof sourceSchema>;
 
+/** A repository as GitHub spells it, `owner/name`, as a repo lease and a project's unit name. */
+export const REPO_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
+
 /**
  * The plugin that serves each source. github is served by github-watcher:
  * bb reserves the id `github` for its bundled plugin and refuses a path
@@ -61,6 +64,9 @@ export type Deployment = z.infer<typeof deploymentSchema>;
  * that ring the doorbell. `sha` is the run's head commit, which is usually
  * the deploying repository's commit, not the merge's, so a subscriber must
  * not match on it. `run_attempt` tells a re-run from the first attempt.
+ * `startedAt` is the run's `run_started_at` when the doorbell carries it; a
+ * subscriber that needs it and does not find it reads the run back through
+ * the source contract.
  */
 export const workflowRunSchema = z
   .object({
@@ -70,9 +76,31 @@ export const workflowRunSchema = z
     url: z.string().nullable().default(null),
     sha: z.string().default(""),
     run_attempt: z.number().int().positive().default(1),
+    startedAt: z.string().nullable().default(null),
   })
   .loose();
 export type WorkflowRun = z.infer<typeof workflowRunSchema>;
+
+/**
+ * One workflow run read back through the source contract, by the workflow
+ * file and the run number the image tag names. `headSha` is the run's own
+ * head commit; `startedAt` its `run_started_at`; `jobs` the run's jobs with
+ * the times a build's `started_at` is read from. A deployment rule's
+ * `image-tag` strategy needs all three, none of which a `workflow_run`
+ * doorbell reliably carries.
+ */
+export const workflowRunInfoSchema = z.object({
+  id: z.number().int().nonnegative(),
+  runNumber: z.number().int().positive(),
+  headSha: z.string().nullable(),
+  startedAt: z.string().nullable(),
+  jobs: z.array(z.object({ name: z.string(), startedAt: z.string().nullable(), conclusion: z.string().nullable() })),
+});
+export type WorkflowRunInfo = z.infer<typeof workflowRunInfoSchema>;
+
+/** How GitHub's compare API reports one ref against another. */
+export const compareStatusSchema = z.enum(["ahead", "behind", "diverged", "identical"]);
+export type CompareStatus = z.infer<typeof compareStatusSchema>;
 
 /** How much of a comment or description crosses the contract. */
 export const SNAPSHOT_COMMENT_CHARS = 4000;
@@ -144,6 +172,15 @@ export const snapshotPullSchema = z.object({
   reviews: z.array(snapshotReviewSchema),
   /** The rollup on the head commit: success, failure, pending, error, expected. Null when there are no checks. */
   checks: z.object({ state: z.string(), failing: z.array(z.string()) }).nullable(),
+  /**
+   * The commit GitHub recorded as the merge (its `mergeCommit`), which a
+   * squash merge makes different from `headSha`. Null when the pull request
+   * is not merged, or the source could not read it; a deployment watch then
+   * has no merge to carry and stays on the steward-decided path.
+   */
+  mergeCommit: z.string().nullable().default(null),
+  /** The paths the pull request changed, for matching a deployment rule's `when.paths`. */
+  files: z.array(z.string()).default([]),
 });
 export type SnapshotPull = z.infer<typeof snapshotPullSchema>;
 
@@ -348,6 +385,52 @@ export const sourceContract = {
       /** Set when the repository could not be read (not visible, no access). */
       error: z.string().nullable(),
     }),
+  },
+  /**
+   * One file's text at a ref, for a deployment rule's `image-tag` strategy:
+   * the manifest the image tag is read from, and the Dockerfile a consumer's
+   * pin is read from. `content` is null when the path is not there at that
+   * ref; `error` when the read failed. Linear has no files and answers with
+   * an error.
+   */
+  sourceFileAtRef: {
+    input: z.object({ repo: z.string().min(1).max(200), path: z.string().min(1).max(1000), ref: z.string().min(1).max(300) }),
+    output: z.object({ content: z.string().nullable(), error: z.string().nullable() }),
+  },
+  /**
+   * The newest commit on a branch that touched a path at or before `until`,
+   * for the build commit a deployment rule compares against. An empty `path`
+   * asks for the branch's tip as of `until`, which is what a build that
+   * checks out the default branch builds from. `error` when the read failed.
+   */
+  sourceLatestCommit: {
+    input: z.object({ repo: z.string().min(1).max(200), branch: z.string().min(1).max(300), path: z.string().max(1000), until: z.string().min(1).max(100) }),
+    output: z.object({ sha: z.string().nullable(), committedAt: z.string().nullable(), error: z.string().nullable() }),
+  },
+  /**
+   * One workflow run, by its id (the number a `workflow_run` doorbell's
+   * entity names) or by the workflow file and the run number an image tag
+   * names, with its head sha, its start and its jobs. `run` is null when no
+   * run carries the number; `error` when the read failed.
+   */
+  sourceWorkflowRun: {
+    input: z.object({
+      repo: z.string().min(1).max(200),
+      workflow: z.string().min(1).max(300).optional(),
+      runNumber: z.number().int().positive().optional(),
+      runId: z.number().int().positive().optional(),
+    }),
+    output: z.object({ run: workflowRunInfoSchema.nullable(), error: z.string().nullable() }),
+  },
+  /**
+   * GitHub's compare status of `head` against `base` (ahead, behind,
+   * diverged or identical), for a deployment rule that asks whether one ref
+   * contains another. `status` is null when the compare could not be read;
+   * `error` says why. Linear has no commits and answers with an error.
+   */
+  sourceCompare: {
+    input: z.object({ repo: z.string().min(1).max(200), base: z.string().min(1).max(300), head: z.string().min(1).max(300) }),
+    output: z.object({ status: compareStatusSchema.nullable(), error: z.string().nullable() }),
   },
 } as const;
 

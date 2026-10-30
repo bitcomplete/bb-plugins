@@ -4,7 +4,7 @@
 // function that talks to the network takes its fetch as an argument, and no
 // token appears in anything this module returns or throws.
 import { z } from "zod";
-import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type DependabotAlert, type DependabotSeverity, type EntitySnapshot } from "./source-contract.js";
+import { DEPENDABOT_SEVERITIES, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS, signedBy, type AdoptableEntity, type CompareStatus, type DependabotAlert, type DependabotSeverity, type EntitySnapshot, type WorkflowRunInfo } from "./source-contract.js";
 
 export const GITHUB_URL = "https://github.com";
 export const GITHUB_API_URL = "https://api.github.com";
@@ -119,6 +119,8 @@ const COMMON_FIELDS = `number title body url createdAt updatedAt author ${ACTOR}
 export const TARGET_QUERY = `query($owner: String!, $name: String!, $number: Int!) { viewer { login } repository(owner: $owner, name: $name) { nameWithOwner issueOrPullRequest(number: $number) { __typename
   ... on Issue { ${COMMON_FIELDS} state stateReason }
   ... on PullRequest { ${COMMON_FIELDS} state isDraft merged reviewDecision headRefName headRefOid baseRefName
+    mergeCommit { oid }
+    files(first: 100) { nodes { path } }
     reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { name } ... on Bot { login } ... on Mannequin { login } } } }
     latestReviews(first: 50) { nodes { author ${ACTOR} state } }
     reviews(last: 50) { nodes { id author ${ACTOR} state body createdAt submittedAt url commit { oid } comments(first: 50) { nodes { ${COMMENT_FIELDS} path } } } }
@@ -167,6 +169,8 @@ const pullNode = z.object({
   state: z.string(),
   isDraft: z.boolean().nullish(),
   merged: z.boolean().nullish(),
+  mergeCommit: z.object({ oid: z.string() }).nullish(),
+  files: z.object({ nodes: z.array(z.object({ path: z.string() })) }).nullish(),
   reviewDecision: z.string().nullish(),
   headRefName: z.string().nullish(),
   headRefOid: z.string().nullish(),
@@ -403,7 +407,20 @@ export function parseSnapshot(payload: unknown): EntitySnapshot | null {
   return {
     ...snapshot,
     state,
-    pull: { draft, merged, base: p.base, head: p.head, headSha: p.headSha, headAuthor: commit?.author?.user?.login ?? null, reviewDecision: p.reviewDecision, requestedReviewers: p.requestedReviewers, reviews, checks: p.checks },
+    pull: {
+      draft,
+      merged,
+      base: p.base,
+      head: p.head,
+      headSha: p.headSha,
+      headAuthor: commit?.author?.user?.login ?? null,
+      reviewDecision: p.reviewDecision,
+      requestedReviewers: p.requestedReviewers,
+      reviews,
+      checks: p.checks,
+      mergeCommit: node.mergeCommit?.oid ?? null,
+      files: (node.files?.nodes ?? []).map((f) => f.path).sort(),
+    },
   };
 }
 
@@ -597,4 +614,110 @@ export function parseDeploymentStatus(payload: unknown): { state: string; url: s
   if (status === undefined) return { state: "", url: null };
   const url = [status.log_url, status.environment_url, status.target_url, status.url].find((u): u is string => typeof u === "string" && u !== "") ?? null;
   return { state: status.state, url };
+}
+
+// ---- files, commits, workflow runs and compares, for deployment rules (BB-132) ----
+
+/** One file's text at a ref, from a blob expression `<ref>:<path>`. */
+export const FILE_AT_REF_QUERY = `query($owner: String!, $name: String!, $expression: String!) { repository(owner: $owner, name: $name) { object(expression: $expression) { ... on Blob { text } } } }`;
+
+const fileAtRefPayload = z.object({ data: z.object({ repository: z.object({ object: z.object({ text: z.string().nullish() }).nullable() }).nullable() }).nullable() });
+
+/**
+ * The file's text, or null when the path is not there at that ref (a
+ * directory, a deleted file, a binary). Throws when GitHub refused the read
+ * or the repository is not visible.
+ */
+export function parseFileAtRef(payload: unknown): string | null {
+  const errors = graphqlErrors(payload);
+  const parsed = fileAtRefPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  const repository = parsed.data.data?.repository ?? null;
+  if (repository === null) {
+    if (errors.length > 0 && errorTypes(payload).some((t) => t !== "NOT_FOUND")) throw new Error(`GitHub: ${errors.join("; ")}`);
+    return null;
+  }
+  return repository.object?.text ?? null;
+}
+
+/**
+ * The newest commit on a branch (its default when the branch is "HEAD" or
+ * empty) that touched a path at or before `until`. An empty path asks for the
+ * branch's tip as of `until`.
+ */
+export const LATEST_COMMIT_QUERY = `query($owner: String!, $name: String!, $qualified: String!, $path: String, $until: GitTimestamp) { repository(owner: $owner, name: $name) {
+  ref(qualifiedName: $qualified) { target { ... on Commit { history(first: 1, path: $path, until: $until) { nodes { oid committedDate } } } } }
+  defaultBranchRef { target { ... on Commit { history(first: 1, path: $path, until: $until) { nodes { oid committedDate } } } } } } }`;
+
+const latestCommitPayload = z.object({
+  data: z
+    .object({
+      repository: z
+        .object({
+          ref: z.object({ target: z.object({ history: z.object({ nodes: z.array(z.object({ oid: z.string(), committedDate: z.string().nullish() })) }).nullish() }).nullish() }).nullish(),
+          defaultBranchRef: z.object({ target: z.object({ history: z.object({ nodes: z.array(z.object({ oid: z.string(), committedDate: z.string().nullish() })) }).nullish() }).nullish() }).nullish(),
+        })
+        .nullable(),
+    })
+    .nullable(),
+});
+
+/**
+ * The commit and its date, or null when the branch or path has no history
+ * before `until`. The `ref` answer is preferred; a "HEAD" branch has none and
+ * falls back to the default branch.
+ */
+export function parseLatestCommit(payload: unknown): { sha: string; committedAt: string | null } | null {
+  const errors = graphqlErrors(payload);
+  const parsed = latestCommitPayload.safeParse(payload);
+  if (!parsed.success) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : "GitHub answered without data");
+  const repository = parsed.data.data?.repository ?? null;
+  if (repository === null) throw new Error(errors.length > 0 ? `GitHub: ${errors.join("; ")}` : `GitHub: repository not found`);
+  const node = repository.ref?.target?.history?.nodes[0] ?? repository.defaultBranchRef?.target?.history?.nodes[0] ?? null;
+  return node === null ? null : { sha: node.oid, committedAt: node.committedDate ?? null };
+}
+
+/**
+ * One page of a workflow's runs, newest first, for finding the run an image
+ * tag names. The REST API has no lookup by run number, so the caller pages
+ * until the number is reached or passed.
+ */
+export const workflowRunsPath = (repo: string, workflow: string, page: number, perPage = 100): string => `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?per_page=${perPage}&page=${page}`;
+
+export const workflowRunJobsPath = (repo: string, runId: number, perPage = 100): string => `/repos/${repo}/actions/runs/${runId}/jobs?per_page=${perPage}`;
+
+/** One run by its id, for a `workflow_run` doorbell that needs its start time. */
+export const workflowRunPath = (repo: string, runId: number): string => `/repos/${repo}/actions/runs/${runId}`;
+
+const workflowRunsPayload = z.object({
+  total_count: z.number().nullish(),
+  workflow_runs: z.array(z.object({ id: z.number(), run_number: z.number(), head_sha: z.string().nullish(), run_started_at: z.string().nullish(), created_at: z.string().nullish() })).default([]),
+});
+
+/** The runs on a page, each with the facts a deployment rule needs, in the order GitHub returned them (newest first). */
+export function parseWorkflowRuns(payload: unknown): Array<Pick<WorkflowRunInfo, "id" | "runNumber" | "headSha" | "startedAt">> {
+  const parsed = workflowRunsPayload.safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a workflow run list");
+  return parsed.data.workflow_runs.map((r) => ({ id: r.id, runNumber: r.run_number, headSha: r.head_sha ?? null, startedAt: r.run_started_at ?? r.created_at ?? null }));
+}
+
+const workflowJobsPayload = z.object({ jobs: z.array(z.object({ name: z.string(), started_at: z.string().nullish(), conclusion: z.string().nullish() })).default([]) });
+
+/** A run's jobs, each with the `started_at` a build job's pin is read as of. */
+export function parseWorkflowJobs(payload: unknown): WorkflowRunInfo["jobs"] {
+  const parsed = workflowJobsPayload.safeParse(payload);
+  if (!parsed.success) throw new Error("GitHub answered with something that is not a workflow job list");
+  return parsed.data.jobs.map((j) => ({ name: j.name, startedAt: j.started_at ?? null, conclusion: j.conclusion ?? null }));
+}
+
+/** The REST compare path for `head` against `base`, both of which may be a sha, a branch or a tag. */
+export const comparePath = (repo: string, base: string, head: string): string => `/repos/${repo}/compare/${encodeURIComponent(`${base}...${head}`)}`;
+
+const comparePayload = z.object({ status: z.string() });
+
+/** GitHub's compare status, or null when the answer is not one GitHub names. */
+export function parseCompare(payload: unknown): CompareStatus | null {
+  const parsed = comparePayload.safeParse(payload);
+  if (!parsed.success) return null;
+  return (["ahead", "behind", "diverged", "identical"] as const).includes(parsed.data.status as CompareStatus) ? (parsed.data.status as CompareStatus) : null;
 }

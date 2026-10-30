@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, refKey, TARGET_QUERY } from "./github.js";
+import { parseCompare, parseDependabotAlerts, parseDeploymentStatus, parseDeployments, parseFileAtRef, parseLatestCommit, parseOpenPulls, parseRef, parseRefKey, parseRepo, parseRepoCheck, parseSnapshot, parseTarget, parseWorkflowJobs, parseWorkflowRuns, refKey, TARGET_QUERY } from "./github.js";
 import { entitySnapshotSchema, SNAPSHOT_COMMENT_CHARS, SNAPSHOT_COMMENTS_MAX, SNAPSHOT_DESCRIPTION_CHARS } from "./source-contract.js";
 
 describe("refs", () => {
@@ -48,6 +48,8 @@ const pull = (over: Record<string, unknown> = {}) => ({
         state: "OPEN",
         isDraft: false,
         merged: false,
+        mergeCommit: { oid: "fedcba9876543210" },
+        files: { nodes: [{ path: "src/b.ts" }, { path: "src/a.ts" }] },
         reviewDecision: "REVIEW_REQUIRED",
         headRefName: "feature/widgets",
         headRefOid: "0123456789abcdef",
@@ -203,6 +205,8 @@ describe("parseSnapshot", () => {
         { author: "carol", state: "approved", submittedAt: "2026-10-09T10:00:00Z", commit: "bbbb" },
       ],
       checks: { state: "failure", failing: ["ci/deploy (https://ci/deploy)", "test (https://ci/test)"] },
+      mergeCommit: "fedcba9876543210",
+      files: ["src/a.ts", "src/b.ts"],
     });
     expect(TARGET_QUERY).toContain("viewer { login }");
   });
@@ -331,5 +335,41 @@ describe("deployments", () => {
     expect(parseDeploymentStatus([{ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" }])).toEqual({ state: "failure", url: "https://api.github.com/repos/Acme/Widgets/deployments/7/statuses/9" });
     expect(parseDeploymentStatus([])).toEqual({ state: "", url: null });
     expect(() => parseDeploymentStatus({ message: "Not Found" })).toThrow(/deployment status list/u);
+  });
+});
+
+// BB-132: the reads a structured deployment `carries` rule makes.
+describe("deployment rule reads", () => {
+  it("reads a file blob at a ref, null when the path is not there", () => {
+    expect(parseFileAtRef({ data: { repository: { object: { text: "hello" } } } })).toBe("hello");
+    expect(parseFileAtRef({ data: { repository: { object: null } } })).toBeNull();
+    expect(parseFileAtRef({ data: { repository: null }, errors: [{ type: "NOT_FOUND", message: "gone" }] })).toBeNull();
+    expect(() => parseFileAtRef({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
+  });
+
+  it("reads the newest commit on a branch for a path as of a time, falling back to the default branch", () => {
+    const node = { oid: "abc123", committedDate: "2026-10-30T18:00:00Z" };
+    expect(parseLatestCommit({ data: { repository: { ref: { target: { history: { nodes: [node] } } }, defaultBranchRef: null } } })).toEqual({ sha: "abc123", committedAt: "2026-10-30T18:00:00Z" });
+    expect(parseLatestCommit({ data: { repository: { ref: null, defaultBranchRef: { target: { history: { nodes: [node] } } } } } })).toEqual({ sha: "abc123", committedAt: "2026-10-30T18:00:00Z" });
+    expect(parseLatestCommit({ data: { repository: { ref: { target: { history: { nodes: [] } } }, defaultBranchRef: null } } })).toBeNull();
+    expect(() => parseLatestCommit({ data: null, errors: [{ type: "RATE_LIMITED", message: "slow down" }] })).toThrow(/slow down/u);
+  });
+
+  it("reads a workflow run page and its jobs", () => {
+    expect(parseWorkflowRuns({ workflow_runs: [{ id: 11, run_number: 7, head_sha: "head111", run_started_at: "2026-10-30T18:00:00Z" }] })).toEqual([{ id: 11, runNumber: 7, headSha: "head111", startedAt: "2026-10-30T18:00:00Z" }]);
+    // A missing start falls back to the run's creation time.
+    expect(parseWorkflowRuns({ workflow_runs: [{ id: 11, run_number: 7, head_sha: null, created_at: "2026-10-30T17:00:00Z" }] })[0]).toEqual({ id: 11, runNumber: 7, headSha: null, startedAt: "2026-10-30T17:00:00Z" });
+    expect(() => parseWorkflowRuns({ workflow_runs: "nope" })).toThrow(/workflow run list/u);
+    expect(parseWorkflowJobs({ jobs: [{ name: "build", started_at: "2026-10-30T18:05:00Z", conclusion: "success" }, { name: "deploy", started_at: null, conclusion: null }] })).toEqual([{ name: "build", startedAt: "2026-10-30T18:05:00Z", conclusion: "success" }, { name: "deploy", startedAt: null, conclusion: null }]);
+    expect(() => parseWorkflowJobs("nope")).toThrow(/workflow job list/u);
+  });
+
+  it("reads a compare status, and null for one GitHub does not name", () => {
+    expect(parseCompare({ status: "ahead" })).toBe("ahead");
+    expect(parseCompare({ status: "identical" })).toBe("identical");
+    expect(parseCompare({ status: "behind" })).toBe("behind");
+    expect(parseCompare({ status: "diverged" })).toBe("diverged");
+    expect(parseCompare({ status: "weird" })).toBeNull();
+    expect(parseCompare({ message: "Not Found" })).toBeNull();
   });
 });

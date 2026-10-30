@@ -255,10 +255,56 @@ describe("playbooks", () => {
       );
     const none = parsePlaybook(withDeployment(""), "linear-tickets");
     if (!none.ok) throw new Error(none.error);
-    expect(none.value.deployment).toMatchObject({ repo: "bitcomplete/bb-gate", environment: "production", workflows: [] });
+    expect(none.value.deployments[0]).toMatchObject({ repo: "bitcomplete/bb-gate", environment: "production", workflows: [] });
     const named = parsePlaybook(withDeployment("\n  workflows: [bb-server.yaml, image.yaml]"), "linear-tickets");
     if (!named.ok) throw new Error(named.error);
-    expect(named.value.deployment?.workflows).toEqual(["bb-server.yaml", "image.yaml"]);
+    expect(named.value.deployments[0]?.workflows).toEqual(["bb-server.yaml", "image.yaml"]);
+  });
+
+  it("takes a list of deployment targets with structured carries rules (BB-132)", () => {
+    const structured = LINEAR_TICKETS.replace(
+      "requeue-default: 2d",
+      [
+        "requeue-default: 2d",
+        "deployment:",
+        "  - name: bb-gate",
+        "    source: github",
+        "    repo: bitcomplete/bb-gate",
+        "    environment: production",
+        "    carries:",
+        "      - when: { repo: bitcomplete/bb-plugins }",
+        "        strategy:",
+        "          kind: image-tag",
+        "          manifest: kploy/production/kustomization.yaml",
+        "          image: bb-server",
+        "          workflow: bb-server.yaml",
+        "          job: build_and_push_image",
+        "          consumer: { dockerfile: docker/bb-server/Dockerfile, pinArg: BB_PLUGINS_REF, repo: bitcomplete/bb-plugins }",
+        "      - when: { repo: bitcomplete/bb-gate, paths: [docker/bb-server/**] }",
+        "        strategy: { kind: ref-contains-merge }",
+        "  - name: devbox",
+        "    source: github",
+        "    repo: bitcomplete/devbox",
+        "    environment: production",
+        "    carries: [{ when: { repo: bitcomplete/devbox }, strategy: { kind: ref-contains-merge } }]",
+      ].join("\n"),
+    );
+    const parsed = parsePlaybook(structured, "linear-tickets");
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.value.deployments.map((d) => d.name)).toEqual(["bb-gate", "devbox"]);
+    expect(parsed.value.deployments[0]!.carries).toHaveLength(2);
+    const rules = parsed.value.deployments[0]!.carries as Array<{ strategy: { kind: string } }>;
+    expect(rules[0]!.strategy.kind).toBe("image-tag");
+    expect(rules[1]!.strategy.kind).toBe("ref-contains-merge");
+    // A single free-text target still parses, exactly as before.
+    const singleText = LINEAR_TICKETS.replace("requeue-default: 2d", 'requeue-default: 2d\ndeployment:\n  source: github\n  repo: bitcomplete/bb-gate\n  environment: production\n  carries: "the pin contains the merge"\n  timeout: 6h');
+    const single = parsePlaybook(singleText, "linear-tickets");
+    if (!single.ok) throw new Error(single.error);
+    expect(single.value.deployments).toHaveLength(1);
+    expect(single.value.deployments[0]!.carries).toBe("the pin contains the merge");
+    // An unknown strategy is refused, and so is an empty rule list.
+    expect(parsePlaybook(structured.replace("kind: ref-contains-merge", "kind: magic"), "linear-tickets")).toMatchObject({ ok: false });
+    expect(parsePlaybook(structured.replace("carries: [{ when: { repo: bitcomplete/devbox }, strategy: { kind: ref-contains-merge } }]", "carries: []"), "linear-tickets")).toMatchObject({ ok: false });
   });
 
   it("refuses what would misbehave", () => {

@@ -1218,6 +1218,15 @@ describe("the source contract", () => {
     expect(await bb.storage.kv.get("stewards/interest")).toBeUndefined();
   });
 
+  it("answers the github-only deployment reads with an error (BB-132)", async () => {
+    const { harness } = await setup({ token: "at-0" });
+    expect(await harness.callRpc("sourceDeployments", { repo: "acme/web", environment: "production", limit: 10 })).toEqual({ deployments: [], error: "deployments are read from github, not linear" });
+    expect(await harness.callRpc("sourceFileAtRef", { repo: "acme/web", path: "x", ref: "main" })).toEqual({ content: null, error: "files are read from github, not linear" });
+    expect(await harness.callRpc("sourceLatestCommit", { repo: "acme/web", branch: "main", path: "x", until: "2026-10-30T18:00:00Z" })).toEqual({ sha: null, committedAt: null, error: "commits are read from github, not linear" });
+    expect(await harness.callRpc("sourceWorkflowRun", { repo: "acme/web", workflow: "w.yaml", runNumber: 1 })).toEqual({ run: null, error: "workflow runs are read from github, not linear" });
+    expect(await harness.callRpc("sourceCompare", { repo: "acme/web", base: "a", head: "b" })).toEqual({ status: null, error: "commits are compared on github, not linear" });
+  });
+
   describe("leases and rings", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
