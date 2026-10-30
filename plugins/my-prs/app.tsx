@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { definePluginApp, UrlLink, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { AddressProjectDialog } from "./address-project-dialog.js";
+import { PrOverview } from "./pr-overview.js";
+import { PR_STATUSES, prStatus, statusDescription } from "./pr-status.js";
 import type { ExperimentalBadge } from "@get-bb/plugin-sdk/app";
 import { groupByOrganization } from "./areas.js";
 import { cn } from "./lib/utils.js";
+import { createSnapshotCache, useSnapshot } from "./lib/snapshot-cache.js";
 import type { rpcContract } from "./server.js";
 import type { Row, View } from "./types.js";
 
@@ -55,25 +58,27 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
   const navigate = useBbNavigate();
   const threadId = row.dispatch.kind === "linked" ? row.dispatch.threadId : null;
   const clearable = row.dispatch.kind === "uncertain" || (row.dispatch.kind === "linked" && ["idle", "error"].includes(row.threadStatus ?? ""));
+  const status = PR_STATUSES.find((status) => status.key === prStatus(row));
   const holdLabel = row.holdUntil ? `On hold until ${new Date(row.holdUntil).toLocaleString()}` : null;
-  const why = row.turn?.why ?? (row.draft ? "Draft" : "Waiting on reviewers or checks");
-  const since = row.turn ? row.turn.since : Date.parse(row.updatedAt);
+  const why = statusDescription(row);
+  const since = row.turn && !row.dismissed ? row.turn.since : Date.parse(row.updatedAt);
   const info = holdLabel ?? `${why}${since === null ? "" : ` · ${age(since, now)} ago`}`;
   const threadLabel = row.threadStatus === "idle" ? "Idle" : row.threadStatus === "error" ? "Failed"
     : ["starting", "pending", "active", "running", "stopping"].includes(row.threadStatus ?? "") ? "Working" : "Open thread";
   const threadTone = kind !== "turn" || threadLabel === "Idle" ? GRAY : row.threadStatus === "error"
     ? "bg-rose-500/10 text-[light-dark(var(--color-rose-800),var(--color-rose-200))]" : BLUE;
   return <li className={cn("group min-w-0 rounded-md hover:bg-foreground/[0.03]", selected && "bg-sky-500/[0.07]")}>
-    <div className="flex items-start gap-2 py-1 pl-2 pr-1.5 text-[12.5px] leading-5">
+    <div className="flex flex-wrap items-start gap-x-2 gap-y-0 py-1 pl-2 pr-1.5 text-[12.5px] leading-5 @min-[480px]:flex-nowrap">
       {kind === "turn" && row.dispatch.kind === "none" ? <input type="checkbox" checked={selected} disabled={pending}
         aria-label={`Select ${row.repo}#${row.number}`} onChange={() => undefined} onClick={(event) => onPick(event.shiftKey)}
         className={cn(CHECKBOX, "mt-[3px] opacity-50 group-hover:opacity-100 group-focus-within:opacity-100")} /> : <span aria-hidden className="size-3.5 shrink-0" />}
       <UrlLink href={row.url} title={`${row.repo} #${row.number}`}
-        className={cn("flex w-[124px] shrink-0 justify-start gap-1 whitespace-nowrap rounded-sm text-muted-foreground hover:underline @min-[720px]:w-[156px]", RING)}>
+        className={cn("flex w-[calc(100%-22px)] shrink-0 items-center justify-start gap-1 whitespace-nowrap rounded-sm text-muted-foreground hover:underline @min-[480px]:w-[124px] @min-[720px]:w-[156px]", RING)}>
+        <span aria-label={status?.label} className={cn("mr-1 h-2.5 w-2 shrink-0 rounded-[2px]", status?.color)} />
         <span className="min-w-0 truncate">{row.repo.split("/").pop()}</span>
         <b className={cn("shrink-0 font-medium", kind === "turn" ? "text-foreground" : "text-foreground/80")}>#{row.number}</b>
       </UrlLink>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 basis-full pl-[22px] @min-[480px]:basis-0 @min-[480px]:pl-0">
         <p className={cn("whitespace-normal break-words @min-[720px]:truncate", kind !== "turn" && "text-foreground/80")} title={row.title}>{row.title}</p>
         <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
           <span className="min-w-0" title={info}>{info}</span>
@@ -111,20 +116,21 @@ function FeedbackRow({ row, kind, now, pending, selected, onPick, onAddress, onD
   </li>;
 }
 
-function useInbox() {
+export const prsCache = createSnapshotCache<View>();
+
+function useMyPrs() {
   const rpc = useRpc<typeof rpcContract>();
-  const [view, setView] = useState<View | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const load = useCallback(() => rpc.call("prs_get"), [rpc]);
+  const snapshot = useSnapshot(prsCache, load);
   const report = useCallback((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)), []);
-  const refresh = useCallback(() => { void rpc.call("inbox_get").then(setView, report); }, [rpc, report]);
-  useEffect(refresh, [refresh]);
-  useEffect(() => { const timer = setInterval(refresh, 15_000); return () => clearInterval(timer); }, [refresh]);
-  useRealtime("inbox-changed", refresh);
-  return { rpc, view, error, setError, report, refresh };
+  const refresh = useCallback(() => prsCache.refresh(load), [load]);
+  useRealtime("prs-changed", refresh);
+  return { rpc, view: snapshot.data, error: error ?? snapshot.error, setError, report, refresh };
 }
 
-export function InboxPage() {
-  const { rpc, view, error, setError, report, refresh } = useInbox();
+export function MyPrsPage() {
+  const { rpc, view, error, setError, report, refresh } = useMyPrs();
   const navigate = useBbNavigate();
   const rootRef = useRef<HTMLDivElement>(null);
   const anchor = useRef<string | null>(null);
@@ -240,12 +246,13 @@ export function InboxPage() {
       <main className={cn(COLUMN, "px-2 pb-10 pt-3 @min-[720px]:px-4")}>
         {error || view?.poll?.error ? <p role="alert" className="px-2 pb-3 text-[12px] text-destructive">{error ?? view?.poll?.error}</p> : null}
         {view === null ? <p role="status" className={EMPTY}>Reading the queue…</p> : <>
+          <PrOverview rows={rows} now={now} />
           <section aria-label="Your turn">
             <div className={SECTION_HEAD}>
-              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-sky-500/70" />
+              <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full bg-amber-500/80" />
               <ScopeCheckbox items={eligible} selected={selected} label="Select all actionable PRs" disabled={pending} onPick={pickScope} />
               <h2 className="truncate text-[12.5px] font-semibold">Your turn</h2>
-              <span className={cn(COUNT, yours.length ? cn("font-semibold", BLUE) : "text-muted-foreground")}>{yours.length}</span>
+              <span className={cn(COUNT, yours.length ? cn("font-semibold", AMBER) : "text-muted-foreground")}>{yours.length}</span>
             </div>
             {yours.length === 0 ? <p className={EMPTY}>Nothing waiting on you.</p> : renderGroups(yours, "turn")}
             {dismissed.length > 0 ? <details className="pb-1.5">
@@ -290,17 +297,17 @@ export function InboxPage() {
   </div>;
 }
 
-function useInboxBadge(): ExperimentalBadge | null {
-  const { view } = useInbox();
+function useMyPrsBadge(): ExperimentalBadge | null {
+  const { view } = useMyPrs();
   const count = view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0;
   return count > 0 ? { count, tone: "warning", label: `${count} pull request${count === 1 ? "" : "s"} waiting for your response` } : null;
 }
 
-function InboxCount() {
-  const { view } = useInbox();
+function MyPrsCount() {
+  const { view } = useMyPrs();
   return <span className={cn("inline-flex min-w-4 justify-center rounded px-1 py-1 text-[10px] font-medium leading-none", AMBER)}>{view?.rows.filter((row) => row.turn && !row.dismissed && !row.holdUntil).length ?? 0}</span>;
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "inbox", title: "My PRs", icon: "GitBranch", path: "inbox", component: InboxPage, experimental_useBadge: useInboxBadge, headerContent: InboxCount });
+  app.slots.navPanel({ id: "my-prs", title: "My PRs", icon: "GitBranch", path: "my-prs", component: MyPrsPage, experimental_useBadge: useMyPrsBadge, headerContent: MyPrsCount });
 });

@@ -69,5 +69,7 @@ export function feedbackOf({ pr, reviews, comments, threads, requested }: {
     threads: threads.filter((thread) => thread.comments.nodes.some((comment) => human(comment.author))).map((thread) => ({ id: thread.id, resolved: thread.isResolved, comments: thread.comments.nodes.filter((comment) => human(comment.author)) })),
   })).digest("hex");
   return { id: pr.id, repo: pr.repository.nameWithOwner, number: pr.number, title: pr.title, url: pr.url,
-    head: pr.headRefOid, branch: pr.headRefName, draft: pr.isDraft, updatedAt: pr.updatedAt, activity, turn };
+    head: pr.headRefOid, branch: pr.headRefName, draft: pr.isDraft, updatedAt: pr.updatedAt, activity, turn,
+    status: { reviewDecision: pr.reviewDecision, mergeable: pr.mergeable, mergeStateStatus: pr.mergeStateStatus,
+      checks: pr.commits.nodes[0]?.commit.statusCheckRollup?.state ?? null } };
 }

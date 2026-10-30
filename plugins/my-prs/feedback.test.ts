@@ -20,7 +20,7 @@ describe("Workstreams' Your turn rules", () => {
     }
   });
   it("a push answers changes requested, while comments and approval notes require a reply", () => {
-    const pr = fixture().pr; pr.commits.nodes = [{ commit: { committedDate: at(12) } }];
+    const pr = fixture().pr; pr.commits.nodes = [{ commit: { committedDate: at(12), statusCheckRollup: null } }];
     expect(read({ pr, reviews: [review({ state: "CHANGES_REQUESTED", body: "" })] }).turn).toBeNull();
     expect(read({ pr }).turn?.why).toBe("Comment from @reviewer");
     expect(read({ pr, reviews: [review({ state: "APPROVED" })] }).turn?.why).toBe("Approval comment from @reviewer");

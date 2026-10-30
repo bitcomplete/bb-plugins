@@ -1,10 +1,18 @@
 import { z } from "zod";
 import { yourTurnSchema } from "./your-turn.js";
 
+export const statusSchema = z.object({
+  reviewDecision: z.enum(["APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"]).nullable(),
+  mergeable: z.enum(["MERGEABLE", "CONFLICTING", "UNKNOWN"]),
+  mergeStateStatus: z.string(),
+  checks: z.enum(["ERROR", "EXPECTED", "FAILURE", "PENDING", "SUCCESS"]).nullable(),
+});
+
 export const pullRequestSchema = z.object({
   id: z.string(), repo: z.string(), number: z.number().int().positive(), title: z.string(),
   url: z.string().url().startsWith("https://github.com/"), head: z.string(), branch: z.string(),
   draft: z.boolean(), updatedAt: z.string(), activity: z.string(), turn: yourTurnSchema.nullable(),
+  status: statusSchema.nullable().default(null),
 });
 export type PullRequest = z.infer<typeof pullRequestSchema>;
 
