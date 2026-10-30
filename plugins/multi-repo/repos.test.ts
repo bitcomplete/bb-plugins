@@ -5,6 +5,7 @@ import {
   findRepo,
   parseReposFile,
   removeRepo,
+  resolvePublishMode,
   resolveRepoEntry,
   serializeReposFile,
   setRepoBranch,
@@ -341,6 +342,41 @@ describe("publish policy", () => {
     if (!branch.ok) return;
     expect(branch.value.publish).toBe("pull-request");
     expect(parseReposFile(serializeReposFile(branch.value))).toMatchObject({ ok: true });
+  });
+});
+
+describe("resolvePublishMode", () => {
+  it("defaults a primary project to a pull request for every path", () => {
+    for (const path of ["repos.json", "AGENTS.md", "skills/x.md", "stewards/project.json"]) {
+      expect(resolvePublishMode(undefined, "primary", path)).toBe("pull-request");
+    }
+  });
+
+  it("defaults a standalone repo to push for repos.json and a pull request elsewhere", () => {
+    expect(resolvePublishMode(undefined, "standalone", "repos.json")).toBe("push");
+    expect(resolvePublishMode(undefined, "standalone", "AGENTS.md")).toBe("pull-request");
+    expect(resolvePublishMode(undefined, "standalone", "skills/x.md")).toBe("pull-request");
+    expect(resolvePublishMode(undefined, "standalone", "stewards/project.json")).toBe("pull-request");
+  });
+
+  it("lets a whole-project value override the layout default", () => {
+    expect(resolvePublishMode("push", "primary", "AGENTS.md")).toBe("push");
+    expect(resolvePublishMode("pull-request", "standalone", "repos.json")).toBe("pull-request");
+  });
+
+  it("picks the most specific split key, and the default when none matches", () => {
+    const policy = { "repos.json": "pull-request", "stewards/": "push", "stewards/playbooks/": "pull-request" } as const;
+    expect(resolvePublishMode(policy, "standalone", "repos.json")).toBe("pull-request");
+    expect(resolvePublishMode(policy, "standalone", "stewards/roles.json")).toBe("push");
+    expect(resolvePublishMode(policy, "standalone", "stewards/playbooks/x.md")).toBe("pull-request");
+    // Nothing matches, so the standalone default applies.
+    expect(resolvePublishMode(policy, "standalone", "AGENTS.md")).toBe("pull-request");
+  });
+
+  it("matches a key without a trailing slash as a directory too", () => {
+    expect(resolvePublishMode({ skills: "push" }, "standalone", "skills/x.md")).toBe("push");
+    expect(resolvePublishMode({ skills: "push" }, "standalone", "skills")).toBe("push");
+    expect(resolvePublishMode({ skills: "push" }, "standalone", "skill-set/x.md")).toBe("pull-request");
   });
 });
 

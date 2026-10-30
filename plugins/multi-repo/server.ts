@@ -55,6 +55,7 @@ import {
   validateRepoSet,
   type RepoEntry,
   type ReposFile,
+  type PublishMode,
 } from "./repos.js";
 import { PROJECT_SOURCE_DIR, normalizeRemoteUrl, type ProjectLayout } from "./paths.js";
 import {
@@ -610,19 +611,27 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     message: string,
     signal?: AbortSignal,
     layout: ProjectLayout = "standalone",
-  ): Promise<void> {
+    threadId?: string | null,
+  ): Promise<{ mode: PublishMode; prUrl: string | null; message: string | null }> {
     const result = await host.call(
       "writeProjectSourceRepos",
-      { path: location.path, reposJson: serializeReposFile(file), message, layout },
+      {
+        path: location.path,
+        reposJson: serializeReposFile(file),
+        message,
+        layout,
+        ...(file.publish === undefined ? {} : { publish: file.publish }),
+        threadId: threadId ?? null,
+      },
       { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) },
     );
-    // The file is written either way, but an uncommitted change is not shared
-    // with anyone else and will confuse the next person to pull. Say so rather
-    // than reporting success.
-    if (!result.committed && result.message !== null) {
-      throw new Error(`${REPOS_FILE} was written but not committed: ${result.message}`);
+    // A failed commit or a failed publish is a hard error on every surface,
+    // not a note: the local commit is kept, and the caller must say so.
+    if (!result.ok) {
+      throw new Error(result.message ?? `${REPOS_FILE} could not be published.`);
     }
     changed();
+    return { mode: result.mode, prUrl: result.prUrl, message: result.message };
   }
 
   /**
@@ -631,12 +640,27 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
    * message. A failure carries a code the CLI can surface and a sentence the
    * other two can show as it is.
    */
-  type EditOutcome = { ok: true; dir: string } | { ok: false; code: string; error: string };
+  /**
+   * One line a tool, CLI or panel can show after a write, naming how it reached
+   * origin: a push, a pull request, or a local-only note when there is no
+   * remote. The write itself already succeeded by the time this is called.
+   */
+  function publishNote(published: { mode: PublishMode; prUrl: string | null; message: string | null }): string {
+    if (published.mode === "pull-request") {
+      return published.prUrl === null ? "Opened a pull request for the change." : `Opened ${published.prUrl} for the change.`;
+    }
+    return published.message ?? "Pushed the change to origin.";
+  }
+
+  type EditOutcome =
+    | { ok: true; dir: string; mode: PublishMode; prUrl: string | null; message: string | null }
+    | { ok: false; code: string; error: string };
 
   async function addRepoToProject(
     location: SourceLocation,
     seed: RepoSeed,
     signal?: AbortSignal,
+    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: true }, signal);
     if (current.file === null) {
@@ -656,14 +680,15 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = addRepo(current.file, entry);
     if (!edited.ok) return { ok: false, code: "invalid_repo_set", error: edited.error };
-    await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout);
-    return { ok: true, dir: entry.dir };
+    const published = await writeRepoSet(location, edited.value, `Add ${entry.dir} to the repo set`, signal, current.layout, threadId);
+    return { ok: true, dir: entry.dir, ...published };
   }
 
   async function removeRepoFromProject(
     location: SourceLocation,
     dir: string,
     signal?: AbortSignal,
+    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
@@ -671,8 +696,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     }
     const edited = removeRepo(current.file, dir);
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
-    await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout);
-    return { ok: true, dir };
+    const published = await writeRepoSet(location, edited.value, `Remove ${dir} from the repo set`, signal, current.layout, threadId);
+    return { ok: true, dir, ...published };
   }
 
   async function setProjectRepoBranch(
@@ -680,6 +705,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     dir: string,
     branch: string | null,
     signal?: AbortSignal,
+    threadId?: string | null,
   ): Promise<EditOutcome> {
     const current = await readRepoSet(location, { bootstrap: false }, signal);
     if (current.file === null) {
@@ -689,8 +715,8 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     if (!edited.ok) return { ok: false, code: "unknown_repo", error: edited.error };
     const next = edited.value.repos.find((repo) => repo.dir === dir)?.branch;
     const message = next === undefined ? `Use the default branch for ${dir}` : `Base ${dir} on ${next}`;
-    await writeRepoSet(location, edited.value, message, signal, current.layout);
-    return { ok: true, dir };
+    const published = await writeRepoSet(location, edited.value, message, signal, current.layout, threadId);
+    return { ok: true, dir, ...published };
   }
 
   /**
@@ -846,7 +872,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
               .map((repo) => repo.dir)
               .join(", ")}`,
           );
-          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout);
+          await writeRepoSet(location, seeded, "Seed the repo set from checkouts on this machine", context.signal, layout, context.thread.id);
           repoSet = seeded;
         }
 
@@ -1152,7 +1178,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
       // All three writes run host-side: the commit in the canonical checkout,
       // the cache population, and the clone into the live workspace. That is
       // what makes this work while the agent is sandboxed.
-      const outcome = await addRepoToProject(location, seed, signal);
+      const outcome = await addRepoToProject(location, seed, signal, threadId);
       if (!outcome.ok) throw new Error(outcome.error);
       const dir = outcome.dir;
       const entry = resolveRepoEntry(seed);
@@ -1188,6 +1214,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
         `path: ${added.repo.path}`,
         `branch: ${added.repo.branch} (based on ${added.repo.baseBranch})`,
         `remote: ${added.repo.remote}`,
+        publishNote(outcome),
       ].join("\n");
     },
   });
@@ -1201,12 +1228,12 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
     async execute(input, { threadId, signal }) {
       const manifest = await requireManifest(threadId);
       const location: SourceLocation = { hostId: manifest.hostId, path: manifest.projectSourcePath };
-      const outcome = await removeRepoFromProject(location, input.dir, signal);
+      const outcome = await removeRepoFromProject(location, input.dir, signal, threadId);
       if (!outcome.ok) throw new Error(outcome.error);
       // Deliberately leaves the checkout alone. A workspace should not mutate
       // under a running thread, and deleting a directory the agent may have
       // uncommitted work in would be the worst possible way to learn that.
-      return `Removed ${input.dir} from ${REPOS_FILE}. The existing checkout at ${manifest.root}/${input.dir} is untouched.`;
+      return `Removed ${input.dir} from ${REPOS_FILE}. The existing checkout at ${manifest.root}/${input.dir} is untouched. ${publishNote(outcome)}`;
     },
   });
 
@@ -1397,6 +1424,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
                 ...(input.options.branch === undefined ? {} : { branch: input.options.branch }),
               },
               ctx.signal,
+              ctx.threadId,
             );
             if (!outcome.ok) {
               throw new PluginCliError(outcome.error, {
@@ -1406,7 +1434,7 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
             }
             return {
               exitCode: 0,
-              stdout: `Added ${outcome.dir}. New threads in this project will get it; existing workspaces are unchanged.`,
+              stdout: `Added ${outcome.dir}. New threads in this project will get it; existing workspaces are unchanged. ${publishNote(outcome)}`,
             };
           },
         }),
@@ -1417,9 +1445,9 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           options: { project: PROJECT_OPTION },
           async run(input, ctx) {
             const location = await requireSource(await resolveProjectId(ctx, input.options.project));
-            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal);
+            const outcome = await removeRepoFromProject(location, input.positionals.dir, ctx.signal, ctx.threadId);
             if (!outcome.ok) throw new PluginCliError(outcome.error, { code: outcome.code });
-            return { exitCode: 0, stdout: `Removed ${outcome.dir}. Existing workspaces are unchanged.` };
+            return { exitCode: 0, stdout: `Removed ${outcome.dir}. Existing workspaces are unchanged. ${publishNote(outcome)}` };
           },
         }),
 
@@ -1648,11 +1676,13 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
 
     async saveRepoSet({ projectId, reposJson }) {
       const location = await projectSource(projectId);
-      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      if (location === null) {
+        return { ok: false, error: "This project has no checkout on any machine.", mode: null, prUrl: null, message: null };
+      }
       // Validated here as well as in the panel: the panel's copy of the rules
       // is a convenience, and this is the boundary.
       const parsed = parseReposFile(reposJson);
-      if (!parsed.ok) return { ok: false, error: parsed.error };
+      if (!parsed.ok) return { ok: false, error: parsed.error, mode: null, prUrl: null, message: null };
       try {
         // Bootstrap first. On a project whose `.bb` does not exist yet — a
         // brand new one, on a machine whose workspace directory is still
@@ -1665,43 +1695,61 @@ export default async function multiRepoPlugin(bb: BbPluginApi): Promise<void> {
           { path: location.path, fetchTtlMs: CACHE_FRESH_MS, bootstrap: true },
           { hostId: location.hostId, timeoutMs: READ_TIMEOUT_MS },
         );
-        await writeRepoSet(location, parsed.value, `Update the repo set`, undefined, prepared.layout ?? "standalone");
-        return { ok: true, error: null };
+        const published = await writeRepoSet(
+          location,
+          parsed.value,
+          `Update the repo set`,
+          undefined,
+          prepared.layout ?? "standalone",
+        );
+        return { ok: true, error: null, ...published };
       } catch (error) {
-        return { ok: false, error: errorMessage(error) };
+        return { ok: false, error: errorMessage(error), mode: null, prUrl: null, message: null };
       }
     },
 
     async addRepo({ projectId, repo }) {
       const location = await projectSource(projectId);
-      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      if (location === null) {
+        return { ok: false, error: "This project has no checkout on any machine.", mode: null, prUrl: null, message: null };
+      }
       try {
         const outcome = await addRepoToProject(location, repo);
-        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+        return outcome.ok
+          ? { ok: true, error: null, mode: outcome.mode, prUrl: outcome.prUrl, message: outcome.message }
+          : { ok: false, error: outcome.error, mode: null, prUrl: null, message: null };
       } catch (error) {
-        return { ok: false, error: errorMessage(error) };
+        return { ok: false, error: errorMessage(error), mode: null, prUrl: null, message: null };
       }
     },
 
     async removeRepo({ projectId, dir }) {
       const location = await projectSource(projectId);
-      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      if (location === null) {
+        return { ok: false, error: "This project has no checkout on any machine.", mode: null, prUrl: null, message: null };
+      }
       try {
         const outcome = await removeRepoFromProject(location, dir);
-        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+        return outcome.ok
+          ? { ok: true, error: null, mode: outcome.mode, prUrl: outcome.prUrl, message: outcome.message }
+          : { ok: false, error: outcome.error, mode: null, prUrl: null, message: null };
       } catch (error) {
-        return { ok: false, error: errorMessage(error) };
+        return { ok: false, error: errorMessage(error), mode: null, prUrl: null, message: null };
       }
     },
 
     async setRepoBranch({ projectId, dir, branch }) {
       const location = await projectSource(projectId);
-      if (location === null) return { ok: false, error: "This project has no checkout on any machine." };
+      if (location === null) {
+        return { ok: false, error: "This project has no checkout on any machine.", mode: null, prUrl: null, message: null };
+      }
       try {
         const outcome = await setProjectRepoBranch(location, dir, branch);
-        return outcome.ok ? { ok: true, error: null } : { ok: false, error: outcome.error };
+        return outcome.ok
+          ? { ok: true, error: null, mode: outcome.mode, prUrl: outcome.prUrl, message: outcome.message }
+          : { ok: false, error: outcome.error, mode: null, prUrl: null, message: null };
       } catch (error) {
-        return { ok: false, error: errorMessage(error) };
+        return { ok: false, error: errorMessage(error), mode: null, prUrl: null, message: null };
       }
     },
 

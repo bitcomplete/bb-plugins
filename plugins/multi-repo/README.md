@@ -83,12 +83,17 @@ bb repos list --project proj_abc123
 - `url` — anything git can clone, **including a local path**, which makes
   "base this on my local checkout" a first-class option.
 - `branch` — optional base branch; defaults to that repo's default branch.
-- `publish` — optional. `"push"` or `"pull-request"`, or an object mapping a
+- `publish` — optional. How every committed `.bb` write reaches `origin`:
+  `"push"` pushes the default branch at once, `"pull-request"` pushes a
+  `guidance-` branch and opens a pull request without moving the default
+  branch. It may be one mode for the whole project, or an object mapping a
   `.bb`-relative path (`repos.json`, `AGENTS.md`, `skills/`, `stewards/`) to
-  one of those modes. The parser accepts and preserves it, and an unknown
-  value is a clear error, but the behaviour it names (BB-148 deliverable 2) is
-  not implemented yet: for now an absent key and any valid value behave
-  identically. Nothing writes the key yet.
+  one of those modes; the most specific key wins, and an unknown value is a
+  clear error. With no key set the layout decides: a **primary** project
+  (`.bb/` on a code repo's default branch) is `pull-request` for every path,
+  `repos.json` included; a **standalone** `.bb` repo pushes `repos.json` and
+  reviews `AGENTS.md`, `skills/` and `stewards/` by pull request. `push` is
+  opt-in in a primary project through this key.
 
 **Branches float; SHAs are never pinned.** This is a dev workspace, not a
 release manifest.
@@ -213,21 +218,33 @@ the generated block cannot be edited.
 ### Writing back to `.bb`
 
 The canonical `.bb` checkout is outside the agent's sandbox, so the write is
-inverted: the plugin's host entry does it.
+inverted: the plugin's host entry does it. **Every committed `.bb` write goes
+through one publish step**, by the project's `publish` policy (see
+`repos.json` above). The Repos panel, `bb repos add`/`remove`/base-branch,
+`workspace_add_repo`/`workspace_remove_repo`, the raw `repos.json` editor, the
+discovery seed and `mergeGuidance` all call it.
 
-**A write lands on the canonical checkout's default branch and does not push
-it.** The Repos panel, `bb repos add`/`remove`, `workspace_add_repo` and the
-raw `repos.json` editor all commit on that local branch. The plugin reads that
-local branch while it is strictly ahead of `origin` (see
-`resolveDefaultBranchRef`), so the edit is live on this server immediately —
-and on no other machine until it is pushed. The generated instruction block
-says so with an **unpushed `.bb`** line: the commit count, the subjects, the
-fact that they are live on this server only, and the exact
-`git -C <project-source> push origin <branch>` command. `bb repos list` prints
-the same line under its `layout` row. A clean checkout prints nothing extra.
+- **`push`** writes and commits on the canonical checkout's default branch and
+  pushes it to `origin` at once. The change is live everywhere immediately.
+- **`pull-request`** builds the commit on a `guidance-<path>` branch (a
+  temporary detached worktree at the default branch, so the checkout's own
+  branch and working tree are untouched), pushes it, and opens a pull request
+  with `gh`. The default branch never moves; the change lands when the pull
+  request merges. A second write to the same path reuses the open pull request.
 
-On the **standalone** layout, the canonical repo *fetches* from the workspace
-clone:
+A failed push or a failed `gh pr create` is a hard error on every surface
+(panel, CLI, agent tool): the local commit is kept exactly where it is, nothing
+is force-pushed, and the default branch is not reset. The generated
+instruction block still prints an **unpushed `.bb`** line when the checkout's
+default branch is ahead of `origin` — now the signal that a publish did not
+land — and `bb repos list` prints the same line under its `layout` row. The
+plugin keeps reading that local branch while it is strictly ahead (see
+`resolveDefaultBranchRef`), so a failed change is still live on this server
+and reported, and `preparePrimaryProjectSource` can seed a project and
+provision from it before the seed pull request merges.
+
+On the **standalone** layout, `workspace_publish_guidance` still fetches from
+the workspace clone onto a `guidance-<threadId>` branch:
 
 ```
 git -C <canonical-.bb> fetch <workspace>/.bb HEAD:refs/heads/guidance-<threadId>
@@ -236,12 +253,13 @@ git -C <canonical-.bb> fetch <workspace>/.bb HEAD:refs/heads/guidance-<threadId>
 On the **primary** layout, `.bb/` is a directory in the primary repo and the
 default branch is reviewed like code, so `workspace_publish_guidance` builds a
 `guidance-<threadId>` branch with the workspace's `.bb/` content and stops
-there — it never moves the default branch. `mergeGuidance` reports that a
-lesson needs a pull request (BB-108 adds that flow). That avoids the sandbox and
-`receive.denyCurrentBranch` at once, and leaves a named branch to review and
-merge. `workspace_publish_guidance` is the agent's entry point; `repos.json`
-edits from the tools, the CLI and the panel take the same host-side route,
-which is why they work under `accept-edits`.
+there — it never moves the default branch. `mergeGuidance` now publishes the
+branch by the policy: `push` fast-forwards the default branch and pushes it,
+`pull-request` pushes the branch and opens the pull request. That avoids the
+sandbox and `receive.denyCurrentBranch` at once, and leaves a named branch to
+review and merge. `workspace_publish_guidance` is the agent's entry point for
+the whole `.bb/` tree; `repos.json` edits from the tools, the CLI and the panel
+take the same host-side route, which is why they work under `accept-edits`.
 
 ### Reading `.bb` from another plugin
 

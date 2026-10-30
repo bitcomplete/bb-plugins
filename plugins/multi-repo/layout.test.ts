@@ -116,13 +116,13 @@ describe("formatInstructions", () => {
     expect(clean).not.toContain("Push with");
   });
 
-  it("says the .bb write commits on the project checkout and does not push", () => {
+  it("says every .bb write publishes by the policy and reports a failure", () => {
     const text = formatInstructions(manifest());
-    expect(text).toContain("do not push it");
-    expect(text).toContain("live on this server only");
-    expect(text).toContain("`origin/main`");
-    // The old sentence promised review-by-pull-request for a local commit.
-    expect(text).not.toContain("reviewed like code");
+    expect(text).toContain("publishes to `origin`");
+    expect(text).toContain("pull request");
+    expect(text).toContain("A failed publish keeps the local commit");
+    // The old sentence said the plugin commits locally and never pushes.
+    expect(text).not.toContain("do not push it");
   });
 
   it("prints count, subjects, the server-only warning and the push command when ahead", () => {
@@ -190,7 +190,7 @@ describe("formatInstructions", () => {
     expect(text.length).toBeLessThanOrEqual(INSTRUCTIONS_MAX);
     // The table gives up rows; the prose after it and the unpushed line do not.
     expect(text).toContain("Unpushed `.bb`");
-    expect(text).toContain("do not push it");
+    expect(text).toContain("publishes to `origin`");
     expect(text).toContain("workspace_add_repo");
     expect(text).toContain("truncated");
   });

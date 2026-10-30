@@ -314,11 +314,11 @@ describe("guidance on a primary repo", () => {
     expect(await gitLine(canonical, ["show", "HEAD:.bb/AGENTS.md"])).toBe("before");
   });
 
-  it("reports that a lesson needs a pull request instead of fast-forwarding", async () => {
+  it("refuses a lesson that was never pushed as a guidance branch", async () => {
     const { canonical } = await pair();
     const result = await mergeGuidance(canonical, "thr_lesson", ".bb/AGENTS.md", "a lesson");
     expect(result.ok).toBe(false);
-    expect(result.message).toMatch(/pull request/u);
+    expect(result.message).toMatch(/No guidance branch refs\/heads\/guidance-thr_lesson has been published/u);
   });
 
   it("commits the workspace's uncommitted .bb edits before publishing (standalone)", async () => {
@@ -559,7 +559,7 @@ describe("seeding an empty repo set", () => {
             ],
           };
         case "writeProjectSourceRepos":
-          return { committed: true, head: "seed", message: null };
+          return { ok: true, committed: true, head: "seed", mode: "push", prUrl: null, message: null };
         case "provisionWorkspace":
           return {
             root: ROOT,

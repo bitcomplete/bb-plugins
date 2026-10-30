@@ -62,29 +62,34 @@ It is the **wrong** place for anything specific to one thread.
 
 ### Publishing changes to `.bb`
 
-**How a `.bb` change lands.** A committed `.bb` write is not published on its
-own yet. The Repos panel,
-`bb repos add`/`remove` and `workspace_add_repo` commit on the project
-checkout's default branch and do not push it; the plugin reads that local
-branch while it is ahead of `origin`, so the change is live on this server
-only. Pushing is the operator's job until the publish policy ships.
+**Every committed `.bb` write is published by the project's policy.** The
+Repos panel, `bb repos add`/`remove`, `workspace_add_repo`, the raw
+`repos.json` editor, the discovery seed and `mergeGuidance` all go through the
+same step, so a change never stays on one server. A failed push or pull
+request keeps the local commit and is reported on the panel, the CLI and the
+tool result; nothing force-pushes or resets the default branch.
 
-- **In a primary-repo project** (`.bb/` on a code repo's default branch), a
-  `.bb` change is a pull request. Publish a branch with
-  `workspace_publish_guidance` and merge it; do not push the default branch.
-- **In a standalone `.bb` repo**, `repos.json` edits go straight to the
-  default branch, while `AGENTS.md`, `skills/` and `stewards/` are reviewed
-  like code and land by pull request.
+`repos.json` may carry a `publish` key, either one mode for the project or an
+object of path → mode:
 
-To publish from a thread: edit the files under `<workspace>/.bb`, then call
-`workspace_publish_guidance`. It commits them host-side and lands them on a
-`guidance-<thread>` branch in the canonical checkout, for a person to review
-and merge. There is no need to commit inside `.bb` yourself.
+- `"push"` pushes the default branch to `origin` at once.
+- `"pull-request"` pushes a `guidance-` branch and opens a pull request,
+  never moving the default branch.
 
-The push to `origin` is **best-effort**: a protected or unreachable remote
-leaves the branch only in the local canonical checkout. Read the tool's result
-message, which says which happened, and push the branch yourself when it did
-not reach `origin`.
+With no key set, the default follows the layout:
+
+- **In a primary-repo project** (`.bb/` on a code repo's default branch), every
+  path defaults to `pull-request`, `repos.json` included.
+- **In a standalone `.bb` repo**, `repos.json` defaults to `push`, while
+  `AGENTS.md`, `skills/` and `stewards/` default to `pull-request`.
+
+To publish the whole `.bb` tree from a thread: edit the files under
+`<workspace>/.bb`, then call `workspace_publish_guidance`. It commits them
+host-side and lands them on a `guidance-<thread>` branch in the canonical
+checkout, for a person to review and merge. There is no need to commit inside
+`.bb` yourself. Its push to `origin` is still best-effort: read the result
+message, which says whether the branch reached `origin` or only the local
+canonical checkout, and push it yourself when it did not.
 
 In the primary layout, `<workspace>/.bb` is a symlink to `<primary>/.bb`: the
 primary repo carries `.bb/` on its default branch, and the link shows you the
