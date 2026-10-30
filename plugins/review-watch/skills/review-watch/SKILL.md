@@ -7,11 +7,11 @@ description: Read the GitHub review queue and start work on a queued item. Use w
 
 Review Watch keeps one queue of pull requests that need the user's attention. A
 background poller asks GitHub every few minutes. The **Reviews** page and
-`bb review-watch` command read the same queue. The sidebar and thread-header
-badges show `review-requested` and `review-followup` items in two
-colored chips. Each badge shows both counts, including zeros. Hover over the
-header badge to see labeled counts, preview up to five review requests, and
-open **Reviews**.
+`bb review-watch` command read the same queue. The **Reviews** navigation icon
+shows the `review-requested` count, including zero. The thread-header badge
+shows `review-requested` and `review-followup` counts in two colored chips,
+including zeros. Hover over the header badge to see labeled counts, preview
+up to five review requests, and open **Reviews**.
 
 The queue is notify-only. Review Watch never posts to GitHub or starts a
 thread on its own. A human chooses **Start**, **Review selected**, or

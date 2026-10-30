@@ -15,8 +15,9 @@ on its own. The queue notifies; you dispatch.
   `bb review-watch` CLI, RPC for the page, and the realtime signal that keeps
   every open page current.
 - `app.tsx` — the **Reviews** page in the left sidebar
-  (`app.slots.navPanel`), two review counts on its sidebar row and
-  thread header, and a hover preview of up to five review requests.
+  (`app.slots.navPanel`), an initial-review count on its navigation icon,
+  two review counts in the thread header, and a hover preview of up to five
+  review requests.
 - `src/types.ts` — the shared vocabulary: `Rule`, `PullRequest`, `QueueItem`.
 - `src/github.ts` — the GitHub client and its two transports, a personal access
   token and the `gh` CLI. The only code that talks to the network.
@@ -49,11 +50,11 @@ item. Every command that takes a key accepts an unambiguous prefix.
 ## Notifications
 
 BB exposes no public SDK route for a plugin to raise a user notification. The
-sidebar and thread-header badges show `review-requested` and
-`review-followup` items in two colored chips. Each badge shows both counts,
-including zero counts. Hover over the header badge to see labeled counts,
-preview up to five review requests, and open the full **Reviews** page. The
-realtime signal keeps these surfaces current.
+**Reviews** navigation icon shows the `review-requested` count, including zero.
+The thread-header badge shows `review-requested` and `review-followup` counts
+in two colored chips, including zeros. Hover over the header badge to see
+labeled counts, preview up to five review requests, and open the full **Reviews**
+page. The realtime signal keeps these surfaces current.
 
 On the **Reviews** page, queued and started `review-requested` and
 `review-followup` items stay in their action sections and remain counted.

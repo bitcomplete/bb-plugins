@@ -2,7 +2,7 @@
 //
 // Start and Review N ask the server to spawn threads; Dismiss drops a row. The
 // page never talks to GitHub; the server's poller owns that.
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import * as HoverCard from "@radix-ui/react-hover-card";
 import {
   definePluginApp,
@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 
 /** The panel's route segment. Shared so every jump to it names one string. */
 const REVIEWS_PATH = "reviews";
+const REVIEWS_ICON = "review-watch/reviews";
 
 /** Headings, in the order a human should work them. */
 const SECTIONS: readonly { rule: Rule; title: string }[] = [
@@ -637,6 +638,39 @@ function useActiveReviewItems(): { items: QueueItem[]; lastPoll: LastPoll } {
   return { items: activeReviews, lastPoll };
 }
 
+// Registered icons lack PluginContext; the app overlay owns the live SDK hooks.
+let initialReviewCount = 0;
+const initialReviewListeners = new Set<() => void>();
+
+function ReviewIconSync() {
+  const { items } = useActiveReviewItems();
+  const initial = items.filter((item) => item.rule === "review-requested").length;
+  useEffect(() => {
+    if (initialReviewCount === initial) return;
+    initialReviewCount = initial;
+    for (const listener of initialReviewListeners) listener();
+  }, [initial]);
+  return null;
+}
+
+function ReviewsIcon({ className }: { className?: string }) {
+  const initial = useSyncExternalStore(
+    (listener) => {
+      initialReviewListeners.add(listener);
+      return () => { initialReviewListeners.delete(listener); };
+    },
+    () => initialReviewCount,
+  );
+  return (
+    <span className={className} style={{ position: "relative", display: "inline-flex" }} title={`${initial} initial reviews`}>
+      <Icon name="GitPullRequest" style={{ width: "100%", height: "100%" }} />
+      <span style={{ position: "absolute", right: -8, top: -6, display: "flex", height: 14, minWidth: 14, alignItems: "center", justifyContent: "center", borderRadius: 9999, border: "1px solid var(--background)", backgroundColor: "var(--color-sky-600, #0284c7)", padding: "0 2px", boxSizing: "border-box", fontSize: 9, fontWeight: 500, lineHeight: 1, color: "white", fontVariantNumeric: "tabular-nums" }}>
+        {initial > 99 ? "99+" : initial}
+      </span>
+    </span>
+  );
+}
+
 /**
  * The count on the sidebar row. No public SDK API lets a plugin raise a user
  * notification, so for a notify-only plugin this badge and the realtime signal
@@ -760,10 +794,12 @@ function QueuedHeaderAction({
 }
 
 export default definePluginApp((app) => {
+  app.experimental_icons.register({ name: REVIEWS_ICON, component: ReviewsIcon });
+  app.slots.experimental_appOverlay({ id: "review-icon-sync", component: ReviewIconSync });
   app.slots.navPanel({
     id: "reviews",
     title: "Reviews",
-    icon: "GitPullRequest",
+    icon: REVIEWS_ICON,
     path: REVIEWS_PATH,
     component: ReviewsPage,
     experimental_sidebarAccessory: QueuedBadge,

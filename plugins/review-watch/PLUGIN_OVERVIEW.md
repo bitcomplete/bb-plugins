@@ -18,10 +18,11 @@ choose to.
 - Checkboxes for queued review requests. **Review selected** opens one aggregate
   review thread.
 - A `bb review-watch` command that reads the same queue from a terminal.
-- Oval badges on the sidebar row and thread header show `review-requested`
-  and `review-followup` items in two colored chips. Each badge shows both
-  counts, including zeros. Hover over the header badge to see labeled counts,
-  preview up to five review requests, or open the full **Reviews** page. Live
+- The **Reviews** navigation icon shows the `review-requested` count, including
+  zero. The thread-header badge shows `review-requested` and `review-followup`
+  counts in two colored chips, including zeros. Hover over the header badge to
+  see labeled counts, preview up to five review requests, or open the full
+  **Reviews** page. Live
   updates keep the list current without a reload.
 
 ## How it works
