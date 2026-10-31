@@ -4,9 +4,13 @@ import {
   channelProject,
   chooseConversationProject,
   conversationOf,
+  couldNotFetchLine,
+  fileKind,
   FILES_NAMED,
   filesLine,
   formatFileSize,
+  IMAGE_MAX_BYTES,
+  isForwardableFile,
   isFromOwner,
   isUntrusted,
   parseChannelMap,
@@ -16,7 +20,9 @@ import {
   SESSION_TEXT_CHARS,
   sessionsSchema,
   STEER_NOTE,
+  TEXT_MAX_BYTES,
   wakeText,
+  withFiles,
   type ChannelMap,
   type ChannelEntry,
   type Project,
@@ -135,11 +141,13 @@ describe("wakeText", () => {
     expect(wakeText(event())).not.toContain("correction or addition");
   });
 
-  it("appends the not-forwarded line for a new thread and a steered follow-up", () => {
-    const files: SessionFile[] = [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }];
-    const spawned = wakeText(event({ files }));
+  it("has no files line of its own; withFiles adds the not-forwarded line for a new thread and a steered follow-up", () => {
+    const files: SessionFile[] = [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, filetype: "png", preview: "" }];
+    // `wakeText` is the body only; the caller appends what the fetch decided.
+    expect(wakeText(event({ files }))).not.toContain("not forwarded");
+    const spawned = withFiles(wakeText(event({ files })), files);
     expect(spawned.endsWith("1 file was attached and not forwarded: shot.png (image/png, 1.2 KB)")).toBe(true);
-    const steered = wakeText(event({ files }), { steered: true });
+    const steered = withFiles(wakeText(event({ files }), { steered: true }), files);
     expect(steered).toContain(STEER_NOTE);
     // The files line is the wake's last line, after the steer note.
     expect(steered.endsWith("1 file was attached and not forwarded: shot.png (image/png, 1.2 KB)")).toBe(true);
@@ -153,7 +161,7 @@ describe("wakeText", () => {
 });
 
 describe("filesLine", () => {
-  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, ...over });
+  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, filetype: "png", preview: "", ...over });
 
   it("names every file with its type and size", () => {
     const line = filesLine([file(), file({ id: "F2", name: "notes.txt", mimeType: "text/plain", size: 2048 })]);
@@ -195,6 +203,78 @@ describe("filesLine", () => {
     expect(formatFileSize(1024)).toBe("1 KB");
     expect(formatFileSize(1536)).toBe("1.5 KB");
     expect(formatFileSize(10 * 1024 * 1024)).toBe("10 MB");
+  });
+});
+
+describe("couldNotFetchLine", () => {
+  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, filetype: "png", preview: "", ...over });
+
+  it("names the files whose fetch failed, sanitized, and nothing when none did", () => {
+    expect(couldNotFetchLine([file({ name: "a.png" }), file({ id: "F2", name: "b.txt" })])).toBe("could not fetch a.png, b.txt");
+    expect(couldNotFetchLine([])).toBe("");
+  });
+
+  it("falls back to a placeholder and clips a long list", () => {
+    expect(couldNotFetchLine([file({ name: "" })])).toBe("could not fetch (unnamed)");
+    const many = Array.from({ length: FILES_NAMED + 2 }, (_, i) => file({ id: `F${i}`, name: `f${i}.png` }));
+    const line = couldNotFetchLine(many);
+    expect(line).toContain("and 2 more");
+    expect(line).not.toContain(`f${FILES_NAMED}.png`);
+  });
+});
+
+describe("withFiles", () => {
+  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, filetype: "png", preview: "", ...over });
+
+  it("appends the not-forwarded line, then the could-not-fetch line", () => {
+    const body = "the wake";
+    const line = withFiles(body, [file({ name: "video.mp4", mimeType: "video/mp4", size: 5 }), file({ name: "log.txt", mimeType: "text/plain", size: 10 })], [file({ id: "F3", name: "big.png", size: 20 })]);
+    expect(line.startsWith(`${body}\n\n2 files were attached and not forwarded:`)).toBe(true);
+    expect(line.endsWith("could not fetch big.png")).toBe(true);
+  });
+
+  it("leaves the body unchanged when there is nothing to say", () => {
+    expect(withFiles("the wake", [])).toBe("the wake");
+    expect(withFiles("the wake", [], [])).toBe("the wake");
+  });
+});
+
+describe("fileKind and isForwardableFile", () => {
+  const file = (over: Partial<SessionFile> = {}): SessionFile => ({ id: "F1", name: "x", mimeType: "", size: 0, filetype: "", preview: "", ...over });
+
+  it("classifies the image types the endpoint forwards", () => {
+    for (const mimeType of ["image/png", "image/jpeg", "image/gif", "image/webp"]) {
+      expect(fileKind(file({ mimeType }))).toBe("image");
+    }
+    // A charset parameter is ignored, and case does not matter.
+    expect(fileKind(file({ mimeType: "image/png; charset=binary" }))).toBe("image");
+    expect(fileKind(file({ mimeType: "IMAGE/PNG" }))).toBe("image");
+  });
+
+  it("classifies text by mime type or by a code filetype", () => {
+    expect(fileKind(file({ mimeType: "text/plain" }))).toBe("text");
+    expect(fileKind(file({ mimeType: "application/json" }))).toBe("text");
+    // Slack labels a snippet application/octet-stream but sends a code filetype.
+    expect(fileKind(file({ mimeType: "application/octet-stream", filetype: "python" }))).toBe("text");
+    expect(fileKind(file({ mimeType: "application/octet-stream", filetype: "go" }))).toBe("text");
+    // A mime type wins over an unknown filetype.
+    expect(fileKind(file({ mimeType: "image/png", filetype: "binary" }))).toBe("image");
+  });
+
+  it("leaves binaries, video and unknown types alone", () => {
+    expect(fileKind(file({ mimeType: "application/octet-stream" }))).toBe("other");
+    expect(fileKind(file({ mimeType: "video/mp4" }))).toBe("other");
+    expect(fileKind(file({ mimeType: "application/zip" }))).toBe("other");
+  });
+
+  it("is forwardable only within the endpoint's size cap", () => {
+    expect(isForwardableFile(file({ mimeType: "image/png", size: IMAGE_MAX_BYTES }))).toBe(true);
+    expect(isForwardableFile(file({ mimeType: "image/png", size: IMAGE_MAX_BYTES + 1 }))).toBe(false);
+    expect(isForwardableFile(file({ mimeType: "text/plain", size: TEXT_MAX_BYTES }))).toBe(true);
+    expect(isForwardableFile(file({ mimeType: "text/plain", size: TEXT_MAX_BYTES + 1 }))).toBe(false);
+    // A code snippet past its cap is not fetched either.
+    expect(isForwardableFile(file({ mimeType: "application/octet-stream", filetype: "python", size: TEXT_MAX_BYTES + 1 }))).toBe(false);
+    expect(isForwardableFile(file({ mimeType: "video/mp4", size: 1 }))).toBe(false);
   });
 });
 

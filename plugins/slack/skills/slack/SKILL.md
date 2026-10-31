@@ -33,6 +33,17 @@ An untagged reply arrives only after a Slack admin subscribes the app to
 `groups:history` bot scopes and reinstalling, then adding the two bot events);
 until then bb never sees it.
 
+An image or a small text-like file attached to a Slack message is fetched from
+bb-gate-hooks (`GET /v1/slack/sessions/{session}/files/{id}`) and arrives in
+the thread as an attachment part alongside the text, before the turn starts:
+images (png, jpeg, gif, webp) up to 10 MiB and text-like files up to 1 MiB.
+Anything else — a binary, a video, a file over its cap, or a file whose fetch
+fails or times out — is named in a line in the wake text instead ("… files
+were attached and not forwarded: …" or "could not fetch …"); the turn still
+runs and is never held. Forwarding needs the team app's `files:read` bot scope,
+added by hand with a reinstall; without it every file stays on the "not
+forwarded" line.
+
 ## Replying
 
 A Slack wake reaches a thread as a message naming the session

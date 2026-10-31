@@ -63,9 +63,15 @@ describe("sessionEventSchema", () => {
       ],
     });
     expect(parsed.files).toEqual([
-      { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
-      { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99 },
+      { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234, filetype: "", preview: "" },
+      { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99, filetype: "", preview: "" },
     ]);
+    // The additive `filetype` and `preview` hints are read when the service sends them.
+    const withHints = sessionEventSchema.parse({
+      ...base,
+      files: [{ id: "F3", name: "snip", mimeType: "application/octet-stream", size: 10, filetype: "python", preview: "print(1)" }],
+    });
+    expect(withHints.files[0]).toMatchObject({ filetype: "python", preview: "print(1)" });
   });
 
   it("rejects a wake from another source", () => {

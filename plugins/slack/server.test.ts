@@ -1,6 +1,6 @@
 import { createFakePluginHost, makeMessageDispatchHookContext } from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, legacySettingDescriptors, projectPromptBlocks, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
+import serverEntry, { ASSISTANT_GREETING, CALLBACK_PATH, createSlackPlugin, FILE_FETCH_TIMEOUT_MS, legacySettingDescriptors, projectPromptBlocks, SET_PROJECT_ACTION, SET_PROJECT_BUTTON_ACTION } from "./server.js";
 
 const APP_URL = "https://bb.example";
 const HOOKS_URL = "http://bb-gate-hooks.test:8081";
@@ -28,6 +28,7 @@ function fakeHooks() {
   const ephemerals: Array<Record<string, unknown>> = [];
   const responses: Array<{ url: string; body: Record<string, unknown> }> = [];
   const joins: Array<{ connection: string; channel: string }> = [];
+  const fileFetches: Array<{ session: string; id: string; connection: string }> = [];
   const subscribes: Array<{ connection: string; source: string; watches: Array<{ kind: string; id: string; capability?: string }> }> = [];
   let botChannelRequests = 0;
   const state: {
@@ -37,6 +38,7 @@ function fakeHooks() {
     botChannels: () => Response | Promise<Response>;
     join: () => Response | Promise<Response>;
     message: () => Response | Promise<Response>;
+    file: (session: string, id: string, signal: AbortSignal | null | undefined) => Response | Promise<Response>;
     subscribe: (body: (typeof subscribes)[number]) => Response | Promise<Response>;
   } = {
     start: () => Response.json({ authorizeUrl: "https://slack.com/openid/connect/authorize?client_id=x", state: "st-1" }),
@@ -45,6 +47,7 @@ function fakeHooks() {
     botChannels: () => Response.json({ channels: ["C0123", "G0456"] }),
     join: () => Response.json({ ok: true }),
     message: () => Response.json({ ok: true }),
+    file: () => new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { status: 200, headers: { "content-type": "image/png" } }),
     subscribe: (body) => Response.json({ leases: body.watches, rejected: [] }),
   };
   const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit): Promise<Response> => {
@@ -99,6 +102,13 @@ function fakeHooks() {
       responses.push({ url: u, body: JSON.parse(String(init?.body)) as Record<string, unknown> });
       return Response.json({ ok: true });
     }
+    const fileRoute = /^\/v1\/slack\/sessions\/([^/]+)\/files\/([^/]+)$/u.exec(new URL(u).pathname);
+    if (fileRoute !== null) {
+      const session = decodeURIComponent(fileRoute[1]!);
+      const id = decodeURIComponent(fileRoute[2]!);
+      fileFetches.push({ session, id, connection: new URL(u).searchParams.get("connection") ?? "" });
+      return state.file(session, id, init?.signal);
+    }
     const route = /^http:\/\/bb-gate-hooks\.test:8081\/v1\/slack\/sessions\/([^/]+)\/(message|status|title)$/u.exec(u);
     if (route !== null) {
       const session = decodeURIComponent(route[1]!);
@@ -125,6 +135,7 @@ function fakeHooks() {
     responses,
     joins,
     subscribes,
+    fileFetches,
     state,
     botChannelRequests: () => botChannelRequests,
     last: () => streams.at(-1)!,
@@ -242,6 +253,12 @@ async function setup(
       projects: {
         list: async () => (options.projects ?? PROJECTS).map((p) => ({ ...p, sources: options.sources ?? SOURCES })),
         get: async ({ projectId }: { projectId: string }) => ({ id: projectId, name: projectId, kind: "standard", sources: options.sources ?? SOURCES }),
+        attachments: {
+          upload: async (args) => {
+            const isImage = (args.mimeType ?? "").startsWith("image/");
+            return { type: isImage ? "localImage" : "localFile", path: `attachments/${args.filename ?? "file"}`, name: args.filename ?? "file", mimeType: args.mimeType, sizeBytes: 4 };
+          },
+        },
       },
       hosts: { list: async () => options.hosts ?? HOSTS },
       environments: { list: async (args?: { projectId?: string }) => (args?.projectId === undefined ? (options.allEnvironments ?? options.environments ?? ENVIRONMENTS) : (options.environments ?? ENVIRONMENTS)) },
@@ -278,6 +295,12 @@ async function setup(
     harness.behavior.callAgentTool(name, args, ctx) as Promise<string | { content: Array<{ type: string; text?: string }>; isError?: boolean }>;
   const text = (result: Awaited<ReturnType<typeof tool>>) => (typeof result === "string" ? result : result.content.map((c) => c.text ?? "").join(""));
   return { bb, harness, hooks, slack, fetchImpl, tool, text, advance: (ms: number) => (now += ms), now: () => now, factory };
+}
+
+/** The text of a spawn/send call's input, where a test would have read `prompt`. */
+function promptOf(args: unknown): string {
+  const input = (args as { input?: Array<{ type: string; text?: string }> }).input ?? [];
+  return input.map((part) => part.text ?? "").join("\n");
 }
 
 describe("Slack plugin", () => {
@@ -385,7 +408,7 @@ describe("Slack plugin", () => {
       projectId: "prj-2",
       environment: { type: "provider", environmentProviderId: "multi-repo-workspace", inputs: { repos: ["a"] }, machine: { type: "existing", hostId: "host_on" } },
     });
-    expect(String((spawns[0]![0] as { prompt: string }).prompt)).toContain("session D0123:1712345678.901234");
+    expect(promptOf(spawns[0]![0])).toContain("session D0123:1712345678.901234");
     expect(s.hooks.statuses.at(-1)).toMatchObject({ session: "D0123:1712345678.901234", body: { connection: "c_1", status: "is thinking…" } });
 
     s.hooks.last().send(s.hooks.session({ comment: { text: "also the SSO page", untrusted: false } }));
@@ -397,28 +420,112 @@ describe("Slack plugin", () => {
     await s.stop();
   });
 
-  it("names a message's files in the spawned prompt and the follow-up, and still wakes a file-only message", async () => {
+  it("forwards a message's images and text files as localImage/localFile parts, and still wakes a file-only message", async () => {
     const s = await live();
     const files = [
       { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
       { id: "F2", name: "snippet.go", mimeType: "text/plain", size: 99 },
     ];
-    // A file-only message (empty text) still wakes the thread.
+    // A file-only message (empty text) still wakes the thread, with the parts.
     s.hooks.last().send(s.hooks.session({ comment: { text: "", untrusted: false }, files }));
     await tick();
-    const prompt = String((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt);
-    expect(prompt).toContain("(no text)");
-    expect(prompt.endsWith("2 files were attached and not forwarded: shot.png (image/png, 1.2 KB), snippet.go (text/plain, 99 B)")).toBe(true);
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string; name?: string; path?: string }> };
+    expect(spawn.input[0]!.text).toContain("(no text)");
+    expect(spawn.input.map((p) => p.type)).toEqual(["text", "localImage", "localFile"]);
+    expect(spawn.input[1]).toMatchObject({ type: "localImage", path: "attachments/shot.png" });
+    expect(spawn.input[2]).toMatchObject({ type: "localFile", name: "snippet.go" });
+    // Nothing was dropped, so no Step 1 line.
+    expect(spawn.input[0]!.text).not.toContain("not forwarded");
+    // Both files were fetched through the endpoint, named by the wake's session.
+    expect(s.hooks.fileFetches).toEqual([
+      { session: "D0123:1712345678.901234", id: "F1", connection: "c_1" },
+      { session: "D0123:1712345678.901234", id: "F2", connection: "c_1" },
+    ]);
 
-    // A follow-up names its own files, and a later message without any carries no line.
+    // A follow-up forwards its own file, and a later message without any carries no line.
     s.hooks.last().send(s.hooks.session({ comment: { text: "and this one", untrusted: false }, files: [{ id: "F3", name: "log.txt", mimeType: "text/plain", size: 2048 }] }));
     await tick();
-    const send = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ text: string }> };
-    expect(send.input[0]!.text.endsWith("1 file was attached and not forwarded: log.txt (text/plain, 2 KB)")).toBe(true);
+    const send = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ type: string; text: string }> };
+    expect(send.input.map((p) => p.type)).toEqual(["text", "localFile"]);
+    expect(send.input[0]!.text).not.toContain("not forwarded");
     s.hooks.last().send(s.hooks.session({ comment: { text: "nothing attached", untrusted: false } }));
     await tick();
-    const last = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ text: string }> };
-    expect(last.input[0]!.text).not.toContain("not forwarded");
+    const last = s.harness.sdk.callsTo("threads.send").at(-1)![0] as { input: Array<{ type: string; text: string }> };
+    expect(last.input.map((p) => p.type)).toEqual(["text"]);
+    await s.stop();
+  });
+
+  it("reports a timed-out file fetch in the thread and never holds the turn", async () => {
+    const s = await live();
+    // A file fetch that hangs until its signal aborts, the way a stalled service does.
+    s.hooks.state.file = (_session, _id, signal) =>
+      new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")));
+      });
+    s.hooks.last().send(s.hooks.session({ files: [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }] }));
+    // The batch times out; the wake still reaches the thread, with the line.
+    await tick(FILE_FETCH_TIMEOUT_MS + 1);
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }> };
+    expect(spawn.input.map((p) => p.type)).toEqual(["text"]);
+    expect(spawn.input[0]!.text).toContain("could not fetch shot.png");
+    // The fetch was logged without the name or the URL.
+    const warnings = s.harness.logEntries.filter((entry) => entry.level === "warn").map((entry) => entry.message);
+    expect(warnings.some((line) => line.includes("could not fetch one of its files") && line.includes("timed out"))).toBe(true);
+    expect(warnings.join("\n")).not.toContain("shot.png");
+    await s.stop();
+  });
+
+  it("falls back to a could-not-fetch line when the service refuses a file", async () => {
+    const s = await live();
+    // 503 missing-scope: the Slack app has no files:read until it is reinstalled.
+    s.hooks.state.file = () => Response.json({ error: "missing-scope" }, { status: 503 });
+    s.hooks.last().send(s.hooks.session({ comment: { text: "look", untrusted: false }, files: [{ id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 }] }));
+    await tick();
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }> };
+    expect(spawn.input.map((p) => p.type)).toEqual(["text"]);
+    expect(spawn.input[0]!.text).toContain("look");
+    expect(spawn.input[0]!.text).toContain("could not fetch shot.png");
+    expect(s.harness.sdk.callsTo("projects.attachments.upload")).toHaveLength(0);
+    await s.stop();
+  });
+
+  it("handles a mixed message: a forwarded image, a not-forwarded binary and a failed text file", async () => {
+    const s = await live();
+    s.hooks.state.file = (_session, id) =>
+      id === "F3" ? Response.json({ error: "too-large" }, { status: 413 }) : new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "content-type": "image/png" } });
+    const files = [
+      { id: "F1", name: "shot.png", mimeType: "image/png", size: 1234 },
+      { id: "F2", name: "clip.mp4", mimeType: "video/mp4", size: 999 },
+      { id: "F3", name: "notes.txt", mimeType: "text/plain", size: 2048 },
+    ];
+    s.hooks.last().send(s.hooks.session({ comment: { text: "three things", untrusted: false }, files }));
+    await tick();
+    const spawn = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }> };
+    // Only the image was uploaded; the binary stayed off the wire.
+    expect(spawn.input.map((p) => p.type)).toEqual(["text", "localImage"]);
+    expect(s.hooks.fileFetches.map((f) => f.id)).toEqual(["F1", "F3"]);
+    const text = spawn.input[0]!.text!;
+    expect(text).toContain("1 file was attached and not forwarded: clip.mp4 (video/mp4, 999 B)");
+    expect(text).toContain("could not fetch notes.txt");
+    // The not-forwarded line comes before the could-not-fetch line.
+    expect(text.indexOf("not forwarded")).toBeLessThan(text.indexOf("could not fetch"));
+    await s.stop();
+  });
+
+  it("gives a dot-only or empty file name a safe upload name", async () => {
+    const s = await live();
+    s.hooks.last().send(
+      s.hooks.session({
+        comment: { text: "two", untrusted: false },
+        files: [
+          { id: "F1", name: "..", mimeType: "image/png", size: 10 },
+          { id: "F2", name: "", mimeType: "image/png", size: 10 },
+        ],
+      }),
+    );
+    await tick();
+    const uploads = s.harness.sdk.callsTo("projects.attachments.upload").map((call) => (call[0] as { filename: string }).filename);
+    expect(uploads).toEqual(["slack-file", "slack-file"]);
     await s.stop();
   });
 
@@ -581,7 +688,7 @@ describe("Slack plugin", () => {
     await tick();
     const spawns = s.harness.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
-    const released = String((spawns[0]![0] as { prompt: string }).prompt);
+    const released = promptOf(spawns[0]![0]);
     expect(released).toContain("halt work");
     expect(released).toContain("Alice confirmed request");
     await s.stop();
@@ -621,8 +728,10 @@ describe("Slack plugin", () => {
       }),
     );
     await tick();
-    const released = String((s.harness.sdk.callsTo("threads.spawn")[0]![0] as { prompt: string }).prompt);
-    expect(released).toContain("2 files were attached and not forwarded: shot.png (image/png, 1.2 KB), confirm.png (image/png, 2 KB)");
+    const released = s.harness.sdk.callsTo("threads.spawn")[0]![0] as { input: Array<{ type: string; text?: string }> };
+    // Both the held file and the one on the confirming message are forwarded.
+    expect(released.input.map((p) => p.type)).toEqual(["text", "localImage", "localImage"]);
+    expect(released.input[0]!.text).not.toContain("not forwarded");
     await s.stop();
   });
 
@@ -1684,7 +1793,7 @@ describe("Slack plugin", () => {
     await tick();
     const spawns = s.harness.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
-    const released = String((spawns[0]![0] as { prompt: string }).prompt);
+    const released = promptOf(spawns[0]![0]);
     expect(released).toContain("Carol wrote");
     expect(released).not.toContain("Carol asked");
     await s.stop();
@@ -1957,7 +2066,7 @@ describe("Slack plugin", () => {
     await tick();
     const spawns = s.harness.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(1);
-    const prompt = String((spawns[0]![0] as { prompt: string }).prompt);
+    const prompt = promptOf(spawns[0]![0]);
     expect(prompt).toContain("session D0123:1712345678.901234");
     expect(prompt).toContain("build this");
     // The session record survived the pane open, so a follow-up continues the same bb thread.
